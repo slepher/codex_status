@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "id": "full",
+  "version": 3,
+  "min_fw": "0.3",
+  "canvas": { "w": 200, "h": 200 },
+  "elements": [
+    { "type": "rect", "rect": [3, 3, 194, 194], "fill": false, "color": "black" },
+    { "type": "text", "bind": "account.plan", "prefix": "CODEX ", "x": 8, "y": 10, "font": "f16", "color": "black" },
+    { "type": "text", "bind": "bridge.label", "x": 8, "y": 32, "font": "f12", "color": "black" },
+    { "type": "text", "bind": "device.channel", "x": 156, "y": 12, "font": "f12", "color": "red" },
+    { "type": "text", "bind": "buckets[codex].weekly.usedPercent", "prefix": "USED ", "suffix": "%", "x": 8, "y": 52, "font": "f24", "color": "black" },
+    { "type": "bar", "bind": "buckets[codex].weekly.remaining", "rect": [8, 84, 184, 14], "fg": "yellow", "bg": "white", "border": true },
+    { "type": "text", "bind": "buckets[codex].weekly.resetsAt", "prefix": "RESET ", "x": 8, "y": 106, "font": "f12", "color": "black" },
+    { "type": "text", "bind": "device.sync_hhmm", "prefix": "SYNC ", "x": 8, "y": 126, "font": "f12", "color": "black" },
+    { "type": "text", "bind": "resetCredits.availableCount", "prefix": "RC ", "x": 118, "y": 126, "font": "f12", "color": "black" },
+    { "type": "text", "bind": "device.ip", "prefix": "IP ", "x": 8, "y": 146, "font": "f12", "color": "black" },
+    { "type": "text", "bind": "server_time", "prefix": "SRV ", "x": 8, "y": 166, "font": "f12", "color": "black" }
+  ]
+}

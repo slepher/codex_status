@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Codex Status Bridge</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: "Segoe UI", system-ui, sans-serif; margin: 16px; }
+  h2 { margin: 0 0 4px; font-size: 18px; }
+  .muted { opacity: .6; font-size: 12px; margin-bottom: 12px; }
+  button { margin: 0 8px 12px 0; padding: 6px 12px; }
+  pre { background: rgba(127,127,127,.12); padding: 10px; border-radius: 6px;
+        max-height: 460px; overflow: auto; font-size: 12px; }
+</style>
+</head>
+<body>
+  <h2>Codex Status Bridge</h2>
+  <div class="muted" id="meta">starting…</div>
+  <button onclick="forceSync()">Force BLE sync</button>
+  <button onclick="reloadTemplates()">Reload templates</button>
+  <pre id="out">loading…</pre>
+<script>
+  const invoke = window.__TAURI__.core.invoke;
+  const out = document.getElementById('out');
+  const meta = document.getElementById('meta');
+
+  async function refresh() {
+    try {
+      const s = await invoke('get_status');
+      meta.textContent = `http ${s.http} · lan ${s.lan_ip} · templates ${s.templates.length} · updated ${s.updated || 'never'}`;
+      out.textContent = JSON.stringify(s.usage ?? { note: 'no usage yet' }, null, 2);
+    } catch (e) {
+      out.textContent = 'error: ' + e;
+    }
+  }
+  async function forceSync() { await invoke('force_sync'); refresh(); }
+  async function reloadTemplates() { await invoke('reload_templates'); refresh(); }
+  refresh();
+  setInterval(refresh, 3000);
+</script>
+</body>
+</html>

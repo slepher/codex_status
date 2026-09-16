@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "id": "mini",
+  "version": 2,
+  "min_fw": "0.3",
+  "canvas": { "w": 200, "h": 200 },
+  "elements": [
+    { "type": "text", "bind": "account.plan", "prefix": "PLAN ", "x": 8, "y": 8, "font": "f12", "color": "black" },
+    { "type": "text", "bind": "buckets[codex].weekly.remaining", "suffix": "%", "x": 38, "y": 56, "font": "f24", "color": "black" },
+    { "type": "text", "text": "LEFT", "x": 88, "y": 96, "font": "f16", "color": "black" },
+    { "type": "bar", "bind": "buckets[codex].weekly.remaining", "rect": [20, 140, 160, 20], "fg": "black", "bg": "white", "border": true },
+    { "type": "text", "bind": "device.sync_hhmm", "prefix": "SYNC ", "x": 8, "y": 170, "font": "f12", "color": "black" }
+  ]
+}
