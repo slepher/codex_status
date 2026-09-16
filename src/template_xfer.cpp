@@ -36,6 +36,14 @@ static bool idValid(const String &id) {
     return true;
 }
 
+static bool hashValid(const String &hash) {
+    if (hash.length() != 8) return false;
+    for (size_t i = 0; i < hash.length(); i++) {
+        if (!isxdigit((unsigned char)hash[i])) return false;
+    }
+    return true;
+}
+
 static void abortRecv() {
     if (sBuf) free(sBuf);
     sBuf = nullptr;
@@ -46,10 +54,31 @@ static void abortRecv() {
 static bool versionGE(const String &fw, const String &minv) {
     if (minv.length() == 0) return true;
     int fmaj = 0, fmin = 0, mmaj = 0, mmin = 0;
-    sscanf(fw.c_str(), "%d.%d", &fmaj, &fmin);
-    sscanf(minv.c_str(), "%d.%d", &mmaj, &mmin);
+    if (sscanf(fw.c_str(), "%d.%d", &fmaj, &fmin) != 2 ||
+        sscanf(minv.c_str(), "%d.%d", &mmaj, &mmin) != 2 ||
+        fmaj < 0 || fmin < 0 || mmaj < 0 || mmin < 0) return false;
     if (fmaj != mmaj) return fmaj > mmaj;
     return fmin >= mmin;
+}
+
+bool tplValidateForStorage(const String &tmplJson, const String &expectedHash,
+                           const String &fwVersion, String &err) {
+    if (!hashValid(expectedHash)) { err = "hash"; return false; }
+    uint32_t crc = crc32buf((const uint8_t *)tmplJson.c_str(), tmplJson.length());
+    char actual[9];
+    snprintf(actual, sizeof(actual), "%08x", (unsigned)crc);
+    if (!expectedHash.equalsIgnoreCase(actual)) { err = "hash"; return false; }
+    if (!tplValidate(tmplJson, err)) return false;
+    JsonDocument td;
+    if (deserializeJson(td, tmplJson)) { err = "json"; return false; }
+    if (!td["min_fw"].isNull()) {
+        const char *minfw = td["min_fw"].as<const char *>();
+        if (!minfw || !versionGE(fwVersion, String(minfw))) {
+            err = "minfw";
+            return false;
+        }
+    }
+    return true;
 }
 
 static void ack(const char *op, bool ok, const char *err = nullptr) {
@@ -66,7 +95,7 @@ static void handleBegin(JsonDocument &d) {
     uint32_t ver = d["version"] | 0;
     uint32_t len = d["len"] | 0;
     uint32_t crc = d["crc"] | 0;
-    if (!idValid(id) || len == 0 || len > TPL_MAX_LEN || hash.length() == 0) {
+    if (!idValid(id) || len == 0 || len > TPL_MAX_LEN || !hashValid(hash)) {
         ack("begin", false, "args");
         return;
     }
@@ -105,19 +134,9 @@ static void handleEnd() {
     abortRecv();
 
     String err;
-    if (!tplValidate(json, err)) {
+    if (!tplValidateForStorage(json, sHash, sFw, err)) {
         ack("end", false, err.c_str());
         return;
-    }
-    {
-        JsonDocument td;
-        if (!deserializeJson(td, json)) {
-            const char *minfw = td["min_fw"] | "";
-            if (!versionGE(sFw, String(minfw))) {
-                ack("end", false, "minfw");
-                return;
-            }
-        }
     }
     TplMeta existing;
     bool unchanged = tplStoreFind(sId, existing) && existing.hash == sHash;
@@ -183,7 +202,12 @@ void tplXferHandleCtrl(const String &json) {
 }
 
 void tplXferHandleChunk(const uint8_t *data, size_t len) {
-    if (!sInProgress || !sBuf || len < 3) return;
+    if (!sInProgress || !sBuf) return;
+    if (len < 3) {
+        ack("data", false, "short");
+        abortRecv();
+        return;
+    }
     size_t off = (size_t)data[0] | ((size_t)data[1] << 8);
     const uint8_t *payload = data + 2;
     size_t plen = len - 2;
@@ -201,4 +225,12 @@ void tplXferHandleChunk(const uint8_t *data, size_t len) {
 void tplXferBegin(const String &fwVersion, TplChangedHandler onChanged) {
     sFw = fwVersion;
     sChanged = onChanged;
+}
+
+void tplXferReset() {
+    abortRecv();
+    sId = "";
+    sHash = "";
+    sVer = 0;
+    sCrc = 0;
 }

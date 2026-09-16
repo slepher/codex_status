@@ -26,7 +26,7 @@
 #include "template_engine.h"
 #include "template_xfer.h"
 
-#define FW_VERSION    "0.4.0-bw"
+#define FW_VERSION    "0.4.1-bw"
 #define AP_PASSWORD   "codex1234"
 #define OTA_PASSWORD  "codexota"
 #define MAX_SLOTS     3
@@ -52,6 +52,8 @@ static String        pendingUsage;
 static String        pendingChannel;
 static volatile bool pendingEndpoint = false;
 static volatile bool pendingTplChanged = false;
+static bool pairingOverlay = false;
+static bool drawingPairingOverlay = false;
 
 static String activeTplJson;
 static String activeTplId;
@@ -71,6 +73,11 @@ static bool     epdPartialReady = false;
 
 static void screen(const std::vector<String> &lines, UBYTE color = BLACK);
 static void epdFlush(bool fullRefresh = false);
+
+static bool pairingOverlayActive() {
+    bool paired = bleIsConnected() && blePeerIsBonded() && blePeerIsEncrypted();
+    return pairingOverlay && blePairingWindowOpen() && !paired;
+}
 
 static String macSuffix() {
     String mac = WiFi.macAddress();
@@ -161,6 +168,7 @@ static void screenIdle() {
 }
 
 static void screen(const std::vector<String> &lines, UBYTE color) {
+    if (pairingOverlayActive() && !drawingPairingOverlay) return;
     if (!frame) return;
     Paint_SelectImage(frame);
     Paint_Clear(WHITE);
@@ -172,6 +180,12 @@ static void screen(const std::vector<String> &lines, UBYTE color) {
         if (y > EPD_H - 24) break;
     }
     epdFlush();
+}
+
+static void screenPairingOverlay() {
+    drawingPairingOverlay = true;
+    screen({"RELEASE BOOT", "BLE PAIRING", "WINDOWS ADD DEVICE"});
+    drawingPairingOverlay = false;
 }
 
 static void epdBegin() {
@@ -308,6 +322,7 @@ static void drawSmallLeft(const String &s, int x, int y) {
 }
 
 static void renderUsage(const String &json, const char *channel) {
+    if (pairingOverlayActive()) return;
     if (!frame) return;
     JsonDocument doc;
     if (deserializeJson(doc, json)) {
@@ -383,6 +398,7 @@ static bool tplCacheLoad() {
 }
 
 static void renderActiveUsage(const String &json, const char *channel) {
+    if (pairingOverlayActive()) return;
     if (!frame) return;
     if (tplCacheLoad()) {
         TplEnv env;
@@ -416,9 +432,27 @@ static void maybeFetchTemplate(const EndpointRec &rec, const String &usageJson) 
         uint32_t ver = meta["version"] | 0;
         if (!hash.length()) continue;
         TplMeta local;
-        if (tplStoreFind(id, local) && local.hash == hash) continue;
+        String localHash;
+        bool localValid = false;
+        if (tplStoreFind(id, local) && local.hash == hash) {
+            String localJson, localErr;
+            localValid = tplStoreLoad(id, localJson) &&
+                         tplValidateForStorage(localJson, hash, FW_VERSION, localErr);
+            if (localValid) localHash = local.hash;
+            if (!localValid) {
+                Serial.printf("[tpl] local %s rejected: %s\n", id.c_str(), localErr.c_str());
+            }
+        } else if (tplStoreFind(id, local)) {
+            localHash = local.hash;
+        }
+        if (localValid) continue;
         String out, err;
-        if (usageTemplateGet(rec, id, hash, out, err)) {
+        if (usageTemplateGet(rec, id, localHash, out, err)) {
+            String acceptErr;
+            if (!tplValidateForStorage(out, hash, FW_VERSION, acceptErr)) {
+                Serial.printf("[tpl] HTTP %s rejected: %s\n", id.c_str(), acceptErr.c_str());
+                continue;
+            }
             if (tplStoreSave(id, ver, hash, (const uint8_t *)out.c_str(), out.length())) {
                 if (tplStoreActive().length() == 0 || tplStoreActive() == id) {
                     tplStoreSetActive(id);
@@ -667,7 +701,7 @@ static void startNormalMode() {
 
     bleBegin("CodexStatus-" + macSuffix(), FW_VERSION);
     bleSetHandlers(handleBleUsage, handleBleEndpoint);
-    bleSetTemplateHandlers(tplXferHandleCtrl, tplXferHandleChunk);
+    bleSetTemplateHandlers(tplXferHandleCtrl, tplXferHandleChunk, tplXferReset);
     updateInfoExtra();
 
     server.on("/", HTTP_GET, handleStatus);
@@ -804,6 +838,7 @@ static void handleSerialCli() {
 void loop() {
     handleSerialCli();
     server.handleClient();
+    blePoll();
     if (!configMode) {
         ArduinoOTA.handle();
 
@@ -815,10 +850,12 @@ void loop() {
             if (bootStage < 1 && held > 2000) {
                 bootStage = 1;
                 bleOpenPairingWindow(120000);
-                screen({"BLE PAIRING", "window 120s", "connect from PC"});
+                pairingOverlay = true;
+                screenPairingOverlay();
             }
             if (bootStage < 2 && held > 10000) {
                 bootStage = 2;
+                pairingOverlay = false;
                 factoryReset();
             }
         } else {
@@ -827,6 +864,16 @@ void loop() {
                 if (bootStage == 0 && held > 50 && held < 1500) nextTemplate();
                 bootDownAt = 0;
                 bootStage = 0;
+            }
+        }
+
+        if (pairingOverlay) {
+            bool paired = bleIsConnected() && blePeerIsBonded() && blePeerIsEncrypted();
+            if (!blePairingWindowOpen() || paired) {
+                pairingOverlay = false;
+                activeTplId = "";
+                if (lastUsage.length()) renderActiveUsage(lastUsage, lastChannel.c_str());
+                else screenIdle();
             }
         }
 

@@ -19,13 +19,15 @@ use uuid::Uuid;
 use bridge_core::template::{encode_chunks, template_hash, Library};
 
 pub const SVC_UUID: &str = "e7f1a000-4b2a-4c9e-9a11-3c0d5e9a0000";
+pub const CHR_INFO: &str = "e7f1a001-4b2a-4c9e-9a11-3c0d5e9a0000";
 pub const CHR_ENDPOINT: &str = "e7f1a002-4b2a-4c9e-9a11-3c0d5e9a0000";
 pub const CHR_USAGE: &str = "e7f1a003-4b2a-4c9e-9a11-3c0d5e9a0000";
 pub const CHR_STATUS: &str = "e7f1a004-4b2a-4c9e-9a11-3c0d5e9a0000";
 pub const CHR_TPL_CTRL: &str = "e7f1a005-4b2a-4c9e-9a11-3c0d5e9a0000";
 pub const CHR_TPL_DATA: &str = "e7f1a006-4b2a-4c9e-9a11-3c0d5e9a0000";
 
-pub const CHUNK_PAYLOAD: usize = 180;
+pub const JSON_WRITE_LIMIT: usize = 180;
+pub const CHUNK_PAYLOAD: usize = JSON_WRITE_LIMIT - 2;
 
 #[derive(Debug, Clone)]
 pub struct BleConfig {
@@ -104,6 +106,24 @@ impl Pusher {
         }
     }
 
+    fn peer_bonded(info: &serde_json::Value) -> bool {
+        info.get("peerBonded").and_then(|v| v.as_bool()) == Some(true)
+    }
+
+    async fn read_info(peripheral: &Peripheral) -> Result<serde_json::Value> {
+        let target = peripheral
+            .characteristics()
+            .into_iter()
+            .find(|c| c.uuid == Self::uuid(CHR_INFO))
+            .ok_or_else(|| anyhow!("info characteristic missing"))?;
+        let raw = peripheral.read(&target).await.context("read device info")?;
+        let info: serde_json::Value = serde_json::from_slice(&raw).context("parse device info")?;
+        if !Self::peer_bonded(&info) {
+            bail!("device is not bonded; pair manually in Windows Bluetooth settings: hold BOOT for 2 seconds to open the 120 second pairing window, connect CodexStatus, then retry")
+        }
+        Ok(info)
+    }
+
     async fn fetch_usage(&self) -> Result<serde_json::Value> {
         let url = format!("{}/usage", self.upstream.trim_end_matches('/'));
         let resp = self
@@ -133,6 +153,18 @@ impl Pusher {
             .write(&target, data, WriteType::WithResponse)
             .await
             .with_context(|| format!("write {uuid}"))
+    }
+
+    fn fragment_payload(data: &[u8], limit: usize) -> Vec<Vec<u8>> {
+        assert!(limit > 0);
+        data.chunks(limit).map(|chunk| chunk.to_vec()).collect()
+    }
+
+    async fn write_json(peripheral: &Peripheral, uuid: &str, data: &[u8]) -> Result<()> {
+        for chunk in Self::fragment_payload(data, JSON_WRITE_LIMIT) {
+            Self::write_char(peripheral, uuid, &chunk).await?;
+        }
+        Ok(())
     }
 
     async fn log_notifications(peripheral: &Peripheral) -> Result<tokio::task::JoinHandle<()>> {
@@ -166,13 +198,13 @@ impl Pusher {
             "port": self.cfg.port,
             "token": self.cfg.token,
         });
-        Self::write_char(peripheral, CHR_ENDPOINT, payload.to_string().as_bytes()).await
+        Self::write_json(peripheral, CHR_ENDPOINT, payload.to_string().as_bytes()).await
     }
 
     async fn push_usage(&self, peripheral: &Peripheral) -> Result<()> {
         match self.fetch_usage().await {
             Ok(usage) => {
-                Self::write_char(peripheral, CHR_USAGE, usage.to_string().as_bytes()).await?;
+                Self::write_json(peripheral, CHR_USAGE, usage.to_string().as_bytes()).await?;
                 tracing::info!("usage pushed over BLE");
                 Ok(())
             }
@@ -194,16 +226,16 @@ impl Pusher {
             "len": bytes.len(),
             "crc": crc,
         });
-        Self::write_char(peripheral, CHR_TPL_CTRL, begin.to_string().as_bytes()).await?;
+        Self::write_json(peripheral, CHR_TPL_CTRL, begin.to_string().as_bytes()).await?;
         tokio::time::sleep(Duration::from_millis(300)).await;
         for chunk in encode_chunks(bytes, CHUNK_PAYLOAD) {
             Self::write_char(peripheral, CHR_TPL_DATA, &chunk).await?;
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
-        Self::write_char(peripheral, CHR_TPL_CTRL, br#"{"op":"end"}"#).await?;
+        Self::write_json(peripheral, CHR_TPL_CTRL, br#"{"op":"end"}"#).await?;
         tokio::time::sleep(Duration::from_millis(500)).await;
         let activate = json!({"op": "activate", "id": id});
-        Self::write_char(peripheral, CHR_TPL_CTRL, activate.to_string().as_bytes()).await?;
+        Self::write_json(peripheral, CHR_TPL_CTRL, activate.to_string().as_bytes()).await?;
         tracing::info!("template {id} pushed and activated ({} bytes)", bytes.len());
         Ok(())
     }
@@ -242,6 +274,14 @@ impl Pusher {
         tracing::info!("connecting {name} ({})", peripheral.address());
         peripheral.connect().await.context("connect")?;
         peripheral.discover_services().await.context("discover")?;
+        let info = match Self::read_info(&peripheral).await {
+            Ok(info) => info,
+            Err(e) => {
+                let _ = peripheral.disconnect().await;
+                return Err(e);
+            }
+        };
+        tracing::info!("device info: {}", info);
 
         let notify_handle = Self::log_notifications(&peripheral).await.ok();
 
@@ -273,5 +313,28 @@ impl Pusher {
             }
             tokio::time::sleep(interval).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Pusher;
+    use serde_json::json;
+
+    #[test]
+    fn json_fragments_reassemble_at_boundary_and_preserve_utf8_bytes() {
+        let mut input = vec![b'x'; 180];
+        input.extend_from_slice("界尾".as_bytes());
+        let parts = Pusher::fragment_payload(&input, super::JSON_WRITE_LIMIT);
+        assert_eq!(parts.iter().map(Vec::len).max(), Some(180));
+        assert!(parts.iter().all(|part| part.len() <= super::JSON_WRITE_LIMIT));
+        assert_eq!(parts.concat(), input);
+    }
+
+    #[test]
+    fn info_gate_requires_persistent_bond() {
+        assert!(Pusher::peer_bonded(&json!({"peerBonded": true})));
+        assert!(!Pusher::peer_bonded(&json!({"peerBonded": false, "peerEncrypted": true})));
+        assert!(!Pusher::peer_bonded(&json!({"peerEncrypted": true})));
     }
 }

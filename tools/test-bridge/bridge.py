@@ -14,11 +14,37 @@ import argparse
 import asyncio
 import json
 import socket
+import sys
 import threading
 import time
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
+
+
+_builtin_print = print
+
+
+def safe_print(*args, **kwargs):
+    try:
+        _builtin_print(*args, **kwargs)
+        return
+    except UnicodeEncodeError:
+        output = kwargs.get("file", sys.stdout)
+        sep = kwargs.get("sep", " ")
+        end = kwargs.get("end", "\n")
+        encoding = getattr(output, "encoding", None) or "utf-8"
+        text = sep.join(str(arg) for arg in args) + end
+        encoded = text.encode(encoding, errors="replace")
+        buffer = getattr(output, "buffer", None)
+        if buffer is not None:
+            buffer.write(encoded)
+            buffer.flush()
+        else:
+            output.write(encoded.decode(encoding, errors="replace"))
+
+
+print = safe_print
 
 try:
     from bleak import BleakScanner, BleakClient
@@ -31,6 +57,8 @@ CHR_USAGE = "e7f1a003-4b2a-4c9e-9a11-3c0d5e9a0000"
 CHR_STATUS = "e7f1a004-4b2a-4c9e-9a11-3c0d5e9a0000"
 CHR_TPL_CTRL = "e7f1a005-4b2a-4c9e-9a11-3c0d5e9a0000"
 CHR_TPL_DATA = "e7f1a006-4b2a-4c9e-9a11-3c0d5e9a0000"
+CHR_INFO = "e7f1a001-4b2a-4c9e-9a11-3c0d5e9a0000"
+JSON_WRITE_LIMIT = 180
 
 ARGS = None
 RESET_AT = int(time.time()) + 3 * 3600  # 启动时固定，模拟真实窗口重置时间
@@ -104,6 +132,25 @@ def bridge_label() -> str:
     name = socket.gethostname()
     cleaned = "".join(c if (" " <= c <= "~") else "?" for c in name)[:16]
     return cleaned or "bridge"
+
+
+def fragment_payload(data: bytes, limit: int = JSON_WRITE_LIMIT) -> list[bytes]:
+    if limit <= 0:
+        raise ValueError("fragment limit must be positive")
+    return [data[i:i + limit] for i in range(0, len(data), limit)]
+
+
+def negotiated_write_limit(client, default: int = JSON_WRITE_LIMIT) -> int:
+    mtu = getattr(client, "mtu_size", None)
+    if isinstance(mtu, int) and mtu > 3:
+        return min(default, mtu - 3)
+    return default
+
+
+async def write_fragmented(client, uuid: str, data: bytes, limit: int | None = None):
+    limit = negotiated_write_limit(client) if limit is None else limit
+    for chunk in fragment_payload(data, limit):
+        await client.write_gatt_char(uuid, chunk, response=True)
 
 
 def make_usage() -> dict:
@@ -194,21 +241,21 @@ async def push_template(client, tid: str):
     crc = zlib.crc32(data) & 0xffffffff
     ctrl = {"op": "begin", "id": tid, "version": TPL_BY_ID[tid]["version"],
             "hash": f"{crc:08x}", "len": len(data), "crc": crc}
-    await client.write_gatt_char(CHR_TPL_CTRL, json.dumps(ctrl).encode(), response=True)
+    await write_fragmented(client, CHR_TPL_CTRL, json.dumps(ctrl).encode())
     print(f"[ble] template begin id={tid} len={len(data)} crc={crc:08x}")
     await asyncio.sleep(0.3)
     off = 0
     while off < len(data):
-        chunk = data[off:off + 180]
+        chunk = data[off:off + max(1, negotiated_write_limit(client) - 2)]
         payload = bytes([off & 0xFF, (off >> 8) & 0xFF]) + chunk
         await client.write_gatt_char(CHR_TPL_DATA, payload, response=True)
         off += len(chunk)
         await asyncio.sleep(0.03)
-    await client.write_gatt_char(CHR_TPL_CTRL, b'{"op":"end"}', response=True)
+    await write_fragmented(client, CHR_TPL_CTRL, b'{"op":"end"}')
     print(f"[ble] template end id={tid} ({off}B sent)")
     await asyncio.sleep(0.5)
     act = json.dumps({"op": "activate", "id": tid}).encode()
-    await client.write_gatt_char(CHR_TPL_CTRL, act, response=True)
+    await write_fragmented(client, CHR_TPL_CTRL, act)
     print(f"[ble] template activate {tid}")
 
 
@@ -225,16 +272,28 @@ async def ble_push():
         return
     print(f"[ble] connecting {dev.name} ({dev.address})")
     async with BleakClient(dev, timeout=30) as client:
+        info_raw = await client.read_gatt_char(CHR_INFO)
+        try:
+            info = json.loads(bytes(info_raw).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            raise RuntimeError(f"device info is malformed: {e}") from e
+        if not isinstance(info, dict) or info.get("peerBonded") is not True:
+            raise RuntimeError(
+                "device is not bonded; pair manually in Windows Bluetooth settings: "
+                "hold BOOT for 2 seconds to open the 120 second pairing window, "
+                "connect CodexStatus, then retry"
+            )
+        print(f"[ble] device info: {info}")
         try:
             await client.start_notify(
                 CHR_STATUS, lambda _, data: print("[ble] status:", data.decode(errors="replace")))
         except Exception as e:
             print("[ble] notify subscribe failed:", e)
         ep = {"schema": 1, "host": lan_ip(), "port": ARGS.port, "token": ARGS.token}
-        await client.write_gatt_char(CHR_ENDPOINT, json.dumps(ep).encode(), response=True)
+        await write_fragmented(client, CHR_ENDPOINT, json.dumps(ep).encode())
         print(f"[ble] endpoint written: {ep}")
         if ARGS.push_usage:
-            await client.write_gatt_char(CHR_USAGE, json.dumps(make_usage()).encode(), response=True)
+            await write_fragmented(client, CHR_USAGE, json.dumps(make_usage()).encode())
             print("[ble] usage pushed over BLE")
             await asyncio.sleep(1)
         if ARGS.push_template:
@@ -258,7 +317,10 @@ def main():
 
     threading.Thread(target=serve_http, daemon=True).start()
     if not ARGS.no_ble:
-        asyncio.run(ble_push())
+        try:
+            asyncio.run(ble_push())
+        except Exception as e:
+            print(f"[ble] failed: {e}; HTTP mock remains available")
     print("[main] running; Ctrl+C to stop")
     try:
         while True:

@@ -3,6 +3,7 @@
 
 static bool httpGet(const String &url, const EndpointRec &rec, String &out, String &err,
                     uint32_t timeoutMs) {
+    out = "";
     HTTPClient http;
     http.setConnectTimeout(timeoutMs);
     http.setTimeout(timeoutMs);
@@ -15,6 +16,10 @@ static bool httpGet(const String &url, const EndpointRec &rec, String &out, Stri
     if (code == 200) {
         out = http.getString();
         http.end();
+        if (out.length() == 0) {
+            err = "empty response";
+            return false;
+        }
         return true;
     }
     err = "http " + String(code);
@@ -27,9 +32,15 @@ bool usageHttpGet(const EndpointRec &rec, String &out, String &err, uint32_t tim
     return httpGet(url, rec, out, err, timeoutMs);
 }
 
-bool usageTemplateGet(const EndpointRec &rec, const String &id, const String &hash,
+bool usageTemplateGet(const EndpointRec &rec, const String &id, const String &localHash,
                       String &out, String &err, uint32_t timeoutMs) {
     String url = "http://" + rec.host + ":" + String(rec.port) +
-                 "/template?id=" + id + "&hash=" + hash;
-    return httpGet(url, rec, out, err, timeoutMs);
+                 "/template?id=" + id + "&hash=" + localHash;
+    if (!httpGet(url, rec, out, err, timeoutMs)) return false;
+    if (out.length() > 32768) {
+        out = "";
+        err = "template too large";
+        return false;
+    }
+    return true;
 }
