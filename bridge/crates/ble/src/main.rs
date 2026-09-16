@@ -24,7 +24,7 @@ struct Args {
     token: String,
     #[arg(long, default_value = "tools/test-bridge/templates")]
     templates: PathBuf,
-    /// Template ids to push (empty = all in library).
+    /// Template ids to push (omitted = all in library, explicit full sync).
     #[arg(long, num_args = 0..)]
     template_ids: Vec<String>,
     /// Base URL of the running bridge-core HTTP server used as usage source.
@@ -55,7 +55,8 @@ async fn main() -> Result<()> {
         host: args.host.clone().unwrap_or_else(lan_ip),
         port: args.port,
         token: args.token.clone(),
-        template_ids: args.template_ids.clone(),
+        template_ids: if args.template_ids.is_empty() { None } else { Some(args.template_ids.clone()) },
+        activate: None,
     };
     tracing::info!("endpoint advertised: {}:{}", cfg.host, cfg.port);
 

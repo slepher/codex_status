@@ -1,0 +1,56 @@
+use std::path::{Path, PathBuf};
+
+fn find_arduinojson(root: &Path) -> PathBuf {
+    if let Ok(explicit) = std::env::var("CODEX_STATUS_ARDUINOJSON") {
+        let path = PathBuf::from(explicit);
+        if path.join("ArduinoJson.h").is_file() {
+            return path;
+        }
+    }
+    let libdeps = root.join(".pio/libdeps");
+    if let Ok(entries) = std::fs::read_dir(&libdeps) {
+        for entry in entries.flatten() {
+            let candidate = entry.path().join("ArduinoJson/src");
+            if candidate.join("ArduinoJson.h").is_file() {
+                return candidate;
+            }
+        }
+    }
+    panic!(
+        "ArduinoJson.h not found; run `pio run` once or set CODEX_STATUS_ARDUINOJSON to the ArduinoJson src directory"
+    );
+}
+
+fn main() {
+    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let root = manifest.join("../../..");
+    let firmware = root.join("src");
+    let shim = manifest.join("shim");
+    let ffi = manifest.join("src/ffi.cpp");
+
+    let arduinojson = find_arduinojson(&root);
+
+    let mut build = cc::Build::new();
+    build
+        .cpp(true)
+        .std("c++17")
+        .include(&shim)
+        .include(&firmware)
+        .include(&arduinojson)
+        .define("ARDUINOJSON_ENABLE_ARDUINO_STRING", "1")
+        .warnings(false)
+        .flag_if_supported("/utf-8")
+        .file(firmware.join("template_engine.cpp"))
+        .file(firmware.join("GUI_Paint.cpp"))
+        .file(&ffi);
+    for name in ["font8", "font12", "font16", "font20", "font24"] {
+        build.file(firmware.join(format!("{name}.cpp")));
+    }
+    build.compile("bridge_render");
+
+    for tracked in ["template_engine.cpp", "template_engine.h", "GUI_Paint.cpp", "GUI_Paint.h"] {
+        println!("cargo:rerun-if-changed={}", firmware.join(tracked).display());
+    }
+    println!("cargo:rerun-if-changed={}", ffi.display());
+    println!("cargo:rerun-if-changed={}", manifest.join("shim").display());
+}

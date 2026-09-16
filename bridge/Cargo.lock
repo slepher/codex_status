@@ -437,8 +437,11 @@ name = "bridge-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "bridge-ble",
  "bridge-core",
+ "bridge-mcp",
+ "bridge-render",
  "serde",
  "serde_json",
  "tauri",
@@ -448,6 +451,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -483,6 +487,30 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "bridge-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "bridge-ble",
+ "bridge-core",
+ "bridge-render",
+ "serde",
+ "serde_json",
+ "tokio",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "bridge-render"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cc",
+ "png 0.17.16",
 ]
 
 [[package]]

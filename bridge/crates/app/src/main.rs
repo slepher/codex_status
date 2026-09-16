@@ -3,9 +3,9 @@
 mod config;
 mod icon;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bridge_ble::{lan_ip, BleConfig, Pusher};
@@ -19,23 +19,37 @@ use icon::State as IconState;
 use serde_json::{json, Value};
 use tauri::menu::{Menu, MenuItem, MenuItemKind, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, State, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tokio::sync::{Notify, RwLock};
+
+#[derive(Default)]
+struct PendingPush {
+    ids: Vec<String>,
+    activate: Option<String>,
+}
 
 struct RuntimeStatus {
     last_sync: Option<i64>,
     last_error: Option<String>,
     last_error_at: Option<i64>,
     paused: bool,
+    pending: PendingPush,
+    last_push_at: Option<i64>,
+    last_push_error: Option<String>,
 }
 
 struct AppCtx {
     config: Config,
+    root: PathBuf,
+    app_handle: OnceLock<AppHandle>,
     envelope: Arc<RwLock<Option<Value>>>,
     library: Arc<RwLock<Library>>,
     force_ble: Arc<Notify>,
     status: Mutex<RuntimeStatus>,
     ble_primed: AtomicBool,
+    mcp_port: Mutex<u16>,
+    mcp_error: Mutex<Option<String>>,
+    mcp_tx: tokio::sync::watch::Sender<u16>,
 }
 
 fn now_secs() -> i64 {
@@ -170,11 +184,12 @@ fn show_panel(app: &AppHandle) {
 #[tauri::command]
 async fn get_status(state: State<'_, Arc<AppCtx>>) -> Result<Value, String> {
     let usage = state.envelope.read().await.clone();
+    refresh_library(&state).await;
     let library = state.library.read().await;
     let templates: Vec<Value> = library
         .entries
         .values()
-        .map(|e| json!({"id": e.id, "hash": e.hash, "version": e.version}))
+        .map(|e| json!({"id": e.id, "hash": e.hash}))
         .collect();
     let status = state.status.lock().unwrap();
     Ok(json!({
@@ -187,14 +202,362 @@ async fn get_status(state: State<'_, Arc<AppCtx>>) -> Result<Value, String> {
         "weekly_remaining": weekly_remaining(&usage),
         "templates": templates,
         "paused": status.paused,
+        "pending": status.pending.ids.len(),
+        "last_push_at": status.last_push_at,
+        "last_push_error": status.last_push_error,
         "last_sync": status.last_sync,
         "last_error": status.last_error,
         "updated": usage.as_ref().and_then(|u| u.get("server_time")).and_then(|v| v.as_i64()),
     }))
 }
 
+fn local_hhmm() -> String {
+    #[cfg(windows)]
+    unsafe {
+        let mut time = std::mem::zeroed();
+        windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut time);
+        return format!("{:02}:{:02}", time.wHour, time.wMinute);
+    }
+    #[cfg(not(windows))]
+    "--:--".to_string()
+}
+
+async fn mcp_handler(
+    axum::extract::State(ctx): axum::extract::State<Arc<AppCtx>>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let host_ok = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(|h| {
+            h.starts_with("127.0.0.1") || h.starts_with("localhost") || h.starts_with("[::1]")
+        })
+        .unwrap_or(false);
+    if !host_ok {
+        return (axum::http::StatusCode::FORBIDDEN, "host not allowed").into_response();
+    }
+    let request: Value = match serde_json::from_str(&body) {
+        Ok(value) => value,
+        Err(err) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("parse error: {err}"),
+            )
+                .into_response();
+        }
+    };
+    let mcp_cfg = bridge_mcp::McpConfig {
+        port: ctx.config.port,
+        token: ctx.config.token.clone(),
+        templates: ctx.config.templates.clone(),
+        profiles: ctx.config.profiles.clone(),
+        data_root: bridge_core::paths::data_root(),
+        seeds: ctx.config.seeds.clone(),
+        profile_seed: ctx.config.profile_seed.clone(),
+        root: ctx.root.clone(),
+    };
+    let tool = request
+        .pointer("/params/name")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    match bridge_mcp::handle_request(&mcp_cfg, &request).await {
+        Some(response) => {
+            let ok = response
+                .pointer("/result/isError")
+                .and_then(|v| v.as_bool())
+                .map(|is_error| !is_error)
+                .unwrap_or(false);
+            if ok && matches!(tool.as_deref(), Some("template_save") | Some("profile_save")) {
+                if let Some(handle) = ctx.app_handle.get() {
+                    let _ = handle.emit("templates-changed", ());
+                }
+            }
+            (
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                response.to_string(),
+            )
+                .into_response()
+        }
+        None => axum::http::StatusCode::ACCEPTED.into_response(),
+    }
+}
+
+async fn mcp_serve(ctx: Arc<AppCtx>) {
+    let mut rx = ctx.mcp_tx.subscribe();
+    loop {
+        let port = *rx.borrow();
+        match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(listener) => {
+                *ctx.mcp_error.lock().unwrap() = None;
+                tracing::info!("mcp http listening on http://127.0.0.1:{port}/mcp");
+                let app = axum::Router::new()
+                    .route("/mcp", axum::routing::post(mcp_handler))
+                    .with_state(ctx.clone());
+                tokio::select! {
+                    _ = axum::serve(listener, app) => {}
+                    _ = rx.changed() => {}
+                }
+            }
+            Err(err) => {
+                *ctx.mcp_error.lock().unwrap() = Some(format!("bind 127.0.0.1:{port}: {err}"));
+                tracing::warn!("mcp bind failed: {err}");
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    _ = rx.changed() => {}
+                }
+            }
+        }
+    }
+}
+
+fn persist_mcp_port(_root: &Path, port: u16) {
+    let path = bridge_core::paths::data_root().join("bridge-app.json");
+    let mut doc: Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_else(|| json!({}));
+    if let Some(object) = doc.as_object_mut() {
+        object.insert("mcp_port".to_string(), json!(port));
+    }
+    if let Ok(text) = serde_json::to_string_pretty(&doc) {
+        let _ = std::fs::write(&path, text);
+    }
+}
+
+#[tauri::command]
+async fn get_mcp_info(state: State<'_, Arc<AppCtx>>) -> Result<Value, String> {
+    let port = *state.mcp_port.lock().unwrap();
+    let error = state.mcp_error.lock().unwrap().clone();
+    let url = format!("http://127.0.0.1:{port}/mcp");
+    let stdio_command = format!(
+        "{} --print-config opencode",
+        bridge_mcp::preferred_exe().display()
+    );
+    let tools = "bridge_status / template_get / template_validate / template_render / template_save / template_push";
+
+    let generic_prompt = format!(
+        "本机已启动 Codex Status 的 MCP 服务（Streamable HTTP）：{url}\n\
+         工具前缀 codex_status_（{tools}），用于读取、校验、渲染预览、保存模板并 BLE 推送到墨水屏。\n\
+         请把它加入你所在客户端的 MCP 配置（remote/http 类型）；配置写入后需要重开会话或客户端才能加载。\
+         若你无法自行修改配置，请告诉我该在哪一步粘贴这一行。"
+    );
+    let opencode_snippet = serde_json::to_string_pretty(&json!({
+        "mcp": {"codex_status": {"type": "remote", "url": url, "enabled": true}}
+    }))
+    .unwrap_or_default();
+    let claude_snippet = serde_json::to_string_pretty(&json!({
+        "mcpServers": {"codex-status": {"type": "http", "url": url}}
+    }))
+    .unwrap_or_default();
+    let cursor_snippet = serde_json::to_string_pretty(&json!({
+        "mcpServers": {"codex-status": {"url": url}}
+    }))
+    .unwrap_or_default();
+    let vscode_snippet = serde_json::to_string_pretty(&json!({
+        "servers": {"codex-status": {"type": "http", "url": url}}
+    }))
+    .unwrap_or_default();
+    let codex_command = format!("codex mcp add codex-status --url {url}");
+    let claude_command = format!("claude mcp add --transport http codex-status {url}");
+
+    let prompts = json!({
+        "generic": generic_prompt,
+        "opencode": format!(
+            "请把下面的 MCP 配置合并进项目根目录的 opencode.jsonc（没有就新建，保留 $schema: https://opencode.ai/config.json），保存后重开会话即可使用 codex_status_* 工具：\n\n{opencode_snippet}"
+        ),
+        "codex": format!("在终端运行：\n{codex_command}\n\n或在 ~/.codex/config.toml 中加入：\n[mcp_servers.codex-status]\nurl = \"{url}\""),
+        "claude": format!(
+            "Claude Code（CLI）：在终端运行\n{claude_command}\n\nClaude Desktop：把下面的配置合并进 claude_desktop_config.json 后重启客户端：\n\n{claude_snippet}"
+        ),
+        "cursor": format!(
+            "请把下面的配置合并进 ~/.cursor/mcp.json（或项目内 .cursor/mcp.json），保存后在 Cursor 设置里确认该 MCP 已启用：\n\n{cursor_snippet}"
+        ),
+        "vscode": format!(
+            "请把下面的配置合并进项目内的 .vscode/mcp.json，然后在 VS Code 中启用该 server：\n\n{vscode_snippet}"
+        ),
+    });
+
+    Ok(json!({
+        "port": port,
+        "url": url,
+        "error": error,
+        "stdio_command": stdio_command,
+        "prompts": prompts,
+    }))
+}
+
+#[tauri::command]
+async fn set_mcp_port(state: State<'_, Arc<AppCtx>>, port: u16) -> Result<Value, String> {
+    if port < 1024 {
+        return Err("端口需 >= 1024".to_string());
+    }
+    *state.mcp_port.lock().unwrap() = port;
+    let _ = state.mcp_tx.send(port);
+    persist_mcp_port(&state.root, port);
+    Ok(json!({"port": port}))
+}
+
+/// MCP tools and manual edits change template files behind the app's back, so
+/// re-scan the directory before answering preview/status queries.
+async fn refresh_library(state: &State<'_, Arc<AppCtx>>) {
+    if let Ok(fresh) = Library::load(&state.config.templates) {
+        *state.library.write().await = fresh;
+    }
+}
+
+#[tauri::command]
+async fn preview_template(
+    state: State<'_, Arc<AppCtx>>,
+    id: Option<String>,
+) -> Result<Value, String> {
+    refresh_library(&state).await;
+    let (template, width, height) = {
+        let library = state.library.read().await;
+        let target = id
+            .filter(|value| !value.is_empty())
+            .or_else(|| library.ids().into_iter().next())
+            .ok_or_else(|| "no templates loaded".to_string())?;
+        let entry = library
+            .get(&target)
+            .ok_or_else(|| format!("template not found: {target}"))?;
+        let text = String::from_utf8(entry.bytes.clone()).map_err(|e| e.to_string())?;
+        (text, bridge_render::WIDTH, bridge_render::HEIGHT)
+    };
+    let usage = state
+        .envelope
+        .read()
+        .await
+        .clone()
+        .unwrap_or_else(|| json!({}));
+    let ip = lan_ip();
+    let sync = local_hhmm();
+    let env = bridge_render::Env {
+        channel: "WIFI",
+        ip: &ip,
+        sync_hhmm: &sync,
+        battery: bridge_render::DEFAULT_BATTERY,
+    };
+    let bits = bridge_render::render_bits(&template, &usage.to_string(), &env)
+        .map_err(|e| e.to_string())?;
+    Ok(json!({"width": width, "height": height, "bits": bits}))
+}
+
 #[tauri::command]
 async fn force_sync(state: State<'_, Arc<AppCtx>>) -> Result<(), String> {
+    state.force_ble.notify_one();
+    Ok(())
+}
+
+fn profiles_path(ctx: &AppCtx) -> PathBuf {
+    ctx.config.profiles.clone()
+}
+
+/// Seed the runtime directory from the repo copies. Existing files are never
+/// overwritten: runtime edits always win.
+fn ensure_runtime(config: &Config) -> std::io::Result<()> {
+    std::fs::create_dir_all(&config.templates)?;
+    if let Ok(entries) = std::fs::read_dir(&config.seeds) {
+        for entry in entries.flatten() {
+            let source = entry.path();
+            if source.extension().map(|e| e != "json").unwrap_or(true) {
+                continue;
+            }
+            let Some(name) = source.file_name() else { continue };
+            let target = config.templates.join(name);
+            if !target.exists() {
+                let _ = std::fs::copy(&source, &target);
+            }
+        }
+    }
+    if !config.profiles.exists() && config.profile_seed.exists() {
+        if let Some(parent) = config.profiles.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::copy(&config.profile_seed, &config.profiles);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_profiles(state: State<'_, Arc<AppCtx>>) -> Result<Value, String> {
+    refresh_library(&state).await;
+    let templates: Vec<Value> = {
+        let library = state.library.read().await;
+        library
+            .entries
+            .values()
+            .map(|e| json!({"id": e.id, "hash": e.hash}))
+            .collect()
+    };
+    let profiles = bridge_core::profile::ProfilesFile::load(&profiles_path(&state))
+        .map_err(|e| e.to_string())?;
+    let list: Vec<Value> = profiles
+        .profiles
+        .iter()
+        .map(|p| {
+            json!({
+                "id": p.id,
+                "name": p.name,
+                "templates": p.templates,
+                "enabled": p.enabled_ids(),
+            })
+        })
+        .collect();
+    Ok(json!({"profiles": list, "templates": templates}))
+}
+
+#[tauri::command]
+async fn save_profile(
+    state: State<'_, Arc<AppCtx>>,
+    id: String,
+    name: Option<String>,
+    templates: Vec<bridge_core::profile::ProfileEntry>,
+) -> Result<(), String> {
+    let known: Vec<String> = state.library.read().await.ids();
+    let path = profiles_path(&state);
+    let mut profiles = bridge_core::profile::ProfilesFile::load(&path).map_err(|e| e.to_string())?;
+    let profile = bridge_core::profile::Profile {
+        id,
+        name: name.unwrap_or_default(),
+        templates,
+    };
+    profiles
+        .upsert(profile, &known)
+        .map_err(|e| e.to_string())?;
+    profiles.save(&path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn delete_profile(state: State<'_, Arc<AppCtx>>, id: String) -> Result<(), String> {
+    let path = profiles_path(&state);
+    let mut profiles = bridge_core::profile::ProfilesFile::load(&path).map_err(|e| e.to_string())?;
+    if !profiles.remove(&id) {
+        return Err(format!("profile not found: {id}"));
+    }
+    profiles.save(&path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn push_profile(state: State<'_, Arc<AppCtx>>, id: String) -> Result<(), String> {
+    let profiles = bridge_core::profile::ProfilesFile::load(&profiles_path(&state))
+        .map_err(|e| e.to_string())?;
+    let profile = profiles
+        .get(&id)
+        .ok_or_else(|| format!("profile not found: {id}"))?
+        .clone();
+    let enabled = profile.enabled_ids();
+    if enabled.is_empty() {
+        return Err("没有启用的模板，无法推送".to_string());
+    }
+    {
+        let mut status = state.status.lock().unwrap();
+        status.pending = PendingPush {
+            ids: enabled.clone(),
+            activate: enabled.first().cloned(),
+        };
+    }
     state.force_ble.notify_one();
     Ok(())
 }
@@ -254,18 +617,6 @@ async fn run_services(ctx: Arc<AppCtx>) {
     };
     tokio::spawn(run_poller(poller, ctx.envelope.clone()));
 
-    let ble_cfg = BleConfig {
-        name_prefix: "CodexStatus-".to_string(),
-        host: lan_ip(),
-        port: ctx.config.port,
-        token: ctx.config.token.clone(),
-        template_ids: Vec::new(),
-    };
-    let pusher = Pusher::new(
-        ble_cfg,
-        ctx.library.clone(),
-        format!("http://127.0.0.1:{}", ctx.config.port),
-    );
     loop {
         let paused = ctx.status.lock().unwrap().paused;
         if paused {
@@ -295,6 +646,23 @@ async fn run_services(ctx: Arc<AppCtx>) {
                 continue;
             }
         };
+        // Templates are only pushed when explicitly requested (profile push in
+        // the panel or MCP profile_push); the periodic cycle just refreshes
+        // usage/endpoint.
+        let pending = std::mem::take(&mut ctx.status.lock().unwrap().pending);
+        let ble_cfg = BleConfig {
+            name_prefix: "CodexStatus-".to_string(),
+            host: lan_ip(),
+            port: ctx.config.port,
+            token: ctx.config.token.clone(),
+            template_ids: Some(pending.ids.clone()),
+            activate: pending.activate.clone(),
+        };
+        let pusher = Pusher::new(
+            ble_cfg,
+            ctx.library.clone(),
+            format!("http://127.0.0.1:{}", ctx.config.port),
+        );
         match pusher.cycle_once(&adapter).await {
             Ok(()) => {
                 tracing::info!("ble cycle done");
@@ -302,6 +670,10 @@ async fn run_services(ctx: Arc<AppCtx>) {
                 status.last_sync = Some(now_secs());
                 status.last_error = None;
                 status.last_error_at = None;
+                if !pending.ids.is_empty() {
+                    status.last_push_at = Some(now_secs());
+                    status.last_push_error = None;
+                }
             }
             Err(e) => {
                 tracing::warn!("ble cycle: {e}");
@@ -309,6 +681,17 @@ async fn run_services(ctx: Arc<AppCtx>) {
                     let mut status = ctx.status.lock().unwrap();
                     status.last_error = Some(format!("ble: {e}"));
                     status.last_error_at = Some(now_secs());
+                    if !pending.ids.is_empty() {
+                        status.last_push_error = Some(format!("ble: {e}"));
+                    }
+                    for id in pending.ids {
+                        if !status.pending.ids.contains(&id) {
+                            status.pending.ids.push(id);
+                        }
+                    }
+                    if status.pending.activate.is_none() {
+                        status.pending.activate = pending.activate;
+                    }
                 }
                 ctx.ble_primed.store(false, Ordering::SeqCst);
                 tokio::time::sleep(Duration::from_secs(15)).await;
@@ -324,8 +707,20 @@ fn main() {
     if config.templates.is_relative() {
         config.templates = root.join(&config.templates);
     }
+    if config.seeds.is_relative() {
+        config.seeds = root.join(&config.seeds);
+    }
+    if config.profiles.is_relative() {
+        config.profiles = root.join(&config.profiles);
+    }
+    if config.profile_seed.is_relative() {
+        config.profile_seed = root.join(&config.profile_seed);
+    }
+    if let Err(e) = ensure_runtime(&config) {
+        tracing::warn!("runtime seeding: {e}");
+    }
 
-    let log_dir = root.join("artifacts/logs");
+    let log_dir = bridge_core::paths::data_root().join("logs");
     let _ = std::fs::create_dir_all(&log_dir);
     let file_appender = tracing_appender::rolling::daily(&log_dir, "bridge-app.log");
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
@@ -346,8 +741,12 @@ fn main() {
 
     let library = Library::load(&config.templates).unwrap_or_default();
     tracing::info!("templates: {:?}", library.ids());
+    let mcp_port = config.mcp_port;
+    let (mcp_tx, _mcp_rx) = tokio::sync::watch::channel(mcp_port);
     let ctx = Arc::new(AppCtx {
         config,
+        root: root.clone(),
+        app_handle: OnceLock::new(),
         envelope: Arc::new(RwLock::new(None)),
         library: Arc::new(RwLock::new(library)),
         force_ble: Arc::new(Notify::new()),
@@ -356,25 +755,39 @@ fn main() {
             last_error: None,
             last_error_at: None,
             paused: false,
+            pending: PendingPush::default(),
+            last_push_at: None,
+            last_push_error: None,
         }),
         ble_primed: AtomicBool::new(false),
+        mcp_port: Mutex::new(mcp_port),
+        mcp_error: Mutex::new(None),
+        mcp_tx,
     });
 
     let ctx_setup = ctx.clone();
-    let root_setup = root.clone();
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             show_panel(app);
         }))
         .invoke_handler(tauri::generate_handler![
             get_status,
+            preview_template,
             force_sync,
             set_paused,
-            reload_templates
+            push_profile,
+            reload_templates,
+            get_profiles,
+            save_profile,
+            delete_profile,
+            get_mcp_info,
+            set_mcp_port
         ])
         .setup(move |app| {
+            let _ = ctx_setup.app_handle.set(app.handle().clone());
             app.manage(ctx_setup.clone());
             tauri::async_runtime::spawn(run_services(ctx_setup.clone()));
+            tauri::async_runtime::spawn(mcp_serve(ctx_setup.clone()));
 
             let open = MenuItem::with_id(app, "open", "打开面板", true, None::<&str>)?;
             let sync = MenuItem::with_id(app, "sync", "立即同步", true, None::<&str>)?;
@@ -440,7 +853,7 @@ fn main() {
                             refresh_tray(&app_handle, &ctx);
                         }
                         "device" => open_url(&format!("http://{}", lan_ip())),
-                        "logs" => open_path(&root_setup.join("artifacts/logs")),
+                        "logs" => open_path(&bridge_core::paths::data_root().join("logs")),
                         "templates" => open_path(&ctx.config.templates),
                         _ => {}
                     }

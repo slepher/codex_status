@@ -4,79 +4,200 @@
 <meta charset="utf-8">
 <title>Codex Status 设备管家</title>
 <style>
-  :root { color-scheme: light dark; --card: rgba(127,127,127,.10); --line: rgba(127,127,127,.25); --ok: #22a55e; --warn: #e6a700; --err: #d93a3a; --muted: #8a8a8a; }
+  :root { color-scheme: light dark; --card: rgba(127,127,127,.10); --line: rgba(127,127,127,.25); --ok: #22a55e; --warn: #e6a700; --err: #d93a3a; --muted: #8a8a8a; --accent: #3fae5a; }
   * { box-sizing: border-box; }
-  body { font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif; margin: 0; padding: 16px; font-size: 13px; }
-  h1 { font-size: 17px; margin: 0; }
-  .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
-  .grid { display: grid; gap: 12px; margin-top: 14px; }
-  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+  body { font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif; margin: 0; font-size: 13px; }
+  header { padding: 14px 16px 0; }
+  h1 { font-size: 16px; margin: 0; }
+  .sub { color: var(--muted); font-size: 12px; margin-top: 3px; }
+  .tabs { display: flex; gap: 4px; padding: 12px 16px 0; border-bottom: 1px solid var(--line); }
+  .tabs button { border: 0; background: transparent; color: var(--muted); padding: 7px 12px; cursor: pointer; border-bottom: 2px solid transparent; font-size: 13px; }
+  .tabs button.on { color: inherit; border-bottom-color: currentColor; font-weight: 600; }
+  main { padding: 14px 16px; }
+  .panel { display: none; }
+  .panel.on { display: block; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px; margin-bottom: 12px; }
   .card h2 { font-size: 13px; margin: 0 0 10px; font-weight: 600; }
+  .bar { display: flex; align-items: center; gap: 10px; }
+  .bar .status { flex: 1; text-align: left; color: var(--muted); font-size: 12px; min-height: 16px; }
+  .bar .menus { display: flex; gap: 8px; flex: none; }
+  .bar .menus button { height: 34px; padding: 0 14px; display: inline-flex; align-items: center; justify-content: center; }
   .row { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px dashed var(--line); }
   .row:last-child { border-bottom: 0; }
   .row span:first-child { color: var(--muted); }
+  .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
+  select, input { padding: 5px 8px; border-radius: 8px; border: 1px solid var(--line); background: transparent; color: inherit; }
+  canvas.big { width: 340px; height: 340px; image-rendering: pixelated; border: 1px solid var(--line); border-radius: 6px; background: #fff; }
+  canvas.thumb { display: block; width: 56px; height: 56px; image-rendering: pixelated; border: 1px solid var(--line); border-radius: 5px; background: #fff; flex: none; }
   .rings { display: flex; gap: 18px; justify-content: center; padding: 6px 0; }
   .ring { width: 96px; height: 96px; border-radius: 50%; border: 6px solid var(--line); display: flex; flex-direction: column; align-items: center; justify-content: center; }
   .ring b { font-size: 22px; }
-  .ring small { color: var(--muted); }
-  .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+  .ring small, .muted { color: var(--muted); }
   button { padding: 6px 12px; border-radius: 8px; border: 1px solid var(--line); background: transparent; color: inherit; cursor: pointer; }
   button:disabled { opacity: .45; cursor: not-allowed; }
-  .tpl { display: flex; align-items: center; justify-content: space-between; padding: 4px 0; }
-  .badge { font-size: 11px; border: 1px solid var(--line); border-radius: 6px; padding: 1px 6px; color: var(--muted); }
-  .badge.on { color: #fff; background: var(--ok); border-color: var(--ok); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button.danger { color: var(--err); border-color: var(--err); }
+  button.icon { padding: 4px 8px; }
   .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); margin-right: 6px; }
   .dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.err { background: var(--err); }
   .todo { color: var(--muted); font-style: italic; }
+
+  /* dropdown + menus */
+  .menu-wrap { position: relative; }
+  .menu { position: absolute; z-index: 40; top: calc(100% + 4px); left: 0; min-width: 210px; background: Canvas; border: 1px solid var(--line); border-radius: 10px; padding: 6px; box-shadow: 0 8px 24px rgba(0,0,0,.35); display: none; }
+  .menu.right { left: auto; right: 0; }
+  .menu.open { display: block; }
+  .menu .item { display: flex; gap: 8px; align-items: center; padding: 7px 10px; border-radius: 7px; cursor: pointer; }
+  .menu .item:hover { background: var(--card); }
+  .menu .sep { height: 1px; background: var(--line); margin: 6px 4px; }
+  .menu .check { width: 14px; color: var(--accent); }
+
+  /* rows */
+  .plist { display: flex; flex-direction: column; }
+  .prow { display: flex; gap: 10px; align-items: center; min-height: 64px; padding: 7px 6px; border-bottom: 1px dashed var(--line); border-radius: 6px; user-select: none; }
+  .prow:last-child { border-bottom: 0; }
+  .prow.dragging { opacity: .45; }
+  .prow.drop-above { box-shadow: 0 -2px 0 0 var(--accent); }
+  .prow.drop-below { box-shadow: 0 2px 0 0 var(--accent); }
+  .prow .handle { cursor: grab; color: var(--muted); padding: 2px 4px; user-select: none; }
+  .prow .order { width: 16px; text-align: right; color: var(--muted); flex: none; }
+  .prow .name { cursor: pointer; flex: 1; min-width: 60px; user-select: text; }
+  .prow .name:hover { text-decoration: underline; }
+  .prow .ctl { display: flex; gap: 6px; align-items: center; }
+  .switch { position: relative; width: 40px; height: 20px; border-radius: 10px; background: var(--line); cursor: pointer; flex: none; }
+  .switch.on { background: var(--accent); }
+  .switch::after { content: ''; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #fff; transition: left .12s; }
+  .switch.on::after { left: 22px; }
+  .xbtn { width: 22px; height: 22px; border-radius: 50%; border: 0; background: rgba(127,127,127,.35); color: #fff; font-weight: 700; cursor: pointer; line-height: 1; }
+  .xbtn:hover { background: var(--err); }
+
+  /* modal */
+  .backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: none; align-items: center; justify-content: center; z-index: 90; }
+  .backdrop.open { display: flex; }
+  .modal { width: min(560px, 92vw); background: Canvas; border: 1px solid var(--line); border-radius: 12px; padding: 18px; }
+  .modal h3 { margin: 0 0 14px; font-size: 16px; }
+  .modal .field { width: 100%; padding: 9px 10px; margin-top: 6px; }
+  .modal .foot { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
+  .modal .pick { max-height: 46vh; overflow: auto; margin-top: 8px; border-top: 1px solid var(--line); }
+  .modal .pick .prow { border-bottom: 1px dashed var(--line); }
+  .modal .all { display: flex; justify-content: space-between; align-items: center; margin-top: 8px; }
 </style>
 </head>
 <body>
-  <h1><span class="dot" id="dot"></span>Codex Status 设备管家</h1>
-  <div class="sub" id="sub">正在读取状态…</div>
+  <header>
+    <h1><span class="dot" id="dot"></span>Codex Status 设备管家</h1>
+    <div class="sub" id="sub">正在读取状态…</div>
+  </header>
 
-  <div class="grid">
-    <div class="card">
-      <h2>余量</h2>
-      <div class="rings">
-        <div class="ring"><b id="ring-week">--</b><small>周余量</small></div>
-        <div class="ring"><b id="ring-5h">--</b><small>5H 余量</small></div>
+  <nav class="tabs">
+    <button class="on" data-tab="templates">配置</button>
+    <button data-tab="device">设备</button>
+    <button data-tab="actions">操作</button>
+    <button data-tab="mcp">MCP</button>
+  </nav>
+
+  <main>
+    <section class="panel on" id="tab-templates">
+      <div class="card">
+        <div class="bar">
+          <div class="status" id="profile-status"></div>
+          <div class="menus">
+            <div class="menu-wrap">
+              <button id="profile-btn" onclick="toggleMenu('menu-profile', event)">配置 ▾</button>
+              <div class="menu" id="menu-profile"></div>
+            </div>
+            <div class="menu-wrap">
+              <button class="icon" onclick="toggleMenu('menu-actions', event)">⋯</button>
+              <div class="menu right" id="menu-actions"></div>
+            </div>
+          </div>
+        </div>
       </div>
-    </div>
-
-    <div class="card">
-      <h2>设备</h2>
-      <div class="row"><span>ROM 版本</span><span class="todo" id="dev-fw">待接入</span></div>
-      <div class="row"><span>运行槽位</span><span class="todo" id="dev-slot">待接入</span></div>
-      <div class="row"><span>电量</span><span class="todo" id="dev-batt">待接入</span></div>
-      <div class="row"><span>Wi-Fi / RSSI</span><span class="todo" id="dev-wifi">待接入</span></div>
-      <div class="row"><span>最近 BLE 同步</span><span id="dev-sync">--</span></div>
-    </div>
-
-    <div class="card">
-      <h2>模板</h2>
-      <div id="tpl-list" class="todo">加载中…</div>
-      <div class="actions">
-        <button onclick="reloadTemplates()">从磁盘重载</button>
+      <div class="card">
+        <div id="profile-rows" class="plist todo">加载中…</div>
       </div>
-    </div>
+    </section>
 
-    <div class="card">
-      <h2>操作</h2>
-      <div class="actions">
-        <button id="btn-pause" onclick="togglePause()">暂停推送</button>
-        <button onclick="forceSync()">立即同步</button>
-        <button disabled>升级固件…</button>
-        <button disabled>打开设备页</button>
-        <button disabled>开机自启</button>
+    <section class="panel" id="tab-device">
+      <div class="card">
+        <h2>余量</h2>
+        <div class="rings">
+          <div class="ring"><b id="ring-week">--</b><small>周余量</small></div>
+          <div class="ring"><b id="ring-5h">--</b><small>5H 余量</small></div>
+        </div>
       </div>
-      <div class="sub" id="last-error"></div>
-    </div>
+      <div class="card">
+        <h2>设备</h2>
+        <div class="row"><span>ROM 版本</span><span class="todo" id="dev-fw">待接入</span></div>
+        <div class="row"><span>运行槽位</span><span class="todo" id="dev-slot">待接入</span></div>
+        <div class="row"><span>电量</span><span class="todo" id="dev-batt">待接入</span></div>
+        <div class="row"><span>Wi-Fi / RSSI</span><span class="todo" id="dev-wifi">待接入</span></div>
+        <div class="row"><span>最近 BLE 同步</span><span id="dev-sync">--</span></div>
+      </div>
+    </section>
+
+    <section class="panel" id="tab-actions">
+      <div class="card">
+        <h2>操作</h2>
+        <div class="actions">
+          <button id="btn-pause" onclick="togglePause()">暂停推送</button>
+          <button onclick="forceSync()">立即同步</button>
+          <button disabled>升级固件…</button>
+          <button disabled>打开设备页</button>
+          <button disabled>开机自启</button>
+        </div>
+        <div class="sub" id="last-error"></div>
+      </div>
+    </section>
+
+    <section class="panel" id="tab-mcp">
+      <div class="card">
+        <h2>MCP 服务（本地 HTTP）</h2>
+        <div class="toolbar">
+          <span class="muted">端口</span>
+          <input id="mcp-port" type="number" min="1024" max="65535" style="width:92px">
+          <button onclick="saveMcpPort()">保存并重启</button>
+          <span id="mcp-state" class="muted"></span>
+        </div>
+        <div class="row"><span>URL</span><span id="mcp-url">--</span></div>
+        <div class="row"><span>stdio 兜底</span><span class="muted" id="mcp-stdio" style="max-width:62%;text-align:right;word-break:break-all">--</span></div>
+      </div>
+      <div class="card">
+        <h2>给 agent 的接入提示</h2>
+        <div class="toolbar">
+          <span class="muted">目标 agent</span>
+          <select id="mcp-agent" onchange="renderMcpPrompt()">
+            <option value="generic">通用（默认）</option>
+            <option value="opencode">opencode</option>
+            <option value="codex">Codex CLI</option>
+            <option value="claude">Claude Code / Desktop</option>
+            <option value="cursor">Cursor</option>
+            <option value="vscode">VS Code</option>
+          </select>
+        </div>
+        <textarea id="mcp-prompt" readonly rows="6"
+                  style="width:100%;font-family:ui-monospace,Consolas,monospace;font-size:12px;border-radius:8px;border:1px solid var(--line);background:transparent;color:inherit"></textarea>
+        <div class="actions" style="margin-top:8px">
+          <button onclick="copyText($('mcp-prompt').value)">复制提示文本</button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div class="backdrop" id="backdrop" onclick="if (event.target === this) closeModal()">
+    <div class="modal" id="modal"></div>
   </div>
 
 <script>
   const invoke = window.__TAURI__.core.invoke;
   const $ = (id) => document.getElementById(id);
   let paused = false;
+  let knownTemplates = [];
+  let knownProfiles = [];
+  let currentProfileId = null;
+  let modalPreviewId = null;
+  let dragId = null;
+  const thumbCache = new Map();
 
   function relTime(ts) {
     if (!ts) return '从未';
@@ -86,38 +207,515 @@
     return Math.floor(diff / 3600) + ' 小时前';
   }
 
+  document.querySelectorAll('.tabs button').forEach((button) => {
+    button.addEventListener('click', () => {
+      document.querySelectorAll('.tabs button').forEach((b) => b.classList.toggle('on', b === button));
+      document.querySelectorAll('.panel').forEach((p) => p.classList.toggle('on', p.id === 'tab-' + button.dataset.tab));
+      if (button.dataset.tab === 'templates') refreshProfiles();
+      if (button.dataset.tab === 'mcp') refreshMcp();
+    });
+  });
+
+  document.addEventListener('click', (event) => {
+    if (!event.target.closest('.menu-wrap')) {
+      document.querySelectorAll('.menu.open').forEach((m) => m.classList.remove('open'));
+    }
+  });
+
+  function toggleMenu(id, event) {
+    event.stopPropagation();
+    const menu = $(id);
+    const wasOpen = menu.classList.contains('open');
+    document.querySelectorAll('.menu.open').forEach((m) => m.classList.remove('open'));
+    if (!wasOpen) {
+      menu.classList.add('open');
+      if (id === 'menu-profile') renderProfileMenu();
+      if (id === 'menu-actions') renderActionsMenu();
+    }
+  }
+
+  function closeMenus() {
+    document.querySelectorAll('.menu.open').forEach((m) => m.classList.remove('open'));
+  }
+
+  /* ---------- modal helpers ---------- */
+
+  function openModal(html) {
+    $('modal').innerHTML = html;
+    $('backdrop').classList.add('open');
+  }
+
+  function closeModal() {
+    $('backdrop').classList.remove('open');
+    modalPreviewId = null;
+  }
+
+  function modalNewProfile() {
+    openModal(`
+      <h3>新建配置</h3>
+      <div>输入配置名称</div>
+      <input class="field" id="modal-name" placeholder="例如：日常">
+      <div class="foot">
+        <button onclick="closeModal()">取消</button>
+        <button class="primary" onclick="createProfile()">创建</button>
+      </div>`);
+    $('modal-name').focus();
+  }
+
+  function modalRenameProfile() {
+    const profile = currentProfile();
+    if (!profile) return;
+    openModal(`
+      <h3>重命名配置</h3>
+      <div>输入新的配置名称</div>
+      <input class="field" id="modal-name" value="${escapeAttr(profile.name || '')}">
+      <div class="foot">
+        <button onclick="closeModal()">取消</button>
+        <button class="primary" onclick="renameProfile()">保存</button>
+      </div>`);
+    $('modal-name').focus();
+  }
+
+  function modalDeleteProfile() {
+    const profile = currentProfile();
+    if (!profile) return;
+    openModal(`
+      <h3>删除配置「${escapeHtml(profile.name || profile.id)}」？</h3>
+      <div class="muted">此操作不可撤销。</div>
+      <div class="foot">
+        <button onclick="closeModal()">取消</button>
+        <button class="danger" onclick="confirmDeleteProfile()">删除</button>
+      </div>`);
+  }
+
+  function modalAddTemplates() {
+    const profile = currentProfile();
+    if (!profile) return;
+    const existing = new Set(profile.templates.map((t) => t.id));
+    const available = knownTemplates.filter((t) => !existing.has(t.id));
+    const rows = available.length
+      ? available.map((t) => `
+          <div class="prow">
+            <canvas class="thumb" data-id="${t.id}" width="200" height="200"></canvas>
+            <span class="name">${t.id}</span>
+            <span class="ctl"><input type="checkbox" value="${t.id}" class="pick-box"></span>
+          </div>`).join('')
+      : '<div class="todo" style="padding:10px">没有可添加的模板（都已在配置中）</div>';
+    openModal(`
+      <h3>添加模板到「${escapeHtml(profile.name || profile.id)}」</h3>
+      <div class="all"><span class="muted">可用模板</span><button class="icon" onclick="togglePickAll()">全选</button></div>
+      <div class="pick">${rows}</div>
+      <div class="foot">
+        <button onclick="closeModal()">取消</button>
+        <button class="primary" onclick="addTemplatesToProfile()">添加</button>
+      </div>`);
+    drawPickThumbs();
+  }
+
+  function togglePickAll() {
+    const boxes = [...document.querySelectorAll('.pick-box')];
+    const allOn = boxes.every((b) => b.checked);
+    boxes.forEach((b) => { b.checked = !allOn; });
+  }
+
+  async function drawPickThumbs() {
+    for (const canvas of document.querySelectorAll('#modal canvas.thumb')) {
+      await drawThumbFor(canvas);
+    }
+  }
+
+  async function drawThumbFor(canvas) {
+    const id = canvas.dataset.id;
+    try {
+      let bits = thumbCache.get(id);
+      if (!bits) {
+        const r = await invoke('preview_template', { id });
+        bits = r.bits;
+        thumbCache.set(id, bits);
+      }
+      drawBits(canvas, bits);
+    } catch (e) { /* thumbnails are best-effort */ }
+  }
+
+  /* ---------- menus ---------- */
+
+  function renderProfileMenu() {
+    const menu = $('menu-profile');
+    menu.innerHTML =
+      `<div class="item" onclick="closeMenus(); modalNewProfile()">＋ 新建配置</div>` +
+      `<div class="sep"></div>` +
+      knownProfiles.map((p) =>
+        `<div class="item" onclick="selectProfile('${p.id}')">` +
+        `<span class="check">${p.id === currentProfileId ? '✓' : ''}</span>` +
+        `<span>${escapeHtml(p.name || p.id)}</span></div>`).join('');
+    $('profile-btn').textContent = (currentProfile()?.name || '配置') + ' ▾';
+  }
+
+  function renderActionsMenu() {
+    $('menu-actions').innerHTML =
+      `<div class="item" onclick="closeMenus(); modalAddTemplates()">＋ 添加模板</div>` +
+      `<div class="sep"></div>` +
+      `<div class="item" onclick="closeMenus(); pushCurrentProfile()">⇪ 推送到设备</div>` +
+      `<div class="item" onclick="closeMenus(); modalRenameProfile()">✎ 重命名</div>` +
+      `<div class="item" onclick="closeMenus(); modalDeleteProfile()">🗑 删除</div>`;
+  }
+
+  /* ---------- profiles ---------- */
+
+  function currentProfile() {
+    return knownProfiles.find((p) => p.id === currentProfileId) || null;
+  }
+
+  function selectProfile(id) {
+    currentProfileId = id;
+    closeMenus();
+    renderProfileRows();
+    renderProfileMenu();
+  }
+
+  async function refreshProfiles() {
+    try {
+      const data = await invoke('get_profiles');
+      knownProfiles = data.profiles || [];
+      if (data.templates && data.templates.length) knownTemplates = data.templates;
+      if (!knownProfiles.some((p) => p.id === currentProfileId)) {
+        currentProfileId = knownProfiles.length ? knownProfiles[0].id : null;
+      }
+      renderProfileMenu();
+      renderProfileRows();
+    } catch (e) {
+      $('profile-rows').textContent = '读取失败：' + e;
+    }
+  }
+
+  async function persistProfile(templates, statusText) {
+    const profile = currentProfile();
+    if (!profile) return;
+    try {
+      await invoke('save_profile', { id: profile.id, name: profile.name, templates });
+      await refreshProfiles();
+      if (statusText) $('profile-status').textContent = statusText;
+    } catch (e) {
+      $('profile-status').textContent = '保存失败：' + e;
+      renderProfileRows();
+    }
+  }
+
+  function renderProfileRows() {
+    const box = $('profile-rows');
+    const profile = currentProfile();
+    if (!profile) {
+      box.className = 'plist todo';
+      box.textContent = knownProfiles.length ? '请选择一个配置' : '还没有配置，点左上"配置 ▾ → 新建配置"';
+      return;
+    }
+    if (!profile.templates.length) {
+      box.className = 'plist todo';
+      box.textContent = '配置为空——用"⋯ → 添加模板"加入模板';
+      return;
+    }
+    box.className = 'plist';
+    box.innerHTML = profile.templates.map((entry, index) => `
+      <div class="prow" draggable="true" data-id="${entry.id}" data-index="${index}">
+        <span class="handle" title="拖拽排序">⠿</span>
+        <span class="order">${index + 1}</span>
+        <canvas class="thumb" data-id="${entry.id}" width="200" height="200"></canvas>
+        <span class="name" onclick="openPreviewModal('${entry.id}')">${entry.id}</span>
+        <span class="ctl">
+          <span class="muted" style="font-size:12px">${entry.enabled ? '已启用' : '已禁用'}</span>
+          <span class="switch ${entry.enabled ? 'on' : ''}" onclick="toggleEnabled('${entry.id}')"></span>
+          <button class="xbtn" title="从配置删除" onclick="removeFromProfile('${entry.id}')">×</button>
+        </span>
+      </div>`).join('');
+    bindDrag();
+    box.querySelectorAll('canvas.thumb').forEach((c) => drawThumbFor(c));
+  }
+
+  async function toggleEnabled(id) {
+    const profile = currentProfile();
+    if (!profile) return;
+    const enabledCount = profile.templates.filter((t) => t.enabled).length;
+    const entry = profile.templates.find((t) => t.id === id);
+    if (!entry) return;
+    if (!entry.enabled && enabledCount >= 3) {
+      $('profile-status').textContent = '设备只有 3 个槽位，最多启用 3 个模板';
+      return;
+    }
+    const templates = profile.templates.map((t) => ({ id: t.id, enabled: t.id === id ? !t.enabled : t.enabled }));
+    persistProfile(templates, entry.enabled ? `已禁用 ${id}` : `已启用 ${id}`);
+  }
+
+  function removeFromProfile(id) {
+    const profile = currentProfile();
+    if (!profile) return;
+    persistProfile(profile.templates.filter((t) => t.id !== id).map((t) => ({ id: t.id, enabled: t.enabled })), `已从配置删除 ${id}`);
+  }
+
+  async function addTemplatesToProfile() {
+    const profile = currentProfile();
+    if (!profile) return;
+    const picked = [...document.querySelectorAll('.pick-box:checked')].map((b) => b.value);
+    if (!picked.length) { closeModal(); return; }
+    let enabledCount = profile.templates.filter((t) => t.enabled).length;
+    const entries = profile.templates.map((t) => ({ id: t.id, enabled: t.enabled }));
+    let overflow = 0;
+    for (const id of picked) {
+      const enabled = enabledCount < 3;
+      if (enabled) enabledCount++;
+      else overflow++;
+      entries.push({ id, enabled });
+    }
+    closeModal();
+    await persistProfile(entries, overflow
+      ? `已添加 ${picked.length} 个模板，其中 ${overflow} 个未启用（设备仅 3 槽）`
+      : `已添加 ${picked.length} 个模板`);
+  }
+
+  /* ---------- drag & drop ---------- */
+
+  function bindDrag() {
+    const rows = [...document.querySelectorAll('#profile-rows .prow')];
+    rows.forEach((row) => {
+      row.addEventListener('dragstart', (event) => {
+        dragId = row.dataset.id;
+        row.classList.add('dragging');
+        event.dataTransfer.effectAllowed = 'move';
+        event.dataTransfer.setData('text/plain', dragId);
+      });
+      row.addEventListener('dragend', () => {
+        dragId = null;
+        rows.forEach((r) => r.classList.remove('dragging', 'drop-above', 'drop-below'));
+      });
+      row.addEventListener('dragover', (event) => {
+        event.preventDefault();
+        if (!dragId || row.dataset.id === dragId) return;
+        const rect = row.getBoundingClientRect();
+        const above = event.clientY < rect.top + rect.height / 2;
+        row.classList.toggle('drop-above', above);
+        row.classList.toggle('drop-below', !above);
+      });
+      row.addEventListener('dragleave', () => row.classList.remove('drop-above', 'drop-below'));
+      row.addEventListener('drop', (event) => {
+        event.preventDefault();
+        const profile = currentProfile();
+        if (!profile || !dragId) return;
+        const targetId = row.dataset.id;
+        const above = row.classList.contains('drop-above');
+        const entries = profile.templates.map((t) => ({ id: t.id, enabled: t.enabled }));
+        const from = entries.findIndex((t) => t.id === dragId);
+        if (from < 0) return;
+        const [moved] = entries.splice(from, 1);
+        let to = entries.findIndex((t) => t.id === targetId);
+        if (to < 0) to = entries.length;
+        else if (!above) to += 1;
+        entries.splice(to, 0, moved);
+        rows.forEach((r) => r.classList.remove('drop-above', 'drop-below'));
+        persistProfile(entries, '顺序已更新');
+      });
+    });
+  }
+
+  /* ---------- create / rename / delete ---------- */
+
+  async function createProfile() {
+    const name = $('modal-name').value.trim() || '配置';
+    const id = 'config-' + Math.random().toString(36).slice(2, 6);
+    try {
+      await invoke('save_profile', { id, name, templates: [] });
+      closeModal();
+      currentProfileId = id;
+      await refreshProfiles();
+      $('profile-status').textContent = '已创建空配置';
+    } catch (e) {
+      $('profile-status').textContent = '创建失败：' + e;
+      closeModal();
+    }
+  }
+
+  async function renameProfile() {
+    const profile = currentProfile();
+    if (!profile) return;
+    const name = $('modal-name').value.trim();
+    try {
+      await invoke('save_profile', {
+        id: profile.id,
+        name,
+        templates: profile.templates.map((t) => ({ id: t.id, enabled: t.enabled })),
+      });
+      closeModal();
+      await refreshProfiles();
+      $('profile-status').textContent = '已重命名';
+    } catch (e) {
+      $('profile-status').textContent = '重命名失败：' + e;
+      closeModal();
+    }
+  }
+
+  async function confirmDeleteProfile() {
+    const profile = currentProfile();
+    if (!profile) return;
+    try {
+      await invoke('delete_profile', { id: profile.id });
+      closeModal();
+      currentProfileId = null;
+      await refreshProfiles();
+      $('profile-status').textContent = '已删除配置';
+    } catch (e) {
+      $('profile-status').textContent = '删除失败：' + e;
+      closeModal();
+    }
+  }
+
+  async function pushCurrentProfile() {
+    const profile = currentProfile();
+    if (!profile) return;
+    try {
+      await invoke('push_profile', { id: profile.id });
+      $('profile-status').textContent = '已排队，正在通过 BLE 推送…';
+    } catch (e) {
+      $('profile-status').textContent = '推送失败：' + e;
+    }
+  }
+
+  function openPreviewModal(id) {
+    modalPreviewId = id;
+    openModal(`
+      <h3>${escapeHtml(id)} 预览</h3>
+      <canvas id="modal-preview" class="big" width="200" height="200"></canvas>
+      <div class="foot">
+        <button onclick="refreshModalPreview('${id}')">刷新</button>
+        <button class="primary" onclick="closeModal()">关闭</button>
+      </div>`);
+    refreshModalPreview(id);
+  }
+
+  async function refreshModalPreview(id) {
+    try {
+      const r = await invoke('preview_template', { id });
+      drawBits($('modal-preview'), r.bits);
+    } catch (e) {
+      $('modal-preview').replaceWith(Object.assign(document.createElement('div'), {
+        className: 'todo', textContent: '渲染失败：' + e,
+      }));
+    }
+  }
+
+  function escapeHtml(text) {
+    return String(text).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+
+  function escapeAttr(text) {
+    return escapeHtml(text).replace(/`/g, '&#96;');
+  }
+
+  /* ---------- shared ---------- */
+
+
   async function refresh() {
     try {
       const s = await invoke('get_status');
       const weekly = s.weekly_remaining;
       $('ring-week').textContent = weekly == null ? '--' : weekly + '%';
-      $('ring-5h').textContent = '--';
       $('sub').textContent = `LAN ${s.lan_ip}:${s.http.split(':').pop()} · 轮询 ${s.interval_secs}s · BLE ${s.ble_interval_secs}s`;
       $('dev-sync').textContent = relTime(s.last_sync);
       $('last-error').textContent = s.last_error ? '最近错误：' + s.last_error : '';
       paused = !!s.paused;
       $('btn-pause').textContent = paused ? '恢复推送' : '暂停推送';
       $('dot').className = 'dot ' + (s.last_error ? 'err' : (s.last_sync ? 'ok' : 'warn'));
-      const list = $('tpl-list');
-      if (s.templates && s.templates.length) {
-        list.className = '';
-        list.innerHTML = s.templates.map((t) =>
-          `<div class="tpl"><span>${t.id} <span class="badge">v${t.version} · ${t.hash.slice(0, 8)}</span></span>` +
-          `<span class="badge">--</span></div>`).join('');
-      } else {
-        list.className = 'todo';
-        list.textContent = '磁盘上没有模板';
-      }
+      knownTemplates = s.templates || [];
+      trackPush(s);
     } catch (e) {
       $('sub').textContent = '读取失败：' + e;
     }
   }
 
+  if (window.__TAURI__.event) {
+    window.__TAURI__.event.listen('templates-changed', () => {
+      thumbCache.clear();
+      refreshProfiles();
+      if (modalPreviewId && $('backdrop').classList.contains('open')) {
+        refreshModalPreview(modalPreviewId);
+      }
+    });
+  }
+
+  let lastPushAt = null;
+
+  function trackPush(s) {
+    const pending = s.pending || 0;
+    if (pending > 0) {
+      $('profile-status').textContent = `正在通过 BLE 推送…（剩余 ${pending} 个模板）`;
+    }
+    if (lastPushAt === null) {
+      lastPushAt = s.last_push_at || 0;
+      return;
+    }
+    if ((s.last_push_at || 0) > lastPushAt) {
+      lastPushAt = s.last_push_at;
+      $('profile-status').textContent = s.last_push_error
+        ? '推送失败：' + s.last_push_error
+        : '推送完成';
+    }
+  }
+
+
+  function drawBits(canvas, bits) {
+    const ctx = canvas.getContext('2d');
+    const img = ctx.createImageData(200, 200);
+    for (let y = 0; y < 200; y++) {
+      for (let x = 0; x < 200; x++) {
+        const white = bits[y * 25 + (x >> 3)] & (0x80 >> (x & 7));
+        const v = white ? 255 : 0;
+        const i = (y * 200 + x) * 4;
+        img.data[i] = img.data[i + 1] = img.data[i + 2] = v;
+        img.data[i + 3] = 255;
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+  }
+
   async function forceSync() { await invoke('force_sync'); refresh(); }
-  async function reloadTemplates() { await invoke('reload_templates'); refresh(); }
+  async function reloadTemplates() { await invoke('reload_templates'); refresh(); refreshProfiles(); }
   async function togglePause() { await invoke('set_paused', { paused: !paused }); refresh(); }
 
+  let mcpInfo = null;
+
+  async function refreshMcp() {
+    try {
+      const info = await invoke('get_mcp_info');
+      mcpInfo = info;
+      $('mcp-port').value = info.port;
+      $('mcp-url').textContent = info.url;
+      $('mcp-state').textContent = info.error ? '错误：' + info.error : '监听中';
+      $('mcp-stdio').textContent = info.stdio_command;
+      renderMcpPrompt();
+    } catch (e) {
+      $('mcp-state').textContent = '读取失败：' + e;
+    }
+  }
+
+  function renderMcpPrompt() {
+    if (!mcpInfo) return;
+    const key = $('mcp-agent').value;
+    $('mcp-prompt').value = mcpInfo.prompts?.[key] ?? '';
+  }
+
+  async function saveMcpPort() {
+    const port = parseInt($('mcp-port').value, 10);
+    try {
+      await invoke('set_mcp_port', { port });
+    } catch (e) {
+      $('mcp-state').textContent = '保存失败：' + e;
+    }
+    refreshMcp();
+  }
+
+  function copyText(text) {
+    navigator.clipboard.writeText(text || '');
+  }
+
   refresh();
+  refreshProfiles();
   setInterval(refresh, 3000);
 </script>
 </body>

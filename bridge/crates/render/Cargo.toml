@@ -1,0 +1,13 @@
+[package]
+name = "bridge-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Host build of the firmware template engine for pixel-accurate previews"
+
+[dependencies]
+anyhow = "1"
+png = "0.17"
+
+[build-dependencies]
+cc = "1"

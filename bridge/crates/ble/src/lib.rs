@@ -36,7 +36,11 @@ pub struct BleConfig {
     pub port: u16,
     pub token: String,
     /// Empty = push every template in the library.
-    pub template_ids: Vec<String>,
+    /// `None` pushes every template (explicit full sync), `Some(vec![])` pushes
+    /// none (periodic sync), `Some(list)` pushes exactly those.
+    pub template_ids: Option<Vec<String>>,
+    /// Template to activate after an explicit push (profile's active choice).
+    pub activate: Option<String>,
 }
 
 /// Best-effort LAN IP used in the endpoint written over BLE.
@@ -245,12 +249,15 @@ impl Pusher {
     }
 
     async fn push_templates(&self, peripheral: &Peripheral, info: &serde_json::Value) -> Result<()> {
+        if matches!(&self.cfg.template_ids, Some(list) if list.is_empty()) {
+            tracing::info!("no template push requested; templates left untouched");
+            return Ok(());
+        }
         let items: Vec<(String, Vec<u8>, u64)> = {
             let library = self.library.read().await;
-            let ids: Vec<String> = if self.cfg.template_ids.is_empty() {
-                library.ids()
-            } else {
-                self.cfg.template_ids.clone()
+            let ids: Vec<String> = match &self.cfg.template_ids {
+                None => library.ids(),
+                Some(list) => list.clone(),
             };
             ids.into_iter()
                 .filter_map(|id| {
@@ -261,13 +268,6 @@ impl Pusher {
                 .collect()
         };
         let device = info.get("templates").and_then(|v| v.as_array());
-        let device_active = device.and_then(|arr| {
-            arr.iter()
-                .find(|t| t.get("active").and_then(|a| a.as_bool()).unwrap_or(false))
-                .and_then(|t| t.get("id"))
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        });
         let mut pushed: Vec<String> = Vec::new();
         for (id, bytes, version) in items {
             let hash = template_hash(&bytes);
@@ -283,23 +283,20 @@ impl Pusher {
                 tracing::info!("template {id} up to date ({hash}); skip");
                 continue;
             }
-            let refresh_active = device_active.as_deref() == Some(id.as_str());
-            if let Err(e) = self.push_template(peripheral, &id, &bytes, version, refresh_active).await {
+            if let Err(e) = self.push_template(peripheral, &id, &bytes, version, false).await {
                 tracing::warn!("push template {id}: {e}");
                 continue;
             }
             pushed.push(id);
         }
-        if device_active.is_none() {
-            if let Some(last) = pushed.last() {
-                let activate = json!({"op": "activate", "id": last});
-                Self::write_json(peripheral, CHR_TPL_CTRL, activate.to_string().as_bytes()).await?;
-                tracing::info!("activated template {last} (device had no active template)");
-            }
-        } else if let Some(active) = device_active {
-            if pushed.is_empty() {
-                tracing::info!("all templates up to date; keeping {active} active");
-            }
+        // Template pushes are explicit user/agent actions: show the profile's
+        // chosen template (or the last pushed one).
+        if let Some(target) = self.cfg.activate.clone().or_else(|| pushed.last().cloned()) {
+            let activate = json!({"op": "activate", "id": target});
+            Self::write_json(peripheral, CHR_TPL_CTRL, activate.to_string().as_bytes()).await?;
+            tracing::info!("activated template {target}");
+        } else {
+            tracing::info!("no template changes to push; device left as-is");
         }
         Ok(())
     }

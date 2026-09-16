@@ -1,6 +1,8 @@
 pub mod codex;
 pub mod envelope;
 pub mod http;
+pub mod paths;
+pub mod profile;
 pub mod runtime;
 pub mod template;
 
