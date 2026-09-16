@@ -27,7 +27,7 @@
 #include "template_engine.h"
 #include "template_xfer.h"
 
-#define FW_VERSION    "0.6.0-bw"
+#define FW_VERSION    "0.6.1-bw"
 #define AP_PASSWORD   "codex1234"
 #define OTA_PASSWORD  "codexota"
 #define MAX_SLOTS     3
@@ -934,9 +934,10 @@ void loop() {
             if (usageOnScreen) {
                 String minute = nowHHMM();
                 int battery = batteryPercent();
+                bool batteryMoved = renderedBattery >= 0 && battery >= 0 &&
+                                    abs(battery - renderedBattery) >= 2;
                 if (!pairingOverlayActive() && lastUsage.length() &&
-                    (renderedIp != ipText() || renderedMinute != minute ||
-                     renderedBattery != battery)) {
+                    (renderedIp != ipText() || renderedMinute != minute || batteryMoved)) {
                     renderActiveUsage(lastUsage, lastChannel.c_str());
                 }
             } else if (sig != screenSig) {
