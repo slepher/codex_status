@@ -27,7 +27,7 @@
 #include "template_engine.h"
 #include "template_xfer.h"
 
-#define FW_VERSION    "0.5.0-bw"
+#define FW_VERSION    "0.6.0-bw"
 #define AP_PASSWORD   "codex1234"
 #define OTA_PASSWORD  "codexota"
 #define MAX_SLOTS     3
@@ -76,7 +76,7 @@ static int      epdPartialCount = 0;
 static bool     epdPartialReady = false;
 
 static void screen(const std::vector<String> &lines, UBYTE color = BLACK);
-static void epdFlush(bool fullRefresh = false);
+static void epdFlush(bool forceFull = false);
 
 static bool pairingOverlayActive() {
     bool paired = bleIsConnected() && blePeerIsBonded() && blePeerIsEncrypted();
@@ -216,25 +216,35 @@ static void epdBegin() {
     epdPartialCount = 0;
 }
 
-// fullRefresh=true (default for data screens): high-contrast full refresh
-// (~1.5s, flashes). Otherwise partial refresh (~300ms, no flash) with a
-// full refresh every 30 partials to clear ghosting.
-static void epdFlush(bool fullRefresh) {
+// Data screens default to partial refresh (~300ms, no flash). A full refresh
+// (~1.5s, flashes) runs when the panel is not partial-ready, when the changed
+// area exceeds 12.5% of the panel (layout/value jumps), or after 30 partials
+// to clear ghosting. forceFull requests a full refresh explicitly.
+static void epdFlush(bool forceFull) {
     if (!frame) return;
     if (lastDisplayedFrame && memcmp(frame, lastDisplayedFrame, EPD_FB_BYTES) == 0) return;
-    if (!fullRefresh && epdPartialReady) {
+
+    bool partial = !forceFull && epdPartialReady;
+    if (partial && lastDisplayedFrame) {
+        int changed = 0;
+        for (int i = 0; i < EPD_FB_BYTES; i++)
+            changed += __builtin_popcount((unsigned char)(frame[i] ^ lastDisplayedFrame[i]));
+        if (changed > EPD_W * EPD_H / 8) partial = false;
+    }
+    if (partial && ++epdPartialCount <= 30) {
         EPD_SSD1681_DisplayPart(frame);
         epdWriteCount++;
         if (lastDisplayedFrame) memcpy(lastDisplayedFrame, frame, EPD_FB_BYTES);
-        if (++epdPartialCount < 30) return;
+        return;
     }
+
+    epdPartialCount = 0;
     if (epdPartialReady) EPD_SSD1681_Init();   // reload full-refresh LUT
     EPD_SSD1681_Display(frame);
     epdWriteCount++;
     if (lastDisplayedFrame) memcpy(lastDisplayedFrame, frame, EPD_FB_BYTES);
     EPD_SSD1681_Init_Partial();
     epdPartialReady = true;
-    epdPartialCount = 0;
 }
 
 // ---- Quad built-in screen (B/W design, partial refresh) ----
@@ -362,7 +372,7 @@ static void renderUsage(const String &json, const char *channel) {
     for (int i = 0; i < (int)bl.size(); i++)
         drawSmallLeft(bl[i], Q_BL_X, Q_BL_SLOTS[first + i]);
 
-    epdFlush(true);
+    epdFlush(false);
     usageOnScreen = true;
     renderedIp = ipText();
     renderedMinute = nowHHMM();
@@ -409,7 +419,7 @@ static void renderActiveUsage(const String &json, const char *channel) {
         Paint_SelectImage(frame);
         Paint_Clear(WHITE);
         if (tplDraw(activeTplJson, json, env)) {
-            epdFlush(true);
+            epdFlush(false);
             usageOnScreen = true;
             renderedIp = ipText();
             renderedMinute = env.syncHHMM;
@@ -687,7 +697,8 @@ static void handleStatus() {
     String activeHash = tplStoreFind(activeId, activeMeta) ? activeMeta.hash : "";
     html += "<li>Templates: " + String(tplStoreCount()) + " (active: " + activeId +
             (activeHash.length() ? String(" hash ") + activeHash : String("")) + ")</li>";
-    html += "<li>EPD writes: " + String(epdWriteCount) + "</li>";
+    html += "<li>EPD writes: " + String(epdWriteCount) + " (partial " +
+            String(epdPartialReady ? "ready" : "off") + ", streak " + String(epdPartialCount) + ")</li>";
     html += "<li>Free heap: " + String(ESP.getFreeHeap()) + "</li>";
     html += F("</ul><p><a href='/update'>Firmware OTA update</a></p></body></html>");
     server.send(200, "text/html", html);
