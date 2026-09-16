@@ -26,7 +26,7 @@
 #include "template_engine.h"
 #include "template_xfer.h"
 
-#define FW_VERSION    "0.4.1-bw"
+#define FW_VERSION    "0.4.2-bw"
 #define AP_PASSWORD   "codex1234"
 #define OTA_PASSWORD  "codexota"
 #define MAX_SLOTS     3

@@ -4,6 +4,8 @@
 #include "template_store.h"
 #include "template_engine.h"
 #include "ble_bridge.h"
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #define TPL_MAX_LEN 32768
 
@@ -94,7 +96,7 @@ static void handleBegin(JsonDocument &d) {
     String hash = String((const char *)(d["hash"] | ""));
     uint32_t ver = d["version"] | 0;
     uint32_t len = d["len"] | 0;
-    uint32_t crc = d["crc"] | 0;
+    uint32_t crc = d["crc"] | 0U;
     if (!idValid(id) || len == 0 || len > TPL_MAX_LEN || !hashValid(hash)) {
         ack("begin", false, "args");
         return;
@@ -148,6 +150,8 @@ static void handleEnd() {
     }
     tplStoreSetActive(sId);
     tplStoreTouch(sId);
+    Serial.printf("[tpl] end stack_hwm=%u bytes\n",
+                  (unsigned)uxTaskGetStackHighWaterMark(nullptr));
     ack("end", true);
     Serial.printf("[tpl] end id=%s hash=%s%s\n", sId.c_str(), sHash.c_str(),
                   unchanged ? " (unchanged)" : "");
