@@ -7,6 +7,7 @@ static EndpointJsonHandler endpointHandler = nullptr;
 static TemplateCtrlHandler tplCtrlHandler  = nullptr;
 static TemplateDataHandler tplDataHandler  = nullptr;
 static TemplateResetHandler tplResetHandler = nullptr;
+static AuthJsonHandler     authHandler     = nullptr;
 
 static bool     connected      = false;
 static bool     peerBonded     = false;
@@ -18,6 +19,7 @@ static uint32_t pairingUntil   = 0;
 static String   usageBuf;
 static String   endpointBuf;
 static String   tplCtrlBuf;
+static String   authBuf;
 static String   fwVersion      = "?";
 static String   infoExtra;
 static NimBLECharacteristic *statusChr  = nullptr;
@@ -52,6 +54,7 @@ static void clearReceiveBuffers() {
     usageBuf = "";
     endpointBuf = "";
     tplCtrlBuf = "";
+    authBuf = "";
     if (tplResetHandler) tplResetHandler();
 }
 
@@ -195,6 +198,15 @@ class TplDataCallbacks : public NimBLECharacteristicCallbacks {
     }
 };
 
+class AuthCallbacks : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic *c, ble_gap_conn_desc *desc) override {
+        if (!writeAllowed(desc)) return;
+        std::string v = c->getValue();
+        appendJson(authBuf, v, 256, "auth",
+                   [](const String &json) { if (authHandler) authHandler(json); });
+    }
+};
+
 void bleBegin(const String &deviceName, const String &fw) {
     fwVersion = fw;
     NimBLEDevice::init(deviceName.c_str());
@@ -225,6 +237,10 @@ void bleBegin(const String &deviceName, const String &fw) {
     NimBLECharacteristic *tplDat = svc->createCharacteristic(BLE_CHR_TPLDAT,
         NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_ENC);
     tplDat->setCallbacks(new TplDataCallbacks());
+
+    NimBLECharacteristic *authChr = svc->createCharacteristic(BLE_CHR_AUTH,
+        NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_ENC);
+    authChr->setCallbacks(new AuthCallbacks());
 
     statusChr = svc->createCharacteristic(BLE_CHR_STATUS, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
 
@@ -262,6 +278,10 @@ void bleSetTemplateHandlers(TemplateCtrlHandler onCtrl, TemplateDataHandler onDa
     tplResetHandler = onReset;
 }
 
+void bleSetAuthHandler(AuthJsonHandler onAuth) {
+    authHandler = onAuth;
+}
+
 void bleSetInfoExtra(const String &json) {
     infoExtra = json;
     refreshInfo();
@@ -272,6 +292,13 @@ void bleNotifyStatus(const String &json) {
     statusChr->setValue(reinterpret_cast<const uint8_t *>(json.c_str()), json.length());
     if (connected && peerEncrypted && peerBonded) statusChr->notify();
     Serial.printf("[ble] status: %s\n", json.c_str());
+}
+
+// Like bleNotifyStatus but without serial logging; used for secrets (auth token).
+void bleNotifyStatusQuiet(const String &json) {
+    if (!statusChr) return;
+    statusChr->setValue(reinterpret_cast<const uint8_t *>(json.c_str()), json.length());
+    if (connected && peerEncrypted && peerBonded) statusChr->notify();
 }
 
 void blePoll() {

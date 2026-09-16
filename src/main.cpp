@@ -16,6 +16,7 @@
 #include <vector>
 #include <esp_sleep.h>
 #include <esp_ota_ops.h>
+#include <esp_system.h>
 
 #include "DEV_Config.h"
 #include "EPD_SSD1681.h"
@@ -28,9 +29,9 @@
 #include "template_engine.h"
 #include "template_xfer.h"
 
-#define FW_VERSION    "0.6.2-bw"
+#define FW_VERSION    "0.7.0-bw"
 #define AP_PASSWORD   "codex1234"
-#define OTA_PASSWORD  "codexota"
+#define AUTH_TOKEN_TTL_MS 3600000UL
 #define MAX_SLOTS     3
 #define SLOT_TIMEOUT  15000
 #define WIFI_LOST_RESTART_MS 120000
@@ -47,6 +48,10 @@ static UBYTE      *lastDisplayedFrame = nullptr;
 static uint32_t    epdWriteCount = 0;
 static bool        otaRebootPending = false;
 static uint32_t    otaRebootAt = 0;
+static String      authToken;
+static uint32_t    authTokenExpiresAt = 0;
+static char        otaPasswordBuf[40] = {0};
+static bool        otaUploadDenied = false;
 static bool        configMode = false;
 static uint32_t    lastConnectedMs = 0;
 static uint32_t    nextFetchAt = 0;
@@ -685,6 +690,8 @@ static void startConfigMode() {
 }
 
 // ---------------- 正常模式 ----------------
+static bool requestAuthorized();
+
 static const char *resetReasonName() {
     switch (esp_reset_reason()) {
     case ESP_RST_POWERON:   return "power-on";
@@ -725,17 +732,94 @@ static void handleStatus() {
     html += "<li>EPD writes: " + String(epdWriteCount) + " (partial " +
             String(epdPartialReady ? "ready" : "off") + ", streak " + String(epdPartialCount) + ")</li>";
     html += "<li>Free heap: " + String(ESP.getFreeHeap()) + "</li>";
-    html += F("</ul><p><a href='/update'>Firmware OTA update</a></p></body></html>");
+    html += F("</ul><p>");
+    if (requestAuthorized()) {
+        html += "<a href='/update?token=" + authToken + "'>Firmware OTA update</a>";
+    } else {
+        html += "Firmware OTA: negotiate a token over BLE first (tools/device-auth)";
+    }
+    html += F("</p></body></html>");
     server.send(200, "text/html", html);
 }
 
+static void randomHex(char *out, size_t bytes) {
+    static const char *hex = "0123456789abcdef";
+    for (size_t i = 0; i < bytes; i++) {
+        uint32_t r = esp_random();
+        out[i * 2]     = hex[(r >> 4) & 0x0F];
+        out[i * 2 + 1] = hex[r & 0x0F];
+    }
+    out[bytes * 2] = '\0';
+}
+
+static void setOtaPassword(const char *value) {
+    strncpy(otaPasswordBuf, value, sizeof(otaPasswordBuf) - 1);
+    otaPasswordBuf[sizeof(otaPasswordBuf) - 1] = '\0';
+    ArduinoOTA.setPassword(otaPasswordBuf);
+}
+
+static void rotateOtaPassword() {
+    char buf[33];
+    randomHex(buf, 16);
+    setOtaPassword(buf);
+}
+
+static void issueAuthToken() {
+    char buf[33];
+    randomHex(buf, 16);
+    authToken = buf;
+    authTokenExpiresAt = millis() + AUTH_TOKEN_TTL_MS;
+    setOtaPassword(authToken.c_str());
+    Serial.println("[auth] token issued over BLE");
+}
+
+static bool authValid() {
+    return authToken.length() > 0 && (int32_t)(millis() - authTokenExpiresAt) < 0;
+}
+
+// Wi-Fi operations require a token that was negotiated over the bonded BLE
+// link; accepted as "Authorization: Bearer <token>" or ?token=<token>.
+static bool requestAuthorized() {
+    if (!authValid()) return false;
+    if (server.hasHeader("Authorization")) {
+        if (server.header("Authorization") == String("Bearer ") + authToken) return true;
+    }
+    if (server.hasArg("token") && server.arg("token") == authToken) return true;
+    return false;
+}
+
+static void authTick() {
+    if (authToken.length() && (int32_t)(millis() - authTokenExpiresAt) >= 0) {
+        authToken = "";
+        rotateOtaPassword();
+        Serial.println("[auth] token expired; OTA password randomized");
+    }
+}
+
+static void handleBleAuth(const String &json) {
+    JsonDocument doc;
+    if (deserializeJson(doc, json) || doc["cmd"].isNull() || strcmp(doc["cmd"] | "", "token")) {
+        bleNotifyStatusQuiet("{\"ack\":\"auth\",\"ok\":false}");
+        return;
+    }
+    issueAuthToken();
+    bleNotifyStatusQuiet(String("{\"ack\":\"auth\",\"ok\":true,\"token\":\"") + authToken +
+                         "\",\"expiresIn\":" + String(AUTH_TOKEN_TTL_MS / 1000) + "}");
+}
+
 static void handleUpdatePage() {
-    server.send(200, "text/html",
-        F("<!DOCTYPE html><html><head><meta charset='utf-8'><title>OTA</title></head><body>"
-          "<h2>Firmware OTA</h2>"
-          "<form method='POST' action='/doUpdate' enctype='multipart/form-data'>"
-          "<input type='file' name='firmware' accept='.bin'>"
-          "<button type='submit'>Upload</button></form></body></html>"));
+    if (!requestAuthorized()) {
+        server.send(401, "text/plain", "unauthorized: negotiate a token over BLE first");
+        return;
+    }
+    String page = F("<!DOCTYPE html><html><head><meta charset='utf-8'><title>OTA</title></head><body>"
+                    "<h2>Firmware OTA</h2>"
+                    "<form method='POST' action='/doUpdate?token=");
+    page += authToken;
+    page += F("' enctype='multipart/form-data'>"
+              "<input type='file' name='firmware' accept='.bin'>"
+              "<button type='submit'>Upload</button></form></body></html>");
+    server.send(200, "text/html", page);
 }
 
 static void startNormalMode() {
@@ -751,6 +835,7 @@ static void startNormalMode() {
     bleBegin("CodexStatus-" + macSuffix(), FW_VERSION);
     bleSetHandlers(handleBleUsage, handleBleEndpoint);
     bleSetTemplateHandlers(tplXferHandleCtrl, tplXferHandleChunk, tplXferReset);
+    bleSetAuthHandler(handleBleAuth);
     updateInfoExtra();
 
     server.on("/", HTTP_GET, handleStatus);
@@ -758,18 +843,30 @@ static void startNormalMode() {
     server.on("/doUpdate", HTTP_POST,
         []() {
             server.sendHeader("Connection", "close");
+            if (otaUploadDenied) {
+                server.send(401, "text/plain", "unauthorized: negotiate a token over BLE first");
+                return;
+            }
             server.send(200, "text/plain", Update.hasError() ? "UPDATE FAILED" : "UPDATE OK");
         },
         []() {
             HTTPUpload &up = server.upload();
             if (up.status == UPLOAD_FILE_START) {
+                if (!requestAuthorized()) {
+                    otaUploadDenied = true;
+                    Serial.println("[ota] rejected: unauthorized");
+                    return;
+                }
+                otaUploadDenied = false;
                 Serial.printf("[ota] upload start: %s\n", up.filename.c_str());
                 std::vector<String> lines = {"OTA update", up.filename};
                 screen(lines);
                 if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
             } else if (up.status == UPLOAD_FILE_WRITE) {
+                if (otaUploadDenied) return;
                 if (Update.write(up.buf, up.currentSize) != up.currentSize) Update.printError(Serial);
             } else if (up.status == UPLOAD_FILE_END) {
+                if (otaUploadDenied) return;
                 if (Update.end(true)) {
                     Serial.printf("[ota] success %u bytes, rebooting shortly\n", (unsigned)up.totalSize);
                     screen({"OTA success", "Rebooting..."});
@@ -783,7 +880,7 @@ static void startNormalMode() {
     server.begin();
 
     ArduinoOTA.setHostname(hostname.c_str());
-    ArduinoOTA.setPassword(OTA_PASSWORD);
+    rotateOtaPassword();
     ArduinoOTA.onStart([]() { screen({"ArduinoOTA", "updating..."}); });
     ArduinoOTA.onProgress([](unsigned int p, unsigned int t) {
         Serial.printf("[ota] %u%%\r", t ? p * 100 / t : 0);
@@ -889,6 +986,7 @@ static void handleSerialCli() {
 
 void loop() {
     if (otaRebootPending && (int32_t)(millis() - otaRebootAt) >= 0) ESP.restart();
+    authTick();
     handleSerialCli();
     server.handleClient();
     blePoll();
