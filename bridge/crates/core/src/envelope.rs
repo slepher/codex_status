@@ -13,7 +13,7 @@ pub struct TemplateRef {
 
 #[derive(Debug, Clone)]
 pub struct EnvelopeOptions {
-    pub bridge_label: String,
+    pub bridge_label: Option<String>,
     pub bridge_host_id: String,
     pub next_sync_seconds: u64,
     pub templates: BTreeMap<String, TemplateRef>,
@@ -88,6 +88,22 @@ fn reset_credits(result: &Value) -> (i64, i64) {
     (count, next)
 }
 
+/// Display label for the bridge: the Codex account email local part, ASCII-safe.
+pub fn account_username(account: &Value) -> Option<String> {
+    let email = account.get("account")?.get("email")?.as_str()?;
+    let local = email.split('@').next().unwrap_or("");
+    let cleaned: String = local
+        .chars()
+        .map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '?' })
+        .take(16)
+        .collect();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
 pub fn build_envelope(result: &Value, opts: &EnvelopeOptions) -> Value {
     let direct = result.get("rateLimits").cloned().unwrap_or(Value::Null);
     let by = result
@@ -133,14 +149,17 @@ pub fn build_envelope(result: &Value, opts: &EnvelopeOptions) -> Value {
         })
         .collect();
 
-    json!({
+    let mut envelope = json!({
         "schema": 1,
         "server_time": now,
         "next_sync_seconds": opts.next_sync_seconds,
         "bridge": {"label": opts.bridge_label, "hostId": opts.bridge_host_id},
         "account": {"plan": plan},
         "buckets": buckets,
-        "resetCredits": {"availableCount": reset_count, "nextExpiresAt": reset_next},
         "templates": templates,
-    })
+    });
+    if reset_count > 0 {
+        envelope["resetCredits"] = json!({"availableCount": reset_count, "nextExpiresAt": reset_next});
+    }
+    envelope
 }

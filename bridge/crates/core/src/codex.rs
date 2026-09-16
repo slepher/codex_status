@@ -246,6 +246,10 @@ impl CodexClient {
         self.call("account/rateLimits/read", None).await
     }
 
+    pub async fn read_account(&self) -> Result<Value> {
+        self.call("account/read", Some(json!({}))).await
+    }
+
     pub fn kill(&mut self) {
         let _ = self.child.start_kill();
     }

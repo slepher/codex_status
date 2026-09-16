@@ -66,15 +66,20 @@ async fn main() -> Result<()> {
     tracing::info!("templates: {:?}", library.read().await.ids());
 
     let envelope: Arc<RwLock<Option<serde_json::Value>>> = Arc::new(RwLock::new(None));
-    let label = host_label();
+    let host_id = short_id(&host_label());
 
     if args.once {
         let mut client = bridge_core::codex::CodexClient::spawn(&exe).await?;
         client.initialize().await?;
         let rate_limits = client.read_rate_limits().await?;
+        let label = client
+            .read_account()
+            .await
+            .ok()
+            .and_then(|account| bridge_core::envelope::account_username(&account));
         let opts = EnvelopeOptions {
-            bridge_label: label.clone(),
-            bridge_host_id: short_id(&label),
+            bridge_label: label,
+            bridge_host_id: host_id.clone(),
             next_sync_seconds: args.interval,
             templates: library.read().await.template_refs(),
         };
@@ -97,8 +102,7 @@ async fn main() -> Result<()> {
 
     let poller = PollerConfig {
         exe,
-        label: label.clone(),
-        host_id: short_id(&label),
+        host_id: host_id.clone(),
         interval_secs: args.interval,
         templates: library.clone(),
     };

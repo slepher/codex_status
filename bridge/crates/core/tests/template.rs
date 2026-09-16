@@ -20,7 +20,7 @@ fn hashes_match_python_test_bridge() {
     assert_eq!(full.version, 3);
     assert_eq!(mini.version, 2);
     let quad = library.get("quad").expect("quad template");
-    assert_eq!(quad.version, 1);
+    assert_eq!(quad.version, 2);
     assert_eq!(quad.min_fw.as_deref(), Some("0.5"));
 }
 

@@ -101,11 +101,9 @@ async fn run_services(ctx: Arc<AppCtx>) {
         }
     });
 
-    let label = host_label();
     let poller = PollerConfig {
         exe,
-        label: label.clone(),
-        host_id: short_id(&label),
+        host_id: short_id(&host_label()),
         interval_secs: ctx.config.interval_secs,
         templates: ctx.library.clone(),
     };

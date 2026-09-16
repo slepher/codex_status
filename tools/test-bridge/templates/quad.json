@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "id": "quad",
-  "version": 1,
+  "version": 2,
   "min_fw": "0.5",
   "canvas": { "w": 200, "h": 200 },
   "elements": [
@@ -13,9 +13,9 @@
     { "type": "text", "text": "100", "when": { "bind": "buckets[codex].5h.remaining", "exists": false }, "region": [98, 112, 92, 68], "align": "center", "scale": 3, "font": "f20", "color": "white", "bg": "black" },
     { "type": "text", "text": "5H", "region": [98, 180, 92, 12], "align": "center", "scale": 1, "font": "f8", "color": "white", "bg": "black" },
     { "type": "text", "bind": "account.plan", "prefix": "PLAN ", "region": [112, 4, 84, 18], "align": "right", "font": "f12", "color": "black" },
-    { "type": "text", "bind": "bridge.label", "prefix": "LABEL ", "region": [112, 22, 84, 18], "align": "right", "font": "f12", "color": "black" },
+    { "type": "text", "bind": "bridge.label", "when": { "bind": "bridge.label", "exists": true }, "region": [112, 22, 84, 18], "align": "right", "font": "f12", "color": "black" },
     { "type": "text", "bind": "buckets[codex].weekly.resetsAt", "time_format": "date", "region": [112, 40, 84, 18], "align": "right", "font": "f12", "color": "black" },
-    { "type": "text", "bind": "resetCredits.availableCount", "prefix": "RC ", "region": [112, 58, 84, 18], "align": "right", "font": "f12", "color": "black" },
+    { "type": "text", "bind": "resetCredits.availableCount", "when": { "bind": "resetCredits.availableCount", "exists": true }, "prefix": "RC ", "region": [112, 58, 84, 18], "align": "right", "font": "f12", "color": "black" },
     { "type": "text", "bind": "buckets[codex].5h.resetsAt", "when": { "bind": "buckets[codex].5h.resetsAt", "exists": true }, "prefix": "5H ", "time_format": "hhmm", "region": [4, 158, 84, 12], "font": "f12", "color": "black" },
     { "type": "text", "bind": "device.battery", "prefix": "BATT ", "suffix": "%", "region": [4, 172, 84, 12], "font": "f12", "color": "black" },
     { "type": "text", "bind": "device.sync_hhmm", "prefix": "SYNC ", "region": [4, 186, 84, 12], "font": "f12", "color": "black" }
