@@ -6,6 +6,7 @@
 * |                 clawdmeter-epaper (firmware/src/boards/waveshare_epaper_154).
 ******************************************************************************/
 #include "EPD_SSD1681.h"
+#include "dev_log.h"
 #include "DEV_Config.h"
 
 // 1bpp framebuffer size: 200 x 200 / 8 = 5000 bytes
@@ -82,7 +83,7 @@ static void readBusy(void)
     UDOUBLE t0 = millis();
     while (digitalRead(EPD_BUSY_PIN) == HIGH) {
         if (millis() - t0 > 5000) {
-            Serial.println("[epd] busy timeout");
+            DevLog.println("[epd] busy timeout");
             return;
         }
         delay(1);

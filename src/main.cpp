@@ -19,6 +19,7 @@
 #include <esp_system.h>
 
 #include "DEV_Config.h"
+#include "dev_log.h"
 #include "EPD_SSD1681.h"
 #include "GUI_Paint.h"
 #include "fonts.h"
@@ -29,7 +30,7 @@
 #include "template_engine.h"
 #include "template_xfer.h"
 
-#define FW_VERSION    "0.7.0-bw"
+#define FW_VERSION    "0.8.0-bw"
 #define AP_PASSWORD   "codex1234"
 #define AUTH_TOKEN_TTL_MS 3600000UL
 #define MAX_SLOTS     3
@@ -208,14 +209,14 @@ static void epdBegin() {
     EPD_SSD1681_Clear(EPD_SSD1681_WHITE);
     frame = (UBYTE *)malloc(EPD_FB_BYTES);
     if (!frame) {
-        Serial.println("[epd] frame buffer malloc failed");
+        DevLog.println("[epd] frame buffer malloc failed");
         return;
     }
     lastDisplayedFrame = (UBYTE *)malloc(EPD_FB_BYTES);
     if (lastDisplayedFrame) {
         memset(lastDisplayedFrame, 0xFF, EPD_FB_BYTES);
     } else {
-        Serial.println("[epd] last-display buffer malloc failed; writes will not be skipped");
+        DevLog.println("[epd] last-display buffer malloc failed; writes will not be skipped");
     }
     Paint_NewImage(frame, EPD_W, EPD_H, 0, WHITE);
     Paint_SetScale(2);
@@ -269,10 +270,14 @@ static const int Q_LINE_H = 14;
 static const int Q_BL_X = 4;
 static const int Q_BL_SLOTS[4] = {140, 154, 168, 182};
 
-static int batteryPercent() {
+static uint32_t batteryMilliVolts() {
     uint32_t mv = 0;
     for (int i = 0; i < 8; i++) mv += analogReadMilliVolts(4);
-    uint32_t vbat = (mv / 8) * 2;   // board divider: VBAT = VADC x 2
+    return (mv / 8) * 2;   // board divider: VBAT = VADC x 2
+}
+
+static int batteryPercent() {
+    uint32_t vbat = batteryMilliVolts();
     if (vbat >= 4200) return 100;
     if (vbat <= 3300) return 0;
     return (int)((vbat - 3300) * 100 / 900);
@@ -341,7 +346,7 @@ static void renderUsage(const String &json, const char *channel) {
     if (!frame) return;
     JsonDocument doc;
     if (deserializeJson(doc, json)) {
-        Serial.println("[usage] parse failed");
+        DevLog.println("[usage] parse failed");
         return;
     }
     const char *plan  = doc["account"]["plan"] | "?";
@@ -386,7 +391,7 @@ static void renderUsage(const String &json, const char *channel) {
     renderedMinute = nowHHMM();
     renderedBattery = battery;
     screenSig = String("usage");
-    Serial.printf("[ui] quad rendered (wk=%d fh=%d ch=%s)\n",
+    DevLog.printf("[ui] quad rendered (wk=%d fh=%d ch=%s)\n",
                   wk.used, fh.used, channel ? channel : "");
 }
 
@@ -433,10 +438,10 @@ static void renderActiveUsage(const String &json, const char *channel) {
             renderedMinute = env.syncHHMM;
             renderedBattery = env.battery;
             screenSig = String("usage");
-            Serial.printf("[tpl] rendered %s (%s)\n", activeTplId.c_str(), channel ? channel : "");
+            DevLog.printf("[tpl] rendered %s (%s)\n", activeTplId.c_str(), channel ? channel : "");
             return;
         }
-        Serial.printf("[tpl] %s invalid, fallback built-in\n", activeTplId.c_str());
+        DevLog.printf("[tpl] %s invalid, fallback built-in\n", activeTplId.c_str());
     }
     renderUsage(json, channel);
 }
@@ -461,7 +466,7 @@ static void maybeFetchTemplate(const EndpointRec &rec, const String &usageJson) 
                          tplValidateForStorage(localJson, hash, FW_VERSION, localErr);
             if (localValid) localHash = local.hash;
             if (!localValid) {
-                Serial.printf("[tpl] local %s rejected: %s\n", id.c_str(), localErr.c_str());
+                DevLog.printf("[tpl] local %s rejected: %s\n", id.c_str(), localErr.c_str());
             }
         } else if (tplStoreFind(id, local)) {
             localHash = local.hash;
@@ -471,7 +476,7 @@ static void maybeFetchTemplate(const EndpointRec &rec, const String &usageJson) 
         if (usageTemplateGet(rec, id, localHash, out, err)) {
             String acceptErr;
             if (!tplValidateForStorage(out, hash, FW_VERSION, acceptErr)) {
-                Serial.printf("[tpl] HTTP %s rejected: %s\n", id.c_str(), acceptErr.c_str());
+                DevLog.printf("[tpl] HTTP %s rejected: %s\n", id.c_str(), acceptErr.c_str());
                 continue;
             }
             if (tplStoreSave(id, ver, hash, (const uint8_t *)out.c_str(), out.length())) {
@@ -480,10 +485,10 @@ static void maybeFetchTemplate(const EndpointRec &rec, const String &usageJson) 
                     activeTplId = "";
                 }
                 updateInfoExtra();
-                Serial.printf("[tpl] fetched %s hash=%s\n", id.c_str(), hash.c_str());
+                DevLog.printf("[tpl] fetched %s hash=%s\n", id.c_str(), hash.c_str());
             }
         } else if (err != "http 304") {
-            Serial.printf("[tpl] fetch %s failed: %s\n", id.c_str(), err.c_str());
+            DevLog.printf("[tpl] fetch %s failed: %s\n", id.c_str(), err.c_str());
         }
     }
 }
@@ -503,7 +508,7 @@ static void nextTemplate() {
     tplStoreSetActive(m.id);
     activeTplId = "";
     pendingTplChanged = true;
-    Serial.printf("[tpl] local switch -> %s\n", m.id.c_str());
+    DevLog.printf("[tpl] local switch -> %s\n", m.id.c_str());
 }
 
 static void factoryReset() {
@@ -540,14 +545,14 @@ static bool tryWifiUsage() {
         if (usageHttpGet(rec, out, err)) {
             JsonDocument parsed;
             if (deserializeJson(parsed, out) || parsed.as<JsonObject>().isNull()) {
-                Serial.println("[wifi] usage rejected: invalid JSON");
+                DevLog.println("[wifi] usage rejected: invalid JSON");
                 continue;
             }
             storeTouch(rec.mac);
             lastSyncMs = millis();
             lastOkMs = millis();
             lastSyncEpoch = time(nullptr);
-            Serial.printf("[wifi] usage from %s:%u\n", rec.host.c_str(), rec.port);
+            DevLog.printf("[wifi] usage from %s:%u\n", rec.host.c_str(), rec.port);
             bleNotifyStatus("{\"ack\":\"wifi-usage\",\"ok\":true}");
             maybeFetchTemplate(rec, out);
             {
@@ -562,7 +567,7 @@ static bool tryWifiUsage() {
             renderActiveUsage(lastUsage, "WIFI");
             return true;
         }
-        Serial.printf("[wifi] %s:%u failed: %s\n", rec.host.c_str(), rec.port, err.c_str());
+        DevLog.printf("[wifi] %s:%u failed: %s\n", rec.host.c_str(), rec.port, err.c_str());
     }
     return false;
 }
@@ -606,17 +611,17 @@ static bool connectStored() {
         String pass = prefs.getString(("p" + String(i)).c_str(), "");
         if (!ssid.length()) continue;
         screen({"CODEX STATUS", FW_VERSION, "", "Connecting:", ssid});
-        Serial.printf("[wifi] trying slot %d: %s\n", i, ssid.c_str());
+        DevLog.printf("[wifi] trying slot %d: %s\n", i, ssid.c_str());
         WiFi.begin(ssid.c_str(), pass.c_str());
         uint32_t t0 = millis();
         while (WiFi.status() != WL_CONNECTED && millis() - t0 < SLOT_TIMEOUT) {
             delay(250);
-            Serial.print(".");
+            DevLog.print(".");
         }
-        Serial.println();
+        DevLog.println();
         if (WiFi.status() == WL_CONNECTED) {
             prefs.end();
-            Serial.printf("[wifi] connected: %s ip=%s\n", ssid.c_str(), WiFi.localIP().toString().c_str());
+            DevLog.printf("[wifi] connected: %s ip=%s\n", ssid.c_str(), WiFi.localIP().toString().c_str());
             return true;
         }
         WiFi.disconnect(true);
@@ -673,7 +678,7 @@ static void startConfigMode() {
     WiFi.mode(WIFI_AP);
     apSsid = "CodexStatus-" + macSuffix();
     WiFi.softAP(apSsid.c_str(), AP_PASSWORD);
-    Serial.printf("[config] AP=%s pass=%s url=http://192.168.4.1\n", apSsid.c_str(), AP_PASSWORD);
+    DevLog.printf("[config] AP=%s pass=%s url=http://192.168.4.1\n", apSsid.c_str(), AP_PASSWORD);
     screen({"WIFI SETUP", "", "AP:   " + apSsid, "PASS: " AP_PASSWORD, "", "Open http://", "192.168.4.1"});
     server.on("/", HTTP_GET, handleConfigRoot);
     server.on("/save", HTTP_POST, handleConfigSave);
@@ -721,6 +726,8 @@ static void handleStatus() {
     html += "<li>SSID: " + WiFi.SSID() + "</li>";
     html += "<li>IP: " + WiFi.localIP().toString() + "</li>";
     html += "<li>RSSI: " + String(WiFi.RSSI()) + " dBm</li>";
+    html += "<li>Battery: " + String(batteryPercent()) + "% (" +
+            String(batteryMilliVolts()) + " mV)</li>";
     html += "<li>BLE connected: " + String(bleIsConnected() ? "yes" : "no") + "</li>";
     html += "<li>Endpoints stored: " + String(storeCount()) + "</li>";
     html += "<li>Last channel: " + lastChannel + "</li>";
@@ -740,6 +747,46 @@ static void handleStatus() {
     }
     html += F("</p></body></html>");
     server.send(200, "text/html", html);
+}
+
+static void handleStatusJson() {
+    JsonDocument doc;
+    doc["fw"] = FW_VERSION;
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    const esp_partition_t *next = esp_ota_get_next_update_partition(nullptr);
+    doc["slot"] = running ? running->label : "?";
+    doc["next_slot"] = next ? next->label : "?";
+    doc["reset"] = resetReasonName();
+    doc["uptime_s"] = millis() / 1000;
+    doc["ssid"] = WiFi.SSID();
+    doc["ip"] = WiFi.localIP().toString();
+    doc["rssi"] = WiFi.RSSI();
+    doc["ble"] = bleIsConnected();
+    doc["endpoints"] = storeCount();
+    doc["channel"] = lastChannel;
+    doc["battery"] = batteryPercent();
+    doc["battery_mv"] = batteryMilliVolts();
+    doc["heap"] = ESP.getFreeHeap();
+    doc["epd_writes"] = epdWriteCount;
+    doc["epd_partial"] = epdPartialReady;
+    doc["epd_streak"] = epdPartialCount;
+    JsonArray templates = doc["templates"].to<JsonArray>();
+    String activeId = tplStoreActive();
+    for (int i = 0; i < tplStoreCount(); i++) {
+        TplMeta meta;
+        if (!tplStoreGet(i, meta)) continue;
+        JsonObject item = templates.add<JsonObject>();
+        item["id"] = meta.id;
+        item["hash"] = meta.hash;
+        item["active"] = meta.id == activeId;
+    }
+    String out;
+    serializeJson(doc, out);
+    server.send(200, "application/json", out);
+}
+
+static void handleLog() {
+    server.send(200, "text/plain; charset=utf-8", DevLog.dump());
 }
 
 static void randomHex(char *out, size_t bytes) {
@@ -770,7 +817,7 @@ static void issueAuthToken() {
     authToken = buf;
     authTokenExpiresAt = millis() + AUTH_TOKEN_TTL_MS;
     setOtaPassword(authToken.c_str());
-    Serial.println("[auth] token issued over BLE");
+    DevLog.println("[auth] token issued over BLE");
 }
 
 static bool authValid() {
@@ -792,7 +839,7 @@ static void authTick() {
     if (authToken.length() && (int32_t)(millis() - authTokenExpiresAt) >= 0) {
         authToken = "";
         rotateOtaPassword();
-        Serial.println("[auth] token expired; OTA password randomized");
+        DevLog.println("[auth] token expired; OTA password randomized");
     }
 }
 
@@ -839,6 +886,8 @@ static void startNormalMode() {
     updateInfoExtra();
 
     server.on("/", HTTP_GET, handleStatus);
+    server.on("/status.json", HTTP_GET, handleStatusJson);
+    server.on("/log", HTTP_GET, handleLog);
     server.on("/update", HTTP_GET, handleUpdatePage);
     server.on("/doUpdate", HTTP_POST,
         []() {
@@ -854,11 +903,11 @@ static void startNormalMode() {
             if (up.status == UPLOAD_FILE_START) {
                 if (!requestAuthorized()) {
                     otaUploadDenied = true;
-                    Serial.println("[ota] rejected: unauthorized");
+                    DevLog.println("[ota] rejected: unauthorized");
                     return;
                 }
                 otaUploadDenied = false;
-                Serial.printf("[ota] upload start: %s\n", up.filename.c_str());
+                DevLog.printf("[ota] upload start: %s\n", up.filename.c_str());
                 std::vector<String> lines = {"OTA update", up.filename};
                 screen(lines);
                 if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
@@ -868,7 +917,7 @@ static void startNormalMode() {
             } else if (up.status == UPLOAD_FILE_END) {
                 if (otaUploadDenied) return;
                 if (Update.end(true)) {
-                    Serial.printf("[ota] success %u bytes, rebooting shortly\n", (unsigned)up.totalSize);
+                    DevLog.printf("[ota] success %u bytes, rebooting shortly\n", (unsigned)up.totalSize);
                     screen({"OTA success", "Rebooting..."});
                     otaRebootPending = true;
                     otaRebootAt = millis() + 1500;
@@ -883,14 +932,14 @@ static void startNormalMode() {
     rotateOtaPassword();
     ArduinoOTA.onStart([]() { screen({"ArduinoOTA", "updating..."}); });
     ArduinoOTA.onProgress([](unsigned int p, unsigned int t) {
-        Serial.printf("[ota] %u%%\r", t ? p * 100 / t : 0);
+        DevLog.printf("[ota] %u%%\r", t ? p * 100 / t : 0);
     });
     ArduinoOTA.onEnd([]() { screen({"OTA OK", "rebooting..."}); delay(800); });
-    ArduinoOTA.onError([](ota_error_t e) { Serial.printf("[ota] error %u\n", e); });
+    ArduinoOTA.onError([](ota_error_t e) { DevLog.printf("[ota] error %u\n", e); });
     ArduinoOTA.begin();
     MDNS.addService("http", "tcp", 80);
 
-    Serial.printf("[net] ready: http://%s/  host=%s.local  endpoints=%d\n",
+    DevLog.printf("[net] ready: http://%s/  host=%s.local  endpoints=%d\n",
                   WiFi.localIP().toString().c_str(), hostname.c_str(), storeCount());
 
     if (storeCount() > 0) {
@@ -905,7 +954,7 @@ void setup() {
     epdBegin();
     screen({"CODEX STATUS", FW_VERSION, "booting..."});
     const esp_partition_t *running = esp_ota_get_running_partition();
-    Serial.printf("\n[codex-status] v%s mac=%s reset=%s slot=%s\n", FW_VERSION,
+    DevLog.printf("\n[codex-status] v%s mac=%s reset=%s slot=%s\n", FW_VERSION,
                   WiFi.macAddress().c_str(), resetReasonName(),
                   running ? running->label : "?");
     { Preferences p; p.begin("brg", false); p.end(); }
@@ -929,7 +978,7 @@ static bool batteryMode() {
 }
 
 static void enterDeepSleep(uint32_t sec) {
-    Serial.printf("[pm] deep sleep %us\n", (unsigned)sec);
+    DevLog.printf("[pm] deep sleep %us\n", (unsigned)sec);
     screen({"BATTERY MODE", "sleep " + String(sec) + "s"});
     delay(500);
     WiFi.disconnect(true);
@@ -966,20 +1015,20 @@ static void handleSerialCli() {
                 prefs.putString(("s" + String(slot)).c_str(), ssid);
                 prefs.putString(("p" + String(slot)).c_str(), pass);
                 prefs.end();
-                Serial.printf("[cli] wifi saved slot %d ssid=%s, rebooting\n", slot, ssid.c_str());
+                DevLog.printf("[cli] wifi saved slot %d ssid=%s, rebooting\n", slot, ssid.c_str());
                 screen({"Wi-Fi saved via USB:", ssid, "", "Rebooting..."});
                 delay(800);
                 ESP.restart();
             } else {
-                Serial.println("[cli] usage: wifi <ssid> <pass>");
+                DevLog.println("[cli] usage: wifi <ssid> <pass>");
             }
         } else if (line == "status") {
-            Serial.printf("[cli] fw=%s ip=%s rssi=%d heap=%u\n",
+            DevLog.printf("[cli] fw=%s ip=%s rssi=%d heap=%u\n",
                           FW_VERSION, ipText().c_str(), WiFi.RSSI(), ESP.getFreeHeap());
         } else if (line == "batt") {
-            Serial.printf("[cli] battery=%d%%\n", batteryPercent());
+            DevLog.printf("[cli] battery=%d%%\n", batteryPercent());
         } else if (line.length()) {
-            Serial.println("[cli] commands: wifi <ssid> <pass> | status | batt");
+            DevLog.println("[cli] commands: wifi <ssid> <pass> | status | batt");
         }
     }
 }
@@ -1050,7 +1099,7 @@ void loop() {
                 lastSyncEpoch = time(nullptr);
                 renderActiveUsage(lastUsage, lastChannel.c_str());
             } else {
-                Serial.println("[usage] BLE usage rejected: invalid JSON");
+                DevLog.println("[usage] BLE usage rejected: invalid JSON");
             }
         }
 
@@ -1081,7 +1130,7 @@ void loop() {
 
         if (WiFi.status() != WL_CONNECTED) {
             if (millis() - lastConnectedMs > WIFI_LOST_RESTART_MS) {
-                Serial.println("[net] wifi lost, restarting");
+                DevLog.println("[net] wifi lost, restarting");
                 ESP.restart();
             }
         } else {

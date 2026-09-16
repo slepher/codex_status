@@ -1,4 +1,5 @@
 #include "ble_bridge.h"
+#include "dev_log.h"
 #include <NimBLEDevice.h>
 #include <ArduinoJson.h>
 
@@ -64,14 +65,14 @@ static bool securePeer(const ble_gap_conn_desc *desc) {
 
 static bool writeAllowed(const ble_gap_conn_desc *desc) {
     if (securePeer(desc)) return true;
-    Serial.println("[ble] rejected unencrypted or unbonded write");
+    DevLog.println("[ble] rejected unencrypted or unbonded write");
     return false;
 }
 
 static bool appendJson(String &buf, const std::string &value, size_t limit,
                        const char *name, void (*handler)(const String &)) {
     if (buf.length() + value.size() > limit) {
-        Serial.printf("[ble] %s JSON overflow, buffer cleared\n", name);
+        DevLog.printf("[ble] %s JSON overflow, buffer cleared\n", name);
         buf = "";
         if (!strcmp(name, "template-control") && tplResetHandler) tplResetHandler();
         return false;
@@ -80,7 +81,7 @@ static bool appendJson(String &buf, const std::string &value, size_t limit,
     if (!jsonComplete(buf)) return false;
     JsonDocument doc;
     if (deserializeJson(doc, buf)) {
-        Serial.printf("[ble] malformed %s JSON, buffer cleared\n", name);
+        DevLog.printf("[ble] malformed %s JSON, buffer cleared\n", name);
         buf = "";
         if (!strcmp(name, "template-control") && tplResetHandler) tplResetHandler();
         return false;
@@ -125,10 +126,10 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         disconnecting = false;
         clearReceiveBuffers();
         peerAddress = NimBLEAddress(desc->peer_id_addr).toString().c_str();
-        Serial.printf("[ble] connected: %s bonded=%d\n", peerAddress.c_str(), desc->sec_state.bonded);
+        DevLog.printf("[ble] connected: %s bonded=%d\n", peerAddress.c_str(), desc->sec_state.bonded);
         refreshInfo();
         if (!peerBonded && !blePairingWindowOpen()) {
-            Serial.println("[ble] unbonded peer outside pairing window; disconnecting");
+            DevLog.println("[ble] unbonded peer outside pairing window; disconnecting");
             disconnecting = true;
             server->disconnect(desc->conn_handle);
         }
@@ -141,7 +142,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         disconnecting = false;
         clearReceiveBuffers();
         refreshInfo();
-        Serial.println("[ble] disconnected");
+        DevLog.println("[ble] disconnected");
     }
     void onDisconnect(NimBLEServer *server, ble_gap_conn_desc *desc) override {
         onDisconnect(server);
@@ -151,14 +152,14 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         peerBonded = desc && desc->sec_state.bonded;
         refreshInfo();
         if (!securePeer(desc)) {
-            Serial.println("[ble] authentication rejected: encryption and bond required");
+            DevLog.println("[ble] authentication rejected: encryption and bond required");
             if (bleServer && desc) {
                 disconnecting = true;
                 bleServer->disconnect(desc->conn_handle);
             }
             return;
         }
-        Serial.println("[ble] authenticated bonded peer");
+        DevLog.println("[ble] authenticated bonded peer");
     }
 };
 
@@ -251,7 +252,7 @@ void bleBegin(const String &deviceName, const String &fw) {
     adv->setScanResponse(true);
     NimBLEDevice::startAdvertising();
 
-    Serial.printf("[ble] advertising as %s fw=%s\n", deviceName.c_str(), fw.c_str());
+    DevLog.printf("[ble] advertising as %s fw=%s\n", deviceName.c_str(), fw.c_str());
 }
 
 bool bleIsConnected() { return connected; }
@@ -291,7 +292,7 @@ void bleNotifyStatus(const String &json) {
     if (!statusChr) return;
     statusChr->setValue(reinterpret_cast<const uint8_t *>(json.c_str()), json.length());
     if (connected && peerEncrypted && peerBonded) statusChr->notify();
-    Serial.printf("[ble] status: %s\n", json.c_str());
+    DevLog.printf("[ble] status: %s\n", json.c_str());
 }
 
 // Like bleNotifyStatus but without serial logging; used for secrets (auth token).
@@ -303,14 +304,14 @@ void bleNotifyStatusQuiet(const String &json) {
 
 void blePoll() {
     if (connected && !peerBonded && !blePairingWindowOpen() && !disconnecting && bleServer) {
-        Serial.println("[ble] pairing window expired; disconnecting unbonded peer");
+        DevLog.println("[ble] pairing window expired; disconnecting unbonded peer");
         disconnecting = true;
         bleServer->disconnect(peerConnHandle);
     }
 }
 
 void bleClearBonds() {
-    Serial.println("[ble] clearing all bonds");
+    DevLog.println("[ble] clearing all bonds");
     NimBLEDevice::deleteAllBonds();
     pairingUntil = 0;
 }

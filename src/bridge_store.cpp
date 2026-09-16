@@ -1,4 +1,5 @@
 #include "bridge_store.h"
+#include "dev_log.h"
 #include <Preferences.h>
 
 #define STORE_MAX 8
@@ -60,7 +61,7 @@ void storeUpsert(const String &mac, const String &host, uint16_t port, const Str
     prefs.putULong(k("r", slot).c_str(), ctr);
     prefs.putULong("ctr", ctr);
     prefs.end();
-    Serial.printf("[store] upsert slot=%d mac=%s %s:%u\n", slot, mac.c_str(), host.c_str(), port);
+    DevLog.printf("[store] upsert slot=%d mac=%s %s:%u\n", slot, mac.c_str(), host.c_str(), port);
 }
 
 void storeTouch(const String &mac) {

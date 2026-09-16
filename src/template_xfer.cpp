@@ -1,4 +1,5 @@
 #include "template_xfer.h"
+#include "dev_log.h"
 #include <ArduinoJson.h>
 #include <esp32-hal-psram.h>
 #include "template_store.h"
@@ -110,7 +111,7 @@ static void handleBegin(JsonDocument &d) {
     sId = id; sHash = hash; sVer = ver; sLen = len; sCrc = crc;
     sGot = 0;
     sInProgress = true;
-    Serial.printf("[tpl] begin id=%s v%u len=%u crc=%08x\n",
+    DevLog.printf("[tpl] begin id=%s v%u len=%u crc=%08x\n",
                   id.c_str(), (unsigned)ver, (unsigned)len, (unsigned)crc);
     String j = String("{\"ack\":\"tpl\",\"op\":\"begin\",\"ok\":true,\"len\":") + String(len) + "}";
     bleNotifyStatus(j);
@@ -125,7 +126,7 @@ static void handleEnd() {
     }
     uint32_t crc = crc32buf(sBuf, sLen);
     if (sCrc != 0 && crc != sCrc) {
-        Serial.printf("[tpl] crc mismatch %08x != %08x\n", (unsigned)crc, (unsigned)sCrc);
+        DevLog.printf("[tpl] crc mismatch %08x != %08x\n", (unsigned)crc, (unsigned)sCrc);
         ack("end", false, "crc");
         abortRecv();
         return;
@@ -150,10 +151,10 @@ static void handleEnd() {
     }
     tplStoreSetActive(sId);
     tplStoreTouch(sId);
-    Serial.printf("[tpl] end stack_hwm=%u bytes\n",
+    DevLog.printf("[tpl] end stack_hwm=%u bytes\n",
                   (unsigned)uxTaskGetStackHighWaterMark(nullptr));
     ack("end", true);
-    Serial.printf("[tpl] end id=%s hash=%s%s\n", sId.c_str(), sHash.c_str(),
+    DevLog.printf("[tpl] end id=%s hash=%s%s\n", sId.c_str(), sHash.c_str(),
                   unchanged ? " (unchanged)" : "");
     if (sChanged) sChanged();
 }
@@ -166,7 +167,7 @@ static void handleActivate(JsonDocument &d) {
     tplStoreSetActive(id);
     tplStoreTouch(id);
     ack("activate", true);
-    Serial.printf("[tpl] activate %s\n", id.c_str());
+    DevLog.printf("[tpl] activate %s\n", id.c_str());
     if (sChanged) sChanged();
 }
 
@@ -216,7 +217,7 @@ void tplXferHandleChunk(const uint8_t *data, size_t len) {
     const uint8_t *payload = data + 2;
     size_t plen = len - 2;
     if (off != sGot || off + plen > sLen) {
-        Serial.printf("[tpl] bad chunk off=%u got=%u plen=%u len=%u\n",
+        DevLog.printf("[tpl] bad chunk off=%u got=%u plen=%u len=%u\n",
                       (unsigned)off, (unsigned)sGot, (unsigned)plen, (unsigned)sLen);
         ack("data", false, "off");
         abortRecv();

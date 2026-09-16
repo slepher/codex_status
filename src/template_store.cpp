@@ -1,4 +1,5 @@
 #include "template_store.h"
+#include "dev_log.h"
 #include <LittleFS.h>
 #include <ArduinoJson.h>
 #include <vector>
@@ -44,7 +45,7 @@ static void persist() {
 
 void tplStoreBegin() {
     if (!LittleFS.begin(true, "/littlefs", 10, "storage")) {
-        Serial.println("[tpl] LittleFS mount failed");
+        DevLog.println("[tpl] LittleFS mount failed");
         return;
     }
     if (!LittleFS.exists("/tpl")) LittleFS.mkdir("/tpl");
@@ -68,7 +69,7 @@ void tplStoreBegin() {
         }
         f.close();
     }
-    Serial.printf("[tpl] store: %d template(s), active=%s\n",
+    DevLog.printf("[tpl] store: %d template(s), active=%s\n",
                   (int)sItems.size(), sActive.c_str());
 }
 
@@ -130,12 +131,12 @@ bool tplStoreSave(const String &id, uint32_t version, const String &hash,
             if (sItems[i].usedAt < oldest) { oldest = sItems[i].usedAt; victim = i; }
         }
         if (victim < 0) break;
-        Serial.printf("[tpl] evict %s\n", sItems[victim].id.c_str());
+        DevLog.printf("[tpl] evict %s\n", sItems[victim].id.c_str());
         LittleFS.remove(tplPath(sItems[victim].id));
         sItems.erase(sItems.begin() + victim);
     }
     persist();
-    Serial.printf("[tpl] saved %s v%u hash=%s len=%u\n",
+    DevLog.printf("[tpl] saved %s v%u hash=%s len=%u\n",
                   id.c_str(), (unsigned)version, hash.c_str(), (unsigned)len);
     return true;
 }
@@ -184,5 +185,5 @@ void tplStoreClear() {
     LittleFS.remove(IDX_PATH);
     sItems.clear();
     sActive = "";
-    Serial.println("[tpl] store cleared");
+    DevLog.println("[tpl] store cleared");
 }
