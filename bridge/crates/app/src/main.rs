@@ -331,11 +331,7 @@ async fn get_mcp_info(state: State<'_, Arc<AppCtx>>) -> Result<Value, String> {
     let port = *state.mcp_port.lock().unwrap();
     let error = state.mcp_error.lock().unwrap().clone();
     let url = format!("http://127.0.0.1:{port}/mcp");
-    let stdio_command = format!(
-        "{} --print-config opencode",
-        bridge_mcp::preferred_exe().display()
-    );
-    let tools = "bridge_status / template_get / template_validate / template_render / template_save / template_push";
+    let tools = "bridge_status / template_get / template_validate / template_render / template_save / profiles_list / profile_save / profile_push";
 
     let generic_prompt = format!(
         "本机已启动 Codex Status 的 MCP 服务（Streamable HTTP）：{url}\n\
@@ -383,7 +379,6 @@ async fn get_mcp_info(state: State<'_, Arc<AppCtx>>) -> Result<Value, String> {
         "port": port,
         "url": url,
         "error": error,
-        "stdio_command": stdio_command,
         "prompts": prompts,
     }))
 }

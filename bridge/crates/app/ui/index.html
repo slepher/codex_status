@@ -160,7 +160,6 @@
           <span id="mcp-state" class="muted"></span>
         </div>
         <div class="row"><span>URL</span><span id="mcp-url">--</span></div>
-        <div class="row"><span>stdio 兜底</span><span class="muted" id="mcp-stdio" style="max-width:62%;text-align:right;word-break:break-all">--</span></div>
       </div>
       <div class="card">
         <h2>给 agent 的接入提示</h2>
@@ -687,7 +686,6 @@
       $('mcp-port').value = info.port;
       $('mcp-url').textContent = info.url;
       $('mcp-state').textContent = info.error ? '错误：' + info.error : '监听中';
-      $('mcp-stdio').textContent = info.stdio_command;
       renderMcpPrompt();
     } catch (e) {
       $('mcp-state').textContent = '读取失败：' + e;
