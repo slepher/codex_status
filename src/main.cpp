@@ -15,6 +15,7 @@
 #include <string.h>
 #include <vector>
 #include <esp_sleep.h>
+#include <esp_ota_ops.h>
 
 #include "DEV_Config.h"
 #include "EPD_SSD1681.h"
@@ -27,7 +28,7 @@
 #include "template_engine.h"
 #include "template_xfer.h"
 
-#define FW_VERSION    "0.6.1-bw"
+#define FW_VERSION    "0.6.2-bw"
 #define AP_PASSWORD   "codex1234"
 #define OTA_PASSWORD  "codexota"
 #define MAX_SLOTS     3
@@ -44,6 +45,8 @@ static WebServer   server(80);
 static UBYTE      *frame = nullptr;
 static UBYTE      *lastDisplayedFrame = nullptr;
 static uint32_t    epdWriteCount = 0;
+static bool        otaRebootPending = false;
+static uint32_t    otaRebootAt = 0;
 static bool        configMode = false;
 static uint32_t    lastConnectedMs = 0;
 static uint32_t    nextFetchAt = 0;
@@ -682,10 +685,32 @@ static void startConfigMode() {
 }
 
 // ---------------- 正常模式 ----------------
+static const char *resetReasonName() {
+    switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:   return "power-on";
+    case ESP_RST_EXT:       return "external";
+    case ESP_RST_SW:        return "software";
+    case ESP_RST_PANIC:     return "panic";
+    case ESP_RST_INT_WDT:   return "int-wdt";
+    case ESP_RST_TASK_WDT:  return "task-wdt";
+    case ESP_RST_WDT:       return "wdt";
+    case ESP_RST_DEEPSLEEP: return "deep-sleep";
+    case ESP_RST_BROWNOUT:  return "brownout";
+    case ESP_RST_SDIO:      return "sdio";
+    default:                return "unknown";
+    }
+}
+
 static void handleStatus() {
     String html = F("<!DOCTYPE html><html><head><meta charset='utf-8'><title>Codex Status</title></head><body>");
     html += F("<h2>Codex Status</h2><ul>");
     html += "<li>Version: " FW_VERSION "</li>";
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    const esp_partition_t *next = esp_ota_get_next_update_partition(nullptr);
+    html += "<li>Running: " + String(running ? running->label : "?") +
+            " (next OTA slot: " + String(next ? next->label : "?") + ")</li>";
+    html += "<li>Reset reason: " + String(resetReasonName()) +
+            " (uptime " + String(millis() / 1000) + "s)</li>";
     html += "<li>SSID: " + WiFi.SSID() + "</li>";
     html += "<li>IP: " + WiFi.localIP().toString() + "</li>";
     html += "<li>RSSI: " + String(WiFi.RSSI()) + " dBm</li>";
@@ -746,10 +771,10 @@ static void startNormalMode() {
                 if (Update.write(up.buf, up.currentSize) != up.currentSize) Update.printError(Serial);
             } else if (up.status == UPLOAD_FILE_END) {
                 if (Update.end(true)) {
-                    Serial.printf("[ota] success %u bytes, rebooting\n", (unsigned)up.totalSize);
+                    Serial.printf("[ota] success %u bytes, rebooting shortly\n", (unsigned)up.totalSize);
                     screen({"OTA success", "Rebooting..."});
-                    delay(1000);
-                    ESP.restart();
+                    otaRebootPending = true;
+                    otaRebootAt = millis() + 1500;
                 } else {
                     Update.printError(Serial);
                 }
@@ -782,7 +807,10 @@ static void startNormalMode() {
 void setup() {
     epdBegin();
     screen({"CODEX STATUS", FW_VERSION, "booting..."});
-    Serial.printf("\n[codex-status] v%s mac=%s\n", FW_VERSION, WiFi.macAddress().c_str());
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    Serial.printf("\n[codex-status] v%s mac=%s reset=%s slot=%s\n", FW_VERSION,
+                  WiFi.macAddress().c_str(), resetReasonName(),
+                  running ? running->label : "?");
     { Preferences p; p.begin("brg", false); p.end(); }
 
     tplStoreBegin();
@@ -860,6 +888,7 @@ static void handleSerialCli() {
 }
 
 void loop() {
+    if (otaRebootPending && (int32_t)(millis() - otaRebootAt) >= 0) ESP.restart();
     handleSerialCli();
     server.handleClient();
     blePoll();
