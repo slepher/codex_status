@@ -68,7 +68,7 @@
   .switch.on { background: var(--accent); }
   .switch::after { content: ''; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #fff; transition: left .12s; }
   .switch.on::after { left: 22px; }
-  .xbtn { width: 22px; height: 22px; border-radius: 50%; border: 0; background: rgba(127,127,127,.35); color: #fff; font-weight: 700; cursor: pointer; line-height: 1; }
+  .xbtn { display: flex; align-items: center; justify-content: center; width: 22px; height: 22px; padding: 0; border-radius: 50%; border: 0; background: rgba(127,127,127,.35); color: #fff; font-weight: 700; font-size: 15px; line-height: 1; cursor: pointer; }
   .xbtn:hover { background: var(--err); }
 
   /* modal */
@@ -120,6 +120,12 @@
 
     <section class="panel" id="tab-device">
       <div class="card">
+        <div class="bar">
+          <div class="status" id="device-state">读取中…</div>
+          <div class="menus"><button onclick="refreshDevice()">刷新</button></div>
+        </div>
+      </div>
+      <div class="card">
         <h2>余量</h2>
         <div class="rings">
           <div class="ring"><b id="ring-week">--</b><small>周余量</small></div>
@@ -128,10 +134,15 @@
       </div>
       <div class="card">
         <h2>设备</h2>
-        <div class="row"><span>ROM 版本</span><span class="todo" id="dev-fw">待接入</span></div>
-        <div class="row"><span>运行槽位</span><span class="todo" id="dev-slot">待接入</span></div>
-        <div class="row"><span>电量</span><span class="todo" id="dev-batt">待接入</span></div>
-        <div class="row"><span>Wi-Fi / RSSI</span><span class="todo" id="dev-wifi">待接入</span></div>
+        <div class="row"><span>ROM 版本</span><span id="dev-fw">--</span></div>
+        <div class="row"><span>运行槽位</span><span id="dev-slot">--</span></div>
+        <div class="row"><span>重置原因</span><span id="dev-reset">--</span></div>
+        <div class="row"><span>电量</span><span id="dev-batt">--</span></div>
+        <div class="row"><span>Wi-Fi / RSSI</span><span id="dev-wifi">--</span></div>
+        <div class="row"><span>BLE 连接</span><span id="dev-ble">--</span></div>
+        <div class="row"><span>模板</span><span id="dev-templates">--</span></div>
+        <div class="row"><span>EPD 写入</span><span id="dev-epd">--</span></div>
+        <div class="row"><span>Free heap</span><span id="dev-heap">--</span></div>
         <div class="row"><span>最近 BLE 同步</span><span id="dev-sync">--</span></div>
       </div>
     </section>
@@ -211,6 +222,7 @@
       document.querySelectorAll('.tabs button').forEach((b) => b.classList.toggle('on', b === button));
       document.querySelectorAll('.panel').forEach((p) => p.classList.toggle('on', p.id === 'tab-' + button.dataset.tab));
       if (button.dataset.tab === 'templates') refreshProfiles();
+      if (button.dataset.tab === 'device') refreshDevice();
       if (button.dataset.tab === 'mcp') refreshMcp();
     });
   });
@@ -623,6 +635,10 @@
       $('dot').className = 'dot ' + (s.last_error ? 'err' : (s.last_sync ? 'ok' : 'warn'));
       knownTemplates = s.templates || [];
       trackPush(s);
+      if (document.querySelector('.tabs button[data-tab="device"]').classList.contains('on')
+          && Date.now() - lastDeviceFetch > 15000) {
+        refreshDevice();
+      }
     } catch (e) {
       $('sub').textContent = '读取失败：' + e;
     }
@@ -639,6 +655,32 @@
   }
 
   let lastPushAt = null;
+  let lastDeviceFetch = 0;
+
+  async function refreshDevice() {
+    lastDeviceFetch = Date.now();
+    try {
+      const d = await invoke('get_device_status');
+      if (!d.online) {
+        $('device-state').textContent = `设备离线（${d.ip}）${d.error ? '：' + d.error : ''}`;
+        ['dev-fw','dev-slot','dev-reset','dev-batt','dev-wifi','dev-ble','dev-templates','dev-epd','dev-heap'].forEach((id) => { $(id).textContent = '--'; });
+        return;
+      }
+      const f = d.fields || {};
+      $('device-state').textContent = `在线 · ${d.ip}`;
+      $('dev-fw').textContent = f['Version'] || '--';
+      $('dev-slot').textContent = f['Running'] || '--';
+      $('dev-reset').textContent = f['Reset reason'] || '--';
+      $('dev-batt').textContent = f['Battery'] || '—（固件 0.8.0 提供）';
+      $('dev-wifi').textContent = `${f['SSID'] || '--'} · ${f['RSSI'] || '--'}`;
+      $('dev-ble').textContent = f['BLE connected'] || '--';
+      $('dev-templates').textContent = f['Templates'] || '--';
+      $('dev-epd').textContent = f['EPD writes'] || '--';
+      $('dev-heap').textContent = f['Free heap'] || '--';
+    } catch (e) {
+      $('device-state').textContent = '读取失败：' + e;
+    }
+  }
 
   function trackPush(s) {
     const pending = s.pending || 0;

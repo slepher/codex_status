@@ -1,4 +1,5 @@
 pub mod codex;
+pub mod device;
 pub mod envelope;
 pub mod http;
 pub mod paths;

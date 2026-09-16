@@ -256,6 +256,7 @@ async fn mcp_handler(
         data_root: bridge_core::paths::data_root(),
         seeds: ctx.config.seeds.clone(),
         profile_seed: ctx.config.profile_seed.clone(),
+        device_ip: ctx.config.device_ip.clone(),
         root: ctx.root.clone(),
     };
     let tool = request
@@ -323,6 +324,32 @@ fn persist_mcp_port(_root: &Path, port: u16) {
     }
     if let Ok(text) = serde_json::to_string_pretty(&doc) {
         let _ = std::fs::write(&path, text);
+    }
+}
+
+#[tauri::command]
+async fn get_device_status(state: State<'_, Arc<AppCtx>>) -> Result<Value, String> {
+    let ip = state.config.device_ip.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        bridge_core::device::fetch(&ip, std::time::Duration::from_secs(3))
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    match result {
+        Ok(status) => {
+            let map: serde_json::Map<String, Value> = status
+                .fields
+                .iter()
+                .map(|(k, v)| (k.clone(), json!(v)))
+                .collect();
+            Ok(json!({"online": true, "ip": state.config.device_ip, "fields": map}))
+        }
+        Err(e) => Ok(json!({
+            "online": false,
+            "ip": state.config.device_ip,
+            "error": e.to_string(),
+            "fields": {},
+        })),
     }
 }
 
@@ -767,6 +794,7 @@ fn main() {
         }))
         .invoke_handler(tauri::generate_handler![
             get_status,
+            get_device_status,
             preview_template,
             force_sync,
             set_paused,
