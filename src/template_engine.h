@@ -5,6 +5,7 @@ struct TplEnv {
     String channel;   // "WIFI" / "BLE"
     String ip;
     String syncHHMM;  // "--:--" when unknown
+    int battery = -1; // percentage, or -1 when the device value is unknown
 };
 
 // Draw a template onto the current Paint image (caller has cleared the frame).

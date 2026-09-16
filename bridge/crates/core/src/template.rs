@@ -41,6 +41,7 @@ pub enum BindSpec {
     DeviceChannel,
     DeviceIp,
     DeviceSync,
+    DeviceBattery,
     Bucket {
         bucket: String,
         win: WinSel,
@@ -60,6 +61,7 @@ pub fn parse_bind(path: &str) -> Option<BindSpec> {
         "device.channel" => return Some(BindSpec::DeviceChannel),
         "device.ip" => return Some(BindSpec::DeviceIp),
         "device.sync_hhmm" => return Some(BindSpec::DeviceSync),
+        "device.battery" => return Some(BindSpec::DeviceBattery),
         _ => {}
     }
     let rest = path.strip_prefix("buckets[")?;
@@ -126,7 +128,58 @@ fn rect_ok(rect: Option<&Value>) -> bool {
     w > 0 && h > 0
 }
 
+fn text_region_ok(region: Option<&Value>) -> bool {
+    let Some(arr) = region.and_then(|r| r.as_array()) else {
+        return false;
+    };
+    if arr.len() != 4 {
+        return false;
+    }
+    let x = arr[0].as_i64();
+    let y = arr[1].as_i64();
+    let w = arr[2].as_i64();
+    let h = arr[3].as_i64();
+    let (Some(x), Some(y), Some(w), Some(h)) = (x, y, w, h) else {
+        return false;
+    };
+    x >= 0 && y >= 0 && x < CANVAS && y < CANVAS && w > 0 && h > 0
+        && w <= CANVAS && h <= CANVAS && x <= CANVAS - w && y <= CANVAS - h
+}
+
+fn epoch_bind(bind: &str) -> bool {
+    matches!(
+        parse_bind(bind),
+        Some(BindSpec::ServerTime)
+            | Some(BindSpec::ResetExpires)
+            | Some(BindSpec::Bucket {
+                field: BindField::ResetsAt,
+                ..
+            })
+    )
+}
+
+fn validate_condition(e: &Value) -> Result<(), String> {
+    let Some(raw) = e.get("when") else {
+        return Ok(());
+    };
+    let Some(obj) = raw.as_object() else {
+        return Err("when".into());
+    };
+    if obj.len() != 2 || obj.keys().any(|key| key != "bind" && key != "exists") {
+        return Err("when".into());
+    }
+    let bind = obj.get("bind").and_then(|v| v.as_str()).ok_or("when bind")?;
+    if parse_bind(bind).is_none() {
+        return Err(format!("when bind {bind}"));
+    }
+    if obj.get("exists").and_then(|v| v.as_bool()).is_none() {
+        return Err("when exists".into());
+    }
+    Ok(())
+}
+
 fn validate_element(e: &Value) -> Result<(), String> {
+    validate_condition(e)?;
     let ty = e.get("type").and_then(|v| v.as_str()).ok_or("type")?;
     match ty {
         "text" => {
@@ -141,6 +194,33 @@ fn validate_element(e: &Value) -> Result<(), String> {
             }
             if !bind.is_empty() && parse_bind(bind).is_none() {
                 return Err(format!("bind {bind}"));
+            }
+            if let Some(scale) = e.get("scale") {
+                let scale = scale.as_i64().ok_or("scale")?;
+                if !(1..=3).contains(&scale) {
+                    return Err("scale".into());
+                }
+            }
+            if e.get("region").is_some() && !text_region_ok(e.get("region")) {
+                return Err("region".into());
+            }
+            if let Some(align) = e.get("align") {
+                if e.get("region").is_none() {
+                    return Err("align".into());
+                }
+                match align.as_str() {
+                    Some("left") | Some("center") | Some("right") => {}
+                    _ => return Err("align".into()),
+                }
+            }
+            if let Some(format) = e.get("time_format") {
+                let format = format.as_str().ok_or("time_format")?;
+                if !matches!(format, "date" | "hhmm")
+                    || bind.is_empty()
+                    || !epoch_bind(bind)
+                {
+                    return Err("time_format".into());
+                }
             }
         }
         "bar" => {

@@ -12,6 +12,7 @@
 #include <ESPmDNS.h>
 #include <ArduinoJson.h>
 #include <time.h>
+#include <string.h>
 #include <vector>
 #include <esp_sleep.h>
 
@@ -26,7 +27,7 @@
 #include "template_engine.h"
 #include "template_xfer.h"
 
-#define FW_VERSION    "0.4.2-bw"
+#define FW_VERSION    "0.5.0-bw"
 #define AP_PASSWORD   "codex1234"
 #define OTA_PASSWORD  "codexota"
 #define MAX_SLOTS     3
@@ -41,6 +42,8 @@ static const int EPD_FB_BYTES = (EPD_W / 8) * EPD_H;
 static Preferences prefs;
 static WebServer   server(80);
 static UBYTE      *frame = nullptr;
+static UBYTE      *lastDisplayedFrame = nullptr;
+static uint32_t    epdWriteCount = 0;
 static bool        configMode = false;
 static uint32_t    lastConnectedMs = 0;
 static uint32_t    nextFetchAt = 0;
@@ -60,7 +63,6 @@ static String activeTplId;
 static uint32_t gNextSyncSec = 300;
 
 static String lastUsage;
-static String lastUsageSig;
 static String lastChannel = "-";
 static String renderedIp;
 static uint32_t lastSyncMs = 0;
@@ -68,6 +70,8 @@ static time_t   lastSyncEpoch = 0;
 static uint32_t lastOkMs = 0;
 static bool     usageOnScreen = false;
 static String   screenSig;
+static String   renderedMinute;
+static int      renderedBattery = -1;
 static int      epdPartialCount = 0;
 static bool     epdPartialReady = false;
 
@@ -123,33 +127,25 @@ struct WinInfo {
 static WinInfo findWindow(JsonDocument &doc, bool fiveHour) {
     WinInfo r;
     JsonArray buckets = doc["buckets"].as<JsonArray>();
+    JsonObject codex;
     for (JsonObject b : buckets) {
-        JsonArray wins = b["windows"].as<JsonArray>();
-        for (JsonObject w : wins) {
-            int wm = w["windowMins"] | 0;
-            bool match = fiveHour ? (wm == 300) : (wm >= 10080);
-            if (!match) continue;
-            r.found = true;
-            r.used = w["usedPercent"] | -1;
-            r.resets = w["resetsAt"] | 0LL;
-            return r;
+        if (String((const char *)(b["id"] | "")) == "codex") {
+            codex = b;
+            break;
         }
     }
+    if (codex.isNull()) return r;
+    JsonArray wins = codex["windows"].as<JsonArray>();
+    for (JsonObject w : wins) {
+        int wm = w["windowMins"] | 0;
+        bool match = fiveHour ? (wm == 300) : (wm >= 10080);
+        if (!match) continue;
+        r.found = true;
+        r.used = w["usedPercent"] | -1;
+        r.resets = w["resetsAt"] | 0LL;
+        return r;
+    }
     return r;
-}
-
-static String usageSig(const String &json) {
-    JsonDocument doc;
-    if (deserializeJson(doc, json)) return String("bad");
-    const char *plan  = doc["account"]["plan"] | "?";
-    const char *label = doc["bridge"]["label"] | "?";
-    int rc = doc["resetCredits"]["availableCount"] | -1;
-    WinInfo fh = findWindow(doc, true);
-    WinInfo wk = findWindow(doc, false);
-    char buf[128];
-    snprintf(buf, sizeof(buf), "%s|%s|%d|%d|%lld|%d|%lld",
-             plan, label, rc, wk.used, wk.resets, fh.used, fh.resets);
-    return String(buf);
 }
 
 static void screenIdle() {
@@ -207,6 +203,12 @@ static void epdBegin() {
         Serial.println("[epd] frame buffer malloc failed");
         return;
     }
+    lastDisplayedFrame = (UBYTE *)malloc(EPD_FB_BYTES);
+    if (lastDisplayedFrame) {
+        memset(lastDisplayedFrame, 0xFF, EPD_FB_BYTES);
+    } else {
+        Serial.println("[epd] last-display buffer malloc failed; writes will not be skipped");
+    }
     Paint_NewImage(frame, EPD_W, EPD_H, 0, WHITE);
     Paint_SetScale(2);
     Paint_SelectImage(frame);
@@ -219,12 +221,17 @@ static void epdBegin() {
 // full refresh every 30 partials to clear ghosting.
 static void epdFlush(bool fullRefresh) {
     if (!frame) return;
+    if (lastDisplayedFrame && memcmp(frame, lastDisplayedFrame, EPD_FB_BYTES) == 0) return;
     if (!fullRefresh && epdPartialReady) {
         EPD_SSD1681_DisplayPart(frame);
+        epdWriteCount++;
+        if (lastDisplayedFrame) memcpy(lastDisplayedFrame, frame, EPD_FB_BYTES);
         if (++epdPartialCount < 30) return;
     }
     if (epdPartialReady) EPD_SSD1681_Init();   // reload full-refresh LUT
     EPD_SSD1681_Display(frame);
+    epdWriteCount++;
+    if (lastDisplayedFrame) memcpy(lastDisplayedFrame, frame, EPD_FB_BYTES);
     EPD_SSD1681_Init_Partial();
     epdPartialReady = true;
     epdPartialCount = 0;
@@ -233,7 +240,7 @@ static void epdFlush(bool fullRefresh) {
 // ---- Quad built-in screen (B/W design, partial refresh) ----
 // Block size matches the factory UI proportions (~52% x 34% of the panel).
 static const int Q_BLK_W = 104;
-static const int Q_BLK_H = 68;
+static const int Q_BLK_H = 90;
 static const int Q_TL_X  = 4;
 static const int Q_TL_Y  = 4;
 static const int Q_BR_X  = EPD_W - 4 - Q_BLK_W;
@@ -302,16 +309,6 @@ static void drawHeroBlock(int x, int y, const String &value) {
     drawBigCentered(value, x, y, Q_BLK_W, Q_BLK_H);
 }
 
-static void drawInfinityBlock(int x, int y) {
-    Paint_DrawRectangle(x, y, x + Q_BLK_W - 1, y + Q_BLK_H - 1, BLACK, DOT_PIXEL_1X1, DRAW_FILL_FULL);
-    int cx = x + Q_BLK_W / 2;
-    int cy = y + Q_BLK_H / 2;
-    Paint_DrawCircle(cx - 17, cy, 20, WHITE, DOT_PIXEL_1X1, DRAW_FILL_FULL);
-    Paint_DrawCircle(cx + 17, cy, 20, WHITE, DOT_PIXEL_1X1, DRAW_FILL_FULL);
-    Paint_DrawCircle(cx - 17, cy, 9, BLACK, DOT_PIXEL_1X1, DRAW_FILL_FULL);
-    Paint_DrawCircle(cx + 17, cy, 9, BLACK, DOT_PIXEL_1X1, DRAW_FILL_FULL);
-}
-
 static void drawSmallRight(const String &s, int right, int y) {
     int w = (int)s.length() * Font12.Width;
     Paint_DrawString_EN(right - w, y, s.c_str(), &Font12, WHITE, BLACK);
@@ -340,10 +337,11 @@ static void renderUsage(const String &json, const char *channel) {
 
     drawHeroBlock(Q_TL_X, Q_TL_Y, (wk.found && wk.used >= 0) ? String(100 - wk.used) : String("--"));
     if (fh.found) drawHeroBlock(Q_BR_X, Q_BR_Y, (fh.used >= 0) ? String(100 - fh.used) : String("--"));
-    else          drawInfinityBlock(Q_BR_X, Q_BR_Y);
+    else          drawHeroBlock(Q_BR_X, Q_BR_Y, String("100"));
 
     String rcLine = (rc >= 0) ? String("RC ") + rc : String("RC --");
     std::vector<String> tr, bl;
+    int battery = batteryPercent();
 
     // Pre-confirmed fixed layout: "MM-DD HH:MM" is 11 chars x Font12.Width(7)
     // = 77px, which fits the 98px available right of the week block, so the
@@ -355,7 +353,7 @@ static void renderUsage(const String &json, const char *channel) {
     tr.push_back(fmtEpoch(wk.resets, "%m-%d %H:%M"));
     tr.push_back(rcLine);
     if (fh.found) bl.push_back(String("5H ") + fmtEpoch(fh.resets, "%H:%M"));
-    bl.push_back(String("BATT ") + batteryPercent() + "%");
+    bl.push_back(String("BATT ") + battery + "%");
     bl.push_back(String("SYNC ") + nowHHMM());
 
     for (int i = 0; i < (int)tr.size(); i++)
@@ -367,6 +365,8 @@ static void renderUsage(const String &json, const char *channel) {
     epdFlush(true);
     usageOnScreen = true;
     renderedIp = ipText();
+    renderedMinute = nowHHMM();
+    renderedBattery = battery;
     screenSig = String("usage");
     Serial.printf("[ui] quad rendered (wk=%d fh=%d ch=%s)\n",
                   wk.used, fh.used, channel ? channel : "");
@@ -405,12 +405,15 @@ static void renderActiveUsage(const String &json, const char *channel) {
         env.channel   = channel ? channel : "";
         env.ip        = ipText();
         env.syncHHMM  = nowHHMM();
+        env.battery   = batteryPercent();
         Paint_SelectImage(frame);
         Paint_Clear(WHITE);
         if (tplDraw(activeTplJson, json, env)) {
             epdFlush(true);
             usageOnScreen = true;
             renderedIp = ipText();
+            renderedMinute = env.syncHHMM;
+            renderedBattery = env.battery;
             screenSig = String("usage");
             Serial.printf("[tpl] rendered %s (%s)\n", activeTplId.c_str(), channel ? channel : "");
             return;
@@ -457,7 +460,6 @@ static void maybeFetchTemplate(const EndpointRec &rec, const String &usageJson) 
                 if (tplStoreActive().length() == 0 || tplStoreActive() == id) {
                     tplStoreSetActive(id);
                     activeTplId = "";
-                    lastUsageSig = "";
                 }
                 updateInfoExtra();
                 Serial.printf("[tpl] fetched %s hash=%s\n", id.c_str(), hash.c_str());
@@ -518,6 +520,11 @@ static bool tryWifiUsage() {
         if (!storeGet(idx, rec)) continue;
         String out, err;
         if (usageHttpGet(rec, out, err)) {
+            JsonDocument parsed;
+            if (deserializeJson(parsed, out) || parsed.as<JsonObject>().isNull()) {
+                Serial.println("[wifi] usage rejected: invalid JSON");
+                continue;
+            }
             storeTouch(rec.mac);
             lastSyncMs = millis();
             lastOkMs = millis();
@@ -532,13 +539,9 @@ static bool tryWifiUsage() {
                     if (ns >= 60 && ns <= 86400) gNextSyncSec = ns;
                 }
             }
-            String sig = usageSig(out);
-            if (sig != lastUsageSig || lastChannel != "WIFI" || !usageOnScreen) {
-                lastUsage = out;
-                lastUsageSig = sig;
-                lastChannel = "WIFI";
-                renderActiveUsage(out, "WIFI");
-            }
+            lastUsage = out;
+            lastChannel = "WIFI";
+            renderActiveUsage(lastUsage, "WIFI");
             return true;
         }
         Serial.printf("[wifi] %s:%u failed: %s\n", rec.host.c_str(), rec.port, err.c_str());
@@ -547,6 +550,11 @@ static bool tryWifiUsage() {
 }
 
 static void handleBleUsage(const String &json) {
+    JsonDocument parsed;
+    if (deserializeJson(parsed, json) || parsed.as<JsonObject>().isNull()) {
+        bleNotifyStatus("{\"ack\":\"usage\",\"ok\":false}");
+        return;
+    }
     pendingUsage = json;
     pendingChannel = "BLE";
     pendingUsageReady = true;
@@ -674,7 +682,12 @@ static void handleStatus() {
     html += "<li>BLE connected: " + String(bleIsConnected() ? "yes" : "no") + "</li>";
     html += "<li>Endpoints stored: " + String(storeCount()) + "</li>";
     html += "<li>Last channel: " + lastChannel + "</li>";
-    html += "<li>Templates: " + String(tplStoreCount()) + " (active: " + tplStoreActive() + ")</li>";
+    String activeId = tplStoreActive();
+    TplMeta activeMeta;
+    String activeHash = tplStoreFind(activeId, activeMeta) ? activeMeta.hash : "";
+    html += "<li>Templates: " + String(tplStoreCount()) + " (active: " + activeId +
+            (activeHash.length() ? String(" hash ") + activeHash : String("")) + ")</li>";
+    html += "<li>EPD writes: " + String(epdWriteCount) + "</li>";
     html += "<li>Free heap: " + String(ESP.getFreeHeap()) + "</li>";
     html += F("</ul><p><a href='/update'>Firmware OTA update</a></p></body></html>");
     server.send(200, "text/html", html);
@@ -890,13 +903,17 @@ void loop() {
         }
         if (pendingUsageReady) {
             pendingUsageReady = false;
-            lastUsage = pendingUsage;
-            lastUsageSig = usageSig(pendingUsage);
-            lastChannel = pendingChannel;
-            lastSyncMs = millis();
-            lastOkMs = millis();
-            lastSyncEpoch = time(nullptr);
-            renderActiveUsage(lastUsage, lastChannel.c_str());
+            JsonDocument parsed;
+            if (!deserializeJson(parsed, pendingUsage) && !parsed.as<JsonObject>().isNull()) {
+                lastUsage = pendingUsage;
+                lastChannel = pendingChannel;
+                lastSyncMs = millis();
+                lastOkMs = millis();
+                lastSyncEpoch = time(nullptr);
+                renderActiveUsage(lastUsage, lastChannel.c_str());
+            } else {
+                Serial.println("[usage] BLE usage rejected: invalid JSON");
+            }
         }
 
         static uint32_t lastStatusAt = 0;
@@ -904,8 +921,11 @@ void loop() {
             lastStatusAt = millis();
             String sig = String("idle|") + ipText() + "|" + String(bridgeOk()) + "|" + String(bleIsConnected());
             if (usageOnScreen) {
-                if (renderedIp != ipText() && lastUsage.length()) {
-                    renderedIp = ipText();
+                String minute = nowHHMM();
+                int battery = batteryPercent();
+                if (!pairingOverlayActive() && lastUsage.length() &&
+                    (renderedIp != ipText() || renderedMinute != minute ||
+                     renderedBattery != battery)) {
                     renderActiveUsage(lastUsage, lastChannel.c_str());
                 }
             } else if (sig != screenSig) {

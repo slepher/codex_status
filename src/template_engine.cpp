@@ -15,8 +15,12 @@ enum BindKind {
     B_PLAN, B_LABEL, B_HOSTID, B_SERVER_TIME,
     B_RESET_COUNT, B_RESET_EXPIRES,
     B_BUCKET_USED, B_BUCKET_REMAIN, B_BUCKET_RESET, B_BUCKET_WINMINS,
-    B_DEV_CHANNEL, B_DEV_IP, B_DEV_SYNC
+    B_DEV_CHANNEL, B_DEV_IP, B_DEV_SYNC, B_DEV_BATTERY
 };
+
+// The optional JSON "time_format" accepts exactly "date" (the compact local
+// MM-DD HH:MM default) or "hhmm" (reserved for epoch bindings).
+enum TextTimeFormat { TTF_DATE, TTF_HHMM };
 
 // winMode: 0 = weekly, 1 = 5h, 2 = index (winIndex)
 struct BindSpec {
@@ -24,6 +28,12 @@ struct BindSpec {
     String   bucket;
     int      winMode  = 0;
     int      winIndex = 0;
+};
+
+struct DrawCondition {
+    bool active = false;
+    BindSpec bind;
+    bool exists = false;
 };
 
 static sFONT *fontByName(const char *name) {
@@ -78,6 +88,7 @@ static bool parseBind(const String &path, BindSpec &s) {
     if (path == "device.channel")             { s.kind = B_DEV_CHANNEL; return true; }
     if (path == "device.ip")                  { s.kind = B_DEV_IP; return true; }
     if (path == "device.sync_hhmm")           { s.kind = B_DEV_SYNC; return true; }
+    if (path == "device.battery")              { s.kind = B_DEV_BATTERY; return true; }
     if (path.startsWith("buckets[")) {
         int close = path.indexOf(']', 8);
         if (close < 0) return false;
@@ -109,6 +120,26 @@ static bool parseBind(const String &path, BindSpec &s) {
     return false;
 }
 
+static bool isEpochBind(const BindSpec &s) {
+    return s.kind == B_SERVER_TIME || s.kind == B_RESET_EXPIRES ||
+           s.kind == B_BUCKET_RESET;
+}
+
+static bool parseTimeFormat(JsonVariant v, const BindSpec &s, TextTimeFormat &fmt) {
+    if (v.isNull()) return false;
+    const char *value = v.as<const char *>();
+    if (!value || !isEpochBind(s)) return false;
+    if (!strcmp(value, "date")) {
+        fmt = TTF_DATE;
+        return true;
+    }
+    if (!strcmp(value, "hhmm")) {
+        fmt = TTF_HHMM;
+        return true;
+    }
+    return false;
+}
+
 static bool findWindow(JsonDocument &usage, const BindSpec &s, JsonObject &w) {
     JsonArray buckets = usage["buckets"].as<JsonArray>();
     if (buckets.isNull()) return false;
@@ -132,17 +163,20 @@ static bool findWindow(JsonDocument &usage, const BindSpec &s, JsonObject &w) {
     return false;
 }
 
-static String fmtEpoch(long long epoch) {
+static String fmtEpoch(long long epoch, TextTimeFormat format = TTF_DATE) {
     char b[24] = "--";
     if (epoch > 0) {
         time_t t = (time_t)epoch;
         struct tm *lt = localtime(&t);
-        if (lt && t > 1600000000) strftime(b, sizeof(b), "%m-%d %H:%M", lt);
+        if (lt && t > 1600000000) {
+            strftime(b, sizeof(b), format == TTF_HHMM ? "%H:%M" : "%m-%d %H:%M", lt);
+        }
     }
     return String(b);
 }
 
-static bool evalBind(const BindSpec &s, JsonDocument &usage, const TplEnv &env, String &out) {
+static bool evalBind(const BindSpec &s, TextTimeFormat format, JsonDocument &usage,
+                     const TplEnv &env, String &out) {
     switch (s.kind) {
     case B_PLAN:    out = String((const char *)(usage["account"]["plan"] | "--")); return true;
     case B_LABEL:   out = String((const char *)(usage["bridge"]["label"] | "--")); return true;
@@ -150,18 +184,37 @@ static bool evalBind(const BindSpec &s, JsonDocument &usage, const TplEnv &env, 
     case B_DEV_CHANNEL: out = env.channel.length() ? env.channel : "--"; return true;
     case B_DEV_IP:      out = env.ip; return true;
     case B_DEV_SYNC:    out = env.syncHHMM; return true;
-    case B_SERVER_TIME: out = fmtEpoch(usage["server_time"] | 0LL); return true;
+    case B_DEV_BATTERY: out = env.battery >= 0 ? String(env.battery) : "--"; return true;
+    case B_SERVER_TIME:
+        if (usage["server_time"].isNull()) return false;
+        out = fmtEpoch(usage["server_time"] | 0LL, format);
+        return true;
     case B_RESET_COUNT: out = String(usage["resetCredits"]["availableCount"] | 0); return true;
-    case B_RESET_EXPIRES: out = fmtEpoch(usage["resetCredits"]["nextExpiresAt"] | 0LL); return true;
+    case B_RESET_EXPIRES:
+        if (usage["resetCredits"]["nextExpiresAt"].isNull()) return false;
+        out = fmtEpoch(usage["resetCredits"]["nextExpiresAt"] | 0LL, format);
+        return true;
     default: break;
     }
     JsonObject w;
     if (!findWindow(usage, s, w)) return false;
     switch (s.kind) {
-    case B_BUCKET_USED:    out = String(w["usedPercent"] | 0); return true;
-    case B_BUCKET_REMAIN:  out = String(100 - (w["usedPercent"] | 0)); return true;
-    case B_BUCKET_RESET:   out = fmtEpoch(w["resetsAt"] | 0LL); return true;
-    case B_BUCKET_WINMINS: out = String(w["windowMins"] | 0); return true;
+    case B_BUCKET_USED:
+        if (w["usedPercent"].isNull()) return false;
+        out = String(w["usedPercent"] | 0);
+        return true;
+    case B_BUCKET_REMAIN:
+        if (w["usedPercent"].isNull()) return false;
+        out = String(100 - (w["usedPercent"] | 0));
+        return true;
+    case B_BUCKET_RESET:
+        if (w["resetsAt"].isNull()) return false;
+        out = fmtEpoch(w["resetsAt"] | 0LL, format);
+        return true;
+    case B_BUCKET_WINMINS:
+        if (w["windowMins"].isNull()) return false;
+        out = String(w["windowMins"] | 0);
+        return true;
     default: return false;
     }
 }
@@ -174,12 +227,118 @@ static bool evalBindNum(const BindSpec &s, JsonDocument &usage, double &v) {
     JsonObject w;
     if (!findWindow(usage, s, w)) return false;
     switch (s.kind) {
-    case B_BUCKET_USED:    v = w["usedPercent"] | 0; return true;
-    case B_BUCKET_REMAIN:  v = 100 - (w["usedPercent"] | 0); return true;
-    case B_BUCKET_RESET:   v = w["resetsAt"] | 0LL; return true;
-    case B_BUCKET_WINMINS: v = w["windowMins"] | 0; return true;
+    case B_BUCKET_USED:
+        if (w["usedPercent"].isNull()) return false;
+        v = w["usedPercent"] | 0;
+        return true;
+    case B_BUCKET_REMAIN:
+        if (w["usedPercent"].isNull()) return false;
+        v = 100 - (w["usedPercent"] | 0);
+        return true;
+    case B_BUCKET_RESET:
+        if (w["resetsAt"].isNull()) return false;
+        v = w["resetsAt"] | 0LL;
+        return true;
+    case B_BUCKET_WINMINS:
+        if (w["windowMins"].isNull()) return false;
+        v = w["windowMins"] | 0;
+        return true;
     default: return false;
     }
+}
+
+static bool bindExists(const BindSpec &s, JsonDocument &usage, const TplEnv &env,
+                       bool haveUsage) {
+    switch (s.kind) {
+    case B_DEV_CHANNEL: return env.channel.length() > 0;
+    case B_DEV_IP:      return env.ip.length() > 0;
+    case B_DEV_SYNC:    return env.syncHHMM.length() > 0 && env.syncHHMM != "--:--";
+    case B_DEV_BATTERY: return env.battery >= 0;
+    case B_PLAN:        return haveUsage && !usage["account"]["plan"].isNull();
+    case B_LABEL:       return haveUsage && !usage["bridge"]["label"].isNull();
+    case B_HOSTID:      return haveUsage && !usage["bridge"]["hostId"].isNull();
+    case B_SERVER_TIME: return haveUsage && !usage["server_time"].isNull();
+    case B_RESET_COUNT: return haveUsage && !usage["resetCredits"]["availableCount"].isNull();
+    case B_RESET_EXPIRES: return haveUsage && !usage["resetCredits"]["nextExpiresAt"].isNull();
+    default: break;
+    }
+    if (!haveUsage) return false;
+    JsonObject w;
+    if (!findWindow(usage, s, w)) return false;
+    switch (s.kind) {
+    case B_BUCKET_USED:
+    case B_BUCKET_REMAIN: return !w["usedPercent"].isNull();
+    case B_BUCKET_RESET:   return !w["resetsAt"].isNull();
+    case B_BUCKET_WINMINS: return !w["windowMins"].isNull();
+    default: return false;
+    }
+}
+
+static bool parseCondition(JsonObject e, DrawCondition &condition) {
+    JsonVariant raw = e["when"];
+    if (!e.containsKey("when")) return true;
+    if (raw.isNull()) return false;
+    if (!raw.is<JsonObject>()) return false;
+    JsonObject obj = raw.as<JsonObject>();
+    if (obj.size() != 2 || obj["bind"].isNull() || obj["exists"].isNull()) return false;
+    for (JsonPair kv : obj) {
+        const char *key = kv.key().c_str();
+        if (strcmp(key, "bind") && strcmp(key, "exists")) return false;
+    }
+    const char *bind = obj["bind"].as<const char *>();
+    if (!bind || !parseBind(String(bind), condition.bind)) return false;
+    if (!obj["exists"].is<bool>()) return false;
+    condition.exists = obj["exists"].as<bool>();
+    condition.active = true;
+    return true;
+}
+
+static bool conditionMatches(const DrawCondition &condition, JsonDocument &usage,
+                             const TplEnv &env, bool haveUsage) {
+    if (!condition.active) return true;
+    return bindExists(condition.bind, usage, env, haveUsage) == condition.exists;
+}
+
+static bool textScale(JsonVariant value, int &scale) {
+    if (value.isNull()) return false;
+    if (!value.is<int>()) return false;
+    scale = value.as<int>();
+    return scale >= 1 && scale <= 3;
+}
+
+static bool textRegion(JsonVariant value, int &x, int &y, int &w, int &h) {
+    if (value.isNull()) return false;
+    JsonArray r = value.as<JsonArray>();
+    if (r.isNull() || r.size() != 4) return false;
+    if (!r[0].is<int>() || !r[1].is<int>() || !r[2].is<int>() || !r[3].is<int>()) return false;
+    x = r[0].as<int>(); y = r[1].as<int>(); w = r[2].as<int>(); h = r[3].as<int>();
+    return x >= 0 && y >= 0 && x < TPL_W && y < TPL_H &&
+           w > 0 && h > 0 && w <= TPL_W && h <= TPL_H &&
+           x <= TPL_W - w && y <= TPL_H - h;
+}
+
+static bool parseTextLayout(JsonObject e, BindSpec *spec, int &scale,
+                            bool &hasRegion, int &rx, int &ry, int &rw, int &rh,
+                            TextTimeFormat &format) {
+    if (e.containsKey("scale")) {
+        if (!textScale(e["scale"], scale)) return false;
+    } else {
+        scale = 1;
+    }
+    hasRegion = e.containsKey("region");
+    if (hasRegion && !textRegion(e["region"], rx, ry, rw, rh)) return false;
+    JsonVariant align = e["align"];
+    if (e.containsKey("align")) {
+        if (!hasRegion || !align.is<const char *>()) return false;
+        const char *a = align.as<const char *>();
+        if (strcmp(a, "left") && strcmp(a, "center") && strcmp(a, "right")) return false;
+    }
+    if (e.containsKey("time_format")) {
+        if (!spec || !parseTimeFormat(e["time_format"], *spec, format)) return false;
+    } else {
+        format = TTF_DATE;
+    }
+    return true;
 }
 
 static bool decodeBase64(const char *in, uint8_t *out, size_t outLen) {
@@ -187,6 +346,38 @@ static bool decodeBase64(const char *in, uint8_t *out, size_t outLen) {
     int rc = mbedtls_base64_decode(out, outLen, &olen,
                                    (const unsigned char *)in, strlen(in));
     return rc == 0 && olen == outLen;
+}
+
+static void drawScaledText(const String &value, sFONT *font, int x, int y,
+                           int scale, int fg, int bg, bool clipped,
+                           int clipX, int clipY, int clipW, int clipH) {
+    int bytesPerRow = (font->Width + 7) / 8;
+    int cursor = x;
+    for (size_t i = 0; i < value.length(); i++) {
+        char c = value[i];
+        if (c < ' ' || c > '~') c = '?';
+        size_t offset = (size_t)(c - ' ') * font->Height * bytesPerRow;
+        const uint8_t *glyph = font->table + offset;
+        for (int row = 0; row < font->Height; row++) {
+            for (int col = 0; col < font->Width; col++) {
+                bool ink = (glyph[row * bytesPerRow + col / 8] & (0x80 >> (col % 8))) != 0;
+                if (!ink && bg == COLOR_NONE) continue;
+                int px0 = cursor + col * scale;
+                int py0 = y + row * scale;
+                for (int sy = 0; sy < scale; sy++) {
+                    for (int sx = 0; sx < scale; sx++) {
+                        int px = px0 + sx;
+                        int py = py0 + sy;
+                        if (px < 0 || py < 0 || px >= TPL_W || py >= TPL_H) continue;
+                        if (clipped && (px < clipX || py < clipY ||
+                                        px >= clipX + clipW || py >= clipY + clipH)) continue;
+                        Paint_SetPixel((UWORD)px, (UWORD)py, (UWORD)(ink ? fg : bg));
+                    }
+                }
+            }
+        }
+        cursor += font->Width * scale;
+    }
 }
 
 static bool drawIcon(const uint8_t *bits, int x, int y, int w, int h, int fg) {
@@ -217,6 +408,9 @@ static bool clampRect(JsonArray r, int &x, int &y, int &w, int &h) {
 static bool drawElements(JsonArray els, JsonDocument &usage, const TplEnv &env,
                          bool haveUsage, bool dry) {
     for (JsonObject e : els) {
+        DrawCondition condition;
+        if (!parseCondition(e, condition)) return false;
+        if (!dry && !conditionMatches(condition, usage, env, haveUsage)) continue;
         const char *type = e["type"] | "";
         if (!strcmp(type, "text")) {
             sFONT *font = fontByName(e["font"] | "");
@@ -226,20 +420,44 @@ static bool drawElements(JsonArray els, JsonDocument &usage, const TplEnv &env,
             if (!strlen(bind) && !strlen(text)) return false;
             BindSpec spec;
             if (strlen(bind) && !parseBind(String(bind), spec)) return false;
+            int scale = 1, rx = 0, ry = 0, rw = 0, rh = 0;
+            bool hasRegion = false;
+            TextTimeFormat format = TTF_DATE;
+            if (!parseTextLayout(e, strlen(bind) ? &spec : nullptr, scale,
+                                 hasRegion, rx, ry, rw, rh, format)) return false;
             if (!dry) {
                 String val;
                 if (strlen(bind)) {
                     if (!haveUsage) val = "--";
-                    else if (!evalBind(spec, usage, env, val)) val = "--";
+                    else if (!evalBind(spec, format, usage, env, val)) val = "--";
                 } else {
                     val = text;
                 }
                 val = asciiOnly(String((const char *)(e["prefix"] | "")) + val +
                                 String((const char *)(e["suffix"] | "")));
-                int x = e["x"] | 0, y = e["y"] | 0;
                 int fg = colorVal(e["color"], 0);
                 int bg = e["bg"] ? colorVal(e["bg"], 1) : 1;
-                Paint_DrawString_EN(x, y, val.c_str(), font, (UWORD)bg, (UWORD)fg);
+                int x = e["x"] | 0, y = e["y"] | 0;
+                if (!hasRegion && scale == 1) {
+                    Paint_DrawString_EN(x, y, val.c_str(), font, (UWORD)bg, (UWORD)fg);
+                } else {
+                    int useScale = scale;
+                    int textW = (int)val.length() * font->Width * useScale;
+                    while (hasRegion && useScale > 1 &&
+                           (textW > rw || font->Height * useScale > rh)) {
+                        useScale--;
+                        textW = (int)val.length() * font->Width * useScale;
+                    }
+                    if (hasRegion) {
+                        const char *align = e["align"] | "left";
+                        x = rx;
+                        if (!strcmp(align, "center")) x = rx + (rw - textW) / 2;
+                        else if (!strcmp(align, "right")) x = rx + rw - textW;
+                        y = ry + (rh - font->Height * useScale) / 2;
+                    }
+                    drawScaledText(val, font, x, y, useScale, fg, bg,
+                                   hasRegion, rx, ry, rw, rh);
+                }
             }
         } else if (!strcmp(type, "bar")) {
             const char *bind = e["bind"] | "";
@@ -334,6 +552,7 @@ bool tplValidate(const String &tmplJson, String &err) {
     env.channel = "--";
     env.ip = "--";
     env.syncHHMM = "--:--";
+    env.battery = -1;
     if (!drawElements(els, empty, env, false, true)) { err = "element"; return false; }
     return true;
 }

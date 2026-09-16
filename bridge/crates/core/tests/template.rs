@@ -19,6 +19,9 @@ fn hashes_match_python_test_bridge() {
     assert_eq!(mini.hash, "e6ba459e");
     assert_eq!(full.version, 3);
     assert_eq!(mini.version, 2);
+    let quad = library.get("quad").expect("quad template");
+    assert_eq!(quad.version, 1);
+    assert_eq!(quad.min_fw.as_deref(), Some("0.5"));
 }
 
 #[test]
@@ -71,6 +74,42 @@ fn validates_templates_like_device() {
         json!({"schema": 1, "canvas": {"w": 200, "h": 200}, "elements": [{"type": "text", "text": "x", "font": "f99", "x": 0, "y": 0}]}),
         json!({"schema": 1, "canvas": {"w": 200, "h": 200}, "elements": [{"type": "bar", "bind": "buckets[codex].monthly.usedPercent", "rect": [0,0,10,10]}]}),
         json!({"schema": 1, "canvas": {"w": 200, "h": 200}, "elements": [{"type": "rect", "rect": [0,0,-5,10]}]}),
+    ] {
+        assert!(validate_template(&bad).is_err(), "should reject: {bad}");
+    }
+}
+
+#[test]
+fn validates_quad_text_bounds_formats_and_conditions() {
+    let valid = json!({
+        "schema": 1,
+        "canvas": {"w": 200, "h": 200},
+        "elements": [
+            {"type": "text", "bind": "buckets[codex].5h.resetsAt",
+             "time_format": "hhmm", "region": [4, 4, 100, 30],
+             "align": "center", "scale": 3, "font": "f20"},
+            {"type": "icon", "when": {"bind": "buckets[codex].5h.remaining", "exists": false},
+             "x": 4, "y": 40, "w": 8, "h": 8, "bits": "AAAAAAAAAAA="}
+        ]
+    });
+    assert!(validate_template(&valid).is_ok());
+
+    for bad in [
+        json!({"schema":1,"canvas":{"w":200,"h":200},"elements":[{"type":"text","text":"x","font":"f8","scale":0}]}),
+        json!({"schema":1,"canvas":{"w":200,"h":200},"elements":[{"type":"text","text":"x","font":"f8","scale":4}]}),
+        json!({"schema":1,"canvas":{"w":200,"h":200},"elements":[{"type":"text","text":"x","font":"f8","scale":1.0}]}),
+        json!({"schema":1,"canvas":{"w":200,"h":200},"elements":[{"type":"text","text":"x","font":"f8","scale":null}]}),
+        json!({"schema":1,"canvas":{"w":200,"h":200},"elements":[{"type":"text","text":"x","font":"f8","region":[0,0,201,10]}]}),
+        json!({"schema":1,"canvas":{"w":200,"h":200},"elements":[{"type":"text","text":"x","font":"f8","region":[2147483647,0,1,1]}]}),
+        json!({"schema":1,"canvas":{"w":200,"h":200},"elements":[{"type":"text","text":"x","font":"f8","region":[0,0,10,10],"align":"diagonal"}]}),
+        json!({"schema":1,"canvas":{"w":200,"h":200},"elements":[{"type":"text","text":"x","font":"f8","align":"right"}]}),
+        json!({"schema":1,"canvas":{"w":200,"h":200},"elements":[{"type":"text","bind":"account.plan","font":"f8","time_format":"hhmm"}]}),
+        json!({"schema":1,"canvas":{"w":200,"h":200},"elements":[{"type":"text","bind":"server_time","font":"f8","time_format":"bad"}]}),
+        json!({"schema":1,"canvas":{"w":200,"h":200},"elements":[{"type":"text","bind":"server_time","font":"f8","time_format":null}]}),
+        json!({"schema":1,"canvas":{"w":200,"h":200},"elements":[{"type":"text","text":"x","font":"f8","when":null}]}),
+        json!({"schema":1,"canvas":{"w":200,"h":200},"elements":[{"type":"text","text":"x","font":"f8","when":{"bind":"buckets[codex].5h.remaining","exists":1}}]}),
+        json!({"schema":1,"canvas":{"w":200,"h":200},"elements":[{"type":"text","text":"x","font":"f8","when":{"bind":"buckets[codex].monthly.remaining","exists":true}}]}),
+        json!({"schema":1,"canvas":{"w":200,"h":200},"elements":[{"type":"text","text":"x","font":"f8","when":{"bind":"account.plan","exists":true,"extra":false}}]}),
     ] {
         assert!(validate_template(&bad).is_err(), "should reject: {bad}");
     }
