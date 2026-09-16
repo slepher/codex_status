@@ -1,0 +1,36 @@
+{
+  "profiles": [
+    {
+      "id": "default",
+      "name": "默认",
+      "templates": [
+        {
+          "id": "quad",
+          "enabled": true
+        },
+        {
+          "id": "mini",
+          "enabled": true
+        },
+        {
+          "id": "full",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "config-tbif",
+      "name": "codex",
+      "templates": [
+        {
+          "id": "mini",
+          "enabled": true
+        },
+        {
+          "id": "quad",
+          "enabled": true
+        }
+      ]
+    }
+  ]
+}

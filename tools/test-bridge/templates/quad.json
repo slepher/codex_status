@@ -1,23 +1,224 @@
 {
-  "schema": 1,
-  "id": "quad",
-  "version": 2,
-  "min_fw": "0.5",
-  "canvas": { "w": 200, "h": 200 },
+  "canvas": {
+    "h": 200,
+    "w": 200
+  },
   "elements": [
-    { "type": "rect", "rect": [4, 4, 104, 90], "fill": true, "color": "black" },
-    { "type": "rect", "rect": [92, 106, 104, 90], "fill": true, "color": "black" },
-    { "type": "text", "bind": "buckets[codex].weekly.remaining", "region": [10, 10, 92, 68], "align": "center", "scale": 3, "font": "f20", "color": "white", "bg": "black" },
-    { "type": "text", "text": "WEEK", "region": [10, 78, 92, 12], "align": "center", "scale": 1, "font": "f8", "color": "white", "bg": "black" },
-    { "type": "text", "bind": "buckets[codex].5h.remaining", "when": { "bind": "buckets[codex].5h.remaining", "exists": true }, "region": [98, 112, 92, 68], "align": "center", "scale": 3, "font": "f20", "color": "white", "bg": "black" },
-    { "type": "text", "text": "100", "when": { "bind": "buckets[codex].5h.remaining", "exists": false }, "region": [98, 112, 92, 68], "align": "center", "scale": 3, "font": "f20", "color": "white", "bg": "black" },
-    { "type": "text", "text": "5H", "region": [98, 180, 92, 12], "align": "center", "scale": 1, "font": "f8", "color": "white", "bg": "black" },
-    { "type": "text", "bind": "account.plan", "prefix": "PLAN ", "region": [112, 4, 84, 18], "align": "right", "font": "f12", "color": "black" },
-    { "type": "text", "bind": "bridge.label", "when": { "bind": "bridge.label", "exists": true }, "region": [112, 22, 84, 18], "align": "right", "font": "f12", "color": "black" },
-    { "type": "text", "bind": "buckets[codex].weekly.resetsAt", "time_format": "date", "region": [112, 40, 84, 18], "align": "right", "font": "f12", "color": "black" },
-    { "type": "text", "bind": "resetCredits.availableCount", "when": { "bind": "resetCredits.availableCount", "exists": true }, "prefix": "RC ", "region": [112, 58, 84, 18], "align": "right", "font": "f12", "color": "black" },
-    { "type": "text", "bind": "buckets[codex].5h.resetsAt", "when": { "bind": "buckets[codex].5h.resetsAt", "exists": true }, "prefix": "5H ", "time_format": "hhmm", "region": [4, 158, 84, 12], "font": "f12", "color": "black" },
-    { "type": "text", "bind": "device.battery", "prefix": "BATT ", "suffix": "%", "region": [4, 172, 84, 12], "font": "f12", "color": "black" },
-    { "type": "text", "bind": "device.sync_hhmm", "prefix": "SYNC ", "region": [4, 186, 84, 12], "font": "f12", "color": "black" }
-  ]
+    {
+      "color": "black",
+      "fill": true,
+      "rect": [
+        4,
+        4,
+        97,
+        97
+      ],
+      "type": "rect"
+    },
+    {
+      "color": "black",
+      "fill": true,
+      "rect": [
+        101,
+        101,
+        97,
+        97
+      ],
+      "type": "rect"
+    },
+    {
+      "align": "center",
+      "bg": "black",
+      "bind": "buckets[codex].weekly.remaining",
+      "color": "white",
+      "font": "f20",
+      "region": [
+        8,
+        12,
+        88,
+        68
+      ],
+      "scale": 3,
+      "type": "text"
+    },
+    {
+      "align": "center",
+      "bg": "black",
+      "color": "white",
+      "font": "f16",
+      "region": [
+        8,
+        78,
+        88,
+        18
+      ],
+      "scale": 1,
+      "text": "WEEK",
+      "type": "text"
+    },
+    {
+      "align": "center",
+      "bg": "black",
+      "bind": "buckets[codex].5h.remaining",
+      "color": "white",
+      "font": "f20",
+      "region": [
+        104,
+        112,
+        88,
+        68
+      ],
+      "scale": 3,
+      "type": "text",
+      "when": {
+        "bind": "buckets[codex].5h.remaining",
+        "exists": true
+      }
+    },
+    {
+      "align": "center",
+      "bg": "black",
+      "color": "white",
+      "font": "f20",
+      "region": [
+        104,
+        112,
+        88,
+        68
+      ],
+      "scale": 3,
+      "text": "100",
+      "type": "text",
+      "when": {
+        "bind": "buckets[codex].5h.remaining",
+        "exists": false
+      }
+    },
+    {
+      "align": "center",
+      "bg": "black",
+      "color": "white",
+      "font": "f16",
+      "region": [
+        104,
+        178,
+        88,
+        18
+      ],
+      "scale": 1,
+      "text": "5H",
+      "type": "text"
+    },
+    {
+      "align": "right",
+      "bind": "account.plan",
+      "color": "black",
+      "font": "f12",
+      "prefix": "PLAN ",
+      "region": [
+        112,
+        4,
+        84,
+        18
+      ],
+      "type": "text"
+    },
+    {
+      "align": "right",
+      "bind": "bridge.label",
+      "color": "black",
+      "font": "f12",
+      "region": [
+        112,
+        22,
+        84,
+        18
+      ],
+      "type": "text",
+      "when": {
+        "bind": "bridge.label",
+        "exists": true
+      }
+    },
+    {
+      "align": "right",
+      "bind": "buckets[codex].weekly.resetsAt",
+      "color": "black",
+      "font": "f12",
+      "region": [
+        112,
+        40,
+        84,
+        18
+      ],
+      "time_format": "date",
+      "type": "text"
+    },
+    {
+      "align": "right",
+      "bind": "resetCredits.availableCount",
+      "color": "black",
+      "font": "f12",
+      "prefix": "RC ",
+      "region": [
+        112,
+        58,
+        84,
+        18
+      ],
+      "type": "text",
+      "when": {
+        "bind": "resetCredits.availableCount",
+        "exists": true
+      }
+    },
+    {
+      "bind": "buckets[codex].5h.resetsAt",
+      "color": "black",
+      "font": "f12",
+      "prefix": "5H ",
+      "region": [
+        4,
+        158,
+        84,
+        12
+      ],
+      "time_format": "hhmm",
+      "type": "text",
+      "when": {
+        "bind": "buckets[codex].5h.resetsAt",
+        "exists": true
+      }
+    },
+    {
+      "bind": "device.battery",
+      "color": "black",
+      "font": "f12",
+      "prefix": "BATT ",
+      "region": [
+        4,
+        172,
+        84,
+        12
+      ],
+      "suffix": "%",
+      "type": "text"
+    },
+    {
+      "bind": "device.sync_hhmm",
+      "color": "black",
+      "font": "f12",
+      "prefix": "SYNC ",
+      "region": [
+        4,
+        186,
+        84,
+        12
+      ],
+      "type": "text"
+    }
+  ],
+  "id": "quad",
+  "min_fw": "0.5",
+  "schema": 1
 }
