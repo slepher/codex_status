@@ -1,40 +1,122 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<title>Codex Status Bridge</title>
+<title>Codex Status 设备管家</title>
 <style>
-  :root { color-scheme: light dark; }
-  body { font-family: "Segoe UI", system-ui, sans-serif; margin: 16px; }
-  h2 { margin: 0 0 4px; font-size: 18px; }
-  .muted { opacity: .6; font-size: 12px; margin-bottom: 12px; }
-  button { margin: 0 8px 12px 0; padding: 6px 12px; }
-  pre { background: rgba(127,127,127,.12); padding: 10px; border-radius: 6px;
-        max-height: 460px; overflow: auto; font-size: 12px; }
+  :root { color-scheme: light dark; --card: rgba(127,127,127,.10); --line: rgba(127,127,127,.25); --ok: #22a55e; --warn: #e6a700; --err: #d93a3a; --muted: #8a8a8a; }
+  * { box-sizing: border-box; }
+  body { font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif; margin: 0; padding: 16px; font-size: 13px; }
+  h1 { font-size: 17px; margin: 0; }
+  .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .grid { display: grid; gap: 12px; margin-top: 14px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+  .card h2 { font-size: 13px; margin: 0 0 10px; font-weight: 600; }
+  .row { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px dashed var(--line); }
+  .row:last-child { border-bottom: 0; }
+  .row span:first-child { color: var(--muted); }
+  .rings { display: flex; gap: 18px; justify-content: center; padding: 6px 0; }
+  .ring { width: 96px; height: 96px; border-radius: 50%; border: 6px solid var(--line); display: flex; flex-direction: column; align-items: center; justify-content: center; }
+  .ring b { font-size: 22px; }
+  .ring small { color: var(--muted); }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+  button { padding: 6px 12px; border-radius: 8px; border: 1px solid var(--line); background: transparent; color: inherit; cursor: pointer; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .tpl { display: flex; align-items: center; justify-content: space-between; padding: 4px 0; }
+  .badge { font-size: 11px; border: 1px solid var(--line); border-radius: 6px; padding: 1px 6px; color: var(--muted); }
+  .badge.on { color: #fff; background: var(--ok); border-color: var(--ok); }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); margin-right: 6px; }
+  .dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.err { background: var(--err); }
+  .todo { color: var(--muted); font-style: italic; }
 </style>
 </head>
 <body>
-  <h2>Codex Status Bridge</h2>
-  <div class="muted" id="meta">starting…</div>
-  <button onclick="forceSync()">Force BLE sync</button>
-  <button onclick="reloadTemplates()">Reload templates</button>
-  <pre id="out">loading…</pre>
+  <h1><span class="dot" id="dot"></span>Codex Status 设备管家</h1>
+  <div class="sub" id="sub">正在读取状态…</div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>余量</h2>
+      <div class="rings">
+        <div class="ring"><b id="ring-week">--</b><small>周余量</small></div>
+        <div class="ring"><b id="ring-5h">--</b><small>5H 余量</small></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>设备</h2>
+      <div class="row"><span>ROM 版本</span><span class="todo" id="dev-fw">待接入</span></div>
+      <div class="row"><span>运行槽位</span><span class="todo" id="dev-slot">待接入</span></div>
+      <div class="row"><span>电量</span><span class="todo" id="dev-batt">待接入</span></div>
+      <div class="row"><span>Wi-Fi / RSSI</span><span class="todo" id="dev-wifi">待接入</span></div>
+      <div class="row"><span>最近 BLE 同步</span><span id="dev-sync">--</span></div>
+    </div>
+
+    <div class="card">
+      <h2>模板</h2>
+      <div id="tpl-list" class="todo">加载中…</div>
+      <div class="actions">
+        <button onclick="reloadTemplates()">从磁盘重载</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>操作</h2>
+      <div class="actions">
+        <button id="btn-pause" onclick="togglePause()">暂停推送</button>
+        <button onclick="forceSync()">立即同步</button>
+        <button disabled>升级固件…</button>
+        <button disabled>打开设备页</button>
+        <button disabled>开机自启</button>
+      </div>
+      <div class="sub" id="last-error"></div>
+    </div>
+  </div>
+
 <script>
   const invoke = window.__TAURI__.core.invoke;
-  const out = document.getElementById('out');
-  const meta = document.getElementById('meta');
+  const $ = (id) => document.getElementById(id);
+  let paused = false;
+
+  function relTime(ts) {
+    if (!ts) return '从未';
+    const diff = Math.max(0, Math.floor(Date.now() / 1000) - ts);
+    if (diff < 60) return '刚刚';
+    if (diff < 3600) return Math.floor(diff / 60) + ' 分钟前';
+    return Math.floor(diff / 3600) + ' 小时前';
+  }
 
   async function refresh() {
     try {
       const s = await invoke('get_status');
-      meta.textContent = `http ${s.http} · lan ${s.lan_ip} · templates ${s.templates.length} · updated ${s.updated || 'never'}`;
-      out.textContent = JSON.stringify(s.usage ?? { note: 'no usage yet' }, null, 2);
+      const weekly = s.weekly_remaining;
+      $('ring-week').textContent = weekly == null ? '--' : weekly + '%';
+      $('ring-5h').textContent = '--';
+      $('sub').textContent = `LAN ${s.lan_ip}:${s.http.split(':').pop()} · 轮询 ${s.interval_secs}s · BLE ${s.ble_interval_secs}s`;
+      $('dev-sync').textContent = relTime(s.last_sync);
+      $('last-error').textContent = s.last_error ? '最近错误：' + s.last_error : '';
+      paused = !!s.paused;
+      $('btn-pause').textContent = paused ? '恢复推送' : '暂停推送';
+      $('dot').className = 'dot ' + (s.last_error ? 'err' : (s.last_sync ? 'ok' : 'warn'));
+      const list = $('tpl-list');
+      if (s.templates && s.templates.length) {
+        list.className = '';
+        list.innerHTML = s.templates.map((t) =>
+          `<div class="tpl"><span>${t.id} <span class="badge">v${t.version} · ${t.hash.slice(0, 8)}</span></span>` +
+          `<span class="badge">--</span></div>`).join('');
+      } else {
+        list.className = 'todo';
+        list.textContent = '磁盘上没有模板';
+      }
     } catch (e) {
-      out.textContent = 'error: ' + e;
+      $('sub').textContent = '读取失败：' + e;
     }
   }
+
   async function forceSync() { await invoke('force_sync'); refresh(); }
   async function reloadTemplates() { await invoke('reload_templates'); refresh(); }
+  async function togglePause() { await invoke('set_paused', { paused: !paused }); refresh(); }
+
   refresh();
   setInterval(refresh, 3000);
 </script>

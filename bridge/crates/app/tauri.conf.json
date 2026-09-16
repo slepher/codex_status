@@ -11,10 +11,11 @@
     "windows": [
       {
         "label": "main",
-        "title": "Codex Status Bridge",
+        "title": "Codex Status 设备管家",
         "width": 560,
-        "height": 640,
-        "resizable": true
+        "height": 680,
+        "resizable": true,
+        "visible": false
       }
     ],
     "security": {

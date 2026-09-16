@@ -215,7 +215,7 @@ impl Pusher {
         }
     }
 
-    async fn push_template(&self, peripheral: &Peripheral, id: &str, bytes: &[u8], version: u64) -> Result<()> {
+    async fn push_template(&self, peripheral: &Peripheral, id: &str, bytes: &[u8], version: u64, activate: bool) -> Result<()> {
         let crc = crc32fast::hash(bytes);
         let hash = template_hash(bytes);
         let begin = json!({
@@ -234,13 +234,17 @@ impl Pusher {
         }
         Self::write_json(peripheral, CHR_TPL_CTRL, br#"{"op":"end"}"#).await?;
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let activate = json!({"op": "activate", "id": id});
-        Self::write_json(peripheral, CHR_TPL_CTRL, activate.to_string().as_bytes()).await?;
-        tracing::info!("template {id} pushed and activated ({} bytes)", bytes.len());
+        if activate {
+            let activate = json!({"op": "activate", "id": id});
+            Self::write_json(peripheral, CHR_TPL_CTRL, activate.to_string().as_bytes()).await?;
+            tracing::info!("template {id} pushed and activated ({} bytes)", bytes.len());
+        } else {
+            tracing::info!("template {id} pushed, not activated ({} bytes)", bytes.len());
+        }
         Ok(())
     }
 
-    async fn push_templates(&self, peripheral: &Peripheral) -> Result<()> {
+    async fn push_templates(&self, peripheral: &Peripheral, info: &serde_json::Value) -> Result<()> {
         let items: Vec<(String, Vec<u8>, u64)> = {
             let library = self.library.read().await;
             let ids: Vec<String> = if self.cfg.template_ids.is_empty() {
@@ -256,9 +260,45 @@ impl Pusher {
                 })
                 .collect()
         };
+        let device = info.get("templates").and_then(|v| v.as_array());
+        let device_active = device.and_then(|arr| {
+            arr.iter()
+                .find(|t| t.get("active").and_then(|a| a.as_bool()).unwrap_or(false))
+                .and_then(|t| t.get("id"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        });
+        let mut pushed: Vec<String> = Vec::new();
         for (id, bytes, version) in items {
-            if let Err(e) = self.push_template(peripheral, &id, &bytes, version).await {
+            let hash = template_hash(&bytes);
+            let up_to_date = device
+                .map(|arr| {
+                    arr.iter().any(|t| {
+                        t.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
+                            && t.get("hash").and_then(|v| v.as_str()) == Some(hash.as_str())
+                    })
+                })
+                .unwrap_or(false);
+            if up_to_date {
+                tracing::info!("template {id} up to date ({hash}); skip");
+                continue;
+            }
+            let refresh_active = device_active.as_deref() == Some(id.as_str());
+            if let Err(e) = self.push_template(peripheral, &id, &bytes, version, refresh_active).await {
                 tracing::warn!("push template {id}: {e}");
+                continue;
+            }
+            pushed.push(id);
+        }
+        if device_active.is_none() {
+            if let Some(last) = pushed.last() {
+                let activate = json!({"op": "activate", "id": last});
+                Self::write_json(peripheral, CHR_TPL_CTRL, activate.to_string().as_bytes()).await?;
+                tracing::info!("activated template {last} (device had no active template)");
+            }
+        } else if let Some(active) = device_active {
+            if pushed.is_empty() {
+                tracing::info!("all templates up to date; keeping {active} active");
             }
         }
         Ok(())
@@ -290,7 +330,7 @@ impl Pusher {
             tokio::time::sleep(Duration::from_millis(500)).await;
             self.push_usage(&peripheral).await?;
             tokio::time::sleep(Duration::from_millis(500)).await;
-            self.push_templates(&peripheral).await?;
+            self.push_templates(&peripheral, &info).await?;
             Ok::<_, anyhow::Error>(())
         }
         .await;
