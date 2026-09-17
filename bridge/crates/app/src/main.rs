@@ -71,6 +71,28 @@ fn now_secs() -> i64 {
 /// the 5 min heartbeat plus jitter) before BLE scanning resumes.
 const HTTP_PUSH_HEALTHY_SECS: u64 = 360;
 
+fn http_push_healthy(ctx: &AppCtx) -> bool {
+    let status = ctx.status.lock().unwrap();
+    status
+        .last_push_ok_at
+        .is_some_and(|t| now_secs().saturating_sub(t) < HTTP_PUSH_HEALTHY_SECS as i64)
+}
+
+/// Give the push task a moment to prove the device is reachable over HTTP
+/// before the first BLE scan of a bridge run.
+async fn wait_http_healthy(ctx: &AppCtx, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if http_push_healthy(ctx) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 fn host_label() -> String {
     let raw = std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
@@ -825,14 +847,11 @@ async fn run_services(ctx: Arc<AppCtx>) {
         let pending_waiting = !ctx.status.lock().unwrap().pending.ids.is_empty();
         // Demand-driven scanning (sleep.md §4.6): while `POST /usage` is
         // succeeding the device is LIVE and BLE is off on its side, so scan
-        // only for explicit work, startup, or when the HTTP path goes quiet.
-        let http_ok = {
-            let status = ctx.status.lock().unwrap();
-            status
-                .last_push_ok_at
-                .is_some_and(|t| now.saturating_sub(t as u64) < HTTP_PUSH_HEALTHY_SECS)
-        };
-        if !first && !pending_waiting && http_ok {
+        // only for explicit work or when the HTTP path goes quiet. On the first
+        // pass, wait briefly for the initial push instead of scanning blindly.
+        let http_ok = http_push_healthy(&ctx)
+            || (first && wait_http_healthy(&ctx, Duration::from_secs(8)).await);
+        if !pending_waiting && http_ok {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(15)) => {}
                 _ = ctx.force_ble.notified() => {}

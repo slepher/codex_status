@@ -42,9 +42,9 @@ M3 Plan B shipped 0.10.2 with three known gaps from the prompt handover:
 ## Bridge
 
 - `last_push_ok_at` tracks successful `POST /usage`; while fresh (< 360 s) the
-  BLE loop skips scanning except at startup, for pending template pushes, or on
-  an explicit sync request. A single push timeout must not flip the path: only
-  two consecutive failed attempts clear the healthy timestamp (the device
+  BLE loop skips scanning; on a fresh bridge run it waits up to 8 s for the
+  first push before scanning. A single push timeout must not flip the path:
+  only two consecutive failed attempts clear the healthy timestamp (the device
   WebServer occasionally misses a request). The push-check cadence is 3 s so
   envelope changes reach the device inside the T9 ≤5 s budget.
 - BLE cycle failures no longer set `last_error` while the HTTP path is healthy
