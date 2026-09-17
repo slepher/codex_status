@@ -45,11 +45,15 @@ M3 Plan B shipped 0.10.2 with three known gaps from the prompt handover:
   BLE loop skips scanning except at startup, for pending template pushes, or on
   an explicit sync request. A single push timeout must not flip the path: only
   two consecutive failed attempts clear the healthy timestamp (the device
-  WebServer occasionally misses a request).
+  WebServer occasionally misses a request). The push-check cadence is 3 s so
+  envelope changes reach the device inside the T9 ≤5 s budget.
 - BLE cycle failures no longer set `last_error` while the HTTP path is healthy
   (debug log only); HTTP success clears stale `ble:` errors and updates
   `last_sync`.
 - Tray "OK/stale" threshold now covers the 5 min heartbeat.
+- Startup: `tools/start-bridge.ps1` launches the tray detached with
+  `UseShellExecute=true` + hidden window + file logs and returns immediately
+  (no inherited stdio handles, so callers never block).
 
 ## Evidence (2026-09-17)
 
@@ -68,13 +72,17 @@ M3 Plan B shipped 0.10.2 with three known gaps from the prompt handover:
   configured.
 - Token persistence: same token accepted for `/sleep` after two deep-sleep
   cycles and after a reflash (`[auth] token loaded from NVS`).
+- T9 transport: direct `POST /usage` with the endpoint token returned
+  `{"accepted":true}` in 0.95 s wall time with `epd_writes` already
+  incremented; bridge push-check cadence tightened to 3 s (observed envelope
+  refresh → push in 2.0 s).
 - Regression: `POST /doUpdate` without a token → 401.
 - Bridge: `cargo check --workspace --offline` clean.
 
 ## Pending
 
-- M2/M3 acceptance: T9 push latency, T10 LIVE current, T1 DEEP overnight, T7
-  IDLE, T8 three-way consistency on the device.
+- M2/M3 acceptance: T10 LIVE current, T1 DEEP overnight, T7 IDLE, T8
+  three-way consistency on the device (T9 transport verified).
 - `PROGRESS.md` + commit for 0.10.3; ROM archived as
   `artifacts/codex-status-0.10.3-bw.bin`, SHA256
   `C0AABDC117D88D8FB073306C27F0BAD5DB7967600A1ACFAF019B7EFE5780B61D`.

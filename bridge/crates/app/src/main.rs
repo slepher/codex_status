@@ -748,7 +748,9 @@ async fn run_services(ctx: Arc<AppCtx>) {
             let mut last_fp: u64 = 0;
             let mut last_ok: u64 = 0;
             loop {
-                tokio::time::sleep(Duration::from_secs(10)).await;
+                // Check the fingerprint every 3 s so an envelope change reaches
+                // the device well inside the T9 ≤5 s budget.
+                tokio::time::sleep(Duration::from_secs(3)).await;
                 let usage = ctx.envelope.try_read().ok().and_then(|g| g.clone());
                 let Some(usage) = usage else { continue };
                 let text = usage.to_string();
