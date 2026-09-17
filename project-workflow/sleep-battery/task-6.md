@@ -74,6 +74,11 @@ M3 Plan B shipped 0.10.2 with three known gaps from the prompt handover:
   long press powers back on; a short press does nothing in either state.
 - PWR is readable on USB too (hold detected); the hold is ignored/restarted as
   configured.
+- Battery trend on LIVE (stock-core Plan B): 75 %/3976 mV → 45 %/3708 mV in
+  ~3 h (~10 %/h, tens of mA) — the ≤2 mA T10 target needs the M3 PM light
+  sleep (custom core), not modem sleep alone. A 5 min background sampler writes
+  `artifacts/battery-log.csv` for the LIVE upper bound and the overnight T1
+  check.
 - Token persistence: same token accepted for `/sleep` after two deep-sleep
   cycles and after a reflash (`[auth] token loaded from NVS`).
 - T9 transport: direct `POST /usage` with the endpoint token returned
