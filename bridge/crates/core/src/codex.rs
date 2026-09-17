@@ -66,8 +66,18 @@ pub fn candidate_paths(explicit: Option<&Path>) -> Vec<PathBuf> {
     out
 }
 
+#[cfg(windows)]
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 fn version_matches(exe: &Path) -> bool {
-    let output = std::process::Command::new(exe).arg("--version").output();
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--version");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = cmd.output();
     match output {
         Ok(out) => {
             let mut text = String::from_utf8_lossy(&out.stdout).to_string();
@@ -104,12 +114,16 @@ pub struct CodexClient {
 
 impl CodexClient {
     pub async fn spawn(exe: &Path) -> Result<Self> {
-        let mut child = Command::new(exe)
+        let mut command = Command::new(exe);
+        command
             .args(["-s", "read-only", "-a", "never", "app-server"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        command.creation_flags(CREATE_NO_WINDOW);
+        let mut child = command
             .spawn()
             .with_context(|| format!("spawn {}", exe.display()))?;
 
