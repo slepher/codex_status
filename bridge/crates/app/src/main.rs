@@ -675,16 +675,52 @@ async fn reload_templates(state: State<'_, Arc<AppCtx>>) -> Result<usize, String
     Ok(count)
 }
 
+/// FNV-1a over the envelope with volatile fields removed. `server_time` and
+/// the rolling `resetsAt` of unused windows (the app-server reports
+/// `now + window` on every poll while `usedPercent` is 0) carry no screen
+/// data, so pushes follow real data changes plus the 5 min heartbeat
+/// (sleep.md §4.3) instead of firing on every poll.
+fn usage_fingerprint(usage: &Value) -> u64 {
+    let mut value = usage.clone();
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("server_time");
+    }
+    if let Some(buckets) = value.get_mut("buckets").and_then(|b| b.as_array_mut()) {
+        for bucket in buckets.iter_mut() {
+            if let Some(windows) = bucket.get_mut("windows").and_then(|w| w.as_array_mut()) {
+                for window in windows.iter_mut() {
+                    let used = window
+                        .get("usedPercent")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    if used == 0 {
+                        if let Some(obj) = window.as_object_mut() {
+                            obj.remove("resetsAt");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let text = value.to_string();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in text.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
 /// Fingerprint of what the BLE cycle would push: usage envelope + pending
 /// template work + the idle template. A successful cycle pauses scanning until
 /// this changes or the 5 min heartbeat expires (sleep.md §4.6).
 fn ble_fingerprint(ctx: &AppCtx) -> u64 {
-    let usage = ctx
+    let usage_fp = ctx
         .envelope
         .try_read()
         .ok()
-        .and_then(|g| g.as_ref().map(|v| v.to_string()))
-        .unwrap_or_default();
+        .and_then(|g| g.as_ref().map(usage_fingerprint))
+        .unwrap_or(0);
     let (ids, activate) = {
         let status = ctx.status.lock().unwrap();
         (
@@ -698,13 +734,8 @@ fn ble_fingerprint(ctx: &AppCtx) -> u64 {
         .ok()
         .and_then(|v| v.clone())
         .unwrap_or_default();
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in usage
-        .bytes()
-        .chain(ids.bytes())
-        .chain(activate.bytes())
-        .chain(idle.bytes())
-    {
+    let mut h: u64 = usage_fp ^ 0xcbf2_9ce4_8422_2325;
+    for b in ids.bytes().chain(activate.bytes()).chain(idle.bytes()) {
         h ^= b as u64;
         h = h.wrapping_mul(0x100_0000_01b3);
     }
@@ -776,14 +807,7 @@ async fn run_services(ctx: Arc<AppCtx>) {
                 let usage = ctx.envelope.try_read().ok().and_then(|g| g.clone());
                 let Some(usage) = usage else { continue };
                 let text = usage.to_string();
-                let fp = {
-                    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-                    for b in text.bytes() {
-                        h ^= b as u64;
-                        h = h.wrapping_mul(0x100_0000_01b3);
-                    }
-                    h
-                };
+                let fp = usage_fingerprint(&usage);
                 let now = now_secs() as u64;
                 if fp == last_fp && now.saturating_sub(last_ok) < 300 {
                     continue;

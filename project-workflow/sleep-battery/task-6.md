@@ -50,6 +50,10 @@ M3 Plan B shipped 0.10.2 with three known gaps from the prompt handover:
 - BLE cycle failures no longer set `last_error` while the HTTP path is healthy
   (debug log only); HTTP success clears stale `ble:` errors and updates
   `last_sync`.
+- Push fingerprint excludes `server_time` and the rolling `resetsAt` of unused
+  windows (app-server reports `now + window` every poll while `usedPercent` is
+  0), so steady-state pushes are heartbeat-only instead of per-minute; EPD
+  partial refreshes drop from ~1/min to ~1/5min.
 - Tray "OK/stale" threshold now covers the 5 min heartbeat.
 - Startup: `tools/start-bridge.ps1` launches the tray detached with
   `UseShellExecute=true` + hidden window + file logs and returns immediately
