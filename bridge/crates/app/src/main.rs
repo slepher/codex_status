@@ -37,6 +37,12 @@ struct RuntimeStatus {
     pending: PendingPush,
     last_push_at: Option<i64>,
     last_push_error: Option<String>,
+    /// Last successful `POST /usage`; while fresh, the HTTP path is the healthy
+    /// data route and BLE scanning stays off (sleep.md §4.6).
+    last_push_ok_at: Option<i64>,
+    /// Consecutive failed push attempts; a single timeout must not invalidate
+    /// the HTTP path (the device's WebServer occasionally misses a request).
+    push_fail_streak: u32,
 }
 
 struct AppCtx {
@@ -60,6 +66,10 @@ fn now_secs() -> i64 {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }
+
+/// How long a successful `POST /usage` keeps the HTTP path "healthy" (covers
+/// the 5 min heartbeat plus jitter) before BLE scanning resumes.
+const HTTP_PUSH_HEALTHY_SECS: u64 = 360;
 
 fn host_label() -> String {
     let raw = std::env::var("COMPUTERNAME")
@@ -103,10 +113,10 @@ fn tray_snapshot(ctx: &AppCtx) -> (Option<i32>, IconState, String) {
         } else if status.last_sync.is_none() {
             IconState::NoData
         } else {
-            stale_or_ok(ctx, &status, now)
+            stale_or_ok(&status, now)
         }
     } else {
-        stale_or_ok(ctx, &status, now)
+        stale_or_ok(&status, now)
     };
     let sync_text = status
         .last_sync
@@ -138,9 +148,9 @@ fn tray_snapshot(ctx: &AppCtx) -> (Option<i32>, IconState, String) {
     (percent, state, tip)
 }
 
-fn stale_or_ok(ctx: &AppCtx, status: &RuntimeStatus, now: i64) -> IconState {
+fn stale_or_ok(status: &RuntimeStatus, now: i64) -> IconState {
     match status.last_sync {
-        Some(sync) if now - sync <= (ctx.config.ble_interval_secs as i64) * 3 => IconState::Ok,
+        Some(sync) if now - sync <= HTTP_PUSH_HEALTHY_SECS as i64 => IconState::Ok,
         _ => IconState::Stale,
     }
 }
@@ -207,6 +217,7 @@ async fn get_status(state: State<'_, Arc<AppCtx>>) -> Result<Value, String> {
         "pending": status.pending.ids.len(),
         "last_push_at": status.last_push_at,
         "last_push_error": status.last_push_error,
+        "last_push_ok_at": status.last_push_ok_at,
         "last_sync": status.last_sync,
         "last_error": status.last_error,
         "updated": usage.as_ref().and_then(|u| u.get("server_time")).and_then(|v| v.as_i64()),
@@ -762,20 +773,43 @@ async fn run_services(ctx: Arc<AppCtx>) {
                     .send()
                     .await
                 {
-                    Ok(resp) => {
+                    Ok(resp) if resp.status().is_success() => {
                         last_fp = fp;
                         last_ok = now;
                         tracing::info!("usage push -> {} ({})", resp.status(), url);
+                        let mut status = ctx.status.lock().unwrap();
+                        status.last_push_ok_at = Some(now as i64);
+                        status.push_fail_streak = 0;
+                        status.last_sync = Some(now as i64);
+                        if status.last_error.as_deref().is_some_and(|e| e.starts_with("ble:")) {
+                            status.last_error = None;
+                            status.last_error_at = None;
+                        }
+                    }
+                    Ok(resp) => {
+                        tracing::warn!("usage push -> {} ({})", resp.status(), url);
+                        let mut status = ctx.status.lock().unwrap();
+                        status.last_error = Some(format!("push: HTTP {}", resp.status()));
+                        status.last_error_at = Some(now as i64);
+                        status.push_fail_streak = status.push_fail_streak.saturating_add(1);
+                        if status.push_fail_streak >= 2 {
+                            status.last_push_ok_at = None;
+                        }
                     }
                     Err(e) => {
                         tracing::debug!("usage push skipped: {e}");
+                        let mut status = ctx.status.lock().unwrap();
+                        status.push_fail_streak = status.push_fail_streak.saturating_add(1);
+                        if status.push_fail_streak >= 2 {
+                            status.last_push_ok_at = None;
+                        }
                     }
                 }
             }
         });
     }
 
-    let mut misses: u32 = 0;
+        let mut misses: u32 = 0;
     let mut last_fp: u64 = 0;
     let mut pause_until: u64 = 0;
     loop {
@@ -784,18 +818,36 @@ async fn run_services(ctx: Arc<AppCtx>) {
             tokio::time::sleep(Duration::from_secs(2)).await;
             continue;
         }
-        let fp = ble_fingerprint(&ctx);
+        let first = !ctx.ble_primed.swap(true, Ordering::SeqCst);
         let now = now_secs() as u64;
         let pending_waiting = !ctx.status.lock().unwrap().pending.ids.is_empty();
+        // Demand-driven scanning (sleep.md §4.6): while `POST /usage` is
+        // succeeding the device is LIVE and BLE is off on its side, so scan
+        // only for explicit work, startup, or when the HTTP path goes quiet.
+        let http_ok = {
+            let status = ctx.status.lock().unwrap();
+            status
+                .last_push_ok_at
+                .is_some_and(|t| now.saturating_sub(t as u64) < HTTP_PUSH_HEALTHY_SECS)
+        };
+        if !first && !pending_waiting && http_ok {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(15)) => {}
+                _ = ctx.force_ble.notified() => {}
+            }
+            continue;
+        }
+        let fp = ble_fingerprint(&ctx);
         if !pending_waiting && fp == last_fp && now < pause_until {
             let wait = Duration::from_secs(pause_until - now);
             tokio::select! {
                 _ = tokio::time::sleep(wait) => {}
                 _ = ctx.force_ble.notified() => {}
+
+
             }
             continue;
         }
-        let first = !ctx.ble_primed.swap(true, Ordering::SeqCst);
         let mut manual = pending_waiting;
         let wait = if first || pending_waiting {
             Duration::ZERO
@@ -865,23 +917,27 @@ async fn run_services(ctx: Arc<AppCtx>) {
                 pause_until = now_secs() as u64 + 300;
             }
             Err(e) => {
-                tracing::warn!("ble cycle: {e}");
                 misses = misses.saturating_add(1);
-                {
-                    let mut status = ctx.status.lock().unwrap();
+                let mut status = ctx.status.lock().unwrap();
+                if http_ok {
+                    // Expected while the device is LIVE (BLE off by design); the
+                    // HTTP push path is healthy, so don't surface a hard error.
+                    tracing::debug!("ble cycle skipped: {e}");
+                } else {
+                    tracing::warn!("ble cycle: {e}");
                     status.last_error = Some(format!("ble: {e}"));
                     status.last_error_at = Some(now_secs());
-                    if !pending.ids.is_empty() {
-                        status.last_push_error = Some(format!("ble: {e}"));
+                }
+                if !pending.ids.is_empty() {
+                    status.last_push_error = Some(format!("ble: {e}"));
+                }
+                for id in pending.ids {
+                    if !status.pending.ids.contains(&id) {
+                        status.pending.ids.push(id);
                     }
-                    for id in pending.ids {
-                        if !status.pending.ids.contains(&id) {
-                            status.pending.ids.push(id);
-                        }
-                    }
-                    if status.pending.activate.is_none() {
-                        status.pending.activate = pending.activate;
-                    }
+                }
+                if status.pending.activate.is_none() {
+                    status.pending.activate = pending.activate;
                 }
             }
         }
@@ -948,6 +1004,8 @@ fn main() {
             pending: PendingPush::default(),
             last_push_at: None,
             last_push_error: None,
+            last_push_ok_at: None,
+            push_fail_streak: 0,
         }),
         ble_primed: AtomicBool::new(false),
         mcp_port: Mutex::new(mcp_port),

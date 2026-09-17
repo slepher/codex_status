@@ -18,6 +18,7 @@
 #include <esp_sleep.h>
 #include <esp_ota_ops.h>
 #include <esp_system.h>
+#include <driver/rtc_io.h>
 
 #include "DEV_Config.h"
 #include "dev_log.h"
@@ -31,7 +32,7 @@
 #include "template_engine.h"
 #include "template_xfer.h"
 
-#define FW_VERSION    "0.10.2-bw"
+#define FW_VERSION    "0.10.3-bw"
 #define AP_PASSWORD   "codex1234"
 #define MAX_SLOTS     3
 
@@ -223,6 +224,9 @@ static void screen(const std::vector<String> &lines, UBYTE color = BLACK);
 static void epdFlush(bool forceFull = false);
 static int  batteryPercent();
 static bool requestAuthorized();
+static void deepSleepFor(uint32_t sec, bool renderIdle);
+
+static esp_sleep_wakeup_cause_t bootWakeCause = ESP_SLEEP_WAKEUP_UNDEFINED;
 
 static bool pairingOverlayActive() {
     bool paired = bleIsConnected() && blePeerIsBonded() && blePeerIsEncrypted();
@@ -690,6 +694,9 @@ static void factoryReset() {
     prefs.begin("wifi", false);
     prefs.clear();
     prefs.end();
+    prefs.begin("auth", false);
+    prefs.clear();
+    prefs.end();
     delay(1000);
     ESP.restart();
 }
@@ -836,6 +843,33 @@ static void handleUsagePost() {
                 accepted ? "{\"accepted\":true}" : "{\"accepted\":false}");
 }
 
+// Deep-sleep wake sources: RTC timer plus BOOT (GPIO0) and PWR (GPIO18),
+// active-low (sleep.md §4.2). The RTC pull-ups are armed explicitly so the
+// buttons stay readable once the RTC domain is the only powered island.
+static void armWakeSources(uint64_t timerUs) {
+    rtc_gpio_pullup_en(GPIO_NUM_0);
+    rtc_gpio_pulldown_dis(GPIO_NUM_0);
+    rtc_gpio_pullup_en(GPIO_NUM_18);
+    rtc_gpio_pulldown_dis(GPIO_NUM_18);
+    esp_sleep_enable_ext1_wakeup((1ULL << 0) | (1ULL << 18), ESP_EXT1_WAKEUP_ANY_LOW);
+    if (timerUs) esp_sleep_enable_timer_wakeup(timerUs);
+}
+
+// Common DEEP entry: optional IDLE render, panel/BLE/Wi-Fi teardown, wake
+// sources armed, then deep sleep.
+static void deepSleepFor(uint32_t sec, bool renderIdle) {
+    if (renderIdle) {
+        String cached;
+        if (usageCacheLoad(cached)) renderActiveUsage(cached, "DEEP", true);
+        else screenIdle();
+    }
+    epdPanelSleep();
+    bleAdvertiseStop();
+    WiFi.disconnect(true);
+    armWakeSources((uint64_t)sec * 1000000ULL);
+    esp_deep_sleep_start();
+}
+
 // Token-gated debug route: put the device straight into DEEP with a short
 // timer so hardware tests (ext1 wake, current) can run without waiting for the
 // LIVE exit watchdog. POST /sleep?sec=60
@@ -850,15 +884,7 @@ static void handleSleepPost() {
     DevLog.printf("[pm] test sleep %us\n", (unsigned)sec);
     server.send(200, "application/json", String("{\"sleeping\":") + String(sec) + "}");
     delay(200);
-    String cached;
-    if (usageCacheLoad(cached)) renderActiveUsage(cached, "DEEP", true);
-    else screenIdle();
-    epdPanelSleep();
-    bleAdvertiseStop();
-    WiFi.disconnect(true);
-    esp_sleep_enable_timer_wakeup((uint64_t)sec * 1000000ULL);
-    esp_sleep_enable_ext1_wakeup(1ULL << 0, ESP_EXT1_WAKEUP_ANY_LOW);
-    esp_deep_sleep_start();
+    deepSleepFor(sec, true);
 }
 
 static void handleBleUsage(const String &json) {
@@ -1047,6 +1073,16 @@ static const char *resetReasonName() {
     }
 }
 
+static const char *wakeCauseName(esp_sleep_wakeup_cause_t cause) {
+    switch (cause) {
+    case ESP_SLEEP_WAKEUP_UNDEFINED: return "power-on";
+    case ESP_SLEEP_WAKEUP_EXT0:      return "ext0";
+    case ESP_SLEEP_WAKEUP_EXT1:      return "ext1";
+    case ESP_SLEEP_WAKEUP_TIMER:     return "timer";
+    default:                         return "other";
+    }
+}
+
 static void handleStatus() {
     String html = F("<!DOCTYPE html><html><head><meta charset='utf-8'><title>Codex Status</title></head><body>");
     html += F("<h2>Codex Status</h2><ul>");
@@ -1091,6 +1127,8 @@ static void handleStatusJson() {
     doc["slot"] = running ? running->label : "?";
     doc["next_slot"] = next ? next->label : "?";
     doc["reset"] = resetReasonName();
+    doc["wake"] = wakeCauseName(bootWakeCause);
+    doc["pwr"] = digitalRead(18);
     doc["uptime_s"] = millis() / 1000;
     doc["ssid"] = WiFi.SSID();
     doc["ip"] = WiFi.localIP().toString();
@@ -1146,22 +1184,44 @@ static void setOtaPassword(const char *value) {
     ArduinoOTA.setPassword(otaPasswordBuf);
 }
 
-static void rotateOtaPassword() {
-    char buf[33];
-    randomHex(buf, 16);
-    setOtaPassword(buf);
+// OTA/Wi-Fi operation token. Issued once on the device and persisted in NVS so
+// reboots and DEEP sleep no longer invalidate it; it is disclosed only over the
+// bonded BLE link (never over HTTP or serial).
+static void persistAuthToken() {
+    Preferences p;
+    p.begin("auth", false);
+    p.putString("token", authToken);
+    p.end();
 }
 
-static void issueAuthToken() {
+static void loadOrIssueAuthToken() {
+    Preferences p;
+    p.begin("auth", true);
+    authToken = p.getString("token", "");
+    p.end();
+    if (authToken.length() != 32) {
+        char buf[33];
+        randomHex(buf, 16);
+        authToken = buf;
+        persistAuthToken();
+        DevLog.println("[auth] token initialized in NVS");
+    } else {
+        DevLog.println("[auth] token loaded from NVS");
+    }
+    setOtaPassword(authToken.c_str());
+}
+
+static void rotateAuthToken() {
     char buf[33];
     randomHex(buf, 16);
     authToken = buf;
+    persistAuthToken();
     setOtaPassword(authToken.c_str());
-    DevLog.println("[auth] token issued over BLE");
+    DevLog.println("[auth] token rotated");
 }
 
 static bool authValid() {
-    // No expiry: the token lives in RAM until the device reboots/sleeps.
+    // No expiry: the token lives in NVS across reboots and deep sleep.
     return authToken.length() > 0;
 }
 
@@ -1182,7 +1242,8 @@ static void handleBleAuth(const String &json) {
         bleNotifyStatusQuiet("{\"ack\":\"auth\",\"ok\":false}");
         return;
     }
-    issueAuthToken();
+    if (doc["rotate"] | false) rotateAuthToken();
+    else if (!authValid()) loadOrIssueAuthToken();
     holdWindow(WINDOW_MAX_MS);
     bleNotifyStatusQuiet(String("{\"ack\":\"auth\",\"ok\":true,\"token\":\"") + authToken + "\"}");
 }
@@ -1279,7 +1340,7 @@ static void startNormalMode() {
 
     if (haveWifi) {
         ArduinoOTA.setHostname(hostname.c_str());
-        rotateOtaPassword();
+        loadOrIssueAuthToken();
         ArduinoOTA.onStart([]() { screen({"ArduinoOTA", "updating..."}); });
         ArduinoOTA.onProgress([](unsigned int p, unsigned int t) {
             DevLog.printf("[ota] %u%%\r", t ? p * 100 / t : 0);
@@ -1302,6 +1363,7 @@ static void startNormalMode() {
 
 void setup() {
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    bootWakeCause = cause;
     bool woke = (cause == ESP_SLEEP_WAKEUP_TIMER || cause == ESP_SLEEP_WAKEUP_EXT1);
     hostname = "codex-status-" + macSuffix();
     epdBegin(!woke);
@@ -1319,9 +1381,10 @@ void setup() {
         DevLog.println("[pm] RTC state initialized");
     }
     const esp_partition_t *running = esp_ota_get_running_partition();
-    DevLog.printf("\n[codex-status] v%s mac=%s reset=%s slot=%s mode=%s wake=%d\n", FW_VERSION,
+    DevLog.printf("\n[codex-status] v%s mac=%s reset=%s slot=%s mode=%s wake=%d(%s)\n", FW_VERSION,
                   WiFi.macAddress().c_str(), resetReasonName(),
-                  running ? running->label : "?", MODE_NAMES[runtimeMode()], (int)cause);
+                  running ? running->label : "?", MODE_NAMES[runtimeMode()], (int)cause,
+                  wakeCauseName(cause));
     { Preferences p; p.begin("brg", false); p.end(); }
 
     tplStoreBegin();
@@ -1357,12 +1420,7 @@ static void exitLive(uint8_t reason) {
     if (usageCacheLoad(cached)) renderActiveUsage(cached, "DEEP", true);
     else screenIdle();
     DevLog.printf("[live] exit (%s)\n", idleReasonText());
-    epdPanelSleep();
-    bleAdvertiseStop();
-    WiFi.disconnect(true);
-    esp_sleep_enable_timer_wakeup(300ULL * 1000000ULL);
-    esp_sleep_enable_ext1_wakeup(1ULL << 0, ESP_EXT1_WAKEUP_ANY_LOW);
-    esp_deep_sleep_start();
+    deepSleepFor(300, false);
 }
 
 // Window finished: render IDLE when required, update the failure/backoff state
@@ -1400,12 +1458,7 @@ static void finishWindowAndSleep(bool haveWifi) {
     DevLog.printf("[pm] window done synced=%d wifi=%d fail=%u idle=%d reason=%s next=%us\n",
                   windowSynced ? 1 : 0, haveWifi ? 1 : 0, (unsigned)rtcFailCount,
                   showIdle ? 1 : 0, idleReasonText(), (unsigned)next);
-    epdPanelSleep();
-    bleAdvertiseStop();
-    WiFi.disconnect(true);
-    esp_sleep_enable_timer_wakeup((uint64_t)next * 1000000ULL);
-    esp_sleep_enable_ext1_wakeup(1ULL << 0, ESP_EXT1_WAKEUP_ANY_LOW);
-    esp_deep_sleep_start();
+    deepSleepFor(next, false);
 }
 
 // USB serial provisioning: `wifi <ssid> <pass>` saves to NVS and reboots;
@@ -1464,10 +1517,38 @@ static void handleSerialCli() {
                 DevLog.printf("[cli] mode=%s%s\n", MODE_NAMES[m],
                               m == 2 ? " (live == deep until M3)" : "");
             }
+        } else if (line == "pair") {
+            bleOpenPairingWindow(120000);
+            bleAdvertiseStart();
+            DevLog.println("[cli] pairing window open 120s");
+        } else if (line == "sleep" || line.startsWith("sleep ")) {
+            uint32_t sec = line.length() > 6 ? (uint32_t)line.substring(6).toInt() : 60;
+            if (sec < 15) sec = 15;
+            if (sec > 900) sec = 900;
+            DevLog.printf("[cli] sleep %us\n", (unsigned)sec);
+            delay(100);
+            deepSleepFor(sec, true);
         } else if (line.length()) {
-            DevLog.println("[cli] commands: wifi <ssid> <pass> | status | batt | mode [auto|deep|live]");
+            DevLog.println("[cli] commands: wifi <ssid> <pass> | status | batt | mode [auto|deep|live] | sleep [sec] | pair");
         }
     }
+}
+
+// PWR (GPIO18) held for 3 s: software power-off by dropping the VBAT latch
+// (GPIO17). On battery the MCU dies here; if USB/charger power keeps the board
+// alive the hold degrades to a clean restart so the device never sits inert.
+// (HWCDC's isPlugged() is not reliable after a cable unplug, so it is not used
+// as a gate.)
+static void powerOff() {
+    DevLog.println("[pm] PWR held 3s: power off");
+    epdPanelSleep();
+    bleAdvertiseStop();
+    WiFi.disconnect(true);
+    delay(200);
+    digitalWrite(17, LOW);
+    delay(3000);
+    DevLog.println("[pm] latch dropped but still powered (USB); restarting");
+    ESP.restart();
 }
 
 void loop() {
@@ -1476,14 +1557,27 @@ void loop() {
     server.handleClient();
     blePoll();
 
+    static uint32_t pwrDownAt = 0;
+    static bool pwrHandled = false;
+    static uint32_t pwrEnableAt = 0;
+    if (!pwrEnableAt) pwrEnableAt = millis() + 5000;   // boot grace: PWR just powered the board on
+    if (digitalRead(18) == LOW) {
+        if (!pwrDownAt) pwrDownAt = millis();
+        else if (!pwrHandled && millis() - pwrDownAt > 3000 &&
+                 (int32_t)(millis() - pwrEnableAt) >= 0) {
+            pwrHandled = true;
+            powerOff();
+        }
+    } else {
+        pwrDownAt = 0;
+        pwrHandled = false;
+    }
+
     if (configMode) {
         // D10: AP provisioning sleeps again after 5 idle minutes.
         if (millis() - configStartedAt > CONFIG_IDLE_MS) {
             DevLog.println("[config] idle timeout, sleeping");
-            WiFi.disconnect(true);
-            esp_sleep_enable_timer_wakeup(300ULL * 1000000ULL);
-            esp_sleep_enable_ext1_wakeup(1ULL << 0, ESP_EXT1_WAKEUP_ANY_LOW);
-            esp_deep_sleep_start();
+            deepSleepFor(300, false);
         }
         delay(5);
         return;
