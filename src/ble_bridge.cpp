@@ -60,12 +60,43 @@ static void clearReceiveBuffers() {
     if (tplResetHandler) tplResetHandler();
 }
 
-static bool securePeer(const ble_gap_conn_desc *desc) {
-    return desc && desc->sec_state.encrypted && desc->sec_state.bonded;
-}
+// NimBLE-Arduino 1.x exposes connection info as ble_gap_conn_desc*; 2.x as
+// NimBLEConnInfo&. CODEX_NIMBLE_V2 is set by the pm env so both cores build
+// from this same source.
+#if CODEX_NIMBLE_V2
+class PeerRef {
+  public:
+    PeerRef(NimBLEConnInfo &info) : info_(&info) {}
+    bool     secure() const { return info_->isEncrypted() && info_->isBonded(); }
+    bool     encrypted() const { return info_->isEncrypted(); }
+    bool     bonded() const { return info_->isBonded(); }
+    uint16_t handle() const { return info_->getConnHandle(); }
+    String   address() const { return info_->getAddress().toString().c_str(); }
 
-static bool writeAllowed(const ble_gap_conn_desc *desc) {
-    if (securePeer(desc)) return true;
+  private:
+    NimBLEConnInfo *info_;
+};
+#define PEER_ARG NimBLEConnInfo &desc
+#else
+class PeerRef {
+  public:
+    PeerRef(ble_gap_conn_desc *desc) : desc_(desc) {}
+    bool secure() const { return desc_ && desc_->sec_state.encrypted && desc_->sec_state.bonded; }
+    bool encrypted() const { return desc_ && desc_->sec_state.encrypted; }
+    bool bonded() const { return desc_ && desc_->sec_state.bonded; }
+    uint16_t handle() const { return desc_ ? desc_->conn_handle : BLE_HS_CONN_HANDLE_NONE; }
+    String address() const {
+        return desc_ ? NimBLEAddress(desc_->peer_id_addr).toString().c_str() : String();
+    }
+
+  private:
+    ble_gap_conn_desc *desc_;
+};
+#define PEER_ARG ble_gap_conn_desc *desc
+#endif
+
+static bool writeAllowed(PeerRef peer) {
+    if (peer.secure()) return true;
     DevLog.println("[ble] rejected unencrypted or unbonded write");
     return false;
 }
@@ -106,36 +137,17 @@ static void refreshInfo() {
 }
 
 class InfoCallbacks : public NimBLECharacteristicCallbacks {
+#if CODEX_NIMBLE_V2
+    void onRead(NimBLECharacteristic *c, PEER_ARG) override { refreshInfo(); }
+#else
     void onRead(NimBLECharacteristic *c) override { refreshInfo(); }
-    void onRead(NimBLECharacteristic *c, ble_gap_conn_desc *desc) override { refreshInfo(); }
+    void onRead(NimBLECharacteristic *c, PEER_ARG) override { refreshInfo(); }
+#endif
 };
 
 class ServerCallbacks : public NimBLEServerCallbacks {
-    void onConnect(NimBLEServer *server) override {
-        connected = true;
-        peerBonded = false;
-        peerEncrypted = false;
-        disconnecting = false;
-        clearReceiveBuffers();
-        refreshInfo();
-    }
-    void onConnect(NimBLEServer *server, ble_gap_conn_desc *desc) override {
-        connected = true;
-        peerConnHandle = desc->conn_handle;
-        peerBonded = NimBLEDevice::isBonded(NimBLEAddress(desc->peer_id_addr));
-        peerEncrypted = desc->sec_state.encrypted;
-        disconnecting = false;
-        clearReceiveBuffers();
-        peerAddress = NimBLEAddress(desc->peer_id_addr).toString().c_str();
-        DevLog.printf("[ble] connected: %s bonded=%d\n", peerAddress.c_str(), desc->sec_state.bonded);
-        refreshInfo();
-        if (!peerBonded && !blePairingWindowOpen()) {
-            DevLog.println("[ble] unbonded peer outside pairing window; disconnecting");
-            disconnecting = true;
-            server->disconnect(desc->conn_handle);
-        }
-    }
-    void onDisconnect(NimBLEServer *server) override {
+  private:
+    void handleDisconnect() {
         connected = false;
         peerBonded = false;
         peerEncrypted = false;
@@ -144,19 +156,59 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         clearReceiveBuffers();
         refreshInfo();
         DevLog.println("[ble] disconnected");
+        // NimBLE 2.x does not resume advertising after a connection ends.
+        // Restart it while the window still wants the radio on; LIVE and sleep
+        // entry set `advertising` false explicitly.
+        if (advertising) {
+            NimBLEDevice::startAdvertising();
+            DevLog.println("[ble] advertising restarted after disconnect");
+        }
     }
-    void onDisconnect(NimBLEServer *server, ble_gap_conn_desc *desc) override {
-        onDisconnect(server);
-    }
-    void onAuthenticationComplete(ble_gap_conn_desc *desc) override {
-        peerEncrypted = desc && desc->sec_state.encrypted;
-        peerBonded = desc && desc->sec_state.bonded;
+
+  public:
+#if !CODEX_NIMBLE_V2
+    void onConnect(NimBLEServer *server) override {
+        connected = true;
+        peerBonded = false;
+        peerEncrypted = false;
+        disconnecting = false;
+        clearReceiveBuffers();
         refreshInfo();
-        if (!securePeer(desc)) {
+    }
+#endif
+    void onConnect(NimBLEServer *server, PEER_ARG) override {
+        connected = true;
+        PeerRef peer(desc);
+        peerConnHandle = peer.handle();
+        peerBonded = peer.bonded();
+        peerEncrypted = peer.encrypted();
+        disconnecting = false;
+        clearReceiveBuffers();
+        peerAddress = peer.address();
+        DevLog.printf("[ble] connected: %s bonded=%d\n", peerAddress.c_str(), peerBonded ? 1 : 0);
+        refreshInfo();
+        if (!peerBonded && !blePairingWindowOpen()) {
+            DevLog.println("[ble] unbonded peer outside pairing window; disconnecting");
+            disconnecting = true;
+            server->disconnect(peer.handle());
+        }
+    }
+#if CODEX_NIMBLE_V2
+    void onDisconnect(NimBLEServer *server, PEER_ARG, int reason) override { handleDisconnect(); }
+#else
+    void onDisconnect(NimBLEServer *server) override { handleDisconnect(); }
+    void onDisconnect(NimBLEServer *server, PEER_ARG) override { handleDisconnect(); }
+#endif
+    void onAuthenticationComplete(PEER_ARG) override {
+        PeerRef peer(desc);
+        peerEncrypted = peer.encrypted();
+        peerBonded = peer.bonded();
+        refreshInfo();
+        if (!peer.secure()) {
             DevLog.println("[ble] authentication rejected: encryption and bond required");
-            if (bleServer && desc) {
+            if (bleServer) {
                 disconnecting = true;
-                bleServer->disconnect(desc->conn_handle);
+                bleServer->disconnect(peer.handle());
             }
             return;
         }
@@ -165,7 +217,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 };
 
 class EndpointCallbacks : public NimBLECharacteristicCallbacks {
-    void onWrite(NimBLECharacteristic *c, ble_gap_conn_desc *desc) override {
+    void onWrite(NimBLECharacteristic *c, PEER_ARG) override {
         if (!writeAllowed(desc)) return;
         std::string v = c->getValue();
         appendJson(endpointBuf, v, 1024, "endpoint",
@@ -174,7 +226,7 @@ class EndpointCallbacks : public NimBLECharacteristicCallbacks {
 };
 
 class UsageCallbacks : public NimBLECharacteristicCallbacks {
-    void onWrite(NimBLECharacteristic *c, ble_gap_conn_desc *desc) override {
+    void onWrite(NimBLECharacteristic *c, PEER_ARG) override {
         if (!writeAllowed(desc)) return;
         std::string v = c->getValue();
         appendJson(usageBuf, v, 4096, "usage",
@@ -183,7 +235,7 @@ class UsageCallbacks : public NimBLECharacteristicCallbacks {
 };
 
 class TplCtrlCallbacks : public NimBLECharacteristicCallbacks {
-    void onWrite(NimBLECharacteristic *c, ble_gap_conn_desc *desc) override {
+    void onWrite(NimBLECharacteristic *c, PEER_ARG) override {
         if (!writeAllowed(desc)) return;
         std::string v = c->getValue();
         appendJson(tplCtrlBuf, v, 512, "template-control",
@@ -192,7 +244,7 @@ class TplCtrlCallbacks : public NimBLECharacteristicCallbacks {
 };
 
 class TplDataCallbacks : public NimBLECharacteristicCallbacks {
-    void onWrite(NimBLECharacteristic *c, ble_gap_conn_desc *desc) override {
+    void onWrite(NimBLECharacteristic *c, PEER_ARG) override {
         if (!writeAllowed(desc)) return;
         if (!tplDataHandler) return;
         std::string v = c->getValue();
@@ -201,7 +253,7 @@ class TplDataCallbacks : public NimBLECharacteristicCallbacks {
 };
 
 class AuthCallbacks : public NimBLECharacteristicCallbacks {
-    void onWrite(NimBLECharacteristic *c, ble_gap_conn_desc *desc) override {
+    void onWrite(NimBLECharacteristic *c, PEER_ARG) override {
         if (!writeAllowed(desc)) return;
         std::string v = c->getValue();
         appendJson(authBuf, v, 256, "auth",
@@ -249,8 +301,18 @@ void bleBegin(const String &deviceName, const String &fw) {
     svc->start();
 
     NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
+#if CODEX_NIMBLE_V2
+    // NimBLE 2.x advertises no name unless set explicitly, and the scan
+    // response must be enabled explicitly as well; bridges scan by the
+    // CodexStatus- prefix. The 128-bit service UUID does not fit next to the
+    // name in the 31-byte legacy payload (Data length exceeded), and nothing
+    // filters on it, so it is left out of the advertisement.
+    adv->setName(deviceName.c_str());
+    adv->enableScanResponse(true);
+#else
     adv->addServiceUUID(BLE_SVC_UUID);
     adv->setScanResponse(true);
+#endif
     NimBLEDevice::startAdvertising();
     advertising = true;
 

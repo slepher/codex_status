@@ -21,3 +21,13 @@ __pycache__/
 .vscode/ipch
 Thumbs.db
 desktop.ini
+
+# pioarduino custom_sdkconfig droppings (regenerated per build)
+sdkconfig
+sdkconfig.old
+sdkconfig.defaults
+sdkconfig.*
+CMakeLists.txt
+.dummy/
+dependencies.lock
+managed_components/

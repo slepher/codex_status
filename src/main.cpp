@@ -18,7 +18,11 @@
 #include <esp_sleep.h>
 #include <esp_ota_ops.h>
 #include <esp_system.h>
+#include <esp_pm.h>
+#include <esp_wifi.h>
+#include <esp_mac.h>
 #include <driver/rtc_io.h>
+#include <driver/gpio.h>
 
 #include "DEV_Config.h"
 #include "dev_log.h"
@@ -32,7 +36,11 @@
 #include "template_engine.h"
 #include "template_xfer.h"
 
+#ifdef CODEX_PM
+#define FW_VERSION    "0.11.9-bw"
+#else
 #define FW_VERSION    "0.10.3-bw"
+#endif
 #define AP_PASSWORD   "codex1234"
 #define MAX_SLOTS     3
 
@@ -93,6 +101,11 @@ RTC_DATA_ATTR static uint8_t  rtcIdleReason = IDLE_BOOT;
 RTC_DATA_ATTR static bool     rtcNeverSynced = true;
 RTC_DATA_ATTR static uint32_t rtcBssidHash = 0;
 RTC_DATA_ATTR static uint32_t rtcUsageHash = 0;
+// Why AP config mode was entered last (0 none, 1 no saved slots, 2 BOOT held
+// 5-10 s). Kept in RTC memory so a post-mortem /status.json read after the AP
+// idle sleep can tell a provisioning bug from a stuck/glitching BOOT pin.
+RTC_DATA_ATTR static uint8_t  rtcApReason = 0;
+static const char *AP_REASON_NAMES[] = {"none", "no_slots", "boot_hold"};
 
 static bool     windowMode = false;      // DEEP window flow (M2 default)
 static uint32_t windowDeadline = 0;
@@ -103,6 +116,11 @@ static bool     windowEnvSwitch = false;
 static uint32_t activeHoldSec = ACTIVE_HOLD_S;
 static bool     otaInProgress = false;
 static uint32_t configStartedAt = 0;
+// `stay` CLI: keep the device awake (no deep sleep) until reset. Used while
+// USB-debugging provisioning/pairing, where the normal window cycling makes
+// interactive work impossible.
+static bool debugStayAwake = false;
+
 
 // LIVE (M3 Plan B: modem sleep on the stock core; PM auto-light-sleep later).
 static bool     liveMode = false;
@@ -110,6 +128,37 @@ static uint32_t liveEnteredAtMs = 0;
 static uint32_t liveLastSyncMs = 0;
 static uint32_t liveLastPollMs = 0;
 static uint32_t wifiLostSinceMs = 0;
+static bool     pmLightSleep = false;
+
+// LIVE power management: PM dynamic frequency scaling (240/40 MHz) plus
+// automatic light sleep. Requires CONFIG_PM_ENABLE and
+// CONFIG_FREERTOS_USE_TICKLESS_IDLE from the custom sdkconfig (pm env); on the
+// stock core esp_pm_configure returns ESP_ERR_NOT_SUPPORTED, which is logged
+// because it means tickless idle never made it into the core.
+static void configurePowerManagement() {
+#ifdef CODEX_PM
+    esp_pm_config_t cfg = {};
+    cfg.max_freq_mhz = 240;
+    cfg.min_freq_mhz = 40;
+    cfg.light_sleep_enable = true;
+    esp_err_t err = esp_pm_configure(&cfg);
+    pmLightSleep = (err == ESP_OK);
+    DevLog.printf("[pm] esp_pm_configure(light_sleep=1, 240/40MHz): %s\n", esp_err_to_name(err));
+#else
+    DevLog.println("[pm] stock core: PM light sleep not compiled in");
+#endif
+}
+
+// CONFIG_PM_SLP_DISABLE_GPIO floats every pad during automatic light sleep
+// (~200-300 uA saved). The VBAT latch (GPIO17 high), the panel power enable
+// (GPIO6 low = panel powered) and the audio amp power (GPIO42 low = off) must
+// keep their levels, so they opt out of the sleep switch.
+static void retainSleepCriticalGpio() {
+    gpio_sleep_sel_dis(GPIO_NUM_17);
+    gpio_sleep_sel_dis(GPIO_NUM_6);
+    gpio_sleep_sel_dis(GPIO_NUM_42);
+    DevLog.println("[pm] GPIO sleep retention: 17/6/42");
+}
 
 static uint32_t fnv1a(const String &s) {
     uint32_t h = 2166136261u;
@@ -234,9 +283,14 @@ static bool pairingOverlayActive() {
 }
 
 static String macSuffix() {
-    String mac = WiFi.macAddress();
-    mac.replace(":", "");
-    return mac.substring(6);
+    // Read the base MAC straight from eFuse: WiFi.macAddress() needs the Wi-Fi
+    // driver (and NVS) up, which is not true yet at BLE init / AP startup and
+    // returns 00:00:00:00:00:00 on the Arduino 3.x core.
+    uint8_t mac[6] = {0};
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%02X%02X%02X", mac[3], mac[4], mac[5]);
+    return String(buf);
 }
 
 static String ipText() {
@@ -343,6 +397,7 @@ static void epdBegin(bool clearPanel = true) {
     digitalWrite(42, LOW);
     pinMode(17, OUTPUT);
     digitalWrite(17, HIGH);
+    retainSleepCriticalGpio();
     delay(20);
     DEV_Module_Init();
     EPD_SSD1681_Init();
@@ -858,6 +913,10 @@ static void armWakeSources(uint64_t timerUs) {
 // Common DEEP entry: optional IDLE render, panel/BLE/Wi-Fi teardown, wake
 // sources armed, then deep sleep.
 static void deepSleepFor(uint32_t sec, bool renderIdle) {
+    if (debugStayAwake) {
+        DevLog.println("[pm] stay awake: deep sleep skipped");
+        return;
+    }
     if (renderIdle) {
         String cached;
         if (usageCacheLoad(cached)) renderActiveUsage(cached, "DEEP", true);
@@ -919,15 +978,17 @@ static void handleBleEndpoint(const String &json) {
     pendingEndpoint = true;
 }
 
-static bool hasWifiSlots() {
+static int countWifiSlots() {
     prefs.begin("wifi", true);
-    bool any = false;
+    int n = 0;
     for (int i = 0; i < MAX_SLOTS; i++) {
-        if (prefs.getString(("s" + String(i)).c_str(), "").length()) { any = true; break; }
+        if (prefs.getString(("s" + String(i)).c_str(), "").length()) n++;
     }
     prefs.end();
-    return any;
+    return n;
 }
+
+static bool hasWifiSlots() { return countWifiSlots() > 0; }
 
 // Scan once and connect to the saved slot with the best signal; the last-used
 // slot wins near-ties. Single 9 s connect attempt (sleep.md §4.2/§4.9).
@@ -1143,12 +1204,15 @@ static void handleStatusJson() {
     doc["fail_count"] = rtcFailCount;
     doc["window_synced"] = windowSynced;
     doc["live"] = liveMode;
+    doc["pm_light_sleep"] = pmLightSleep;
     doc["battery"] = batteryPercent();
     doc["battery_mv"] = batteryMilliVolts();
     doc["heap"] = ESP.getFreeHeap();
     doc["epd_writes"] = epdWriteCount;
     doc["epd_partial"] = epdPartialReady;
     doc["epd_streak"] = epdPartialCount;
+    doc["wifi_slots"] = countWifiSlots();
+    doc["ap_reason"] = AP_REASON_NAMES[rtcApReason < 3 ? rtcApReason : 0];
     JsonArray templates = doc["templates"].to<JsonArray>();
     String activeId = tplStoreActive();
     for (int i = 0; i < tplStoreCount(); i++) {
@@ -1393,14 +1457,38 @@ void setup() {
     if (hasWifiSlots()) {
         startNormalMode();
     } else {
+        rtcApReason = 1;
         DevLog.println("[config] no saved Wi-Fi slots; entering AP mode (D10)");
         startConfigMode();
     }
 }
 
-// LIVE entry/exit (sleep.md §4.1/§4.3). Plan B keeps the Wi-Fi association
-// with modem sleep on the stock core; custom-core PM light sleep is a later
-// optimization gated by the T10 current measurement.
+// LIVE Wi-Fi power save: WIFI_PS_MAX_MODEM with listen_interval=10 wakes the
+// modem every 10 beacons (~1 s at the usual 100 ms beacon interval) instead of
+// every DTIM. The listen interval is advertised in the association request, so
+// it is applied together with one re-association here; the bridge tolerates a
+// missed push and retries on its next tick.
+static void configureWifiPowerSave() {
+    wifi_config_t cfg = {};
+    if (esp_wifi_get_config(WIFI_IF_STA, &cfg) == ESP_OK && cfg.sta.listen_interval != 10) {
+        cfg.sta.listen_interval = 10;
+        esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &cfg);
+        if (err == ESP_OK && WiFi.status() == WL_CONNECTED) {
+            WiFi.disconnect(false);
+            delay(100);
+            WiFi.reconnect();
+            uint32_t t0 = millis();
+            while (WiFi.status() != WL_CONNECTED && millis() - t0 < 6000) delay(100);
+        }
+        DevLog.printf("[pm] listen_interval=10 (%s), connected=%d\n",
+                      esp_err_to_name(err), WiFi.status() == WL_CONNECTED);
+    }
+    esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+    DevLog.println("[pm] WiFi PS = MAX_MODEM");
+}
+
+// LIVE entry/exit (sleep.md §4.1/§4.3): PM light sleep + MAX_MODEM Wi-Fi PS,
+// BLE advertising stays off until a pairing window is asked for.
 static void enterLive() {
     liveMode = true;
     windowMode = false;
@@ -1408,9 +1496,10 @@ static void enterLive() {
     liveLastSyncMs = millis();
     liveLastPollMs = millis();
     wifiLostSinceMs = 0;
-    WiFi.setSleep(true);
+    configurePowerManagement();
+    configureWifiPowerSave();
     bleAdvertiseStop();
-    DevLog.println("[live] enter (modem sleep, BLE advertising off)");
+    DevLog.println("[live] enter (PM light sleep, BLE advertising off)");
 }
 
 static void exitLive(uint8_t reason) {
@@ -1521,6 +1610,9 @@ static void handleSerialCli() {
             bleOpenPairingWindow(120000);
             bleAdvertiseStart();
             DevLog.println("[cli] pairing window open 120s");
+        } else if (line == "stay") {
+            debugStayAwake = true;
+            DevLog.println("[cli] stay awake until reset");
         } else if (line == "sleep" || line.startsWith("sleep ")) {
             uint32_t sec = line.length() > 6 ? (uint32_t)line.substring(6).toInt() : 60;
             if (sec < 15) sec = 15;
@@ -1529,7 +1621,7 @@ static void handleSerialCli() {
             delay(100);
             deepSleepFor(sec, true);
         } else if (line.length()) {
-            DevLog.println("[cli] commands: wifi <ssid> <pass> | status | batt | mode [auto|deep|live] | sleep [sec] | pair");
+            DevLog.println("[cli] commands: wifi <ssid> <pass> | status | batt | mode [auto|deep|live] | sleep [sec] | pair | stay");
         }
     }
 }
@@ -1575,7 +1667,7 @@ void loop() {
 
     if (configMode) {
         // D10: AP provisioning sleeps again after 5 idle minutes.
-        if (millis() - configStartedAt > CONFIG_IDLE_MS) {
+        if (!debugStayAwake && millis() - configStartedAt > CONFIG_IDLE_MS) {
             DevLog.println("[config] idle timeout, sleeping");
             deepSleepFor(300, false);
         }
@@ -1587,7 +1679,14 @@ void loop() {
 
     static uint32_t bootDownAt = 0;
     static int      bootStage = 0;
-    if (digitalRead(0) == LOW) {
+    // Arm the button only after GPIO0 has read HIGH once: a strapping/mux
+    // glitch that made it read LOW for the first seconds of boot otherwise
+    // looked like a 5 s hold and dropped the device into AP mode on release
+    // (seen right after OTA into the pioarduino core).
+    static bool     bootArmed = false;
+    bool bootLow = (digitalRead(0) == LOW);
+    if (!bootArmed && !bootLow) bootArmed = true;
+    if (bootArmed && bootLow) {
         if (!bootDownAt) bootDownAt = millis();
         uint32_t held = millis() - bootDownAt;
         if (bootStage < 1 && held > 2000) {
@@ -1610,6 +1709,7 @@ void loop() {
             uint32_t held = millis() - bootDownAt;
             if (bootStage == 0 && held > 50 && held < 1500) nextTemplate();
             else if (bootStage == 2 && held >= 5000 && held < 10000) {
+                rtcApReason = 2;
                 DevLog.println("[config] BOOT held 5s; entering AP mode (D10)");
                 startConfigMode();
                 return;
@@ -1692,7 +1792,7 @@ void loop() {
     if (otaInProgress) holdWindow(WINDOW_HOLD_MS);
     // Pairing/token operations and live BLE peers also keep the window open.
     if (windowMode && !otaInProgress && !bleIsConnected() && !blePairingWindowOpen() &&
-        !pairingOverlay && (int32_t)(millis() - windowDeadline) >= 0) {
+        !pairingOverlay && !debugStayAwake && (int32_t)(millis() - windowDeadline) >= 0) {
         finishWindowAndSleep(windowHadWifi || WiFi.status() == WL_CONNECTED);
     }
 
