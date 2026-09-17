@@ -442,6 +442,7 @@ dependencies = [
  "bridge-core",
  "bridge-mcp",
  "bridge-render",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tauri",

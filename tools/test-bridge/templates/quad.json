@@ -176,6 +176,7 @@
       "bind": "buckets[codex].5h.resetsAt",
       "color": "black",
       "font": "f12",
+      "mode": "live",
       "prefix": "5H ",
       "region": [
         4,
@@ -191,9 +192,29 @@
       }
     },
     {
+      "bind": "buckets[codex].5h.resetsAt",
+      "color": "black",
+      "font": "f12",
+      "mode": "idle",
+      "prefix": "5H ",
+      "region": [
+        4,
+        144,
+        84,
+        12
+      ],
+      "time_format": "hhmm",
+      "type": "text",
+      "when": {
+        "bind": "buckets[codex].5h.resetsAt",
+        "exists": true
+      }
+    },
+    {
       "bind": "device.battery",
       "color": "black",
       "font": "f12",
+      "mode": "live",
       "prefix": "BATT ",
       "region": [
         4,
@@ -205,9 +226,57 @@
       "type": "text"
     },
     {
+      "bind": "device.battery",
+      "color": "black",
+      "font": "f12",
+      "mode": "idle",
+      "prefix": "BATT ",
+      "region": [
+        4,
+        158,
+        84,
+        12
+      ],
+      "suffix": "%",
+      "type": "text"
+    },
+    {
+      "bind": "device.state",
+      "color": "black",
+      "font": "f12",
+      "mode": "idle",
+      "region": [
+        4,
+        172,
+        84,
+        12
+      ],
+      "type": "text"
+    },
+    {
+      "bind": "device.offline_mins",
+      "color": "black",
+      "font": "f12",
+      "mode": "idle",
+      "prefix": "OFF ",
+      "region": [
+        4,
+        186,
+        84,
+        12
+      ],
+      "suffix": "M",
+      "type": "text",
+      "when": {
+        "bind": "device.offline_mins",
+        "exists": true
+      }
+    },
+    {
       "bind": "device.sync_hhmm",
       "color": "black",
       "font": "f12",
+      "mode": "live",
       "prefix": "SYNC ",
       "region": [
         4,
@@ -219,6 +288,7 @@
     }
   ],
   "id": "quad",
-  "min_fw": "0.5",
-  "schema": 1
+  "min_fw": "0.10",
+  "schema": 1,
+  "version": 4
 }

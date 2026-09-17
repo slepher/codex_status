@@ -18,6 +18,11 @@ pub struct PollerConfig {
     pub host_id: String,
     pub interval_secs: u64,
     pub templates: Arc<RwLock<Library>>,
+    /// Idle screen template id delivered in the envelope (default `quad`);
+    /// shared with the app so the panel can change it at runtime.
+    pub idle_template: Arc<RwLock<Option<String>>>,
+    /// active hold window in seconds (default 600).
+    pub active_hold_seconds: u64,
 }
 
 pub async fn run_poller(cfg: PollerConfig, envelope: Arc<RwLock<Option<Value>>>) -> Result<()> {
@@ -40,11 +45,14 @@ pub async fn run_poller(cfg: PollerConfig, envelope: Arc<RwLock<Option<Value>>>)
                     match client.read_rate_limits().await {
                         Ok(rate_limits) => {
                             let template_refs = cfg.templates.read().await.template_refs();
+                            let idle_template = cfg.idle_template.read().await.clone();
                             let opts = EnvelopeOptions {
                                 bridge_label: label.clone(),
                                 bridge_host_id: cfg.host_id.clone(),
                                 next_sync_seconds: cfg.interval_secs,
                                 templates: template_refs,
+                                idle_template,
+                                active_hold_seconds: cfg.active_hold_seconds,
                             };
                             *envelope.write().await = Some(build_envelope(&rate_limits, &opts));
                             tracing::info!("usage refreshed");

@@ -186,6 +186,20 @@ void EPD_SSD1681_Init_Partial(void)
     readBusy();
 }
 
+// Wake the controller from deep-sleep mode 1 and prepare a partial refresh.
+// Mode 1 retains RAM, but a reset after wake may not be trusted to keep the
+// "previous" RAM (cmd 0x26) baseline, so it is re-seeded from the frame that
+// is known to be on screen.
+void EPD_SSD1681_WakePartial(const UBYTE *PreviousImage)
+{
+    EPD_SSD1681_Init_Partial();
+    if (!PreviousImage) return;
+    setWindow(0, EPD_SSD1681_HEIGHT - 1, EPD_SSD1681_WIDTH - 1, 0);
+    setCursor(0, EPD_SSD1681_HEIGHT - 1);
+    sendCmd(0x26);
+    sendDataN(PreviousImage, FB_BYTES);
+}
+
 void EPD_SSD1681_Clear(UBYTE color)
 {
     static UBYTE chunk[500];

@@ -41,6 +41,9 @@ pub struct BleConfig {
     pub template_ids: Option<Vec<String>>,
     /// Template to activate after an explicit push (profile's active choice).
     pub activate: Option<String>,
+    /// Scan window per cycle. Long for one-shot tools, short (5 s) for the
+    /// low-duty tray loop.
+    pub scan_timeout_ms: u64,
 }
 
 /// Best-effort LAN IP used in the endpoint written over BLE.
@@ -303,7 +306,8 @@ impl Pusher {
 
     /// One connect → push → disconnect cycle.
     pub async fn cycle_once(&self, adapter: &Adapter) -> Result<()> {
-        let peripheral = Self::wait_for_device(adapter, &self.cfg.name_prefix, Duration::from_secs(30)).await?;
+        let scan = Duration::from_millis(self.cfg.scan_timeout_ms.max(1000));
+        let peripheral = Self::wait_for_device(adapter, &self.cfg.name_prefix, scan).await?;
         let props = peripheral.properties().await?;
         let name = props
             .and_then(|p| p.local_name)

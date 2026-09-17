@@ -15,8 +15,13 @@ enum BindKind {
     B_PLAN, B_LABEL, B_HOSTID, B_SERVER_TIME,
     B_RESET_COUNT, B_RESET_EXPIRES,
     B_BUCKET_USED, B_BUCKET_REMAIN, B_BUCKET_RESET, B_BUCKET_WINMINS,
-    B_DEV_CHANNEL, B_DEV_IP, B_DEV_SYNC, B_DEV_BATTERY
+    B_DEV_CHANNEL, B_DEV_IP, B_DEV_SYNC, B_DEV_BATTERY,
+    B_DEV_STATE, B_DEV_OFFLINE, B_DEV_REASON
 };
+
+// Element render mode: `any` draws in both screens, `idle`/`live` only in the
+// matching one (sleep.md §4.4).
+enum TplMode { MODE_ANY, MODE_IDLE, MODE_LIVE };
 
 // The optional JSON "time_format" accepts exactly "date" (the compact local
 // MM-DD HH:MM default) or "hhmm" (reserved for epoch bindings).
@@ -89,6 +94,9 @@ static bool parseBind(const String &path, BindSpec &s) {
     if (path == "device.ip")                  { s.kind = B_DEV_IP; return true; }
     if (path == "device.sync_hhmm")           { s.kind = B_DEV_SYNC; return true; }
     if (path == "device.battery")              { s.kind = B_DEV_BATTERY; return true; }
+    if (path == "device.state")                { s.kind = B_DEV_STATE; return true; }
+    if (path == "device.offline_mins")         { s.kind = B_DEV_OFFLINE; return true; }
+    if (path == "device.idle_reason")          { s.kind = B_DEV_REASON; return true; }
     if (path.startsWith("buckets[")) {
         int close = path.indexOf(']', 8);
         if (close < 0) return false;
@@ -185,6 +193,18 @@ static bool evalBind(const BindSpec &s, TextTimeFormat format, JsonDocument &usa
     case B_DEV_IP:      out = env.ip; return true;
     case B_DEV_SYNC:    out = env.syncHHMM; return true;
     case B_DEV_BATTERY: out = env.battery >= 0 ? String(env.battery) : "--"; return true;
+    case B_DEV_STATE:
+        if (!env.idle) return false;
+        out = "IDLE";
+        return true;
+    case B_DEV_OFFLINE:
+        if (!env.idle || env.offlineMins < 0) return false;
+        out = String(env.offlineMins);
+        return true;
+    case B_DEV_REASON:
+        if (!env.idle || env.idleReason.length() == 0) return false;
+        out = env.idleReason;
+        return true;
     case B_SERVER_TIME:
         if (usage["server_time"].isNull()) return false;
         out = fmtEpoch(usage["server_time"] | 0LL, format);
@@ -254,6 +274,9 @@ static bool bindExists(const BindSpec &s, JsonDocument &usage, const TplEnv &env
     case B_DEV_IP:      return env.ip.length() > 0;
     case B_DEV_SYNC:    return env.syncHHMM.length() > 0 && env.syncHHMM != "--:--";
     case B_DEV_BATTERY: return env.battery >= 0;
+    case B_DEV_STATE:   return env.idle;
+    case B_DEV_OFFLINE: return env.idle && env.offlineMins >= 0;
+    case B_DEV_REASON:  return env.idle && env.idleReason.length() > 0;
     case B_PLAN:        return haveUsage && !usage["account"]["plan"].isNull();
     case B_LABEL:       return haveUsage && !usage["bridge"]["label"].isNull();
     case B_HOSTID:      return haveUsage && !usage["bridge"]["hostId"].isNull();
@@ -297,6 +320,17 @@ static bool conditionMatches(const DrawCondition &condition, JsonDocument &usage
                              const TplEnv &env, bool haveUsage) {
     if (!condition.active) return true;
     return bindExists(condition.bind, usage, env, haveUsage) == condition.exists;
+}
+
+static bool parseElementMode(JsonObject e, TplMode &mode) {
+    if (!e.containsKey("mode")) { mode = MODE_ANY; return true; }
+    JsonVariant v = e["mode"];
+    if (!v.is<const char *>()) return false;
+    const char *s = v.as<const char *>();
+    if (!strcmp(s, "any"))       { mode = MODE_ANY; return true; }
+    if (!strcmp(s, "idle"))      { mode = MODE_IDLE; return true; }
+    if (!strcmp(s, "live"))      { mode = MODE_LIVE; return true; }
+    return false;
 }
 
 static bool textScale(JsonVariant value, int &scale) {
@@ -410,7 +444,13 @@ static bool drawElements(JsonArray els, JsonDocument &usage, const TplEnv &env,
     for (JsonObject e : els) {
         DrawCondition condition;
         if (!parseCondition(e, condition)) return false;
-        if (!dry && !conditionMatches(condition, usage, env, haveUsage)) continue;
+        TplMode mode = MODE_ANY;
+        if (!parseElementMode(e, mode)) return false;
+        if (!dry) {
+            if (mode == MODE_IDLE && !env.idle) continue;
+            if (mode == MODE_LIVE && env.idle) continue;
+            if (!conditionMatches(condition, usage, env, haveUsage)) continue;
+        }
         const char *type = e["type"] | "";
         if (!strcmp(type, "text")) {
             sFONT *font = fontByName(e["font"] | "");

@@ -19,6 +19,7 @@
 
 void EPD_SSD1681_Init(void);          // full-refresh waveform init
 void EPD_SSD1681_Init_Partial(void);  // partial-refresh waveform init
+void EPD_SSD1681_WakePartial(const UBYTE *PreviousImage);  // wake from sleep + seed prev RAM
 void EPD_SSD1681_Clear(UBYTE color);  // fill RAM + full refresh (no framebuffer needed)
 void EPD_SSD1681_Display(const UBYTE *Image);      // full refresh + seed previous RAM
 void EPD_SSD1681_DisplayPart(const UBYTE *Image);  // partial refresh (~300ms, no flash)

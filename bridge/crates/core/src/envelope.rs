@@ -17,6 +17,10 @@ pub struct EnvelopeOptions {
     pub bridge_host_id: String,
     pub next_sync_seconds: u64,
     pub templates: BTreeMap<String, TemplateRef>,
+    /// Device idle screen template id (sleep.md D6, default `quad`).
+    pub idle_template: Option<String>,
+    /// active hold window in seconds (sleep.md D5, default 600).
+    pub active_hold_seconds: u64,
 }
 
 /// Window type is classified by duration, never by primary/secondary position.
@@ -153,11 +157,15 @@ pub fn build_envelope(result: &Value, opts: &EnvelopeOptions) -> Value {
         "schema": 1,
         "server_time": now,
         "next_sync_seconds": opts.next_sync_seconds,
+        "active_hold_seconds": opts.active_hold_seconds,
         "bridge": {"label": opts.bridge_label, "hostId": opts.bridge_host_id},
         "account": {"plan": plan},
         "buckets": buckets,
         "templates": templates,
     });
+    if let Some(idle) = &opts.idle_template {
+        envelope["idle_template"] = json!(idle);
+    }
     if reset_count > 0 {
         envelope["resetCredits"] = json!({"availableCount": reset_count, "nextExpiresAt": reset_next});
     }

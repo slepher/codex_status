@@ -180,6 +180,10 @@ def make_usage() -> dict:
         "resetCredits": {"availableCount": 1, "nextExpiresAt": now + 7 * 86400},
         "templates": {tid: {"version": t["version"], "hash": TPL_HASH[tid]}
                       for tid, t in TPL_BY_ID.items()},
+        # M2 device protocol: idle screen template id (production bridge
+        # defaults to quad; the device must already know the template).
+        "idle_template": ARGS.idle_template,
+        "active_hold_seconds": ARGS.active_hold,
     }
 
 
@@ -312,6 +316,10 @@ def main():
     p.add_argument("--push-usage", action="store_true")
     p.add_argument("--push-template", action="store_true")
     p.add_argument("--template", default="full", choices=list(TPL_BY_ID))
+    p.add_argument("--idle-template", default="full",
+                   help="envelope idle_template id (production default: quad)")
+    p.add_argument("--active-hold", type=int, default=600,
+                   help="envelope active_hold_seconds")
     p.add_argument("--no-ble", action="store_true")
     ARGS = p.parse_args()
 

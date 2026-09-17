@@ -12,6 +12,7 @@
 #include <ESPmDNS.h>
 #include <ArduinoJson.h>
 #include <time.h>
+#include <sys/time.h>
 #include <string.h>
 #include <vector>
 #include <esp_sleep.h>
@@ -30,13 +31,9 @@
 #include "template_engine.h"
 #include "template_xfer.h"
 
-#define FW_VERSION    "0.8.0-bw"
+#define FW_VERSION    "0.10.2-bw"
 #define AP_PASSWORD   "codex1234"
-#define AUTH_TOKEN_TTL_MS 3600000UL
 #define MAX_SLOTS     3
-#define SLOT_TIMEOUT  15000
-#define WIFI_LOST_RESTART_MS 120000
-#define FETCH_INTERVAL_MS    30000
 
 static const int EPD_W = EPD_SSD1681_WIDTH;
 static const int EPD_H = EPD_SSD1681_HEIGHT;
@@ -50,14 +47,152 @@ static uint32_t    epdWriteCount = 0;
 static bool        otaRebootPending = false;
 static uint32_t    otaRebootAt = 0;
 static String      authToken;
-static uint32_t    authTokenExpiresAt = 0;
 static char        otaPasswordBuf[40] = {0};
 static bool        otaUploadDenied = false;
 static bool        configMode = false;
-static uint32_t    lastConnectedMs = 0;
-static uint32_t    nextFetchAt = 0;
 static String      hostname;
 static String      apSsid;
+
+// Runtime power mode: 0 auto (DEEP windows, M2), 1 deep, 2 live.
+// Until M3 delivers the LIVE path (custom core + PM), `live` behaves as deep.
+static const char *MODE_NAMES[3] = {"auto", "deep", "live"};
+
+static uint8_t runtimeMode() {
+    Preferences p;
+    p.begin("cfg", true);
+    uint8_t m = p.getUChar("mode", 0);
+    p.end();
+    return m > 2 ? 0 : m;
+}
+
+static void setRuntimeMode(uint8_t m) {
+    Preferences p;
+    p.begin("cfg", false);
+    p.putUChar("mode", m > 2 ? 0 : m);
+    p.end();
+}
+
+// ---------------- M2 DEEP window state (sleep.md §4.1/§4.2) ----------------
+#define WINDOW_MS        15000UL
+#define WINDOW_HOLD_MS   30000UL
+#define WINDOW_MAX_MS    (10UL * 60UL * 1000UL)
+#define ACTIVE_HOLD_S    600
+#define CONFIG_IDLE_MS   (5UL * 60UL * 1000UL)
+#define STORE_MAX_LOCAL  8
+
+enum IdleReason { IDLE_BOOT = 0, IDLE_WIFI_LOST, IDLE_BRIDGE_LOST, IDLE_ENV_SWITCH };
+static const char *IDLE_REASON_NAMES[] = {"boot", "wifi_lost", "bridge_lost", "env_switch"};
+
+RTC_DATA_ATTR static uint32_t rtcMagic = 0;
+RTC_DATA_ATTR static uint32_t rtcActiveAt = 0;
+RTC_DATA_ATTR static char     rtcActiveMac[20] = {0};
+RTC_DATA_ATTR static uint8_t  rtcFailCount = 0;
+RTC_DATA_ATTR static uint8_t  rtcFastLeft = 3;
+RTC_DATA_ATTR static uint8_t  rtcIdleReason = IDLE_BOOT;
+RTC_DATA_ATTR static bool     rtcNeverSynced = true;
+RTC_DATA_ATTR static uint32_t rtcBssidHash = 0;
+RTC_DATA_ATTR static uint32_t rtcUsageHash = 0;
+
+static bool     windowMode = false;      // DEEP window flow (M2 default)
+static uint32_t windowDeadline = 0;
+static uint32_t windowHardStop = 0;
+static bool     windowSynced = false;
+static bool     windowHadWifi = false;
+static bool     windowEnvSwitch = false;
+static uint32_t activeHoldSec = ACTIVE_HOLD_S;
+static bool     otaInProgress = false;
+static uint32_t configStartedAt = 0;
+
+// LIVE (M3 Plan B: modem sleep on the stock core; PM auto-light-sleep later).
+static bool     liveMode = false;
+static uint32_t liveEnteredAtMs = 0;
+static uint32_t liveLastSyncMs = 0;
+static uint32_t liveLastPollMs = 0;
+static uint32_t wifiLostSinceMs = 0;
+
+static uint32_t fnv1a(const String &s) {
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < s.length(); i++) {
+        h ^= (uint8_t)s[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static bool timeKnown() { return time(nullptr) > 1600000000; }
+
+static const char *idleReasonText() {
+    return IDLE_REASON_NAMES[rtcIdleReason <= IDLE_ENV_SWITCH ? rtcIdleReason : 0];
+}
+
+static void setActiveMac(const String &mac) {
+    strncpy(rtcActiveMac, mac.c_str(), sizeof(rtcActiveMac) - 1);
+    rtcActiveMac[sizeof(rtcActiveMac) - 1] = '\0';
+}
+
+static void adoptServerTime(JsonDocument &doc) {
+    long long st = doc["server_time"] | 0LL;
+    if (!timeKnown() && st > 1600000000) {
+        struct timeval tv = {(time_t)st, 0};
+        settimeofday(&tv, nullptr);
+        DevLog.printf("[pm] clock set from bridge: %lld\n", st);
+    }
+}
+
+static bool usageCacheLoad(String &out) {
+    Preferences p;
+    p.begin("ucache", true);
+    out = p.getString("json", "");
+    p.end();
+    return out.length() > 0;
+}
+
+static void usageCacheSave(const String &json) {
+    uint32_t h = fnv1a(json);
+    if (h == rtcUsageHash) return;
+    if (json.length() >= 4000) {
+        DevLog.println("[pm] usage cache skipped: too large");
+        rtcUsageHash = h;
+        return;
+    }
+    Preferences p;
+    p.begin("ucache", false);
+    p.putString("json", json);
+    p.end();
+    rtcUsageHash = h;
+}
+
+// Keep the current window open for an explicit user action (BLE pairing/token
+// issuance, OTA upload), up to a bounded hard stop.
+static void holdWindow(uint32_t ms) {
+    if (!windowMode) return;
+    windowHardStop = millis() + ms;
+    if ((int32_t)(windowHardStop - windowDeadline) > 0) windowDeadline = windowHardStop;
+}
+
+// A sync is accepted from any bridge while there is no active bridge, from the
+// active bridge itself, after the active hold window, when the active
+// endpoint's BSSID no longer matches the current one, or on an explicit
+// activate flag (sleep.md §2).
+static bool usageAccepted(const String &mac, bool explicitActivate) {
+    if (explicitActivate) return true;
+    if (!rtcActiveMac[0] || rtcActiveAt == 0) return true;
+    if (mac.length() && mac == rtcActiveMac) return true;
+    if (timeKnown() && rtcActiveAt > 1600000000 &&
+        (time_t)time(nullptr) - (time_t)rtcActiveAt >= (time_t)activeHoldSec) {
+        return true;
+    }
+    String bssid = WiFi.BSSIDstr();
+    for (int i = 0; i < storeCount(); i++) {
+        EndpointRec r;
+        if (!storeGet(i, r)) continue;
+        if (r.mac == String(rtcActiveMac)) {
+            if (r.bssid.length() && bssid.length() && r.bssid != bssid) return true;
+            break;
+        }
+    }
+    return false;
+}
 
 static volatile bool pendingUsageReady = false;
 static String        pendingUsage;
@@ -69,7 +204,6 @@ static bool drawingPairingOverlay = false;
 
 static String activeTplJson;
 static String activeTplId;
-static uint32_t gNextSyncSec = 300;
 
 static String lastUsage;
 static String lastChannel = "-";
@@ -83,9 +217,12 @@ static String   renderedMinute;
 static int      renderedBattery = -1;
 static int      epdPartialCount = 0;
 static bool     epdPartialReady = false;
+static bool     epdAsleep = false;
 
 static void screen(const std::vector<String> &lines, UBYTE color = BLACK);
 static void epdFlush(bool forceFull = false);
+static int  batteryPercent();
+static bool requestAuthorized();
 
 static bool pairingOverlayActive() {
     bool paired = bleIsConnected() && blePeerIsBonded() && blePeerIsEncrypted();
@@ -160,12 +297,11 @@ static WinInfo findWindow(JsonDocument &doc, bool fiveHour) {
 static void screenIdle() {
     std::vector<String> lines;
     lines.push_back("CODEX STATUS");
-    lines.push_back(FW_VERSION);
+    lines.push_back("IDLE - NO LINK");
+    lines.push_back(String("BATT ") + batteryPercent() + "%");
     lines.push_back(String("IP ") + ipText());
-    lines.push_back(String("BRG ") + (bridgeOk() ? "OK" : "--"));
-    lines.push_back(String("BLE ") + (bleIsConnected() ? "LINK" : "READY"));
-    lines.push_back(String("EP ") + String(storeCount()));
-    lines.push_back(String("SYNC ") + (lastSyncEpoch ? nowHHMM() : String("--:--")));
+    lines.push_back("SYNC --:--");
+    lines.push_back(String("FW ") + FW_VERSION);
     screen(lines);
     usageOnScreen = false;
     renderedIp = ipText();
@@ -193,7 +329,7 @@ static void screenPairingOverlay() {
     drawingPairingOverlay = false;
 }
 
-static void epdBegin() {
+static void epdBegin(bool clearPanel = true) {
     pinMode(EPD_PWR_PIN, OUTPUT);
     digitalWrite(EPD_PWR_PIN, HIGH);
     delay(500);
@@ -206,7 +342,7 @@ static void epdBegin() {
     delay(20);
     DEV_Module_Init();
     EPD_SSD1681_Init();
-    EPD_SSD1681_Clear(EPD_SSD1681_WHITE);
+    if (clearPanel) EPD_SSD1681_Clear(EPD_SSD1681_WHITE);
     frame = (UBYTE *)malloc(EPD_FB_BYTES);
     if (!frame) {
         DevLog.println("[epd] frame buffer malloc failed");
@@ -229,6 +365,14 @@ static void epdBegin() {
 // (~1.5s, flashes) runs when the panel is not partial-ready, when the changed
 // area exceeds 12.5% of the panel (layout/value jumps), or after 30 partials
 // to clear ghosting. forceFull requests a full refresh explicitly.
+// The panel sleeps (SSD1681 deep-sleep mode 1, RAM retained) after every
+// refresh and is woken/re-initialized before the next draw.
+static void epdPanelSleep() {
+    if (epdAsleep) return;
+    EPD_SSD1681_Sleep();
+    epdAsleep = true;
+}
+
 static void epdFlush(bool forceFull) {
     if (!frame) return;
     if (lastDisplayedFrame && memcmp(frame, lastDisplayedFrame, EPD_FB_BYTES) == 0) return;
@@ -241,19 +385,26 @@ static void epdFlush(bool forceFull) {
         if (changed > EPD_W * EPD_H / 8) partial = false;
     }
     if (partial && ++epdPartialCount <= 30) {
+        if (epdAsleep) {
+            EPD_SSD1681_WakePartial(lastDisplayedFrame);
+            epdAsleep = false;
+        }
         EPD_SSD1681_DisplayPart(frame);
         epdWriteCount++;
         if (lastDisplayedFrame) memcpy(lastDisplayedFrame, frame, EPD_FB_BYTES);
+        epdPanelSleep();
         return;
     }
 
     epdPartialCount = 0;
-    if (epdPartialReady) EPD_SSD1681_Init();   // reload full-refresh LUT
+    if (epdPartialReady || epdAsleep) EPD_SSD1681_Init();   // full LUT + wake
+    epdAsleep = false;
     EPD_SSD1681_Display(frame);
     epdWriteCount++;
     if (lastDisplayedFrame) memcpy(lastDisplayedFrame, frame, EPD_FB_BYTES);
     EPD_SSD1681_Init_Partial();
     epdPartialReady = true;
+    epdPanelSleep();
 }
 
 // ---- Quad built-in screen (B/W design, partial refresh) ----
@@ -396,7 +547,7 @@ static void renderUsage(const String &json, const char *channel) {
 }
 
 static void updateInfoExtra() {
-    String items = "\"templates\":[";
+    String items = "\"ip\":\"" + ipText() + "\",\"http_port\":80,\"templates\":[";
     String active = tplStoreActive();
     for (int i = 0; i < tplStoreCount(); i++) {
         TplMeta m;
@@ -420,30 +571,50 @@ static bool tplCacheLoad() {
     return true;
 }
 
-static void renderActiveUsage(const String &json, const char *channel) {
+static void renderActiveUsage(const String &json, const char *channel, bool idle = false) {
     if (pairingOverlayActive()) return;
     if (!frame) return;
-    if (tplCacheLoad()) {
-        TplEnv env;
-        env.channel   = channel ? channel : "";
-        env.ip        = ipText();
-        env.syncHHMM  = nowHHMM();
-        env.battery   = batteryPercent();
-        Paint_SelectImage(frame);
-        Paint_Clear(WHITE);
-        if (tplDraw(activeTplJson, json, env)) {
-            epdFlush(false);
-            usageOnScreen = true;
-            renderedIp = ipText();
-            renderedMinute = env.syncHHMM;
-            renderedBattery = env.battery;
-            screenSig = String("usage");
-            DevLog.printf("[tpl] rendered %s (%s)\n", activeTplId.c_str(), channel ? channel : "");
+    String tplJson, tplId;
+    if (idle) {
+        String iid = tplStoreIdle();
+        if (iid.length() && tplStoreLoad(iid, tplJson)) tplId = iid;
+    }
+    if (!tplJson.length()) {
+        if (!tplCacheLoad()) {
+            if (idle) screenIdle();
             return;
         }
-        DevLog.printf("[tpl] %s invalid, fallback built-in\n", activeTplId.c_str());
+        tplJson = activeTplJson;
+        tplId = activeTplId;
     }
-    renderUsage(json, channel);
+    TplEnv env;
+    env.channel   = channel ? channel : "";
+    env.ip        = ipText();
+    env.syncHHMM  = nowHHMM();
+    env.battery   = batteryPercent();
+    env.idle      = idle;
+    if (idle) {
+        env.idleReason = idleReasonText();
+        if (timeKnown() && rtcActiveAt > 1600000000) {
+            env.offlineMins = (int)(((time_t)time(nullptr) - (time_t)rtcActiveAt) / 60);
+        }
+    }
+    Paint_SelectImage(frame);
+    Paint_Clear(WHITE);
+    if (tplDraw(tplJson, json, env)) {
+        epdFlush(false);
+        usageOnScreen = true;
+        renderedIp = ipText();
+        renderedMinute = env.syncHHMM;
+        renderedBattery = env.battery;
+        screenSig = String("usage");
+        DevLog.printf("[tpl] rendered %s %s (%s)\n", tplId.c_str(),
+                      idle ? "idle" : "live", channel ? channel : "");
+        return;
+    }
+    DevLog.printf("[tpl] %s invalid, fallback built-in\n", tplId.c_str());
+    if (!idle) renderUsage(json, channel);
+    else screenIdle();
 }
 
 static void maybeFetchTemplate(const EndpointRec &rec, const String &usageJson) {
@@ -523,53 +694,171 @@ static void factoryReset() {
     ESP.restart();
 }
 
+static void applyEnvelopeMeta(JsonDocument &doc) {
+    long long hold = doc["active_hold_seconds"] | 0LL;
+    if (hold >= 60 && hold <= 86400) activeHoldSec = (uint32_t)hold;
+    const char *idle = doc["idle_template"] | "";
+    if (strlen(idle)) tplStoreSetIdle(String(idle));
+}
+
+// Endpoint selection (sleep.md §4.2): when the active bridge synced recently,
+// only try its endpoint; otherwise try same-BSSID endpoints first (MRU), then
+// the rest. Per-endpoint timeout is 2 s.
 static bool tryWifiUsage() {
     if (WiFi.status() != WL_CONNECTED) return false;
     int n = storeCount();
     if (n <= 0) return false;
-    bool tried[8] = {false};
-    for (int k = 0; k < n; k++) {
-        int idx = -1;
-        uint32_t mx = 0;
+
+    String bssid = WiFi.BSSIDstr();
+    bool activeFresh = rtcActiveMac[0] && rtcActiveAt > 0 && timeKnown() &&
+                       (time_t)time(nullptr) - (time_t)rtcActiveAt < (time_t)activeHoldSec;
+    int order[STORE_MAX_LOCAL];
+    int count = 0;
+    bool used[STORE_MAX_LOCAL] = {false};
+
+    if (activeFresh) {
         for (int i = 0; i < n; i++) {
-            if (tried[i]) continue;
             EndpointRec r;
-            if (!storeGet(i, r)) { tried[i] = true; continue; }
-            if (idx < 0 || r.mru > mx) { idx = i; mx = r.mru; }
+            if (storeGet(i, r) && r.mac == String(rtcActiveMac)) { order[count++] = i; used[i] = true; break; }
         }
-        if (idx < 0) break;
-        tried[idx] = true;
+    }
+    for (int pass = 0; pass < 2; pass++) {
+        while (count < n) {
+            int idx = -1;
+            uint32_t mx = 0;
+            for (int i = 0; i < n; i++) {
+                if (used[i]) continue;
+                EndpointRec r;
+                if (!storeGet(i, r)) { used[i] = true; continue; }
+                bool same = bssid.length() && r.bssid.length() && r.bssid == bssid;
+                if ((pass == 0) != same) continue;
+                if (idx < 0 || r.mru > mx) { idx = i; mx = r.mru; }
+            }
+            if (idx < 0) break;
+            used[idx] = true;
+            order[count++] = idx;
+        }
+        if (!bssid.length()) break;   // no BSSID known: single MRU pass
+    }
+
+    for (int k = 0; k < count; k++) {
         EndpointRec rec;
-        if (!storeGet(idx, rec)) continue;
+        if (!storeGet(order[k], rec)) continue;
         String out, err;
-        if (usageHttpGet(rec, out, err)) {
-            JsonDocument parsed;
-            if (deserializeJson(parsed, out) || parsed.as<JsonObject>().isNull()) {
-                DevLog.println("[wifi] usage rejected: invalid JSON");
-                continue;
-            }
-            storeTouch(rec.mac);
-            lastSyncMs = millis();
-            lastOkMs = millis();
-            lastSyncEpoch = time(nullptr);
-            DevLog.printf("[wifi] usage from %s:%u\n", rec.host.c_str(), rec.port);
-            bleNotifyStatus("{\"ack\":\"wifi-usage\",\"ok\":true}");
-            maybeFetchTemplate(rec, out);
-            {
-                JsonDocument d;
-                if (!deserializeJson(d, out)) {
-                    uint32_t ns = d["next_sync_seconds"] | 0;
-                    if (ns >= 60 && ns <= 86400) gNextSyncSec = ns;
-                }
-            }
-            lastUsage = out;
-            lastChannel = "WIFI";
-            renderActiveUsage(lastUsage, "WIFI");
-            return true;
+        if (!usageHttpGet(rec, out, err, 2000)) {
+            DevLog.printf("[wifi] %s:%u failed: %s\n", rec.host.c_str(), rec.port, err.c_str());
+            continue;
         }
-        DevLog.printf("[wifi] %s:%u failed: %s\n", rec.host.c_str(), rec.port, err.c_str());
+        JsonDocument parsed;
+        if (deserializeJson(parsed, out) || parsed.as<JsonObject>().isNull()) {
+            DevLog.println("[wifi] usage rejected: invalid JSON");
+            continue;
+        }
+        adoptServerTime(parsed);
+        applyEnvelopeMeta(parsed);
+        bool explicitActivate = parsed["activate"] | false;
+        bool accepted = usageAccepted(rec.mac, explicitActivate);
+        storeTouch(rec.mac);
+        if (bssid.length()) storeSetBssid(rec.mac, bssid);
+        lastSyncMs = millis();
+        lastOkMs = millis();
+        lastSyncEpoch = time(nullptr);
+        windowSynced = true;
+        DevLog.printf("[wifi] usage from %s:%u accepted=%d\n",
+                      rec.host.c_str(), rec.port, accepted ? 1 : 0);
+        bleNotifyStatus("{\"ack\":\"wifi-usage\",\"ok\":true}");
+        maybeFetchTemplate(rec, out);
+        lastUsage = out;
+        lastChannel = "WIFI";
+        usageCacheSave(out);
+        if (accepted) {
+            setActiveMac(rec.mac);
+            rtcActiveAt = timeKnown() ? (uint32_t)time(nullptr) : 0;
+            renderActiveUsage(lastUsage, "WIFI", false);
+        }
+        return true;
     }
     return false;
+}
+
+// POST /usage from the bridge (sleep.md §4.3). Auth uses the endpoint token
+// that the bridge itself wrote over BLE; the matching record identifies the
+// bridge MAC for the §2 active rules.
+static bool endpointTokenAuthorized(String &mac) {
+    String header = server.header("Authorization");
+    if (!header.startsWith("Bearer ")) return false;
+    String token = header.substring(7);
+    token.trim();
+    if (!token.length()) return false;
+    for (int i = 0; i < storeCount(); i++) {
+        EndpointRec rec;
+        if (!storeGet(i, rec)) continue;
+        if (rec.token.length() && rec.token == token) {
+            mac = rec.mac;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void handleUsagePost() {
+    String mac;
+    if (!endpointTokenAuthorized(mac)) {
+        server.send(401, "application/json", "{\"accepted\":false}");
+        return;
+    }
+    String body = server.arg("plain");
+    JsonDocument parsed;
+    if (deserializeJson(parsed, body) || parsed.as<JsonObject>().isNull()) {
+        server.send(400, "application/json", "{\"accepted\":false}");
+        return;
+    }
+    adoptServerTime(parsed);
+    applyEnvelopeMeta(parsed);
+    bool explicitActivate = parsed["activate"] | false;
+    bool accepted = usageAccepted(mac, explicitActivate);
+    lastSyncMs = millis();
+    lastOkMs = millis();
+    lastSyncEpoch = time(nullptr);
+    liveLastSyncMs = millis();
+    windowSynced = true;
+    usageCacheSave(body);
+    if (accepted) {
+        setActiveMac(mac);
+        rtcActiveAt = timeKnown() ? (uint32_t)time(nullptr) : 0;
+        lastUsage = body;
+        lastChannel = "PUSH";
+        renderActiveUsage(lastUsage, "PUSH");
+    } else {
+        DevLog.printf("[live] push ignored (active=%s)\n", rtcActiveMac);
+    }
+    server.send(200, "application/json",
+                accepted ? "{\"accepted\":true}" : "{\"accepted\":false}");
+}
+
+// Token-gated debug route: put the device straight into DEEP with a short
+// timer so hardware tests (ext1 wake, current) can run without waiting for the
+// LIVE exit watchdog. POST /sleep?sec=60
+static void handleSleepPost() {
+    if (!requestAuthorized()) {
+        server.send(401, "text/plain", "unauthorized");
+        return;
+    }
+    uint32_t sec = server.hasArg("sec") ? (uint32_t)server.arg("sec").toInt() : 60;
+    if (sec < 30) sec = 30;
+    if (sec > 900) sec = 900;
+    DevLog.printf("[pm] test sleep %us\n", (unsigned)sec);
+    server.send(200, "application/json", String("{\"sleeping\":") + String(sec) + "}");
+    delay(200);
+    String cached;
+    if (usageCacheLoad(cached)) renderActiveUsage(cached, "DEEP", true);
+    else screenIdle();
+    epdPanelSleep();
+    bleAdvertiseStop();
+    WiFi.disconnect(true);
+    esp_sleep_enable_timer_wakeup((uint64_t)sec * 1000000ULL);
+    esp_sleep_enable_ext1_wakeup(1ULL << 0, ESP_EXT1_WAKEUP_ANY_LOW);
+    esp_deep_sleep_start();
 }
 
 static void handleBleUsage(const String &json) {
@@ -604,30 +893,73 @@ static void handleBleEndpoint(const String &json) {
     pendingEndpoint = true;
 }
 
-static bool connectStored() {
+static bool hasWifiSlots() {
     prefs.begin("wifi", true);
+    bool any = false;
     for (int i = 0; i < MAX_SLOTS; i++) {
-        String ssid = prefs.getString(("s" + String(i)).c_str(), "");
-        String pass = prefs.getString(("p" + String(i)).c_str(), "");
-        if (!ssid.length()) continue;
-        screen({"CODEX STATUS", FW_VERSION, "", "Connecting:", ssid});
-        DevLog.printf("[wifi] trying slot %d: %s\n", i, ssid.c_str());
-        WiFi.begin(ssid.c_str(), pass.c_str());
-        uint32_t t0 = millis();
-        while (WiFi.status() != WL_CONNECTED && millis() - t0 < SLOT_TIMEOUT) {
-            delay(250);
-            DevLog.print(".");
-        }
-        DevLog.println();
-        if (WiFi.status() == WL_CONNECTED) {
-            prefs.end();
-            DevLog.printf("[wifi] connected: %s ip=%s\n", ssid.c_str(), WiFi.localIP().toString().c_str());
-            return true;
-        }
-        WiFi.disconnect(true);
+        if (prefs.getString(("s" + String(i)).c_str(), "").length()) { any = true; break; }
     }
     prefs.end();
-    return false;
+    return any;
+}
+
+// Scan once and connect to the saved slot with the best signal; the last-used
+// slot wins near-ties. Single 9 s connect attempt (sleep.md §4.2/§4.9).
+static bool connectBest() {
+    WiFi.mode(WIFI_STA);
+    WiFi.setHostname(hostname.c_str());
+    int n = WiFi.scanNetworks();
+    if (n <= 0) {
+        DevLog.println("[wifi] scan: no networks");
+        return false;
+    }
+    prefs.begin("wifi", true);
+    uint8_t last = prefs.getUChar("last", 0xFF);
+    prefs.end();
+
+    int bestSlot = -1;
+    int bestRssi = -1000;
+    for (int i = 0; i < MAX_SLOTS; i++) {
+        prefs.begin("wifi", true);
+        String ssid = prefs.getString(("s" + String(i)).c_str(), "");
+        prefs.end();
+        if (!ssid.length()) continue;
+        for (int k = 0; k < n; k++) {
+            if (WiFi.SSID(k) != ssid) continue;
+            int rssi = WiFi.RSSI(k) + (i == last ? 10 : 0);
+            if (rssi > bestRssi) { bestRssi = rssi; bestSlot = i; }
+            break;
+        }
+    }
+    WiFi.scanDelete();
+    if (bestSlot < 0) {
+        DevLog.println("[wifi] scan: no saved network visible");
+        return false;
+    }
+    prefs.begin("wifi", true);
+    String ssid = prefs.getString(("s" + String(bestSlot)).c_str(), "");
+    String pass = prefs.getString(("p" + String(bestSlot)).c_str(), "");
+    prefs.end();
+    screen({"CODEX STATUS", FW_VERSION, "", "Connecting:", ssid});
+    DevLog.printf("[wifi] slot %d (%s) rssi=%d\n", bestSlot, ssid.c_str(), bestRssi);
+    WiFi.begin(ssid.c_str(), pass.c_str());
+    uint32_t t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 9000) {
+        delay(200);
+        DevLog.print(".");
+    }
+    DevLog.println();
+    if (WiFi.status() != WL_CONNECTED) {
+        DevLog.println("[wifi] connect timeout");
+        WiFi.disconnect(true);
+        return false;
+    }
+    prefs.begin("wifi", false);
+    prefs.putUChar("last", (uint8_t)bestSlot);
+    prefs.end();
+    DevLog.printf("[wifi] connected: %s ip=%s bssid=%s\n", ssid.c_str(),
+                  WiFi.localIP().toString().c_str(), WiFi.BSSIDstr().c_str());
+    return true;
 }
 
 // ---------------- 配网模式 ----------------
@@ -666,6 +998,7 @@ static void handleConfigSave() {
     if (slot < 0) slot = 0;
     prefs.putString(("s" + String(slot)).c_str(), ssid);
     prefs.putString(("p" + String(slot)).c_str(), pass);
+    prefs.putUChar("last", (uint8_t)slot);
     prefs.end();
     server.send(200, "text/html", "<h3>Saved. Rebooting...</h3>");
     screen({"Wi-Fi saved:", ssid, "", "Rebooting..."});
@@ -675,6 +1008,7 @@ static void handleConfigSave() {
 
 static void startConfigMode() {
     configMode = true;
+    configStartedAt = millis();
     WiFi.mode(WIFI_AP);
     apSsid = "CodexStatus-" + macSuffix();
     WiFi.softAP(apSsid.c_str(), AP_PASSWORD);
@@ -764,6 +1098,13 @@ static void handleStatusJson() {
     doc["ble"] = bleIsConnected();
     doc["endpoints"] = storeCount();
     doc["channel"] = lastChannel;
+    doc["mode"] = MODE_NAMES[runtimeMode()];
+    doc["idle_reason"] = idleReasonText();
+    doc["active_mac"] = rtcActiveMac;
+    doc["active_at"] = rtcActiveAt;
+    doc["fail_count"] = rtcFailCount;
+    doc["window_synced"] = windowSynced;
+    doc["live"] = liveMode;
     doc["battery"] = batteryPercent();
     doc["battery_mv"] = batteryMilliVolts();
     doc["heap"] = ESP.getFreeHeap();
@@ -815,13 +1156,13 @@ static void issueAuthToken() {
     char buf[33];
     randomHex(buf, 16);
     authToken = buf;
-    authTokenExpiresAt = millis() + AUTH_TOKEN_TTL_MS;
     setOtaPassword(authToken.c_str());
     DevLog.println("[auth] token issued over BLE");
 }
 
 static bool authValid() {
-    return authToken.length() > 0 && (int32_t)(millis() - authTokenExpiresAt) < 0;
+    // No expiry: the token lives in RAM until the device reboots/sleeps.
+    return authToken.length() > 0;
 }
 
 // Wi-Fi operations require a token that was negotiated over the bonded BLE
@@ -835,14 +1176,6 @@ static bool requestAuthorized() {
     return false;
 }
 
-static void authTick() {
-    if (authToken.length() && (int32_t)(millis() - authTokenExpiresAt) >= 0) {
-        authToken = "";
-        rotateOtaPassword();
-        DevLog.println("[auth] token expired; OTA password randomized");
-    }
-}
-
 static void handleBleAuth(const String &json) {
     JsonDocument doc;
     if (deserializeJson(doc, json) || doc["cmd"].isNull() || strcmp(doc["cmd"] | "", "token")) {
@@ -850,8 +1183,8 @@ static void handleBleAuth(const String &json) {
         return;
     }
     issueAuthToken();
-    bleNotifyStatusQuiet(String("{\"ack\":\"auth\",\"ok\":true,\"token\":\"") + authToken +
-                         "\",\"expiresIn\":" + String(AUTH_TOKEN_TTL_MS / 1000) + "}");
+    holdWindow(WINDOW_MAX_MS);
+    bleNotifyStatusQuiet(String("{\"ack\":\"auth\",\"ok\":true,\"token\":\"") + authToken + "\"}");
 }
 
 static void handleUpdatePage() {
@@ -872,12 +1205,23 @@ static void handleUpdatePage() {
 static void startNormalMode() {
     configMode = false;
     hostname = "codex-status-" + macSuffix();
-    WiFi.setHostname(hostname.c_str());
-    lastConnectedMs = millis();
-
     configTzTime("CST-8", "pool.ntp.org");
     pinMode(0, INPUT_PULLUP);
     pinMode(18, INPUT_PULLUP);
+
+    windowMode = true;
+    bool haveWifi = connectBest();
+    windowHadWifi = haveWifi;
+    if (haveWifi) {
+        uint32_t h = fnv1a(WiFi.BSSIDstr());
+        if (h && h != rtcBssidHash) {
+            rtcBssidHash = h;
+            rtcFastLeft = 3;   // accelerated windows after a network change
+            windowEnvSwitch = true;
+        }
+    } else {
+        DevLog.println("[wifi] window without Wi-Fi");
+    }
 
     bleBegin("CodexStatus-" + macSuffix(), FW_VERSION);
     bleSetHandlers(handleBleUsage, handleBleEndpoint);
@@ -888,6 +1232,8 @@ static void startNormalMode() {
     server.on("/", HTTP_GET, handleStatus);
     server.on("/status.json", HTTP_GET, handleStatusJson);
     server.on("/log", HTTP_GET, handleLog);
+    server.on("/usage", HTTP_POST, handleUsagePost);
+    server.on("/sleep", HTTP_POST, handleSleepPost);
     server.on("/update", HTTP_GET, handleUpdatePage);
     server.on("/doUpdate", HTTP_POST,
         []() {
@@ -907,6 +1253,8 @@ static void startNormalMode() {
                     return;
                 }
                 otaUploadDenied = false;
+                otaInProgress = true;
+                windowDeadline = millis() + WINDOW_HOLD_MS;
                 DevLog.printf("[ota] upload start: %s\n", up.filename.c_str());
                 std::vector<String> lines = {"OTA update", up.filename};
                 screen(lines);
@@ -915,6 +1263,7 @@ static void startNormalMode() {
                 if (otaUploadDenied) return;
                 if (Update.write(up.buf, up.currentSize) != up.currentSize) Update.printError(Serial);
             } else if (up.status == UPLOAD_FILE_END) {
+                otaInProgress = false;
                 if (otaUploadDenied) return;
                 if (Update.end(true)) {
                     DevLog.printf("[ota] success %u bytes, rebooting shortly\n", (unsigned)up.totalSize);
@@ -928,61 +1277,133 @@ static void startNormalMode() {
         });
     server.begin();
 
-    ArduinoOTA.setHostname(hostname.c_str());
-    rotateOtaPassword();
-    ArduinoOTA.onStart([]() { screen({"ArduinoOTA", "updating..."}); });
-    ArduinoOTA.onProgress([](unsigned int p, unsigned int t) {
-        DevLog.printf("[ota] %u%%\r", t ? p * 100 / t : 0);
-    });
-    ArduinoOTA.onEnd([]() { screen({"OTA OK", "rebooting..."}); delay(800); });
-    ArduinoOTA.onError([](ota_error_t e) { DevLog.printf("[ota] error %u\n", e); });
-    ArduinoOTA.begin();
-    MDNS.addService("http", "tcp", 80);
-
-    DevLog.printf("[net] ready: http://%s/  host=%s.local  endpoints=%d\n",
-                  WiFi.localIP().toString().c_str(), hostname.c_str(), storeCount());
-
-    if (storeCount() > 0) {
-        if (!tryWifiUsage()) screenIdle();
-    } else {
-        screenIdle();
+    if (haveWifi) {
+        ArduinoOTA.setHostname(hostname.c_str());
+        rotateOtaPassword();
+        ArduinoOTA.onStart([]() { screen({"ArduinoOTA", "updating..."}); });
+        ArduinoOTA.onProgress([](unsigned int p, unsigned int t) {
+            DevLog.printf("[ota] %u%%\r", t ? p * 100 / t : 0);
+        });
+        ArduinoOTA.onEnd([]() { screen({"OTA OK", "rebooting..."}); delay(800); });
+        ArduinoOTA.onError([](ota_error_t e) { DevLog.printf("[ota] error %u\n", e); });
+        ArduinoOTA.begin();
+        MDNS.addService("http", "tcp", 80);
     }
-    nextFetchAt = millis() + FETCH_INTERVAL_MS;
+
+    DevLog.printf("[net] ready: http://%s/  host=%s.local  endpoints=%d mode=%s wifi=%d\n",
+                  WiFi.localIP().toString().c_str(), hostname.c_str(), storeCount(),
+                  MODE_NAMES[runtimeMode()], haveWifi ? 1 : 0);
+
+    windowDeadline = millis() + WINDOW_MS;
+    windowHardStop = millis() + WINDOW_MAX_MS;
+    windowSynced = false;
+    if (haveWifi && storeCount() > 0) tryWifiUsage();
 }
 
 void setup() {
-    epdBegin();
-    screen({"CODEX STATUS", FW_VERSION, "booting..."});
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    bool woke = (cause == ESP_SLEEP_WAKEUP_TIMER || cause == ESP_SLEEP_WAKEUP_EXT1);
+    hostname = "codex-status-" + macSuffix();
+    epdBegin(!woke);
+    if (!woke) screen({"CODEX STATUS", FW_VERSION, "booting..."});
+    if (rtcMagic != 0xC0DE0001) {
+        rtcMagic = 0xC0DE0001;
+        rtcActiveAt = 0;
+        rtcActiveMac[0] = 0;
+        rtcFailCount = 0;
+        rtcFastLeft = 3;
+        rtcIdleReason = IDLE_BOOT;
+        rtcNeverSynced = true;
+        rtcBssidHash = 0;
+        rtcUsageHash = 0;
+        DevLog.println("[pm] RTC state initialized");
+    }
     const esp_partition_t *running = esp_ota_get_running_partition();
-    DevLog.printf("\n[codex-status] v%s mac=%s reset=%s slot=%s\n", FW_VERSION,
+    DevLog.printf("\n[codex-status] v%s mac=%s reset=%s slot=%s mode=%s wake=%d\n", FW_VERSION,
                   WiFi.macAddress().c_str(), resetReasonName(),
-                  running ? running->label : "?");
+                  running ? running->label : "?", MODE_NAMES[runtimeMode()], (int)cause);
     { Preferences p; p.begin("brg", false); p.end(); }
 
     tplStoreBegin();
     tplXferBegin(FW_VERSION, []() { pendingTplChanged = true; });
 
-    if (connectStored()) {
+    if (hasWifiSlots()) {
         startNormalMode();
     } else {
+        DevLog.println("[config] no saved Wi-Fi slots; entering AP mode (D10)");
         startConfigMode();
     }
 }
 
-static bool batteryMode() {
-    Preferences p;
-    p.begin("cfg", true);
-    bool b = p.getBool("batt", false);
-    p.end();
-    return b;
+// LIVE entry/exit (sleep.md §4.1/§4.3). Plan B keeps the Wi-Fi association
+// with modem sleep on the stock core; custom-core PM light sleep is a later
+// optimization gated by the T10 current measurement.
+static void enterLive() {
+    liveMode = true;
+    windowMode = false;
+    liveEnteredAtMs = millis();
+    liveLastSyncMs = millis();
+    liveLastPollMs = millis();
+    wifiLostSinceMs = 0;
+    WiFi.setSleep(true);
+    bleAdvertiseStop();
+    DevLog.println("[live] enter (modem sleep, BLE advertising off)");
 }
 
-static void enterDeepSleep(uint32_t sec) {
-    DevLog.printf("[pm] deep sleep %us\n", (unsigned)sec);
-    screen({"BATTERY MODE", "sleep " + String(sec) + "s"});
-    delay(500);
+static void exitLive(uint8_t reason) {
+    rtcIdleReason = reason;
+    liveMode = false;
+    String cached;
+    if (usageCacheLoad(cached)) renderActiveUsage(cached, "DEEP", true);
+    else screenIdle();
+    DevLog.printf("[live] exit (%s)\n", idleReasonText());
+    epdPanelSleep();
+    bleAdvertiseStop();
     WiFi.disconnect(true);
-    esp_sleep_enable_timer_wakeup((uint64_t)sec * 1000000ULL);
+    esp_sleep_enable_timer_wakeup(300ULL * 1000000ULL);
+    esp_sleep_enable_ext1_wakeup(1ULL << 0, ESP_EXT1_WAKEUP_ANY_LOW);
+    esp_deep_sleep_start();
+}
+
+// Window finished: render IDLE when required, update the failure/backoff state
+// and deep-sleep until the next window (sleep.md §4.1/§4.2).
+static void finishWindowAndSleep(bool haveWifi) {
+    if (windowSynced) {
+        rtcFailCount = 0;
+        rtcNeverSynced = false;
+        if (haveWifi) {
+            enterLive();
+            return;
+        }
+    } else {
+        if (rtcFailCount < 255) rtcFailCount++;
+        if (windowEnvSwitch) rtcIdleReason = IDLE_ENV_SWITCH;
+        else if (rtcNeverSynced) rtcIdleReason = IDLE_BOOT;
+        else if (!haveWifi) rtcIdleReason = IDLE_WIFI_LOST;
+        else rtcIdleReason = IDLE_BRIDGE_LOST;
+    }
+    bool showIdle = !windowSynced && (rtcFailCount >= 2 || rtcNeverSynced);
+    if (showIdle) {
+        String cached;
+        if (usageCacheLoad(cached)) renderActiveUsage(cached, "DEEP", true);
+        else screenIdle();
+    }
+    uint32_t next;
+    if (rtcFailCount >= 3) {
+        next = 900;
+    } else if (rtcFastLeft > 0) {
+        next = 60;
+        rtcFastLeft--;
+    } else {
+        next = 300;
+    }
+    DevLog.printf("[pm] window done synced=%d wifi=%d fail=%u idle=%d reason=%s next=%us\n",
+                  windowSynced ? 1 : 0, haveWifi ? 1 : 0, (unsigned)rtcFailCount,
+                  showIdle ? 1 : 0, idleReasonText(), (unsigned)next);
+    epdPanelSleep();
+    bleAdvertiseStop();
+    WiFi.disconnect(true);
+    esp_sleep_enable_timer_wakeup((uint64_t)next * 1000000ULL);
     esp_sleep_enable_ext1_wakeup(1ULL << 0, ESP_EXT1_WAKEUP_ANY_LOW);
     esp_deep_sleep_start();
 }
@@ -1014,6 +1435,7 @@ static void handleSerialCli() {
                 if (slot < 0) slot = 0;
                 prefs.putString(("s" + String(slot)).c_str(), ssid);
                 prefs.putString(("p" + String(slot)).c_str(), pass);
+                prefs.putUChar("last", (uint8_t)slot);
                 prefs.end();
                 DevLog.printf("[cli] wifi saved slot %d ssid=%s, rebooting\n", slot, ssid.c_str());
                 screen({"Wi-Fi saved via USB:", ssid, "", "Rebooting..."});
@@ -1027,115 +1449,158 @@ static void handleSerialCli() {
                           FW_VERSION, ipText().c_str(), WiFi.RSSI(), ESP.getFreeHeap());
         } else if (line == "batt") {
             DevLog.printf("[cli] battery=%d%%\n", batteryPercent());
+        } else if (line == "mode") {
+            DevLog.printf("[cli] mode=%s\n", MODE_NAMES[runtimeMode()]);
+        } else if (line.startsWith("mode ")) {
+            String v = line.substring(5);
+            v.trim();
+            int m = -1;
+            for (int i = 0; i < 3; i++)
+                if (v == MODE_NAMES[i]) m = i;
+            if (m < 0) {
+                DevLog.println("[cli] usage: mode auto|deep|live");
+            } else {
+                setRuntimeMode((uint8_t)m);
+                DevLog.printf("[cli] mode=%s%s\n", MODE_NAMES[m],
+                              m == 2 ? " (live == deep until M3)" : "");
+            }
         } else if (line.length()) {
-            DevLog.println("[cli] commands: wifi <ssid> <pass> | status | batt");
+            DevLog.println("[cli] commands: wifi <ssid> <pass> | status | batt | mode [auto|deep|live]");
         }
     }
 }
 
 void loop() {
     if (otaRebootPending && (int32_t)(millis() - otaRebootAt) >= 0) ESP.restart();
-    authTick();
     handleSerialCli();
     server.handleClient();
     blePoll();
-    if (!configMode) {
-        ArduinoOTA.handle();
 
-        static uint32_t bootDownAt = 0;
-        static int      bootStage = 0;
-        if (digitalRead(0) == LOW) {
-            if (!bootDownAt) bootDownAt = millis();
+    if (configMode) {
+        // D10: AP provisioning sleeps again after 5 idle minutes.
+        if (millis() - configStartedAt > CONFIG_IDLE_MS) {
+            DevLog.println("[config] idle timeout, sleeping");
+            WiFi.disconnect(true);
+            esp_sleep_enable_timer_wakeup(300ULL * 1000000ULL);
+            esp_sleep_enable_ext1_wakeup(1ULL << 0, ESP_EXT1_WAKEUP_ANY_LOW);
+            esp_deep_sleep_start();
+        }
+        delay(5);
+        return;
+    }
+
+    ArduinoOTA.handle();
+
+    static uint32_t bootDownAt = 0;
+    static int      bootStage = 0;
+    if (digitalRead(0) == LOW) {
+        if (!bootDownAt) bootDownAt = millis();
+        uint32_t held = millis() - bootDownAt;
+        if (bootStage < 1 && held > 2000) {
+            bootStage = 1;
+            bleOpenPairingWindow(120000);
+            bleAdvertiseStart();   // LIVE keeps BLE off until pairing is asked for
+            pairingOverlay = true;
+            screenPairingOverlay();
+        }
+        if (bootStage < 2 && held > 5000) {
+            bootStage = 2;
+        }
+        if (bootStage < 3 && held > 10000) {
+            bootStage = 3;
+            pairingOverlay = false;
+            factoryReset();
+        }
+    } else {
+        if (bootDownAt) {
             uint32_t held = millis() - bootDownAt;
-            if (bootStage < 1 && held > 2000) {
-                bootStage = 1;
-                bleOpenPairingWindow(120000);
-                pairingOverlay = true;
-                screenPairingOverlay();
+            if (bootStage == 0 && held > 50 && held < 1500) nextTemplate();
+            else if (bootStage == 2 && held >= 5000 && held < 10000) {
+                DevLog.println("[config] BOOT held 5s; entering AP mode (D10)");
+                startConfigMode();
+                return;
             }
-            if (bootStage < 2 && held > 10000) {
-                bootStage = 2;
-                pairingOverlay = false;
-                factoryReset();
-            }
-        } else {
-            if (bootDownAt) {
-                uint32_t held = millis() - bootDownAt;
-                if (bootStage == 0 && held > 50 && held < 1500) nextTemplate();
-                bootDownAt = 0;
-                bootStage = 0;
-            }
+            bootDownAt = 0;
+            bootStage = 0;
         }
+    }
 
-        if (pairingOverlay) {
-            bool paired = bleIsConnected() && blePeerIsBonded() && blePeerIsEncrypted();
-            if (!blePairingWindowOpen() || paired) {
-                pairingOverlay = false;
-                activeTplId = "";
-                if (lastUsage.length()) renderActiveUsage(lastUsage, lastChannel.c_str());
-                else screenIdle();
-            }
-        }
-
-        if (pendingTplChanged) {
-            pendingTplChanged = false;
+    if (pairingOverlay) {
+        bool paired = bleIsConnected() && blePeerIsBonded() && blePeerIsEncrypted();
+        if (!blePairingWindowOpen() || paired) {
+            pairingOverlay = false;
             activeTplId = "";
-            updateInfoExtra();
             if (lastUsage.length()) renderActiveUsage(lastUsage, lastChannel.c_str());
             else screenIdle();
         }
-        if (pendingEndpoint) {
-            pendingEndpoint = false;
-            tryWifiUsage();
-        }
-        if (pendingUsageReady) {
-            pendingUsageReady = false;
-            JsonDocument parsed;
-            if (!deserializeJson(parsed, pendingUsage) && !parsed.as<JsonObject>().isNull()) {
+    }
+
+    if (pendingTplChanged) {
+        pendingTplChanged = false;
+        activeTplId = "";
+        updateInfoExtra();
+        if (lastUsage.length()) renderActiveUsage(lastUsage, lastChannel.c_str());
+        else screenIdle();
+    }
+    if (pendingEndpoint) {
+        pendingEndpoint = false;
+        if (WiFi.status() == WL_CONNECTED) tryWifiUsage();
+    }
+    if (pendingUsageReady) {
+        pendingUsageReady = false;
+        JsonDocument parsed;
+        if (!deserializeJson(parsed, pendingUsage) && !parsed.as<JsonObject>().isNull()) {
+            adoptServerTime(parsed);
+            applyEnvelopeMeta(parsed);
+            bool explicitActivate = parsed["activate"] | false;
+            String mac = blePeerAddress();
+            bool accepted = usageAccepted(mac, explicitActivate);
+            lastSyncMs = millis();
+            lastOkMs = millis();
+            lastSyncEpoch = time(nullptr);
+            windowSynced = true;
+            usageCacheSave(pendingUsage);
+            if (accepted) {
+                setActiveMac(mac);
+                rtcActiveAt = timeKnown() ? (uint32_t)time(nullptr) : 0;
                 lastUsage = pendingUsage;
                 lastChannel = pendingChannel;
-                lastSyncMs = millis();
-                lastOkMs = millis();
-                lastSyncEpoch = time(nullptr);
                 renderActiveUsage(lastUsage, lastChannel.c_str());
             } else {
-                DevLog.println("[usage] BLE usage rejected: invalid JSON");
-            }
-        }
-
-        static uint32_t lastStatusAt = 0;
-        if (millis() - lastStatusAt > 10000) {
-            lastStatusAt = millis();
-            String sig = String("idle|") + ipText() + "|" + String(bridgeOk()) + "|" + String(bleIsConnected());
-            if (usageOnScreen) {
-                String minute = nowHHMM();
-                int battery = batteryPercent();
-                bool batteryMoved = renderedBattery >= 0 && battery >= 0 &&
-                                    abs(battery - renderedBattery) >= 2;
-                if (!pairingOverlayActive() && lastUsage.length() &&
-                    (renderedIp != ipText() || renderedMinute != minute || batteryMoved)) {
-                    renderActiveUsage(lastUsage, lastChannel.c_str());
-                }
-            } else if (sig != screenSig) {
-                screenIdle();
-            }
-        }
-
-        if (millis() > nextFetchAt) {
-            nextFetchAt = millis() + FETCH_INTERVAL_MS;
-            if (storeCount() > 0 && tryWifiUsage()) {
-                if (batteryMode()) enterDeepSleep(gNextSyncSec);
-            }
-        }
-
-        if (WiFi.status() != WL_CONNECTED) {
-            if (millis() - lastConnectedMs > WIFI_LOST_RESTART_MS) {
-                DevLog.println("[net] wifi lost, restarting");
-                ESP.restart();
+                DevLog.printf("[usage] BLE usage ignored (active=%s)\n", rtcActiveMac);
             }
         } else {
-            lastConnectedMs = millis();
+            DevLog.println("[usage] BLE usage rejected: invalid JSON");
         }
     }
+
+    // LIVE: the bridge pushes; watchdog falls back to DEEP (sleep.md §4.1).
+    if (liveMode) {
+        if (WiFi.status() == WL_CONNECTED) {
+            wifiLostSinceMs = 0;
+        } else if (!wifiLostSinceMs) {
+            wifiLostSinceMs = millis();
+        } else if (millis() - wifiLostSinceMs > 180000UL) {
+            exitLive(IDLE_WIFI_LOST);
+        }
+        if (liveLastSyncMs && millis() - liveLastSyncMs > 600000UL) {
+            exitLive(IDLE_BRIDGE_LOST);
+        }
+        if (millis() - liveLastPollMs > 900000UL) {
+            liveLastPollMs = millis();
+            if (storeCount() > 0) tryWifiUsage();
+        }
+        delay(5);
+        return;
+    }
+
+    // An OTA upload holds the window open (bounded recovery safeguard).
+    if (otaInProgress) holdWindow(WINDOW_HOLD_MS);
+    // Pairing/token operations and live BLE peers also keep the window open.
+    if (windowMode && !otaInProgress && !bleIsConnected() && !blePairingWindowOpen() &&
+        !pairingOverlay && (int32_t)(millis() - windowDeadline) >= 0) {
+        finishWindowAndSleep(windowHadWifi || WiFi.status() == WL_CONNECTED);
+    }
+
     delay(5);
 }

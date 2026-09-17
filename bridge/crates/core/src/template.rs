@@ -42,6 +42,9 @@ pub enum BindSpec {
     DeviceIp,
     DeviceSync,
     DeviceBattery,
+    DeviceState,
+    DeviceOfflineMins,
+    DeviceIdleReason,
     Bucket {
         bucket: String,
         win: WinSel,
@@ -62,6 +65,9 @@ pub fn parse_bind(path: &str) -> Option<BindSpec> {
         "device.ip" => return Some(BindSpec::DeviceIp),
         "device.sync_hhmm" => return Some(BindSpec::DeviceSync),
         "device.battery" => return Some(BindSpec::DeviceBattery),
+        "device.state" => return Some(BindSpec::DeviceState),
+        "device.offline_mins" => return Some(BindSpec::DeviceOfflineMins),
+        "device.idle_reason" => return Some(BindSpec::DeviceIdleReason),
         _ => {}
     }
     let rest = path.strip_prefix("buckets[")?;
@@ -180,6 +186,12 @@ fn validate_condition(e: &Value) -> Result<(), String> {
 
 fn validate_element(e: &Value) -> Result<(), String> {
     validate_condition(e)?;
+    if let Some(mode) = e.get("mode") {
+        match mode.as_str() {
+            Some("any") | Some("idle") | Some("live") => {}
+            _ => return Err("mode".into()),
+        }
+    }
     let ty = e.get("type").and_then(|v| v.as_str()).ok_or("type")?;
     match ty {
         "text" => {

@@ -15,6 +15,8 @@ bool blePeerIsEncrypted();
 String blePeerAddress();
 bool blePairingWindowOpen();
 void bleOpenPairingWindow(uint32_t ms);
+void bleAdvertiseStart();
+void bleAdvertiseStop();
 void bleSetHandlers(UsageJsonHandler onUsage, EndpointJsonHandler onEndpoint);
 void bleSetTemplateHandlers(TemplateCtrlHandler onCtrl, TemplateDataHandler onData,
                             TemplateResetHandler onReset = nullptr);

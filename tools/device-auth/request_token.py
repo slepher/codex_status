@@ -3,7 +3,8 @@
 
 The device only accepts Wi-Fi operations (firmware OTA /update, /doUpdate and
 ArduinoOTA) with a token issued here. The token is bound to the encrypted
-BLE link, lives in RAM only and expires after 1 hour.
+BLE link and lives in RAM without an expiry; it disappears when the device
+reboots or deep-sleeps.
 """
 import argparse
 import asyncio
@@ -61,7 +62,7 @@ async def request_token(scan_timeout: float, reply_timeout: float) -> int:
         print("device refused the token request")
         return 1
     print()
-    print(f"TOKEN={msg['token']} (expiresIn {msg.get('expiresIn')}s)")
+    print(f"TOKEN={msg['token']} (no expiry; valid until the device reboots or deep-sleeps)")
     print(f'usage: curl.exe --noproxy "*" -H "Authorization: Bearer {msg["token"]}" http://<device-ip>/update')
     return 0
 

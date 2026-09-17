@@ -17,6 +17,7 @@ static bool     disconnecting  = false;
 static uint16_t peerConnHandle = BLE_HS_CONN_HANDLE_NONE;
 static String   peerAddress;
 static uint32_t pairingUntil   = 0;
+static bool     advertising    = false;
 static String   usageBuf;
 static String   endpointBuf;
 static String   tplCtrlBuf;
@@ -251,6 +252,7 @@ void bleBegin(const String &deviceName, const String &fw) {
     adv->addServiceUUID(BLE_SVC_UUID);
     adv->setScanResponse(true);
     NimBLEDevice::startAdvertising();
+    advertising = true;
 
     DevLog.printf("[ble] advertising as %s fw=%s\n", deviceName.c_str(), fw.c_str());
 }
@@ -265,6 +267,22 @@ bool blePairingWindowOpen() {
 void bleOpenPairingWindow(uint32_t ms) {
     pairingUntil = ms ? millis() + ms : 0;
     refreshInfo();
+}
+
+// BLE advertises only while the device has an active window (boot/OTA/pairing).
+// Sleep entry stops advertising so the radio is quiet outside the window.
+void bleAdvertiseStart() {
+    if (advertising) return;
+    NimBLEDevice::startAdvertising();
+    advertising = true;
+    DevLog.println("[ble] advertising start");
+}
+
+void bleAdvertiseStop() {
+    if (!advertising) return;
+    NimBLEDevice::stopAdvertising();
+    advertising = false;
+    DevLog.println("[ble] advertising stop");
 }
 
 void bleSetHandlers(UsageJsonHandler onUsage, EndpointJsonHandler onEndpoint) {

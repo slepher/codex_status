@@ -57,6 +57,7 @@ async fn main() -> Result<()> {
         token: args.token.clone(),
         template_ids: if args.template_ids.is_empty() { None } else { Some(args.template_ids.clone()) },
         activate: None,
+        scan_timeout_ms: 30000,
     };
     tracing::info!("endpoint advertised: {}:{}", cfg.host, cfg.port);
 

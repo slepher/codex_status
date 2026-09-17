@@ -1,5 +1,6 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod autostart;
 mod config;
 mod icon;
 
@@ -17,7 +18,7 @@ use bridge_core::short_id;
 use config::Config;
 use icon::State as IconState;
 use serde_json::{json, Value};
-use tauri::menu::{Menu, MenuItem, MenuItemKind, PredefinedMenuItem};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem, MenuItemKind, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tokio::sync::{Notify, RwLock};
@@ -45,6 +46,7 @@ struct AppCtx {
     envelope: Arc<RwLock<Option<Value>>>,
     library: Arc<RwLock<Library>>,
     force_ble: Arc<Notify>,
+    idle_template: Arc<RwLock<Option<String>>>,
     status: Mutex<RuntimeStatus>,
     ble_primed: AtomicBool,
     mcp_port: Mutex<u16>,
@@ -257,6 +259,7 @@ async fn mcp_handler(
         seeds: ctx.config.seeds.clone(),
         profile_seed: ctx.config.profile_seed.clone(),
         device_ip: ctx.config.device_ip.clone(),
+        idle_template: ctx.idle_template.read().await.clone(),
         root: ctx.root.clone(),
     };
     let tool = request
@@ -421,6 +424,43 @@ async fn set_mcp_port(state: State<'_, Arc<AppCtx>>, port: u16) -> Result<Value,
     Ok(json!({"port": port}))
 }
 
+fn persist_idle_template(_root: &Path, id: &Option<String>) {
+    let path = bridge_core::paths::data_root().join("bridge-app.json");
+    let mut doc: Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_else(|| json!({}));
+    if let Some(object) = doc.as_object_mut() {
+        object.insert("idle_template".to_string(), json!(id));
+    }
+    if let Ok(text) = serde_json::to_string_pretty(&doc) {
+        let _ = std::fs::write(&path, text);
+    }
+}
+
+#[tauri::command]
+async fn get_idle_template(state: State<'_, Arc<AppCtx>>) -> Result<Value, String> {
+    Ok(json!({"idle_template": state.idle_template.read().await.clone()}))
+}
+
+#[tauri::command]
+async fn set_idle_template(
+    state: State<'_, Arc<AppCtx>>,
+    id: Option<String>,
+) -> Result<Value, String> {
+    let id = id.filter(|value| !value.is_empty());
+    if let Some(value) = &id {
+        let library = state.library.read().await;
+        if library.get(value).is_none() {
+            return Err(format!("template not found: {value}"));
+        }
+    }
+    *state.idle_template.write().await = id.clone();
+    persist_idle_template(&state.root, &id);
+    state.force_ble.notify_one();
+    Ok(json!({"idle_template": id}))
+}
+
 /// MCP tools and manual edits change template files behind the app's back, so
 /// re-scan the directory before answering preview/status queries.
 async fn refresh_library(state: &State<'_, Arc<AppCtx>>) {
@@ -460,6 +500,7 @@ async fn preview_template(
         ip: &ip,
         sync_hhmm: &sync,
         battery: bridge_render::DEFAULT_BATTERY,
+        ..Default::default()
     };
     let bits = bridge_render::render_bits(&template, &usage.to_string(), &env)
         .map_err(|e| e.to_string())?;
@@ -601,6 +642,42 @@ async fn reload_templates(state: State<'_, Arc<AppCtx>>) -> Result<usize, String
     Ok(count)
 }
 
+/// Fingerprint of what the BLE cycle would push: usage envelope + pending
+/// template work + the idle template. A successful cycle pauses scanning until
+/// this changes or the 5 min heartbeat expires (sleep.md §4.6).
+fn ble_fingerprint(ctx: &AppCtx) -> u64 {
+    let usage = ctx
+        .envelope
+        .try_read()
+        .ok()
+        .and_then(|g| g.as_ref().map(|v| v.to_string()))
+        .unwrap_or_default();
+    let (ids, activate) = {
+        let status = ctx.status.lock().unwrap();
+        (
+            status.pending.ids.join(","),
+            status.pending.activate.clone().unwrap_or_default(),
+        )
+    };
+    let idle = ctx
+        .idle_template
+        .try_read()
+        .ok()
+        .and_then(|v| v.clone())
+        .unwrap_or_default();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in usage
+        .bytes()
+        .chain(ids.bytes())
+        .chain(activate.bytes())
+        .chain(idle.bytes())
+    {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
 async fn run_services(ctx: Arc<AppCtx>) {
     let exe = match locate_codex(ctx.config.codex_path.as_deref()) {
         Ok(exe) => exe,
@@ -636,24 +713,100 @@ async fn run_services(ctx: Arc<AppCtx>) {
         host_id: short_id(&host_label()),
         interval_secs: ctx.config.interval_secs,
         templates: ctx.library.clone(),
+        idle_template: ctx.idle_template.clone(),
+        active_hold_seconds: ctx.config.active_hold_seconds,
     };
     tokio::spawn(run_poller(poller, ctx.envelope.clone()));
 
+    // Usage push (sleep.md §4.3/§4.6): POST the envelope to the device on
+    // fingerprint change or 5 min heartbeat. Connection errors just mean the
+    // device is in DEEP; the BLE/window path covers that.
+    {
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            let client = match reqwest::Client::builder()
+                .timeout(Duration::from_secs(3))
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("usage push client: {e}");
+                    return;
+                }
+            };
+            let mut last_fp: u64 = 0;
+            let mut last_ok: u64 = 0;
+            loop {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                let usage = ctx.envelope.try_read().ok().and_then(|g| g.clone());
+                let Some(usage) = usage else { continue };
+                let text = usage.to_string();
+                let fp = {
+                    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+                    for b in text.bytes() {
+                        h ^= b as u64;
+                        h = h.wrapping_mul(0x100_0000_01b3);
+                    }
+                    h
+                };
+                let now = now_secs() as u64;
+                if fp == last_fp && now.saturating_sub(last_ok) < 300 {
+                    continue;
+                }
+                let url = format!("http://{}/usage", ctx.config.device_ip);
+                match client
+                    .post(&url)
+                    .bearer_auth(&ctx.config.token)
+                    .header("Content-Type", "application/json")
+                    .body(text)
+                    .send()
+                    .await
+                {
+                    Ok(resp) => {
+                        last_fp = fp;
+                        last_ok = now;
+                        tracing::info!("usage push -> {} ({})", resp.status(), url);
+                    }
+                    Err(e) => {
+                        tracing::debug!("usage push skipped: {e}");
+                    }
+                }
+            }
+        });
+    }
+
+    let mut misses: u32 = 0;
+    let mut last_fp: u64 = 0;
+    let mut pause_until: u64 = 0;
     loop {
         let paused = ctx.status.lock().unwrap().paused;
         if paused {
             tokio::time::sleep(Duration::from_secs(2)).await;
             continue;
         }
+        let fp = ble_fingerprint(&ctx);
+        let now = now_secs() as u64;
+        let pending_waiting = !ctx.status.lock().unwrap().pending.ids.is_empty();
+        if !pending_waiting && fp == last_fp && now < pause_until {
+            let wait = Duration::from_secs(pause_until - now);
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = ctx.force_ble.notified() => {}
+            }
+            continue;
+        }
         let first = !ctx.ble_primed.swap(true, Ordering::SeqCst);
-        let wait = if first {
+        let mut manual = pending_waiting;
+        let wait = if first || pending_waiting {
             Duration::ZERO
         } else {
-            Duration::from_secs(ctx.config.ble_interval_secs)
+            Duration::from_secs(if misses >= 12 { 60 } else { 20 })
         };
-        tokio::select! {
-            _ = tokio::time::sleep(wait) => {}
-            _ = ctx.force_ble.notified() => {}
+        if !wait.is_zero() {
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = ctx.force_ble.notified() => { manual = true; }
+            }
         }
         let adapter = match Pusher::adapter().await {
             Ok(a) => a,
@@ -670,15 +823,26 @@ async fn run_services(ctx: Arc<AppCtx>) {
         };
         // Templates are only pushed when explicitly requested (profile push in
         // the panel or MCP profile_push); the periodic cycle just refreshes
-        // usage/endpoint.
+        // usage/endpoint. Explicit profile pushes also carry the idle template.
         let pending = std::mem::take(&mut ctx.status.lock().unwrap().pending);
+        let mut push_ids = pending.ids.clone();
+        if !push_ids.is_empty() {
+            if let Some(idle) = ctx.idle_template.read().await.clone() {
+                if ctx.library.read().await.get(&idle).is_some() && !push_ids.contains(&idle) {
+                    push_ids.push(idle);
+                }
+            }
+        }
         let ble_cfg = BleConfig {
             name_prefix: "CodexStatus-".to_string(),
             host: lan_ip(),
             port: ctx.config.port,
             token: ctx.config.token.clone(),
-            template_ids: Some(pending.ids.clone()),
+            template_ids: Some(push_ids),
             activate: pending.activate.clone(),
+            // A user-triggered sync (panel/MCP/tray) waits longer for the
+            // device's short DEEP window; periodic rounds stay low-duty.
+            scan_timeout_ms: if manual { 30000 } else { 5000 },
         };
         let pusher = Pusher::new(
             ble_cfg,
@@ -688,6 +852,8 @@ async fn run_services(ctx: Arc<AppCtx>) {
         match pusher.cycle_once(&adapter).await {
             Ok(()) => {
                 tracing::info!("ble cycle done");
+                misses = 0;
+                last_fp = fp;
                 let mut status = ctx.status.lock().unwrap();
                 status.last_sync = Some(now_secs());
                 status.last_error = None;
@@ -696,9 +862,11 @@ async fn run_services(ctx: Arc<AppCtx>) {
                     status.last_push_at = Some(now_secs());
                     status.last_push_error = None;
                 }
+                pause_until = now_secs() as u64 + 300;
             }
             Err(e) => {
                 tracing::warn!("ble cycle: {e}");
+                misses = misses.saturating_add(1);
                 {
                     let mut status = ctx.status.lock().unwrap();
                     status.last_error = Some(format!("ble: {e}"));
@@ -715,8 +883,6 @@ async fn run_services(ctx: Arc<AppCtx>) {
                         status.pending.activate = pending.activate;
                     }
                 }
-                ctx.ble_primed.store(false, Ordering::SeqCst);
-                tokio::time::sleep(Duration::from_secs(15)).await;
             }
         }
     }
@@ -764,6 +930,7 @@ fn main() {
     let library = Library::load(&config.templates).unwrap_or_default();
     tracing::info!("templates: {:?}", library.ids());
     let mcp_port = config.mcp_port;
+    let idle_template = Arc::new(RwLock::new(config.idle_template.clone()));
     let (mcp_tx, _mcp_rx) = tokio::sync::watch::channel(mcp_port);
     let ctx = Arc::new(AppCtx {
         config,
@@ -772,6 +939,7 @@ fn main() {
         envelope: Arc::new(RwLock::new(None)),
         library: Arc::new(RwLock::new(library)),
         force_ble: Arc::new(Notify::new()),
+        idle_template,
         status: Mutex::new(RuntimeStatus {
             last_sync: None,
             last_error: None,
@@ -804,7 +972,9 @@ fn main() {
             save_profile,
             delete_profile,
             get_mcp_info,
-            set_mcp_port
+            set_mcp_port,
+            get_idle_template,
+            set_idle_template
         ])
         .setup(move |app| {
             let _ = ctx_setup.app_handle.set(app.handle().clone());
@@ -820,8 +990,14 @@ fn main() {
             let device = MenuItem::with_id(app, "device", "打开设备页", true, None::<&str>)?;
             let logs = MenuItem::with_id(app, "logs", "打开日志", true, None::<&str>)?;
             let templates = MenuItem::with_id(app, "templates", "打开模板目录", true, None::<&str>)?;
-            let autostart =
-                MenuItem::with_id(app, "autostart", "开机自启", false, None::<&str>)?;
+            let autostart = CheckMenuItem::with_id(
+                app,
+                "autostart",
+                "开机自启",
+                true,
+                autostart::matches_current_exe(),
+                None::<&str>,
+            )?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
             let sep1 = PredefinedMenuItem::separator(app)?;
             let sep2 = PredefinedMenuItem::separator(app)?;
@@ -876,6 +1052,19 @@ fn main() {
                             refresh_tray(&app_handle, &ctx);
                         }
                         "device" => open_url(&format!("http://{}", lan_ip())),
+                        "autostart" => {
+                            let enable = !autostart::enabled();
+                            match autostart::set(enable) {
+                                Ok(()) => tracing::info!("autostart set to {enable}"),
+                                Err(e) => tracing::warn!("autostart set failed: {e}"),
+                            }
+                            let autostart_id = tauri::menu::MenuId::from("autostart");
+                            if let Some(MenuItemKind::Check(item)) =
+                                app_handle.menu().and_then(|m| m.get(&autostart_id))
+                            {
+                                let _ = item.set_checked(autostart::matches_current_exe());
+                            }
+                        }
                         "logs" => open_path(&bridge_core::paths::data_root().join("logs")),
                         "templates" => open_path(&ctx.config.templates),
                         _ => {}

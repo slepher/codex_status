@@ -6,6 +6,7 @@
 
 static std::vector<TplMeta> sItems;
 static String sActive;
+static String sIdle;
 static uint32_t sCtr = 0;
 
 static const char *IDX_PATH = "/tpl/index.json";
@@ -24,6 +25,7 @@ static bool idValid(const String &id) {
 static void persist() {
     JsonDocument doc;
     doc["active"] = sActive;
+    doc["idle"] = sIdle;
     JsonArray arr = doc["items"].to<JsonArray>();
     for (const auto &m : sItems) {
         JsonObject o = arr.add<JsonObject>();
@@ -51,11 +53,13 @@ void tplStoreBegin() {
     if (!LittleFS.exists("/tpl")) LittleFS.mkdir("/tpl");
     sItems.clear();
     sActive = "";
+    sIdle = "";
     File f = LittleFS.open(IDX_PATH, FILE_READ);
     if (f) {
         JsonDocument doc;
         if (!deserializeJson(doc, f.readString())) {
             sActive = doc["active"] | "";
+            sIdle   = doc["idle"] | "";
             JsonArray arr = doc["items"].as<JsonArray>();
             for (JsonObject o : arr) {
                 TplMeta m;
@@ -128,6 +132,7 @@ bool tplStoreSave(const String &id, uint32_t version, const String &hash,
         uint32_t oldest = 0xFFFFFFFF;
         for (int i = 0; i < (int)sItems.size(); i++) {
             if (sItems[i].id == sActive) continue;
+            if (sIdle.length() && sItems[i].id == sIdle) continue;
             if (sItems[i].usedAt < oldest) { oldest = sItems[i].usedAt; victim = i; }
         }
         if (victim < 0) break;
@@ -157,11 +162,20 @@ bool tplStoreRemove(const String &id) {
         if (sItems[i].id == id) { sItems.erase(sItems.begin() + i); break; }
     }
     if (sActive == id) sActive = sItems.empty() ? "" : sItems[0].id;
+    if (sIdle == id) sIdle = "";
     persist();
     return true;
 }
 
 String tplStoreActive() { return sActive; }
+
+String tplStoreIdle() { return sIdle; }
+
+void tplStoreSetIdle(const String &id) {
+    if (sIdle == id) return;
+    sIdle = id;
+    persist();
+}
 
 bool tplStoreSetActive(const String &id) {
     TplMeta m;
@@ -185,5 +199,6 @@ void tplStoreClear() {
     LittleFS.remove(IDX_PATH);
     sItems.clear();
     sActive = "";
+    sIdle = "";
     DevLog.println("[tpl] store cleared");
 }

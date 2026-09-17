@@ -4,7 +4,7 @@ use bridge_core::template::{
     canonical_bytes, encode_chunks, parse_bind, template_hash, validate_template, BindField,
     BindSpec, Library, WinSel,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 
 fn template_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../tools/test-bridge/templates")
@@ -20,8 +20,8 @@ fn hashes_match_python_test_bridge() {
     assert_eq!(full.version, 3);
     assert_eq!(mini.version, 2);
     let quad = library.get("quad").expect("quad template");
-    assert_eq!(quad.version, 2);
-    assert_eq!(quad.min_fw.as_deref(), Some("0.5"));
+    assert_eq!(quad.version, 4);
+    assert_eq!(quad.min_fw.as_deref(), Some("0.10"));
 }
 
 #[test]
@@ -55,6 +55,33 @@ fn parse_bind_grammar() {
     assert_eq!(parse_bind("buckets[codex].monthly.usedPercent"), None);
     assert_eq!(parse_bind("buckets[].weekly.usedPercent"), None);
     assert_eq!(parse_bind("account.email"), None);
+    assert_eq!(parse_bind("device.state"), Some(BindSpec::DeviceState));
+    assert_eq!(
+        parse_bind("device.offline_mins"),
+        Some(BindSpec::DeviceOfflineMins)
+    );
+    assert_eq!(
+        parse_bind("device.idle_reason"),
+        Some(BindSpec::DeviceIdleReason)
+    );
+}
+
+#[test]
+fn validates_element_mode_whitelist() {
+    let template = |mode: Value| {
+        json!({
+            "schema": 1,
+            "canvas": {"w": 200, "h": 200},
+            "elements": [
+                {"type": "text", "text": "X", "font": "f12", "x": 0, "y": 0, "mode": mode}
+            ]
+        })
+    };
+    assert!(validate_template(&template(json!("any"))).is_ok());
+    assert!(validate_template(&template(json!("idle"))).is_ok());
+    assert!(validate_template(&template(json!("live"))).is_ok());
+    assert!(validate_template(&template(json!("always"))).is_err());
+    assert!(validate_template(&template(json!(1))).is_err());
 }
 
 #[test]

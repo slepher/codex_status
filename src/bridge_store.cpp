@@ -26,6 +26,7 @@ bool storeGet(int i, EndpointRec &rec) {
     rec.host  = prefs.getString(k("h", i).c_str(), "");
     rec.port  = prefs.getUShort(k("p", i).c_str(), 0);
     rec.token = prefs.getString(k("t", i).c_str(), "");
+    rec.bssid = prefs.getString(k("b", i).c_str(), "");
     rec.mru   = prefs.getULong(k("r", i).c_str(), 0);
     prefs.end();
     return rec.host.length() > 0;
@@ -75,6 +76,21 @@ void storeTouch(const String &mac) {
         }
     }
     prefs.putULong("ctr", ctr);
+    prefs.end();
+}
+
+void storeSetBssid(const String &mac, const String &bssid) {
+    if (!mac.length() || !bssid.length()) return;
+    prefs.begin("brg", false);
+    int n = prefs.getUChar("n", 0);
+    for (int i = 0; i < n && i < STORE_MAX; i++) {
+        if (prefs.getString(k("m", i).c_str(), "") == mac) {
+            if (prefs.getString(k("b", i).c_str(), "") != bssid) {
+                prefs.putString(k("b", i).c_str(), bssid);
+            }
+            break;
+        }
+    }
     prefs.end();
 }
 
