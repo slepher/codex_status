@@ -66,6 +66,20 @@ pub fn fetch(ip: &str, timeout: Duration) -> Result<DeviceStatus> {
     Ok(DeviceStatus { fields })
 }
 
+/// Raw PM statistics from `GET /pmstats` (firmware >= 0.13.0): light-sleep
+/// counters and the PM lock dump, consumed by the panel 功耗 tab and the MCP
+/// `pm_stats` tool.
+pub fn fetch_pmstats(ip: &str, timeout: Duration) -> Result<String> {
+    let body = http_get(ip, "/pmstats", timeout)?;
+    if !body.contains("Mode stats:") || !body.contains("Lock stats:") {
+        return Err(anyhow!(
+            "/pmstats unavailable on {ip} (needs firmware >= 0.13.0): {}",
+            body.trim().chars().take(80).collect::<String>()
+        ));
+    }
+    Ok(body)
+}
+
 fn fields_from_json(value: &serde_json::Value) -> Option<Vec<(String, String)>> {
     let text = |key: &str| value.get(key).and_then(|v| v.as_str()).map(str::to_string);
     let number = |key: &str| value.get(key).and_then(|v| v.as_i64());

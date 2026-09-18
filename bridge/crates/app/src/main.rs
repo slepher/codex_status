@@ -48,6 +48,16 @@ struct CachedDevice {
     fields: Vec<(String, String)>,
 }
 
+/// Last `GET /pmstats` response; short TTL so a tab open + manual refresh
+/// cannot hammer the device (each read briefly wakes it from light sleep).
+#[derive(Clone)]
+struct CachedPmStats {
+    fetched_at: i64,
+    online: bool,
+    ip: String,
+    text: String,
+}
+
 struct AppCtx {
     config: Config,
     root: PathBuf,
@@ -61,6 +71,7 @@ struct AppCtx {
     /// Device Wi-Fi MAC learned from /status.json; UDP updates require a match.
     device_mac: Mutex<Option<String>>,
     device_cache: Mutex<Option<CachedDevice>>,
+    pmstats_cache: Mutex<Option<CachedPmStats>>,
     /// The device asked for a BLE handshake in its UDP announce (`ble=1`).
     udp_ble: AtomicBool,
     /// Set when the device address changed; the push loop sends immediately.
@@ -379,12 +390,55 @@ async fn get_device_status(state: State<'_, Arc<AppCtx>>) -> Result<Value, Strin
     }
 }
 
+/// Read `GET /pmstats` from the device. Cached for 10 s because each read
+/// briefly wakes the device out of light sleep and would skew the counters.
+#[tauri::command]
+async fn get_pmstats(state: State<'_, Arc<AppCtx>>) -> Result<Value, String> {
+    const TTL_SECS: i64 = 10;
+    {
+        let cache = state.pmstats_cache.lock().unwrap();
+        if let Some(cached) = cache.as_ref() {
+            if now_secs() - cached.fetched_at < TTL_SECS {
+                return Ok(json!({
+                    "online": cached.online,
+                    "ip": cached.ip,
+                    "fetched_at": cached.fetched_at,
+                    "text": cached.text,
+                }));
+            }
+        }
+    }
+    let ip = state.device_ip.lock().unwrap().clone();
+    let fetch_ip = ip.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        bridge_core::device::fetch_pmstats(&fetch_ip, Duration::from_secs(5))
+    })
+    .await;
+    let (online, text) = match result {
+        Ok(Ok(text)) => (true, text),
+        Ok(Err(e)) => (false, e.to_string()),
+        Err(e) => (false, e.to_string()),
+    };
+    *state.pmstats_cache.lock().unwrap() = Some(CachedPmStats {
+        fetched_at: now_secs(),
+        online,
+        ip: ip.clone(),
+        text: text.clone(),
+    });
+    Ok(json!({
+        "online": online,
+        "ip": ip,
+        "fetched_at": now_secs(),
+        "text": text,
+    }))
+}
+
 #[tauri::command]
 async fn get_mcp_info(state: State<'_, Arc<AppCtx>>) -> Result<Value, String> {
     let port = *state.mcp_port.lock().unwrap();
     let error = state.mcp_error.lock().unwrap().clone();
     let url = format!("http://127.0.0.1:{port}/mcp");
-    let tools = "bridge_status / template_get / template_validate / template_render / template_save / profiles_list / profile_save / profile_push / firmware_ota";
+    let tools = "bridge_status / template_get / template_validate / template_render / template_save / profiles_list / profile_save / profile_push / firmware_ota / pm_stats";
 
     let generic_prompt = format!(
         "本机已启动 Codex Status 的 MCP 服务（Streamable HTTP）：{url}\n\
@@ -1068,6 +1122,7 @@ fn main() {
         device_ip: Mutex::new(device_ip),
         device_mac: Mutex::new(None),
         device_cache: Mutex::new(None),
+        pmstats_cache: Mutex::new(None),
         udp_ble: AtomicBool::new(false),
         device_ip_dirty: AtomicBool::new(false),
         force_push: Arc::new(Notify::new()),
@@ -1085,6 +1140,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_status,
             get_device_status,
+            get_pmstats,
             preview_template,
             force_sync,
             set_paused,

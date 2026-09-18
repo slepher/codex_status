@@ -134,7 +134,9 @@
 `last_push`）、待机模板存储槽。**保留**：`armWakeSources`（仅 WIFI OFF 电池态
 与 AP 无凭据深睡使用）、`powerOff`、OTA（上传期间持 `NO_LIGHT_SLEEP` 锁）。
 新增调试 CLI `pmstats`（`esp_pm_impl_dump_stats` + `esp_pm_dump_locks` 输出到
-DevLog/`/log`），用于证明 light sleep 生效。
+DevLog/`/log`），用于证明 light sleep 生效。0.13.0 起同一文本也可经只读
+`GET /pmstats` 免 token 读取（与 `/log` 同级；实现见
+`project-workflow/pmstats/`），bridge 面板「功耗」tab 与 MCP `pm_stats` 用它。
 
 ## 11. 验收
 

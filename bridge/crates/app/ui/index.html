@@ -42,6 +42,17 @@
   .dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.err { background: var(--err); }
   .todo { color: var(--muted); font-style: italic; }
 
+  /* power tab */
+  details > summary { cursor: pointer; color: var(--muted); }
+  .pmbar { display: flex; height: 18px; margin-top: 4px; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  .pmbar .seg { height: 100%; }
+  .pmlegend { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 10px; font-size: 12px; color: var(--muted); }
+  .pmlegend .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; }
+  .lrow { display: flex; gap: 10px; align-items: center; padding: 5px 0; border-bottom: 1px dashed var(--line); font-size: 12px; }
+  .lrow:last-child { border-bottom: 0; }
+  .lrow .lname { flex: 1; min-width: 80px; }
+  .lrow.hot .lname::before { content: '\25cf'; color: var(--warn); margin-right: 6px; }
+
   /* dropdown + menus */
   .menu-wrap { position: relative; }
   .menu { position: absolute; z-index: 40; top: calc(100% + 4px); left: 0; min-width: 210px; background: Canvas; border: 1px solid var(--line); border-radius: 10px; padding: 6px; box-shadow: 0 8px 24px rgba(0,0,0,.35); display: none; }
@@ -92,6 +103,7 @@
   <nav class="tabs">
     <button class="on" data-tab="templates">配置</button>
     <button data-tab="device">设备</button>
+    <button data-tab="power">功耗</button>
     <button data-tab="actions">操作</button>
     <button data-tab="mcp">MCP</button>
   </nav>
@@ -144,6 +156,44 @@
         <div class="row"><span>EPD 写入</span><span id="dev-epd">--</span></div>
         <div class="row"><span>Free heap</span><span id="dev-heap">--</span></div>
         <div class="row"><span>最近 BLE 同步</span><span id="dev-sync">--</span></div>
+      </div>
+    </section>
+
+    <section class="panel" id="tab-power">
+      <div class="card">
+        <div class="bar">
+          <div class="status" id="pm-state">读取中…</div>
+          <div class="menus"><button onclick="refreshPmStats(true)">采样</button></div>
+        </div>
+        <div class="sub">读取会让设备短暂苏醒，故仅在打开本页或手动采样时读取（缓存 10s）。</div>
+      </div>
+      <div class="card">
+        <h2>休眠概览</h2>
+        <div class="rings">
+          <div class="ring"><b id="pm-sleep-pct">--</b><small>休眠占比</small></div>
+          <div class="ring"><b id="pm-wakes">--</b><small>light sleep 次数</small></div>
+        </div>
+        <div class="row"><span>累计休眠</span><span id="pm-sleep-time">--</span></div>
+        <div class="row"><span>平均每次休眠</span><span id="pm-avg">--</span></div>
+        <div class="row"><span>拒绝休眠次数</span><span id="pm-reject">--</span></div>
+        <div class="row"><span>醒着时间</span><span id="pm-awake">--</span></div>
+      </div>
+      <div class="card">
+        <h2>CPU 模式时间占比</h2>
+        <div class="pmbar" id="pm-modes"></div>
+        <div class="pmlegend" id="pm-legend"></div>
+      </div>
+      <div class="card">
+        <h2>PM 锁（Active &gt; 0 阻止入睡）</h2>
+        <div id="pm-locks" class="plist todo">读取中…</div>
+      </div>
+      <div class="card">
+        <details>
+          <summary>原始输出</summary>
+          <textarea id="pm-raw" readonly rows="14"
+                    style="width:100%;margin-top:8px;font-family:ui-monospace,Consolas,monospace;font-size:12px;border-radius:8px;border:1px solid var(--line);background:transparent;color:inherit"></textarea>
+          <div class="actions" style="margin-top:8px"><button onclick="copyText($('pm-raw').value)">复制</button></div>
+        </details>
       </div>
     </section>
 
@@ -223,6 +273,7 @@
       document.querySelectorAll('.panel').forEach((p) => p.classList.toggle('on', p.id === 'tab-' + button.dataset.tab));
       if (button.dataset.tab === 'templates') refreshProfiles();
       if (button.dataset.tab === 'device') refreshDevice();
+      if (button.dataset.tab === 'power') refreshPmStats(false);
       if (button.dataset.tab === 'mcp') refreshMcp();
     });
   });
@@ -678,6 +729,97 @@
       $('dev-heap').textContent = f['Free heap'] || '--';
     } catch (e) {
       $('device-state').textContent = '读取失败：' + e;
+    }
+  }
+
+  /* ---------- power tab (pmstats) ---------- */
+
+  const PM_COLORS = { SLEEP: 'var(--accent)', APB_MIN: '#7fa8e0', APB_MAX: '#e0b24a', CPU_MAX: '#d96a4a' };
+  let lastPmFetch = 0;
+
+  function fmtDuration(seconds) {
+    if (!isFinite(seconds) || seconds < 0) return '--';
+    const s = Math.floor(seconds);
+    const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+    if (d) return `${d}d ${h}h ${m}m`;
+    if (h) return `${h}h ${m}m`;
+    if (m) return `${m}m ${s % 60}s`;
+    return `${s}s`;
+  }
+
+  async function refreshPmStats(force) {
+    if (!force && Date.now() - lastPmFetch < 15000) return;
+    lastPmFetch = Date.now();
+    $('pm-state').textContent = '读取中…';
+    try {
+      const r = await invoke('get_pmstats');
+      if (!r.online) {
+        $('pm-state').textContent = `设备 ${r.ip} 读取失败：${r.text || '不可达'}`;
+        return;
+      }
+      renderPmStats(r);
+    } catch (e) {
+      $('pm-state').textContent = '读取失败：' + e;
+    }
+  }
+
+  function renderPmStats(r) {
+    const text = r.text || '';
+    $('pm-raw').value = text;
+    $('pm-state').textContent = `在线 · ${r.ip} · 采样 ${new Date(r.fetched_at * 1000).toLocaleTimeString()}`;
+
+    const modes = [];
+    const modeRe = /^(SLEEP|APB_MIN|APB_MAX|CPU_MAX)\s+.+?\s+(\d+)\s+(\d+)\s*%/gm;
+    let m;
+    while ((m = modeRe.exec(text))) modes.push({ name: m[1], us: Number(m[2]), pct: Number(m[3]) });
+    const counts = text.match(/light_sleep_counts:(\d+)\s+light_sleep_reject_counts:(\d+)/);
+    const boot = text.match(/Time since boot up:\s*(\d+)\s*us/);
+    const sleep = modes.find((x) => x.name === 'SLEEP');
+
+    $('pm-sleep-pct').textContent = sleep ? sleep.pct + '%' : '--';
+    $('pm-sleep-time').textContent = sleep ? fmtDuration(sleep.us / 1e6) : '--';
+    if (boot && sleep) $('pm-awake').textContent = fmtDuration((Number(boot[1]) - sleep.us) / 1e6);
+    else $('pm-awake').textContent = '--';
+    if (counts) {
+      const n = Number(counts[1]);
+      $('pm-wakes').textContent = n.toLocaleString();
+      $('pm-reject').textContent = Number(counts[2]).toLocaleString();
+      const avgUs = n > 0 && sleep ? sleep.us / n : NaN;
+      $('pm-avg').textContent = isFinite(avgUs)
+        ? (avgUs >= 1e6 ? (avgUs / 1e6).toFixed(2) + ' s' : (avgUs / 1e3).toFixed(1) + ' ms')
+        : '--';
+    } else {
+      $('pm-wakes').textContent = '--';
+      $('pm-avg').textContent = '--';
+      $('pm-reject').textContent = '--';
+    }
+
+    const bar = $('pm-modes'), legend = $('pm-legend');
+    if (modes.length) {
+      bar.innerHTML = modes.map((x) =>
+        `<div class="seg" style="flex:${Math.max(x.pct, 0.5)} 0 0;min-width:2px;background:${PM_COLORS[x.name] || '#888'}" title="${x.name} ${x.pct}%"></div>`).join('');
+      legend.innerHTML = modes.map((x) =>
+        `<span><i class="sw" style="background:${PM_COLORS[x.name] || '#888'}"></i>${x.name} ${x.pct}% · ${fmtDuration(x.us / 1e6)}</span>`).join('');
+    } else {
+      bar.innerHTML = '';
+      legend.textContent = '暂无数据';
+    }
+
+    const locks = [];
+    const lockRe = /^(\S+)\s+([A-Z_]+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*%/gm;
+    while ((m = lockRe.exec(text))) {
+      locks.push({ name: m[1], type: m[2], active: Number(m[4]), count: Number(m[5]), us: Number(m[6]), pct: Number(m[7]) });
+    }
+    const box = $('pm-locks');
+    if (!locks.length) {
+      box.className = 'plist todo';
+      box.textContent = '无锁记录';
+    } else {
+      box.className = 'plist';
+      box.innerHTML = locks.sort((a, b) => b.active - a.active || b.us - a.us).map((l) =>
+        `<div class="lrow${l.active > 0 ? ' hot' : ''}">` +
+        `<span class="lname">${escapeHtml(l.name)} <span class="muted">${escapeHtml(l.type)}</span></span>` +
+        `<span class="muted">active ${l.active} · 共 ${l.count} 次 · ${fmtDuration(l.us / 1e6)} (${l.pct}%)</span></div>`).join('');
     }
   }
 

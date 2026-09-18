@@ -41,7 +41,7 @@
 #include "template_engine.h"
 #include "template_xfer.h"
 
-#define FW_VERSION    "0.12.6-bw"
+#define FW_VERSION    "0.13.0-bw"
 #define AP_PASSWORD   "codex1234"
 #define MAX_SLOTS     3
 
@@ -1267,6 +1267,36 @@ static void handleLog() {
     server.send(200, "text/plain; charset=utf-8", DevLog.dump());
 }
 
+// PM light-sleep counters (CONFIG_PM_PROFILING) for remote diagnostics.
+// Read-only, no token: same exposure level as /log and /status.json.
+static String pmStatsText() {
+#if defined(CODEX_PM)
+    char *buf = nullptr;
+    size_t len = 0;
+    FILE *f = open_memstream(&buf, &len);
+    if (!f) return String("pmstats: memstream failed");
+    // With CONFIG_PM_PROFILING (enabled in this build) dump_locks appends the
+    // mode/sleep stats itself; calling impl_dump_stats first would duplicate it.
+    esp_pm_dump_locks(f);
+    fflush(f);
+    if (buf && strstr(buf, "Mode stats:") == nullptr) {
+        esp_pm_impl_dump_stats(f);
+    }
+    fclose(f);
+    String out = buf ? buf : "";
+    free(buf);
+    return out;
+#else
+    return String("stock core: no PM stats");
+#endif
+}
+
+static void handlePmStats() {
+    String text = pmStatsText();
+    DevLog.printf("[pm] stats over HTTP (%u bytes)\n", (unsigned)text.length());
+    server.send(200, "text/plain; charset=utf-8", text);
+}
+
 static void randomHex(char *out, size_t bytes) {
     static const char *hex = "0123456789abcdef";
     for (size_t i = 0; i < bytes; i++) {
@@ -1597,6 +1627,7 @@ static void registerHttpRoutes() {
     server.on("/", HTTP_GET, handleStatus);
     server.on("/status.json", HTTP_GET, handleStatusJson);
     server.on("/log", HTTP_GET, handleLog);
+    server.on("/pmstats", HTTP_GET, handlePmStats);
     server.on("/usage", HTTP_POST, handleUsagePost);
     server.on("/template", HTTP_POST, handleTemplatePost);
     server.on("/update", HTTP_GET, handleUpdatePage);
@@ -1797,21 +1828,7 @@ void setup() {
 }
 
 static void dumpPmStats() {
-#if defined(CODEX_PM)
-    char *buf = nullptr;
-    size_t len = 0;
-    FILE *f = open_memstream(&buf, &len);
-    if (!f) { DevLog.println("[pm] pmstats: memstream failed"); return; }
-    esp_pm_impl_dump_stats(f);
-    esp_pm_dump_locks(f);
-    fclose(f);
-    if (buf) {
-        DevLog.printf("[pm] stats:\n%s", buf);
-        free(buf);
-    }
-#else
-    DevLog.println("[pm] stock core: no PM stats");
-#endif
+    DevLog.printf("[pm] stats:\n%s", pmStatsText().c_str());
 }
 
 // USB serial provisioning: `wifi <ssid> <pass>` saves to NVS and reboots;
