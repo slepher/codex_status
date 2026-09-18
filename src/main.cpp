@@ -1,6 +1,6 @@
 /*
- * Codex Status - 0.12.0 single-mode runtime
- * Wi-Fi 主通道（HTTP 推送/轮询）+ 按需 BLE 会话；空闲 light sleep。
+ * Codex Status - 0.12.6 single-mode runtime
+ * Wi-Fi 主通道（HTTP 推送/轮询/模板）+ 按需 BLE 会话（身份/token）；空闲 light sleep。
  * 状态机权威文档：docs/power-state.md
  */
 
@@ -41,7 +41,7 @@
 #include "template_engine.h"
 #include "template_xfer.h"
 
-#define FW_VERSION    "0.12.5-bw"
+#define FW_VERSION    "0.12.6-bw"
 #define AP_PASSWORD   "codex1234"
 #define MAX_SLOTS     3
 
@@ -863,6 +863,73 @@ static void handleUsagePost() {
                 accepted ? "{\"accepted\":true}" : "{\"accepted\":false}");
 }
 
+static bool tplIdValid(const String &id) {
+    if (id.length() == 0 || id.length() > 16) return false;
+    for (size_t i = 0; i < id.length(); i++) {
+        char c = id[i];
+        if (!isalnum((unsigned char)c) && c != '_' && c != '-') return false;
+    }
+    return true;
+}
+
+// POST /template (docs/power-state.md §5/§9): templates travel over HTTP as an
+// explicit user/agent action; BLE only carries identity (pairing, endpoint,
+// tokens). Gated by the endpoint token the bridge wrote over BLE; `hash` in the
+// query is the CRC32 of the raw body, validated together with min_fw/dry-run by
+// tplValidateForStorage (never partially rendered).
+static void handleTemplatePost() {
+    String mac;
+    if (!endpointTokenAuthorized(mac)) {
+        server.send(401, "application/json", "{\"saved\":false,\"err\":\"unauthorized\"}");
+        return;
+    }
+    if (server.clientContentLength() > 32768) {
+        server.send(413, "application/json", "{\"saved\":false,\"err\":\"too_large\"}");
+        return;
+    }
+    String id = server.arg("id");
+    String hash = server.arg("hash");
+    uint32_t version = server.arg("version").toInt();
+    bool activate = server.hasArg("activate") && server.arg("activate") != "0";
+    String body = server.arg("plain");
+    if (!tplIdValid(id) || !body.length()) {
+        server.send(400, "application/json", "{\"saved\":false,\"err\":\"args\"}");
+        return;
+    }
+    String err;
+    if (!tplValidateForStorage(body, hash, FW_VERSION, err)) {
+        DevLog.printf("[tpl] http reject %s: %s\n", id.c_str(), err.c_str());
+        server.send(400, "application/json",
+                    String("{\"saved\":false,\"err\":\"") + err + "\"}");
+        return;
+    }
+    TplMeta existing;
+    bool unchanged = tplStoreFind(id, existing) && existing.hash == hash;
+    if (!unchanged &&
+        !tplStoreSave(id, version, hash, (const uint8_t *)body.c_str(), body.length())) {
+        server.send(500, "application/json", "{\"saved\":false,\"err\":\"save\"}");
+        return;
+    }
+    bool activated = false;
+    if (activate) {
+        tplStoreSetActive(id);
+        tplStoreTouch(id);
+        activated = true;
+    }
+    if (!unchanged || activated) {
+        activeTplId = "";
+        updateInfoExtra();
+        renderCurrent();
+    }
+    DevLog.printf("[tpl] http %s id=%s hash=%s%s\n",
+                  unchanged ? "unchanged" : "saved", id.c_str(), hash.c_str(),
+                  activated ? " (activated)" : "");
+    server.send(200, "application/json",
+                String("{\"saved\":true,\"activated\":") + (activated ? "true" : "false") +
+                    ",\"unchanged\":" + (unchanged ? "true" : "false") +
+                    ",\"id\":\"" + id + "\"}");
+}
+
 // Deep-sleep wake sources: RTC timer plus BOOT (GPIO0) and PWR (GPIO18),
 // active-low. The RTC pull-ups are armed explicitly so the buttons stay
 // readable once the RTC domain is the only powered island.
@@ -1531,6 +1598,7 @@ static void registerHttpRoutes() {
     server.on("/status.json", HTTP_GET, handleStatusJson);
     server.on("/log", HTTP_GET, handleLog);
     server.on("/usage", HTTP_POST, handleUsagePost);
+    server.on("/template", HTTP_POST, handleTemplatePost);
     server.on("/update", HTTP_GET, handleUpdatePage);
     server.on("/doUpdate", HTTP_POST,
         []() {

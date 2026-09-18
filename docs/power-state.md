@@ -69,8 +69,9 @@
   计时）→ 关 BLE；单击亦可立即关闭。
 - 关闭 = 停广播 + `NimBLEDevice::deinit(true)`（释放控制器 PM 锁，light sleep
   的前提）；状态字 `BLE OFF`、绿灯灭。
-- BLE 用途（一次性/按需）：配对与绑定、endpoint/token 下发、OTA token 取用、
-  无 Wi-Fi 时模板应急下发。日常数据一律 HTTP。
+- BLE 用途（一次性/按需，仅身份类）：配对与绑定、endpoint/token 下发、
+  OTA token 取用。模板推送与日常数据一律 HTTP（`POST /template`，见 §9）；
+  BLE 不再传输模板。
 - 触发 bridge 握手：设备 UDP 广播带 `ble=1` 标志，bridge 收到后做一次定向
   BLE 连接完成 endpoint/token 下发即断开；不周期扫描。
 
@@ -110,10 +111,12 @@
 - **缓存设备最后状态**（fw、模板清单、endpoint、在线状态），面板显示用缓存。
 - **不做周期 BLE 扫描**：BLE 仅按需一次性连接（UDP announce `ble=1` 或用户
   显式动作）；日常 `POST /usage` 走 HTTP；设备 `GET /usage` 也走 HTTP。
-- **模板只经显式推送**：设备不在 boot、BLE 交接或在线稳态自动拉取模板；
-  只有用户（面板）或 agent（MCP `profile_push`）显式推送时才传输并激活。
-  桥的 `GET /template` 仅供工具/调试，设备端不再调用；信封里的
-  `templates` 哈希表仅作参考。
+- **模板只经显式推送（HTTP）**：设备不在 boot、BLE 交接或在线稳态自动拉取
+  模板；只有用户（面板）或 agent（MCP `profile_push`）显式推送时才传输并
+  激活。传输走设备 `POST /template`（endpoint token 门控，body 为原始模板
+  JSON，query 带 `id/version/hash/activate`；固件做 CRC/min_fw/dry-run 校验
+  后落盘并重绘），推送前先 GET `/status.json` 比对 hash 跳过未变化模板。
+  桥的 `GET /template` 仅供工具/调试；信封里的 `templates` 哈希表仅作参考。
 - **UDP 通告**：设备拿到 IP 后及每 ~5min 向 `255.255.255.255:8767` 广播
   `{magic, mac, ip, port, proto, ble, fw}`；bridge 监听并更新对应 MAC 的
   endpoint；envelope 里带上 bridge 的 host/port，设备侧 endpoint 自愈。

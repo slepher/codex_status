@@ -580,9 +580,10 @@
   async function pushCurrentProfile() {
     const profile = currentProfile();
     if (!profile) return;
+    $('profile-status').textContent = '正在通过 HTTP 推送…';
     try {
-      await invoke('push_profile', { id: profile.id });
-      $('profile-status').textContent = '已排队，正在通过 BLE 推送…';
+      const summary = await invoke('push_profile', { id: profile.id });
+      $('profile-status').textContent = '推送完成：' + summary;
     } catch (e) {
       $('profile-status').textContent = '推送失败：' + e;
     }
@@ -634,7 +635,6 @@
       $('btn-pause').textContent = paused ? '恢复推送' : '暂停推送';
       $('dot').className = 'dot ' + (s.last_error ? 'err' : (s.last_sync ? 'ok' : 'warn'));
       knownTemplates = s.templates || [];
-      trackPush(s);
       if (document.querySelector('.tabs button[data-tab="device"]').classList.contains('on')
           && Date.now() - lastDeviceFetch > 15000) {
         refreshDevice();
@@ -654,7 +654,6 @@
     });
   }
 
-  let lastPushAt = null;
   let lastDeviceFetch = 0;
 
   async function refreshDevice() {
@@ -681,24 +680,6 @@
       $('device-state').textContent = '读取失败：' + e;
     }
   }
-
-  function trackPush(s) {
-    const pending = s.pending || 0;
-    if (pending > 0) {
-      $('profile-status').textContent = `正在通过 BLE 推送…（剩余 ${pending} 个模板）`;
-    }
-    if (lastPushAt === null) {
-      lastPushAt = s.last_push_at || 0;
-      return;
-    }
-    if ((s.last_push_at || 0) > lastPushAt) {
-      lastPushAt = s.last_push_at;
-      $('profile-status').textContent = s.last_push_error
-        ? '推送失败：' + s.last_push_error
-        : '推送完成';
-    }
-  }
-
 
   function drawBits(canvas, bits) {
     const ctx = canvas.getContext('2d');

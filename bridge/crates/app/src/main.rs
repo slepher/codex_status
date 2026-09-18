@@ -24,18 +24,11 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tokio::sync::{Notify, RwLock};
 
-#[derive(Default)]
-struct PendingPush {
-    ids: Vec<String>,
-    activate: Option<String>,
-}
-
 struct RuntimeStatus {
     last_sync: Option<i64>,
     last_error: Option<String>,
     last_error_at: Option<i64>,
     paused: bool,
-    pending: PendingPush,
     last_push_at: Option<i64>,
     last_push_error: Option<String>,
     /// Last successful `POST /usage`; while fresh, the HTTP path is the healthy
@@ -231,7 +224,6 @@ async fn get_status(state: State<'_, Arc<AppCtx>>) -> Result<Value, String> {
         "weekly_remaining": weekly_remaining(&usage),
         "templates": templates,
         "paused": status.paused,
-        "pending": status.pending.ids.len(),
         "last_push_at": status.last_push_at,
         "last_push_error": status.last_push_error,
         "last_push_ok_at": status.last_push_ok_at,
@@ -250,6 +242,20 @@ fn local_hhmm() -> String {
     }
     #[cfg(not(windows))]
     "--:--".to_string()
+}
+
+fn mcp_config(ctx: &AppCtx) -> bridge_mcp::McpConfig {
+    bridge_mcp::McpConfig {
+        port: ctx.config.port,
+        token: ctx.config.token.clone(),
+        templates: ctx.config.templates.clone(),
+        profiles: ctx.config.profiles.clone(),
+        data_root: bridge_core::paths::data_root(),
+        seeds: ctx.config.seeds.clone(),
+        profile_seed: ctx.config.profile_seed.clone(),
+        device_ip: ctx.device_ip.lock().unwrap().clone(),
+        root: ctx.root.clone(),
+    }
 }
 
 async fn mcp_handler(
@@ -278,17 +284,7 @@ async fn mcp_handler(
                 .into_response();
         }
     };
-    let mcp_cfg = bridge_mcp::McpConfig {
-        port: ctx.config.port,
-        token: ctx.config.token.clone(),
-        templates: ctx.config.templates.clone(),
-        profiles: ctx.config.profiles.clone(),
-        data_root: bridge_core::paths::data_root(),
-        seeds: ctx.config.seeds.clone(),
-        profile_seed: ctx.config.profile_seed.clone(),
-        device_ip: ctx.device_ip.lock().unwrap().clone(),
-        root: ctx.root.clone(),
-    };
+    let mcp_cfg = mcp_config(&ctx);
     let tool = request
         .pointer("/params/name")
         .and_then(|v| v.as_str())
@@ -392,7 +388,7 @@ async fn get_mcp_info(state: State<'_, Arc<AppCtx>>) -> Result<Value, String> {
 
     let generic_prompt = format!(
         "本机已启动 Codex Status 的 MCP 服务（Streamable HTTP）：{url}\n\
-         工具前缀 codex_status_（{tools}），用于读取、校验、渲染预览、保存模板并 BLE 推送到墨水屏。\n\
+         工具前缀 codex_status_（{tools}），用于读取、校验、渲染预览、保存模板并 HTTP 推送到墨水屏。\n\
          请把它加入你所在客户端的 MCP 配置（remote/http 类型）；配置写入后需要重开会话或客户端才能加载。\
          若你无法自行修改配置，请告诉我该在哪一步粘贴这一行。"
     );
@@ -504,7 +500,7 @@ async fn force_sync(state: State<'_, Arc<AppCtx>>) -> Result<(), String> {
 }
 
 /// Explicit user action: push the envelope over HTTP immediately and run one
-/// BLE handshake (endpoint/token refresh, templates if pending).
+/// BLE handshake (endpoint/token refresh).
 fn request_sync(ctx: &AppCtx) {
     ctx.device_ip_dirty.store(true, Ordering::SeqCst);
     ctx.force_push.notify_one();
@@ -601,8 +597,10 @@ async fn delete_profile(state: State<'_, Arc<AppCtx>>, id: String) -> Result<(),
     profiles.save(&path).map_err(|e| e.to_string())
 }
 
+/// Explicit user action (docs/power-state.md §5/§9): templates are pushed over
+/// HTTP (`POST /template`), not BLE. Returns the transfer summary for the UI.
 #[tauri::command]
-async fn push_profile(state: State<'_, Arc<AppCtx>>, id: String) -> Result<(), String> {
+async fn push_profile(state: State<'_, Arc<AppCtx>>, id: String) -> Result<String, String> {
     let profiles = bridge_core::profile::ProfilesFile::load(&profiles_path(&state))
         .map_err(|e| e.to_string())?;
     let profile = profiles
@@ -613,15 +611,20 @@ async fn push_profile(state: State<'_, Arc<AppCtx>>, id: String) -> Result<(), S
     if enabled.is_empty() {
         return Err("没有启用的模板，无法推送".to_string());
     }
-    {
-        let mut status = state.status.lock().unwrap();
-        status.pending = PendingPush {
-            ids: enabled.clone(),
-            activate: enabled.first().cloned(),
-        };
+    let activate = enabled.first().cloned();
+    let cfg = mcp_config(&state);
+    match bridge_mcp::push_templates_http(&cfg, &enabled, activate.as_deref()).await {
+        Ok(summary) => {
+            let mut status = state.status.lock().unwrap();
+            status.last_push_at = Some(now_secs());
+            status.last_push_error = None;
+            Ok(summary)
+        }
+        Err(e) => {
+            state.status.lock().unwrap().last_push_error = Some(e.clone());
+            Err(e)
+        }
     }
-    state.force_ble.notify_one();
-    Ok(())
 }
 
 #[tauri::command]
@@ -925,9 +928,10 @@ async fn run_services(ctx: Arc<AppCtx>) {
         });
     }
 
-    // v0.12 demand-driven BLE (docs/power-state.md §9): no periodic scanning.
-    // A cycle runs only for explicit work (panel/MCP push, force sync) or when
-    // the device asks for a handshake in its UDP announce (ble=1).
+    // v0.12 demand-driven BLE (docs/power-state.md §5/§9): no periodic scanning
+    // and no template transfers. A cycle runs only when the device asks for a
+    // handshake in its UDP announce (`ble=1`), which refreshes the endpoint
+    // record (host/port/token) over the bonded link. Templates go over HTTP.
     loop {
         if ctx.status.lock().unwrap().paused {
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -938,8 +942,7 @@ async fn run_services(ctx: Arc<AppCtx>) {
             _ = tokio::time::sleep(Duration::from_secs(5)) => {}
         }
         let udp_request = ctx.udp_ble.swap(false, Ordering::SeqCst);
-        let pending_waiting = !ctx.status.lock().unwrap().pending.ids.is_empty();
-        if !udp_request && !pending_waiting {
+        if !udp_request {
             continue;
         }
         let adapter = match Pusher::adapter().await {
@@ -955,17 +958,14 @@ async fn run_services(ctx: Arc<AppCtx>) {
                 continue;
             }
         };
-        // Templates are only pushed when explicitly requested (profile push in
-        // the panel or MCP profile_push).
-        let pending = std::mem::take(&mut ctx.status.lock().unwrap().pending);
-        let push_ids = pending.ids.clone();
         let ble_cfg = BleConfig {
             name_prefix: "CodexStatus-".to_string(),
             host: lan_ip(),
             port: ctx.config.port,
             token: ctx.config.token.clone(),
-            template_ids: Some(push_ids),
-            activate: pending.activate.clone(),
+            // Identity handshake only: `Some(vec![])` leaves templates untouched.
+            template_ids: Some(Vec::new()),
+            activate: None,
             scan_timeout_ms: 30000,
         };
         let pusher = Pusher::new(
@@ -975,41 +975,20 @@ async fn run_services(ctx: Arc<AppCtx>) {
         );
         match pusher.cycle_once(&adapter).await {
             Ok(()) => {
-                tracing::info!(
-                    "ble cycle done ({})",
-                    if udp_request { "udp handshake" } else { "explicit push" }
-                );
+                tracing::info!("ble handshake done (udp announce)");
                 let mut status = ctx.status.lock().unwrap();
                 status.last_sync = Some(now_secs());
                 status.last_error = None;
                 status.last_error_at = None;
-                if !pending.ids.is_empty() {
-                    status.last_push_at = Some(now_secs());
-                    status.last_push_error = None;
-                }
             }
             Err(e) => {
                 tracing::warn!("ble cycle: {e}");
                 {
                     let mut status = ctx.status.lock().unwrap();
-                    if !udp_request {
-                        status.last_error = Some(format!("ble: {e}"));
-                        status.last_error_at = Some(now_secs());
-                    }
-                    if !pending.ids.is_empty() {
-                        status.last_push_error = Some(format!("ble: {e}"));
-                    }
-                    for id in pending.ids {
-                        if !status.pending.ids.contains(&id) {
-                            status.pending.ids.push(id);
-                        }
-                    }
-                    if status.pending.activate.is_none() {
-                        status.pending.activate = pending.activate;
-                    }
+                    status.last_error = Some(format!("ble: {e}"));
+                    status.last_error_at = Some(now_secs());
                 }
-                // Give an unreachable device time to re-open its BLE session
-                // before retrying explicit push work.
+                // Give an unreachable device time to re-open its BLE session.
                 tokio::time::sleep(Duration::from_secs(20)).await;
             }
         }
@@ -1081,7 +1060,6 @@ fn main() {
             last_error: None,
             last_error_at: None,
             paused: false,
-            pending: PendingPush::default(),
             last_push_at: None,
             last_push_error: None,
             last_push_ok_at: None,
