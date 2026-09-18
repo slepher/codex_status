@@ -54,7 +54,8 @@
 - **BOOT 单击**（<2s 释放；1s 节流，屏幕始终反映最终状态）：
   IDLE → BLE ON；BLE ON → BLE OFF（→ light sleep）；WIFI OFF（插电清醒态）→
   立即重试 Wi-Fi；AP 态无操作。
-- **BOOT 2s**：切下一个本地模板 + 进入 BLE ON（已开则重置 120s 计时）。
+- **BOOT 2s**：切下一个本地模板（0.13.2 起不再顺带开 BLE 会话；需要 BLE
+  用单击）。
 - **BOOT 15s**：进入 AP 配网模式。
 - **BOOT 30s**：恢复出厂（清 NVS/绑定/模板/凭据后重启进 AP）。
 - **PWR 3s**：断电（现有逻辑，拉低 GPIO17；USB 供电时退化为重启）。
@@ -137,13 +138,16 @@
 DevLog/`/log`），用于证明 light sleep 生效。0.13.0 起同一文本也可经只读
 `GET /pmstats` 免 token 读取（与 `/log` 同级；实现见
 `project-workflow/pmstats/`），bridge 面板「功耗」tab 与 MCP `pm_stats` 用它。
+0.13.3 起 `loop()` 空闲轮询为 25ms（有 TCP 客户端/OTA 时自动回 5ms，见
+`loopDelayForNow()`），把 light sleep 碎片从 ~134 次/s 降到 ~45 次/s；诊断
+参数见 `project-workflow/pmstats/task-2.md`。
 
 ## 11. 验收
 
 - **T10**：拔电 IDLE 态平均电流 ≤2mA（电池 `battery_mv` 斜率 + `pmstats`
   双证；对照 0.10.3 ~10%/h）。
 - **T9**：light sleep 下 bridge `POST /usage` 成功且延迟可接受（唤醒延迟）。
-- **状态机回归**：单击 BLE ON/OFF 屏幕可见、2s 切模板+BLE ON、15s AP、30s
+- **状态机回归**：单击 BLE ON/OFF 屏幕可见、2s 切模板（不自动开 BLE）、15s AP、30s
   恢复出厂、GP3 指示；插电常开/拔电 120s；20% 宽限与自动恢复。
 - **WIFI OFF**：拔 AP 后 30s 判定 → 深睡；1m×3/5m×3/15m 定时重试节奏正确；
   按键唤醒清零；插电态不睡、60s 重试、串口可用；屏幕 `WIFI OFF`。
@@ -157,7 +161,8 @@ DevLog/`/log`），用于证明 light sleep 生效。0.13.0 起同一文本也�
 - PC USB SOF 拔插检测可靠性（实现后实测多轮；拔线 3ms 内失效）。
 - UDP 广播的 Windows 防火墙放行（首次可能弹窗）与 LAN 内无认证风险（仅更
   新已存在 MAC 的 IP，可接受则不做签名）。
-- light sleep 下 WebServer/OTA 的稳定性与延迟（需实测）。
+- light sleep 下 WebServer/OTA 的稳定性与延迟（HTTP 已实测：空闲 25ms 轮询下
+  往返 ~0.3–0.5s；传输时回 5ms；OTA 全流程待下个版本回归）。
 - USB 供电时 USB 锁使 light sleep 不可用属预期（插电本就不睡）。
 - 实现顺序建议：固件状态机 → 模板协议去 `mode` → bridge 去待机/缓存/UDP →
   watchdog → 三端测试与整机验收。

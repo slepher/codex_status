@@ -24,6 +24,7 @@
 #include <esp_pm.h>
 #include <esp_wifi.h>
 #include <esp_mac.h>
+#include <esp_timer.h>
 #include <esp_private/pm_impl.h>
 #include <driver/rtc_io.h>
 #include <driver/gpio.h>
@@ -41,7 +42,7 @@
 #include "template_engine.h"
 #include "template_xfer.h"
 
-#define FW_VERSION    "0.13.0-bw"
+#define FW_VERSION    "0.13.3-bw"
 #define AP_PASSWORD   "codex1234"
 #define MAX_SLOTS     3
 
@@ -119,6 +120,70 @@ static bool     ledState = false;         // logical LED: BLE ON
 // LIVE power management: PM dynamic frequency scaling (240/40 MHz) plus
 // automatic light sleep. Requires CONFIG_PM_ENABLE and
 // CONFIG_FREERTOS_USE_TICKLESS_IDLE from the custom sdkconfig.
+//
+// Sleep diagnostics (task-2): bucket actual light-sleep durations and count
+// wakeup causes to locate the ~6 ms cadence, see
+// project-workflow/pmstats/task-2.md. Read via /pmstats?diag=1.
+#if defined(CODEX_PM) && CONFIG_PM_LIGHT_SLEEP_CALLBACKS
+struct SleepDiag {
+    uint32_t count;
+    uint32_t causes[4];          // timer / wifi / gpio / other
+    uint64_t total_us;
+    uint32_t min_us, max_us, last_us;
+    uint32_t last_expected_us, last_next_alarm_us;
+    uint32_t hist[12];
+};
+
+static SleepDiag sleepDiag = {};
+
+static uint32_t sleepBucket(int64_t us) {
+    static const int64_t edges[11] = {1000, 2000, 4000, 6000, 8000, 10000,
+                                      20000, 50000, 100000, 500000, 1000000};
+    for (uint32_t i = 0; i < 11; i++) {
+        if (us < edges[i]) return i;
+    }
+    return 11;
+}
+
+static esp_err_t sleepEnterCb(int64_t sleep_time_us, void *) {
+    int64_t gap = esp_timer_get_next_alarm_for_wake_up() - esp_timer_get_time();
+    sleepDiag.last_expected_us = (uint32_t)sleep_time_us;
+    sleepDiag.last_next_alarm_us = gap < 0 ? 0 : (uint32_t)gap;
+    return ESP_OK;
+}
+
+static esp_err_t sleepExitCb(int64_t slept_us, void *) {
+    sleepDiag.count++;
+    sleepDiag.total_us += (uint64_t)slept_us;
+    if (sleepDiag.count == 1 || slept_us < (int64_t)sleepDiag.min_us) {
+        sleepDiag.min_us = (uint32_t)slept_us;
+    }
+    if ((uint64_t)slept_us > sleepDiag.max_us) sleepDiag.max_us = (uint32_t)slept_us;
+    sleepDiag.last_us = (uint32_t)slept_us;
+    sleepDiag.hist[sleepBucket(slept_us)]++;
+    switch (esp_sleep_get_wakeup_cause()) {
+        case ESP_SLEEP_WAKEUP_TIMER: sleepDiag.causes[0]++; break;
+        case ESP_SLEEP_WAKEUP_WIFI:  sleepDiag.causes[1]++; break;
+        case ESP_SLEEP_WAKEUP_GPIO:  sleepDiag.causes[2]++; break;
+        default:                     sleepDiag.causes[3]++; break;
+    }
+    return ESP_OK;
+}
+#endif
+
+// Arduino loop() cadence. Idle default is 25 ms: the sleep survey (task-2)
+// showed light-sleep fragmentation drops sharply up to ~25-50 ms (134 -> 45
+// wakeups/s) while HTTP latency stays acceptable. While a TCP client is
+// connected (HTTP request/response, OTA upload) the loop falls back to 5 ms so
+// transfer throughput and interactive latency are unaffected.
+// POST /diag?loop_delay=N retunes the idle value at runtime (token-gated).
+static uint32_t loopDelayMs = 25;
+
+static uint32_t loopDelayForNow() {
+    if (server.client().connected()) return 5;
+    return loopDelayMs;
+}
+
 static void configurePowerManagement() {
 #ifdef CODEX_PM
     esp_pm_config_t cfg = {};
@@ -128,6 +193,13 @@ static void configurePowerManagement() {
     esp_err_t err = esp_pm_configure(&cfg);
     pmLightSleep = (err == ESP_OK);
     DevLog.printf("[pm] esp_pm_configure(light_sleep=1, 240/40MHz): %s\n", esp_err_to_name(err));
+#if CONFIG_PM_LIGHT_SLEEP_CALLBACKS
+    esp_pm_sleep_cbs_register_config_t cbs = {};
+    cbs.enter_cb = sleepEnterCb;
+    cbs.exit_cb = sleepExitCb;
+    esp_err_t cberr = esp_pm_light_sleep_register_cbs(&cbs);
+    DevLog.printf("[pm] sleep diag callbacks: %s\n", esp_err_to_name(cberr));
+#endif
 #else
     DevLog.println("[pm] stock core: PM light sleep not compiled in");
 #endif
@@ -1291,10 +1363,108 @@ static String pmStatsText() {
 #endif
 }
 
+// Active esp_timer list (?timers=1), used to correlate light-sleep wakeups
+// with the next timer alarm (see project-workflow/pmstats/task-2.md).
+static String timerStatsText() {
+#if defined(CODEX_PM)
+    char *buf = nullptr;
+    size_t len = 0;
+    FILE *f = open_memstream(&buf, &len);
+    if (!f) return String("timers: memstream failed");
+    esp_timer_dump(f);
+    fclose(f);
+    String out = buf ? buf : "";
+    free(buf);
+    return out;
+#else
+    return String("stock core: no timer dump");
+#endif
+}
+
+// Light-sleep diagnostics: sleep duration histogram + wakeup causes (task-2).
+static String sleepDiagText() {
+#if defined(CODEX_PM) && CONFIG_PM_LIGHT_SLEEP_CALLBACKS
+    static const char *buckets[12] = {"<1ms", "1-2ms", "2-4ms", "4-6ms", "6-8ms",
+                                      "8-10ms", "10-20ms", "20-50ms", "50-100ms",
+                                      "100-500ms", "0.5-1s", ">=1s"};
+    SleepDiag d;
+    memcpy(&d, (const void *)&sleepDiag, sizeof(d));
+    String out;
+    out += "Sleep diag:\n";
+    out += "  count=" + String(d.count) +
+           " avg_us=" + String(d.count ? (double)d.total_us / d.count : 0.0, 1) +
+           " min_us=" + String(d.min_us) + " max_us=" + String(d.max_us) +
+           " last_us=" + String(d.last_us) + "\n";
+    out += "  wake_cause: timer=" + String(d.causes[0]) + " wifi=" + String(d.causes[1]) +
+           " gpio=" + String(d.causes[2]) + " other=" + String(d.causes[3]) + "\n";
+    out += "  last_expected_us=" + String(d.last_expected_us) +
+           " last_next_alarm_gap_us=" + String(d.last_next_alarm_us) + "\n";
+    out += "  slept_hist:";
+    for (int i = 0; i < 12; i++) {
+        if (d.hist[i]) out += String(" ") + buckets[i] + "=" + String(d.hist[i]);
+    }
+    out += "\n";
+    return out;
+#else
+    return String("Sleep diag: disabled (CONFIG_PM_LIGHT_SLEEP_CALLBACKS off)\n");
+#endif
+}
+
+// FreeRTOS task snapshot + run-time stats (stats formatting functions are on).
+static String taskStatsText() {
+#if defined(CODEX_PM)
+    const size_t size = 8192;
+    char *buf = (char *)malloc(size);
+    if (!buf) return String("Tasks: no mem\n");
+    String out = "Tasks (name, state, prio, stack free, num):\n";
+    vTaskList(buf);
+    out += buf;
+    out += "\nRun time (abs, %):\n";
+    vTaskGetRunTimeStats(buf);
+    out += buf;
+    free(buf);
+    return out;
+#else
+    return String("Tasks: stock core\n");
+#endif
+}
+
 static void handlePmStats() {
     String text = pmStatsText();
+    if (server.hasArg("timers")) {
+        text += "\n";
+        text += timerStatsText();
+    }
+    if (server.hasArg("diag")) {
+        text += "\n";
+        text += sleepDiagText();
+        text += "\n";
+        text += taskStatsText();
+        text += "\n";
+        text += timerStatsText();
+    }
     DevLog.printf("[pm] stats over HTTP (%u bytes)\n", (unsigned)text.length());
     server.send(200, "text/plain; charset=utf-8", text);
+}
+
+// Token-gated runtime knob for task-2 experiments: POST /diag?loop_delay=20
+// changes the loop() yield without reflashing. Diagnostic-only endpoint.
+static void handleDiag() {
+    if (!requestAuthorized()) {
+        server.send(401, "text/plain", "unauthorized");
+        return;
+    }
+    if (server.hasArg("loop_delay")) {
+        long v = server.arg("loop_delay").toInt();
+        if (v < 1 || v > 500) {
+            server.send(400, "text/plain", "loop_delay out of range 1..500");
+            return;
+        }
+        loopDelayMs = (uint32_t)v;
+        DevLog.printf("[diag] loop_delay=%u ms\n", (unsigned)loopDelayMs);
+    }
+    server.send(200, "text/plain", "loop_delay=" + String(loopDelayMs) + " ms\n\n" +
+                                          sleepDiagText());
 }
 
 static void randomHex(char *out, size_t bytes) {
@@ -1628,6 +1798,7 @@ static void registerHttpRoutes() {
     server.on("/status.json", HTTP_GET, handleStatusJson);
     server.on("/log", HTTP_GET, handleLog);
     server.on("/pmstats", HTTP_GET, handlePmStats);
+    server.on("/diag", HTTP_POST, handleDiag);
     server.on("/usage", HTTP_POST, handleUsagePost);
     server.on("/template", HTTP_POST, handleTemplatePost);
     server.on("/update", HTTP_GET, handleUpdatePage);
@@ -1880,8 +2051,14 @@ static void handleSerialCli() {
             DevLog.println("[cli] BLE session on, pairing window 120s");
         } else if (line == "pmstats") {
             dumpPmStats();
+        } else if (line == "timers") {
+            DevLog.printf("[pm] timers:\n%s", timerStatsText().c_str());
+        } else if (line == "diag") {
+            DevLog.printf("[pm] %s", sleepDiagText().c_str());
+            DevLog.printf("[pm] %s", taskStatsText().c_str());
+            DevLog.printf("[pm] timers:\n%s", timerStatsText().c_str());
         } else if (line.length()) {
-            DevLog.println("[cli] commands: wifi <ssid> <pass> | status | batt | pair | pmstats");
+            DevLog.println("[cli] commands: wifi <ssid> <pass> | status | batt | pair | pmstats | timers | diag");
         }
     }
 }
@@ -1952,8 +2129,7 @@ void loop() {
         uint32_t held = millis() - bootDownAt;
         if (bootStage < 1 && held > 2000) {
             bootStage = 1;
-            nextTemplate();
-            enterBleOn(true);   // 2 s: next local template + BLE session
+            nextTemplate();     // 2 s: next local template (no BLE session)
         }
         if (bootStage < 2 && held > 15000) {
             bootStage = 2;
@@ -2033,5 +2209,5 @@ void loop() {
         if (offlineMinute > 0 || wasShown) renderCurrent();
     }
 
-    delay(5);
+    delay(loopDelayForNow());
 }
