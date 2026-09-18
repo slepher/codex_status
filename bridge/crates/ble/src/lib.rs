@@ -25,6 +25,7 @@ pub const CHR_USAGE: &str = "e7f1a003-4b2a-4c9e-9a11-3c0d5e9a0000";
 pub const CHR_STATUS: &str = "e7f1a004-4b2a-4c9e-9a11-3c0d5e9a0000";
 pub const CHR_TPL_CTRL: &str = "e7f1a005-4b2a-4c9e-9a11-3c0d5e9a0000";
 pub const CHR_TPL_DATA: &str = "e7f1a006-4b2a-4c9e-9a11-3c0d5e9a0000";
+pub const CHR_AUTH: &str = "e7f1a007-4b2a-4c9e-9a11-3c0d5e9a0000";
 
 pub const JSON_WRITE_LIMIT: usize = 180;
 pub const CHUNK_PAYLOAD: usize = JSON_WRITE_LIMIT - 2;
@@ -302,6 +303,61 @@ impl Pusher {
             tracing::info!("no template changes to push; device left as-is");
         }
         Ok(())
+    }
+
+    /// Connect to an advertising device (BLE session on, e.g. after a BOOT
+    /// click) and request the OTA/Wi-Fi operation token over the bonded auth
+    /// characteristic. The token is disclosed only over this encrypted link.
+    pub async fn request_device_token(
+        adapter: &Adapter,
+        name_prefix: &str,
+        scan_timeout_ms: u64,
+    ) -> Result<String> {
+        let scan = Duration::from_millis(scan_timeout_ms.max(1000));
+        let peripheral = Self::wait_for_device(adapter, name_prefix, scan).await?;
+        tracing::info!("connecting {} for device token", peripheral.address());
+        peripheral.connect().await.context("connect")?;
+        peripheral.discover_services().await.context("discover")?;
+        if let Err(e) = Self::read_info(&peripheral).await {
+            let _ = peripheral.disconnect().await;
+            return Err(e);
+        }
+        let status = peripheral
+            .characteristics()
+            .into_iter()
+            .find(|c| c.uuid == Self::uuid(CHR_STATUS))
+            .ok_or_else(|| anyhow!("status characteristic missing"))?;
+        peripheral
+            .subscribe(&status)
+            .await
+            .context("subscribe status")?;
+        let mut stream = peripheral.notifications().await?;
+        Self::write_json(&peripheral, CHR_AUTH, br#"{"cmd":"token"}"#).await?;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut token: Option<String> = None;
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout_at(deadline, stream.next()).await {
+                Ok(Some(ValueNotification { uuid, value, .. })) => {
+                    if uuid != Self::uuid(CHR_STATUS) {
+                        continue;
+                    }
+                    let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&value) else {
+                        continue;
+                    };
+                    if doc.get("ack").and_then(|v| v.as_str()) != Some("auth") {
+                        continue;
+                    }
+                    if let Some(value) = doc.get("token").and_then(|v| v.as_str()) {
+                        token = Some(value.to_string());
+                    }
+                    break;
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        let _ = peripheral.disconnect().await;
+        token.ok_or_else(|| anyhow!("device token response timed out"))
     }
 
     /// One connect → push → disconnect cycle.

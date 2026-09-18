@@ -9,6 +9,8 @@ typedef void (*TemplateResetHandler)();
 typedef void (*AuthJsonHandler)(const String &json);
 
 void bleBegin(const String &deviceName, const String &fwVersion);
+void bleDeinit();
+bool bleInitialized();
 bool bleIsConnected();
 bool blePeerIsBonded();
 bool blePeerIsEncrypted();

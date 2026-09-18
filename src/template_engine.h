@@ -6,9 +6,8 @@ struct TplEnv {
     String ip;
     String syncHHMM;  // "--:--" when unknown
     int battery = -1; // percentage, or -1 when the device value is unknown
-    bool idle = false;           // render mode: IDLE screen (true) / LIVE data (false)
+    String state;                // AP / BLE ON / BLE OFF / WIFI OFF
     int offlineMins = -1;        // minutes since the last successful sync
-    String idleReason;           // boot/wifi_lost/bridge_lost/env_switch
 };
 
 // Draw a template onto the current Paint image (caller has cleared the frame).

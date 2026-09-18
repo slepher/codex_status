@@ -54,7 +54,30 @@
       ],
       "scale": 1,
       "text": "WEEK",
-      "type": "text"
+      "type": "text",
+      "when": {
+        "bind": "buckets[codex].monthly.remaining",
+        "exists": false
+      }
+    },
+    {
+      "align": "center",
+      "bg": "black",
+      "color": "white",
+      "font": "f16",
+      "region": [
+        8,
+        78,
+        88,
+        18
+      ],
+      "scale": 1,
+      "text": "MONTH",
+      "type": "text",
+      "when": {
+        "bind": "buckets[codex].monthly.remaining",
+        "exists": true
+      }
     },
     {
       "align": "center",
@@ -176,26 +199,6 @@
       "bind": "buckets[codex].5h.resetsAt",
       "color": "black",
       "font": "f12",
-      "mode": "live",
-      "prefix": "5H ",
-      "region": [
-        4,
-        158,
-        84,
-        12
-      ],
-      "time_format": "hhmm",
-      "type": "text",
-      "when": {
-        "bind": "buckets[codex].5h.resetsAt",
-        "exists": true
-      }
-    },
-    {
-      "bind": "buckets[codex].5h.resetsAt",
-      "color": "black",
-      "font": "f12",
-      "mode": "idle",
       "prefix": "5H ",
       "region": [
         4,
@@ -214,22 +217,6 @@
       "bind": "device.battery",
       "color": "black",
       "font": "f12",
-      "mode": "live",
-      "prefix": "BATT ",
-      "region": [
-        4,
-        172,
-        84,
-        12
-      ],
-      "suffix": "%",
-      "type": "text"
-    },
-    {
-      "bind": "device.battery",
-      "color": "black",
-      "font": "f12",
-      "mode": "idle",
       "prefix": "BATT ",
       "region": [
         4,
@@ -244,7 +231,6 @@
       "bind": "device.state",
       "color": "black",
       "font": "f12",
-      "mode": "idle",
       "region": [
         4,
         172,
@@ -257,7 +243,6 @@
       "bind": "device.offline_mins",
       "color": "black",
       "font": "f12",
-      "mode": "idle",
       "prefix": "OFF ",
       "region": [
         4,
@@ -276,7 +261,6 @@
       "bind": "device.sync_hhmm",
       "color": "black",
       "font": "f12",
-      "mode": "live",
       "prefix": "SYNC ",
       "region": [
         4,
@@ -284,11 +268,15 @@
         84,
         12
       ],
-      "type": "text"
+      "type": "text",
+      "when": {
+        "bind": "device.offline_mins",
+        "exists": false
+      }
     }
   ],
   "id": "quad",
-  "min_fw": "0.10",
+  "min_fw": "0.12",
   "schema": 1,
-  "version": 4
+  "version": 7
 }

@@ -70,6 +70,7 @@ fn fields_from_json(value: &serde_json::Value) -> Option<Vec<(String, String)>> 
     let text = |key: &str| value.get(key).and_then(|v| v.as_str()).map(str::to_string);
     let number = |key: &str| value.get(key).and_then(|v| v.as_i64());
     let fw = text("fw")?;
+    let mac = text("mac").unwrap_or_default();
     let slot = text("slot").unwrap_or_default();
     let next_slot = text("next_slot").unwrap_or_default();
     let reset = text("reset").unwrap_or_default();
@@ -78,6 +79,10 @@ fn fields_from_json(value: &serde_json::Value) -> Option<Vec<(String, String)>> 
     let ip = text("ip").unwrap_or_default();
     let rssi = number("rssi").map(|v| format!("{v} dBm")).unwrap_or_default();
     let ble = value.get("ble").and_then(|v| v.as_bool()).unwrap_or(false);
+    let state = text("state").unwrap_or_default();
+    let plugged = value.get("plugged").and_then(|v| v.as_bool()).unwrap_or(false);
+    let wifi_state = text("wifi_state").unwrap_or_default();
+    let retry_stage = number("retry_stage").unwrap_or(0);
     let endpoints = number("endpoints").unwrap_or(0);
     let channel = text("channel").unwrap_or_default();
     let battery = number("battery").unwrap_or(-1);
@@ -112,6 +117,8 @@ fn fields_from_json(value: &serde_json::Value) -> Option<Vec<(String, String)>> 
     };
     Some(vec![
         ("Version".to_string(), fw),
+        ("MAC".to_string(), mac),
+        ("State".to_string(), format!("{state} (USB {plugged}, wifi {wifi_state}, retry {retry_stage})")),
         ("Running".to_string(), format!("{slot} (next OTA slot: {next_slot})")),
         ("Reset reason".to_string(), format!("{reset} (uptime {uptime}s)")),
         ("SSID".to_string(), ssid),

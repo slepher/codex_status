@@ -14,4 +14,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["multipart", "rustls-tls"] }
+tracing = "0.1"
 windows-sys = { version = "0.60", features = ["Win32_System_SystemInformation"] }

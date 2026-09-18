@@ -31,16 +31,3 @@ bool usageHttpGet(const EndpointRec &rec, String &out, String &err, uint32_t tim
     String url = "http://" + rec.host + ":" + String(rec.port) + "/usage";
     return httpGet(url, rec, out, err, timeoutMs);
 }
-
-bool usageTemplateGet(const EndpointRec &rec, const String &id, const String &localHash,
-                      String &out, String &err, uint32_t timeoutMs) {
-    String url = "http://" + rec.host + ":" + String(rec.port) +
-                 "/template?id=" + id + "&hash=" + localHash;
-    if (!httpGet(url, rec, out, err, timeoutMs)) return false;
-    if (out.length() > 32768) {
-        out = "";
-        err = "template too large";
-        return false;
-    }
-    return true;
-}

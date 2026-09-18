@@ -20,8 +20,10 @@ fn hashes_match_python_test_bridge() {
     assert_eq!(full.version, 3);
     assert_eq!(mini.version, 2);
     let quad = library.get("quad").expect("quad template");
-    assert_eq!(quad.version, 4);
-    assert_eq!(quad.min_fw.as_deref(), Some("0.10"));
+    assert_eq!(quad.version, 7);
+    assert_eq!(quad.min_fw.as_deref(), Some("0.12"));
+    // v0.12 single layout, canonical hash checked against the Python format.
+    assert_eq!(quad.hash, "c598adc0");
 }
 
 #[test]
@@ -52,7 +54,7 @@ fn parse_bind_grammar() {
             field: BindField::UsedPercent,
         })
     );
-    assert_eq!(parse_bind("buckets[codex].monthly.usedPercent"), None);
+    assert_eq!(parse_bind("buckets[codex].yearly.usedPercent"), None);
     assert_eq!(parse_bind("buckets[].weekly.usedPercent"), None);
     assert_eq!(parse_bind("account.email"), None);
     assert_eq!(parse_bind("device.state"), Some(BindSpec::DeviceState));
@@ -60,14 +62,19 @@ fn parse_bind_grammar() {
         parse_bind("device.offline_mins"),
         Some(BindSpec::DeviceOfflineMins)
     );
+    assert_eq!(parse_bind("device.idle_reason"), None);
     assert_eq!(
-        parse_bind("device.idle_reason"),
-        Some(BindSpec::DeviceIdleReason)
+        parse_bind("buckets[codex].monthly.remaining"),
+        Some(BindSpec::Bucket {
+            bucket: "codex".into(),
+            win: WinSel::Monthly,
+            field: BindField::Remaining,
+        })
     );
 }
 
 #[test]
-fn validates_element_mode_whitelist() {
+fn ignores_legacy_element_mode_key() {
     let template = |mode: Value| {
         json!({
             "schema": 1,
@@ -77,11 +84,13 @@ fn validates_element_mode_whitelist() {
             ]
         })
     };
+    // v0.12 removed the idle/live element split: the device engine ignores the
+    // unknown `mode` key, so the canonical validator must accept it too.
     assert!(validate_template(&template(json!("any"))).is_ok());
     assert!(validate_template(&template(json!("idle"))).is_ok());
     assert!(validate_template(&template(json!("live"))).is_ok());
-    assert!(validate_template(&template(json!("always"))).is_err());
-    assert!(validate_template(&template(json!(1))).is_err());
+    assert!(validate_template(&template(json!("always"))).is_ok());
+    assert!(validate_template(&template(json!(1))).is_ok());
 }
 
 #[test]
@@ -99,7 +108,7 @@ fn validates_templates_like_device() {
         json!({"schema": 1, "canvas": {"w": 200, "h": 200}, "elements": []}),
         json!({"schema": 1, "canvas": {"w": 200, "h": 200}, "elements": [{"type": "sparkline"}]}),
         json!({"schema": 1, "canvas": {"w": 200, "h": 200}, "elements": [{"type": "text", "text": "x", "font": "f99", "x": 0, "y": 0}]}),
-        json!({"schema": 1, "canvas": {"w": 200, "h": 200}, "elements": [{"type": "bar", "bind": "buckets[codex].monthly.usedPercent", "rect": [0,0,10,10]}]}),
+        json!({"schema": 1, "canvas": {"w": 200, "h": 200}, "elements": [{"type": "bar", "bind": "buckets[codex].yearly.usedPercent", "rect": [0,0,10,10]}]}),
         json!({"schema": 1, "canvas": {"w": 200, "h": 200}, "elements": [{"type": "rect", "rect": [0,0,-5,10]}]}),
     ] {
         assert!(validate_template(&bad).is_err(), "should reject: {bad}");
@@ -135,7 +144,7 @@ fn validates_quad_text_bounds_formats_and_conditions() {
         json!({"schema":1,"canvas":{"w":200,"h":200},"elements":[{"type":"text","bind":"server_time","font":"f8","time_format":null}]}),
         json!({"schema":1,"canvas":{"w":200,"h":200},"elements":[{"type":"text","text":"x","font":"f8","when":null}]}),
         json!({"schema":1,"canvas":{"w":200,"h":200},"elements":[{"type":"text","text":"x","font":"f8","when":{"bind":"buckets[codex].5h.remaining","exists":1}}]}),
-        json!({"schema":1,"canvas":{"w":200,"h":200},"elements":[{"type":"text","text":"x","font":"f8","when":{"bind":"buckets[codex].monthly.remaining","exists":true}}]}),
+        json!({"schema":1,"canvas":{"w":200,"h":200},"elements":[{"type":"text","text":"x","font":"f8","when":{"bind":"buckets[codex].yearly.remaining","exists":true}}]}),
         json!({"schema":1,"canvas":{"w":200,"h":200},"elements":[{"type":"text","text":"x","font":"f8","when":{"bind":"account.plan","exists":true,"extra":false}}]}),
     ] {
         assert!(validate_template(&bad).is_err(), "should reject: {bad}");

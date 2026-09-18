@@ -80,9 +80,10 @@ async fn main() -> Result<()> {
         let opts = EnvelopeOptions {
             bridge_label: label,
             bridge_host_id: host_id.clone(),
+            bridge_host: bridge_core::lan_ip(),
+            bridge_port: args.port,
             next_sync_seconds: args.interval,
             templates: library.read().await.template_refs(),
-            idle_template: Some("quad".to_string()),
             active_hold_seconds: 600,
         };
         println!("{}", serde_json::to_string_pretty(&build_envelope(&rate_limits, &opts))?);
@@ -103,11 +104,13 @@ async fn main() -> Result<()> {
     });
 
     let poller = PollerConfig {
-        exe,
+        exe: Some(exe),
+        codex_override: args.codex_path.clone(),
         host_id: host_id.clone(),
+        bridge_host: bridge_core::lan_ip(),
+        bridge_port: args.port,
         interval_secs: args.interval,
         templates: library.clone(),
-        idle_template: Arc::new(RwLock::new(Some("quad".to_string()))),
         active_hold_seconds: 600,
     };
     run_poller(poller, envelope).await

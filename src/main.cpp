@@ -1,10 +1,12 @@
 /*
- * Codex Status - 0.2.0 BLE
- * Wi-Fi 主通道（HTTP /usage）+ BLE 备选通道（GATT），BLE 配对时下发 endpoint+token
+ * Codex Status - 0.12.0 single-mode runtime
+ * Wi-Fi 主通道（HTTP 推送/轮询）+ 按需 BLE 会话；空闲 light sleep。
+ * 状态机权威文档：docs/power-state.md
  */
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include <WebServer.h>
 #include <Update.h>
 #include <ArduinoOTA.h>
@@ -14,6 +16,7 @@
 #include <time.h>
 #include <sys/time.h>
 #include <string.h>
+#include <stdio.h>
 #include <vector>
 #include <esp_sleep.h>
 #include <esp_ota_ops.h>
@@ -21,8 +24,10 @@
 #include <esp_pm.h>
 #include <esp_wifi.h>
 #include <esp_mac.h>
+#include <esp_private/pm_impl.h>
 #include <driver/rtc_io.h>
 #include <driver/gpio.h>
+#include <driver/usb_serial_jtag.h>
 
 #include "DEV_Config.h"
 #include "dev_log.h"
@@ -36,11 +41,7 @@
 #include "template_engine.h"
 #include "template_xfer.h"
 
-#ifdef CODEX_PM
-#define FW_VERSION    "0.11.9-bw"
-#else
-#define FW_VERSION    "0.10.3-bw"
-#endif
+#define FW_VERSION    "0.12.5-bw"
 #define AP_PASSWORD   "codex1234"
 #define MAX_SLOTS     3
 
@@ -48,8 +49,22 @@ static const int EPD_W = EPD_SSD1681_WIDTH;
 static const int EPD_H = EPD_SSD1681_HEIGHT;
 static const int EPD_FB_BYTES = (EPD_W / 8) * EPD_H;
 
+#define ACTIVE_HOLD_S    600
+#define CONFIG_IDLE_MS   (5UL * 60UL * 1000UL)   // AP idle sleep (battery)
+#define WIFI_CONNECT_MS  30000UL                 // boot connect attempt
+#define WIFI_LOST_MS     30000UL                 // link-loss declaration
+#define WIFI_RETRY_MS    60000UL                 // plugged retry cadence
+#define BLE_GRACE_MS     120000UL                // BLE keep-alive after last use
+#define BATT_CHECK_MS    (5UL * 60UL * 1000UL)
+#define ANNOUNCE_MS      (5UL * 60UL * 1000UL)   // UDP announce heartbeat
+#define BRIDGE_LOST_MIN  6                       // bridge heartbeat 5 min + margin
+#define LOW_BATT_PCT     5
+#define BLE_AUTO_PCT     20
+#define STORE_MAX_LOCAL  8
+
 static Preferences prefs;
 static WebServer   server(80);
+static WiFiUDP     announceUdp;
 static UBYTE      *frame = nullptr;
 static UBYTE      *lastDisplayedFrame = nullptr;
 static uint32_t    epdWriteCount = 0;
@@ -61,80 +76,49 @@ static bool        otaUploadDenied = false;
 static bool        configMode = false;
 static String      hostname;
 static String      apSsid;
-
-// Runtime power mode: 0 auto (DEEP windows, M2), 1 deep, 2 live.
-// Until M3 delivers the LIVE path (custom core + PM), `live` behaves as deep.
-static const char *MODE_NAMES[3] = {"auto", "deep", "live"};
-
-static uint8_t runtimeMode() {
-    Preferences p;
-    p.begin("cfg", true);
-    uint8_t m = p.getUChar("mode", 0);
-    p.end();
-    return m > 2 ? 0 : m;
-}
-
-static void setRuntimeMode(uint8_t m) {
-    Preferences p;
-    p.begin("cfg", false);
-    p.putUChar("mode", m > 2 ? 0 : m);
-    p.end();
-}
-
-// ---------------- M2 DEEP window state (sleep.md §4.1/§4.2) ----------------
-#define WINDOW_MS        15000UL
-#define WINDOW_HOLD_MS   30000UL
-#define WINDOW_MAX_MS    (10UL * 60UL * 1000UL)
-#define ACTIVE_HOLD_S    600
-#define CONFIG_IDLE_MS   (5UL * 60UL * 1000UL)
-#define STORE_MAX_LOCAL  8
-
-enum IdleReason { IDLE_BOOT = 0, IDLE_WIFI_LOST, IDLE_BRIDGE_LOST, IDLE_ENV_SWITCH };
-static const char *IDLE_REASON_NAMES[] = {"boot", "wifi_lost", "bridge_lost", "env_switch"};
+static esp_pm_lock_handle_t otaPmLock = nullptr;
+static bool        otaLockHeld = false;
 
 RTC_DATA_ATTR static uint32_t rtcMagic = 0;
 RTC_DATA_ATTR static uint32_t rtcActiveAt = 0;
 RTC_DATA_ATTR static char     rtcActiveMac[20] = {0};
-RTC_DATA_ATTR static uint8_t  rtcFailCount = 0;
-RTC_DATA_ATTR static uint8_t  rtcFastLeft = 3;
-RTC_DATA_ATTR static uint8_t  rtcIdleReason = IDLE_BOOT;
-RTC_DATA_ATTR static bool     rtcNeverSynced = true;
-RTC_DATA_ATTR static uint32_t rtcBssidHash = 0;
+RTC_DATA_ATTR static uint32_t rtcLastSyncEpoch = 0;
+RTC_DATA_ATTR static uint8_t  rtcRetryStage = 0;
 RTC_DATA_ATTR static uint32_t rtcUsageHash = 0;
 // Why AP config mode was entered last (0 none, 1 no saved slots, 2 BOOT held
-// 5-10 s). Kept in RTC memory so a post-mortem /status.json read after the AP
-// idle sleep can tell a provisioning bug from a stuck/glitching BOOT pin.
+// 15 s). Kept in RTC memory for post-mortem /status.json reads.
 RTC_DATA_ATTR static uint8_t  rtcApReason = 0;
 static const char *AP_REASON_NAMES[] = {"none", "no_slots", "boot_hold"};
 
-static bool     windowMode = false;      // DEEP window flow (M2 default)
-static uint32_t windowDeadline = 0;
-static uint32_t windowHardStop = 0;
-static bool     windowSynced = false;
-static bool     windowHadWifi = false;
-static bool     windowEnvSwitch = false;
-static uint32_t activeHoldSec = ACTIVE_HOLD_S;
 static bool     otaInProgress = false;
 static uint32_t configStartedAt = 0;
-// `stay` CLI: keep the device awake (no deep sleep) until reset. Used while
-// USB-debugging provisioning/pairing, where the normal window cycling makes
-// interactive work impossible.
-static bool debugStayAwake = false;
-
-
-// LIVE (M3 Plan B: modem sleep on the stock core; PM auto-light-sleep later).
-static bool     liveMode = false;
-static uint32_t liveEnteredAtMs = 0;
-static uint32_t liveLastSyncMs = 0;
-static uint32_t liveLastPollMs = 0;
-static uint32_t wifiLostSinceMs = 0;
+static uint32_t activeHoldSec = ACTIVE_HOLD_S;
 static bool     pmLightSleep = false;
+
+// v0.12 runtime state (docs/power-state.md §3-§6)
+static bool     plugged = false;          // PC USB host present (SOF)
+static bool     wifiUp = false;           // STA associated
+static bool     wifiLostHandled = false;  // WIFI OFF policy already applied
+static bool     wifiReconfiguring = false; // deliberate power-save reassociation
+static uint32_t wifiReconfigDeadline = 0;
+static uint32_t wifiLostSince = 0;
+static uint32_t nextWifiRetry = 0;
+static String   wifiSsid, wifiPass;
+static bool     bleOn = false;
+static bool     bleUserOff = false;       // user switched BLE off while docked
+static bool     lastBleAuto = false;      // keep-alive came from plug+charge
+static uint32_t bleOffDeadline = 0;
+static int      batteryPct = -1;
+static uint32_t lastBattCheck = 0;
+static uint32_t announcedIp = 0;
+static uint32_t lastAnnounce = 0;
+static uint32_t lastBootAction = 0;
+static uint32_t ledPulseUntil = 0;
+static bool     ledState = false;         // logical LED: BLE ON
 
 // LIVE power management: PM dynamic frequency scaling (240/40 MHz) plus
 // automatic light sleep. Requires CONFIG_PM_ENABLE and
-// CONFIG_FREERTOS_USE_TICKLESS_IDLE from the custom sdkconfig (pm env); on the
-// stock core esp_pm_configure returns ESP_ERR_NOT_SUPPORTED, which is logged
-// because it means tickless idle never made it into the core.
+// CONFIG_FREERTOS_USE_TICKLESS_IDLE from the custom sdkconfig.
 static void configurePowerManagement() {
 #ifdef CODEX_PM
     esp_pm_config_t cfg = {};
@@ -149,10 +133,26 @@ static void configurePowerManagement() {
 #endif
 }
 
-// CONFIG_PM_SLP_DISABLE_GPIO floats every pad during automatic light sleep
-// (~200-300 uA saved). The VBAT latch (GPIO17 high), the panel power enable
-// (GPIO6 low = panel powered) and the audio amp power (GPIO42 low = off) must
-// keep their levels, so they opt out of the sleep switch.
+static void setupOtaPmLock() {
+#ifdef CODEX_PM
+    if (!otaPmLock) {
+        esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "ota", &otaPmLock);
+    }
+#endif
+}
+
+static void setOtaLock(bool held) {
+    if (!otaPmLock || held == otaLockHeld) return;
+    otaLockHeld = held;
+    if (held) esp_pm_lock_acquire(otaPmLock);
+    else      esp_pm_lock_release(otaPmLock);
+    DevLog.printf("[pm] OTA NO_LIGHT_SLEEP %s\n", held ? "acquired" : "released");
+}
+
+// CONFIG_PM_SLP_DISABLE_GPIO floats every pad during automatic light sleep.
+// The VBAT latch (GPIO17 high), the panel power enable (GPIO6 low = panel
+// powered) and the audio amp power (GPIO42 low = off) must keep their levels,
+// so they opt out of the sleep switch.
 static void retainSleepCriticalGpio() {
     gpio_sleep_sel_dis(GPIO_NUM_17);
     gpio_sleep_sel_dis(GPIO_NUM_6);
@@ -171,13 +171,58 @@ static uint32_t fnv1a(const String &s) {
 
 static bool timeKnown() { return time(nullptr) > 1600000000; }
 
-static const char *idleReasonText() {
-    return IDLE_REASON_NAMES[rtcIdleReason <= IDLE_ENV_SWITCH ? rtcIdleReason : 0];
+static byte hostMac[6] = {0};
+static void loadHostMac() {
+    esp_read_mac(hostMac, ESP_MAC_WIFI_STA);
+}
+
+static String macSuffix() {
+    // Read the base MAC straight from eFuse: WiFi.macAddress() needs the Wi-Fi
+    // driver (and NVS) up, which is not true yet at BLE init / AP startup.
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%02X%02X%02X", hostMac[3], hostMac[4], hostMac[5]);
+    return String(buf);
+}
+
+static String macText() {
+    char buf[18];
+    snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X",
+             hostMac[0], hostMac[1], hostMac[2], hostMac[3], hostMac[4], hostMac[5]);
+    return String(buf);
+}
+
+static const char *deviceStateText() {
+    if (configMode) return "AP";
+    if (!wifiUp)    return "WIFI OFF";
+    if (bleOn)      return "BLE ON";
+    return "BLE OFF";
+}
+
+static const char *wifiStateText() {
+    if (configMode) return "ap";
+    if (wifiUp)     return "connected";
+    return wifiLostHandled ? "lost" : "connecting";
 }
 
 static void setActiveMac(const String &mac) {
     strncpy(rtcActiveMac, mac.c_str(), sizeof(rtcActiveMac) - 1);
     rtcActiveMac[sizeof(rtcActiveMac) - 1] = '\0';
+}
+
+static uint32_t lastPersistedSync = 0;
+
+static void markSynced() {
+    rtcLastSyncEpoch = timeKnown() ? (uint32_t)time(nullptr) : 0;
+    rtcRetryStage = 0;
+    if (rtcLastSyncEpoch == 0) return;
+    // RTC data does not survive the OTA software reset on this board, so keep
+    // the last-sync epoch in NVS too (throttled: at most one write per minute).
+    if (lastPersistedSync && rtcLastSyncEpoch - lastPersistedSync < 60) return;
+    Preferences p;
+    p.begin("sync", false);
+    p.putUInt("last", rtcLastSyncEpoch);
+    p.end();
+    lastPersistedSync = rtcLastSyncEpoch;
 }
 
 static void adoptServerTime(JsonDocument &doc) {
@@ -212,18 +257,9 @@ static void usageCacheSave(const String &json) {
     rtcUsageHash = h;
 }
 
-// Keep the current window open for an explicit user action (BLE pairing/token
-// issuance, OTA upload), up to a bounded hard stop.
-static void holdWindow(uint32_t ms) {
-    if (!windowMode) return;
-    windowHardStop = millis() + ms;
-    if ((int32_t)(windowHardStop - windowDeadline) > 0) windowDeadline = windowHardStop;
-}
-
 // A sync is accepted from any bridge while there is no active bridge, from the
-// active bridge itself, after the active hold window, when the active
-// endpoint's BSSID no longer matches the current one, or on an explicit
-// activate flag (sleep.md §2).
+// active bridge itself, after the active hold window, or when the active
+// endpoint's BSSID no longer matches the current one.
 static bool usageAccepted(const String &mac, bool explicitActivate) {
     if (explicitActivate) return true;
     if (!rtcActiveMac[0] || rtcActiveAt == 0) return true;
@@ -249,22 +285,12 @@ static String        pendingUsage;
 static String        pendingChannel;
 static volatile bool pendingEndpoint = false;
 static volatile bool pendingTplChanged = false;
-static bool pairingOverlay = false;
-static bool drawingPairingOverlay = false;
 
 static String activeTplJson;
 static String activeTplId;
 
 static String lastUsage;
 static String lastChannel = "-";
-static String renderedIp;
-static uint32_t lastSyncMs = 0;
-static time_t   lastSyncEpoch = 0;
-static uint32_t lastOkMs = 0;
-static bool     usageOnScreen = false;
-static String   screenSig;
-static String   renderedMinute;
-static int      renderedBattery = -1;
 static int      epdPartialCount = 0;
 static bool     epdPartialReady = false;
 static bool     epdAsleep = false;
@@ -273,34 +299,24 @@ static void screen(const std::vector<String> &lines, UBYTE color = BLACK);
 static void epdFlush(bool forceFull = false);
 static int  batteryPercent();
 static bool requestAuthorized();
-static void deepSleepFor(uint32_t sec, bool renderIdle);
+static void deepSleepFor(uint32_t sec);
+static void renderCurrent();
+static void enterBleOn(bool userInitiated);
+static void bleOff(const char *reason);
+static void requestAnnounce(bool bleFlag);
+static void handleBleUsage(const String &json);
+static void handleBleEndpoint(const String &json);
+static void handleBleAuth(const String &json);
+static String fmtEpoch(long long ts, const char *fmt);
+static void powerOff();
+static bool configureWifiPowerSave();
 
 static esp_sleep_wakeup_cause_t bootWakeCause = ESP_SLEEP_WAKEUP_UNDEFINED;
-
-static bool pairingOverlayActive() {
-    bool paired = bleIsConnected() && blePeerIsBonded() && blePeerIsEncrypted();
-    return pairingOverlay && blePairingWindowOpen() && !paired;
-}
-
-static String macSuffix() {
-    // Read the base MAC straight from eFuse: WiFi.macAddress() needs the Wi-Fi
-    // driver (and NVS) up, which is not true yet at BLE init / AP startup and
-    // returns 00:00:00:00:00:00 on the Arduino 3.x core.
-    uint8_t mac[6] = {0};
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    char buf[8];
-    snprintf(buf, sizeof(buf), "%02X%02X%02X", mac[3], mac[4], mac[5]);
-    return String(buf);
-}
 
 static String ipText() {
     if (configMode) return "192.168.4.1";
     if (WiFi.status() == WL_CONNECTED) return WiFi.localIP().toString();
     return "-";
-}
-
-static bool bridgeOk() {
-    return lastOkMs > 0 && (millis() - lastOkMs) < 120000;
 }
 
 static String nowHHMM() {
@@ -320,6 +336,26 @@ static String fitText(const String &s, size_t maxChars = 17) {
     }
     if (t.length() <= maxChars) return t;
     return t.substring(0, maxChars - 1) + "~";
+}
+
+// Status screens wrap long text (OTA file names) instead of truncating it;
+// glyph tables are ASCII-only, so non-printable bytes become '?'.
+static std::vector<String> wrapText(const String &s, size_t maxChars = 17) {
+    String t;
+    t.reserve(s.length());
+    for (size_t i = 0; i < s.length(); i++) {
+        char c = s[i];
+        t += (c >= 32 && c <= 126) ? c : '?';
+    }
+    std::vector<String> out;
+    if (t.length() == 0) {
+        out.push_back(String(""));
+        return out;
+    }
+    for (size_t i = 0; i < t.length(); i += maxChars) {
+        out.push_back(t.substring(i, i + maxChars));
+    }
+    return out;
 }
 
 struct WinInfo {
@@ -352,39 +388,33 @@ static WinInfo findWindow(JsonDocument &doc, bool fiveHour) {
     return r;
 }
 
-static void screenIdle() {
+static void screenStatus() {
     std::vector<String> lines;
     lines.push_back("CODEX STATUS");
-    lines.push_back("IDLE - NO LINK");
+    lines.push_back(deviceStateText());
     lines.push_back(String("BATT ") + batteryPercent() + "%");
     lines.push_back(String("IP ") + ipText());
-    lines.push_back("SYNC --:--");
+    lines.push_back(String("SYNC ") + fmtEpoch((long long)rtcLastSyncEpoch, "%H:%M"));
     lines.push_back(String("FW ") + FW_VERSION);
     screen(lines);
-    usageOnScreen = false;
-    renderedIp = ipText();
-    screenSig = String("idle|") + ipText() + "|" + String(bridgeOk()) + "|" + String(bleIsConnected());
 }
 
 static void screen(const std::vector<String> &lines, UBYTE color) {
-    if (pairingOverlayActive() && !drawingPairingOverlay) return;
     if (!frame) return;
     Paint_SelectImage(frame);
     Paint_Clear(WHITE);
     Paint_DrawRectangle(0, 0, EPD_W - 1, EPD_H - 1, BLACK, DOT_PIXEL_1X1, DRAW_FILL_EMPTY);
     int y = 10;
+    bool full = false;
     for (const auto &line : lines) {
-        Paint_DrawString_EN(8, y, fitText(line).c_str(), &Font16, WHITE, color);
-        y += 20;
-        if (y > EPD_H - 24) break;
+        for (const auto &part : wrapText(line)) {
+            if (y > EPD_H - 24) { full = true; break; }
+            Paint_DrawString_EN(8, y, part.c_str(), &Font16, WHITE, color);
+            y += 20;
+        }
+        if (full) break;
     }
     epdFlush();
-}
-
-static void screenPairingOverlay() {
-    drawingPairingOverlay = true;
-    screen({"RELEASE BOOT", "BLE PAIRING", "WINDOWS ADD DEVICE"});
-    drawingPairingOverlay = false;
 }
 
 static void epdBegin(bool clearPanel = true) {
@@ -552,7 +582,6 @@ static void drawSmallLeft(const String &s, int x, int y) {
 }
 
 static void renderUsage(const String &json, const char *channel) {
-    if (pairingOverlayActive()) return;
     if (!frame) return;
     JsonDocument doc;
     if (deserializeJson(doc, json)) {
@@ -576,11 +605,6 @@ static void renderUsage(const String &json, const char *channel) {
     std::vector<String> tr, bl;
     int battery = batteryPercent();
 
-    // Pre-confirmed fixed layout: "MM-DD HH:MM" is 11 chars x Font12.Width(7)
-    // = 77px, which fits the 98px available right of the week block, so the
-    // date+time stays on one line and the plan name stays top-right. (The
-    // two-line date/time + plan-to-bottom-left variant was rejected at
-    // design time; do not switch dynamically.)
     tr.push_back(fitText(String(plan), 12));
     tr.push_back(fitText(String(label), 12));
     tr.push_back(fmtEpoch(wk.resets, "%m-%d %H:%M"));
@@ -596,11 +620,6 @@ static void renderUsage(const String &json, const char *channel) {
         drawSmallLeft(bl[i], Q_BL_X, Q_BL_SLOTS[first + i]);
 
     epdFlush(false);
-    usageOnScreen = true;
-    renderedIp = ipText();
-    renderedMinute = nowHHMM();
-    renderedBattery = battery;
-    screenSig = String("usage");
     DevLog.printf("[ui] quad rendered (wk=%d fh=%d ch=%s)\n",
                   wk.used, fh.used, channel ? channel : "");
 }
@@ -630,97 +649,37 @@ static bool tplCacheLoad() {
     return true;
 }
 
-static void renderActiveUsage(const String &json, const char *channel, bool idle = false) {
-    if (pairingOverlayActive()) return;
+static void renderActiveUsage(const String &json, const char *channel) {
     if (!frame) return;
-    String tplJson, tplId;
-    if (idle) {
-        String iid = tplStoreIdle();
-        if (iid.length() && tplStoreLoad(iid, tplJson)) tplId = iid;
-    }
-    if (!tplJson.length()) {
-        if (!tplCacheLoad()) {
-            if (idle) screenIdle();
-            return;
-        }
-        tplJson = activeTplJson;
-        tplId = activeTplId;
-    }
+    if (!tplCacheLoad()) { screenStatus(); return; }
     TplEnv env;
-    env.channel   = channel ? channel : "";
-    env.ip        = ipText();
-    env.syncHHMM  = nowHHMM();
-    env.battery   = batteryPercent();
-    env.idle      = idle;
-    if (idle) {
-        env.idleReason = idleReasonText();
-        if (timeKnown() && rtcActiveAt > 1600000000) {
-            env.offlineMins = (int)(((time_t)time(nullptr) - (time_t)rtcActiveAt) / 60);
-        }
+    env.channel  = channel ? channel : "";
+    env.ip       = ipText();
+    env.syncHHMM = nowHHMM();
+    env.battery  = batteryPercent();
+    env.state    = deviceStateText();
+    env.offlineMins = -1;
+    if (rtcLastSyncEpoch > 1600000000 && timeKnown()) {
+        long mins = ((long)time(nullptr) - (long)rtcLastSyncEpoch) / 60;
+        // The row means "bridge unreachable": the bridge pushes at least every
+        // 5 minutes, so only expose the value once contact is clearly lost.
+        if (mins > BRIDGE_LOST_MIN) env.offlineMins = (int)mins;
     }
     Paint_SelectImage(frame);
     Paint_Clear(WHITE);
-    if (tplDraw(tplJson, json, env)) {
+    if (tplDraw(activeTplJson, json, env)) {
         epdFlush(false);
-        usageOnScreen = true;
-        renderedIp = ipText();
-        renderedMinute = env.syncHHMM;
-        renderedBattery = env.battery;
-        screenSig = String("usage");
-        DevLog.printf("[tpl] rendered %s %s (%s)\n", tplId.c_str(),
-                      idle ? "idle" : "live", channel ? channel : "");
+        DevLog.printf("[tpl] rendered %s (%s)\n", activeTplId.c_str(), channel ? channel : "");
         return;
     }
-    DevLog.printf("[tpl] %s invalid, fallback built-in\n", tplId.c_str());
-    if (!idle) renderUsage(json, channel);
-    else screenIdle();
+    DevLog.printf("[tpl] %s invalid/incomplete, built-in fallback\n", activeTplId.c_str());
+    if (json.length()) renderUsage(json, channel);
+    else screenStatus();
 }
 
-static void maybeFetchTemplate(const EndpointRec &rec, const String &usageJson) {
-    JsonDocument doc;
-    if (deserializeJson(doc, usageJson)) return;
-    JsonObject tpls = doc["templates"].as<JsonObject>();
-    if (tpls.isNull()) return;
-    for (JsonPair kv : tpls) {
-        String id = String(kv.key().c_str());
-        JsonObject meta = kv.value().as<JsonObject>();
-        String hash = String((const char *)(meta["hash"] | ""));
-        uint32_t ver = meta["version"] | 0;
-        if (!hash.length()) continue;
-        TplMeta local;
-        String localHash;
-        bool localValid = false;
-        if (tplStoreFind(id, local) && local.hash == hash) {
-            String localJson, localErr;
-            localValid = tplStoreLoad(id, localJson) &&
-                         tplValidateForStorage(localJson, hash, FW_VERSION, localErr);
-            if (localValid) localHash = local.hash;
-            if (!localValid) {
-                DevLog.printf("[tpl] local %s rejected: %s\n", id.c_str(), localErr.c_str());
-            }
-        } else if (tplStoreFind(id, local)) {
-            localHash = local.hash;
-        }
-        if (localValid) continue;
-        String out, err;
-        if (usageTemplateGet(rec, id, localHash, out, err)) {
-            String acceptErr;
-            if (!tplValidateForStorage(out, hash, FW_VERSION, acceptErr)) {
-                DevLog.printf("[tpl] HTTP %s rejected: %s\n", id.c_str(), acceptErr.c_str());
-                continue;
-            }
-            if (tplStoreSave(id, ver, hash, (const uint8_t *)out.c_str(), out.length())) {
-                if (tplStoreActive().length() == 0 || tplStoreActive() == id) {
-                    tplStoreSetActive(id);
-                    activeTplId = "";
-                }
-                updateInfoExtra();
-                DevLog.printf("[tpl] fetched %s hash=%s\n", id.c_str(), hash.c_str());
-            }
-        } else if (err != "http 304") {
-            DevLog.printf("[tpl] fetch %s failed: %s\n", id.c_str(), err.c_str());
-        }
-    }
+static void renderCurrent() {
+    if (lastUsage.length()) renderActiveUsage(lastUsage, lastChannel.c_str());
+    else screenStatus();
 }
 
 static void nextTemplate() {
@@ -756,16 +715,31 @@ static void factoryReset() {
     ESP.restart();
 }
 
-static void applyEnvelopeMeta(JsonDocument &doc) {
+// Envelope metadata (docs/power-state.md §9): active-hold tuning plus endpoint
+// self-heal. The bridge advertises its own host/port; the endpoint MAC comes
+// from the authenticated sender, so only a known bridge can update its record.
+static void applyEnvelopeMeta(JsonDocument &doc, const String &mac) {
     long long hold = doc["active_hold_seconds"] | 0LL;
     if (hold >= 60 && hold <= 86400) activeHoldSec = (uint32_t)hold;
-    const char *idle = doc["idle_template"] | "";
-    if (strlen(idle)) tplStoreSetIdle(String(idle));
+    JsonObject bridge = doc["bridge"].as<JsonObject>();
+    const char *host = bridge["host"] | "";
+    int port = bridge["port"] | 0;
+    if (!mac.length() || !strlen(host) || port <= 0 || port > 65535) return;
+    for (int i = 0; i < storeCount(); i++) {
+        EndpointRec rec;
+        if (!storeGet(i, rec)) continue;
+        if (rec.mac != mac) continue;
+        if (rec.host != host || rec.port != (uint16_t)port) {
+            storeUpsert(rec.mac, host, (uint16_t)port, rec.token);
+            DevLog.printf("[brg] endpoint self-heal %s:%d\n", host, port);
+        }
+        return;
+    }
 }
 
-// Endpoint selection (sleep.md §4.2): when the active bridge synced recently,
-// only try its endpoint; otherwise try same-BSSID endpoints first (MRU), then
-// the rest. Per-endpoint timeout is 2 s.
+// Endpoint selection: when the active bridge synced recently, only try its
+// endpoint; otherwise try same-BSSID endpoints first (MRU), then the rest.
+// Per-endpoint timeout is 2 s.
 static bool tryWifiUsage() {
     if (WiFi.status() != WL_CONNECTED) return false;
     int n = storeCount();
@@ -817,35 +791,30 @@ static bool tryWifiUsage() {
             continue;
         }
         adoptServerTime(parsed);
-        applyEnvelopeMeta(parsed);
+        applyEnvelopeMeta(parsed, rec.mac);
         bool explicitActivate = parsed["activate"] | false;
         bool accepted = usageAccepted(rec.mac, explicitActivate);
         storeTouch(rec.mac);
         if (bssid.length()) storeSetBssid(rec.mac, bssid);
-        lastSyncMs = millis();
-        lastOkMs = millis();
-        lastSyncEpoch = time(nullptr);
-        windowSynced = true;
+        markSynced();
         DevLog.printf("[wifi] usage from %s:%u accepted=%d\n",
                       rec.host.c_str(), rec.port, accepted ? 1 : 0);
         bleNotifyStatus("{\"ack\":\"wifi-usage\",\"ok\":true}");
-        maybeFetchTemplate(rec, out);
         lastUsage = out;
         lastChannel = "WIFI";
         usageCacheSave(out);
         if (accepted) {
             setActiveMac(rec.mac);
             rtcActiveAt = timeKnown() ? (uint32_t)time(nullptr) : 0;
-            renderActiveUsage(lastUsage, "WIFI", false);
+            renderActiveUsage(lastUsage, "WIFI");
         }
         return true;
     }
     return false;
 }
 
-// POST /usage from the bridge (sleep.md §4.3). Auth uses the endpoint token
-// that the bridge itself wrote over BLE; the matching record identifies the
-// bridge MAC for the §2 active rules.
+// POST /usage from the bridge. Auth uses the endpoint token that the bridge
+// itself wrote over BLE; the matching record identifies the bridge MAC.
 static bool endpointTokenAuthorized(String &mac) {
     String header = server.header("Authorization");
     if (!header.startsWith("Bearer ")) return false;
@@ -876,14 +845,10 @@ static void handleUsagePost() {
         return;
     }
     adoptServerTime(parsed);
-    applyEnvelopeMeta(parsed);
+    applyEnvelopeMeta(parsed, mac);
     bool explicitActivate = parsed["activate"] | false;
     bool accepted = usageAccepted(mac, explicitActivate);
-    lastSyncMs = millis();
-    lastOkMs = millis();
-    lastSyncEpoch = time(nullptr);
-    liveLastSyncMs = millis();
-    windowSynced = true;
+    markSynced();
     usageCacheSave(body);
     if (accepted) {
         setActiveMac(mac);
@@ -892,15 +857,15 @@ static void handleUsagePost() {
         lastChannel = "PUSH";
         renderActiveUsage(lastUsage, "PUSH");
     } else {
-        DevLog.printf("[live] push ignored (active=%s)\n", rtcActiveMac);
+        DevLog.printf("[wifi] push ignored (active=%s)\n", rtcActiveMac);
     }
     server.send(200, "application/json",
                 accepted ? "{\"accepted\":true}" : "{\"accepted\":false}");
 }
 
 // Deep-sleep wake sources: RTC timer plus BOOT (GPIO0) and PWR (GPIO18),
-// active-low (sleep.md §4.2). The RTC pull-ups are armed explicitly so the
-// buttons stay readable once the RTC domain is the only powered island.
+// active-low. The RTC pull-ups are armed explicitly so the buttons stay
+// readable once the RTC domain is the only powered island.
 static void armWakeSources(uint64_t timerUs) {
     rtc_gpio_pullup_en(GPIO_NUM_0);
     rtc_gpio_pulldown_dis(GPIO_NUM_0);
@@ -910,40 +875,19 @@ static void armWakeSources(uint64_t timerUs) {
     if (timerUs) esp_sleep_enable_timer_wakeup(timerUs);
 }
 
-// Common DEEP entry: optional IDLE render, panel/BLE/Wi-Fi teardown, wake
-// sources armed, then deep sleep.
-static void deepSleepFor(uint32_t sec, bool renderIdle) {
-    if (debugStayAwake) {
-        DevLog.println("[pm] stay awake: deep sleep skipped");
-        return;
-    }
-    if (renderIdle) {
-        String cached;
-        if (usageCacheLoad(cached)) renderActiveUsage(cached, "DEEP", true);
-        else screenIdle();
-    }
+// The only deep-sleep paths in v0.12: WIFI OFF on battery (timed retry) and AP
+// without credentials on battery (timerUs=0: buttons only). Low battery calls
+// powerOff() instead.
+static void deepSleepFor(uint32_t sec) {
     epdPanelSleep();
-    bleAdvertiseStop();
-    WiFi.disconnect(true);
-    armWakeSources((uint64_t)sec * 1000000ULL);
-    esp_deep_sleep_start();
-}
-
-// Token-gated debug route: put the device straight into DEEP with a short
-// timer so hardware tests (ext1 wake, current) can run without waiting for the
-// LIVE exit watchdog. POST /sleep?sec=60
-static void handleSleepPost() {
-    if (!requestAuthorized()) {
-        server.send(401, "text/plain", "unauthorized");
-        return;
+    if (bleInitialized()) {
+        bleAdvertiseStop();
+        bleDeinit();
     }
-    uint32_t sec = server.hasArg("sec") ? (uint32_t)server.arg("sec").toInt() : 60;
-    if (sec < 30) sec = 30;
-    if (sec > 900) sec = 900;
-    DevLog.printf("[pm] test sleep %us\n", (unsigned)sec);
-    server.send(200, "application/json", String("{\"sleeping\":") + String(sec) + "}");
-    delay(200);
-    deepSleepFor(sec, true);
+    WiFi.disconnect(true);
+    armWakeSources(sec ? (uint64_t)sec * 1000000ULL : 0);
+    DevLog.printf("[pm] deep sleep %us\n", (unsigned)sec);
+    esp_deep_sleep_start();
 }
 
 static void handleBleUsage(const String &json) {
@@ -991,15 +935,12 @@ static int countWifiSlots() {
 static bool hasWifiSlots() { return countWifiSlots() > 0; }
 
 // Scan once and connect to the saved slot with the best signal; the last-used
-// slot wins near-ties. Single 9 s connect attempt (sleep.md §4.2/§4.9).
+// slot wins near-ties. When no saved network is visible, fall back to the
+// last-used slot so the 60 s retry cadence has credentials to retry with.
 static bool connectBest() {
     WiFi.mode(WIFI_STA);
     WiFi.setHostname(hostname.c_str());
     int n = WiFi.scanNetworks();
-    if (n <= 0) {
-        DevLog.println("[wifi] scan: no networks");
-        return false;
-    }
     prefs.begin("wifi", true);
     uint8_t last = prefs.getUChar("last", 0xFF);
     prefs.end();
@@ -1020,32 +961,57 @@ static bool connectBest() {
     }
     WiFi.scanDelete();
     if (bestSlot < 0) {
-        DevLog.println("[wifi] scan: no saved network visible");
-        return false;
+        if (last < MAX_SLOTS) {
+            prefs.begin("wifi", true);
+            String s = prefs.getString(("s" + String(last)).c_str(), "");
+            prefs.end();
+            if (s.length()) bestSlot = last;
+        }
+        if (bestSlot < 0) {
+            for (int i = 0; i < MAX_SLOTS; i++) {
+                prefs.begin("wifi", true);
+                String s = prefs.getString(("s" + String(i)).c_str(), "");
+                prefs.end();
+                if (s.length()) { bestSlot = i; break; }
+            }
+        }
+        if (bestSlot < 0) {
+            DevLog.println("[wifi] no saved network");
+            return false;
+        }
+        DevLog.printf("[wifi] scan: no saved network visible; trying slot %d\n", bestSlot);
     }
     prefs.begin("wifi", true);
-    String ssid = prefs.getString(("s" + String(bestSlot)).c_str(), "");
-    String pass = prefs.getString(("p" + String(bestSlot)).c_str(), "");
+    wifiSsid = prefs.getString(("s" + String(bestSlot)).c_str(), "");
+    wifiPass = prefs.getString(("p" + String(bestSlot)).c_str(), "");
     prefs.end();
-    screen({"CODEX STATUS", FW_VERSION, "", "Connecting:", ssid});
-    DevLog.printf("[wifi] slot %d (%s) rssi=%d\n", bestSlot, ssid.c_str(), bestRssi);
-    WiFi.begin(ssid.c_str(), pass.c_str());
+    if (!wifiSsid.length()) return false;
+    screen({"CODEX STATUS", FW_VERSION, "", "Connecting:", wifiSsid});
+    DevLog.printf("[wifi] slot %d (%s) rssi=%d\n", bestSlot, wifiSsid.c_str(), bestRssi);
+    WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
     uint32_t t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 9000) {
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_CONNECT_MS) {
         delay(200);
         DevLog.print(".");
     }
     DevLog.println();
     if (WiFi.status() != WL_CONNECTED) {
         DevLog.println("[wifi] connect timeout");
-        WiFi.disconnect(true);
+        WiFi.disconnect(false);   // keep the radio up for the retry paths
         return false;
     }
     prefs.begin("wifi", false);
     prefs.putUChar("last", (uint8_t)bestSlot);
     prefs.end();
-    DevLog.printf("[wifi] connected: %s ip=%s bssid=%s\n", ssid.c_str(),
+    DevLog.printf("[wifi] connected: %s ip=%s bssid=%s\n", wifiSsid.c_str(),
                   WiFi.localIP().toString().c_str(), WiFi.BSSIDstr().c_str());
+    return true;
+}
+
+static bool retryWifi() {
+    if (!wifiSsid.length()) return false;
+    DevLog.printf("[wifi] retry %s\n", wifiSsid.c_str());
+    WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
     return true;
 }
 
@@ -1116,8 +1082,6 @@ static void startConfigMode() {
 }
 
 // ---------------- 正常模式 ----------------
-static bool requestAuthorized();
-
 static const char *resetReasonName() {
     switch (esp_reset_reason()) {
     case ESP_RST_POWERON:   return "power-on";
@@ -1154,6 +1118,8 @@ static void handleStatus() {
             " (next OTA slot: " + String(next ? next->label : "?") + ")</li>";
     html += "<li>Reset reason: " + String(resetReasonName()) +
             " (uptime " + String(millis() / 1000) + "s)</li>";
+    html += "<li>State: " + String(deviceStateText()) + " (BLE " + String(bleOn ? "session" : "off") +
+            ", USB " + String(plugged ? "plugged" : "battery") + ")</li>";
     html += "<li>SSID: " + WiFi.SSID() + "</li>";
     html += "<li>IP: " + WiFi.localIP().toString() + "</li>";
     html += "<li>RSSI: " + String(WiFi.RSSI()) + " dBm</li>";
@@ -1162,6 +1128,7 @@ static void handleStatus() {
     html += "<li>BLE connected: " + String(bleIsConnected() ? "yes" : "no") + "</li>";
     html += "<li>Endpoints stored: " + String(storeCount()) + "</li>";
     html += "<li>Last channel: " + lastChannel + "</li>";
+    html += "<li>Last sync: " + fmtEpoch((long long)rtcLastSyncEpoch, "%m-%d %H:%M") + "</li>";
     String activeId = tplStoreActive();
     TplMeta activeMeta;
     String activeHash = tplStoreFind(activeId, activeMeta) ? activeMeta.hash : "";
@@ -1183,6 +1150,7 @@ static void handleStatus() {
 static void handleStatusJson() {
     JsonDocument doc;
     doc["fw"] = FW_VERSION;
+    doc["mac"] = macText();
     const esp_partition_t *running = esp_ota_get_running_partition();
     const esp_partition_t *next = esp_ota_get_next_update_partition(nullptr);
     doc["slot"] = running ? running->label : "?";
@@ -1191,20 +1159,20 @@ static void handleStatusJson() {
     doc["wake"] = wakeCauseName(bootWakeCause);
     doc["pwr"] = digitalRead(18);
     doc["uptime_s"] = millis() / 1000;
-    doc["ssid"] = WiFi.SSID();
-    doc["ip"] = WiFi.localIP().toString();
+    doc["ssid"] = configMode ? apSsid : WiFi.SSID();
+    doc["ip"] = ipText();
     doc["rssi"] = WiFi.RSSI();
+    doc["state"] = deviceStateText();
+    doc["ble_on"] = bleOn;
     doc["ble"] = bleIsConnected();
+    doc["plugged"] = plugged;
+    doc["wifi_state"] = wifiStateText();
+    doc["retry_stage"] = rtcRetryStage;
+    doc["last_push"] = rtcLastSyncEpoch;
     doc["endpoints"] = storeCount();
     doc["channel"] = lastChannel;
-    doc["mode"] = MODE_NAMES[runtimeMode()];
-    doc["idle_reason"] = idleReasonText();
-    doc["active_mac"] = rtcActiveMac;
-    doc["active_at"] = rtcActiveAt;
-    doc["fail_count"] = rtcFailCount;
-    doc["window_synced"] = windowSynced;
-    doc["live"] = liveMode;
     doc["pm_light_sleep"] = pmLightSleep;
+    doc["ota"] = otaInProgress;
     doc["battery"] = batteryPercent();
     doc["battery_mv"] = batteryMilliVolts();
     doc["heap"] = ESP.getFreeHeap();
@@ -1249,7 +1217,7 @@ static void setOtaPassword(const char *value) {
 }
 
 // OTA/Wi-Fi operation token. Issued once on the device and persisted in NVS so
-// reboots and DEEP sleep no longer invalidate it; it is disclosed only over the
+// reboots and deep sleep no longer invalidate it; it is disclosed only over the
 // bonded BLE link (never over HTTP or serial).
 static void persistAuthToken() {
     Preferences p;
@@ -1308,7 +1276,6 @@ static void handleBleAuth(const String &json) {
     }
     if (doc["rotate"] | false) rotateAuthToken();
     else if (!authValid()) loadOrIssueAuthToken();
-    holdWindow(WINDOW_MAX_MS);
     bleNotifyStatusQuiet(String("{\"ack\":\"auth\",\"ok\":true,\"token\":\"") + authToken + "\"}");
 }
 
@@ -1327,38 +1294,243 @@ static void handleUpdatePage() {
     server.send(200, "text/html", page);
 }
 
-static void startNormalMode() {
-    configMode = false;
-    hostname = "codex-status-" + macSuffix();
-    configTzTime("CST-8", "pool.ntp.org");
-    pinMode(0, INPUT_PULLUP);
-    pinMode(18, INPUT_PULLUP);
+// UDP announce (docs/power-state.md §9): the device broadcasts its endpoint so
+// the bridge can track DHCP changes; ble=1 asks for a one-shot BLE handshake.
+static void sendAnnounce(bool bleFlag) {
+    if (!wifiUp || WiFi.status() != WL_CONNECTED) return;
+    IPAddress ip = WiFi.localIP();
+    String mac = macText();
+    char payload[192];
+    int n = snprintf(payload, sizeof(payload),
+                     "{\"magic\":\"codex-status\",\"mac\":\"%s\",\"ip\":\"%u.%u.%u.%u\","
+                     "\"port\":80,\"proto\":\"http\",\"ble\":%d,\"fw\":\"%s\"}",
+                     mac.c_str(), ip[0], ip[1], ip[2], ip[3], bleFlag ? 1 : 0, FW_VERSION);
+    announceUdp.beginPacket(IPAddress(255, 255, 255, 255), 8767);
+    announceUdp.write((const uint8_t *)payload, n);
+    announceUdp.endPacket();
+    announcedIp = (uint32_t)ip;
+    lastAnnounce = millis();
+    DevLog.printf("[udp] announce %s ble=%d\n", ip.toString().c_str(), bleFlag ? 1 : 0);
+}
 
-    windowMode = true;
-    bool haveWifi = connectBest();
-    windowHadWifi = haveWifi;
-    if (haveWifi) {
-        uint32_t h = fnv1a(WiFi.BSSIDstr());
-        if (h && h != rtcBssidHash) {
-            rtcBssidHash = h;
-            rtcFastLeft = 3;   // accelerated windows after a network change
-            windowEnvSwitch = true;
-        }
-    } else {
-        DevLog.println("[wifi] window without Wi-Fi");
+static void requestAnnounce(bool bleFlag) {
+    sendAnnounce(bleFlag);
+}
+
+static void serviceAnnounce() {
+    if (!wifiUp) return;
+    if ((uint32_t)WiFi.localIP() != announcedIp) { sendAnnounce(bleOn); return; }
+    if (millis() - lastAnnounce > ANNOUNCE_MS) sendAnnounce(bleOn);
+}
+
+// ---------------- v0.12 state machine ----------------
+static uint32_t retryDelaySec(uint8_t stage) {
+    if (stage < 3) return 60;    // 1 min x3
+    if (stage < 6) return 300;   // 5 min x3
+    return 900;                  // 15 min forever
+}
+
+// GP3 green LED: active low, lit while the BLE session is on.
+static void ledApply() {
+    bool on = ledState;
+    if (ledPulseUntil && (int32_t)(millis() - ledPulseUntil) < 0) on = !on;
+    digitalWrite(3, on ? LOW : HIGH);
+}
+
+static void ledSet(bool on) {
+    ledState = on;
+    ledApply();
+}
+
+static void ledFlash() {
+    ledPulseUntil = millis() + 80;
+    ledApply();
+}
+
+static void serviceLed() {
+    if (ledPulseUntil && (int32_t)(millis() - ledPulseUntil) >= 0) {
+        ledPulseUntil = 0;
+        ledApply();
     }
+}
 
-    bleBegin("CodexStatus-" + macSuffix(), FW_VERSION);
-    bleSetHandlers(handleBleUsage, handleBleEndpoint);
-    bleSetTemplateHandlers(tplXferHandleCtrl, tplXferHandleChunk, tplXferReset);
-    bleSetAuthHandler(handleBleAuth);
+static void enterBleOn(bool userInitiated) {
+    if (!wifiUp) return;
+    if (!bleInitialized()) {
+        bleBegin("CodexStatus-" + macSuffix(), FW_VERSION);
+        bleSetHandlers(handleBleUsage, handleBleEndpoint);
+        bleSetTemplateHandlers(tplXferHandleCtrl, tplXferHandleChunk, tplXferReset);
+        bleSetAuthHandler(handleBleAuth);
+    }
     updateInfoExtra();
+    if (!bleOn) {
+        bleOn = true;
+        bleUserOff = false;
+        ledSet(true);
+        ledFlash();
+        DevLog.println("[ble] session on");
+    }
+    bleAdvertiseStart();
+    if (userInitiated) {
+        bleOpenPairingWindow(120000);
+    }
+    bool autoCond = plugged && batteryPct > BLE_AUTO_PCT;
+    lastBleAuto = autoCond;
+    bleOffDeadline = autoCond ? 0 : millis() + BLE_GRACE_MS;
+    requestAnnounce(true);
+    renderCurrent();
+}
 
+static void bleOff(const char *reason) {
+    if (!bleOn) return;
+    bleOn = false;
+    lastBleAuto = false;
+    bleAdvertiseStop();
+    bleDeinit();
+    ledSet(false);
+    ledFlash();
+    DevLog.printf("[ble] session off (%s)\n", reason ? reason : "");
+    requestAnnounce(false);
+    renderCurrent();
+}
+
+// BLE keep-alive: infinite while plugged and >20%, otherwise 120 s after the
+// last connection/transfer or after the keep-alive condition ends.
+static void serviceBleSession() {
+    if (!bleOn) return;
+    bool autoCond = plugged && batteryPct > BLE_AUTO_PCT;
+    if (bleIsConnected()) {
+        bleOffDeadline = millis() + BLE_GRACE_MS;
+        lastBleAuto = autoCond;
+        return;
+    }
+    if (autoCond) {
+        bleOffDeadline = 0;
+        lastBleAuto = true;
+        return;
+    }
+    if (lastBleAuto) {
+        lastBleAuto = false;
+        bleOffDeadline = millis() + BLE_GRACE_MS;
+    }
+    if (bleOffDeadline && (int32_t)(millis() - bleOffDeadline) >= 0) bleOff("grace expired");
+}
+
+static void pollPlug() {
+    static uint32_t lastPoll = 0;
+    if (millis() - lastPoll < 500) return;
+    lastPoll = millis();
+    bool now = usb_serial_jtag_is_connected();
+    if (now == plugged) return;
+    plugged = now;
+    DevLog.printf("[pm] usb %s\n", plugged ? "plugged" : "unplugged");
+    ledFlash();
+    renderCurrent();
+    if (plugged) {
+        bleUserOff = false;
+        batteryPct = batteryPercent();
+        if (wifiUp && !bleOn && batteryPct > BLE_AUTO_PCT) enterBleOn(false);
+    }
+}
+
+static void pollWifi() {
+    bool nowUp = (WiFi.status() == WL_CONNECTED);
+    if (wifiReconfiguring) {
+        if (nowUp) {
+            wifiReconfiguring = false;
+            if (wifiUp && storeCount() > 0) tryWifiUsage();
+        } else if ((int32_t)(millis() - wifiReconfigDeadline) < 0) {
+            return;   // deliberate power-save reassociation in progress
+        } else {
+            wifiReconfiguring = false;
+            DevLog.println("[wifi] power-save reassociation timed out");
+        }
+    }
+    if (nowUp) {
+        if (!wifiUp) {
+            wifiUp = true;
+            wifiLostHandled = false;
+            wifiLostSince = 0;
+            rtcRetryStage = 0;
+            DevLog.printf("[wifi] connected ip=%s rssi=%d\n",
+                          WiFi.localIP().toString().c_str(), WiFi.RSSI());
+            configureWifiPowerSave();
+            batteryPct = batteryPercent();
+            if (plugged && !bleOn && !bleUserOff && batteryPct > BLE_AUTO_PCT) enterBleOn(false);
+            sendAnnounce(bleOn);
+            renderCurrent();
+        }
+        if ((uint32_t)WiFi.localIP() != announcedIp) sendAnnounce(bleOn);
+        return;
+    }
+    if (wifiUp) {
+        wifiUp = false;
+        wifiLostSince = millis();
+        DevLog.println("[wifi] link lost");
+        renderCurrent();
+    } else if (!wifiLostSince) {
+        wifiLostSince = millis();
+    }
+    if (wifiLostHandled) {
+        if (plugged && (int32_t)(millis() - nextWifiRetry) >= 0) {
+            nextWifiRetry = millis() + WIFI_RETRY_MS;
+            ledFlash();
+            retryWifi();
+        }
+        return;
+    }
+    if (millis() - wifiLostSince < WIFI_LOST_MS) return;
+    wifiLostHandled = true;
+    if (bleOn) bleOff("wifi lost");
+    if (plugged) {
+        nextWifiRetry = millis() + WIFI_RETRY_MS;
+        DevLog.println("[wifi] WIFI OFF (plugged): retry every 60s");
+        renderCurrent();
+        return;
+    }
+    uint32_t delaySec = retryDelaySec(rtcRetryStage);
+    if (rtcRetryStage < 7) rtcRetryStage++;
+    DevLog.printf("[wifi] WIFI OFF (battery): deep sleep %us stage=%u\n",
+                  (unsigned)delaySec, (unsigned)rtcRetryStage);
+    deepSleepFor(delaySec);
+}
+
+static void checkBattery() {
+    if (millis() - lastBattCheck < BATT_CHECK_MS) return;
+    lastBattCheck = millis();
+    batteryPct = batteryPercent();
+    DevLog.printf("[pm] battery %d%% (%u mV) plugged=%d\n",
+                  batteryPct, (unsigned)batteryMilliVolts(), plugged ? 1 : 0);
+    if (!plugged && batteryPct < LOW_BATT_PCT) {
+        DevLog.println("[pm] battery <5%: power off");
+        powerOff();
+    }
+    if (plugged && wifiUp && !bleOn && !bleUserOff && batteryPct > BLE_AUTO_PCT) enterBleOn(false);
+}
+
+static void handleBootClick() {
+    if (millis() - lastBootAction < 1000) return;   // 1 s throttle
+    lastBootAction = millis();
+    if (!wifiUp) {
+        if (plugged && retryWifi()) {
+            DevLog.println("[boot] click: retry Wi-Fi now");
+            ledFlash();
+        }
+        return;
+    }
+    if (bleOn) {
+        bleUserOff = true;
+        bleOff("user click");
+    } else {
+        enterBleOn(true);
+    }
+}
+
+static void registerHttpRoutes() {
     server.on("/", HTTP_GET, handleStatus);
     server.on("/status.json", HTTP_GET, handleStatusJson);
     server.on("/log", HTTP_GET, handleLog);
     server.on("/usage", HTTP_POST, handleUsagePost);
-    server.on("/sleep", HTTP_POST, handleSleepPost);
     server.on("/update", HTTP_GET, handleUpdatePage);
     server.on("/doUpdate", HTTP_POST,
         []() {
@@ -1367,6 +1539,7 @@ static void startNormalMode() {
                 server.send(401, "text/plain", "unauthorized: negotiate a token over BLE first");
                 return;
             }
+            setOtaLock(false);
             server.send(200, "text/plain", Update.hasError() ? "UPDATE FAILED" : "UPDATE OK");
         },
         []() {
@@ -1379,9 +1552,9 @@ static void startNormalMode() {
                 }
                 otaUploadDenied = false;
                 otaInProgress = true;
-                windowDeadline = millis() + WINDOW_HOLD_MS;
+                setOtaLock(true);
                 DevLog.printf("[ota] upload start: %s\n", up.filename.c_str());
-                std::vector<String> lines = {"OTA update", up.filename};
+                std::vector<String> lines = {"OTA update", FW_VERSION, up.filename};
                 screen(lines);
                 if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
             } else if (up.status == UPLOAD_FILE_WRITE) {
@@ -1389,7 +1562,7 @@ static void startNormalMode() {
                 if (Update.write(up.buf, up.currentSize) != up.currentSize) Update.printError(Serial);
             } else if (up.status == UPLOAD_FILE_END) {
                 otaInProgress = false;
-                if (otaUploadDenied) return;
+                if (otaUploadDenied) { setOtaLock(false); return; }
                 if (Update.end(true)) {
                     DevLog.printf("[ota] success %u bytes, rebooting shortly\n", (unsigned)up.totalSize);
                     screen({"OTA success", "Rebooting..."});
@@ -1397,38 +1570,115 @@ static void startNormalMode() {
                     otaRebootAt = millis() + 1500;
                 } else {
                     Update.printError(Serial);
+                    setOtaLock(false);
                 }
             }
         });
+}
+
+// Wi-Fi power save: WIFI_PS_MAX_MODEM with listen_interval=10 wakes the modem
+// every 10 beacons (~1 s) instead of every DTIM, so bridge pushes still wake
+// the device from light sleep with acceptable latency (T9). Applying the
+// listen interval needs one reassociation; while that runs pollWifi must not
+// read the deliberate drop as a lost link.
+static bool configureWifiPowerSave() {
+    wifi_config_t cfg = {};
+    bool reassociate = false;
+    if (esp_wifi_get_config(WIFI_IF_STA, &cfg) == ESP_OK && cfg.sta.listen_interval != 10) {
+        cfg.sta.listen_interval = 10;
+        esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &cfg);
+        if (err == ESP_OK && WiFi.status() == WL_CONNECTED) {
+            reassociate = true;
+        }
+        DevLog.printf("[pm] listen_interval=10 (%s)\n", esp_err_to_name(err));
+    }
+    if (reassociate) {
+        wifiReconfiguring = true;
+        wifiReconfigDeadline = millis() + 15000;
+        WiFi.disconnect(false);
+        delay(100);
+        WiFi.reconnect();
+        uint32_t t0 = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) delay(100);
+        DevLog.printf("[pm] reassociated for power save, connected=%d\n",
+                      WiFi.status() == WL_CONNECTED);
+        if (WiFi.status() == WL_CONNECTED) wifiReconfiguring = false;
+    }
+    esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+    DevLog.println("[pm] WiFi PS = MAX_MODEM");
+    return WiFi.status() == WL_CONNECTED;
+}
+
+static void startNormalMode() {
+    configMode = false;
+    hostname = "codex-status-" + macSuffix();
+    configTzTime("CST-8", "pool.ntp.org");
+    pinMode(0, INPUT_PULLUP);
+    pinMode(18, INPUT_PULLUP);
+    pinMode(3, OUTPUT);
+    digitalWrite(3, HIGH);   // green LED off (active low)
+
+    configurePowerManagement();
+    setupOtaPmLock();
+    announceUdp.begin(0);
+
+    wifiUp = connectBest();
+    registerHttpRoutes();
     server.begin();
 
-    if (haveWifi) {
-        ArduinoOTA.setHostname(hostname.c_str());
+    if (wifiUp) {
+        wifiLostHandled = false;
+        wifiLostSince = 0;
+        lastBattCheck = millis();
+        batteryPct = batteryPercent();
+        configureWifiPowerSave();
         loadOrIssueAuthToken();
-        ArduinoOTA.onStart([]() { screen({"ArduinoOTA", "updating..."}); });
+        ArduinoOTA.setHostname(hostname.c_str());
+        ArduinoOTA.onStart([]() {
+            setOtaLock(true);
+            screen({"ArduinoOTA", "updating..."});
+        });
         ArduinoOTA.onProgress([](unsigned int p, unsigned int t) {
             DevLog.printf("[ota] %u%%\r", t ? p * 100 / t : 0);
         });
-        ArduinoOTA.onEnd([]() { screen({"OTA OK", "rebooting..."}); delay(800); });
-        ArduinoOTA.onError([](ota_error_t e) { DevLog.printf("[ota] error %u\n", e); });
+        ArduinoOTA.onEnd([]() {
+            screen({"OTA OK", "rebooting..."});
+            delay(800);
+            setOtaLock(false);
+        });
+        ArduinoOTA.onError([](ota_error_t e) {
+            setOtaLock(false);
+            DevLog.printf("[ota] error %u\n", e);
+        });
         ArduinoOTA.begin();
         MDNS.addService("http", "tcp", 80);
+        if (plugged && batteryPct > BLE_AUTO_PCT) enterBleOn(false);
+        if (storeCount() > 0) tryWifiUsage();
+        sendAnnounce(bleOn);
+    } else {
+        wifiLostHandled = true;
+        wifiLostSince = millis() - WIFI_LOST_MS;   // already past loss detection
+        if (plugged) {
+            nextWifiRetry = millis() + WIFI_RETRY_MS;
+            DevLog.println("[wifi] no link at boot (plugged): retry every 60s");
+        } else {
+            uint32_t delaySec = retryDelaySec(rtcRetryStage);
+            if (rtcRetryStage < 7) rtcRetryStage++;
+            DevLog.printf("[wifi] no link at boot (battery): deep sleep %us stage=%u\n",
+                          (unsigned)delaySec, (unsigned)rtcRetryStage);
+            deepSleepFor(delaySec);
+        }
     }
 
-    DevLog.printf("[net] ready: http://%s/  host=%s.local  endpoints=%d mode=%s wifi=%d\n",
-                  WiFi.localIP().toString().c_str(), hostname.c_str(), storeCount(),
-                  MODE_NAMES[runtimeMode()], haveWifi ? 1 : 0);
-
-    windowDeadline = millis() + WINDOW_MS;
-    windowHardStop = millis() + WINDOW_MAX_MS;
-    windowSynced = false;
-    if (haveWifi && storeCount() > 0) tryWifiUsage();
+    DevLog.printf("[net] ready state=%s ip=%s host=%s.local endpoints=%d\n",
+                  deviceStateText(), ipText().c_str(), hostname.c_str(), storeCount());
 }
 
 void setup() {
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
     bootWakeCause = cause;
     bool woke = (cause == ESP_SLEEP_WAKEUP_TIMER || cause == ESP_SLEEP_WAKEUP_EXT1);
+    loadHostMac();
     hostname = "codex-status-" + macSuffix();
     epdBegin(!woke);
     if (!woke) screen({"CODEX STATUS", FW_VERSION, "booting..."});
@@ -1436,122 +1686,69 @@ void setup() {
         rtcMagic = 0xC0DE0001;
         rtcActiveAt = 0;
         rtcActiveMac[0] = 0;
-        rtcFailCount = 0;
-        rtcFastLeft = 3;
-        rtcIdleReason = IDLE_BOOT;
-        rtcNeverSynced = true;
-        rtcBssidHash = 0;
+        rtcLastSyncEpoch = 0;
+        rtcRetryStage = 0;
         rtcUsageHash = 0;
         DevLog.println("[pm] RTC state initialized");
     }
+    // The last successful sync must survive OTA/software resets (RTC data is
+    // not reliable across them on this board), so it is also kept in NVS.
+    if (rtcLastSyncEpoch == 0) {
+        Preferences p;
+        p.begin("sync", true);
+        rtcLastSyncEpoch = p.getUInt("last", 0);
+        p.end();
+    }
+    lastPersistedSync = rtcLastSyncEpoch;
+    if (cause == ESP_SLEEP_WAKEUP_EXT1) {
+        rtcRetryStage = 0;   // button wake replays the retry cadence from the top
+        DevLog.println("[pm] button wake: retry stage reset");
+    }
+    plugged = usb_serial_jtag_is_connected();
+    batteryPct = batteryPercent();
+
     const esp_partition_t *running = esp_ota_get_running_partition();
-    DevLog.printf("\n[codex-status] v%s mac=%s reset=%s slot=%s mode=%s wake=%d(%s)\n", FW_VERSION,
-                  WiFi.macAddress().c_str(), resetReasonName(),
-                  running ? running->label : "?", MODE_NAMES[runtimeMode()], (int)cause,
-                  wakeCauseName(cause));
+    DevLog.printf("\n[codex-status] v%s mac=%s reset=%s slot=%s wake=%d(%s) usb=%d\n",
+                  FW_VERSION, macText().c_str(), resetReasonName(),
+                  running ? running->label : "?", (int)cause,
+                  wakeCauseName(cause), plugged ? 1 : 0);
     { Preferences p; p.begin("brg", false); p.end(); }
 
     tplStoreBegin();
     tplXferBegin(FW_VERSION, []() { pendingTplChanged = true; });
+    String cached;
+    if (usageCacheLoad(cached)) lastUsage = cached;
 
     if (hasWifiSlots()) {
         startNormalMode();
     } else {
         rtcApReason = 1;
-        DevLog.println("[config] no saved Wi-Fi slots; entering AP mode (D10)");
+        DevLog.println("[config] no saved Wi-Fi slots; entering AP mode");
         startConfigMode();
     }
 }
 
-// LIVE Wi-Fi power save: WIFI_PS_MAX_MODEM with listen_interval=10 wakes the
-// modem every 10 beacons (~1 s at the usual 100 ms beacon interval) instead of
-// every DTIM. The listen interval is advertised in the association request, so
-// it is applied together with one re-association here; the bridge tolerates a
-// missed push and retries on its next tick.
-static void configureWifiPowerSave() {
-    wifi_config_t cfg = {};
-    if (esp_wifi_get_config(WIFI_IF_STA, &cfg) == ESP_OK && cfg.sta.listen_interval != 10) {
-        cfg.sta.listen_interval = 10;
-        esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &cfg);
-        if (err == ESP_OK && WiFi.status() == WL_CONNECTED) {
-            WiFi.disconnect(false);
-            delay(100);
-            WiFi.reconnect();
-            uint32_t t0 = millis();
-            while (WiFi.status() != WL_CONNECTED && millis() - t0 < 6000) delay(100);
-        }
-        DevLog.printf("[pm] listen_interval=10 (%s), connected=%d\n",
-                      esp_err_to_name(err), WiFi.status() == WL_CONNECTED);
+static void dumpPmStats() {
+#if defined(CODEX_PM)
+    char *buf = nullptr;
+    size_t len = 0;
+    FILE *f = open_memstream(&buf, &len);
+    if (!f) { DevLog.println("[pm] pmstats: memstream failed"); return; }
+    esp_pm_impl_dump_stats(f);
+    esp_pm_dump_locks(f);
+    fclose(f);
+    if (buf) {
+        DevLog.printf("[pm] stats:\n%s", buf);
+        free(buf);
     }
-    esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
-    DevLog.println("[pm] WiFi PS = MAX_MODEM");
-}
-
-// LIVE entry/exit (sleep.md §4.1/§4.3): PM light sleep + MAX_MODEM Wi-Fi PS,
-// BLE advertising stays off until a pairing window is asked for.
-static void enterLive() {
-    liveMode = true;
-    windowMode = false;
-    liveEnteredAtMs = millis();
-    liveLastSyncMs = millis();
-    liveLastPollMs = millis();
-    wifiLostSinceMs = 0;
-    configurePowerManagement();
-    configureWifiPowerSave();
-    bleAdvertiseStop();
-    DevLog.println("[live] enter (PM light sleep, BLE advertising off)");
-}
-
-static void exitLive(uint8_t reason) {
-    rtcIdleReason = reason;
-    liveMode = false;
-    String cached;
-    if (usageCacheLoad(cached)) renderActiveUsage(cached, "DEEP", true);
-    else screenIdle();
-    DevLog.printf("[live] exit (%s)\n", idleReasonText());
-    deepSleepFor(300, false);
-}
-
-// Window finished: render IDLE when required, update the failure/backoff state
-// and deep-sleep until the next window (sleep.md §4.1/§4.2).
-static void finishWindowAndSleep(bool haveWifi) {
-    if (windowSynced) {
-        rtcFailCount = 0;
-        rtcNeverSynced = false;
-        if (haveWifi) {
-            enterLive();
-            return;
-        }
-    } else {
-        if (rtcFailCount < 255) rtcFailCount++;
-        if (windowEnvSwitch) rtcIdleReason = IDLE_ENV_SWITCH;
-        else if (rtcNeverSynced) rtcIdleReason = IDLE_BOOT;
-        else if (!haveWifi) rtcIdleReason = IDLE_WIFI_LOST;
-        else rtcIdleReason = IDLE_BRIDGE_LOST;
-    }
-    bool showIdle = !windowSynced && (rtcFailCount >= 2 || rtcNeverSynced);
-    if (showIdle) {
-        String cached;
-        if (usageCacheLoad(cached)) renderActiveUsage(cached, "DEEP", true);
-        else screenIdle();
-    }
-    uint32_t next;
-    if (rtcFailCount >= 3) {
-        next = 900;
-    } else if (rtcFastLeft > 0) {
-        next = 60;
-        rtcFastLeft--;
-    } else {
-        next = 300;
-    }
-    DevLog.printf("[pm] window done synced=%d wifi=%d fail=%u idle=%d reason=%s next=%us\n",
-                  windowSynced ? 1 : 0, haveWifi ? 1 : 0, (unsigned)rtcFailCount,
-                  showIdle ? 1 : 0, idleReasonText(), (unsigned)next);
-    deepSleepFor(next, false);
+#else
+    DevLog.println("[pm] stock core: no PM stats");
+#endif
 }
 
 // USB serial provisioning: `wifi <ssid> <pass>` saves to NVS and reboots;
-// `status` prints IP/RSSI/heap; `batt` prints battery percent.
+// `status` prints IP/RSSI/heap/state; `batt` prints battery; `pair` opens a
+// BLE session with a pairing window; `pmstats` dumps PM light-sleep counters.
 static void handleSerialCli() {
     static String rx;
     while (Serial.available()) {
@@ -1587,41 +1784,19 @@ static void handleSerialCli() {
                 DevLog.println("[cli] usage: wifi <ssid> <pass>");
             }
         } else if (line == "status") {
-            DevLog.printf("[cli] fw=%s ip=%s rssi=%d heap=%u\n",
-                          FW_VERSION, ipText().c_str(), WiFi.RSSI(), ESP.getFreeHeap());
+            DevLog.printf("[cli] fw=%s state=%s ip=%s rssi=%d heap=%u\n",
+                          FW_VERSION, deviceStateText(), ipText().c_str(),
+                          WiFi.RSSI(), ESP.getFreeHeap());
         } else if (line == "batt") {
-            DevLog.printf("[cli] battery=%d%%\n", batteryPercent());
-        } else if (line == "mode") {
-            DevLog.printf("[cli] mode=%s\n", MODE_NAMES[runtimeMode()]);
-        } else if (line.startsWith("mode ")) {
-            String v = line.substring(5);
-            v.trim();
-            int m = -1;
-            for (int i = 0; i < 3; i++)
-                if (v == MODE_NAMES[i]) m = i;
-            if (m < 0) {
-                DevLog.println("[cli] usage: mode auto|deep|live");
-            } else {
-                setRuntimeMode((uint8_t)m);
-                DevLog.printf("[cli] mode=%s%s\n", MODE_NAMES[m],
-                              m == 2 ? " (live == deep until M3)" : "");
-            }
+            DevLog.printf("[cli] battery=%d%% (%u mV)\n", batteryPercent(),
+                          (unsigned)batteryMilliVolts());
         } else if (line == "pair") {
-            bleOpenPairingWindow(120000);
-            bleAdvertiseStart();
-            DevLog.println("[cli] pairing window open 120s");
-        } else if (line == "stay") {
-            debugStayAwake = true;
-            DevLog.println("[cli] stay awake until reset");
-        } else if (line == "sleep" || line.startsWith("sleep ")) {
-            uint32_t sec = line.length() > 6 ? (uint32_t)line.substring(6).toInt() : 60;
-            if (sec < 15) sec = 15;
-            if (sec > 900) sec = 900;
-            DevLog.printf("[cli] sleep %us\n", (unsigned)sec);
-            delay(100);
-            deepSleepFor(sec, true);
+            enterBleOn(true);
+            DevLog.println("[cli] BLE session on, pairing window 120s");
+        } else if (line == "pmstats") {
+            dumpPmStats();
         } else if (line.length()) {
-            DevLog.println("[cli] commands: wifi <ssid> <pass> | status | batt | mode [auto|deep|live] | sleep [sec] | pair | stay");
+            DevLog.println("[cli] commands: wifi <ssid> <pass> | status | batt | pair | pmstats");
         }
     }
 }
@@ -1629,12 +1804,13 @@ static void handleSerialCli() {
 // PWR (GPIO18) held for 3 s: software power-off by dropping the VBAT latch
 // (GPIO17). On battery the MCU dies here; if USB/charger power keeps the board
 // alive the hold degrades to a clean restart so the device never sits inert.
-// (HWCDC's isPlugged() is not reliable after a cable unplug, so it is not used
-// as a gate.)
 static void powerOff() {
     DevLog.println("[pm] PWR held 3s: power off");
     epdPanelSleep();
-    bleAdvertiseStop();
+    if (bleInitialized()) {
+        bleAdvertiseStop();
+        bleDeinit();
+    }
     WiFi.disconnect(true);
     delay(200);
     digitalWrite(17, LOW);
@@ -1666,10 +1842,11 @@ void loop() {
     }
 
     if (configMode) {
-        // D10: AP provisioning sleeps again after 5 idle minutes.
-        if (!debugStayAwake && millis() - configStartedAt > CONFIG_IDLE_MS) {
-            DevLog.println("[config] idle timeout, sleeping");
-            deepSleepFor(300, false);
+        // AP without credentials: battery sleeps after 5 idle minutes (buttons
+        // only); plugged stays awake so provisioning/serial stay available.
+        if (!plugged && millis() - configStartedAt > CONFIG_IDLE_MS) {
+            DevLog.println("[config] AP idle timeout (battery): deep sleep");
+            deepSleepFor(0);
         }
         delay(5);
         return;
@@ -1681,8 +1858,7 @@ void loop() {
     static int      bootStage = 0;
     // Arm the button only after GPIO0 has read HIGH once: a strapping/mux
     // glitch that made it read LOW for the first seconds of boot otherwise
-    // looked like a 5 s hold and dropped the device into AP mode on release
-    // (seen right after OTA into the pioarduino core).
+    // looked like a long hold.
     static bool     bootArmed = false;
     bool bootLow = (digitalRead(0) == LOW);
     if (!bootArmed && !bootLow) bootArmed = true;
@@ -1691,41 +1867,26 @@ void loop() {
         uint32_t held = millis() - bootDownAt;
         if (bootStage < 1 && held > 2000) {
             bootStage = 1;
-            bleOpenPairingWindow(120000);
-            bleAdvertiseStart();   // LIVE keeps BLE off until pairing is asked for
-            pairingOverlay = true;
-            screenPairingOverlay();
+            nextTemplate();
+            enterBleOn(true);   // 2 s: next local template + BLE session
         }
-        if (bootStage < 2 && held > 5000) {
+        if (bootStage < 2 && held > 15000) {
             bootStage = 2;
+            rtcApReason = 2;
+            DevLog.println("[config] BOOT held 15s; entering AP mode");
+            startConfigMode();
+            return;
         }
-        if (bootStage < 3 && held > 10000) {
+        if (bootStage < 3 && held > 30000) {
             bootStage = 3;
-            pairingOverlay = false;
             factoryReset();
         }
     } else {
         if (bootDownAt) {
             uint32_t held = millis() - bootDownAt;
-            if (bootStage == 0 && held > 50 && held < 1500) nextTemplate();
-            else if (bootStage == 2 && held >= 5000 && held < 10000) {
-                rtcApReason = 2;
-                DevLog.println("[config] BOOT held 5s; entering AP mode (D10)");
-                startConfigMode();
-                return;
-            }
+            if (bootStage == 0 && held > 50 && held < 2000) handleBootClick();
             bootDownAt = 0;
             bootStage = 0;
-        }
-    }
-
-    if (pairingOverlay) {
-        bool paired = bleIsConnected() && blePeerIsBonded() && blePeerIsEncrypted();
-        if (!blePairingWindowOpen() || paired) {
-            pairingOverlay = false;
-            activeTplId = "";
-            if (lastUsage.length()) renderActiveUsage(lastUsage, lastChannel.c_str());
-            else screenIdle();
         }
     }
 
@@ -1733,8 +1894,7 @@ void loop() {
         pendingTplChanged = false;
         activeTplId = "";
         updateInfoExtra();
-        if (lastUsage.length()) renderActiveUsage(lastUsage, lastChannel.c_str());
-        else screenIdle();
+        renderCurrent();
     }
     if (pendingEndpoint) {
         pendingEndpoint = false;
@@ -1745,14 +1905,11 @@ void loop() {
         JsonDocument parsed;
         if (!deserializeJson(parsed, pendingUsage) && !parsed.as<JsonObject>().isNull()) {
             adoptServerTime(parsed);
-            applyEnvelopeMeta(parsed);
-            bool explicitActivate = parsed["activate"] | false;
             String mac = blePeerAddress();
+            applyEnvelopeMeta(parsed, mac);
+            bool explicitActivate = parsed["activate"] | false;
             bool accepted = usageAccepted(mac, explicitActivate);
-            lastSyncMs = millis();
-            lastOkMs = millis();
-            lastSyncEpoch = time(nullptr);
-            windowSynced = true;
+            markSynced();
             usageCacheSave(pendingUsage);
             if (accepted) {
                 setActiveMac(mac);
@@ -1768,32 +1925,27 @@ void loop() {
         }
     }
 
-    // LIVE: the bridge pushes; watchdog falls back to DEEP (sleep.md §4.1).
-    if (liveMode) {
-        if (WiFi.status() == WL_CONNECTED) {
-            wifiLostSinceMs = 0;
-        } else if (!wifiLostSinceMs) {
-            wifiLostSinceMs = millis();
-        } else if (millis() - wifiLostSinceMs > 180000UL) {
-            exitLive(IDLE_WIFI_LOST);
-        }
-        if (liveLastSyncMs && millis() - liveLastSyncMs > 600000UL) {
-            exitLive(IDLE_BRIDGE_LOST);
-        }
-        if (millis() - liveLastPollMs > 900000UL) {
-            liveLastPollMs = millis();
-            if (storeCount() > 0) tryWifiUsage();
-        }
-        delay(5);
-        return;
-    }
+    pollWifi();
+    pollPlug();
+    serviceBleSession();
+    checkBattery();
+    serviceAnnounce();
+    serviceLed();
 
-    // An OTA upload holds the window open (bounded recovery safeguard).
-    if (otaInProgress) holdWindow(WINDOW_HOLD_MS);
-    // Pairing/token operations and live BLE peers also keep the window open.
-    if (windowMode && !otaInProgress && !bleIsConnected() && !blePairingWindowOpen() &&
-        !pairingOverlay && !debugStayAwake && (int32_t)(millis() - windowDeadline) >= 0) {
-        finishWindowAndSleep(windowHadWifi || WiFi.status() == WL_CONNECTED);
+    // Keep the offline-minutes row honest while the bridge is unreachable:
+    // once contact is lost (>= BRIDGE_LOST_MIN minutes since the last sync) the
+    // template shows `OFF <n>M`, so redraw when the integer minute changes.
+    // No periodic refresh while the bridge is heartbeating.
+    static int lastOfflineMinute = -1;
+    int offlineMinute = -1;
+    if (rtcLastSyncEpoch > 1600000000 && timeKnown()) {
+        long mins = ((long)time(nullptr) - (long)rtcLastSyncEpoch) / 60;
+        if (mins > BRIDGE_LOST_MIN) offlineMinute = (int)mins;
+    }
+    if (offlineMinute != lastOfflineMinute) {
+        bool wasShown = lastOfflineMinute > 0;
+        lastOfflineMinute = offlineMinute;
+        if (offlineMinute > 0 || wasShown) renderCurrent();
     }
 
     delay(5);

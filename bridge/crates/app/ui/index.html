@@ -116,14 +116,6 @@
       <div class="card">
         <div id="profile-rows" class="plist todo">加载中…</div>
       </div>
-      <div class="card">
-        <div class="toolbar">
-          <span class="muted">待机模板（IDLE）</span>
-          <select id="idle-template" onchange="saveIdleTemplate()"></select>
-          <span id="idle-state" class="muted"></span>
-        </div>
-        <div class="sub muted">休眠窗口失败时设备显示该模板（仅 mode:idle 元素）；推送配置时一并下发并固定，不被淘汰。</div>
-      </div>
     </section>
 
     <section class="panel" id="tab-device">
@@ -215,7 +207,6 @@
   let currentProfileId = null;
   let modalPreviewId = null;
   let dragId = null;
-  let idleTemplateId = null;
   const thumbCache = new Map();
 
   function relTime(ts) {
@@ -230,7 +221,7 @@
     button.addEventListener('click', () => {
       document.querySelectorAll('.tabs button').forEach((b) => b.classList.toggle('on', b === button));
       document.querySelectorAll('.panel').forEach((p) => p.classList.toggle('on', p.id === 'tab-' + button.dataset.tab));
-      if (button.dataset.tab === 'templates') { refreshProfiles(); refreshIdleTemplate(); }
+      if (button.dataset.tab === 'templates') refreshProfiles();
       if (button.dataset.tab === 'device') refreshDevice();
       if (button.dataset.tab === 'mcp') refreshMcp();
     });
@@ -403,48 +394,8 @@
       }
       renderProfileMenu();
       renderProfileRows();
-      renderIdleOptions();
     } catch (e) {
       $('profile-rows').textContent = '读取失败：' + e;
-    }
-  }
-
-  /* ---------- idle template ---------- */
-
-  async function refreshIdleTemplate() {
-    try {
-      const data = await invoke('get_idle_template');
-      idleTemplateId = data.idle_template || '';
-    } catch (e) {
-      idleTemplateId = '';
-    }
-    renderIdleOptions();
-  }
-
-  function renderIdleOptions() {
-    const select = $('idle-template');
-    if (!select) return;
-    const ids = knownTemplates.map((t) => t.id);
-    let html = '<option value="">（不设置）</option>';
-    for (const id of ids) {
-      html += `<option value="${escapeHtml(id)}"${id === idleTemplateId ? ' selected' : ''}>${escapeHtml(id)}</option>`;
-    }
-    if (idleTemplateId && !ids.includes(idleTemplateId)) {
-      html += `<option value="${escapeHtml(idleTemplateId)}" selected>${escapeHtml(idleTemplateId)}（未安装）</option>`;
-    }
-    select.innerHTML = html;
-  }
-
-  async function saveIdleTemplate() {
-    const select = $('idle-template');
-    const value = select ? select.value : '';
-    try {
-      await invoke('set_idle_template', { id: value || null });
-      idleTemplateId = value;
-      $('idle-state').textContent = '已保存';
-      setTimeout(() => { $('idle-state').textContent = ''; }, 1500);
-    } catch (e) {
-      $('idle-state').textContent = '保存失败：' + e;
     }
   }
 
@@ -805,7 +756,6 @@
 
   refresh();
   refreshProfiles();
-  refreshIdleTemplate();
   setInterval(refresh, 3000);
 </script>
 </body>

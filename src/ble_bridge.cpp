@@ -2,6 +2,7 @@
 #include "dev_log.h"
 #include <NimBLEDevice.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
 
 static UsageJsonHandler    usageHandler    = nullptr;
 static EndpointJsonHandler endpointHandler = nullptr;
@@ -262,6 +263,7 @@ class AuthCallbacks : public NimBLECharacteristicCallbacks {
 };
 
 void bleBegin(const String &deviceName, const String &fw) {
+    if (NimBLEDevice::isInitialized()) return;
     fwVersion = fw;
     NimBLEDevice::init(deviceName.c_str());
     NimBLEDevice::setSecurityAuth(true, false, true);
@@ -319,6 +321,27 @@ void bleBegin(const String &deviceName, const String &fw) {
     DevLog.printf("[ble] advertising as %s fw=%s\n", deviceName.c_str(), fw.c_str());
 }
 
+bool bleInitialized() { return NimBLEDevice::isInitialized(); }
+
+// v0.12: the BLE session is the only reason the BT controller exists. Leaving
+// the session deinitializes NimBLE so the controller releases its
+// ESP_PM_NO_LIGHT_SLEEP lock and automatic light sleep can apply.
+void bleDeinit() {
+    if (!NimBLEDevice::isInitialized()) return;
+    advertising = false;
+    connected = false;
+    peerBonded = false;
+    peerEncrypted = false;
+    peerConnHandle = BLE_HS_CONN_HANDLE_NONE;
+    disconnecting = false;
+    statusChr = nullptr;
+    infoChr = nullptr;
+    bleServer = nullptr;
+    clearReceiveBuffers();
+    NimBLEDevice::deinit(true);
+    DevLog.println("[ble] deinitialized (controller released)");
+}
+
 bool bleIsConnected() { return connected; }
 bool blePeerIsBonded() { return peerBonded; }
 bool blePeerIsEncrypted() { return peerEncrypted; }
@@ -334,14 +357,14 @@ void bleOpenPairingWindow(uint32_t ms) {
 // BLE advertises only while the device has an active window (boot/OTA/pairing).
 // Sleep entry stops advertising so the radio is quiet outside the window.
 void bleAdvertiseStart() {
-    if (advertising) return;
+    if (advertising || !NimBLEDevice::isInitialized()) return;
     NimBLEDevice::startAdvertising();
     advertising = true;
     DevLog.println("[ble] advertising start");
 }
 
 void bleAdvertiseStop() {
-    if (!advertising) return;
+    if (!advertising || !NimBLEDevice::isInitialized()) { advertising = false; return; }
     NimBLEDevice::stopAdvertising();
     advertising = false;
     DevLog.println("[ble] advertising stop");
@@ -392,6 +415,14 @@ void blePoll() {
 
 void bleClearBonds() {
     DevLog.println("[ble] clearing all bonds");
-    NimBLEDevice::deleteAllBonds();
+    if (NimBLEDevice::isInitialized()) {
+        NimBLEDevice::deleteAllBonds();
+    } else {
+        // The controller is down (BLE OFF); erase the bond namespace directly.
+        Preferences p;
+        p.begin("nimble_bond", false);
+        p.clear();
+        p.end();
+    }
     pairingUntil = 0;
 }

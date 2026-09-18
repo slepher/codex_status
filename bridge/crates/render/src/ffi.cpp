@@ -8,8 +8,8 @@ SerialClass Serial;
 extern "C" {
 
 int codex_render(const char *tmpl, const char *usage, const char *channel, const char *ip,
-                 const char *sync_hhmm, int battery, int idle, int offline_mins,
-                 const char *idle_reason, uint8_t *out, int out_len) {
+                 const char *sync_hhmm, int battery, const char *state, int offline_mins,
+                 uint8_t *out, int out_len) {
     if (!tmpl || !out || out_len < 200 * 200 / 8) return -2;
     Paint_NewImage(out, 200, 200, ROTATE_0, WHITE);
     Paint_Clear(WHITE);
@@ -18,9 +18,8 @@ int codex_render(const char *tmpl, const char *usage, const char *channel, const
     env.ip = ip ? ip : "";
     env.syncHHMM = sync_hhmm ? sync_hhmm : "--:--";
     env.battery = battery;
-    env.idle = idle != 0;
+    env.state = state ? state : "";
     env.offlineMins = offline_mins;
-    env.idleReason = idle_reason ? idle_reason : "";
     return tplDraw(String(tmpl), String(usage ? usage : ""), env) ? 1 : 0;
 }
 

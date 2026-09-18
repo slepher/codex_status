@@ -3,6 +3,7 @@
 mod autostart;
 mod config;
 mod icon;
+mod watchdog;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,6 +46,15 @@ struct RuntimeStatus {
     push_fail_streak: u32,
 }
 
+/// Last device status read, served to the panel without a blocking fetch.
+#[derive(Clone)]
+struct CachedDevice {
+    fetched_at: i64,
+    online: bool,
+    ip: String,
+    fields: Vec<(String, String)>,
+}
+
 struct AppCtx {
     config: Config,
     root: PathBuf,
@@ -52,9 +62,17 @@ struct AppCtx {
     envelope: Arc<RwLock<Option<Value>>>,
     library: Arc<RwLock<Library>>,
     force_ble: Arc<Notify>,
-    idle_template: Arc<RwLock<Option<String>>>,
     status: Mutex<RuntimeStatus>,
-    ble_primed: AtomicBool,
+    /// Live device address: seeded from config, updated by UDP announces.
+    device_ip: Mutex<String>,
+    /// Device Wi-Fi MAC learned from /status.json; UDP updates require a match.
+    device_mac: Mutex<Option<String>>,
+    device_cache: Mutex<Option<CachedDevice>>,
+    /// The device asked for a BLE handshake in its UDP announce (`ble=1`).
+    udp_ble: AtomicBool,
+    /// Set when the device address changed; the push loop sends immediately.
+    device_ip_dirty: AtomicBool,
+    force_push: Arc<Notify>,
     mcp_port: Mutex<u16>,
     mcp_error: Mutex<Option<String>>,
     mcp_tx: tokio::sync::watch::Sender<u16>,
@@ -67,31 +85,8 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// How long a successful `POST /usage` keeps the HTTP path "healthy" (covers
-/// the 5 min heartbeat plus jitter) before BLE scanning resumes.
+/// Tray stays OK while a successful push is this recent (5 min heartbeat + jitter).
 const HTTP_PUSH_HEALTHY_SECS: u64 = 360;
-
-fn http_push_healthy(ctx: &AppCtx) -> bool {
-    let status = ctx.status.lock().unwrap();
-    status
-        .last_push_ok_at
-        .is_some_and(|t| now_secs().saturating_sub(t) < HTTP_PUSH_HEALTHY_SECS as i64)
-}
-
-/// Give the push task a moment to prove the device is reachable over HTTP
-/// before the first BLE scan of a bridge run.
-async fn wait_http_healthy(ctx: &AppCtx, timeout: Duration) -> bool {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if http_push_healthy(ctx) {
-            return true;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-}
 
 fn host_label() -> String {
     let raw = std::env::var("COMPUTERNAME")
@@ -291,8 +286,7 @@ async fn mcp_handler(
         data_root: bridge_core::paths::data_root(),
         seeds: ctx.config.seeds.clone(),
         profile_seed: ctx.config.profile_seed.clone(),
-        device_ip: ctx.config.device_ip.clone(),
-        idle_template: ctx.idle_template.read().await.clone(),
+        device_ip: ctx.device_ip.lock().unwrap().clone(),
         root: ctx.root.clone(),
     };
     let tool = request
@@ -365,25 +359,25 @@ fn persist_mcp_port(_root: &Path, port: u16) {
 
 #[tauri::command]
 async fn get_device_status(state: State<'_, Arc<AppCtx>>) -> Result<Value, String> {
-    let ip = state.config.device_ip.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        bridge_core::device::fetch(&ip, std::time::Duration::from_secs(3))
-    })
-    .await
-    .map_err(|e| e.to_string())?;
-    match result {
-        Ok(status) => {
-            let map: serde_json::Map<String, Value> = status
+    let cached = state.device_cache.lock().unwrap().clone();
+    match cached {
+        Some(cached) => {
+            let map: serde_json::Map<String, Value> = cached
                 .fields
                 .iter()
                 .map(|(k, v)| (k.clone(), json!(v)))
                 .collect();
-            Ok(json!({"online": true, "ip": state.config.device_ip, "fields": map}))
+            Ok(json!({
+                "online": cached.online,
+                "ip": cached.ip,
+                "fetched_at": cached.fetched_at,
+                "fields": map,
+            }))
         }
-        Err(e) => Ok(json!({
+        None => Ok(json!({
             "online": false,
-            "ip": state.config.device_ip,
-            "error": e.to_string(),
+            "ip": state.device_ip.lock().unwrap().clone(),
+            "pending": true,
             "fields": {},
         })),
     }
@@ -394,7 +388,7 @@ async fn get_mcp_info(state: State<'_, Arc<AppCtx>>) -> Result<Value, String> {
     let port = *state.mcp_port.lock().unwrap();
     let error = state.mcp_error.lock().unwrap().clone();
     let url = format!("http://127.0.0.1:{port}/mcp");
-    let tools = "bridge_status / template_get / template_validate / template_render / template_save / profiles_list / profile_save / profile_push";
+    let tools = "bridge_status / template_get / template_validate / template_render / template_save / profiles_list / profile_save / profile_push / firmware_ota";
 
     let generic_prompt = format!(
         "本机已启动 Codex Status 的 MCP 服务（Streamable HTTP）：{url}\n\
@@ -457,43 +451,6 @@ async fn set_mcp_port(state: State<'_, Arc<AppCtx>>, port: u16) -> Result<Value,
     Ok(json!({"port": port}))
 }
 
-fn persist_idle_template(_root: &Path, id: &Option<String>) {
-    let path = bridge_core::paths::data_root().join("bridge-app.json");
-    let mut doc: Value = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_else(|| json!({}));
-    if let Some(object) = doc.as_object_mut() {
-        object.insert("idle_template".to_string(), json!(id));
-    }
-    if let Ok(text) = serde_json::to_string_pretty(&doc) {
-        let _ = std::fs::write(&path, text);
-    }
-}
-
-#[tauri::command]
-async fn get_idle_template(state: State<'_, Arc<AppCtx>>) -> Result<Value, String> {
-    Ok(json!({"idle_template": state.idle_template.read().await.clone()}))
-}
-
-#[tauri::command]
-async fn set_idle_template(
-    state: State<'_, Arc<AppCtx>>,
-    id: Option<String>,
-) -> Result<Value, String> {
-    let id = id.filter(|value| !value.is_empty());
-    if let Some(value) = &id {
-        let library = state.library.read().await;
-        if library.get(value).is_none() {
-            return Err(format!("template not found: {value}"));
-        }
-    }
-    *state.idle_template.write().await = id.clone();
-    persist_idle_template(&state.root, &id);
-    state.force_ble.notify_one();
-    Ok(json!({"idle_template": id}))
-}
-
 /// MCP tools and manual edits change template files behind the app's back, so
 /// re-scan the directory before answering preview/status queries.
 async fn refresh_library(state: &State<'_, Arc<AppCtx>>) {
@@ -542,8 +499,17 @@ async fn preview_template(
 
 #[tauri::command]
 async fn force_sync(state: State<'_, Arc<AppCtx>>) -> Result<(), String> {
-    state.force_ble.notify_one();
+    request_sync(&state);
     Ok(())
+}
+
+/// Explicit user action: push the envelope over HTTP immediately and run one
+/// BLE handshake (endpoint/token refresh, templates if pending).
+fn request_sync(ctx: &AppCtx) {
+    ctx.device_ip_dirty.store(true, Ordering::SeqCst);
+    ctx.force_push.notify_one();
+    ctx.udp_ble.store(true, Ordering::SeqCst);
+    ctx.force_ble.notify_one();
 }
 
 fn profiles_path(ctx: &AppCtx) -> PathBuf {
@@ -711,48 +677,137 @@ fn usage_fingerprint(usage: &Value) -> u64 {
     h
 }
 
-/// Fingerprint of what the BLE cycle would push: usage envelope + pending
-/// template work + the idle template. A successful cycle pauses scanning until
-/// this changes or the 5 min heartbeat expires (sleep.md §4.6).
-fn ble_fingerprint(ctx: &AppCtx) -> u64 {
-    let usage_fp = ctx
-        .envelope
-        .try_read()
-        .ok()
-        .and_then(|g| g.as_ref().map(usage_fingerprint))
-        .unwrap_or(0);
-    let (ids, activate) = {
-        let status = ctx.status.lock().unwrap();
-        (
-            status.pending.ids.join(","),
-            status.pending.activate.clone().unwrap_or_default(),
-        )
-    };
-    let idle = ctx
-        .idle_template
-        .try_read()
-        .ok()
-        .and_then(|v| v.clone())
-        .unwrap_or_default();
-    let mut h: u64 = usage_fp ^ 0xcbf2_9ce4_8422_2325;
-    for b in ids.bytes().chain(activate.bytes()).chain(idle.bytes()) {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100_0000_01b3);
-    }
-    h
-}
-
-async fn run_services(ctx: Arc<AppCtx>) {
-    let exe = match locate_codex(ctx.config.codex_path.as_deref()) {
-        Ok(exe) => exe,
+/// UDP announce listener (docs/power-state.md §9): the device broadcasts
+/// `{magic, mac, ip, port, proto, ble, fw}` to 255.255.255.255:8767 on IP
+/// change, BLE session start and every ~5 min. Only a known MAC may move the
+/// endpoint; before the first /status.json fetch only the configured address
+/// is accepted (and its MAC learned).
+async fn udp_listen(ctx: Arc<AppCtx>) {
+    let socket = match tokio::net::UdpSocket::bind(("0.0.0.0", 8767)).await {
+        Ok(socket) => socket,
         Err(e) => {
-            tracing::error!("codex cli not found: {e}");
-            ctx.status.lock().unwrap().last_error = Some(format!("codex cli: {e}"));
-            ctx.status.lock().unwrap().last_error_at = Some(now_secs());
+            tracing::warn!("udp announce bind :8767 failed: {e}");
+            let mut status = ctx.status.lock().unwrap();
+            status.last_error = Some(format!("udp: {e}"));
+            status.last_error_at = Some(now_secs());
             return;
         }
     };
-    tracing::info!("codex cli: {}", exe.display());
+    let _ = socket.set_broadcast(true);
+    tracing::info!("udp announce listener on :8767");
+    let mut buf = [0u8; 1024];
+    loop {
+        let Ok((n, from)) = socket.recv_from(&mut buf).await else { continue };
+        let Ok(doc) = serde_json::from_slice::<Value>(&buf[..n]) else { continue };
+        if doc.get("magic").and_then(|v| v.as_str()) != Some("codex-status") {
+            continue;
+        }
+        let mac = doc.get("mac").and_then(|v| v.as_str()).unwrap_or("");
+        let ip = doc.get("ip").and_then(|v| v.as_str()).unwrap_or("");
+        if mac.is_empty() || ip.is_empty() || from.ip().to_string() != ip {
+            continue;
+        }
+        let configured = ctx.device_ip.lock().unwrap().clone();
+        {
+            let mut known = ctx.device_mac.lock().unwrap();
+            match known.as_deref() {
+                Some(existing) if existing == mac => {}
+                Some(_) => {
+                    tracing::debug!("udp announce ignored (mac mismatch)");
+                    continue;
+                }
+                None if configured == ip => *known = Some(mac.to_string()),
+                None => {
+                    tracing::debug!("udp announce ignored (unknown mac from {ip})");
+                    continue;
+                }
+            }
+        }
+        let changed = {
+            let mut current = ctx.device_ip.lock().unwrap();
+            if *current == ip {
+                false
+            } else {
+                *current = ip.to_string();
+                true
+            }
+        };
+        if changed {
+            tracing::info!("device endpoint updated via UDP: {ip} ({mac})");
+            ctx.device_ip_dirty.store(true, Ordering::SeqCst);
+            ctx.force_push.notify_one();
+        }
+        if doc.get("ble").and_then(|v| v.as_i64()).unwrap_or(0) == 1 {
+            tracing::info!("device requested a BLE handshake via UDP");
+            ctx.udp_ble.store(true, Ordering::SeqCst);
+            ctx.force_ble.notify_one();
+        }
+    }
+}
+
+/// Refresh the cached device status every 10 s; the panel reads the cache.
+async fn device_cache_loop(ctx: Arc<AppCtx>) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        if ctx.status.lock().unwrap().paused {
+            continue;
+        }
+        let ip = ctx.device_ip.lock().unwrap().clone();
+        let fetch_ip = ip.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            bridge_core::device::fetch(&fetch_ip, Duration::from_secs(3))
+        })
+        .await;
+        let (online, fields, mac) = match result {
+            Ok(Ok(status)) => {
+                let mac = status.get("mac").map(str::to_string);
+                (true, status.fields, mac)
+            }
+            Ok(Err(e)) => {
+                tracing::debug!("device status fetch {ip}: {e}");
+                (false, Vec::new(), None)
+            }
+            Err(e) => {
+                tracing::debug!("device status task: {e}");
+                (false, Vec::new(), None)
+            }
+        };
+        if let Some(mac) = mac {
+            if !mac.is_empty() {
+                *ctx.device_mac.lock().unwrap() = Some(mac);
+            }
+        }
+        let mut cache = ctx.device_cache.lock().unwrap();
+        let fields = if online {
+            fields
+        } else {
+            cache.as_ref().map(|c| c.fields.clone()).unwrap_or_default()
+        };
+        *cache = Some(CachedDevice {
+            fetched_at: now_secs(),
+            online,
+            ip,
+            fields,
+        });
+    }
+}
+
+async fn run_services(ctx: Arc<AppCtx>) {
+    // A missing codex.exe must not block HTTP/MCP/BLE: the poller re-discovers
+    // the CLI itself (Codex auto-upgrades move the binary).
+    let exe = match locate_codex(ctx.config.codex_path.as_deref()) {
+        Ok(exe) => {
+            tracing::info!("codex cli: {}", exe.display());
+            Some(exe)
+        }
+        Err(e) => {
+            tracing::error!("codex cli not found: {e}");
+            let mut status = ctx.status.lock().unwrap();
+            status.last_error = Some(format!("codex cli: {e}"));
+            status.last_error_at = Some(now_secs());
+            None
+        }
+    };
 
     let addr = format!("0.0.0.0:{}", ctx.config.port).parse().expect("addr");
     let http_state = AppState {
@@ -774,13 +829,20 @@ async fn run_services(ctx: Arc<AppCtx>) {
 
     let poller = PollerConfig {
         exe,
+        codex_override: ctx.config.codex_path.clone(),
         host_id: short_id(&host_label()),
+        bridge_host: lan_ip(),
+        bridge_port: ctx.config.port,
         interval_secs: ctx.config.interval_secs,
         templates: ctx.library.clone(),
-        idle_template: ctx.idle_template.clone(),
         active_hold_seconds: ctx.config.active_hold_seconds,
     };
     tokio::spawn(run_poller(poller, ctx.envelope.clone()));
+
+    let udp_ctx = ctx.clone();
+    tokio::spawn(async move { udp_listen(udp_ctx).await });
+    let cache_ctx = ctx.clone();
+    tokio::spawn(async move { device_cache_loop(cache_ctx).await });
 
     // Usage push (sleep.md §4.3/§4.6): POST the envelope to the device on
     // fingerprint change or 5 min heartbeat. Connection errors just mean the
@@ -802,17 +864,23 @@ async fn run_services(ctx: Arc<AppCtx>) {
             let mut last_ok: u64 = 0;
             loop {
                 // Check the fingerprint every 3 s so an envelope change reaches
-                // the device well inside the T9 ≤5 s budget.
-                tokio::time::sleep(Duration::from_secs(3)).await;
+                // the device well inside the T9 ≤5 s budget. A UDP endpoint
+                // update wakes the loop and skips the fingerprint gate.
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+                    _ = ctx.force_push.notified() => {}
+                }
+                let forced = ctx.device_ip_dirty.swap(false, Ordering::SeqCst);
                 let usage = ctx.envelope.try_read().ok().and_then(|g| g.clone());
                 let Some(usage) = usage else { continue };
                 let text = usage.to_string();
                 let fp = usage_fingerprint(&usage);
                 let now = now_secs() as u64;
-                if fp == last_fp && now.saturating_sub(last_ok) < 300 {
+                if !forced && fp == last_fp && now.saturating_sub(last_ok) < 300 {
                     continue;
                 }
-                let url = format!("http://{}/usage", ctx.config.device_ip);
+                let device_ip = ctx.device_ip.lock().unwrap().clone();
+                let url = format!("http://{device_ip}/usage");
                 match client
                     .post(&url)
                     .bearer_auth(&ctx.config.token)
@@ -857,53 +925,22 @@ async fn run_services(ctx: Arc<AppCtx>) {
         });
     }
 
-        let mut misses: u32 = 0;
-    let mut last_fp: u64 = 0;
-    let mut pause_until: u64 = 0;
+    // v0.12 demand-driven BLE (docs/power-state.md §9): no periodic scanning.
+    // A cycle runs only for explicit work (panel/MCP push, force sync) or when
+    // the device asks for a handshake in its UDP announce (ble=1).
     loop {
-        let paused = ctx.status.lock().unwrap().paused;
-        if paused {
+        if ctx.status.lock().unwrap().paused {
             tokio::time::sleep(Duration::from_secs(2)).await;
             continue;
         }
-        let first = !ctx.ble_primed.swap(true, Ordering::SeqCst);
-        let now = now_secs() as u64;
+        tokio::select! {
+            _ = ctx.force_ble.notified() => {}
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+        }
+        let udp_request = ctx.udp_ble.swap(false, Ordering::SeqCst);
         let pending_waiting = !ctx.status.lock().unwrap().pending.ids.is_empty();
-        // Demand-driven scanning (sleep.md §4.6): while `POST /usage` is
-        // succeeding the device is LIVE and BLE is off on its side, so scan
-        // only for explicit work or when the HTTP path goes quiet. On the first
-        // pass, wait briefly for the initial push instead of scanning blindly.
-        let http_ok = http_push_healthy(&ctx)
-            || (first && wait_http_healthy(&ctx, Duration::from_secs(8)).await);
-        if !pending_waiting && http_ok {
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(15)) => {}
-                _ = ctx.force_ble.notified() => {}
-            }
+        if !udp_request && !pending_waiting {
             continue;
-        }
-        let fp = ble_fingerprint(&ctx);
-        if !pending_waiting && fp == last_fp && now < pause_until {
-            let wait = Duration::from_secs(pause_until - now);
-            tokio::select! {
-                _ = tokio::time::sleep(wait) => {}
-                _ = ctx.force_ble.notified() => {}
-
-
-            }
-            continue;
-        }
-        let mut manual = pending_waiting;
-        let wait = if first || pending_waiting {
-            Duration::ZERO
-        } else {
-            Duration::from_secs(if misses >= 12 { 60 } else { 20 })
-        };
-        if !wait.is_zero() {
-            tokio::select! {
-                _ = tokio::time::sleep(wait) => {}
-                _ = ctx.force_ble.notified() => { manual = true; }
-            }
         }
         let adapter = match Pusher::adapter().await {
             Ok(a) => a,
@@ -919,17 +956,9 @@ async fn run_services(ctx: Arc<AppCtx>) {
             }
         };
         // Templates are only pushed when explicitly requested (profile push in
-        // the panel or MCP profile_push); the periodic cycle just refreshes
-        // usage/endpoint. Explicit profile pushes also carry the idle template.
+        // the panel or MCP profile_push).
         let pending = std::mem::take(&mut ctx.status.lock().unwrap().pending);
-        let mut push_ids = pending.ids.clone();
-        if !push_ids.is_empty() {
-            if let Some(idle) = ctx.idle_template.read().await.clone() {
-                if ctx.library.read().await.get(&idle).is_some() && !push_ids.contains(&idle) {
-                    push_ids.push(idle);
-                }
-            }
-        }
+        let push_ids = pending.ids.clone();
         let ble_cfg = BleConfig {
             name_prefix: "CodexStatus-".to_string(),
             host: lan_ip(),
@@ -937,9 +966,7 @@ async fn run_services(ctx: Arc<AppCtx>) {
             token: ctx.config.token.clone(),
             template_ids: Some(push_ids),
             activate: pending.activate.clone(),
-            // A user-triggered sync (panel/MCP/tray) waits longer for the
-            // device's short DEEP window; periodic rounds stay low-duty.
-            scan_timeout_ms: if manual { 30000 } else { 5000 },
+            scan_timeout_ms: 30000,
         };
         let pusher = Pusher::new(
             ble_cfg,
@@ -948,9 +975,10 @@ async fn run_services(ctx: Arc<AppCtx>) {
         );
         match pusher.cycle_once(&adapter).await {
             Ok(()) => {
-                tracing::info!("ble cycle done");
-                misses = 0;
-                last_fp = fp;
+                tracing::info!(
+                    "ble cycle done ({})",
+                    if udp_request { "udp handshake" } else { "explicit push" }
+                );
                 let mut status = ctx.status.lock().unwrap();
                 status.last_sync = Some(now_secs());
                 status.last_error = None;
@@ -959,37 +987,45 @@ async fn run_services(ctx: Arc<AppCtx>) {
                     status.last_push_at = Some(now_secs());
                     status.last_push_error = None;
                 }
-                pause_until = now_secs() as u64 + 300;
             }
             Err(e) => {
-                misses = misses.saturating_add(1);
-                let mut status = ctx.status.lock().unwrap();
-                if http_ok {
-                    // Expected while the device is LIVE (BLE off by design); the
-                    // HTTP push path is healthy, so don't surface a hard error.
-                    tracing::debug!("ble cycle skipped: {e}");
-                } else {
-                    tracing::warn!("ble cycle: {e}");
-                    status.last_error = Some(format!("ble: {e}"));
-                    status.last_error_at = Some(now_secs());
-                }
-                if !pending.ids.is_empty() {
-                    status.last_push_error = Some(format!("ble: {e}"));
-                }
-                for id in pending.ids {
-                    if !status.pending.ids.contains(&id) {
-                        status.pending.ids.push(id);
+                tracing::warn!("ble cycle: {e}");
+                {
+                    let mut status = ctx.status.lock().unwrap();
+                    if !udp_request {
+                        status.last_error = Some(format!("ble: {e}"));
+                        status.last_error_at = Some(now_secs());
+                    }
+                    if !pending.ids.is_empty() {
+                        status.last_push_error = Some(format!("ble: {e}"));
+                    }
+                    for id in pending.ids {
+                        if !status.pending.ids.contains(&id) {
+                            status.pending.ids.push(id);
+                        }
+                    }
+                    if status.pending.activate.is_none() {
+                        status.pending.activate = pending.activate;
                     }
                 }
-                if status.pending.activate.is_none() {
-                    status.pending.activate = pending.activate;
-                }
+                // Give an unreachable device time to re-open its BLE session
+                // before retrying explicit push work.
+                tokio::time::sleep(Duration::from_secs(20)).await;
             }
         }
     }
 }
 
 fn main() {
+    // Hidden watchdog mode: supervise the given pid, restart on abnormal exit.
+    let argv: Vec<String> = std::env::args().collect();
+    if let Some(pos) = argv.iter().position(|a| a == "--watchdog") {
+        if let Some(pid) = argv.get(pos + 1).and_then(|v| v.parse::<u32>().ok()) {
+            watchdog::run(pid);
+        }
+        std::process::exit(1);
+    }
+
     let root = config::repo_root();
     let cfg_path = config::config_path(&root);
     let mut config = Config::load(&cfg_path);
@@ -1031,7 +1067,7 @@ fn main() {
     let library = Library::load(&config.templates).unwrap_or_default();
     tracing::info!("templates: {:?}", library.ids());
     let mcp_port = config.mcp_port;
-    let idle_template = Arc::new(RwLock::new(config.idle_template.clone()));
+    let device_ip = config.device_ip.clone();
     let (mcp_tx, _mcp_rx) = tokio::sync::watch::channel(mcp_port);
     let ctx = Arc::new(AppCtx {
         config,
@@ -1040,7 +1076,6 @@ fn main() {
         envelope: Arc::new(RwLock::new(None)),
         library: Arc::new(RwLock::new(library)),
         force_ble: Arc::new(Notify::new()),
-        idle_template,
         status: Mutex::new(RuntimeStatus {
             last_sync: None,
             last_error: None,
@@ -1052,13 +1087,19 @@ fn main() {
             last_push_ok_at: None,
             push_fail_streak: 0,
         }),
-        ble_primed: AtomicBool::new(false),
+        device_ip: Mutex::new(device_ip),
+        device_mac: Mutex::new(None),
+        device_cache: Mutex::new(None),
+        udp_ble: AtomicBool::new(false),
+        device_ip_dirty: AtomicBool::new(false),
+        force_push: Arc::new(Notify::new()),
         mcp_port: Mutex::new(mcp_port),
         mcp_error: Mutex::new(None),
         mcp_tx,
     });
 
     let ctx_setup = ctx.clone();
+    watchdog::spawn(std::process::id());
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             show_panel(app);
@@ -1075,9 +1116,7 @@ fn main() {
             save_profile,
             delete_profile,
             get_mcp_info,
-            set_mcp_port,
-            get_idle_template,
-            set_idle_template
+            set_mcp_port
         ])
         .setup(move |app| {
             let _ = ctx_setup.app_handle.set(app.handle().clone());
@@ -1132,7 +1171,7 @@ fn main() {
                     move |_app, event| match event.id.as_ref() {
                         "quit" => app_handle.exit(0),
                         "open" => show_panel(&app_handle),
-                        "sync" => ctx.force_ble.notify_one(),
+                        "sync" => request_sync(&ctx),
                         "pause" => {
                             let paused = {
                                 let mut status = ctx.status.lock().unwrap();

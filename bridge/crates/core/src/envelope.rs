@@ -15,11 +15,12 @@ pub struct TemplateRef {
 pub struct EnvelopeOptions {
     pub bridge_label: Option<String>,
     pub bridge_host_id: String,
+    /// Bridge LAN address/port advertised for device-side endpoint self-heal.
+    pub bridge_host: String,
+    pub bridge_port: u16,
     pub next_sync_seconds: u64,
     pub templates: BTreeMap<String, TemplateRef>,
-    /// Device idle screen template id (sleep.md D6, default `quad`).
-    pub idle_template: Option<String>,
-    /// active hold window in seconds (sleep.md D5, default 600).
+    /// active hold window in seconds (default 600).
     pub active_hold_seconds: u64,
 }
 
@@ -27,6 +28,8 @@ pub struct EnvelopeOptions {
 pub fn window_kind(minutes: i64) -> &'static str {
     if minutes == 300 {
         "5h"
+    } else if minutes >= 43200 {
+        "monthly"
     } else if minutes >= 10080 {
         "weekly"
     } else {
@@ -158,14 +161,16 @@ pub fn build_envelope(result: &Value, opts: &EnvelopeOptions) -> Value {
         "server_time": now,
         "next_sync_seconds": opts.next_sync_seconds,
         "active_hold_seconds": opts.active_hold_seconds,
-        "bridge": {"label": opts.bridge_label, "hostId": opts.bridge_host_id},
+        "bridge": {
+            "label": opts.bridge_label,
+            "hostId": opts.bridge_host_id,
+            "host": opts.bridge_host,
+            "port": opts.bridge_port
+        },
         "account": {"plan": plan},
         "buckets": buckets,
         "templates": templates,
     });
-    if let Some(idle) = &opts.idle_template {
-        envelope["idle_template"] = json!(idle);
-    }
     if reset_count > 0 {
         envelope["resetCredits"] = json!({"availableCount": reset_count, "nextExpiresAt": reset_next});
     }

@@ -16,9 +16,8 @@ struct Job {
     ip: String,
     sync_hhmm: String,
     battery: i32,
-    idle: bool,
+    state: String,
     offline_mins: i32,
-    idle_reason: String,
     reply: Sender<(i32, Vec<u8>)>,
 }
 
@@ -64,7 +63,7 @@ fn render_job(job: &Job, out: &mut [u8]) -> i32 {
         Ok(value) => value,
         Err(_) => return -3,
     };
-    let idle_reason = match CString::new(job.idle_reason.as_str()) {
+    let state = match CString::new(job.state.as_str()) {
         Ok(value) => value,
         Err(_) => return -3,
     };
@@ -76,9 +75,8 @@ fn render_job(job: &Job, out: &mut [u8]) -> i32 {
             ip.as_ptr(),
             sync.as_ptr(),
             job.battery,
-            if job.idle { 1 } else { 0 },
+            state.as_ptr(),
             job.offline_mins,
-            idle_reason.as_ptr(),
             out.as_mut_ptr(),
             BUF_LEN as c_int,
         )
@@ -101,9 +99,8 @@ extern "C" {
         ip: *const c_char,
         sync_hhmm: *const c_char,
         battery: c_int,
-        idle: c_int,
+        state: *const c_char,
         offline_mins: c_int,
-        idle_reason: *const c_char,
         out: *mut u8,
         out_len: c_int,
     ) -> c_int;
@@ -115,11 +112,10 @@ pub struct Env<'a> {
     pub ip: &'a str,
     pub sync_hhmm: &'a str,
     pub battery: i32,
-    /// Render mode: IDLE screen (true) / LIVE data (false).
-    pub idle: bool,
+    /// Device state word: `AP` / `BLE ON` / `BLE OFF` / `WIFI OFF`.
+    pub state: &'a str,
     /// Minutes since the last successful sync; negative = unknown.
     pub offline_mins: i32,
-    pub idle_reason: &'a str,
 }
 
 impl Default for Env<'_> {
@@ -129,9 +125,8 @@ impl Default for Env<'_> {
             ip: "0.0.0.0",
             sync_hhmm: "--:--",
             battery: -1,
-            idle: false,
+            state: "BLE OFF",
             offline_mins: -1,
-            idle_reason: "",
         }
     }
 }
@@ -146,9 +141,8 @@ pub fn render_bits(template: &str, usage: &str, env: &Env<'_>) -> anyhow::Result
         ip: env.ip.to_string(),
         sync_hhmm: env.sync_hhmm.to_string(),
         battery: env.battery,
-        idle: env.idle,
+        state: env.state.to_string(),
         offline_mins: env.offline_mins,
-        idle_reason: env.idle_reason.to_string(),
         reply: reply_tx,
     };
     engine()

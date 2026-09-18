@@ -21,7 +21,5 @@ bool   tplStoreLoad(const String &id, String &out);
 bool   tplStoreRemove(const String &id);
 String tplStoreActive();
 bool   tplStoreSetActive(const String &id);
-String tplStoreIdle();
-void   tplStoreSetIdle(const String &id);
 void   tplStoreTouch(const String &id);
 void   tplStoreClear();
