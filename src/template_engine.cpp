@@ -31,10 +31,14 @@ struct BindSpec {
     int      winIndex = 0;
 };
 
+// `when` accepts either {"bind":…,"exists":bool} or {"bind":…,"equals":…}
+// (string or integer compared against the bind's rendered text).
 struct DrawCondition {
     bool active = false;
     BindSpec bind;
     bool exists = false;
+    bool useEquals = false;
+    String equals;
 };
 
 static sFONT *fontByName(const char *name) {
@@ -299,15 +303,29 @@ static bool parseCondition(JsonObject e, DrawCondition &condition) {
     if (raw.isNull()) return false;
     if (!raw.is<JsonObject>()) return false;
     JsonObject obj = raw.as<JsonObject>();
-    if (obj.size() != 2 || obj["bind"].isNull() || obj["exists"].isNull()) return false;
+    bool hasExists = !obj["exists"].isNull();
+    bool hasEquals = !obj["equals"].isNull();
+    if (obj.size() != 2 || obj["bind"].isNull() || hasExists == hasEquals) return false;
     for (JsonPair kv : obj) {
         const char *key = kv.key().c_str();
-        if (strcmp(key, "bind") && strcmp(key, "exists")) return false;
+        if (strcmp(key, "bind") && strcmp(key, "exists") && strcmp(key, "equals")) return false;
     }
     const char *bind = obj["bind"].as<const char *>();
     if (!bind || !parseBind(String(bind), condition.bind)) return false;
-    if (!obj["exists"].is<bool>()) return false;
-    condition.exists = obj["exists"].as<bool>();
+    if (hasExists) {
+        if (!obj["exists"].is<bool>()) return false;
+        condition.exists = obj["exists"].as<bool>();
+    } else {
+        JsonVariant eq = obj["equals"];
+        if (eq.is<const char *>()) {
+            condition.equals = eq.as<const char *>();
+        } else if (!eq.is<bool>() && eq.is<long long>()) {
+            condition.equals = String((long long)eq.as<long long>());
+        } else {
+            return false;
+        }
+        condition.useEquals = true;
+    }
     condition.active = true;
     return true;
 }
@@ -315,6 +333,11 @@ static bool parseCondition(JsonObject e, DrawCondition &condition) {
 static bool conditionMatches(const DrawCondition &condition, JsonDocument &usage,
                              const TplEnv &env, bool haveUsage) {
     if (!condition.active) return true;
+    if (condition.useEquals) {
+        String value;
+        if (!evalBind(condition.bind, TTF_DATE, usage, env, value)) return false;
+        return value == condition.equals;
+    }
     return bindExists(condition.bind, usage, env, haveUsage) == condition.exists;
 }
 

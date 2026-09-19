@@ -90,6 +90,14 @@
 
 - `device.state` 绑定值 = `BLE ON` / `BLE OFF` / `WIFI OFF` / `AP`
   （WIFI OFF 优先于 BLE ON；正常 IDLE 显示 `BLE OFF`）。
+- **`when` 条件（0.13.5+）**：`{"bind":…,"exists":bool}`（值是否存在）或
+  `{"bind":…,"equals":…}`（与绑定的渲染文本比较，支持字符串与整数，如
+  `device.state` equals `"WIFI OFF"`）；两种键互斥且只允许 `bind` + 其一，
+  未知键/类型整份拒绝。`equals` 模板需 `min_fw=0.13.5`。
+- **默认 quad（v8）状态图标**：右上第一行 `[BT][WiFi][Bridge][时间]`——
+  BT 仅 `device.state=BLE ON` 显示；WiFi 在 `WIFI OFF` 显示断弧+`!`；
+  Bridge 在 `device.offline_mins` 存在或 `WIFI OFF` 时显示斜杠；原
+  `device.state` 文本行已移除，状态由图标表达。
 - **移除待机模板功能**：删除 `mode: idle/live` 元素语义（模板引擎/Rust
   canonical/Python 测试桥三端同步），模板改为单布局；`device.idle_reason`
   绑定删除；`device.offline_mins` = 联系不上 bridge 的分钟数：桥有 5min

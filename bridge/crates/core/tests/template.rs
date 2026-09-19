@@ -152,6 +152,41 @@ fn validates_quad_text_bounds_formats_and_conditions() {
 }
 
 #[test]
+fn validates_when_equals_condition() {
+    let template = |when: Value| {
+        json!({
+            "schema": 1,
+            "canvas": {"w": 200, "h": 200},
+            "elements": [
+                {"type": "icon", "when": when, "x": 0, "y": 0, "w": 8, "h": 8,
+                 "bits": "AAAAAAAAAAA="}
+            ]
+        })
+    };
+    assert!(
+        validate_template(&template(json!({"bind": "device.state", "equals": "WIFI OFF"})))
+            .is_ok()
+    );
+    assert!(validate_template(&template(json!({"bind": "device.battery", "equals": 75}))).is_ok());
+
+    for bad in [
+        json!({"bind": "device.state", "equals": "WIFI OFF", "exists": true}),
+        json!({"bind": "device.state", "equals": true}),
+        json!({"bind": "device.state", "equals": null}),
+        json!({"bind": "device.state", "equals": 1.5}),
+        json!({"bind": "device.state", "equals": ["WIFI OFF"]}),
+        json!({"bind": "device.state", "equals": {"value": "WIFI OFF"}}),
+        json!({"bind": "account.email", "equals": "x"}),
+        json!({"bind": "device.state", "equals": "x", "extra": 1}),
+    ] {
+        assert!(
+            validate_template(&template(bad.clone())).is_err(),
+            "should reject: {bad}"
+        );
+    }
+}
+
+#[test]
 fn chunks_are_sequential_with_offset_prefix() {
     let data: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
     let chunks = encode_chunks(&data, 180);

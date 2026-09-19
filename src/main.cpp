@@ -43,7 +43,7 @@
 #include "template_engine.h"
 #include "template_xfer.h"
 
-#define FW_VERSION    "0.13.4-bw"
+#define FW_VERSION    "0.13.5-bw"
 #define AP_PASSWORD   "codex1234"
 #define MAX_SLOTS     3
 

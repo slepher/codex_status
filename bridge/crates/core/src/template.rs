@@ -171,15 +171,32 @@ fn validate_condition(e: &Value) -> Result<(), String> {
     let Some(obj) = raw.as_object() else {
         return Err("when".into());
     };
-    if obj.len() != 2 || obj.keys().any(|key| key != "bind" && key != "exists") {
+    if obj.len() != 2
+        || obj
+            .keys()
+            .any(|key| key != "bind" && key != "exists" && key != "equals")
+    {
         return Err("when".into());
     }
     let bind = obj.get("bind").and_then(|v| v.as_str()).ok_or("when bind")?;
     if parse_bind(bind).is_none() {
         return Err(format!("when bind {bind}"));
     }
-    if obj.get("exists").and_then(|v| v.as_bool()).is_none() {
-        return Err("when exists".into());
+    let has_exists = obj.contains_key("exists");
+    let has_equals = obj.contains_key("equals");
+    if has_exists == has_equals {
+        return Err("when".into());
+    }
+    if has_exists {
+        if obj.get("exists").and_then(|v| v.as_bool()).is_none() {
+            return Err("when exists".into());
+        }
+    } else {
+        match obj.get("equals") {
+            Some(Value::String(_)) => {}
+            Some(Value::Number(n)) if n.is_i64() || n.is_u64() => {}
+            _ => return Err("when equals".into()),
+        }
     }
     Ok(())
 }
