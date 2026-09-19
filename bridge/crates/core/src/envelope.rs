@@ -1,4 +1,4 @@
-//! Device usage envelope (request.md §7.5), built from the app-server payload.
+//! Device usage envelope (docs/history/request.md §7.5), built from the app-server payload.
 
 use std::collections::BTreeMap;
 

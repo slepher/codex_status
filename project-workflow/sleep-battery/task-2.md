@@ -1,4 +1,4 @@
-# task-2 — M2 protocol and template assets (sleep.md §6 M2.1–2.2)
+# task-2 — M2 protocol and template assets (docs/history/sleep-plan-v4.md §6 M2.1–2.2)
 
 Status: complete (2026-09-17). task-3 (firmware) and task-4 (bridge) follow.
 
@@ -17,7 +17,7 @@ core tests.
   `device.idle_reason` (`boot`/`wifi_lost`/`bridge_lost`/`env_switch`).
 - Envelope: `idle_template` (string, bridge-selected; omitted when unset) and
   `active_hold_seconds` (default 600).
-- quad: `min_fw 0.10`, `version 4`, bottom-left variants per sleep.md §4.4.
+- quad: `min_fw 0.10`, `version 4`, bottom-left variants per docs/history/sleep-plan-v4.md §4.4.
 
 ## Implemented
 

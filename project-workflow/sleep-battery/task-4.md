@@ -7,7 +7,7 @@ Owned: `bridge/crates/ble/src/lib.rs`, `bridge/crates/core/src/{runtime,envelope
 
 ## Implemented
 
-- BLE cadence (`sleep.md §4.6`): 20 s rounds with a 5 s scan window; 12
+- BLE cadence (`docs/history/sleep-plan-v4.md §4.6`): 20 s rounds with a 5 s scan window; 12
   consecutive misses → 60 s rounds; after a successful cycle scanning pauses
   until the usage/template/idle fingerprint changes or the 5 min heartbeat
   expires (`ble_fingerprint`).

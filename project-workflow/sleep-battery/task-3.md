@@ -6,7 +6,7 @@ Owned: `src/main.cpp`, `src/{bridge_store,template_store}.{h,cpp}`,
 
 ## Implemented
 
-- Window model (`sleep.md §4.2`): every boot is a window; Wi-Fi scan + best
+- Window model (`docs/history/sleep-plan-v4.md §4.2`): every boot is a window; Wi-Fi scan + best
   saved slot (last-used preference, single 9 s attempt), fetch via active
   endpoint when fresh else same-BSSID MRU first (2 s timeout), BLE advertising
   in parallel; window end always deep-sleeps (`finishWindowAndSleep`), fetch

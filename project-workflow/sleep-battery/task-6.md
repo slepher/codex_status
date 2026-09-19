@@ -2,7 +2,7 @@
 
 Status: implemented 2026-09-17; hardware acceptance passed for the wake paths,
 battery PWR power-off and bridge deployment still pending.
-Spec: `prompt.md` next steps 1–2 (follow-up to `task-5.md` M3 Plan B).
+Spec: `docs/history/icons-task.md` next steps 1–2 (follow-up to `task-5.md` M3 Plan B).
 
 ## Why
 

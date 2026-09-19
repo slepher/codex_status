@@ -1,4 +1,4 @@
-# sleep.md — 电池续航与休眠执行方案（v4）
+# 电池续航与休眠执行方案（v4，原 sleep.md，已归档）
 
 状态：**决策闭合，可执行**。按 M1→M2→M3 顺序实施，无待决项、无可选分支。
 范围：固件 `src/`、桥 `bridge/`、模板资产 `tools/test-bridge/templates/`。
@@ -136,7 +136,7 @@ mDNS 不是缺陷：`ArduinoOTA.begin()` 默认 `_mdnsEnabled=true`，内部已�
 
 - 设备→桥：BLE `push_endpoint`（host=`lan_ip()`）按 MAC 刷新；窗口内自动跟随新网段；`lan_ip()` 多网卡选路列入 M2 验证。
 - 桥→设备：`codex-status-XXXX.local`（MAC 后缀稳定）+ BLE info 缓存 IP 兜底。
-- 信任：mDNS 仅寻址，接入以 bond/token 为准；`request.md` D6"零 mDNS"由本方案修订为"允许 mDNS 寻址"。
+- 信任：mDNS 仅寻址，接入以 bond/token 为准；`docs/history/request.md` D6"零 mDNS"由本方案修订为"允许 mDNS 寻址"。
 
 ### 4.8 场景：回到已保存 Wi-Fi 的环境
 

@@ -34,7 +34,7 @@ struct RuntimeStatus {
     last_push_at: Option<i64>,
     last_push_error: Option<String>,
     /// Last successful `POST /usage`; while fresh, the HTTP path is the healthy
-    /// data route and BLE scanning stays off (sleep.md §4.6).
+    /// data route and BLE scanning stays off (docs/history/sleep-plan-v4.md §4.6).
     last_push_ok_at: Option<i64>,
     /// Consecutive failed push attempts; a single timeout must not invalidate
     /// the HTTP path (the device's WebServer occasionally misses a request).
@@ -1372,7 +1372,7 @@ async fn reload_templates(state: State<'_, Arc<AppCtx>>) -> Result<usize, String
 /// the rolling `resetsAt` of unused windows (the app-server reports
 /// `now + window` on every poll while `usedPercent` is 0) carry no screen
 /// data, so pushes follow real data changes plus the 5 min heartbeat
-/// (sleep.md §4.3) instead of firing on every poll.
+/// (docs/history/sleep-plan-v4.md §4.3) instead of firing on every poll.
 fn usage_fingerprint(usage: &Value) -> u64 {
     let mut value = usage.clone();
     if let Some(obj) = value.as_object_mut() {
@@ -1627,7 +1627,7 @@ async fn run_services(ctx: Arc<AppCtx>) {
     let cache_ctx = ctx.clone();
     tokio::spawn(async move { device_cache_loop(cache_ctx).await });
 
-    // Usage push (sleep.md §4.3/§4.6): POST the envelope to the device on
+    // Usage push (docs/history/sleep-plan-v4.md §4.3/§4.6): POST the envelope to the device on
     // fingerprint change or 5 min heartbeat. Connection errors just mean the
     // device is in DEEP; the BLE/window path covers that.
     {

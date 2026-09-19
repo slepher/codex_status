@@ -17,5 +17,5 @@
   通告触发路径本次未捕获到该广播（UDP 广播偶发丢失），机制未变、手动路径已验证。
 - 遗留：ARP 邻居表冷路径（真实换网）未复现，留待现场。
 - 桥当前为 debug 构建（PID 5260 父 + watchdog），固件 0.13.4-bw（ota_0）。
-- 未提交：本目录、`prompt.md`、`PROGRESS.md`、`docs/power-state.md`、固件与桥
+- 未提交：本目录、`docs/history/icons-task.md`、`PROGRESS.md`、`docs/power-state.md`、固件与桥
   代码（等用户同意）。

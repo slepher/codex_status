@@ -1,0 +1,89 @@
+# AGENTS.md — Codex Status
+
+## 项目概览
+
+便携墨水屏显示本机 Codex 余量：ESP32-S3（Waveshare 1.54" 200×200 B/W，SSD1681，局刷 ~300ms）本地渲染；Rust 桥接（Tauri v2 托盘进程）通过 `codex app-server` JSON-RPC 取数，经 Wi-Fi HTTP（主通道）或 BLE GATT（备选）下发 usage 与模板。换样式只换模板 JSON，不刷固件。当前固件 0.13.4-bw（关 mDNS；设备身份 = Wi-Fi MAC + 可编辑显示名；显式 claim/lease 占用，桥按空闲自动占用）。
+
+先读 `PROGRESS.md` 最新一节：它是权威交接文档，含设备现场、ROM SHA256 与待办。历史背景见 `docs/history/request.md`、`docs/device-setup-experience.md`；早期讨论见 `docs/history/discussion-summary.md`（历史资料）。
+
+## 目录导航
+
+| 路径 | 内容 |
+|---|---|
+| `src/` | 固件（PlatformIO/Arduino）。入口 `main.cpp`；`template_engine/template_xfer/template_store`（模板）、`ble_bridge`、`usage_client`、`EPD_SSD1681`、`GUI_Paint`、`dev_log`、`bridge_store`、`owner_store`（claim/lease） |
+| `bridge/crates/core` | app-server 客户端、usage 信封、模板库（canonical JSON + CRC32）、LAN HTTP `/usage` `/template` |
+| `bridge/crates/ble` | btleplug central：endpoint/usage/模板推送 |
+| `bridge/crates/render` | 把固件同一份 C++ 引擎编进宿主，像素级预览/离线对拍 |
+| `bridge/crates/mcp` | MCP 工具（status/get/validate/render/save/profile_save/profile_push/firmware_ota/pm_stats/device_rename/device_discover/device_owner/device_claim/device_release），由托盘内建 HTTP 端点 `http://127.0.0.1:8766/mcp` 提供（见 `opencode.jsonc`；设备类工具由 app 侧实现） |
+| `bridge/crates/app` | 生产形态：单实例托盘 + 内建 HTTP/BLE/MCP，运行数据在 `<exe>/data/`；`src/discovery.rs` 为 ARP 发现回退；身份/发现/占用见 `docs/power-state.md` §9.1/§9.2 |
+| `tools/test-bridge` | Python 测试桥（`start.ps1`/`stop.ps1`）、模板库 `templates/*.json`、`profiles.seed.json` |
+| `tools/device-auth` | `request_token.py`：经已绑定 BLE 链路协商 Wi-Fi 操作 token |
+| `tools/*.mjs` | Node 预览生成/场景测试（`generate-quad-preview.mjs`、`test-quad-preview.mjs`） |
+| `project-workflow/` | 任务计划、task 文档与评审记录 |
+| `artifacts/` | 本地证据（ROM、日志、截图、预览），已 gitignore，不入库 |
+
+## 常用命令
+
+固件（仓库根目录）：
+
+```powershell
+pio run                    # 编译
+pio run -t upload          # USB 烧录（用网页 OTA 后先擦 otadata：erase_region 0xD000 0x2000）
+pio device monitor
+```
+
+pm env（M3，pioarduino `custom_sdkconfig`）构建：仓库改名后路径无空格，直接在仓库目录运行 `pio run` 即可（若路径再含空格，IDF 会拒绝，需用 junction 且让 pio 的真实 cwd 落在 junction 上）。勿用 `-v`（GBK 控制台会 UnicodeEncodeError 挂住构建）。生成物 sdkconfig*/CMakeLists.txt/.dummy 等已 gitignore。构建环境细节与踩坑见 `project-workflow/sleep-battery/task-7.md` §7。本板闪存必须 40 MHz（`board_build.f_flash` + `tools/bootloader_40m_fix.py`），否则 GD25Q64 在 80 MHz 下 ID 读错、写入失败。
+
+Rust 桥（`bridge/` 目录；Windows 才能跑 BLE/Tauri）：
+
+```powershell
+cargo test
+cargo run -p bridge-core -- --once          # 拉一次真实数据并打印信封
+cargo run -p bridge-core                    # 起 HTTP :8765（--templates 指向模板目录）
+cargo run -p bridge-ble -- --once           # 单次 BLE 推送
+cargo run -p bridge-app                     # 托盘应用（生产形态，进程内含 HTTP+BLE+MCP）
+cargo run -p bridge-render -- --template <json> --out <png>   # 离线渲染对拍
+```
+
+环境变量：`CODEX_STATUS_PORT/TOKEN/TEMPLATES/INTERVAL`、`CODEX_STATUS_CODEX`、`CODEX_STATUS_DATA`、`CODEX_STATUS_DEVICE_IP/MAC/NAME`、`CODEX_STATUS_BRIDGE_NAME`。
+
+工具与校验：
+
+```powershell
+pwsh tools/start-bridge.ps1   # 后台启动 bridge-app（隐藏窗口、日志进 artifacts/、立即返回；重复调用只打印 PID）
+Stop-Process -Id (Get-Content artifacts/bridge-app-run.pid)   # 停止 bridge-app
+node tools/generate-quad-preview.mjs
+node tools/test-quad-preview.mjs
+pwsh tools/test-bridge/start.ps1   # 后台启动 Python 测试桥；stop.ps1 停止
+git diff --check                   # 提交前必查
+```
+
+## 关键不变量
+
+- 三方模板一致：固件引擎、Rust canonical JSON、Python 测试桥的模板哈希必须相同；`type/font/bind` 未识别即整份拒绝（dry-run 校验，不半渲染）。改模板协议必须同时改固件、`bridge/crates/core/template.rs` 与测试。
+- 渲染一致：`crates/render` 与固件共用同一份 C++ 引擎，预览须逐像素一致；缺省 battery=75。
+- 所有绘制文本先做 ASCII 净化（防字库越界）。
+- `/update`、`/doUpdate`、ArduinoOTA、`POST /claim` 必须携带设备 token（开机自动签发并存于 NVS，仅经绑定 BLE 链路取用/轮换）；无/错 token 返回 401，不要绕过或放宽。
+- 设备身份 = Wi-Fi MAC（学习并持久化），显示名可改但非主键；UDP/HTTP/BLE 通告 MAC 不符即拒绝。发现链：属性 IP → UDP → ARP（Windows）→ BLE（手动兜底）；mDNS 已关，勿再依赖 `.local`。
+- 占用只走显式 `POST /claim`：`usage`/`template` 永不创建/转移 owner（仅刷新匹配 id 的 `last_seen`）；owner 有效且 `bridge.hostId`（template 用 `bridge_id`）不符一律 409，`activate` 无旁路；lease 到期只清空。桥空闲自动 claim、60s 续约、他人占用不推送；推送仍是用户显式动作（claim 是协议行为，不等于推送模板）。
+- 改 GATT 特征表后 Windows 会缓存旧属性，需解除配对再重配（或后续评估 Service Changed）。
+- 便携数据布局：运行数据 `<exe>/data/`，种子 `<exe>/seed/`（开发回退 `tools/test-bridge/`）；程序不写仓库。
+- 推送是用户显式动作（以 profile 为单位，≤3 启用）；保存模板只落盘，不得自动推送。
+- 版本号 `FW_VERSION` 在 `src/main.cpp`；固件发布后在 `PROGRESS.md` 记录 ROM 路径与 SHA256。
+- 显示规则（权威）：5h 桶不存在时显示静态 100 并隐藏其重置时间；`resetCredits.availableCount<=0` 时隐藏 RC 行；label 取不到用户名时整行隐藏。
+
+## 工作流约定
+
+- 每个里程碑后更新 `PROGRESS.md`（现场、证据、待办）；多步工作用 `project-workflow/<initiative>/` 写 plan/task/status/review，先计划再动代码。
+- 提交信息用英文祈使句，沿用现有风格（如 `Firmware 0.8.0: status JSON, log ring, battery; bridge prefers JSON status`）。未经用户要求不要提交。
+- 后台进程启动必须立即返回、不挂住会话：桥用 `pwsh tools/start-bridge.ps1`（`UseShellExecute=true` 完全分离子进程 + 隐藏窗口 + cmd 重定向日志，避免子进程继承 stdio 句柄导致调用方阻塞）；其他服务照此模式（分离启动 + 日志重定向到 `artifacts/`），不用会继承管道句柄的前台/直连方式。不在前台跑长轮询；不是当前 debug/release 构建输出目录（如 `bridge/target/debug`）下运行的桥/设备服务不要擅自停止。停止当前构建目录的桥时先结束 watchdog 子进程（`--watchdog <pid>`）再停父进程，避免 watchdog 拉起重启。
+- 不提交任何密钥：Wi-Fi 密码、BLE token 只存在于设备 RAM/NVS，不落仓库、不进日志。
+
+## 硬件现场与坑
+
+- 设备：192.168.1.50 / SSID `home-wifi`；BLE `CodexStatus-AABBCC`（`70:04:1D:AA:BB:CC`）；USB 串口 COM 口动态（COM3/COM4），用户常拔 USB（无串口，靠 Wi-Fi 状态页/`/status.json`、`/log`）。
+- OTA：上传成功后延迟 1.5s 重启，HTTP 先返回 `UPDATE OK`（客户端超时属既有现象）；双槽 ota_0/ota_1 轮换。
+- 状态可读：`GET /status.json`（fw/槽位/重置原因/RSSI/电量/heap 等）、`GET /log`（4KB RAM 环形日志）与 `GET /pmstats`（PM light-sleep 统计/锁，0.13.0+，只读免 token）；桥优先用 JSON，旧固件回退 HTML。
+- `cargo test --workspace` 可能因运行中的 `bridge-core.exe` 锁定 `target/debug` 失败（不是逻辑失败）；改用隔离 `CARGO_TARGET_DIR` 复测，或核实进程后由用户决定是否停桥。
+- Windows 控制台为 GBK：Python 桥启动时设 `PYTHONIOENCODING=utf-8`，避免 status notify 打印异常。
+- BLE 写入须按 MTU 分片（usage/模板），单次超 MTU 会 `Invalid Attribute Value Length`。

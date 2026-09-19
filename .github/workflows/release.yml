@@ -1,0 +1,105 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: ${{ runner.os }}-pio-${{ hashFiles('platformio.ini') }}
+          restore-keys: ${{ runner.os }}-pio-
+      - run: pip install -U platformio
+      - name: Build firmware
+        run: pio run
+      - name: Check tag matches FW_VERSION
+        run: |
+          fw=$(grep -oP '#define FW_VERSION\s+"\K[^"]+' src/main.cpp)
+          tag="${{ github.ref_name }}"
+          tag="${tag#v}"
+          if [ "$fw" != "${tag}-bw" ] && [ "$fw" != "$tag" ]; then
+            echo "FW_VERSION ($fw) does not match tag (${{ github.ref_name }})"
+            exit 1
+          fi
+      - name: Stage ROM
+        run: |
+          ver="${{ github.ref_name }}"
+          ver="${ver#v}"
+          cp .pio/build/esp32-s3-epaper-154g/firmware.bin "codex-status-${ver}-bw.bin"
+          sha256sum "codex-status-${ver}-bw.bin"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: codex-status-*-bw.bin
+          if-no-files-found: error
+
+  bridge:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: ${{ runner.os }}-pio-${{ hashFiles('platformio.ini') }}
+          restore-keys: ${{ runner.os }}-pio-
+      - run: pip install -U platformio
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bridge
+      - name: Provide ArduinoJson to bridge-render
+        shell: pwsh
+        run: |
+          pio pkg install
+          $hit = Get-ChildItem .pio\libdeps -Recurse -Filter ArduinoJson.h -ErrorAction SilentlyContinue | Where-Object { $_.Directory.Name -eq 'src' } | Select-Object -First 1
+          if (-not $hit) {
+            pio run
+            $hit = Get-ChildItem .pio\libdeps -Recurse -Filter ArduinoJson.h -ErrorAction SilentlyContinue | Where-Object { $_.Directory.Name -eq 'src' } | Select-Object -First 1
+          }
+          if (-not $hit) { throw "ArduinoJson.h not found after pio pkg install / pio run" }
+          "CODEX_STATUS_ARDUINOJSON=$($hit.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Build bridge-app
+        working-directory: bridge
+        run: cargo build -p bridge-app --release --locked
+      - name: Package portable bundle
+        shell: pwsh
+        run: |
+          $ver = $env:GITHUB_REF_NAME -replace '^v',''
+          New-Item -ItemType Directory -Force dist\bundle\seed | Out-Null
+          Copy-Item bridge\target\release\bridge-app.exe dist\bundle\
+          Copy-Item tools\test-bridge\templates dist\bundle\seed\templates -Recurse
+          Copy-Item tools\test-bridge\profiles.seed.json dist\bundle\seed\
+          Copy-Item LICENSE, README.md dist\bundle\
+          Compress-Archive -Path dist\bundle\* -DestinationPath "dist\codex-status-bridge-$ver-windows-x64.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bridge-windows
+          path: dist/*.zip
+          if-no-files-found: error
+
+  release:
+    needs: [firmware, bridge]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

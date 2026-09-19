@@ -2,7 +2,7 @@
 
 Status: started 2026-09-17 (user escalation: waiting for wake windows is not
 acceptable when the bridge is reachable; LIVE + push must land).
-Spec: `sleep.md` §4.1/§4.3/§4.6/§6 M3; decisions D1–D5, D9.
+Spec: `docs/history/sleep-plan-v4.md` §4.1/§4.3/§4.6/§6 M3; decisions D1–D5, D9.
 
 ## Why
 

@@ -1,6 +1,6 @@
 # Architecture after the communication change (M3 and beyond)
 
-Owner-facing consolidation, 2026-09-17. Supersedes nothing in `sleep.md`;
+Owner-facing consolidation, 2026-09-17. Supersedes nothing in `docs/history/sleep-plan-v4.md`;
 fills in the cross-component consequences of moving the data path from
 “device pulls during deep-sleep windows” to “device is LIVE, bridge pushes”.
 

@@ -1,0 +1,28 @@
+{
+  // 项目级配置：仅在本仓库生效，不改动任何全局设置。
+  // 桥（托盘进程）内建本地 HTTP MCP，端口可在面板 MCP tab 修改。
+  "$schema": "https://opencode.ai/config.json",
+  // 仓库外工具链目录（PlatformIO / Rust / 临时目录）一次放行，避免反复弹权限。
+  "permission": {
+    "bash": "allow",
+    "external_directory": {
+      "~/.platformio/**": "allow",
+      "~/.cargo/**": "allow",
+      "~/.rustup/**": "allow",
+      "~/AppData/Local/OpenAI/**": "allow",
+      "~/AppData/Local/Temp/opencode/**": "allow"
+    }
+  },
+  "mcp": {
+    "codex_status": {
+      "type": "remote",
+      "url": "http://127.0.0.1:8766/mcp",
+      "enabled": true,
+      // OTA (firmware_ota) uploads a ROM and waits for the reboot; give the
+      // long-running call room instead of the default 15 s.
+      "timeout": 180000
+    }
+  }
+}
+
+
