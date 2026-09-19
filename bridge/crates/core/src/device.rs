@@ -9,6 +9,8 @@ use anyhow::{anyhow, Result};
 #[derive(Debug, Clone, Default)]
 pub struct DeviceStatus {
     pub fields: Vec<(String, String)>,
+    /// Parsed `/status.json` document when the structured path was used.
+    pub raw: Option<serde_json::Value>,
 }
 
 impl DeviceStatus {
@@ -44,7 +46,10 @@ pub fn fetch(ip: &str, timeout: Duration) -> Result<DeviceStatus> {
     if let Ok(body) = http_get(ip, "/status.json", timeout) {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
             if let Some(fields) = fields_from_json(&value) {
-                return Ok(DeviceStatus { fields });
+                return Ok(DeviceStatus {
+                    fields,
+                    raw: Some(value),
+                });
             }
         }
     }
@@ -63,7 +68,7 @@ pub fn fetch(ip: &str, timeout: Duration) -> Result<DeviceStatus> {
     if fields.is_empty() {
         return Err(anyhow!("no status fields found on device page"));
     }
-    Ok(DeviceStatus { fields })
+    Ok(DeviceStatus { fields, raw: None })
 }
 
 /// Raw PM statistics from `GET /pmstats` (firmware >= 0.13.0): light-sleep

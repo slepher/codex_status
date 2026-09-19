@@ -65,7 +65,8 @@ async fn main() -> Result<()> {
 
     if args.once {
         let adapter = Pusher::adapter().await?;
-        pusher.cycle_once(&adapter).await?;
+        let info = pusher.cycle_once(&adapter).await?;
+        tracing::info!("device info: {info}");
         return Ok(());
     }
     pusher.run(Duration::from_secs(args.interval)).await

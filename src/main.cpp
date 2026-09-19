@@ -37,12 +37,13 @@
 #include "fonts.h"
 #include "ble_bridge.h"
 #include "bridge_store.h"
+#include "owner_store.h"
 #include "usage_client.h"
 #include "template_store.h"
 #include "template_engine.h"
 #include "template_xfer.h"
 
-#define FW_VERSION    "0.13.3-bw"
+#define FW_VERSION    "0.13.4-bw"
 #define AP_PASSWORD   "codex1234"
 #define MAX_SLOTS     3
 
@@ -697,7 +698,8 @@ static void renderUsage(const String &json, const char *channel) {
 }
 
 static void updateInfoExtra() {
-    String items = "\"ip\":\"" + ipText() + "\",\"http_port\":80,\"templates\":[";
+    String items = "\"mac\":\"" + macText() + "\",\"ip\":\"" + ipText() +
+                   "\",\"http_port\":80,\"templates\":[";
     String active = tplStoreActive();
     for (int i = 0; i < tplStoreCount(); i++) {
         TplMeta m;
@@ -777,6 +779,7 @@ static void factoryReset() {
     bleClearBonds();
     storeClear();
     tplStoreClear();
+    ownerClear(true);
     prefs.begin("wifi", false);
     prefs.clear();
     prefs.end();
@@ -916,6 +919,17 @@ static void handleUsagePost() {
         server.send(400, "application/json", "{\"accepted\":false}");
         return;
     }
+    // Occupancy layer (task-4): only the owner may write; no exceptions (an
+    // `activate` flag or a matching endpoint token is not a bypass). With no
+    // valid owner the legacy behavior applies and no owner is ever created.
+    String bridgeId = parsed["bridge"]["hostId"] | "";
+    if (!ownerAllows(bridgeId)) {
+        DevLog.printf("[owner] usage push rejected (occupied, id=%s)\n", bridgeId.c_str());
+        server.send(409, "application/json",
+                    String("{\"accepted\":false,\"error\":\"occupied\",\"owner\":") +
+                        ownerJson() + "}");
+        return;
+    }
     adoptServerTime(parsed);
     applyEnvelopeMeta(parsed, mac);
     bool explicitActivate = parsed["activate"] | false;
@@ -953,6 +967,17 @@ static void handleTemplatePost() {
     String mac;
     if (!endpointTokenAuthorized(mac)) {
         server.send(401, "application/json", "{\"saved\":false,\"err\":\"unauthorized\"}");
+        return;
+    }
+    // Occupancy layer (task-4): template writes carry `bridge_id` (= hostId);
+    // non-owners are rejected with the current owner, `activate` is no bypass.
+    String bridgeId = server.arg("bridge_id");
+    if (!bridgeId.length()) bridgeId = server.header("X-Bridge-Id");
+    if (!ownerAllows(bridgeId)) {
+        DevLog.printf("[owner] template rejected (occupied, id=%s)\n", bridgeId.c_str());
+        server.send(409, "application/json",
+                    String("{\"saved\":false,\"err\":\"occupied\",\"owner\":") +
+                        ownerJson() + "}");
         return;
     }
     if (server.clientContentLength() > 32768) {
@@ -1275,6 +1300,15 @@ static void handleStatus() {
             (activeHash.length() ? String(" hash ") + activeHash : String("")) + ")</li>";
     html += "<li>EPD writes: " + String(epdWriteCount) + " (partial " +
             String(epdPartialReady ? "ready" : "off") + ", streak " + String(epdPartialCount) + ")</li>";
+    {
+        OwnerRec ownerCur;
+        if (ownerGet(ownerCur)) {
+            html += "<li>Owner: " + ownerCur.name + " (" + ownerCur.id + ") " +
+                    ownerCur.host + ":" + String(ownerCur.port) + "</li>";
+        } else {
+            html += "<li>Owner: -</li>";
+        }
+    }
     html += "<li>Free heap: " + String(ESP.getFreeHeap()) + "</li>";
     html += F("</ul><p>");
     if (requestAuthorized()) {
@@ -1329,6 +1363,22 @@ static void handleStatusJson() {
         item["id"] = meta.id;
         item["hash"] = meta.hash;
         item["active"] = meta.id == activeId;
+    }
+    OwnerRec ownerCur;
+    if (ownerGet(ownerCur)) {
+        JsonObject own = doc["owner"].to<JsonObject>();
+        own["id"] = ownerCur.id;
+        own["name"] = ownerCur.name;
+        own["host"] = ownerCur.host;
+        own["port"] = ownerCur.port;
+        own["since_s"] = ownerCur.since;
+        own["last_seen_s"] = ownerCur.lastSeen;
+        own["lease_s"] = ownerCur.lease;
+        uint32_t now = millis() / 1000;
+        uint32_t elapsed = now - ownerCur.lastSeen;
+        own["expires_in_s"] = (elapsed >= ownerCur.lease) ? 0 : (ownerCur.lease - elapsed);
+    } else {
+        doc["owner"] = nullptr;
     }
     String out;
     serializeJson(doc, out);
@@ -1533,6 +1583,93 @@ static bool requestAuthorized() {
     }
     if (server.hasArg("token") && server.arg("token") == authToken) return true;
     return false;
+}
+
+// Occupancy claim/renew/release (task-4). Token-gated; `since` is kept across
+// renewals of the same id, lease expiry only clears (never transfers).
+// UTF-8 sequences pass through (names/ids may be non-ASCII); control
+// characters are replaced. `maxChars` counts characters, never splitting a
+// multi-byte sequence (invalid UTF-8 would break the JSON readers).
+static String claimText(const String &in, size_t maxChars) {
+    String out;
+    size_t chars = 0;
+    for (size_t i = 0; i < in.length() && chars < maxChars;) {
+        unsigned char c = (unsigned char)in[i];
+        size_t seq = 1;
+        if (c >= 0xF0) seq = 4;
+        else if (c >= 0xE0) seq = 3;
+        else if (c >= 0xC0) seq = 2;
+        if (i + seq > in.length()) break;
+        if (c < 0x20 || c == 0x7F) {
+            out += '?';
+            i += 1;
+        } else {
+            for (size_t k = 0; k < seq; k++) out += in[i + k];
+            i += seq;
+        }
+        chars++;
+    }
+    return out;
+}
+
+static void handleClaim() {
+    if (!requestAuthorized()) {
+        server.send(401, "application/json",
+                    String("{\"error\":\"unauthorized\",\"owner\":") + ownerJson() + "}");
+        return;
+    }
+    String id = claimText(server.arg("id"), 32);
+    id.trim();
+    if (!id.length()) {
+        server.send(400, "application/json", "{\"error\":\"args\"}");
+        return;
+    }
+    bool force = server.hasArg("force") && server.arg("force") != "0";
+    bool release = server.hasArg("release") && server.arg("release") != "0";
+    OwnerRec cur;
+    bool have = ownerGet(cur);
+
+    if (release) {
+        if (!have) {
+            server.send(200, "application/json", "{\"owner\":null,\"released\":false}");
+            return;
+        }
+        if (cur.id != id && !force) {
+            server.send(409, "application/json",
+                        String("{\"error\":\"occupied\",\"owner\":") + ownerJson() + "}");
+            return;
+        }
+        DevLog.printf("[owner] released by id=%s force=%d\n", id.c_str(), force ? 1 : 0);
+        ownerClear(true);
+        server.send(200, "application/json", "{\"owner\":null,\"released\":true}");
+        return;
+    }
+
+    if (have && cur.id != id && !force) {
+        DevLog.printf("[owner] claim denied: held by %s\n", cur.id.c_str());
+        server.send(409, "application/json",
+                    String("{\"error\":\"occupied\",\"owner\":") + ownerJson() + "}");
+        return;
+    }
+
+    OwnerRec req;
+    req.id = id;
+    req.name = claimText(server.arg("name"), 16);
+    req.host = claimText(server.arg("host"), 32);
+    long port = server.arg("port").toInt();
+    req.port = (port > 0 && port <= 65535) ? (uint16_t)port : 0;
+    long lease = server.hasArg("lease") ? server.arg("lease").toInt() : 300;
+    if (lease < 60) lease = 60;
+    if (lease > 3600) lease = 3600;
+    req.lease = (uint32_t)lease;
+    bool keepSince = have && cur.id == id;
+    ownerClaim(req, keepSince);
+    DevLog.printf("[owner] %s id=%s name=%s host=%s:%u lease=%us force=%d\n",
+                  keepSince ? "renew" : "claim", req.id.c_str(), req.name.c_str(),
+                  req.host.c_str(), req.port, (unsigned)req.lease, force ? 1 : 0);
+    server.send(200, "application/json",
+                String("{\"owner\":") + ownerJson() + ",\"renew\":" +
+                    (keepSince ? "true" : "false") + "}");
 }
 
 static void handleBleAuth(const String &json) {
@@ -1801,6 +1938,7 @@ static void registerHttpRoutes() {
     server.on("/diag", HTTP_POST, handleDiag);
     server.on("/usage", HTTP_POST, handleUsagePost);
     server.on("/template", HTTP_POST, handleTemplatePost);
+    server.on("/claim", HTTP_POST, handleClaim);
     server.on("/update", HTTP_GET, handleUpdatePage);
     server.on("/doUpdate", HTTP_POST,
         []() {
@@ -1920,8 +2058,11 @@ static void startNormalMode() {
             setOtaLock(false);
             DevLog.printf("[ota] error %u\n", e);
         });
+        // task-3: no mDNS responder. Name resolution (.local) is dropped on
+        // purpose (the bridge discovers via UDP/ARP/BLE); the DHCP hostname
+        // (option 12) set by WiFi.setHostname still shows in the router.
+        ArduinoOTA.setMdnsEnabled(false);
         ArduinoOTA.begin();
-        MDNS.addService("http", "tcp", 80);
         if (plugged && batteryPct > BLE_AUTO_PCT) enterBleOn(false);
         if (storeCount() > 0) tryWifiUsage();
         sendAnnounce(bleOn);
@@ -1983,6 +2124,7 @@ void setup() {
                   running ? running->label : "?", (int)cause,
                   wakeCauseName(cause), plugged ? 1 : 0);
     { Preferences p; p.begin("brg", false); p.end(); }
+    ownerBegin();
 
     tplStoreBegin();
     tplXferBegin(FW_VERSION, []() { pendingTplChanged = true; });
@@ -2165,21 +2307,26 @@ void loop() {
         pendingUsageReady = false;
         JsonDocument parsed;
         if (!deserializeJson(parsed, pendingUsage) && !parsed.as<JsonObject>().isNull()) {
-            adoptServerTime(parsed);
-            String mac = blePeerAddress();
-            applyEnvelopeMeta(parsed, mac);
-            bool explicitActivate = parsed["activate"] | false;
-            bool accepted = usageAccepted(mac, explicitActivate);
-            markSynced();
-            usageCacheSave(pendingUsage);
-            if (accepted) {
-                setActiveMac(mac);
-                rtcActiveAt = timeKnown() ? (uint32_t)time(nullptr) : 0;
-                lastUsage = pendingUsage;
-                lastChannel = pendingChannel;
-                renderActiveUsage(lastUsage, lastChannel.c_str());
+            String bridgeId = parsed["bridge"]["hostId"] | "";
+            if (!ownerAllows(bridgeId)) {
+                DevLog.printf("[owner] BLE usage ignored (occupied, id=%s)\n", bridgeId.c_str());
             } else {
-                DevLog.printf("[usage] BLE usage ignored (active=%s)\n", rtcActiveMac);
+                adoptServerTime(parsed);
+                String mac = blePeerAddress();
+                applyEnvelopeMeta(parsed, mac);
+                bool explicitActivate = parsed["activate"] | false;
+                bool accepted = usageAccepted(mac, explicitActivate);
+                markSynced();
+                usageCacheSave(pendingUsage);
+                if (accepted) {
+                    setActiveMac(mac);
+                    rtcActiveAt = timeKnown() ? (uint32_t)time(nullptr) : 0;
+                    lastUsage = pendingUsage;
+                    lastChannel = pendingChannel;
+                    renderActiveUsage(lastUsage, lastChannel.c_str());
+                } else {
+                    DevLog.printf("[usage] BLE usage ignored (active=%s)\n", rtcActiveMac);
+                }
             }
         } else {
             DevLog.println("[usage] BLE usage rejected: invalid JSON");

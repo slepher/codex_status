@@ -127,6 +127,41 @@
 - 根因修复：app-server 断开不再走退出路径；spawn `codex.exe` 失败时重新发现
   新版路径（Codex 自动升级会换目录）。
 
+### 9.1 设备身份与发现（device-discovery，0.13.4 起）
+
+- **唯一键 = 设备 Wi-Fi MAC**（`/status.json.mac`、UDP 通告 `mac`、BLE info
+  `mac` 同源），学习后持久化 `<exe>/data/bridge-app.json`；**显示名
+  `device_name`** 仅桥本地、可重名、可改名（默认 `CodexStatus-<MAC 后缀>`）；
+  IP 是可变属性。旧配置（只有 `device_ip`）照常工作，首次学到 MAC 时生成默认
+  名写回；此后 MAC 不符的通告一律拒绝。
+- **发现链**：属性 IP（HTTP）→ UDP 通告（`255.255.255.255:8767`，主路径）→
+  ARP 按 MAC 扫本机 /24（`GetIpNetTable` 邻居表 + UDP poke + `SendARP`，
+  `cfg(windows)`；HTTP 连续失败 ~20s 自动触发）→ BLE 读 info
+  `{mac,ip,http_port}`（手动兜底：单击 BOOT 开会话；`ble=1` 通告触发的
+  cycle 顺带采纳）。显式入口：面板「重新发现」/ MCP `device_discover
+  {via: auto|arp|ble}`。发现即写回 `bridge-app.json` 并触发一次推送。
+- **固件 0.13.4 关闭 mDNS**（`ArduinoOTA.setMdnsEnabled(false)`，无
+  `MDNS.addService`）：失去 `.local` 与 `_http._tcp`（DHCP hostname/DHCP
+  option 12 保留）；bridge/panel/MCP/device-auth 均不依赖 mDNS。
+
+### 9.2 设备占用 claim/lease（可选的独占层，0.13.4 起）
+
+- 设备侧 `owner = {id,name,host,port,since_s,last_seen_s,lease_s}` 存 NVS，
+  **只由显式 `POST /claim`（token 门控）写入/清空**；`usage`/`template` 永不
+  创建/转移 owner（仅刷新匹配 id 的 `last_seen`）。lease 到期只清空为空闲。
+  写接口 owner 校验：无 owner → 完全按旧规则（含 activate/BSSID/timeout）；
+  owner 有效且 `bridge.hostId`（template 用 `bridge_id`/`X-Bridge-Id`）不符 →
+  HTTP 409 + owner，无例外。`/status.json.owner` 暴露占用者（空闲 `null`，
+  含 `expires_in_s`）。
+- **桥自动决策**：空闲/过期 → 主动 claim → 推送；己方 → 推送 + 每 60s 幂等
+  续约（与推送解耦）；他人 → 不 claim、不推送，面板/MCP 显示占用者与
+  "强制接管"；收到 409 只显示不静默重试。claim token 用缓存
+  `<exe>/data/device-token.json`（设备 token），401/缺失提示单击 BOOT 走 BLE
+  交接；显式动作用户可触发一次 BLE 取新 token。
+- **用户动作**：强制接管、释放（release + 本地让步，不再自动 claim，直到
+  "占用/恢复"）、重新发现；MCP `device_owner`（只读）/`device_claim{force?}`/
+  `device_release`。旧固件无 `/claim`（404）时自动回退旧推送行为。
+
 ## 10. 固件删除清单
 
 `windowMode`/`liveMode`/退避与窗口同步、idle/live 双渲染、`device.state=IDLE`

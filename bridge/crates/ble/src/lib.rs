@@ -305,6 +305,27 @@ impl Pusher {
         Ok(())
     }
 
+    /// Connect to an advertising device and read its info JSON
+    /// (`{schema,model,fw,proto,mac,ip,http_port,templates,...}`). Used by the
+    /// explicit `device_discover via=ble` fallback; no usage/template writes.
+    pub async fn read_device_info(
+        adapter: &Adapter,
+        name_prefix: &str,
+        scan_timeout_ms: u64,
+    ) -> Result<serde_json::Value> {
+        let scan = Duration::from_millis(scan_timeout_ms.max(1000));
+        let peripheral = Self::wait_for_device(adapter, name_prefix, scan).await?;
+        tracing::info!("connecting {} for device info", peripheral.address());
+        peripheral.connect().await.context("connect")?;
+        peripheral.discover_services().await.context("discover")?;
+        let info = Self::read_info(&peripheral).await;
+        if let Ok(info) = &info {
+            tracing::info!("device info: {info}");
+        }
+        let _ = peripheral.disconnect().await;
+        info
+    }
+
     /// Connect to an advertising device (BLE session on, e.g. after a BOOT
     /// click) and request the OTA/Wi-Fi operation token over the bonded auth
     /// characteristic. The token is disclosed only over this encrypted link.
@@ -360,8 +381,9 @@ impl Pusher {
         token.ok_or_else(|| anyhow!("device token response timed out"))
     }
 
-    /// One connect → push → disconnect cycle.
-    pub async fn cycle_once(&self, adapter: &Adapter) -> Result<()> {
+    /// One connect → push → disconnect cycle. Returns the device info JSON so
+    /// the caller can adopt its identity (mac/ip) when needed.
+    pub async fn cycle_once(&self, adapter: &Adapter) -> Result<serde_json::Value> {
         let scan = Duration::from_millis(self.cfg.scan_timeout_ms.max(1000));
         let peripheral = Self::wait_for_device(adapter, &self.cfg.name_prefix, scan).await?;
         let props = peripheral.properties().await?;
@@ -397,7 +419,8 @@ impl Pusher {
             handle.abort();
         }
         let _ = peripheral.disconnect().await;
-        result
+        result?;
+        Ok(info)
     }
 
     /// Scan/connect/retry loop.
@@ -405,7 +428,7 @@ impl Pusher {
         loop {
             let adapter = Self::adapter().await?;
             match self.cycle_once(&adapter).await {
-                Ok(()) => tracing::info!("BLE cycle done"),
+                Ok(_) => tracing::info!("BLE cycle done"),
                 Err(e) => tracing::warn!("BLE cycle failed: {e}"),
             }
             tokio::time::sleep(interval).await;

@@ -134,7 +134,24 @@
       <div class="card">
         <div class="bar">
           <div class="status" id="device-state">读取中…</div>
-          <div class="menus"><button onclick="refreshDevice()">刷新</button></div>
+          <div class="menus">
+            <button onclick="discoverDevice('auto')">重新发现</button>
+            <button onclick="refreshDevice()">刷新</button>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <h2>身份</h2>
+        <div class="row"><span>名称（点击重命名）</span><span class="name" id="dev-name" onclick="modalRenameDevice()">--</span></div>
+        <div class="row"><span>MAC（唯一键）</span><span id="dev-mac" class="muted">--</span></div>
+        <div class="row"><span>IP（属性）</span><span id="dev-ip" class="muted">--</span></div>
+        <div class="row"><span>最后发现</span><span id="dev-discover" class="muted">--</span></div>
+        <div class="row"><span>占用</span><span id="dev-owner">--</span></div>
+        <div class="toolbar" style="margin-top:8px">
+          <button onclick="claimDevice(false)">占用/恢复</button>
+          <button onclick="claimDevice(true)">强制接管</button>
+          <button onclick="releaseDevice()">释放</button>
+          <button onclick="discoverDevice('ble')">经 BLE 发现</button>
         </div>
       </div>
       <div class="card">
@@ -681,7 +698,10 @@
       $('ring-week').textContent = weekly == null ? '--' : weekly + '%';
       $('sub').textContent = `LAN ${s.lan_ip}:${s.http.split(':').pop()} · 轮询 ${s.interval_secs}s · BLE ${s.ble_interval_secs}s`;
       $('dev-sync').textContent = relTime(s.last_sync);
-      $('last-error').textContent = s.last_error ? '最近错误：' + s.last_error : '';
+      $('last-error').textContent =
+        (s.last_error ? '最近错误：' + s.last_error : '') +
+        (s.device_note ? (s.last_error ? ' · ' : '') + s.device_note : '');
+      renderDeviceIdentity(s.device);
       paused = !!s.paused;
       $('btn-pause').textContent = paused ? '恢复推送' : '暂停推送';
       $('dot').className = 'dot ' + (s.last_error ? 'err' : (s.last_sync ? 'ok' : 'warn'));
@@ -707,10 +727,98 @@
 
   let lastDeviceFetch = 0;
 
+  function fallbackDeviceName(device) {
+    if (device?.name) return device.name;
+    const hex = (device?.mac || '').replace(/[^0-9a-fA-F]/g, '').toUpperCase();
+    return hex.length >= 6 ? 'CodexStatus-' + hex.slice(-6) : (device?.ip || '--');
+  }
+
+  function renderDeviceIdentity(device) {
+    if (!device) return;
+    $('dev-name').textContent = fallbackDeviceName(device);
+    $('dev-mac').textContent = device.mac || '未学习（等待 UDP/BLE 通告）';
+    $('dev-ip').textContent = device.ip || '--';
+    const d = device.discover;
+    $('dev-discover').textContent = d ? `${d.via} · ${relTime(d.at)}` : '--';
+    const owner = device.owner;
+    if (owner) {
+      const who = owner.name || owner.id || '?';
+      const left = owner.expires_in_s != null ? `（剩余 ${owner.expires_in_s}s）` : '';
+      $('dev-owner').textContent = `${who}@${owner.host || '?'}:${owner.port || '?'}${left}`;
+    } else if (device.yielded) {
+      $('dev-owner').textContent = '已释放（本地让步，点"占用/恢复"重新参与）';
+    } else if (device.claim_unsupported) {
+      $('dev-owner').textContent = '未启用（固件 < 0.13.4）';
+    } else {
+      $('dev-owner').textContent = '空闲 / 本桥自动占用';
+    }
+  }
+
+  function modalRenameDevice() {
+    openModal(`
+      <h3>重命名设备</h3>
+      <div class="muted">名字只是显示标签（可重名），MAC 才是唯一键；仅保存在桥本地。</div>
+      <input class="field" id="modal-device-name" value="${escapeAttr($('dev-name').textContent)}">
+      <div class="foot">
+        <button onclick="closeModal()">取消</button>
+        <button class="primary" onclick="submitRenameDevice()">保存</button>
+      </div>`);
+    $('modal-device-name').focus();
+  }
+
+  async function submitRenameDevice() {
+    const name = $('modal-device-name').value.trim();
+    try {
+      const device = await invoke('rename_device', { name });
+      closeModal();
+      renderDeviceIdentity(device);
+    } catch (e) {
+      $('device-state').textContent = '重命名失败：' + e;
+      closeModal();
+    }
+  }
+
+  async function discoverDevice(via) {
+    $('device-state').textContent = `正在发现（${via}）…`;
+    try {
+      const device = await invoke('device_discover', { via });
+      renderDeviceIdentity(device);
+      $('device-state').textContent = `发现成功 · ${device.ip}`;
+      refresh();
+    } catch (e) {
+      $('device-state').textContent = '发现失败：' + e;
+    }
+  }
+
+  async function claimDevice(force) {
+    $('device-state').textContent = force ? '正在强制接管…' : '正在占用…';
+    try {
+      const r = await invoke('claim_device', { force });
+      renderDeviceIdentity(r.device);
+      $('device-state').textContent = '占用完成';
+      refresh();
+    } catch (e) {
+      $('device-state').textContent = '占用失败：' + e;
+    }
+  }
+
+  async function releaseDevice() {
+    $('device-state').textContent = '正在释放…';
+    try {
+      const r = await invoke('release_device');
+      renderDeviceIdentity(r.device);
+      $('device-state').textContent = '已释放（不再自动占用）';
+      refresh();
+    } catch (e) {
+      $('device-state').textContent = '释放失败：' + e;
+    }
+  }
+
   async function refreshDevice() {
     lastDeviceFetch = Date.now();
     try {
       const d = await invoke('get_device_status');
+      renderDeviceIdentity(d.device);
       if (!d.online) {
         $('device-state').textContent = `设备离线（${d.ip}）${d.error ? '：' + d.error : ''}`;
         ['dev-fw','dev-slot','dev-reset','dev-batt','dev-wifi','dev-ble','dev-templates','dev-epd','dev-heap'].forEach((id) => { $(id).textContent = '--'; });
