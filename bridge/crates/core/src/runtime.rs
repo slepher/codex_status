@@ -54,17 +54,36 @@ pub async fn run_poller(cfg: PollerConfig, envelope: Arc<RwLock<Option<Value>>>)
             Ok(mut client) => {
                 match client.initialize().await {
                     Ok(_) => {
-                        let label = match client.read_account().await {
+                        let mut label = match client.read_account().await {
                             Ok(account) => account_username(&account),
                             Err(e) => {
                                 tracing::warn!("account/read: {e}");
                                 None
                             }
                         };
+                        if label.is_none() {
+                            tracing::info!("account label unavailable; will retry each poll");
+                        }
                         backoff = 1;
                         loop {
                             match client.read_rate_limits().await {
                                 Ok(rate_limits) => {
+                                    // A failed/empty account/read at session start
+                                    // (e.g. transient "workspace routing discovery
+                                    // timed out") must not hide the username for the
+                                    // whole session: retry once per poll until it
+                                    // resolves. A set label is kept as-is.
+                                    if label.is_none() {
+                                        match client.read_account().await {
+                                            Ok(account) => {
+                                                label = account_username(&account);
+                                                if let Some(name) = &label {
+                                                    tracing::info!("account label recovered: {name}");
+                                                }
+                                            }
+                                            Err(e) => tracing::debug!("account/read retry: {e}"),
+                                        }
+                                    }
                                     let template_refs =
                                         cfg.templates.read().await.template_refs();
                                     let opts = EnvelopeOptions {

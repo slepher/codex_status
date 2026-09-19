@@ -43,7 +43,7 @@
 #include "template_engine.h"
 #include "template_xfer.h"
 
-#define FW_VERSION    "0.13.5-bw"
+#define FW_VERSION    "0.13.7-bw"
 #define AP_PASSWORD   "codex1234"
 #define MAX_SLOTS     3
 
@@ -361,6 +361,7 @@ static volatile bool pendingTplChanged = false;
 
 static String activeTplJson;
 static String activeTplId;
+static bool   activeTplHasNow = false;
 
 static String lastUsage;
 static String lastChannel = "-";
@@ -714,12 +715,16 @@ static void updateInfoExtra() {
 
 static bool tplCacheLoad() {
     String id = tplStoreActive();
-    if (!id.length()) { activeTplJson = ""; activeTplId = ""; return false; }
+    if (!id.length()) { activeTplJson = ""; activeTplId = ""; activeTplHasNow = false; return false; }
     if (id == activeTplId && activeTplJson.length()) return true;
     String json;
-    if (!tplStoreLoad(id, json)) { activeTplJson = ""; activeTplId = ""; return false; }
+    if (!tplStoreLoad(id, json)) { activeTplJson = ""; activeTplId = ""; activeTplHasNow = false; return false; }
     activeTplJson = json;
     activeTplId = id;
+    // Scan the (multi-KB, possibly PSRAM-backed) template once per load, not
+    // once per loop: the per-loop scan thrashs the wake-path cache and light
+    // sleep never recovers on this 40 MHz-flash board.
+    activeTplHasNow = activeTplJson.indexOf("device.now") >= 0;
     return true;
 }
 
@@ -2354,6 +2359,29 @@ void loop() {
         bool wasShown = lastOfflineMinute > 0;
         lastOfflineMinute = offlineMinute;
         if (offlineMinute > 0 || wasShown) renderCurrent();
+    }
+
+    // Clock bind: while the active template shows `device.now`, redraw when the
+    // local minute changes (partial refresh, ~1/min; the bridge only pushes
+    // every 5 min, so server_time alone would look frozen).
+    static long lastClockMinute = -1;
+    static uint32_t lastClockCheckMs = 0;
+    if (activeTplHasNow) {
+        uint32_t nowMs = millis();
+        // Gated to 1 Hz: gettimeofday is not cheap and calling it (plus
+        // timeKnown) every loop measurably cut into light sleep.
+        if (lastClockCheckMs == 0 || (uint32_t)(nowMs - lastClockCheckMs) >= 1000) {
+            lastClockCheckMs = nowMs;
+            if (timeKnown()) {
+                long minute = (long)time(nullptr) / 60;
+                if (lastClockMinute < 0) {
+                    lastClockMinute = minute;
+                } else if (minute != lastClockMinute) {
+                    lastClockMinute = minute;
+                    renderCurrent();
+                }
+            }
+        }
     }
 
     delay(loopDelayForNow());

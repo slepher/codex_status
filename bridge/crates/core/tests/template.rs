@@ -62,6 +62,7 @@ fn parse_bind_grammar() {
         parse_bind("device.offline_mins"),
         Some(BindSpec::DeviceOfflineMins)
     );
+    assert_eq!(parse_bind("device.now"), Some(BindSpec::DeviceNow));
     assert_eq!(parse_bind("device.idle_reason"), None);
     assert_eq!(
         parse_bind("buckets[codex].monthly.remaining"),
