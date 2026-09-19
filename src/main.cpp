@@ -43,7 +43,7 @@
 #include "template_engine.h"
 #include "template_xfer.h"
 
-#define FW_VERSION    "0.13.7-bw"
+#define FW_VERSION    "0.13.8-bw"
 #define AP_PASSWORD   "codex1234"
 #define MAX_SLOTS     3
 
@@ -1728,8 +1728,14 @@ static void requestAnnounce(bool bleFlag) {
 
 static void serviceAnnounce() {
     if (!wifiUp) return;
-    if ((uint32_t)WiFi.localIP() != announcedIp) { sendAnnounce(bleOn); return; }
-    if (millis() - lastAnnounce > ANNOUNCE_MS) sendAnnounce(bleOn);
+    if (millis() - lastAnnounce > ANNOUNCE_MS) { sendAnnounce(bleOn); return; }
+    // IP-change detection at 1 Hz: esp_netif_get_ip_info() is not free and
+    // calling it every loop fragmented light sleep (see the 1 Hz housekeeping
+    // tick in loop()).
+    static uint32_t lastIpCheckMs = 0;
+    if (lastIpCheckMs && (uint32_t)(millis() - lastIpCheckMs) < 1000) return;
+    lastIpCheckMs = millis();
+    if ((uint32_t)WiFi.localIP() != announcedIp) sendAnnounce(bleOn);
 }
 
 // ---------------- v0.12 state machine ----------------
@@ -1869,7 +1875,6 @@ static void pollWifi() {
             sendAnnounce(bleOn);
             renderCurrent();
         }
-        if ((uint32_t)WiFi.localIP() != announcedIp) sendAnnounce(bleOn);
         return;
     }
     if (wifiUp) {
@@ -2345,35 +2350,38 @@ void loop() {
     serviceAnnounce();
     serviceLed();
 
-    // Keep the offline-minutes row honest while the bridge is unreachable:
-    // once contact is lost (>= BRIDGE_LOST_MIN minutes since the last sync) the
-    // template shows `OFF <n>M`, so redraw when the integer minute changes.
-    // No periodic refresh while the bridge is heartbeating.
+    // 1 Hz housekeeping tick: read the clock once per second and share it
+    // between the offline-minutes row and the `device.now` clock bind. Both
+    // used to call timeKnown()/time() every loop; 0.13.7 only gated the clock
+    // block, and the remaining per-loop clock read still cut into light sleep.
+    //
+    // Offline-minutes row: once contact is lost (>= BRIDGE_LOST_MIN minutes
+    // since the last sync) the template shows `OFF <n>M`, so redraw when the
+    // integer minute changes. No periodic refresh while the bridge is
+    // heartbeating.
     static int lastOfflineMinute = -1;
-    int offlineMinute = -1;
-    if (rtcLastSyncEpoch > 1600000000 && timeKnown()) {
-        long mins = ((long)time(nullptr) - (long)rtcLastSyncEpoch) / 60;
-        if (mins > BRIDGE_LOST_MIN) offlineMinute = (int)mins;
-    }
-    if (offlineMinute != lastOfflineMinute) {
-        bool wasShown = lastOfflineMinute > 0;
-        lastOfflineMinute = offlineMinute;
-        if (offlineMinute > 0 || wasShown) renderCurrent();
-    }
-
-    // Clock bind: while the active template shows `device.now`, redraw when the
-    // local minute changes (partial refresh, ~1/min; the bridge only pushes
-    // every 5 min, so server_time alone would look frozen).
     static long lastClockMinute = -1;
     static uint32_t lastClockCheckMs = 0;
-    if (activeTplHasNow) {
-        uint32_t nowMs = millis();
-        // Gated to 1 Hz: gettimeofday is not cheap and calling it (plus
-        // timeKnown) every loop measurably cut into light sleep.
-        if (lastClockCheckMs == 0 || (uint32_t)(nowMs - lastClockCheckMs) >= 1000) {
-            lastClockCheckMs = nowMs;
-            if (timeKnown()) {
-                long minute = (long)time(nullptr) / 60;
+    uint32_t clockMs = millis();
+    if ((activeTplHasNow || rtcLastSyncEpoch > 1600000000) &&
+        (lastClockCheckMs == 0 || (uint32_t)(clockMs - lastClockCheckMs) >= 1000)) {
+        lastClockCheckMs = clockMs;
+        if (timeKnown()) {
+            time_t nowSec = time(nullptr);
+            if (rtcLastSyncEpoch > 1600000000) {
+                long mins = ((long)nowSec - (long)rtcLastSyncEpoch) / 60;
+                int offlineMinute = (mins > BRIDGE_LOST_MIN) ? (int)mins : -1;
+                if (offlineMinute != lastOfflineMinute) {
+                    bool wasShown = lastOfflineMinute > 0;
+                    lastOfflineMinute = offlineMinute;
+                    if (offlineMinute > 0 || wasShown) renderCurrent();
+                }
+            }
+            // Clock bind: while the active template shows `device.now`, redraw
+            // when the local minute changes (partial refresh, ~1/min; the
+            // bridge only pushes every 5 min, so server_time looks frozen).
+            if (activeTplHasNow) {
+                long minute = (long)nowSec / 60;
                 if (lastClockMinute < 0) {
                     lastClockMinute = minute;
                 } else if (minute != lastClockMinute) {

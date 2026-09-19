@@ -190,7 +190,15 @@ DevLog/`/log`），用于证明 light sleep 生效。0.13.0 起同一文本也�
 `project-workflow/pmstats/`），bridge 面板「功耗」tab 与 MCP `pm_stats` 用它。
 0.13.3 起 `loop()` 空闲轮询为 25ms（有 TCP 客户端/OTA 时自动回 5ms，见
 `loopDelayForNow()`），把 light sleep 碎片从 ~134 次/s 降到 ~45 次/s；诊断
-参数见 `project-workflow/pmstats/task-2.md`。
+参数见 `project-workflow/pmstats/task-2.md`。0.13.8 起 Wi-Fi 自动 light sleep
+的 modem 活跃窗口按 Kconfig 调优（实测 wifi PM 锁 48.8→24–32ms/次、无推送
+窗口 SLEEP ~92–93%）：`CONFIG_ESP_WIFI_SLP_DEFAULT_MIN_ACTIVE_TIME=20`
+（默认 50，ms）、`..._WAIT_BROADCAST_DATA_TIME=10`（默认 15，ms）、
+`..._MAX_ACTIVE_TIME=60`（默认 10，秒，null-data keep-alive）。改这三项后必须
+删除生成的 `sdkconfig.esp32-s3-epaper-154g` 再构建（kconfgen 对已有 sdkconfig
+的值优先，不删不生效；会触发全量 core 重编，~16.5 min）。同版起 loop 尾部为
+1Hz 合并心跳：离线分钟与 `device.now` 共用一次 `time()`，`serviceAnnounce`
+的 IP 变化检查同样 1Hz 门控；详见 `project-workflow/pmstats/task-3.md`。
 
 ## 11. 验收
 
