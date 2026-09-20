@@ -25,7 +25,7 @@ struct Args {
     templates: PathBuf,
     #[arg(long)]
     codex_path: Option<PathBuf>,
-    #[arg(long, default_value = "60")]
+    #[arg(long, default_value = "180")]
     interval: u64,
     /// Fetch once, print the envelope, exit (no HTTP server).
     #[arg(long)]
@@ -92,10 +92,12 @@ async fn main() -> Result<()> {
     }
 
     let addr: SocketAddr = format!("{}:{}", args.bind, args.port).parse()?;
+    let activity = Arc::new(bridge_core::activity::Activity::new());
     let state = AppState {
         token: Arc::new(args.token.clone()),
         envelope: envelope.clone(),
         library: library.clone(),
+        activity: activity.clone(),
     };
     tokio::spawn(async move {
         if let Err(e) = serve(addr, state).await {
@@ -112,6 +114,7 @@ async fn main() -> Result<()> {
         interval_secs: args.interval,
         templates: library.clone(),
         active_hold_seconds: 600,
+        activity,
     };
     run_poller(poller, envelope).await
 }

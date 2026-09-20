@@ -12,6 +12,7 @@ use anyhow::Result;
 use serde_json::Value;
 use tokio::sync::RwLock;
 
+use crate::activity::Activity;
 use crate::codex::{locate_codex, CodexClient};
 use crate::envelope::{account_username, build_envelope, EnvelopeOptions};
 use crate::template::Library;
@@ -29,6 +30,8 @@ pub struct PollerConfig {
     pub templates: Arc<RwLock<Library>>,
     /// active hold window in seconds (default 600).
     pub active_hold_seconds: u64,
+    /// v0.14 activity tracker (usage_rev / last_change_at for mode decisions).
+    pub activity: Arc<Activity>,
 }
 
 pub async fn run_poller(cfg: PollerConfig, envelope: Arc<RwLock<Option<Value>>>) -> Result<()> {
@@ -52,6 +55,7 @@ pub async fn run_poller(cfg: PollerConfig, envelope: Arc<RwLock<Option<Value>>>)
         let path = exe.clone().expect("codex path");
         match CodexClient::spawn(&path).await {
             Ok(mut client) => {
+                let rate_limit = client.rate_limit_signal();
                 match client.initialize().await {
                     Ok(_) => {
                         let mut label = match client.read_account().await {
@@ -95,8 +99,14 @@ pub async fn run_poller(cfg: PollerConfig, envelope: Arc<RwLock<Option<Value>>>)
                                         templates: template_refs,
                                         active_hold_seconds: cfg.active_hold_seconds,
                                     };
-                                    *envelope.write().await =
-                                        Some(build_envelope(&rate_limits, &opts));
+                                    let next_envelope = build_envelope(&rate_limits, &opts);
+                                    if cfg.activity.note_envelope(&next_envelope) {
+                                        tracing::info!(
+                                            "usage changed (rev {})",
+                                            cfg.activity.usage_rev()
+                                        );
+                                    }
+                                    *envelope.write().await = Some(next_envelope);
                                     tracing::info!("usage refreshed");
                                 }
                                 Err(e) => {
@@ -104,7 +114,16 @@ pub async fn run_poller(cfg: PollerConfig, envelope: Arc<RwLock<Option<Value>>>)
                                     break;
                                 }
                             }
-                            tokio::time::sleep(Duration::from_secs(cfg.interval_secs)).await;
+                            // Event-driven primary path: the app-server pushes a
+                            // rolling rate-limit update when quota changes, so
+                            // refresh immediately. The interval is only the
+                            // fallback heartbeat (default 3 min).
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_secs(cfg.interval_secs)) => {}
+                                _ = rate_limit.notified() => {
+                                    tracing::info!("rate limit update notification: refreshing now");
+                                }
+                            }
                         }
                     }
                     Err(e) => tracing::warn!("initialize: {e}"),

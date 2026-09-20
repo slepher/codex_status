@@ -134,10 +134,32 @@ fn fields_from_json(value: &serde_json::Value) -> Option<Vec<(String, String)>> 
     } else {
         "--".to_string()
     };
+    // v0.14 deep/light mode fields (absent on older firmware).
+    let mode = text("mode").unwrap_or_default();
+    let next_contact = number("next_contact_s").unwrap_or(0);
+    let next_in = number("next_contact_in_s").unwrap_or(0);
+    let mode_text = if mode.is_empty() {
+        "-".to_string()
+    } else if next_contact > 0 {
+        format!("{mode} (next contact {next_in}s / every {next_contact}s)")
+    } else {
+        mode
+    };
+    let deep_text = value
+        .get("deep")
+        .map(|deep| {
+            let clock = deep.get("clock_ticks").and_then(|v| v.as_u64()).unwrap_or(0);
+            let net = deep.get("net_windows").and_then(|v| v.as_u64()).unwrap_or(0);
+            let fails = deep.get("net_fails").and_then(|v| v.as_u64()).unwrap_or(0);
+            format!("clock {clock}, net {net} ({fails} fail)")
+        })
+        .unwrap_or_else(|| "-".to_string());
     Some(vec![
         ("Version".to_string(), fw),
         ("MAC".to_string(), mac),
         ("State".to_string(), format!("{state} (USB {plugged}, wifi {wifi_state}, retry {retry_stage})")),
+        ("Mode".to_string(), mode_text),
+        ("Deep".to_string(), deep_text),
         ("Running".to_string(), format!("{slot} (next OTA slot: {next_slot})")),
         ("Reset reason".to_string(), format!("{reset} (uptime {uptime}s)")),
         ("SSID".to_string(), ssid),

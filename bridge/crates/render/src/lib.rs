@@ -18,6 +18,7 @@ struct Job {
     battery: i32,
     state: String,
     offline_mins: i32,
+    mode: String,
     reply: Sender<(i32, Vec<u8>)>,
 }
 
@@ -67,6 +68,10 @@ fn render_job(job: &Job, out: &mut [u8]) -> i32 {
         Ok(value) => value,
         Err(_) => return -3,
     };
+    let mode = match CString::new(job.mode.as_str()) {
+        Ok(value) => value,
+        Err(_) => return -3,
+    };
     unsafe {
         codex_render(
             tmpl.as_ptr(),
@@ -77,6 +82,7 @@ fn render_job(job: &Job, out: &mut [u8]) -> i32 {
             job.battery,
             state.as_ptr(),
             job.offline_mins,
+            mode.as_ptr(),
             out.as_mut_ptr(),
             BUF_LEN as c_int,
         )
@@ -101,6 +107,7 @@ extern "C" {
         battery: c_int,
         state: *const c_char,
         offline_mins: c_int,
+        mode: *const c_char,
         out: *mut u8,
         out_len: c_int,
     ) -> c_int;
@@ -112,10 +119,12 @@ pub struct Env<'a> {
     pub ip: &'a str,
     pub sync_hhmm: &'a str,
     pub battery: i32,
-    /// Device state word: `AP` / `BLE ON` / `BLE OFF` / `WIFI OFF`.
+    /// Device state word: `AP` / `BLE ON` / `BLE OFF` / `WIFI OFF` / `DEEP`.
     pub state: &'a str,
     /// Minutes since the last successful sync; negative = unknown.
     pub offline_mins: i32,
+    /// Device mode word: `deep` / `light` (bind `device.mode`, v0.14).
+    pub mode: &'a str,
 }
 
 impl Default for Env<'_> {
@@ -127,6 +136,7 @@ impl Default for Env<'_> {
             battery: -1,
             state: "BLE OFF",
             offline_mins: -1,
+            mode: "light",
         }
     }
 }
@@ -143,6 +153,7 @@ pub fn render_bits(template: &str, usage: &str, env: &Env<'_>) -> anyhow::Result
         battery: env.battery,
         state: env.state.to_string(),
         offline_mins: env.offline_mins,
+        mode: env.mode.to_string(),
         reply: reply_tx,
     };
     engine()

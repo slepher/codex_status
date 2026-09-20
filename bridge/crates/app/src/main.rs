@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bridge_ble::{lan_ip, BleConfig, Pusher};
+use bridge_core::activity::{usage_fingerprint, Activity};
 use bridge_core::codex::locate_codex;
 use bridge_core::http::{serve, AppState};
 use bridge_core::runtime::{run_poller, PollerConfig};
@@ -112,6 +113,11 @@ struct AppCtx {
     arp_running: AtomicBool,
     /// Consecutive failed `/status.json` reads (ARP trigger threshold).
     device_fail_streak: AtomicU32,
+    /// v0.14 mode/activity state shared with the HTTP pull path
+    /// (usage_rev / last_change_at / pending queues; docs §13.4).
+    activity: Arc<Activity>,
+    /// ROM path of an OTA queued while the device was asleep (`pending.ota`).
+    pending_ota_rom: Mutex<Option<PathBuf>>,
     /// The device asked for a BLE handshake in its UDP announce (`ble=1`).
     udp_ble: AtomicBool,
     /// Set when the device address changed; the push loop sends immediately.
@@ -465,6 +471,7 @@ async fn get_status(state: State<'_, Arc<AppCtx>>) -> Result<Value, String> {
     // Compute the device snapshot before locking `status` (it takes the same
     // locks in the opposite order and would deadlock against a 3 s poll).
     let device = device_identity_json(&state);
+    let activity = state.activity.snapshot();
     let status = state.status.lock().unwrap();
     Ok(json!({
         "http": format!("http://0.0.0.0:{}", state.config.port),
@@ -483,6 +490,7 @@ async fn get_status(state: State<'_, Arc<AppCtx>>) -> Result<Value, String> {
         "last_error": status.last_error,
         "device_note": status.device_note,
         "device": device,
+        "activity": activity,
         "updated": usage.as_ref().and_then(|u| u.get("server_time")).and_then(|v| v.as_i64()),
     }))
 }
@@ -551,7 +559,15 @@ async fn mcp_handler(
     if let Some(name) = tool.as_deref() {
         if matches!(
             name,
-            "device_rename" | "device_discover" | "device_owner" | "device_claim" | "device_release"
+            "device_rename"
+                | "device_discover"
+                | "device_owner"
+                | "device_claim"
+                | "device_release"
+                | "device_sleep"
+                | "device_wake"
+                | "device_mode"
+                | "device_contact_s"
         ) {
             let id = request.get("id").cloned().unwrap_or(Value::Null);
             let args = request
@@ -578,15 +594,79 @@ async fn mcp_handler(
     let mcp_cfg = mcp_config(&ctx);
     match bridge_mcp::handle_request(&mcp_cfg, &request).await {
         Some(response) => {
-            let ok = response
+            let is_error = response
                 .pointer("/result/isError")
                 .and_then(|v| v.as_bool())
-                .map(|is_error| !is_error)
                 .unwrap_or(false);
+            let text = response
+                .pointer("/result/content/0/text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let unreachable = text.contains("unreachable")
+                || text.contains("not reachable")
+                || text.contains("did not change");
+            // v0.14 queued pushes (docs §13.4): a push aimed at a sleeping
+            // device is queued instead of failed; the next pull contact keeps
+            // the device awake for `pending` and the flush task sends it.
+            if is_error
+                && matches!(tool.as_deref(), Some("profile_push") | Some("firmware_ota"))
+                && (ctx.activity.expects_deep() || unreachable)
+            {
+                let queued = if tool.as_deref() == Some("profile_push") {
+                    let profile_id = request
+                        .pointer("/params/arguments/id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let profiles = bridge_core::profile::ProfilesFile::load(&ctx.config.profiles);
+                    match profiles {
+                        Ok(profiles) => match profiles.get(profile_id) {
+                            Some(profile) => {
+                                let enabled = profile.enabled_ids();
+                                let activate = enabled.first().cloned();
+                                ctx.activity.queue_templates(enabled, activate);
+                                format!(
+                                    "设备在 deep 睡眠；已排队推送 profile '{profile_id}'，下次联系窗口自动发送"
+                                )
+                            }
+                            None => format!("profile not found: {profile_id}"),
+                        },
+                        Err(e) => format!("load profiles: {e}"),
+                    }
+                } else {
+                    let rom = request
+                        .pointer("/params/arguments/rom")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let path = PathBuf::from(rom);
+                    let path = if path.is_absolute() {
+                        path
+                    } else {
+                        ctx.root.join(path)
+                    };
+                    *ctx.pending_ota_rom.lock().unwrap() = Some(path);
+                    ctx.activity.queue_ota();
+                    "设备在 deep 睡眠；OTA 已排队，下次联系窗口自动执行".to_string()
+                };
+                let queued_response = json!({
+                    "jsonrpc": "2.0",
+                    "id": request.get("id").cloned().unwrap_or(Value::Null),
+                    "result": {"content": [{"type": "text", "text": queued}], "isError": false}
+                });
+                return (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    queued_response.to_string(),
+                )
+                    .into_response();
+            }
+            let ok = !is_error;
             if ok && matches!(tool.as_deref(), Some("template_save") | Some("profile_save")) {
+                ctx.activity.note_activity("template-save");
                 if let Some(handle) = ctx.app_handle.get() {
                     let _ = handle.emit("templates-changed", ());
                 }
+            }
+            if ok && tool.as_deref() == Some("profile_push") {
+                ctx.activity.note_activity("template-push");
             }
             (
                 [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -734,6 +814,7 @@ fn parse_claim_response(
         return Err(ClaimError::Other(format!("POST /claim -> HTTP {code} {body}")));
     }
     *ctx.last_claim_at.lock().unwrap() = Some(now_secs());
+    ctx.activity.note_contact("claim");
     Ok(doc.get("owner").cloned().filter(|o| !o.is_null()))
 }
 
@@ -990,6 +1071,57 @@ async fn device_tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, S
             set_owner_cache(ctx, None);
             Ok("device released; auto-claim paused until device_claim".to_string())
         }
+        // Debug helper: shortens the light -> deep loop for battery/deep tests.
+        // `note_deep` makes the next envelope carry mode=deep (and next_contact
+        // 60); `device_ip_dirty` + notify make the push loop send it even though
+        // it now "expects deep". The firmware applies its 60 s grace and sleeps.
+        "device_sleep" => {
+            // Persist deep as well: the pull response follows the push within a
+            // minute and would otherwise bring the device back to light while
+            // the 10 min quiet window is not yet satisfied.
+            ctx.activity.request_deep();
+            ctx.activity.note_deep(60);
+            ctx.device_ip_dirty.store(true, Ordering::SeqCst);
+            ctx.force_push.notify_one();
+            Ok("deep hint queued + pull responses forced deep; device sleeps after the 60 s grace (clear with device_mode auto)"
+                .to_string())
+        }
+        // Debug: make the next pull answer light so the device wakes up and
+        // stays online (readable /status.json, /log). The forced push carries
+        // mode=light to cancel a pending deep hint when the device is awake.
+        "device_wake" => {
+            ctx.activity.request_light();
+            ctx.device_ip_dirty.store(true, Ordering::SeqCst);
+            ctx.force_push.notify_one();
+            Ok("light requested: next pull answers light; push carries mode=light when reachable"
+                .to_string())
+        }
+        // Debug: persistent mode override for pull responses/pushes so the
+        // deep/light loop does not depend on the 10 min quiet hysteresis.
+        "device_mode" => {
+            let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("auto");
+            let code = match mode {
+                "auto" => 0u8,
+                "deep" => 1,
+                "light" => 2,
+                other => return Err(format!("mode must be auto|deep|light (got {other})")),
+            };
+            ctx.activity.set_debug_mode(code);
+            Ok(format!("debug mode = {mode} (pull responses and push envelopes)"))
+        }
+        // Debug: override the pull cadence (0 = auto) to speed up deep cycles.
+        "device_contact_s" => {
+            let s = args.get("s").and_then(|v| v.as_u64()).unwrap_or(u64::MAX);
+            if s != 0 && !(30..=3600).contains(&s) {
+                return Err("s must be 0 (auto) or 30..=3600 seconds".to_string());
+            }
+            ctx.activity.set_debug_contact_s(s);
+            if s == 0 {
+                Ok("debug pull cadence cleared (auto)".to_string())
+            } else {
+                Ok(format!("debug pull cadence = {s}s"))
+            }
+        }
         other => Err(format!("unknown device tool: {other}")),
     }
 }
@@ -1226,6 +1358,7 @@ async fn force_sync(state: State<'_, Arc<AppCtx>>) -> Result<(), String> {
 /// Explicit user action: push the envelope over HTTP immediately and run one
 /// BLE handshake (endpoint/token refresh).
 fn request_sync(ctx: &AppCtx) {
+    ctx.activity.note_activity("sync");
     ctx.device_ip_dirty.store(true, Ordering::SeqCst);
     ctx.force_push.notify_one();
     ctx.udp_ble.store(true, Ordering::SeqCst);
@@ -1339,6 +1472,7 @@ async fn push_profile(state: State<'_, Arc<AppCtx>>, id: String) -> Result<Strin
     let cfg = mcp_config(&state);
     match bridge_mcp::push_templates_http(&cfg, &enabled, activate.as_deref()).await {
         Ok(summary) => {
+            state.activity.note_activity("template-push");
             let mut status = state.status.lock().unwrap();
             status.last_push_at = Some(now_secs());
             status.last_push_error = None;
@@ -1346,6 +1480,13 @@ async fn push_profile(state: State<'_, Arc<AppCtx>>, id: String) -> Result<Strin
         }
         Err(e) => {
             state.status.lock().unwrap().last_push_error = Some(e.clone());
+            // Device asleep: queue the profile for the next pull contact.
+            if state.activity.expects_deep() {
+                state.activity.queue_templates(enabled, activate);
+                return Ok(format!(
+                    "设备在 deep 睡眠；已排队推送 profile '{id}'，下次联系窗口自动发送"
+                ));
+            }
             Err(e)
         }
     }
@@ -1366,42 +1507,6 @@ async fn reload_templates(state: State<'_, Arc<AppCtx>>) -> Result<usize, String
     let count = library.entries.len();
     *state.library.write().await = library;
     Ok(count)
-}
-
-/// FNV-1a over the envelope with volatile fields removed. `server_time` and
-/// the rolling `resetsAt` of unused windows (the app-server reports
-/// `now + window` on every poll while `usedPercent` is 0) carry no screen
-/// data, so pushes follow real data changes plus the 5 min heartbeat
-/// (docs/history/sleep-plan-v4.md §4.3) instead of firing on every poll.
-fn usage_fingerprint(usage: &Value) -> u64 {
-    let mut value = usage.clone();
-    if let Some(obj) = value.as_object_mut() {
-        obj.remove("server_time");
-    }
-    if let Some(buckets) = value.get_mut("buckets").and_then(|b| b.as_array_mut()) {
-        for bucket in buckets.iter_mut() {
-            if let Some(windows) = bucket.get_mut("windows").and_then(|w| w.as_array_mut()) {
-                for window in windows.iter_mut() {
-                    let used = window
-                        .get("usedPercent")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0);
-                    if used == 0 {
-                        if let Some(obj) = window.as_object_mut() {
-                            obj.remove("resetsAt");
-                        }
-                    }
-                }
-            }
-        }
-    }
-    let text = value.to_string();
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in text.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100_0000_01b3);
-    }
-    h
 }
 
 /// UDP announce listener (docs/power-state.md §9): the device broadcasts
@@ -1453,6 +1558,7 @@ async fn udp_listen(ctx: Arc<AppCtx>) {
             continue;
         }
         set_device_ip(&ctx, ip, "udp");
+        ctx.activity.note_contact("udp");
         if doc.get("ble").and_then(|v| v.as_i64()).unwrap_or(0) == 1 {
             tracing::info!("device requested a BLE handshake via UDP");
             ctx.udp_ble.store(true, Ordering::SeqCst);
@@ -1543,6 +1649,7 @@ async fn device_cache_loop(ctx: Arc<AppCtx>) {
         }
         if online {
             ctx.device_fail_streak.store(0, Ordering::SeqCst);
+            ctx.activity.note_contact("http");
             set_owner_cache(&ctx, owner.clone());
             // Surface another bridge's occupancy immediately (the push itself
             // may not run for minutes); the push gate clears the note again.
@@ -1597,6 +1704,7 @@ async fn run_services(ctx: Arc<AppCtx>) {
         token: Arc::new(ctx.config.token.clone()),
         envelope: ctx.envelope.clone(),
         library: ctx.library.clone(),
+        activity: ctx.activity.clone(),
     };
     {
         let ctx = ctx.clone();
@@ -1619,6 +1727,7 @@ async fn run_services(ctx: Arc<AppCtx>) {
         interval_secs: ctx.config.interval_secs,
         templates: ctx.library.clone(),
         active_hold_seconds: ctx.config.active_hold_seconds,
+        activity: ctx.activity.clone(),
     };
     tokio::spawn(run_poller(poller, ctx.envelope.clone()));
 
@@ -1646,6 +1755,8 @@ async fn run_services(ctx: Arc<AppCtx>) {
             let mut last_fp: u64 = 0;
             let mut last_ok: u64 = 0;
             let mut last_gate: u64 = 0;
+            let mut last_contact_gen = ctx.activity.contact_generation();
+            let mut deep_skip_logged = false;
             loop {
                 // Check the fingerprint every 3 s so an envelope change reaches
                 // the device well inside the T9 ≤5 s budget. A UDP endpoint
@@ -1657,9 +1768,23 @@ async fn run_services(ctx: Arc<AppCtx>) {
                 let forced = ctx.device_ip_dirty.swap(false, Ordering::SeqCst);
                 let usage = ctx.envelope.try_read().ok().and_then(|g| g.clone());
                 let Some(usage) = usage else { continue };
-                let text = usage.to_string();
                 let fp = usage_fingerprint(&usage);
                 let now = now_secs() as u64;
+                // v0.14: a pull or announce means the device is awake again;
+                // treat it like a forced push so the fresh data goes out at once.
+                let contact_gen = ctx.activity.contact_generation();
+                let contact_new = contact_gen != last_contact_gen;
+                last_contact_gen = contact_gen;
+                // Expected deep sleep: the device pulls on its own schedule and
+                // cannot receive pushes; do not count failures or alert.
+                if ctx.activity.expects_deep() && !forced && !contact_new {
+                    if !deep_skip_logged {
+                        tracing::info!("device expected deep; pushes paused");
+                        deep_skip_logged = true;
+                    }
+                    continue;
+                }
+                deep_skip_logged = false;
                 // While occupied/yielded, re-check every 15 s so a lease expiry
                 // or another bridge's release is picked up before the 5 min
                 // heartbeat (the gate itself only spends HTTP when claiming).
@@ -1676,7 +1801,10 @@ async fn run_services(ctx: Arc<AppCtx>) {
                         .unwrap()
                         .map(|at| now_secs() - at >= 60)
                         .unwrap_or(true);
-                let push_needed = forced || fp != last_fp || now.saturating_sub(last_ok) >= 300;
+                let push_needed = forced
+                    || contact_new
+                    || fp != last_fp
+                    || now.saturating_sub(last_ok) >= 300;
                 if !push_needed && !recheck && !renew_due {
                     continue;
                 }
@@ -1702,6 +1830,29 @@ async fn run_services(ctx: Arc<AppCtx>) {
                     // Renewal/recheck only: no data changed, keep the heartbeat.
                     continue;
                 }
+                // Push envelope carries the mode decision (docs §13.4) so a
+                // device still in light mode can fall back to deep locally.
+                // `server_time`/`tz_offset_min` are stamped fresh here (the
+                // cached envelope's timestamp can be minutes old) so the device
+                // clock/timezone follow this PC on every push.
+                let mut push_usage = usage.clone();
+                if let Some(obj) = push_usage.as_object_mut() {
+                    obj.insert("server_time".to_string(), json!(now));
+                    obj.insert(
+                        "tz_offset_min".to_string(),
+                        json!(bridge_core::local_offset_minutes()),
+                    );
+                    obj.insert(
+                        "mode".to_string(),
+                        Value::String(ctx.activity.mode_str().to_string()),
+                    );
+                    obj.insert(
+                        "next_contact_s".to_string(),
+                        json!(ctx.activity.next_contact_s()),
+                    );
+                    obj.insert("usage_rev".to_string(), json!(ctx.activity.usage_rev()));
+                }
+                let text = push_usage.to_string();
                 let device_ip = ctx.device_ip.lock().unwrap().clone();
                 let url = format!("http://{device_ip}/usage");
                 match client
@@ -1715,6 +1866,7 @@ async fn run_services(ctx: Arc<AppCtx>) {
                     Ok(resp) if resp.status().is_success() => {
                         last_fp = fp;
                         last_ok = now;
+                        ctx.activity.note_contact("push");
                         tracing::info!("usage push -> {} ({})", resp.status(), url);
                         let mut status = ctx.status.lock().unwrap();
                         status.last_push_ok_at = Some(now as i64);
@@ -1750,14 +1902,106 @@ async fn run_services(ctx: Arc<AppCtx>) {
                         }
                     }
                     Err(e) => {
-                        tracing::debug!("usage push skipped: {e}");
-                        let mut status = ctx.status.lock().unwrap();
-                        status.push_fail_streak = status.push_fail_streak.saturating_add(1);
-                        if status.push_fail_streak >= 2 {
-                            status.last_push_ok_at = None;
+                        if ctx.activity.expects_deep() {
+                            // Device went to sleep; silence is expected.
+                            tracing::debug!("usage push skipped (device deep): {e}");
+                        } else {
+                            tracing::debug!("usage push skipped: {e}");
+                            let mut status = ctx.status.lock().unwrap();
+                            status.push_fail_streak = status.push_fail_streak.saturating_add(1);
+                            if status.push_fail_streak >= 2 {
+                                status.last_push_ok_at = None;
+                            }
                         }
                     }
                 }
+            }
+        });
+    }
+
+    // v0.14 queued pushes (docs §13.4): while the device is deep, template
+    // pushes / OTA requests are queued; the first contact after that (a pull
+    // keeps the device awake for `pending`) flushes them.
+    {
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            let mut last_gen = ctx.activity.contact_generation();
+            let mut last_flush = 0u64;
+            let mut fails = 0u32;
+            let mut last_pending: (Vec<String>, bool) = (Vec::new(), false);
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let (templates, activate) = ctx.activity.pending_templates();
+                let pending_ota = ctx.activity.pending_ota();
+                if templates.is_empty() && !pending_ota {
+                    last_gen = ctx.activity.contact_generation();
+                    fails = 0;
+                    last_pending = (Vec::new(), false);
+                    continue;
+                }
+                // A fresh request (different ROM/templates) is retried promptly
+                // even after earlier failures instead of inheriting the backoff.
+                let pending_now = (templates.clone(), pending_ota);
+                if pending_now != last_pending {
+                    last_pending = pending_now;
+                    fails = 0;
+                    last_flush = 0;
+                }
+                let gen = ctx.activity.contact_generation();
+                let now = now_secs() as u64;
+                // Backoff after failed attempts: 60s, 2m, 4m, 8m, ... max 30m.
+                // A pull contact (gen change) still retries immediately.
+                let wait = if fails == 0 {
+                    60u64
+                } else {
+                    (60u64 << fails.min(5)).min(1800)
+                };
+                if gen == last_gen && now.saturating_sub(last_flush) < wait {
+                    continue;
+                }
+                last_gen = gen;
+                last_flush = now;
+                let mut failed = false;
+                if !templates.is_empty() {
+                    let cfg = mcp_config(&ctx);
+                    match bridge_mcp::push_templates_http(&cfg, &templates, activate.as_deref()).await {
+                        Ok(summary) => {
+                            tracing::info!("queued template push flushed: {summary}");
+                            ctx.activity.clear_pending_templates();
+                        }
+                        Err(e) => {
+                            failed = true;
+                            tracing::warn!("queued template push: {e}");
+                        }
+                    }
+                }
+                if pending_ota {
+                    let rom = ctx.pending_ota_rom.lock().unwrap().clone();
+                    if let Some(rom) = rom {
+                        let request = json!({
+                            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                            "params": {"name": "firmware_ota",
+                                       "arguments": {"rom": rom.display().to_string()}}
+                        });
+                        let cfg = mcp_config(&ctx);
+                        let response = bridge_mcp::handle_request(&cfg, &request).await;
+                        let failed_ota = response
+                            .as_ref()
+                            .and_then(|r| r.pointer("/result/isError"))
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true);
+                        if failed_ota {
+                            failed = true;
+                            tracing::warn!("queued OTA attempt failed; backing off");
+                        } else {
+                            ctx.activity.clear_pending_ota();
+                            *ctx.pending_ota_rom.lock().unwrap() = None;
+                        }
+                    } else {
+                        ctx.activity.clear_pending_ota();
+                    }
+                }
+                fails = if failed { fails.saturating_add(1) } else { 0 };
             }
         });
     }
@@ -1948,6 +2192,8 @@ fn main() {
         device_fail_streak: AtomicU32::new(0),
         udp_ble: AtomicBool::new(false),
         device_ip_dirty: AtomicBool::new(false),
+        activity: Arc::new(Activity::new()),
+        pending_ota_rom: Mutex::new(None),
         force_push: Arc::new(Notify::new()),
         mcp_port: Mutex::new(mcp_port),
         mcp_error: Mutex::new(None),

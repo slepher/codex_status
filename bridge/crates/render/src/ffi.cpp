@@ -9,7 +9,7 @@ extern "C" {
 
 int codex_render(const char *tmpl, const char *usage, const char *channel, const char *ip,
                  const char *sync_hhmm, int battery, const char *state, int offline_mins,
-                 uint8_t *out, int out_len) {
+                 const char *mode, uint8_t *out, int out_len) {
     if (!tmpl || !out || out_len < 200 * 200 / 8) return -2;
     Paint_NewImage(out, 200, 200, ROTATE_0, WHITE);
     Paint_Clear(WHITE);
@@ -20,6 +20,7 @@ int codex_render(const char *tmpl, const char *usage, const char *channel, const
     env.battery = battery;
     env.state = state ? state : "";
     env.offlineMins = offline_mins;
+    env.mode = mode ? mode : "";
     return tplDraw(String(tmpl), String(usage ? usage : ""), env) ? 1 : 0;
 }
 

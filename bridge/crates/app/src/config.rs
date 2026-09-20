@@ -43,7 +43,7 @@ impl Default for Config {
             seeds: bridge_core::paths::seed_templates(),
             profiles: data.join("profiles.json"),
             profile_seed: bridge_core::paths::profile_seed(),
-            interval_secs: 60,
+            interval_secs: 180,
             ble_interval_secs: 300,
             mcp_port: 8766,
             device_ip: "192.168.1.50".to_string(),

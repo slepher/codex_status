@@ -16,7 +16,7 @@ enum BindKind {
     B_RESET_COUNT, B_RESET_EXPIRES,
     B_BUCKET_USED, B_BUCKET_REMAIN, B_BUCKET_RESET, B_BUCKET_WINMINS,
     B_DEV_CHANNEL, B_DEV_IP, B_DEV_SYNC, B_DEV_BATTERY,
-    B_DEV_STATE, B_DEV_OFFLINE, B_DEV_NOW
+    B_DEV_STATE, B_DEV_OFFLINE, B_DEV_NOW, B_DEV_MODE
 };
 
 // The optional JSON "time_format" accepts exactly "date" (the compact local
@@ -97,6 +97,7 @@ static bool parseBind(const String &path, BindSpec &s) {
     if (path == "device.state")                { s.kind = B_DEV_STATE; return true; }
     if (path == "device.offline_mins")         { s.kind = B_DEV_OFFLINE; return true; }
     if (path == "device.now")                  { s.kind = B_DEV_NOW; return true; }
+    if (path == "device.mode")                 { s.kind = B_DEV_MODE; return true; }
     if (path.startsWith("buckets[")) {
         int close = path.indexOf(']', 8);
         if (close < 0) return false;
@@ -219,6 +220,10 @@ static bool evalBind(const BindSpec &s, TextTimeFormat format, JsonDocument &usa
         out = b;
         return true;
     }
+    case B_DEV_MODE:
+        if (env.mode.length() == 0) return false;
+        out = env.mode;
+        return true;
     case B_SERVER_TIME:
         if (usage["server_time"].isNull()) return false;
         out = fmtEpoch(usage["server_time"] | 0LL, format);
@@ -291,6 +296,7 @@ static bool bindExists(const BindSpec &s, JsonDocument &usage, const TplEnv &env
     case B_DEV_STATE:   return env.state.length() > 0;
     case B_DEV_OFFLINE: return env.offlineMins >= 0;
     case B_DEV_NOW:     return time(nullptr) > 1600000000;
+    case B_DEV_MODE:    return env.mode.length() > 0;
     case B_PLAN:        return haveUsage && !usage["account"]["plan"].isNull();
     case B_LABEL:       return haveUsage && !usage["bridge"]["label"].isNull();
     case B_HOSTID:      return haveUsage && !usage["bridge"]["hostId"].isNull();

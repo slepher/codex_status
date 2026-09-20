@@ -239,12 +239,23 @@ pub async fn fetch_device_token(cfg: &McpConfig) -> Result<String> {
     Ok(token)
 }
 
+// The device answers HTTP between light-sleep windows with Wi-Fi power save
+// (listen_interval=10): a cold /status.json can take >10 s (measured 13.8 s),
+// while a truly-offline device fails fast. The old 2 s probe therefore flagged
+// a sleeping-but-awake device as unreachable and pushed OTA into the queue.
+// Two attempts with a wider timeout keep the tool fast when offline.
 async fn device_firmware(ip: &str) -> Option<String> {
     let ip = ip.to_string();
     tokio::task::spawn_blocking(move || {
-        bridge_core::device::fetch(&ip, Duration::from_secs(2))
-            .ok()
-            .and_then(|status| status.get("Version").map(str::to_string))
+        for attempt in 0..2 {
+            if let Ok(status) = bridge_core::device::fetch(&ip, Duration::from_secs(10)) {
+                return status.get("Version").map(str::to_string);
+            }
+            if attempt == 0 {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+        None
     })
     .await
     .ok()
@@ -338,6 +349,20 @@ async fn firmware_ota_inner(cfg: &McpConfig, args: &Value) -> Result<Vec<Value>,
         .and_then(|v| v.to_str())
         .unwrap_or("firmware.bin");
 
+    // Clear a stuck/half-finished previous upload first: older firmware left
+    // UpdateClass "already running" after an aborted transfer, which made every
+    // following Update.begin() fail. Unknown params are ignored by old ROMs.
+    if let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        let abort_url = format!(
+            "http://{ip}/diag?ota_abort=1&token={}",
+            token.as_deref().unwrap()
+        );
+        let _ = client.post(&abort_url).send().await;
+    }
+
     let mut upload = post_firmware(&ip, token.as_deref().unwrap(), bytes.clone(), filename).await;
     if matches!(&upload, Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED) {
         tracing::warn!("device token rejected; re-requesting over BLE");
@@ -347,16 +372,23 @@ async fn firmware_ota_inner(cfg: &McpConfig, args: &Value) -> Result<Vec<Value>,
         token = Some(fresh);
         upload = post_firmware(&ip, token.as_deref().unwrap(), bytes.clone(), filename).await;
     }
-    match &upload {
+    match upload {
         Ok(resp) if !resp.status().is_success() => {
             return Err(format!("doUpdate -> HTTP {}", resp.status()));
+        }
+        Ok(resp) => {
+            // The HTTP status is 200 even for a rejected image; the body is the
+            // only signal (UPDATE FAILED / UPDATE OK).
+            let body = resp.text().await.unwrap_or_default();
+            if body.contains("UPDATE FAILED") {
+                return Err("device reported UPDATE FAILED (see its /log)".to_string());
+            }
         }
         Err(e) => {
             // A reset mid-response can also mean the device already rebooted,
             // so fall through to the version check before declaring failure.
             tracing::warn!("doUpdate transport error: {e}");
         }
-        Ok(_) => {}
     }
 
     match wait_for_new_firmware(&ip, Some(before.as_str()), Duration::from_secs(60)).await {
@@ -577,6 +609,13 @@ fn env_from_args(args: &Value) -> bridge_render::Env<'static> {
             .get("offline_mins")
             .and_then(|v| v.as_i64())
             .unwrap_or(-1) as i32,
+        mode: Box::leak(
+            args.get("mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("light")
+                .to_string()
+                .into_boxed_str(),
+        ),
     }
 }
 
@@ -774,6 +813,44 @@ fn tool_definitions() -> Value {
             "description": "用户显式动作：释放占用并本地让步（不再自动 claim/推送，直到再次 device_claim）",
             "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true},
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+        },
+        {
+            "name": "device_sleep",
+            "title": "让设备进深睡（调试）",
+            "description": "调试辅助：强推 mode=deep 并让后续 pull 响应也保持 deep（跳过 10 分钟安静迟滞），设备 60s 宽限后进深睡；用 device_mode auto 恢复",
+            "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true},
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+        },
+        {
+            "name": "device_wake",
+            "title": "请求设备回 light（调试）",
+            "description": "调试辅助：pull 响应固定返回 light（设备保持在线可读状态/日志）并推 mode=light；设备在 deep 时需等它下一个 pull 生效（可先用 device_contact_s 缩短间隔），用 device_mode auto 恢复",
+            "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true},
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+        },
+        {
+            "name": "device_mode",
+            "title": "调试模式覆盖（调试）",
+            "description": "调试辅助：把 pull 响应/推送信封的 mode 固定为 auto|deep|light，绕过安静迟滞，便于秒级驱动 deep↔light 循环",
+            "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true},
+            "inputSchema": {
+                "type": "object",
+                "properties": {"mode": {"type": "string", "description": "auto|deep|light"}},
+                "required": ["mode"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "device_contact_s",
+            "title": "调试拉取间隔（调试）",
+            "description": "调试辅助：覆盖桥在 pull 响应里下发的 next_contact_s（秒，30–3600；0 恢复自动：活跃 60/安静 900），用于加快 deep↔light 循环",
+            "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true},
+            "inputSchema": {
+                "type": "object",
+                "properties": {"s": {"type": "integer", "description": "间隔秒数（30–3600），0 恢复自动"}},
+                "required": ["s"],
+                "additionalProperties": false
+            }
         }
     ])
 }
@@ -1030,7 +1107,8 @@ async fn call_tool(cfg: &McpConfig, name: &str, args: &Value) -> Result<Vec<Valu
             Ok(vec![text_block(text)])
         }
         "device_rename" | "device_discover" | "device_owner" | "device_claim"
-        | "device_release" => {
+        | "device_release" | "device_sleep" | "device_wake" | "device_mode"
+        | "device_contact_s" => {
             // Implemented in bridge-app (live identity/occupancy state); this
             // library copy has no running app to mutate.
             Err("device tools are only available in the tray app (bridge-app)".to_string())
@@ -1068,7 +1146,7 @@ pub async fn handle_request(cfg: &McpConfig, request: &Value) -> Option<Value> {
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "codex-status", "version": env!("CARGO_PKG_VERSION")},
-                "instructions": "模板编辑工具：先 template_get 读取现状，template_render 用固件同源引擎出图给用户确认。模板保存只落盘；推送到设备是用户显式动作，用 profile_push（配置=最多三个模板的组合）。不要跳过渲染确认，也不要在用户未同意时推送。设备功耗/light sleep 诊断用 pm_stats（只读，勿高频）。设备身份/发现/占用：bridge_status/device_owner 只读；device_rename、device_discover、device_claim(force)、device_release 会改变桥或设备状态，需用户明确要求。"
+                "instructions": "模板编辑工具：先 template_get 读取现状，template_render 用固件同源引擎出图给用户确认。模板保存只落盘；推送到设备是用户显式动作，用 profile_push（配置=最多三个模板的组合）。不要跳过渲染确认，也不要在用户未同意时推送。设备功耗/light sleep 诊断用 pm_stats（只读，勿高频）。设备身份/发现/占用：bridge_status/device_owner 只读；device_rename、device_discover、device_claim(force)、device_release 会改变桥或设备状态，需用户明确要求。调试四件套：device_sleep（推 deep 并保持 deep）、device_wake（pull 固定 light，回在线读日志）、device_mode（auto|deep|light，绕过 10 分钟安静迟滞）、device_contact_s（覆盖 pull 间隔，加速循环）。"
             }),
         )),
         "notifications/initialized" => None,

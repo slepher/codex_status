@@ -48,7 +48,7 @@ function parseBind(path) {
     'account.plan', 'bridge.label', 'bridge.hostId', 'server_time',
     'resetCredits.availableCount', 'resetCredits.nextExpiresAt',
     'device.channel', 'device.ip', 'device.sync_hhmm', 'device.battery',
-    'device.state', 'device.offline_mins',
+    'device.state', 'device.offline_mins', 'device.now', 'device.mode',
   ]);
   if (direct.has(path)) return { kind: path };
   const match = /^buckets\[([^\]]+)\]\.((?:weekly|monthly|5h|primary|secondary|windows\[\d+\]))\.(usedPercent|remaining|resetsAt|windowMins)$/.exec(path);
@@ -80,10 +80,14 @@ function regionOk(region) {
 function validateCondition(element) {
   if (!Object.hasOwn(element, 'when')) return;
   const condition = element.when;
-  if (!condition || typeof condition !== 'object' || Array.isArray(condition)
-    || Object.keys(condition).length !== 2 || !Object.hasOwn(condition, 'bind')
-    || !Object.hasOwn(condition, 'exists') || typeof condition.bind !== 'string'
-    || typeof condition.exists !== 'boolean' || !parseBind(condition.bind)) {
+  const keys = condition && typeof condition === 'object' && !Array.isArray(condition)
+    ? Object.keys(condition) : [];
+  const hasExists = Object.hasOwn(condition ?? {}, 'exists');
+  const hasEquals = Object.hasOwn(condition ?? {}, 'equals');
+  const equalsOk = hasExists ? typeof condition.exists === 'boolean'
+    : (typeof condition.equals === 'string' || Number.isInteger(condition.equals));
+  if (keys.length !== 2 || typeof condition.bind !== 'string' || !parseBind(condition.bind)
+    || !Object.hasOwn(condition, 'bind') || hasExists === hasEquals || !equalsOk) {
     throw new Error('invalid when condition');
   }
 }
@@ -230,6 +234,14 @@ function bindResult(spec, usage, env, format = 'date') {
     const value = env.state;
     return { exists: typeof value === 'string' && value.length > 0, value: value || '--' };
   }
+  if (spec.kind === 'device.now') {
+    const value = env.now_hhmm ?? env.sync_hhmm ?? '23:59';
+    return { exists: true, value };
+  }
+  if (spec.kind === 'device.mode') {
+    const value = env.mode ?? 'light';
+    return { exists: true, value };
+  }
   if (spec.kind === 'device.offline_mins') {
     // Device-side policy decides when the bridge counts as unreachable
     // (heartbeat grace); the preview treats any non-negative value as present.
@@ -250,6 +262,9 @@ function conditionMatches(element, usage, env) {
   if (!Object.hasOwn(element, 'when')) return true;
   const condition = element.when;
   const result = bindResult(parseBind(condition.bind), usage, env);
+  if (Object.hasOwn(condition, 'equals')) {
+    return result.exists && String(result.value) === String(condition.equals);
+  }
   return result.exists === condition.exists;
 }
 
@@ -432,6 +447,8 @@ function generate() {
   writePreview(template, usageFixture({ fiveHourUsed: 11 }), offlineEnv, 'quad-preview-offline.png');
   writePreview(template, usageFixture({ weeklyUsed: 91, fiveHourUsed: null }), { ...offlineEnv, battery: 21 }, 'quad-preview-offline-missing-5h.png');
   writePreview(template, usageFixture({ weeklyUsed: 12, weeklyMins: 43200, fiveHourUsed: null, plan: 'free' }), env, 'quad-preview-monthly.png');
+  const deepEnv = { ...env, state: 'DEEP', mode: 'deep' };
+  writePreview(template, usageFixture({ fiveHourUsed: 11 }), deepEnv, 'quad-preview-deep.png');
 }
 
 export {

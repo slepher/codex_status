@@ -70,7 +70,15 @@ UBYTE DEV_Module_Init(void)
 	//serial printf
 	Serial.begin(115200);
 
-	// hardware SPI (validated with epd-test v3: 20MHz, mode0)
+	// Hardware SPI (validated with epd-test v3: 20MHz, mode0). The Arduino
+	// SPIClass keeps a non-recursive paramLock between beginTransaction() and
+	// endTransaction(); this project never ends the transaction (writes use the
+	// non-locking path while `_inTransaction`), so a second beginTransaction()
+	// would block forever on our own lock. Do it once per boot: a deep network
+	// wake used to call epdBegin() after setup's epdBegin() and hung there.
+	static bool spiReady = false;
+	if (spiReady) return 0;
+	spiReady = true;
 	SPI.begin(EPD_SCK_PIN, -1, EPD_MOSI_PIN, -1);
 	SPI.beginTransaction(SPISettings(20000000, MSBFIRST, SPI_MODE0));
 

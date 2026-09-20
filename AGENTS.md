@@ -14,7 +14,7 @@
 | `bridge/crates/core` | app-server 客户端、usage 信封、模板库（canonical JSON + CRC32）、LAN HTTP `/usage` `/template` |
 | `bridge/crates/ble` | btleplug central：endpoint/usage/模板推送 |
 | `bridge/crates/render` | 把固件同一份 C++ 引擎编进宿主，像素级预览/离线对拍 |
-| `bridge/crates/mcp` | MCP 工具（status/get/validate/render/save/profile_save/profile_push/firmware_ota/pm_stats/device_rename/device_discover/device_owner/device_claim/device_release），由托盘内建 HTTP 端点 `http://127.0.0.1:8766/mcp` 提供（见 `opencode.jsonc`；设备类工具由 app 侧实现） |
+| `bridge/crates/mcp` | MCP 工具（status/get/validate/render/save/profile_save/profile_push/firmware_ota/pm_stats/device_rename/device_discover/device_owner/device_claim/device_release/device_sleep/device_wake/device_mode/device_contact_s，后四个为调试用），由托盘内建 HTTP 端点 `http://127.0.0.1:8766/mcp` 提供（见 `opencode.jsonc`；设备类工具由 app 侧实现） |
 | `bridge/crates/app` | 生产形态：单实例托盘 + 内建 HTTP/BLE/MCP，运行数据在 `<exe>/data/`；`src/discovery.rs` 为 ARP 发现回退；身份/发现/占用见 `docs/power-state.md` §9.1/§9.2 |
 | `tools/test-bridge` | Python 测试桥（`start.ps1`/`stop.ps1`）、模板库 `templates/*.json`、`profiles.seed.json` |
 | `tools/device-auth` | `request_token.py`：经已绑定 BLE 链路协商 Wi-Fi 操作 token |

@@ -10,7 +10,11 @@
 #include <WebServer.h>
 #include <Update.h>
 #include <ArduinoOTA.h>
+#ifdef CODEX_DEEPPULL_TEST
+#include <HTTPClient.h>
+#endif
 #include <Preferences.h>
+#include <LittleFS.h>
 #include <ESPmDNS.h>
 #include <ArduinoJson.h>
 #include <time.h>
@@ -26,6 +30,7 @@
 #include <esp_mac.h>
 #include <esp_timer.h>
 #include <esp_private/pm_impl.h>
+#include <esp_rtc_time.h>
 #include <driver/rtc_io.h>
 #include <driver/gpio.h>
 #include <driver/usb_serial_jtag.h>
@@ -43,7 +48,13 @@
 #include "template_engine.h"
 #include "template_xfer.h"
 
-#define FW_VERSION    "0.13.8-bw"
+#ifdef CODEX_DEEPPULL_TEST
+#define FW_VERSION    "0.13.9-dptest2"
+#elif defined(CODEX_CLK_WINDOW_TEST)
+#define FW_VERSION    "0.13.9-clkwin"
+#else
+#define FW_VERSION    "0.15.0-bw"
+#endif
 #define AP_PASSWORD   "codex1234"
 #define MAX_SLOTS     3
 
@@ -63,6 +74,17 @@ static const int EPD_FB_BYTES = (EPD_W / 8) * EPD_H;
 #define LOW_BATT_PCT     5
 #define BLE_AUTO_PCT     20
 #define STORE_MAX_LOCAL  8
+
+// v0.14 deep/light modes (docs/power-state.md §13).
+#define MODE_DEEP              0
+#define MODE_LIGHT             1
+#define IDLE_DEEP_DEFAULT_S    600    // light -> deep after this much quiet
+#define DEEP_CONTACT_DEFAULT_S 60     // deep network period (bridge overrides)
+#define DEEP_CONTACT_MIN_S     30
+#define DEEP_CONTACT_MAX_S     3600
+#define DEEP_PENDING_WINDOW_MS 180000UL  // stay awake when pull reports pending
+#define CLK_GHOST_LIMIT        90      // deep clock partials before a full redraw
+#define CLK_MAX_BYTES          64      // reserved clock window cap (60 B for quad)
 
 static Preferences prefs;
 static WebServer   server(80);
@@ -92,10 +114,123 @@ RTC_DATA_ATTR static uint32_t rtcUsageHash = 0;
 RTC_DATA_ATTR static uint8_t  rtcApReason = 0;
 static const char *AP_REASON_NAMES[] = {"none", "no_slots", "boot_hold"};
 
+// v0.14 deep/light mode state. RTC survives deep sleep; NVS backs it across
+// OTA/software resets (docs/power-state.md §13.5).
+RTC_DATA_ATTR static uint8_t  rtcMode = MODE_DEEP;
+RTC_DATA_ATTR static uint16_t rtcNextContactS = DEEP_CONTACT_DEFAULT_S;
+RTC_DATA_ATTR static uint32_t rtcNextNetAt = 0;     // epoch of the next pull
+RTC_DATA_ATTR static uint32_t rtcUsageRev = 0;      // bridge usage_rev last seen
+RTC_DATA_ATTR static uint32_t rtcEpochAtSleep = 0;  // clock at the last deep sleep
+RTC_DATA_ATTR static uint64_t rtcClkUsAtSleep = 0;  // RTC timer at the last sleep
+RTC_DATA_ATTR static uint32_t rtcDeepCycles = 0;    // thin clock wakes
+RTC_DATA_ATTR static uint32_t rtcNetCycles = 0;     // deep network windows
+RTC_DATA_ATTR static uint32_t rtcNetFails = 0;      // failed deep network windows
+RTC_DATA_ATTR static uint32_t rtcClockTicks = 0;    // clock window writes
+RTC_DATA_ATTR static uint8_t  rtcLastPullCode = 0;  // last deep-pull HTTP code
+RTC_DATA_ATTR static uint16_t rtcClkPartials = 0;   // clock window partials
+RTC_DATA_ATTR static uint32_t rtcApChannel = 0;     // cached AP for fast connect
+RTC_DATA_ATTR static char     rtcApBssid[20] = {0};
+RTC_DATA_ATTR static uint8_t  rtcApSlot = 0xFF;
+RTC_DATA_ATTR static char     rtcTplActiveId[17] = {0};
+RTC_DATA_ATTR static char     rtcTplHash[9] = {0};
+// Deep-cycle trace: last stage code reached (survives deep sleep; read via
+// /status.json after a manual wake). 1 setup, 2 thin, 3 thin-done, 10 net,
+// 11 wifi, 12 pull-ok, 13 pull-fail, 14 light, 15 pending, 20 enter-deep,
+// 90 raw-sleep, 99 normal boot.
+RTC_DATA_ATTR static uint8_t  rtcStage = 0;
+RTC_DATA_ATTR static uint8_t  rtcLastWake = 0xFF;
+// P1 diagnosis: did the light -> deep glyph render run? bit0 set = the
+// `device.mode` template flag was set, bit1 = it was clear, bit2 = render
+// returned. Read via /status.json `deep.glyph`.
+RTC_DATA_ATTR static uint8_t  rtcDeepGlyph = 0;
+// Debug capture gate: when enabled (see captureFrameToFs), the framebuffer is
+// saved after a pre-sleep refresh; fixed files, overwritten, off by default.
+RTC_DATA_ATTR static uint8_t  rtcFrameCapture = 0;
+RTC_DATA_ATTR static uint16_t rtcFrameCaptures = 0;
+// Diagnostic switch: allow deep sleep while USB is plugged (USB only supplies
+// power; the serial link drops during sleep and re-enumerates on wake). It
+// survives deep-sleep cycles (RTC domain) but is cleared on any non-timer boot
+// (power-on/OTA/button) and via /diag?deep_usb=0 or the `deepusb off` CLI, so
+// normal plugged behavior returns after a reboot.
+RTC_DATA_ATTR static uint8_t  rtcDeepOnUsb = 0;
+
+// P0 diagnosis (sleep-modes): the RTC trace above dies with the RTC domain when
+// the board is power-cycled (plugging USB shows reset=power-on), which is how
+// every battery hang has been recovered so far. When armed via
+// /diag?nvs_stage=1 (RTC flag), mirror the suspense points into NVS so the
+// last reached code survives and can be read as `nvs_stage_boot` from
+// /status.json after recovery. Bounded writes; disabled by default.
+RTC_DATA_ATTR static uint8_t nvsStageEnabled = 0;
+static uint8_t nvsStageWrites = 0;
+static uint8_t nvsStageLast = 0xFF;
+static uint8_t nvsStageAtBoot = 0xFF;
+#define NVS_STAGE_MAX_WRITES 40
+
+static void nvsStageMark(uint8_t code) {
+    if (!nvsStageEnabled || code == nvsStageLast || nvsStageWrites >= NVS_STAGE_MAX_WRITES) return;
+    nvsStageLast = code;
+    nvsStageWrites++;
+    Preferences p;
+    p.begin("pm", false);
+    p.putUChar("stg", code);
+    p.end();
+}
+
+static void setStage(uint8_t code) {
+    rtcStage = code;
+    nvsStageMark(code);
+}
+
 static bool     otaInProgress = false;
+static uint32_t otaLastDataMs = 0;   // last UPLOAD_FILE_WRITE (stall watchdog)
 static uint32_t configStartedAt = 0;
 static uint32_t activeHoldSec = ACTIVE_HOLD_S;
 static bool     pmLightSleep = false;
+
+// Display timezone (POSIX TZ string). The bridge `server_time` is a UTC epoch
+// and the firmware never configured TZ, so localtime() rendered UTC: the clock
+// showed 14:45 while local (CST) was 22:45. Persisted in NVS `pm/tz`; change at
+// runtime with POST /diag?tz=CST-8 (note POSIX sign: UTC+8 => "CST-8").
+static char deviceTz[32] = "CST-8";
+
+static void applyTimezone() {
+    setenv("TZ", deviceTz, 1);
+    tzset();
+}
+
+// Bridge-provided UTC offset in minutes (east positive: CST = +480). POSIX TZ
+// uses the opposite sign, so +480 -> "UTC-8:00". Persisted in NVS `pm/tz` so
+// the device follows the PC timezone; `/diag?tz=` still forces a manual value
+// until the next contact. Out-of-range offsets are ignored, unchanged values
+// skip the NVS write.
+static bool applyTzOffsetMin(long offsetMin) {
+    if (offsetMin < -840 || offsetMin > 840) return false;
+    long absMin = offsetMin < 0 ? -offsetMin : offsetMin;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "UTC%c%ld:%02ld", offsetMin >= 0 ? '-' : '+',
+             absMin / 60, absMin % 60);
+    if (!strcmp(buf, deviceTz)) return false;
+    strncpy(deviceTz, buf, sizeof(deviceTz) - 1);
+    deviceTz[sizeof(deviceTz) - 1] = '\0';
+    applyTimezone();
+    Preferences p;
+    p.begin("pm", false);
+    p.putString("tz", deviceTz);
+    p.end();
+    DevLog.printf("[pm] tz <- bridge %ldmin (%s)\n", offsetMin, deviceTz);
+    return true;
+}
+
+// v0.14 mode runtime. `lastActivity` drives the light -> deep idle transition;
+// `forceDeepAt` honors a bridge `mode:"deep"` hint with a short grace period so
+// a final push/template can land first.
+static uint32_t idleDeepS = IDLE_DEEP_DEFAULT_S;
+static uint32_t lastActivityMs = 0;
+static time_t   lastActivityEpoch = 0;
+static uint32_t forceDeepAtMs = 0;
+static uint32_t pendingWindowUntilMs = 0;
+static bool     deepWakePath = false;      // setup(): this boot is a deep pull
+static bool     panelThinReady = false;    // epdThinBegin() ran on this boot
 
 // v0.12 runtime state (docs/power-state.md §3-§6)
 static bool     plugged = false;          // PC USB host present (SOF)
@@ -244,6 +379,45 @@ static uint32_t fnv1a(const String &s) {
 
 static bool timeKnown() { return time(nullptr) > 1600000000; }
 
+// v0.15 deep/light transition history: a small RTC ring (survives deep sleep;
+// cleared by a power loss, which is acceptable) so the timeline of a sleep
+// session can be read back after a manual wake. Zero flash wear, no switch.
+// Read via GET /history (oldest first; `since=<seq>` for incremental polls);
+// /status.json exposes hist_count (sequence number of the newest record) and
+// hist_head (ring slot the next write uses).
+#define HIST_CAP 120
+enum : uint8_t {
+    HIST_BOOT = 1,        // wake/boot classified, aux = esp_sleep_wakeup_cause_t
+    HIST_ENTER_DEEP = 2,  // light -> deep transition, aux = next_contact_s
+    HIST_THIN = 3,        // minute clock wake, aux = 1 when the clock was drawn
+    HIST_NET_OK = 4,      // network window success, aux = HTTP code (200)
+    HIST_NET_FAIL = 5,    // network window failure, aux = HTTP code (0 unknown)
+    HIST_TO_LIGHT = 6,    // returned/switched to light
+};
+struct HistRec {
+    uint32_t epoch;
+    uint8_t ev;
+    uint8_t stage;
+    uint8_t batt;      // 0xFF = unknown
+    uint16_t aux;
+};
+static_assert(sizeof(HistRec) == 12, "history record layout changed");
+RTC_DATA_ATTR static HistRec histRing[HIST_CAP];
+RTC_DATA_ATTR static uint32_t histCount = 0;   // records ever written
+RTC_DATA_ATTR static uint16_t histHead = 0;    // next write slot
+
+static void histAdd(uint8_t ev, uint16_t aux) {
+    if (histHead >= HIST_CAP) histHead = 0;
+    HistRec &r = histRing[histHead];
+    r.epoch = timeKnown() ? (uint32_t)time(nullptr) : 0;
+    r.ev = ev;
+    r.stage = rtcStage;
+    r.batt = (batteryPct < 0 || batteryPct > 100) ? 0xFF : (uint8_t)batteryPct;
+    r.aux = aux;
+    histHead = (uint16_t)((histHead + 1) % HIST_CAP);
+    histCount++;
+}
+
 static byte hostMac[6] = {0};
 static void loadHostMac() {
     esp_read_mac(hostMac, ESP_MAC_WIFI_STA);
@@ -298,12 +472,45 @@ static void markSynced() {
     lastPersistedSync = rtcLastSyncEpoch;
 }
 
+// The bridge stamps `tz_offset_min` (local minutes east of UTC) into pull and
+// push envelopes; follow the PC timezone when present. Returns true when the
+// TZ string actually changed (callers may need to redraw the clock).
+static bool adoptTzOffset(JsonDocument &doc) {
+    if (doc["tz_offset_min"].isNull()) return false;
+    return applyTzOffsetMin((long)(doc["tz_offset_min"] | 0L));
+}
+
 static void adoptServerTime(JsonDocument &doc) {
     long long st = doc["server_time"] | 0LL;
     if (!timeKnown() && st > 1600000000) {
         struct timeval tv = {(time_t)st, 0};
         settimeofday(&tv, nullptr);
         DevLog.printf("[pm] clock set from bridge: %lld\n", st);
+    }
+    adoptTzOffset(doc);
+}
+
+// Deep network windows align to the bridge clock every pull (docs §13.3); the
+// RTC-differential reconstruction is only a fallback between contacts. Returns
+// true when the timezone changed, so the caller can force a redraw.
+static bool adoptServerTimeForce(JsonDocument &doc) {
+    long long st = doc["server_time"] | 0LL;
+    if (st > 1600000000) {
+        struct timeval tv = {(time_t)st, 0};
+        settimeofday(&tv, nullptr);
+    }
+    return adoptTzOffset(doc);
+}
+
+// Push envelopes carry the bridge's mode decision (the light-phase fallback
+// channel): `deep` schedules a sleep after a short grace period, `light`
+// cancels a pending descent. The pull response uses the same field.
+static void applyBridgeModeHint(JsonDocument &doc) {
+    const char *mode = doc["mode"] | "";
+    if (!strcmp(mode, "deep")) {
+        if (!forceDeepAtMs) forceDeepAtMs = millis() + 60000;
+    } else if (!strcmp(mode, "light")) {
+        forceDeepAtMs = 0;
     }
 }
 
@@ -362,6 +569,7 @@ static volatile bool pendingTplChanged = false;
 static String activeTplJson;
 static String activeTplId;
 static bool   activeTplHasNow = false;
+static bool   activeTplHasMode = false;
 
 static String lastUsage;
 static String lastChannel = "-";
@@ -375,6 +583,7 @@ static int  batteryPercent();
 static bool requestAuthorized();
 static void deepSleepFor(uint32_t sec);
 static void renderCurrent();
+static void otaUploadCleanup(const char *reason);
 static void enterBleOn(bool userInitiated);
 static void bleOff(const char *reason);
 static void requestAnnounce(bool bleFlag);
@@ -384,6 +593,10 @@ static void handleBleAuth(const String &json);
 static String fmtEpoch(long long ts, const char *fmt);
 static void powerOff();
 static bool configureWifiPowerSave();
+static void noteActivity(const char *reason);
+static void saveApInfo();
+static void sleepToNextEvent();
+static void enterDeep(const char *reason);
 
 static esp_sleep_wakeup_cause_t bootWakeCause = ESP_SLEEP_WAKEUP_UNDEFINED;
 
@@ -506,22 +719,49 @@ static void epdBegin(bool clearPanel = true) {
     DEV_Module_Init();
     EPD_SSD1681_Init();
     if (clearPanel) EPD_SSD1681_Clear(EPD_SSD1681_WHITE);
-    frame = (UBYTE *)malloc(EPD_FB_BYTES);
+    panelThinReady = true;
+    // Allocate once per boot: epdBegin() may be re-entered (OOM retry / future
+    // callers) and overwriting the pointers would leak both 5000-byte buffers.
     if (!frame) {
-        DevLog.println("[epd] frame buffer malloc failed");
-        return;
+        frame = (UBYTE *)malloc(EPD_FB_BYTES);
+        if (!frame) {
+            DevLog.println("[epd] frame buffer malloc failed");
+            return;
+        }
     }
-    lastDisplayedFrame = (UBYTE *)malloc(EPD_FB_BYTES);
-    if (lastDisplayedFrame) {
-        memset(lastDisplayedFrame, 0xFF, EPD_FB_BYTES);
-    } else {
-        DevLog.println("[epd] last-display buffer malloc failed; writes will not be skipped");
+    if (!lastDisplayedFrame) {
+        lastDisplayedFrame = (UBYTE *)malloc(EPD_FB_BYTES);
+        if (lastDisplayedFrame) {
+            memset(lastDisplayedFrame, 0xFF, EPD_FB_BYTES);
+        } else {
+            DevLog.println("[epd] last-display buffer malloc failed; writes will not be skipped");
+        }
     }
     Paint_NewImage(frame, EPD_W, EPD_H, 0, WHITE);
     Paint_SetScale(2);
     Paint_SelectImage(frame);
     epdPartialReady = false;
     epdPartialCount = 0;
+}
+
+// Thin deep-sleep wake init: power the panel and bring up SPI only. The
+// window calls (WakePartialWindow) reset the controller and load the partial
+// LUT themselves, so the full init/clear and the framebuffer stay untouched.
+static void epdThinBegin() {
+    if (panelThinReady) return;
+    pinMode(EPD_PWR_PIN, OUTPUT);
+    digitalWrite(EPD_PWR_PIN, HIGH);
+    delay(10);
+    digitalWrite(EPD_PWR_PIN, LOW);
+    delay(100);
+    pinMode(42, OUTPUT);
+    digitalWrite(42, LOW);
+    pinMode(17, OUTPUT);
+    digitalWrite(17, HIGH);
+    retainSleepCriticalGpio();
+    DEV_Module_Init();
+    panelThinReady = true;
+    epdAsleep = false;
 }
 
 // Data screens default to partial refresh (~300ms, no flash). A full refresh
@@ -564,11 +804,221 @@ static void epdFlush(bool forceFull) {
     epdAsleep = false;
     EPD_SSD1681_Display(frame);
     epdWriteCount++;
+    rtcClkPartials = 0;   // full waveform clears the clock-window ghosting
     if (lastDisplayedFrame) memcpy(lastDisplayedFrame, frame, EPD_FB_BYTES);
     EPD_SSD1681_Init_Partial();
     epdPartialReady = true;
     epdPanelSleep();
 }
+
+// ---------------- clock window direct write (v0.14) ----------------
+// The active template's `device.now` text element is reserved once per load:
+// a byte-aligned window holding exactly "HH:MM". In deep sleep the minute tick
+// rewrites only those bytes (60 B for quad v9) instead of rendering a full
+// frame; docs/power-state.md §13.2.
+#ifdef CODEX_CLK_WINDOW_TEST
+#define CLK_TEST_TICKS 10
+#endif
+
+struct ClkRegion {
+    bool     valid;
+    uint8_t  fontId;
+    uint8_t  x0b, x1b;    // byte columns of the window
+    uint16_t y0, y1;      // pixel rows of the window
+    uint8_t  bw, rows;    // bytes per row, rows
+    uint8_t  scale;
+    uint8_t  xOff, yOff;  // element x/y inside the window
+};
+RTC_DATA_ATTR static ClkRegion clkR = {};
+RTC_DATA_ATTR static uint8_t  clkPixels[CLK_MAX_BYTES] = {};
+RTC_DATA_ATTR static bool     clkPixelsValid = false;
+
+static sFONT *clkFontById(uint8_t id) {
+    switch (id) {
+        case 0: return &Font8;
+        case 1: return &Font12;
+        case 2: return &Font16;
+        case 3: return &Font20;
+        case 4: return &Font24;
+        default: return nullptr;
+    }
+}
+
+static int clkFontId(const char *name) {
+    if (!name) return -1;
+    if (!strcmp(name, "f8"))  return 0;
+    if (!strcmp(name, "f12")) return 1;
+    if (!strcmp(name, "f16")) return 2;
+    if (!strcmp(name, "f20")) return 3;
+    if (!strcmp(name, "f24")) return 4;
+    return -1;
+}
+
+// Reserve the clock cell from the active template. The bind prints exactly
+// "HH:MM" (5 glyphs), so the max-width box is 5 x font cell at the element's
+// scale/x/y. No `device.now` element -> no reservation (clkR.valid stays false).
+static void clkComputeRect() {
+    clkR.valid = false;
+    if (!activeTplJson.length()) { DevLog.println("[clk] no active template"); return; }
+    JsonDocument doc;
+    if (deserializeJson(doc, activeTplJson)) { DevLog.println("[clk] template parse failed"); return; }
+    for (JsonObject e : doc["elements"].as<JsonArray>()) {
+        if (strcmp(e["type"] | "", "text")) continue;
+        if (strcmp(e["bind"] | "", "device.now")) continue;
+        // The direct write blits exactly "HH:MM"; anything else (prefix,
+        // suffix, extra text) would be erased, so those templates opt out.
+        if (strlen(e["prefix"] | "") || strlen(e["suffix"] | "")) {
+            DevLog.println("[clk] device.now has prefix/suffix; no reservation");
+            return;
+        }
+        const int fid = clkFontId(e["font"] | "");
+        sFONT *f = (fid >= 0) ? clkFontById((uint8_t)fid) : nullptr;
+        if (!f) { DevLog.println("[clk] clock font unknown"); return; }
+        int scale = e["scale"] | 1;
+        if (scale < 1) scale = 1;
+        int x = e["x"] | 0, y = e["y"] | 0;
+        JsonArray rect = e["rect"].as<JsonArray>();
+        if (!rect.isNull() && rect.size() == 4) {
+            int rx = rect[0] | 0, ry = rect[1] | 0, rw = rect[2] | 0;
+            int textW = 5 * f->Width * scale;
+            const char *align = e["align"] | "left";
+            x = rx;
+            if (!strcmp(align, "center")) x = rx + (rw - textW) / 2;
+            else if (!strcmp(align, "right")) x = rx + rw - textW;
+            y = ry + (rect[3].as<int>() - f->Height * scale) / 2;
+        }
+        int w = 5 * f->Width * scale;
+        int h = f->Height * scale;
+        if (x < 0) x = 0;
+        if (y < 0) y = 0;
+        if (x + w > EPD_W) w = EPD_W - x;
+        if (y + h > EPD_H) h = EPD_H - y;
+        if (w <= 0 || h <= 0) { DevLog.println("[clk] clock outside panel"); return; }
+        const int x0 = (x >> 3) << 3;
+        int x1 = ((x + w - 1) >> 3) * 8 + 7;
+        if (x1 > EPD_W - 1) x1 = EPD_W - 1;
+        const int bw = (x1 >> 3) - (x0 >> 3) + 1;
+        const int bytes = bw * h;
+        if (bytes > CLK_MAX_BYTES) {
+            DevLog.printf("[clk] region %d bytes over cap\n", bytes);
+            return;
+        }
+        clkR.valid = true;
+        clkR.fontId = (uint8_t)fid;
+        clkR.x0b = x0 >> 3;
+        clkR.x1b = x1 >> 3;
+        clkR.y0 = (uint16_t)y;
+        clkR.y1 = (uint16_t)(y + h - 1);
+        clkR.bw = (uint8_t)bw;
+        clkR.rows = (uint8_t)h;
+        clkR.scale = (uint8_t)scale;
+        clkR.xOff = (uint8_t)(x - x0);
+        clkR.yOff = 0;
+        clkPixelsValid = false;
+        DevLog.printf("[clk] reserved x=%d..%d y=%d..%d box=%dx%d win=%dx%dB\n",
+                      x, x + w - 1, y, y + h - 1, w, h, bw, bytes);
+        return;
+    }
+    DevLog.println("[clk] template has no device.now; no reservation");
+}
+
+// Copy the clock window bytes off the framebuffer that is currently on screen.
+static void clkCaptureFromFramebuffer() {
+    if (!clkR.valid || !lastDisplayedFrame) return;
+    const int stride = EPD_W / 8;
+    for (int row = 0; row < clkR.rows; row++) {
+        memcpy(&clkPixels[row * clkR.bw],
+               &lastDisplayedFrame[(clkR.y0 + row) * stride + clkR.x0b],
+               clkR.bw);
+    }
+    clkPixelsValid = true;
+}
+
+static void clkBlitString(uint8_t *buf, const char *s) {
+    sFONT *f = clkFontById(clkR.fontId);
+    if (!f) return;
+    const int stride = (f->Width + 7) / 8;
+    const int scale = clkR.scale;
+    const int bufW = clkR.bw * 8;
+    for (int i = 0; s[i]; i++) {
+        const unsigned char *ptr =
+            &f->table[(s[i] - ' ') * f->Height * stride];
+        for (int row = 0; row < f->Height; row++) {
+            for (int col = 0; col < f->Width; col++) {
+                if (!(ptr[row * stride + col / 8] & (0x80 >> (col % 8)))) continue;
+                for (int dy = 0; dy < scale; dy++) {
+                    for (int dx = 0; dx < scale; dx++) {
+                        const int px = clkR.xOff + (i * f->Width + col) * scale + dx;
+                        const int py = clkR.yOff + row * scale + dy;
+                        if (px < 0 || px >= bufW || py < 0 || py >= clkR.rows) continue;
+                        buf[py * clkR.bw + (px >> 3)] &= ~(0x80 >> (px & 7));
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Clock tick: rebuild only the reserved window and push it to the panel.
+// Used by the light-mode minute tick and by thin deep-sleep wakes; needs the
+// panel to be powered/SPI-initialized (epdBegin or epdThinBegin).
+static bool clockTickWake() {
+    if (!clkR.valid || !panelThinReady) return false;
+    if (!timeKnown()) return false;
+    const uint64_t t0 = esp_timer_get_time();
+    const size_t n = (size_t)clkR.bw * clkR.rows;
+    static uint8_t buf[CLK_MAX_BYTES];
+    memset(buf, 0xFF, n);
+    time_t nowSec = time(nullptr);
+    struct tm *lt = localtime(&nowSec);
+    char s[8] = "--:--";
+    if (lt) strftime(s, sizeof(s), "%H:%M", lt);
+    clkBlitString(buf, s);
+    const int x0 = clkR.x0b * 8, x1 = clkR.x1b * 8 + 7;
+    const uint64_t t1 = esp_timer_get_time();
+    EPD_SSD1681_WakePartialWindow(x0, clkR.y0, x1, clkR.y1,
+                                  clkPixelsValid ? clkPixels : nullptr);
+    const uint64_t t2 = esp_timer_get_time();
+    EPD_SSD1681_DisplayPartWindow(x0, clkR.y0, x1, clkR.y1, buf);
+    const uint64_t t3 = esp_timer_get_time();
+    memcpy(clkPixels, buf, n);
+    clkPixelsValid = true;
+    epdAsleep = false;
+    epdPanelSleep();
+    rtcClockTicks++;
+    rtcClkPartials++;
+    if (rtcClkPartials > CLK_GHOST_LIMIT) rtcClkPartials = CLK_GHOST_LIMIT;
+    epdPartialCount++;   // window writes count toward the light-mode ghost reset
+    const uint64_t t4 = esp_timer_get_time();
+    DevLog.printf("[clk] tick build=%uus wake=%uus write=%uus zzz=%uus total=%uus\n",
+                  (unsigned)(t1 - t0), (unsigned)(t2 - t1), (unsigned)(t3 - t2),
+                  (unsigned)(t4 - t3), (unsigned)(t4 - t0));
+    return true;
+}
+
+#ifdef CODEX_CLK_WINDOW_TEST
+static void clkTestTick() {
+    static uint32_t ticks = 0;   // survives light sleep (RAM kept)
+    if (!clkR.valid) return;
+    ticks++;
+    if (ticks > CLK_TEST_TICKS) {
+        if (ticks == CLK_TEST_TICKS + 1) {
+            DevLog.printf("[clk] A/B test done (%u ticks)\n", (unsigned)CLK_TEST_TICKS);
+        }
+        renderCurrent();
+        return;
+    }
+    const uint64_t t0 = esp_timer_get_time();
+    if (!clkPixelsValid) clkCaptureFromFramebuffer();
+    if (ticks % 2 == 0) {
+        clockTickWake();
+    } else {
+        renderCurrent();
+        clkCaptureFromFramebuffer();
+        DevLog.printf("[clk] A total=%uus\n", (unsigned)(esp_timer_get_time() - t0));
+    }
+}
+#endif
 
 // ---- Quad built-in screen (B/W design, partial refresh) ----
 // Block size matches the factory UI proportions (~52% x 34% of the panel).
@@ -725,6 +1175,8 @@ static bool tplCacheLoad() {
     // once per loop: the per-loop scan thrashs the wake-path cache and light
     // sleep never recovers on this 40 MHz-flash board.
     activeTplHasNow = activeTplJson.indexOf("device.now") >= 0;
+    activeTplHasMode = activeTplJson.indexOf("device.mode") >= 0;
+    clkComputeRect();
     return true;
 }
 
@@ -736,7 +1188,8 @@ static void renderActiveUsage(const String &json, const char *channel) {
     env.ip       = ipText();
     env.syncHHMM = nowHHMM();
     env.battery  = batteryPercent();
-    env.state    = deviceStateText();
+    env.state    = (rtcMode == MODE_DEEP) ? "DEEP" : deviceStateText();
+    env.mode     = (rtcMode == MODE_DEEP) ? "deep" : "light";
     env.offlineMins = -1;
     if (rtcLastSyncEpoch > 1600000000 && timeKnown()) {
         long mins = ((long)time(nullptr) - (long)rtcLastSyncEpoch) / 60;
@@ -776,6 +1229,7 @@ static void nextTemplate() {
     tplStoreSetActive(m.id);
     activeTplId = "";
     pendingTplChanged = true;
+    noteActivity("template-switch");
     DevLog.printf("[tpl] local switch -> %s\n", m.id.c_str());
 }
 
@@ -872,6 +1326,7 @@ static bool tryWifiUsage() {
         }
         adoptServerTime(parsed);
         applyEnvelopeMeta(parsed, rec.mac);
+        applyBridgeModeHint(parsed);
         bool explicitActivate = parsed["activate"] | false;
         bool accepted = usageAccepted(rec.mac, explicitActivate);
         storeTouch(rec.mac);
@@ -886,6 +1341,7 @@ static bool tryWifiUsage() {
         if (accepted) {
             setActiveMac(rec.mac);
             rtcActiveAt = timeKnown() ? (uint32_t)time(nullptr) : 0;
+            noteActivity("pull");
             renderActiveUsage(lastUsage, "WIFI");
         }
         return true;
@@ -937,6 +1393,7 @@ static void handleUsagePost() {
     }
     adoptServerTime(parsed);
     applyEnvelopeMeta(parsed, mac);
+    applyBridgeModeHint(parsed);
     bool explicitActivate = parsed["activate"] | false;
     bool accepted = usageAccepted(mac, explicitActivate);
     markSynced();
@@ -946,6 +1403,7 @@ static void handleUsagePost() {
         rtcActiveAt = timeKnown() ? (uint32_t)time(nullptr) : 0;
         lastUsage = body;
         lastChannel = "PUSH";
+        noteActivity("push");
         renderActiveUsage(lastUsage, "PUSH");
     } else {
         DevLog.printf("[wifi] push ignored (active=%s)\n", rtcActiveMac);
@@ -1021,6 +1479,7 @@ static void handleTemplatePost() {
     if (!unchanged || activated) {
         activeTplId = "";
         updateInfoExtra();
+        noteActivity("template");
         renderCurrent();
     }
     DevLog.printf("[tpl] http %s id=%s hash=%s%s\n",
@@ -1047,16 +1506,61 @@ static void armWakeSources(uint64_t timerUs) {
 // The only deep-sleep paths in v0.12: WIFI OFF on battery (timed retry) and AP
 // without credentials on battery (timerUs=0: buttons only). Low battery calls
 // powerOff() instead.
+//
+// v0.14: deep sleep must keep the panel powered (GPIO6 low; the SSD1681 RAM is
+// what the clock-window partial writes rely on) and the VBAT latch asserted
+// (GPIO17 high), otherwise the next thin wake starts from a random panel RAM
+// and the window refresh corrupts the screen. gpio_hold_* only persists RTC
+// capable pins (0..21); GPIO42 (amp) is left floating like before.
+static void holdPinsForDeepSleep() {
+    gpio_hold_en(GPIO_NUM_6);
+    gpio_hold_en(GPIO_NUM_17);
+    gpio_deep_sleep_hold_en();
+}
+
+// Glitch-free release: a held pad follows the (deep-sleep reset) GPIO output
+// register the moment the hold drops. Releasing GPIO17 while that register is 0
+// pulls the VBAT latch low and cuts battery power mid-boot -- the 0.14.0-0.14.3
+// battery-deep hang (NVS trace stopped at stage 90, BOOT dead, USB = power-on).
+// So restore every pad level first, then drop the holds.
+static void releaseWakeHolds() {
+    pinMode(GPIO_NUM_17, OUTPUT);
+    digitalWrite(GPIO_NUM_17, HIGH);
+    pinMode(GPIO_NUM_6, OUTPUT);
+    digitalWrite(GPIO_NUM_6, LOW);
+    gpio_hold_dis(GPIO_NUM_17);
+    gpio_hold_dis(GPIO_NUM_6);
+    gpio_deep_sleep_hold_dis();
+}
+
+// Bare sleep: no Wi-Fi/BLE/panel calls at all, so it is safe on the thin wake
+// path where those drivers were never initialized (an uninitialized
+// WiFi.disconnect(true) is a known hang risk).
+static void deepSleepRaw(uint32_t sec) {
+    if (sec < 2) sec = 2;
+    if (sec > 3600) sec = 3600;
+    rtcEpochAtSleep = timeKnown() ? (uint32_t)time(nullptr) : 0;
+    rtcClkUsAtSleep = esp_rtc_get_time_us();
+    armWakeSources((uint64_t)sec * 1000000ULL);
+    setStage(90);
+    DevLog.printf("[pm] deep sleep %us (raw)\n", (unsigned)sec);
+    holdPinsForDeepSleep();
+    esp_deep_sleep_start();
+}
+
+// Full transition cleanup (light -> deep and the network-window paths): put
+// the panel to sleep, stop BLE and disconnect Wi-Fi if it was ever up.
 static void deepSleepFor(uint32_t sec) {
     epdPanelSleep();
+    nvsStageMark(48);
     if (bleInitialized()) {
         bleAdvertiseStop();
         bleDeinit();
     }
-    WiFi.disconnect(true);
-    armWakeSources(sec ? (uint64_t)sec * 1000000ULL : 0);
-    DevLog.printf("[pm] deep sleep %us\n", (unsigned)sec);
-    esp_deep_sleep_start();
+    nvsStageMark(49);
+    if (WiFi.getMode() != WIFI_MODE_NULL) WiFi.disconnect(true);
+    nvsStageMark(50);
+    deepSleepRaw(sec);
 }
 
 static void handleBleUsage(const String &json) {
@@ -1359,6 +1863,38 @@ static void handleStatusJson() {
     doc["epd_streak"] = epdPartialCount;
     doc["wifi_slots"] = countWifiSlots();
     doc["ap_reason"] = AP_REASON_NAMES[rtcApReason < 3 ? rtcApReason : 0];
+    // v0.14 deep/light mode (docs/power-state.md §13).
+    doc["mode"] = (rtcMode == MODE_DEEP) ? "deep" : "light";
+    doc["idle_deep_s"] = idleDeepS;
+    doc["next_contact_s"] = rtcNextContactS;
+    doc["usage_rev"] = rtcUsageRev;
+    doc["clk"] = clkR.valid;
+    doc["clk_partials"] = rtcClkPartials;
+    doc["stage"] = rtcStage;
+    doc["last_wake_code"] = rtcLastWake;
+    doc["nvs_stage_boot"] = nvsStageAtBoot;
+    doc["deep_usb"] = rtcDeepOnUsb;
+    doc["frame_capture"] = rtcFrameCapture;
+    doc["tz"] = deviceTz;
+    doc["hist_count"] = histCount;
+    doc["hist_head"] = histHead;
+    {
+        uint32_t nowEpoch = timeKnown() ? (uint32_t)time(nullptr) : 0;
+        doc["next_contact_in_s"] = (rtcNextNetAt && nowEpoch && rtcNextNetAt > nowEpoch)
+                                       ? (rtcNextNetAt - nowEpoch)
+                                       : 0;
+        JsonObject deep = doc["deep"].to<JsonObject>();
+        deep["clock_wakes"] = rtcDeepCycles;
+        deep["net_windows"] = rtcNetCycles;
+        deep["net_fails"] = rtcNetFails;
+        deep["clock_ticks"] = rtcClockTicks;
+        deep["last_code"] = rtcLastPullCode;
+        deep["last_contact"] = rtcLastSyncEpoch;
+        deep["idle_s"] = lastActivityEpoch && nowEpoch ? (uint32_t)(nowEpoch - lastActivityEpoch) : 0;
+        deep["glyph"] = rtcDeepGlyph;
+        deep["tpl_has_mode"] = activeTplHasMode ? 1 : 0;
+        deep["captures"] = rtcFrameCaptures;
+    }
     JsonArray templates = doc["templates"].to<JsonArray>();
     String activeId = tplStoreActive();
     for (int i = 0; i < tplStoreCount(); i++) {
@@ -1392,6 +1928,37 @@ static void handleStatusJson() {
 
 static void handleLog() {
     server.send(200, "text/plain; charset=utf-8", DevLog.dump());
+}
+
+// GET /history: deep/light transition history from the RTC ring, oldest first.
+// `since=<seq>` returns only records with a higher sequence number, so the
+// bridge can poll incrementally using `/status.json`'s hist_count. Read-only,
+// no token (same exposure as /log and /status.json).
+static void handleHistory() {
+    uint32_t since = 0;
+    if (server.hasArg("since")) {
+        long long v = server.arg("since").toInt();
+        if (v > 0) since = (uint32_t)v;
+    }
+    uint32_t avail = histCount < HIST_CAP ? histCount : HIST_CAP;
+    uint32_t firstSeq = histCount - avail + 1;
+    JsonDocument doc;
+    JsonArray arr = doc.to<JsonArray>();
+    for (uint32_t i = 0; i < avail; i++) {
+        uint32_t seq = firstSeq + i;
+        if (seq <= since) continue;
+        const HistRec &r = histRing[(seq - 1) % HIST_CAP];
+        JsonObject item = arr.add<JsonObject>();
+        item["seq"] = seq;
+        item["t"] = r.epoch;
+        item["ev"] = r.ev;
+        item["stage"] = r.stage;
+        item["batt"] = r.batt;
+        item["aux"] = r.aux;
+    }
+    String out;
+    serializeJson(doc, out);
+    server.send(200, "application/json", out);
 }
 
 // PM light-sleep counters (CONFIG_PM_PROFILING) for remote diagnostics.
@@ -1502,11 +2069,85 @@ static void handlePmStats() {
     server.send(200, "text/plain; charset=utf-8", text);
 }
 
+// Debug capture: save the framebuffer as binary PBM (P4; 1 = black) right after
+// a pre-sleep refresh, so a deep frame can be inspected later (the panel itself
+// is unreachable while sleeping and the SSD1681 has no read-back on this board).
+// Gated by rtcFrameCapture (off by default); fixed files, overwritten each time.
+static void captureFrameToFs(const char *tag) {
+    if (!rtcFrameCapture || !frame) return;
+    if (!LittleFS.exists("/frames")) LittleFS.mkdir("/frames");
+    File f = LittleFS.open("/frames/last.pbm", FILE_WRITE);
+    if (!f) {
+        DevLog.println("[cap] open failed");
+        return;
+    }
+    f.printf("P4\n%d %d\n", EPD_W, EPD_H);
+    uint8_t buf[256];
+    for (int off = 0; off < EPD_FB_BYTES; off += (int)sizeof(buf)) {
+        int n = EPD_FB_BYTES - off;
+        if (n > (int)sizeof(buf)) n = (int)sizeof(buf);
+        for (int i = 0; i < n; i++) buf[i] = (uint8_t)(~frame[off + i] & 0xFF);
+        f.write(buf, n);
+    }
+    f.close();
+    File m = LittleFS.open("/frames/meta.txt", FILE_WRITE);
+    if (m) {
+        m.printf("tag=%s mode=%s stage=%u epoch=%lu\n", tag,
+                 rtcMode == MODE_DEEP ? "deep" : "light", (unsigned)rtcStage,
+                 (unsigned long)time(nullptr));
+        m.close();
+    }
+    rtcFrameCaptures++;
+    DevLog.printf("[cap] frame saved (%s)\n", tag);
+}
+
+// Debug screenshot: dump a framebuffer as binary PBM (P4; 1 = black).
+// `?which=frame` (default) = live buffer, `last` = last pushed to the panel,
+// `saved` = the pre-sleep capture from LittleFS. Read-only, token-free like /log.
+static void handleFrame() {
+    String which = server.hasArg("which") ? server.arg("which") : String("frame");
+    if (which == "saved") {
+        if (!LittleFS.exists("/frames/last.pbm")) {
+            server.send(404, "text/plain", "no captured frame");
+            return;
+        }
+        File f = LittleFS.open("/frames/last.pbm", FILE_READ);
+        if (!f) {
+            server.send(500, "text/plain", "open failed");
+            return;
+        }
+        server.streamFile(f, "application/x-portable-bitmap");
+        f.close();
+        return;
+    }
+    UBYTE *src = frame;
+    if (which == "last") src = lastDisplayedFrame;
+    if (!src) {
+        server.send(503, "text/plain", "no frame buffer");
+        return;
+    }
+    String out;
+    out.reserve(EPD_FB_BYTES + 16);
+    out = "P4\n";
+    out += EPD_W;
+    out += ' ';
+    out += EPD_H;
+    out += '\n';
+    for (int i = 0; i < EPD_FB_BYTES; i++) out += (char)(~src[i] & 0xFF);
+    server.send(200, "application/x-portable-bitmap", out);
+}
+
 // Token-gated runtime knob for task-2 experiments: POST /diag?loop_delay=20
 // changes the loop() yield without reflashing. Diagnostic-only endpoint.
 static void handleDiag() {
     if (!requestAuthorized()) {
         server.send(401, "text/plain", "unauthorized");
+        return;
+    }
+    // Remote recovery for a stuck/aborted OTA (UpdateClass left "running").
+    if (server.hasArg("ota_abort")) {
+        otaUploadCleanup("diag");
+        server.send(200, "text/plain", "ota aborted");
         return;
     }
     if (server.hasArg("loop_delay")) {
@@ -1518,8 +2159,72 @@ static void handleDiag() {
         loopDelayMs = (uint32_t)v;
         DevLog.printf("[diag] loop_delay=%u ms\n", (unsigned)loopDelayMs);
     }
-    server.send(200, "text/plain", "loop_delay=" + String(loopDelayMs) + " ms\n\n" +
-                                          sleepDiagText());
+    if (server.hasArg("idle_deep_s")) {
+        long v = server.arg("idle_deep_s").toInt();
+        if (v < 15 || v > 86400) {
+            server.send(400, "text/plain", "idle_deep_s out of range 15..86400");
+            return;
+        }
+        idleDeepS = (uint32_t)v;
+        noteActivity("diag");
+        DevLog.printf("[diag] idle_deep_s=%u\n", (unsigned)idleDeepS);
+    }
+    if (server.hasArg("nvs_stage")) {
+        nvsStageEnabled = server.arg("nvs_stage").toInt() ? 1 : 0;
+        nvsStageWrites = 0;
+        DevLog.printf("[diag] nvs_stage=%u\n", (unsigned)nvsStageEnabled);
+    }
+    if (server.hasArg("deep_usb")) {
+        rtcDeepOnUsb = server.arg("deep_usb").toInt() ? 1 : 0;
+        DevLog.printf("[diag] deep_usb=%u\n", (unsigned)rtcDeepOnUsb);
+    }
+    if (server.hasArg("frame_capture")) {
+        rtcFrameCapture = server.arg("frame_capture").toInt() ? 1 : 0;
+        DevLog.printf("[diag] frame_capture=%u\n", (unsigned)rtcFrameCapture);
+    }
+    // Debug: render the template as deep/light without sleeping (RAM only, not
+    // persisted) so the sleep glyph can be inspected while the device is online.
+    if (server.hasArg("render_mode")) {
+        String m = server.arg("render_mode");
+        if (m == "deep") rtcMode = MODE_DEEP;
+        else if (m == "light") rtcMode = MODE_LIGHT;
+        else {
+            server.send(400, "text/plain", "render_mode must be deep|light");
+            return;
+        }
+        renderCurrent();
+        DevLog.printf("[diag] render_mode=%s\n", m.c_str());
+    }
+    if (server.hasArg("tz")) {
+        String tz = server.arg("tz");
+        tz.trim();
+        if (tz.length() == 0 || tz.length() >= (int)sizeof(deviceTz)) {
+            server.send(400, "text/plain", "tz must be a POSIX TZ string, e.g. CST-8");
+            return;
+        }
+        strncpy(deviceTz, tz.c_str(), sizeof(deviceTz) - 1);
+        deviceTz[sizeof(deviceTz) - 1] = '\0';
+        applyTimezone();
+        Preferences p;
+        p.begin("pm", false);
+        p.putString("tz", deviceTz);
+        p.end();
+        DevLog.printf("[diag] tz=%s\n", deviceTz);
+        renderCurrent();
+    }
+    bool deepNow = server.hasArg("deep_now") && server.arg("deep_now").toInt();
+    if (deepNow) {
+        noteActivity("diag");   // clears any pending forceDeepAt, so set it after
+        forceDeepAtMs = millis() + 1500;
+        DevLog.println("[diag] deep_now scheduled");
+    }
+    server.send(200, "text/plain", "loop_delay=" + String(loopDelayMs) + " ms, idle_deep_s=" +
+                                          String(idleDeepS) + " s, nvs_stage=" +
+                                          String((unsigned)nvsStageEnabled) + ", deep_usb=" +
+                                          String((unsigned)rtcDeepOnUsb) + ", deep_now=" +
+                                          String(deepNow ? 1 : 0) + ", tz=" + deviceTz +
+                                          ", frame_capture=" + String((unsigned)rtcFrameCapture) +
+                                          "\n\n" + sleepDiagText());
 }
 
 static void randomHex(char *out, size_t bytes) {
@@ -1669,6 +2374,7 @@ static void handleClaim() {
     req.lease = (uint32_t)lease;
     bool keepSince = have && cur.id == id;
     ownerClaim(req, keepSince);
+    noteActivity("claim");
     DevLog.printf("[owner] %s id=%s name=%s host=%s:%u lease=%us force=%d\n",
                   keepSince ? "renew" : "claim", req.id.c_str(), req.name.c_str(),
                   req.host.c_str(), req.port, (unsigned)req.lease, force ? 1 : 0);
@@ -1789,7 +2495,7 @@ static void enterBleOn(bool userInitiated) {
     if (userInitiated) {
         bleOpenPairingWindow(120000);
     }
-    bool autoCond = plugged && batteryPct > BLE_AUTO_PCT;
+    bool autoCond = plugged && !rtcDeepOnUsb && batteryPct > BLE_AUTO_PCT;
     lastBleAuto = autoCond;
     bleOffDeadline = autoCond ? 0 : millis() + BLE_GRACE_MS;
     requestAnnounce(true);
@@ -1813,7 +2519,7 @@ static void bleOff(const char *reason) {
 // last connection/transfer or after the keep-alive condition ends.
 static void serviceBleSession() {
     if (!bleOn) return;
-    bool autoCond = plugged && batteryPct > BLE_AUTO_PCT;
+    bool autoCond = plugged && !rtcDeepOnUsb && batteryPct > BLE_AUTO_PCT;
     if (bleIsConnected()) {
         bleOffDeadline = millis() + BLE_GRACE_MS;
         lastBleAuto = autoCond;
@@ -1844,7 +2550,7 @@ static void pollPlug() {
     if (plugged) {
         bleUserOff = false;
         batteryPct = batteryPercent();
-        if (wifiUp && !bleOn && batteryPct > BLE_AUTO_PCT) enterBleOn(false);
+        if (wifiUp && !bleOn && !rtcDeepOnUsb && batteryPct > BLE_AUTO_PCT) enterBleOn(false);
     }
 }
 
@@ -1871,7 +2577,7 @@ static void pollWifi() {
                           WiFi.localIP().toString().c_str(), WiFi.RSSI());
             configureWifiPowerSave();
             batteryPct = batteryPercent();
-            if (plugged && !bleOn && !bleUserOff && batteryPct > BLE_AUTO_PCT) enterBleOn(false);
+            if (plugged && !rtcDeepOnUsb && !bleOn && !bleUserOff && batteryPct > BLE_AUTO_PCT) enterBleOn(false);
             sendAnnounce(bleOn);
             renderCurrent();
         }
@@ -1886,7 +2592,7 @@ static void pollWifi() {
         wifiLostSince = millis();
     }
     if (wifiLostHandled) {
-        if (plugged && (int32_t)(millis() - nextWifiRetry) >= 0) {
+        if (plugged && !rtcDeepOnUsb && (int32_t)(millis() - nextWifiRetry) >= 0) {
             nextWifiRetry = millis() + WIFI_RETRY_MS;
             ledFlash();
             retryWifi();
@@ -1896,7 +2602,7 @@ static void pollWifi() {
     if (millis() - wifiLostSince < WIFI_LOST_MS) return;
     wifiLostHandled = true;
     if (bleOn) bleOff("wifi lost");
-    if (plugged) {
+    if (plugged && !rtcDeepOnUsb) {
         nextWifiRetry = millis() + WIFI_RETRY_MS;
         DevLog.println("[wifi] WIFI OFF (plugged): retry every 60s");
         renderCurrent();
@@ -1919,7 +2625,7 @@ static void checkBattery() {
         DevLog.println("[pm] battery <5%: power off");
         powerOff();
     }
-    if (plugged && wifiUp && !bleOn && !bleUserOff && batteryPct > BLE_AUTO_PCT) enterBleOn(false);
+    if (plugged && !rtcDeepOnUsb && wifiUp && !bleOn && !bleUserOff && batteryPct > BLE_AUTO_PCT) enterBleOn(false);
 }
 
 static void handleBootClick() {
@@ -1940,11 +2646,27 @@ static void handleBootClick() {
     }
 }
 
+// Abort a running/half-finished OTA and restore the normal UI. Without this an
+// aborted upload (client drop / stall) leaves UpdateClass "already running"
+// (every later begin() fails), the OTA PM lock held (no light sleep) and the
+// screen stuck on the OTA view -- the 0.14.10 battery OTA hang.
+static void otaUploadCleanup(const char *reason) {
+    DevLog.printf("[ota] abort (%s) running=%d err=%u\n", reason, Update.isRunning() ? 1 : 0,
+                  (unsigned)Update.getError());
+    Update.abort();
+    otaInProgress = false;
+    setOtaLock(false);
+    otaUploadDenied = false;
+    if (frame) renderCurrent();
+}
+
 static void registerHttpRoutes() {
     server.on("/", HTTP_GET, handleStatus);
     server.on("/status.json", HTTP_GET, handleStatusJson);
     server.on("/log", HTTP_GET, handleLog);
+    server.on("/history", HTTP_GET, handleHistory);
     server.on("/pmstats", HTTP_GET, handlePmStats);
+    server.on("/frame", HTTP_GET, handleFrame);
     server.on("/diag", HTTP_POST, handleDiag);
     server.on("/usage", HTTP_POST, handleUsagePost);
     server.on("/template", HTTP_POST, handleTemplatePost);
@@ -1971,13 +2693,21 @@ static void registerHttpRoutes() {
                 otaUploadDenied = false;
                 otaInProgress = true;
                 setOtaLock(true);
+                otaLastDataMs = millis();
                 DevLog.printf("[ota] upload start: %s\n", up.filename.c_str());
                 std::vector<String> lines = {"OTA update", FW_VERSION, up.filename};
                 screen(lines);
-                if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
+                if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+                    DevLog.printf("[ota] begin failed: %u\n", (unsigned)Update.getError());
+                    otaUploadCleanup("begin-failed");
+                }
             } else if (up.status == UPLOAD_FILE_WRITE) {
-                if (otaUploadDenied) return;
-                if (Update.write(up.buf, up.currentSize) != up.currentSize) Update.printError(Serial);
+                if (otaUploadDenied || !otaInProgress) return;
+                otaLastDataMs = millis();
+                if (Update.write(up.buf, up.currentSize) != up.currentSize) {
+                    DevLog.printf("[ota] write failed: %u\n", (unsigned)Update.getError());
+                    otaUploadCleanup("write-failed");
+                }
             } else if (up.status == UPLOAD_FILE_END) {
                 otaInProgress = false;
                 if (otaUploadDenied) { setOtaLock(false); return; }
@@ -1987,9 +2717,11 @@ static void registerHttpRoutes() {
                     otaRebootPending = true;
                     otaRebootAt = millis() + 1500;
                 } else {
-                    Update.printError(Serial);
-                    setOtaLock(false);
+                    DevLog.printf("[ota] end failed: %u\n", (unsigned)Update.getError());
+                    otaUploadCleanup("end-failed");
                 }
+            } else if (up.status == UPLOAD_FILE_ABORTED) {
+                otaUploadCleanup("aborted");
             }
         });
 }
@@ -2027,10 +2759,12 @@ static bool configureWifiPowerSave() {
     return WiFi.status() == WL_CONNECTED;
 }
 
-static void startNormalMode() {
+static void startNormalMode(bool skipConnect = false) {
     configMode = false;
     hostname = "codex-status-" + macSuffix();
-    configTzTime("CST-8", "pool.ntp.org");
+    // Keep the active TZ (NVS/bridge-provided); a hard-coded "CST-8" here used
+    // to clobber a bridge-synced timezone on every light start.
+    configTzTime(deviceTz, "pool.ntp.org");
     pinMode(0, INPUT_PULLUP);
     pinMode(18, INPUT_PULLUP);
     pinMode(3, OUTPUT);
@@ -2040,7 +2774,12 @@ static void startNormalMode() {
     setupOtaPmLock();
     announceUdp.begin(0);
 
-    wifiUp = connectBest();
+    if (skipConnect && WiFi.status() == WL_CONNECTED) {
+        // Deep pull already fast-connected: no scan, no second association.
+        wifiUp = true;
+    } else {
+        wifiUp = connectBest();
+    }
     registerHttpRoutes();
     server.begin();
 
@@ -2050,6 +2789,7 @@ static void startNormalMode() {
         lastBattCheck = millis();
         batteryPct = batteryPercent();
         configureWifiPowerSave();
+        saveApInfo();
         loadOrIssueAuthToken();
         ArduinoOTA.setHostname(hostname.c_str());
         ArduinoOTA.onStart([]() {
@@ -2073,13 +2813,14 @@ static void startNormalMode() {
         // (option 12) set by WiFi.setHostname still shows in the router.
         ArduinoOTA.setMdnsEnabled(false);
         ArduinoOTA.begin();
-        if (plugged && batteryPct > BLE_AUTO_PCT) enterBleOn(false);
-        if (storeCount() > 0) tryWifiUsage();
+        if (plugged && !rtcDeepOnUsb && batteryPct > BLE_AUTO_PCT) enterBleOn(false);
+        if (!deepWakePath && storeCount() > 0) tryWifiUsage();
+        noteActivity(deepWakePath ? "deep-light" : "boot");
         sendAnnounce(bleOn);
     } else {
         wifiLostHandled = true;
         wifiLostSince = millis() - WIFI_LOST_MS;   // already past loss detection
-        if (plugged) {
+        if (plugged && !rtcDeepOnUsb) {
             nextWifiRetry = millis() + WIFI_RETRY_MS;
             DevLog.println("[wifi] no link at boot (plugged): retry every 60s");
         } else {
@@ -2087,7 +2828,8 @@ static void startNormalMode() {
             if (rtcRetryStage < 7) rtcRetryStage++;
             DevLog.printf("[wifi] no link at boot (battery): deep sleep %us stage=%u\n",
                           (unsigned)delaySec, (unsigned)rtcRetryStage);
-            deepSleepFor(delaySec);
+            rtcNextNetAt = timeKnown() ? (uint32_t)time(nullptr) + delaySec : 0;
+            sleepToNextEvent();
         }
     }
 
@@ -2095,12 +2837,573 @@ static void startNormalMode() {
                   deviceStateText(), ipText().c_str(), hostname.c_str(), storeCount());
 }
 
+// ---------------- v0.14 deep mode (docs/power-state.md §13) ----------------
+// deep: minute RTC wake -> clock-window direct write only; every
+// `rtcNextContactS` one network window fast-connects and pulls GET /usage.
+// light: current always-connected behavior. The bridge decides the mode in
+// the pull response; the device falls back to a local idle timer.
+
+static void persistMode() {
+    Preferences p;
+    p.begin("pm", false);
+    p.putUChar("mode", rtcMode);
+    p.putUShort("next", rtcNextContactS);
+    p.putUInt("next_at", rtcNextNetAt);
+    p.end();
+}
+
+// Deep sleep does not lose the RTC timer; reconstruct the wall clock from the
+// last sleep anchor so minute ticks stay aligned without a network contact.
+static void restoreTimeFromRtc() {
+    if (!rtcEpochAtSleep || !rtcClkUsAtSleep) return;
+    uint64_t nowUs = esp_rtc_get_time_us();
+    if (nowUs <= rtcClkUsAtSleep) return;
+    time_t t = (time_t)rtcEpochAtSleep + (time_t)((nowUs - rtcClkUsAtSleep) / 1000000ULL);
+    struct timeval tv = {t, 0};
+    settimeofday(&tv, nullptr);
+}
+
+static uint32_t secsToNextMinute() {
+    if (!timeKnown()) return 60;
+    time_t n = time(nullptr);
+    uint32_t s = (uint32_t)(60 - (n % 60));
+    if (s < 5) s += 60;   // keep a margin so ticks never double-fire
+    return s;
+}
+
+static void noteActivity(const char *reason) {
+    lastActivityEpoch = timeKnown() ? time(nullptr) : 0;
+    lastActivityMs = millis();
+    forceDeepAtMs = 0;
+    (void)reason;
+}
+
+// Local idle fallback: quiet for `idleDeepS` (default 10 min) on battery with
+// no BLE/OTA session -> deep. A bridge `mode:"deep"` hint shortens the last
+// stretch to 60 s of grace (see the push handlers).
+static bool idleDeepDue() {
+    if ((plugged && !rtcDeepOnUsb) || bleOn || otaInProgress || configMode) return false;
+    if (!wifiUp || !timeKnown()) return false;
+    if (forceDeepAtMs && (int32_t)(millis() - forceDeepAtMs) >= 0) return true;
+    time_t since = lastActivityEpoch ? lastActivityEpoch : (time_t)rtcLastSyncEpoch;
+    if (!since) return false;
+    return (long)(time(nullptr) - since) >= (long)idleDeepS;
+}
+
+static void saveApInfo() {
+    if (WiFi.status() != WL_CONNECTED) return;
+    rtcApChannel = (uint8_t)WiFi.channel();
+    strncpy(rtcApBssid, WiFi.BSSIDstr().c_str(), sizeof(rtcApBssid) - 1);
+    rtcApBssid[sizeof(rtcApBssid) - 1] = '\0';
+    prefs.begin("wifi", true);
+    rtcApSlot = prefs.getUChar("last", 0xFF);
+    prefs.end();
+}
+
+static bool parseBssid(const char *s, uint8_t out[6]) {
+    unsigned v[6];
+    if (sscanf(s, "%x:%x:%x:%x:%x:%x", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) {
+        return false;
+    }
+    for (int i = 0; i < 6; i++) out[i] = (uint8_t)v[i];
+    return true;
+}
+
+// Fast connect with the cached BSSID/channel/slot (no scan, ~1.3-1.5 s); falls
+// back to a plain association when the AP moved.
+static bool deepFastConnect() {
+    uint8_t slot = rtcApSlot;
+    prefs.begin("wifi", true);
+    if (slot >= MAX_SLOTS) slot = prefs.getUChar("last", 0);
+    wifiSsid = prefs.getString(("s" + String(slot)).c_str(), "");
+    wifiPass = prefs.getString(("p" + String(slot)).c_str(), "");
+    prefs.end();
+    if (!wifiSsid.length()) return false;
+    WiFi.mode(WIFI_STA);
+    WiFi.setHostname(hostname.c_str());
+    uint8_t bssid[6];
+    bool fast = rtcApChannel > 0 && rtcApBssid[0] && parseBssid(rtcApBssid, bssid);
+    uint32_t t0 = millis();
+    if (fast) WiFi.begin(wifiSsid.c_str(), wifiPass.c_str(), rtcApChannel, bssid);
+    else      WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 6000) delay(50);
+    if (WiFi.status() != WL_CONNECTED && fast) {
+        DevLog.println("[deep] fast connect failed; plain retry");
+        WiFi.disconnect(false);
+        delay(50);
+        WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+        t0 = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) delay(50);
+    }
+    bool up = WiFi.status() == WL_CONNECTED;
+    DevLog.printf("[deep] wifi %s fast=%d %ums ip=%s\n", up ? "up" : "fail",
+                  fast ? 1 : 0, (unsigned)(millis() - t0),
+                  up ? WiFi.localIP().toString().c_str() : "-");
+    if (up) saveApInfo();
+    return up;
+}
+
+// Preferred endpoint for a pull: the active bridge when known, else the MRU.
+static bool pickEndpoint(EndpointRec &rec) {
+    int n = storeCount();
+    if (n <= 0) return false;
+    if (rtcActiveMac[0]) {
+        for (int i = 0; i < n; i++) {
+            EndpointRec r;
+            if (storeGet(i, r) && r.mac == String(rtcActiveMac)) { rec = r; return true; }
+        }
+    }
+    int best = -1;
+    uint32_t bestMru = 0;
+    for (int i = 0; i < n; i++) {
+        EndpointRec r;
+        if (!storeGet(i, r)) continue;
+        if (best < 0 || r.mru >= bestMru) { best = i; bestMru = r.mru; }
+    }
+    return best >= 0 && storeGet(best, rec);
+}
+
+static void rememberActiveTemplate() {
+    String id = tplStoreActive();
+    TplMeta meta;
+    if (!id.length() || !tplStoreFind(id, meta)) return;
+    strncpy(rtcTplActiveId, id.c_str(), sizeof(rtcTplActiveId) - 1);
+    rtcTplActiveId[sizeof(rtcTplActiveId) - 1] = '\0';
+    strncpy(rtcTplHash, meta.hash.c_str(), sizeof(rtcTplHash) - 1);
+    rtcTplHash[sizeof(rtcTplHash) - 1] = '\0';
+}
+
+static bool activeTemplateChanged() {
+    String id = tplStoreActive();
+    TplMeta meta;
+    if (!id.length() || !tplStoreFind(id, meta)) return true;
+    return id != String(rtcTplActiveId) || meta.hash != String(rtcTplHash);
+}
+
+// When the next timer wake is due (no net contact planned -> immediate retry).
+static bool deepNetDue() {
+    if (!rtcNextNetAt) return true;
+    if (!timeKnown()) return true;
+    return (time_t)time(nullptr) >= (time_t)rtcNextNetAt;
+}
+
+// One deep network window: fast connect -> GET /usage -> execute the bridge
+// response. Returns 0 stay deep, 1 switch to light, 2 stay awake for `pending`.
+static int deepNetworkCycle() {
+    const time_t before = timeKnown() ? time(nullptr) : 0;
+    setStage(10);
+    if (!deepFastConnect()) {
+        setStage(13);
+        rtcNetFails++;
+        histAdd(HIST_NET_FAIL, 0);
+        if (rtcRetryStage < 7) rtcRetryStage++;
+        uint32_t delaySec = retryDelaySec(rtcRetryStage);
+        rtcNextNetAt = timeKnown() ? (uint32_t)time(nullptr) + delaySec : 0;
+        rtcLastPullCode = 0;
+        DevLog.printf("[deep] pull skipped: no wifi; retry %us stage=%u\n",
+                      (unsigned)delaySec, (unsigned)rtcRetryStage);
+        return 0;
+    }
+    EndpointRec rec;
+    if (!pickEndpoint(rec)) {
+        setStage(13);
+        rtcNetFails++;
+        histAdd(HIST_NET_FAIL, 0);
+        rtcNextNetAt = timeKnown() ? (uint32_t)time(nullptr) + 900 : 0;
+        DevLog.println("[deep] pull skipped: no bridge endpoint");
+        return 0;
+    }
+    String path = "/usage?next_contact_s=" + String((unsigned)rtcNextContactS) +
+                  "&mode=deep&usage_rev=" + String((unsigned)rtcUsageRev);
+    String body, err;
+    const uint32_t t0 = millis();
+    bool ok = usageHttpGet(rec, body, err, 4000, path);
+    DevLog.printf("[deep] pull %s:%u %lums %s len=%u\n",
+                  rec.host.c_str(), rec.port, (unsigned)(millis() - t0),
+                  ok ? "ok" : err.c_str(), (unsigned)body.length());
+    rtcLastPullCode = ok ? 200 : 255;
+    if (!ok) {
+        setStage(13);
+        rtcNetFails++;
+        histAdd(HIST_NET_FAIL, 0);
+        if (rtcRetryStage < 7) rtcRetryStage++;
+        uint32_t delaySec = retryDelaySec(rtcRetryStage);
+        rtcNextNetAt = timeKnown() ? (uint32_t)time(nullptr) + delaySec : 0;
+        return 0;
+    }
+    JsonDocument doc;
+    if (deserializeJson(doc, body) || doc.as<JsonObject>().isNull()) {
+        setStage(13);
+        rtcNetFails++;
+        histAdd(HIST_NET_FAIL, 0);
+        rtcNextNetAt = timeKnown() ? (uint32_t)time(nullptr) + 300 : 0;
+        DevLog.println("[deep] pull rejected: invalid JSON");
+        return 0;
+    }
+    rtcNetCycles++;
+    setStage(12);
+    histAdd(HIST_NET_OK, 200);
+    bool tzChanged = adoptServerTimeForce(doc);   // bridge clock is authoritative on contact
+    markSynced();
+    nvsStageMark(41);
+    bool firstPull = lastUsage.length() == 0;
+    lastUsage = body;
+    lastChannel = "PULL";
+
+    const char *mode = doc["mode"] | "deep";
+    long ncs = doc["next_contact_s"] | 0L;
+    if (ncs >= DEEP_CONTACT_MIN_S && ncs <= DEEP_CONTACT_MAX_S) {
+        rtcNextContactS = (uint16_t)ncs;
+    }
+    bool hasRev = !doc["usage_rev"].isNull();
+    uint32_t rev = (uint32_t)(doc["usage_rev"] | 0L);
+    bool usageChanged = true;
+    if (hasRev && rtcUsageRev) usageChanged = rev != rtcUsageRev;
+    if (hasRev) rtcUsageRev = rev;
+    JsonObject pending = doc["pending"].as<JsonObject>();
+    bool pendingOta = pending["ota"] | false;
+    int pendingTpl = (int)pending["templates"].as<JsonArray>().size();
+    nvsStageMark(42);
+
+    if (!frame || usageChanged || firstPull || activeTemplateChanged() ||
+        !clkPixelsValid || tzChanged || rtcClkPartials >= CLK_GHOST_LIMIT) {
+        nvsStageMark(43);
+        // setup() already ran epdBegin() on this boot (frame allocated); only
+        // retry on OOM. A second full init used to re-enter
+        // DEV_Module_Init/SPI.beginTransaction and deadlock on the Arduino SPI
+        // paramLock (taken once, never released) -- the 0.14.x battery hang.
+        if (!frame) epdBegin(false);
+        nvsStageMark(44);
+        renderActiveUsage(body, "PULL");
+        nvsStageMark(45);
+        clkCaptureFromFramebuffer();
+        rememberActiveTemplate();
+        rtcClkPartials = 0;
+        // Only persist when the screen content really changed: a rolling
+        // `resetsAt` on a 0%-used window must not wear the NVS.
+        usageCacheSave(body);
+        nvsStageMark(46);
+        captureFrameToFs("pull");
+    }
+    rtcNextNetAt = timeKnown() ? (uint32_t)time(nullptr) + rtcNextContactS : 0;
+    nvsStageMark(47);
+    DevLog.printf("[deep] mode=%s next=%us rev=%u changed=%d pending=%d/%d batt=%u%% t=%lld\n",
+                  mode, (unsigned)rtcNextContactS, (unsigned)rev, usageChanged ? 1 : 0,
+                  pendingOta ? 1 : 0, pendingTpl, (unsigned)batteryPercent(),
+                  (long long)(before ? (long long)(time(nullptr) - before) : 0));
+
+    if (!strcmp(mode, "light")) {
+        rtcMode = MODE_LIGHT;
+        persistMode();
+        setStage(14);
+        histAdd(HIST_TO_LIGHT, 0);
+        return 1;
+    }
+    if (pendingOta || pendingTpl > 0) {
+        setStage(15);
+        return 2;
+    }
+    return 0;
+}
+
+// Light -> deep transition: capture the clock window, notify the bridge, mark
+// the mode and sleep. Never returns (called from loop()/setup()).
+static void enterDeep(const char *reason) {
+    setStage(19);
+    if (clkR.valid && lastDisplayedFrame) clkCaptureFromFramebuffer();
+    if (!rtcNextContactS) rtcNextContactS = DEEP_CONTACT_DEFAULT_S;
+    if (WiFi.status() == WL_CONNECTED && storeCount() > 0) {
+        EndpointRec rec;
+        if (pickEndpoint(rec)) {
+            String body = String("{\"next_contact_s\":") + rtcNextContactS +
+                          ",\"usage_rev\":" + rtcUsageRev + "}";
+            int code = 0;
+            String out, err;
+            usageHttpPost(rec, "/deep", body, code, out, err, 2000);
+            DevLog.printf("[deep] notify %s:%u /deep -> %d\n",
+                          rec.host.c_str(), rec.port, code);
+        }
+    }
+    setStage(21);
+    rtcMode = MODE_DEEP;
+    rememberActiveTemplate();
+    persistMode();
+    rtcNextNetAt = timeKnown() ? (uint32_t)time(nullptr) + rtcNextContactS : 0;
+    setStage(22);
+    // Draw the sleep-state glyph (device.mode -> deep) before sleeping so the
+    // screen shows the moon/Zzz immediately instead of at the next contact.
+    // Unconditional: the cached flag was suspected of skipping this render.
+    rtcDeepGlyph = activeTplHasMode ? 1 : 2;
+    // Force a full refresh for the sleep glyph. Partial refreshes compare
+    // against the firmware's `lastDisplayedFrame`, which can drift from the
+    // panel's physical image (the thin-wake panel power pulse resets the
+    // controller), so the glyph could be left half-drawn or missing.
+    epdPartialReady = false;
+    renderCurrent();
+    rtcDeepGlyph |= 4;
+    captureFrameToFs("enter-deep");
+    setStage(20);
+    histAdd(HIST_ENTER_DEEP, rtcNextContactS);
+    DevLog.printf("[deep] enter (%s) next_net=%us rev=%u clk=%d\n", reason,
+                  (unsigned)rtcNextContactS, (unsigned)rtcUsageRev, clkR.valid ? 1 : 0);
+    sleepToNextEvent();
+}
+
+// Sleep to the next minute tick (clock reserved) or the next network contact;
+// records the wall-clock/RTC anchors used to reconstruct time on wake.
+static void sleepToNextEvent() {
+    uint32_t secs = 60;
+    if (clkR.valid) {
+        secs = secsToNextMinute();
+    } else if (rtcNextNetAt && timeKnown() &&
+               (time_t)rtcNextNetAt > time(nullptr)) {
+        long d = (long)((time_t)rtcNextNetAt - time(nullptr));
+        secs = (uint32_t)(d > 3600 ? 3600 : (d < 2 ? 2 : d));
+    }
+    if (secs < 2) secs = 2;
+    deepSleepFor(secs);   // deepSleepRaw records the sleep-time anchors
+}
+
+// Thin deep wake: panel + clock window only, no Wi-Fi/NVS/template work.
+static void deepThinWake() {
+    const uint64_t t0 = esp_timer_get_time();
+    setStage(2);
+    epdThinBegin();
+    setStage(30);
+    bool drew = clockTickWake();
+    rtcDeepCycles++;
+    histAdd(HIST_THIN, drew ? 1 : 0);
+    setStage(3);
+    DevLog.printf("[deep] thin wake drew=%d total=%uus\n", drew ? 1 : 0,
+                  (unsigned)(esp_timer_get_time() - t0));
+    sleepToNextEvent();
+}
+
+// ---------------- deep-pull test rig (CODEX_DEEPPULL_TEST only) ----------------
+// Measures: timer deep-sleep wake -> saved-BSSID fast connect -> GET /usage from
+// the bridge -> light sleep. 5 cycles of RTC-measured timings are kept in RTC RAM
+// (deep sleep wipes the DevLog ring), then the device stays online in light sleep
+// so the original ROM can be OTA'd back. Zero impact on release builds.
+#ifdef CODEX_DEEPPULL_TEST
+#define DP_TEST_CYCLES     5
+#define DP_TEST_DEEP_S     30
+#define DP_TEST_CONNECT_MS 6000
+
+RTC_DATA_ATTR static uint32_t dpDone = 0;
+RTC_DATA_ATTR static uint8_t  dpChannel = 0;
+RTC_DATA_ATTR static char     dpBssid[20] = {0};
+RTC_DATA_ATTR static uint8_t  dpSlot = 0xFF;
+// Per cycle: boot_ms, wifi_ms, http_ms, parse_ms, total_ms, code.
+RTC_DATA_ATTR static uint32_t dpLog[DP_TEST_CYCLES][6] = {};
+// Last cycle's full PM stats text (DevLog.printf truncates at 200 bytes, so it
+// is kept in RTC and dumped in chunks while the device is online).
+RTC_DATA_ATTR static char dpPm[768] = {0};
+static uint64_t dpBootUs = 0;
+
+static bool dpParseBssid(const char *s, uint8_t out[6]) {
+    unsigned v[6];
+    if (sscanf(s, "%x:%x:%x:%x:%x:%x", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) {
+        return false;
+    }
+    for (int i = 0; i < 6; i++) out[i] = (uint8_t)v[i];
+    return true;
+}
+
+static void dpSaveAp() {
+    if (WiFi.status() != WL_CONNECTED) return;
+    dpChannel = (uint8_t)WiFi.channel();
+    strncpy(dpBssid, WiFi.BSSIDstr().c_str(), sizeof(dpBssid) - 1);
+    dpBssid[sizeof(dpBssid) - 1] = '\0';
+    prefs.begin("wifi", true);
+    dpSlot = prefs.getUChar("last", 0xFF);
+    prefs.end();
+    DevLog.printf("[dp] saved ap ch=%u bssid=%s slot=%u\n",
+                  (unsigned)dpChannel, dpBssid, (unsigned)dpSlot);
+}
+
+static bool dpFastConnect(uint32_t &wallMs, bool &fast) {
+    uint8_t slot = dpSlot;
+    prefs.begin("wifi", true);
+    if (slot >= MAX_SLOTS) slot = prefs.getUChar("last", 0);
+    wifiSsid = prefs.getString(("s" + String(slot)).c_str(), "");
+    wifiPass = prefs.getString(("p" + String(slot)).c_str(), "");
+    prefs.end();
+    if (!wifiSsid.length()) return false;
+    WiFi.mode(WIFI_STA);
+    WiFi.setHostname(hostname.c_str());
+    uint8_t bssid[6];
+    fast = dpChannel > 0 && dpParseBssid(dpBssid, bssid);
+    const uint32_t t0 = (uint32_t)(esp_timer_get_time() / 1000);
+    if (fast) WiFi.begin(wifiSsid.c_str(), wifiPass.c_str(), dpChannel, bssid);
+    else      WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+    while (WiFi.status() != WL_CONNECTED &&
+           (uint32_t)(esp_timer_get_time() / 1000) - t0 < DP_TEST_CONNECT_MS) {
+        delay(50);
+    }
+    wallMs = (uint32_t)(esp_timer_get_time() / 1000) - t0;
+    return WiFi.status() == WL_CONNECTED;
+}
+
+static void dpCycle() {
+    configurePowerManagement();
+    setupOtaPmLock();
+    const uint64_t startUs = esp_timer_get_time();
+    uint32_t wifiMs = 0, httpMs = 0, parseMs = 0;
+    bool fast = false;
+    const bool up = dpFastConnect(wifiMs, fast);
+    int code = -1;
+    if (up) {
+        EndpointRec rec;
+        bool have = false;
+        for (int i = 0; i < storeCount(); i++) {
+            if (storeGet(i, rec) && rec.host.length() && rec.port) { have = true; break; }
+        }
+        if (have) {
+            HTTPClient http;
+            http.setConnectTimeout(2000);
+            http.setTimeout(4000);
+            http.begin("http://" + rec.host + ":" + String(rec.port) + "/usage");
+            http.addHeader("Authorization", "Bearer " + rec.token);
+            const uint32_t h0 = (uint32_t)(esp_timer_get_time() / 1000);
+            code = http.GET();
+            String body;
+            if (code == 200) body = http.getString();
+            httpMs = (uint32_t)(esp_timer_get_time() / 1000) - h0;
+            if (body.length()) {
+                const uint32_t fnv = fnv1a(body);
+                JsonDocument doc;
+                const uint32_t p0 = (uint32_t)(esp_timer_get_time() / 1000);
+                deserializeJson(doc, body);
+                parseMs = (uint32_t)(esp_timer_get_time() / 1000) - p0;
+                DevLog.printf("[dp] pull host=%s:%u code=%d len=%u fnv=%08x\n",
+                              rec.host.c_str(), (unsigned)rec.port, code,
+                              (unsigned)body.length(), (unsigned)fnv);
+            } else {
+                DevLog.printf("[dp] pull host=%s:%u code=%d len=0\n",
+                              rec.host.c_str(), (unsigned)rec.port, code);
+            }
+            http.end();
+        } else {
+            DevLog.println("[dp] no bridge endpoint stored");
+        }
+    }
+    const uint32_t totalMs = (uint32_t)((esp_timer_get_time() - startUs) / 1000);
+    const uint32_t cycle = dpDone;
+    if (cycle < DP_TEST_CYCLES) {
+        dpLog[cycle][0] = (uint32_t)(dpBootUs / 1000);
+        dpLog[cycle][1] = wifiMs;
+        dpLog[cycle][2] = httpMs;
+        dpLog[cycle][3] = parseMs;
+        dpLog[cycle][4] = totalMs;
+        dpLog[cycle][5] = (uint32_t)code;
+    }
+    dpDone = cycle + 1;
+    DevLog.printf("[dp] cyc=%u/%u up=%d fast=%d boot_ms=%u wifi_ms=%u http_ms=%u parse_ms=%u total_ms=%u code=%d batt=%u%%\n",
+                  (unsigned)(cycle + 1), (unsigned)DP_TEST_CYCLES, up ? 1 : 0, fast ? 1 : 0,
+                  (unsigned)(dpBootUs / 1000), (unsigned)wifiMs, (unsigned)httpMs,
+                  (unsigned)parseMs, (unsigned)totalMs, code, (unsigned)batteryPercent());
+    const String pm = pmStatsText();
+    strncpy(dpPm, pm.c_str(), sizeof(dpPm) - 1);
+    dpPm[sizeof(dpPm) - 1] = '\0';
+    DevLog.printf("[dp] pm text captured (%u bytes)\n", (unsigned)strlen(dpPm));
+}
+
+static void dpDump() {
+    for (uint32_t i = 0; i < DP_TEST_CYCLES && i < dpDone; i++) {
+        DevLog.printf("[dp] rec %u: boot_ms=%u wifi_ms=%u http_ms=%u parse_ms=%u total_ms=%u code=%u\n",
+                      (unsigned)i, (unsigned)dpLog[i][0], (unsigned)dpLog[i][1],
+                      (unsigned)dpLog[i][2], (unsigned)dpLog[i][3],
+                      (unsigned)dpLog[i][4], (unsigned)dpLog[i][5]);
+    }
+    const size_t n = strlen(dpPm);
+    if (n) {
+        DevLog.print("[dp] pm dump begin\n");
+        for (size_t off = 0; off < n; off += 180) {
+            const size_t len = (n - off > 180) ? 180 : (n - off);
+            char chunk[181];
+            memcpy(chunk, dpPm + off, len);
+            chunk[len] = '\0';
+            DevLog.print(chunk);
+        }
+        DevLog.print("\n[dp] pm dump end\n");
+    }
+}
+
+// Returns true when this boot was fully handled (armed/cycled/deep-slept).
+static bool dpTestMain(esp_sleep_wakeup_cause_t cause) {
+    if (plugged) { DevLog.println("[dp] USB plugged: skip test, normal mode"); return false; }
+    if (!hasWifiSlots()) return false;
+    if (dpDone >= DP_TEST_CYCLES) return false;
+    if (cause == ESP_SLEEP_WAKEUP_EXT1) return false;   // button wake: normal
+    if (cause == ESP_SLEEP_WAKEUP_TIMER) {
+        dpCycle();
+        if (dpDone >= DP_TEST_CYCLES) {
+            DevLog.println("[dp] done; normal light-sleep mode (rollback OTA window)");
+            dpDump();
+            return false;   // setup() falls through to startNormalMode()
+        }
+        deepSleepFor(DP_TEST_DEEP_S);
+        return true;        // unreachable
+    }
+    // Fresh boot after OTA: connect once to learn the AP channel/BSSID, then cycle.
+    startNormalMode();
+    if (wifiUp) {
+        dpSaveAp();
+        DevLog.printf("[dp] armed: %u cycles x %us deep sleep\n",
+                      (unsigned)DP_TEST_CYCLES, (unsigned)DP_TEST_DEEP_S);
+        deepSleepFor(DP_TEST_DEEP_S);
+        return true;        // unreachable
+    }
+    return false;
+}
+#endif
+
 void setup() {
+#ifdef CODEX_DEEPPULL_TEST
+    dpBootUs = esp_timer_get_time();
+#endif
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
     bootWakeCause = cause;
+    rtcLastWake = (uint8_t)cause;
+    rtcStage = 1;
+    if (cause != ESP_SLEEP_WAKEUP_TIMER) {
+        rtcDeepOnUsb = 0;      // reboot/reset clears the test switches
+        rtcFrameCapture = 0;
+    }
+    {
+        Preferences p;
+        p.begin("pm", true);
+        nvsStageAtBoot = p.getUChar("stg", 0xFF);
+        String tz = p.getString("tz", "");
+        if (tz.length() && tz.length() < (int)sizeof(deviceTz)) {
+            strncpy(deviceTz, tz.c_str(), sizeof(deviceTz) - 1);
+            deviceTz[sizeof(deviceTz) - 1] = '\0';
+        }
+        p.end();
+    }
+    applyTimezone();
+    nvsStageLast = 0xFF;
+    nvsStageMark(1);      // wake reached setup (diagnostic sessions only)
     bool woke = (cause == ESP_SLEEP_WAKEUP_TIMER || cause == ESP_SLEEP_WAKEUP_EXT1);
     loadHostMac();
     hostname = "codex-status-" + macSuffix();
+    releaseWakeHolds();   // clear deep-sleep GPIO holds from the previous cycle
+    nvsStageMark(4);      // holds released without losing the VBAT latch
+    plugged = usb_serial_jtag_is_connected();
+    batteryPct = batteryPercent();
+    if (rtcMagic == 0xC0DE0001) restoreTimeFromRtc();
+
+    // v0.14 deep timer wake: if no network contact is due, this boot is a thin
+    // clock-only wake (panel + reserved window, no Wi-Fi/NVS/template work).
+    // Buttons and USB still fall through to the normal light-mode path.
+    bool deepTimerBoot = (cause == ESP_SLEEP_WAKEUP_TIMER && rtcMode == MODE_DEEP &&
+                          (!plugged || rtcDeepOnUsb));
+    nvsStageMark(5);      // wake classified (deepTimerBoot known)
+    histAdd(HIST_BOOT, (uint16_t)cause);
+    if (deepTimerBoot && !deepNetDue()) {
+        deepThinWake();   // never returns
+    }
+
     epdBegin(!woke);
     if (!woke) screen({"CODEX STATUS", FW_VERSION, "booting..."});
     if (rtcMagic != 0xC0DE0001) {
@@ -2110,6 +3413,20 @@ void setup() {
         rtcLastSyncEpoch = 0;
         rtcRetryStage = 0;
         rtcUsageHash = 0;
+        rtcMode = MODE_LIGHT;
+        rtcNextContactS = DEEP_CONTACT_DEFAULT_S;
+        rtcNextNetAt = 0;
+        rtcUsageRev = 0;
+        rtcEpochAtSleep = 0;
+        rtcClkUsAtSleep = 0;
+        rtcApChannel = 0;
+        rtcApBssid[0] = 0;
+        rtcApSlot = 0xFF;
+        rtcClkPartials = 0;
+        rtcTplActiveId[0] = 0;
+        rtcTplHash[0] = 0;
+        clkR.valid = false;
+        clkPixelsValid = false;
         DevLog.println("[pm] RTC state initialized");
     }
     // The last successful sync must survive OTA/software resets (RTC data is
@@ -2122,17 +3439,22 @@ void setup() {
     }
     lastPersistedSync = rtcLastSyncEpoch;
     if (cause == ESP_SLEEP_WAKEUP_EXT1) {
+        // Manual wake (BOOT/PWR): leave deep and behave as light (docs §13.3).
+        rtcMode = MODE_LIGHT;
+        persistMode();
         rtcRetryStage = 0;   // button wake replays the retry cadence from the top
-        DevLog.println("[pm] button wake: retry stage reset");
+        histAdd(HIST_TO_LIGHT, 1);   // aux=1: button wake
+        DevLog.println("[pm] button wake: light mode, retry stage reset");
     }
-    plugged = usb_serial_jtag_is_connected();
-    batteryPct = batteryPercent();
+    if (plugged && !rtcDeepOnUsb) rtcMode = MODE_LIGHT;
+    deepWakePath = deepTimerBoot;
 
     const esp_partition_t *running = esp_ota_get_running_partition();
-    DevLog.printf("\n[codex-status] v%s mac=%s reset=%s slot=%s wake=%d(%s) usb=%d\n",
+    DevLog.printf("\n[codex-status] v%s mac=%s reset=%s slot=%s wake=%d(%s) usb=%d deepusb=%d mode=%s\n",
                   FW_VERSION, macText().c_str(), resetReasonName(),
                   running ? running->label : "?", (int)cause,
-                  wakeCauseName(cause), plugged ? 1 : 0);
+                  wakeCauseName(cause), plugged ? 1 : 0, (unsigned)rtcDeepOnUsb,
+                  rtcMode == MODE_DEEP ? "deep" : "light");
     { Preferences p; p.begin("brg", false); p.end(); }
     ownerBegin();
 
@@ -2141,8 +3463,25 @@ void setup() {
     String cached;
     if (usageCacheLoad(cached)) lastUsage = cached;
 
+#ifdef CODEX_DEEPPULL_TEST
+    if (dpTestMain(cause)) return;
+#endif
     if (hasWifiSlots()) {
-        startNormalMode();
+        if (deepWakePath) {
+            // Network window: pull the envelope, then either go back to sleep
+            // or switch to light / stay awake for a pending push.
+            int r = deepNetworkCycle();
+            if (r == 0) {
+                nvsStageMark(51);
+                sleepToNextEvent();   // never returns
+            }
+            if (r == 2) pendingWindowUntilMs = millis() + DEEP_PENDING_WINDOW_MS;
+            startNormalMode(true);
+            if (activeTplHasMode) renderCurrent();   // hide the sleep glyph
+        } else {
+            rtcStage = 99;
+            startNormalMode();
+        }
     } else {
         rtcApReason = 1;
         DevLog.println("[config] no saved Wi-Fi slots; entering AP mode");
@@ -2201,6 +3540,27 @@ static void handleSerialCli() {
         } else if (line == "pair") {
             enterBleOn(true);
             DevLog.println("[cli] BLE session on, pairing window 120s");
+        } else if (line == "deep") {
+            DevLog.println("[cli] deep sleep now");
+            enterDeep("cli");
+        } else if (line == "light") {
+            rtcMode = MODE_LIGHT;
+            forceDeepAtMs = 0;
+            persistMode();
+            noteActivity("cli");
+            DevLog.println("[cli] light mode");
+        } else if (line == "deepusb on") {
+            rtcDeepOnUsb = 1;
+            DevLog.println("[cli] deep_usb=1 (deep sleep allowed while plugged)");
+        } else if (line == "deepusb off") {
+            rtcDeepOnUsb = 0;
+            DevLog.println("[cli] deep_usb=0");
+        } else if (line == "framecap on") {
+            rtcFrameCapture = 1;
+            DevLog.println("[cli] frame_capture=1 (pre-sleep frame -> /frames/last.pbm)");
+        } else if (line == "framecap off") {
+            rtcFrameCapture = 0;
+            DevLog.println("[cli] frame_capture=0");
         } else if (line == "pmstats") {
             dumpPmStats();
         } else if (line == "timers") {
@@ -2210,7 +3570,7 @@ static void handleSerialCli() {
             DevLog.printf("[pm] %s", taskStatsText().c_str());
             DevLog.printf("[pm] timers:\n%s", timerStatsText().c_str());
         } else if (line.length()) {
-            DevLog.println("[cli] commands: wifi <ssid> <pass> | status | batt | pair | pmstats | timers | diag");
+            DevLog.println("[cli] commands: wifi <ssid> <pass> | status | batt | pair | deep | light | deepusb on|off | framecap on|off | pmstats | timers | diag");
         }
     }
 }
@@ -2235,6 +3595,11 @@ static void powerOff() {
 
 void loop() {
     if (otaRebootPending && (int32_t)(millis() - otaRebootAt) >= 0) ESP.restart();
+    // OTA stall watchdog: no upload chunk for 20 s -> abort and restore the UI
+    // (the WebServer also reports UPLOAD_FILE_ABORTED; this is the backstop).
+    if (otaInProgress && otaLastDataMs && (int32_t)(millis() - otaLastDataMs) > 20000) {
+        otaUploadCleanup("stalled");
+    }
     handleSerialCli();
     server.handleClient();
     blePoll();
@@ -2322,6 +3687,7 @@ void loop() {
                 DevLog.printf("[owner] BLE usage ignored (occupied, id=%s)\n", bridgeId.c_str());
             } else {
                 adoptServerTime(parsed);
+                applyBridgeModeHint(parsed);
                 String mac = blePeerAddress();
                 applyEnvelopeMeta(parsed, mac);
                 bool explicitActivate = parsed["activate"] | false;
@@ -2333,6 +3699,7 @@ void loop() {
                     rtcActiveAt = timeKnown() ? (uint32_t)time(nullptr) : 0;
                     lastUsage = pendingUsage;
                     lastChannel = pendingChannel;
+                    noteActivity("ble-usage");
                     renderActiveUsage(lastUsage, lastChannel.c_str());
                 } else {
                     DevLog.printf("[usage] BLE usage ignored (active=%s)\n", rtcActiveMac);
@@ -2349,6 +3716,16 @@ void loop() {
     checkBattery();
     serviceAnnounce();
     serviceLed();
+
+    // v0.14 mode transitions: a pending-window expiry or the local idle timer
+    // (plus a bridge `mode:"deep"` hint) sends the device back to deep sleep.
+    if (pendingWindowUntilMs && (int32_t)(millis() - pendingWindowUntilMs) >= 0) {
+        pendingWindowUntilMs = 0;
+        enterDeep("pending window");
+    }
+    if (idleDeepDue()) {
+        enterDeep(forceDeepAtMs ? "bridge deep" : "idle");
+    }
 
     // 1 Hz housekeeping tick: read the clock once per second and share it
     // between the offline-minutes row and the `device.now` clock bind. Both
@@ -2384,9 +3761,18 @@ void loop() {
                 long minute = (long)nowSec / 60;
                 if (lastClockMinute < 0) {
                     lastClockMinute = minute;
+                    if (clkR.valid) clkCaptureFromFramebuffer();
                 } else if (minute != lastClockMinute) {
                     lastClockMinute = minute;
-                    renderCurrent();
+#ifdef CODEX_CLK_WINDOW_TEST
+                    clkTestTick();
+#else
+                    // Direct window write (v0.14): ~796 ms vs ~864 ms for a full
+                    // re-render; a full render every 30 partials clears ghosting.
+                    if (epdPartialCount >= 30 || !clockTickWake()) {
+                        renderCurrent();
+                    }
+#endif
                 }
             }
         }

@@ -27,6 +27,101 @@
       "type": "rect"
     },
     {
+      "bits": "AYABwAHgAbAZmA2wB+ADwAPAB+ANsBmYAbAB4AHAAYA=",
+      "color": "black",
+      "h": 16,
+      "type": "icon",
+      "w": 16,
+      "when": {
+        "bind": "device.state",
+        "equals": "BLE ON"
+      },
+      "x": 101,
+      "y": 6
+    },
+    {
+      "bits": "AAADwB/4cA7AA4PBH/g4HCAEA8AH4AAAAAABgAGAAAA=",
+      "color": "black",
+      "h": 16,
+      "type": "icon",
+      "w": 16,
+      "x": 121,
+      "y": 6
+    },
+    {
+      "bits": "AAB//sADwAPAA8ADwAPAA8ADwAP//3/+AYAf+B/4AAA=",
+      "color": "black",
+      "h": 16,
+      "type": "icon",
+      "w": 16,
+      "x": 141,
+      "y": 6
+    },
+    {
+      "bits": "AAABgB/4cY7Bg4GBHbg5nCGEAAAAAAAAAAABgAGAAAA=",
+      "color": "black",
+      "h": 16,
+      "type": "icon",
+      "w": 16,
+      "when": {
+        "bind": "device.state",
+        "equals": "WIFI OFF"
+      },
+      "x": 121,
+      "y": 6
+    },
+    {
+      "bits": "AAB//sAD2APMA8YDwwPBg8GDwAP//3/+AYAf+B/+AAY=",
+      "color": "black",
+      "h": 16,
+      "type": "icon",
+      "w": 16,
+      "when": {
+        "bind": "device.offline_mins",
+        "exists": true
+      },
+      "x": 141,
+      "y": 6
+    },
+    {
+      "bits": "AAB//sAD2APMA8YDwwPBg8GDwAP//3/+AYAf+B/+AAY=",
+      "color": "black",
+      "h": 16,
+      "type": "icon",
+      "w": 16,
+      "when": {
+        "bind": "device.state",
+        "equals": "WIFI OFF"
+      },
+      "x": 141,
+      "y": 6
+    },
+    {
+      "bits": "AAAAAH8ABgAIABB8IAh/EAAgAHw4ABAAOAAAAAAAAAA=",
+      "color": "black",
+      "h": 16,
+      "type": "icon",
+      "w": 16,
+      "when": {
+        "bind": "device.mode",
+        "equals": "deep"
+      },
+      "x": 101,
+      "y": 6
+    },
+    {
+      "bind": "device.now",
+      "color": "black",
+      "font": "f12",
+      "type": "text",
+      "when": {
+        "bind": "device.now",
+        "exists": true
+      },
+      "x": 161,
+      "y": 9
+    },
+    {
       "align": "center",
       "bg": "black",
       "bind": "buckets[codex].weekly.remaining",
@@ -140,11 +235,15 @@
       "prefix": "PLAN ",
       "region": [
         112,
-        4,
+        28,
         84,
         18
       ],
-      "type": "text"
+      "type": "text",
+      "when": {
+        "bind": "resetCredits.availableCount",
+        "exists": true
+      }
     },
     {
       "align": "right",
@@ -153,7 +252,7 @@
       "font": "f12",
       "region": [
         112,
-        22,
+        46,
         84,
         18
       ],
@@ -165,17 +264,104 @@
     },
     {
       "align": "right",
+      "bind": "bridge.label",
+      "color": "black",
+      "font": "f12",
+      "region": [
+        112,
+        64,
+        84,
+        18
+      ],
+      "type": "text",
+      "when": {
+        "bind": "bridge.label",
+        "exists": true
+      }
+    },
+    {
+      "color": "white",
+      "fill": true,
+      "rect": [
+        112,
+        46,
+        84,
+        18
+      ],
+      "type": "rect",
+      "when": {
+        "bind": "resetCredits.availableCount",
+        "exists": false
+      }
+    },
+    {
+      "align": "right",
+      "bind": "account.plan",
+      "color": "black",
+      "font": "f12",
+      "prefix": "PLAN ",
+      "region": [
+        112,
+        46,
+        84,
+        18
+      ],
+      "type": "text",
+      "when": {
+        "bind": "resetCredits.availableCount",
+        "exists": false
+      }
+    },
+    {
+      "color": "white",
+      "fill": true,
+      "rect": [
+        112,
+        64,
+        84,
+        18
+      ],
+      "type": "rect",
+      "when": {
+        "bind": "resetCredits.availableCount",
+        "exists": true
+      }
+    },
+    {
+      "align": "right",
       "bind": "buckets[codex].weekly.resetsAt",
       "color": "black",
       "font": "f12",
       "region": [
         112,
-        40,
+        64,
         84,
         18
       ],
       "time_format": "date",
-      "type": "text"
+      "type": "text",
+      "when": {
+        "bind": "resetCredits.availableCount",
+        "exists": true
+      }
+    },
+    {
+      "align": "right",
+      "bind": "buckets[codex].weekly.resetsAt",
+      "color": "black",
+      "font": "f12",
+      "region": [
+        112,
+        82,
+        84,
+        18
+      ],
+      "time_format": "date",
+      "type": "text",
+      "when": {
+        "bind": "resetCredits.availableCount",
+        "exists": false
+      }
     },
     {
       "align": "right",
@@ -185,7 +371,7 @@
       "prefix": "RC ",
       "region": [
         112,
-        58,
+        82,
         84,
         18
       ],
@@ -202,7 +388,7 @@
       "prefix": "5H ",
       "region": [
         4,
-        144,
+        158,
         84,
         12
       ],
@@ -220,23 +406,11 @@
       "prefix": "BATT ",
       "region": [
         4,
-        158,
-        84,
-        12
-      ],
-      "suffix": "%",
-      "type": "text"
-    },
-    {
-      "bind": "device.state",
-      "color": "black",
-      "font": "f12",
-      "region": [
-        4,
         172,
         84,
         12
       ],
+      "suffix": "%",
       "type": "text"
     },
     {
@@ -276,7 +450,7 @@
     }
   ],
   "id": "quad",
-  "min_fw": "0.12",
+  "min_fw": "0.14",
   "schema": 1,
-  "version": 7
+  "version": 10
 }

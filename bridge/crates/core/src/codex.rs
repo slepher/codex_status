@@ -14,7 +14,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{oneshot, Mutex, Notify};
 
 pub const CLI_MARKER: &str = "codex-cli";
 pub const RPC_TIMEOUT: Duration = Duration::from_secs(20);
@@ -103,6 +103,21 @@ pub fn locate_codex(explicit: Option<&Path>) -> Result<PathBuf> {
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
 
+/// Whether a server notification looks like a rolling rate-limit update. The
+/// app-server protocol ships `AccountRateLimitsUpdatedNotification`
+/// ("Sparse rolling rate-limit update ... merge or refetch"); match tolerantly
+/// because the wire name has moved before and its params always carry a
+/// `rateLimits` object.
+pub fn is_rate_limit_notification(method: &str, params: Option<&Value>) -> bool {
+    let m = method.to_ascii_lowercase();
+    if m.contains("ratelimit") && (m.contains("update") || m.contains("change")) {
+        return true;
+    }
+    params
+        .map(|p| p.get("rateLimits").is_some() || p.get("rate_limits").is_some())
+        .unwrap_or(false)
+}
+
 /// JSON-RPC client over a spawned `codex app-server` process.
 pub struct CodexClient {
     child: Child,
@@ -110,6 +125,7 @@ pub struct CodexClient {
     next_id: AtomicU64,
     pending: Pending,
     timeout: Duration,
+    rate_limit_notify: Arc<Notify>,
 }
 
 impl CodexClient {
@@ -132,6 +148,7 @@ impl CodexClient {
         let stderr = child.stderr.take().ok_or_else(|| anyhow!("no stderr"))?;
         let stdin = Arc::new(Mutex::new(stdin));
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let rate_limit_notify = Arc::new(Notify::new());
 
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
@@ -142,6 +159,7 @@ impl CodexClient {
 
         let pending_reader = pending.clone();
         let stdin_reader = stdin.clone();
+        let notify_reader = rate_limit_notify.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             loop {
@@ -160,7 +178,12 @@ impl CodexClient {
                         };
                         let Some(id) = msg.get("id").and_then(|v| v.as_u64()) else {
                             if let Some(m) = msg.get("method").and_then(|v| v.as_str()) {
-                                tracing::debug!(target: "codex.notify", "{m}");
+                                if is_rate_limit_notification(m, msg.get("params")) {
+                                    tracing::info!(target: "codex.notify", "rate limit update: {m}");
+                                    notify_reader.notify_one();
+                                } else {
+                                    tracing::debug!(target: "codex.notify", "{m}");
+                                }
                             }
                             continue;
                         };
@@ -202,6 +225,7 @@ impl CodexClient {
             next_id: AtomicU64::new(1),
             pending,
             timeout: RPC_TIMEOUT,
+            rate_limit_notify,
         })
     }
 
@@ -266,5 +290,37 @@ impl CodexClient {
 
     pub fn kill(&mut self) {
         let _ = self.child.start_kill();
+    }
+
+    /// Fires when the app-server pushes a rolling rate-limit update so the
+    /// poller can refetch immediately instead of waiting for the fallback tick.
+    pub fn rate_limit_signal(&self) -> Arc<Notify> {
+        self.rate_limit_notify.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_rate_limit_notification;
+    use serde_json::json;
+
+    #[test]
+    fn matches_rolling_rate_limit_notifications() {
+        assert!(is_rate_limit_notification(
+            "account/rateLimits/updated",
+            None
+        ));
+        assert!(is_rate_limit_notification(
+            "account/rateLimits/changed",
+            None
+        ));
+        assert!(is_rate_limit_notification(
+            "some/other/method",
+            Some(&json!({"rateLimits": {"primary": {}}}))
+        ));
+        assert!(!is_rate_limit_notification(
+            "item/started",
+            Some(&json!({"item": {}}))
+        ));
     }
 }

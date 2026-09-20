@@ -63,6 +63,18 @@ JSON_WRITE_LIMIT = 180
 ARGS = None
 RESET_AT = int(time.time()) + 3 * 3600  # 启动时固定，模拟真实窗口重置时间
 
+# v0.14 deep/light decision state (mirrors bridge-core activity.rs).
+STATE = {
+    "rev": 0,
+    "last_used": None,
+    "last_change": time.time(),
+    "deep_at": None,
+}
+ACTIVE_CONTACT_S = 60
+QUIET_CONTACT_S = 900
+QUIET_DEEP_S = 600
+LIGHT_HOLD_S = 300
+
 TEMPLATES = [
     {
         "schema": 1, "id": "full", "version": 3, "min_fw": "0.3",
@@ -153,12 +165,20 @@ async def write_fragmented(client, uuid: str, data: bytes, limit: int | None = N
         await client.write_gatt_char(uuid, chunk, response=True)
 
 
+def local_offset_min() -> int:
+    """Local UTC offset in minutes, east positive (CST -> 480)."""
+    now = time.localtime()
+    offset = time.altzone if now.tm_isdst > 0 else time.timezone
+    return int(-offset / 60)
+
+
 def make_usage() -> dict:
     now = int(time.time())
     used = (now // 30) % 100 if ARGS.dynamic else ARGS.percent
     return {
         "schema": 1,
         "server_time": now,
+        "tz_offset_min": local_offset_min(),
         "next_sync_seconds": ARGS.interval,
         "bridge": {"label": bridge_label(), "hostId": "test01"},
         "account": {"plan": "prolite"},
@@ -184,6 +204,42 @@ def make_usage() -> dict:
     }
 
 
+def note_usage(usage: dict) -> None:
+    used = usage["buckets"][0]["windows"][0]["usedPercent"]
+    if STATE["last_used"] != used:
+        STATE["last_used"] = used
+        STATE["rev"] += 1
+        STATE["last_change"] = time.time()
+
+
+def pull_decision() -> dict:
+    """Mirror bridge-core activity.rs: activity -> light, quiet -> deep.
+
+    The bridge answers every minute either way (the 1m×3→5m×3→15m stretch is
+    the device-side Wi-Fi failure backoff, not a bridge decision).
+    """
+    now = time.time()
+    quiet = now - STATE["last_change"]
+    if STATE["deep_at"] is not None and now - STATE["last_change"] < QUIET_DEEP_S:
+        # pending pushes would force light here; the test bridge has none.
+        pass
+    stay_light = quiet < QUIET_DEEP_S
+    if stay_light:
+        STATE["deep_at"] = None
+        return {"mode": "light", "next_contact_s": ACTIVE_CONTACT_S}
+    STATE["deep_at"] = STATE["deep_at"] or now
+    return {"mode": "deep", "next_contact_s": ACTIVE_CONTACT_S}
+
+
+def pull_extra() -> dict:
+    decision = pull_decision()
+    return {
+        **decision,
+        "usage_rev": STATE["rev"],
+        "pending": {"ota": False, "templates": []},
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         u = urlparse(self.path)
@@ -195,13 +251,22 @@ class Handler(BaseHTTPRequestHandler):
             print("[http] 401 unauthorized")
             return
         if u.path == "/usage":
-            body = json.dumps(make_usage()).encode()
+            usage = make_usage()
+            note_usage(usage)
+            pull = any(k in qs for k in ("next_contact_s", "mode", "usage_rev"))
+            if pull:
+                usage.update(pull_extra())
+            body = json.dumps(usage).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-            print(f"[http] 200 /usage -> {json.loads(body)['buckets'][0]['windows'][0]['usedPercent']}%")
+            if pull:
+                print(f"[http] 200 /usage (pull) -> mode={usage['mode']} "
+                      f"next={usage['next_contact_s']}s rev={usage['usage_rev']}")
+            else:
+                print(f"[http] 200 /usage -> {usage['buckets'][0]['windows'][0]['usedPercent']}%")
             return
         if u.path == "/template":
             tid = qs.get("id", ["full"])[0]
@@ -222,6 +287,35 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             print(f"[http] 200 /template?id={tid} hash={TPL_HASH[tid]} ({len(body)}B)")
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def do_POST(self):
+        u = urlparse(self.path)
+        if self.headers.get("Authorization", "") != f"Bearer {ARGS.token}":
+            self.send_response(401)
+            self.end_headers()
+            self.wfile.write(b"unauthorized")
+            print("[http] 401 unauthorized")
+            return
+        if u.path == "/deep":
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            raw = self.rfile.read(length) if length else b"{}"
+            try:
+                doc = json.loads(raw or b"{}")
+            except json.JSONDecodeError:
+                doc = {}
+            next_contact = int(doc.get("next_contact_s") or 0)
+            STATE["deep_at"] = time.time()
+            body = json.dumps({"ok": True, "mode": "deep",
+                               "next_contact_s": next_contact or ACTIVE_CONTACT_S}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            print(f"[http] 200 /deep next_contact_s={next_contact}")
             return
         self.send_response(404)
         self.end_headers()
@@ -294,7 +388,9 @@ async def ble_push():
         await write_fragmented(client, CHR_ENDPOINT, json.dumps(ep).encode())
         print(f"[ble] endpoint written: {ep}")
         if ARGS.push_usage:
-            await write_fragmented(client, CHR_USAGE, json.dumps(make_usage()).encode())
+            usage = make_usage()
+            usage["mode"] = "light"
+            await write_fragmented(client, CHR_USAGE, json.dumps(usage).encode())
             print("[ble] usage pushed over BLE")
             await asyncio.sleep(1)
         if ARGS.push_template:
@@ -309,7 +405,7 @@ def main():
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--percent", type=int, default=91)
     p.add_argument("--dynamic", action="store_true", help="percent 随时间变化")
-    p.add_argument("--interval", type=int, default=60)
+    p.add_argument("--interval", type=int, default=180)
     p.add_argument("--push-usage", action="store_true")
     p.add_argument("--push-template", action="store_true")
     p.add_argument("--template", default="full", choices=list(TPL_BY_ID))

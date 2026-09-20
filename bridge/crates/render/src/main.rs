@@ -14,6 +14,7 @@ struct Args {
     battery: i32,
     state: String,
     offline_mins: i32,
+    mode: String,
 }
 
 fn parse_args() -> Args {
@@ -29,6 +30,7 @@ fn parse_args() -> Args {
         battery: 78,
         state: "BLE OFF".to_string(),
         offline_mins: -1,
+        mode: "light".to_string(),
     };
     let mut iter = std::env::args().skip(1);
     while let Some(flag) = iter.next() {
@@ -45,6 +47,7 @@ fn parse_args() -> Args {
             "--battery" => args.battery = value().parse().expect("battery number"),
             "--state" => args.state = value(),
             "--offline-mins" => args.offline_mins = value().parse().expect("offline minutes"),
+            "--mode" => args.mode = value(),
             other => panic!("unknown flag {other}"),
         }
     }
@@ -68,6 +71,7 @@ fn main() -> anyhow::Result<()> {
         battery: args.battery,
         state: &args.state,
         offline_mins: args.offline_mins,
+        mode: &args.mode,
     };
     let bits = render_bits(&template, &usage, &env)?;
     if let Some(out) = &args.out {

@@ -1,6 +1,235 @@
 # Codex Status 项目进度（交接文档）
 
-## 最新状态：2026-09-19 深夜（三）— 0.13.8-bw：Wi-Fi 活跃窗口调优 + 1Hz 合并心跳
+## 最新状态：2026-09-21 凌晨二 — 0.15.0：时钟/时区随 PC + 深睡切换历史 + P2 端到端过半
+
+- **现场**：设备 `0.15.0-bw`（ota_1，USB 插电，light/deep 测试中，`tz=UTC-8:00`）；
+  桥 = debug 新构建（含 60s 节奏修正，`tools/start-bridge.ps1` 重启，
+  PID 23652 + watchdog 53892）。
+- **新功能（未提交）**：
+  1. **pull/push 时间戳**：桥在 pull 响应生成时刻用 `now` 覆盖缓存信封的
+     `server_time`（此前可能滞后数十秒~分钟），并新增 `tz_offset_min`（本机 UTC
+     偏移分钟，东为正）；推送信封同样重写。实测 pull `server_time` 与墙钟差 **0s**，
+     `tz_offset_min=480`（`bridge/crates/core/src/http.rs`、`lib.rs`、app push 循环；
+     Python 测试桥同步）。
+  2. **时区随 PC（0.15.0 固件）**：`applyTzOffsetMin()` POSIX 反向符号
+     （+480 → `UTC-8:00`）并持久化 NVS `pm/tz`；`configTzTime` 不再硬编码
+     `CST-8`。设备实测从 `CST-8` 变为 `UTC-8:00`，OTA 往返后保持。
+  3. **深睡切换历史（0.15.0 固件）**：RTC 内存环 120×12B（epoch/ev/stage/batt/
+     aux），记录 boot/enter-deep/thin/net-ok/net-fail/to-light；`GET /history`
+     （`?since=` 增量）+ `/status.json` 的 `hist_count/hist_head`。实测一轮
+     deep 循环事件与 `deep{}` 计数一致。
+- **P2 端到端（真机，调试工具驱动，免拔线）**：
+  - pending 模板：deep 期 `profile_push ab-0133` → 排队 → 17:02 pull
+    `mode=light pending_tpl=1` → `queued template push flushed`（mini 上屏）；
+    随后恢复 quad。✅
+  - 迟滞：活动后 pull 答 `light/60`（17:15）；静默 ≥600s 后答 `deep` ✅
+    （按用户纠正：**拉取间隔恒 60s**，见下条）。
+  - **拉取节奏纠正（用户澄清）**：900s 只属于"设备连不上 Wi-Fi/桥"的失败退避
+    （`retryDelaySec`），不是桥安静期的常态。已改桥 `activity.rs`：deep 分支也
+    回 `next_contact_s=60`（Python 测试桥同步、单测/docs §13.3/§13.6/§13.8 更新）。
+  - OTA 排队：deep 期 `firmware_ota 0.14.12` → 排队 → pull `pending_ota=true`
+    → `firmware OTA ok 0.15.0→0.14.12`；再升回 0.15.0（一次直传成功）。✅
+  - 断桥重试：设备深睡时停桥 ~2 分钟 → history `net-fail`（ev5, aux=0）→
+    重启桥后下个窗口 `net-ok`（200）、`retry_stage` 归零、`net_fails=1`。✅
+  - 旧桥缺字段 / token：用无 `tz_offset_min`/`mode` 的旧信封 POST → accepted、
+    `tz` 保持；错误 token → 401。✅
+  - 手动唤醒（BOOT→light、再击→BLE）与 BLE 打断需用户现场按键，待做。
+- **ROM**：`artifacts/codex-status-0.15.0-bw.bin`（1629552 B，SHA256
+  `FCB9CF7560B367D1B9004B2FB424098FE5C9F56DAB1B27A8FF6F6658932771FA`）。
+- **待办**：长测 ≥2h（60s 网络节奏下的电量斜率、时钟准度、残影，`/history`
+  逐分钟 thin 已可用）→ 用户手动唤醒/BLE 测试 → 提交前整理。未提交。
+
+## 历史：2026-09-21 凌晨 — P1 结案（0.14.13 睡前全刷）+ OTA 逻辑修复 + 桥侧调试工具套件
+
+- **现场**：设备 `0.14.13-bw`（USB 插电 light 在线，`tz=CST-8`，调试开关已复位）；
+  桥 = debug 构建（PID **8764** + watchdog **26792**，含 `device_*` 调试四件套）。
+- **P0 保持已验证**（0.14.4 根因 #1 / 0.14.6 根因 #2，见历史节与
+  `project-workflow/sleep-modes/status.md` §6）。
+- **P1 结案（0.14.13）**：深睡 Zzz 不显示/残影的根因是**局刷基线漂移**——唤醒时
+  `epdThinBegin` 的电源脉冲会重置面板控制器，而固件 `lastDisplayedFrame` 仍按旧
+  内容做局刷，导致图标被跳过或与 BT 残影叠加。修复：进 deep 渲染睡眠图标前
+  `epdPartialReady=false` 强制一次全刷（0.14.13）。用户现场确认：**睡眠中 Zzz
+  显示、时钟每分钟更新**。
+  取证工具：`frame_capture` + `GET /frame?which=saved`（睡前帧，与模板逐像素
+  0/256 差异）、`deep.glyph`（渲染是否执行）。
+- **OTA 逻辑修复（用户实测踩坑后发现并修复，0.14.12 + 桥）**：
+  1. 固件未处理 `UPLOAD_FILE_ABORTED` → `Update` 卡在 "already running"、OTA 锁
+     不释放、屏卡 OTA、之后所有上传必失败；现中止/写入/结束失败均清理
+     （`Update.abort()` + 解锁 + 恢复界面），并加 20s 停滞看门狗与
+     `POST /diag?ota_abort=1` 远程急救。
+  2. 桥 OTA 前探测 2s 超时在 light sleep 下常误判离线（实测 HTTP 冷响应
+     10–14s）→ 改 10s + 重试；上传前先调 `/diag?ota_abort=1` 清残留；检查响应体
+     `UPDATE FAILED`（HTTP 200 也失败）；队列 flush 失败退避 60s→2m→4m→…≤30m
+     （新请求立即重试）。
+  3. 验证：`firmware_ota 0.14.12→0.14.13` 一次直传成功。
+- **桥侧调试工具套件（默认不改行为，MCP 按需开启）**：
+  - `device_sleep`（推 deep 并保持）、`device_wake`（固定 light 回在线）、
+    `device_mode auto|deep|light`（绕过 10 分钟安静迟滞）、`device_contact_s s`
+    （覆盖 pull 间隔，加速循环）。
+  - 设备侧：`/diag?deep_usb=1`（插电可睡）、`deep_now=1`（立即睡）、
+    `render_mode=deep|light`（在线渲染深睡帧）、`frame_capture=1` +
+    `GET /frame?which=frame|last|saved`（帧缓冲 PBM）、`nvs_stage`（NVS 面包屑）。
+- **新发现（下一窗口首批任务）**：
+  1. **时钟与 PC 不同步**：pull 响应里的 `server_time` 取自 poller 生成的信封
+     （可能滞后数十秒~分钟），设备每次苏醒按它校时 → 与 PC 有偏差。应在 pull
+     响应生成时用 `now` 重盖 `server_time`。
+  2. **时区应随 PC**：现为固件默认 `CST-8`。桥应在 pull/push 带
+     `tz_offset_min`，固件按 POSIX 反向符号生成 `TZ`（如 +480 → `UTC-8:00`）
+     并持久化 NVS `pm/tz`，CST-8 仅作缺省。
+- **P2 待做**：pending 模板/OTA 排队冲刷、迟滞升降级的真机端到端、深睡 ≥2h
+  长测；详见 `project-workflow/sleep-modes/prompt.md`。
+- **ROM**：0.14.13 `artifacts/codex-status-0.14.13-bw.bin`
+  `F6D9C2F085FF32A09A8A36DC66531CEAE46225F951EB1EB7803BAA0E58E05FCF`；
+  0.14.12 `DD10BC1D…D135`、0.14.11 `4CC2CF0B…78AF`、0.14.10 `B01375C3…2868`、
+  0.14.9 `090C2FBB…6FC82`、0.14.8 `F9797CC6…4213`；回滚
+  `artifacts/codex-status-0.13.8-bw.bin`。
+- **未提交**：`PROGRESS.md`、`docs/power-state.md`、`src/*`（0.14.3–0.14.13）、
+  `bridge/crates/*`（activity debug_mode、device_* 工具、OTA 探测/退避）、
+  `tools/test-bridge/bridge.py`、`tools/*.mjs`、
+  `project-workflow/{deep-pull-test,sleep-modes}/`、`AGENTS.md`（工具清单）。
+
+## 历史：2026-09-20 深夜（四）— P0 电池深睡双根因均已修复并现场验证（0.14.8）
+
+- **现场**：设备 `0.14.8-bw`（时区修复版；QUAD v10 `86a51357` active）；桥 =
+  debug 构建（父 PID **44016** + watchdog **51124**，:8765/:8766/:8767）。
+- **P0 结论（证据链：`project-workflow/sleep-modes/status.md` §6）**：
+  1. **根因 #1（0.14.4 修复）**：唤醒时 `releaseWakeHolds()` 先释放 GPIO hold
+     再设电平 → GPIO17（BAT_Control 锁存）被复位后的输出寄存器瞬时拉低 →
+     断电。改为无毛刺释放（先恢复 17=HIGH、6=LOW 再 `gpio_hold_dis`）。
+  2. **根因 #2（0.14.6 修复）**：deep 网络窗口 pull 成功后渲染分支再次
+     `epdBegin()` → 第二次 `SPI.beginTransaction()` 在 Arduino 非递归
+     `paramLock` 上自锁（项目从不 `endTransaction`）。0.14.5 NVS 细码
+     `nvs_stage_boot=43` 定位（44 未写）；修复：`DEV_Module_Init` 每 boot 幂等、
+     渲染分支仅在 `!frame` 时重试、缓冲单次分配（顺带修泄漏）。
+  3. **验证**：0.14.6/0.14.7 现场——进 deep → thin 唤醒（`clock_wakes=13`）→
+     网络 pull 成功（`last_code=200 net_fails=0`）→ pull 后时钟持续更新、
+     `retry_stage=0`；BOOT 单击 ext1 回 light 正常。
+- **本轮新增（测试/诊断开关）**：
+  - `POST /diag?deep_usb=1` + `deep_now=1`：**插电也可进 deep**（不必拔线），
+    非 TIMER 复位/BOOT 唤醒自动清零；串口 `deepusb on|off`；
+    `/status.json` 暴露 `deep_usb`。
+  - **时区修复（0.14.8）**：桥 `server_time` 是 UTC，固件未设 TZ → 时钟一直
+    显示 UTC（14:45 vs 本地 22:45）。新增默认 `CST-8`、NVS `pm/tz`、
+    `/diag?tz=`；现场确认显示本地时间。
+  - NVS 面包屑（`/diag?...&nvs_stage=1`，读 `nvs_stage_boot`）保留，默认关。
+- **下一步**：P1（深睡 Zzz “覆盖蓝牙标识”，拍屏取证）；P2（T4/T5 真机端到端：
+  deep 期 pending 模板/OTA 排队冲刷、迟滞升降级、BLE 打断、桥不可达/token
+  失效/低电/旧桥兼容）；深睡长时间 soak（≥2h）与功耗斜率。
+- **ROM**：0.14.8 `artifacts/codex-status-0.14.8-bw.bin`
+  `F9797CC64BBDA6211BCBE9FF5CB8695DBA1F1A98F60E608C776EFC4962324213`；
+  0.14.7 `B963E166…3F90`、0.14.6 `693CE5BB…D2F7`、0.14.5 `C3D1E484…9A00`、
+  0.14.4 `CA263411…D479E`、0.14.3 `14A8EC17…BEC5`；回滚
+  `artifacts/codex-status-0.13.8-bw.bin`。
+- **未提交**：`PROGRESS.md`、`docs/power-state.md`、`src/*`（0.14.3–0.14.8 诊断/
+  修复）、`bridge/crates/*`、`tools/test-bridge/bridge.py`、`tools/*.mjs`、
+  `project-workflow/{deep-pull-test,sleep-modes}/`（artifacts 不入库）。
+
+## 历史：2026-09-20 深夜（二）— sleep-modes T1–T5 实现 + 0.14.2 电池深睡待回归
+
+- **现场**：设备 `0.14.2-bw`（USB 刷入 ota_0，next ota_1；当前插电 light，
+  QUAD v10 `86a51357` active，时钟窗口 60B 就绪，USB=COM4）；桥 = 新 debug 构建
+  （父 PID **25184** + watchdog **33412**，:8765/:8766/:8767，含 activity/pull/deep）。
+- **已完成（未提交）**：
+  1. **固件 0.14.x**（`src/main.cpp`、`EPD_SSD1681.*`、`template_engine.*`、
+     `usage_client.*`）：deep/light 双模式（`rtcMode`+NVS `pm`，空闲阈值默认
+     600s，`POST /diag?idle_deep_s=` 可调）；深睡分钟只做**时钟窗口直写**
+     （thin wake，`epdThinBegin`+`clockTickWake`）；按 `next_contact_s` 快连
+     反向拉取 `GET /usage` 并执行 `mode/next_contact_s/usage_rev/pending`；
+     离线重试 1m×3→5m×3→15m；`POST /deep` 通知；pending 窗口 180s；
+     新绑定 `device.mode`（deep/light），deep 时 `device.state="DEEP"`；
+     串口 CLI `deep`/`light`；`/status.json` 新增 mode/deep 统计/阶段码
+     `stage`/`last_wake_code`；5h 100% 的滚动 `resetsAt` 不再触发 NVS 写。
+  2. **睡眠图标**：Zzz 16px（手工像素网格，另有 12/20px），与 BT 同格
+     (101,6)、条件互斥；`enterDeep` 切换模式后立即重绘显示，pull 回 light 后
+     重绘隐藏。生成器 `artifacts/gen-sleep-icon.py`；quad v10 已同步到
+     `tools/test-bridge/templates/quad.json` 与运行时库（version 10，
+     min_fw 0.14，hash `86a51357`）。
+  3. **桥**（`core/activity.rs` 新增，core/app/mcp/render 接线）：
+     `usage_rev`/`last_change_at`/迟滞（light 300s、静默 600s→deep）、
+     pull 响应附 `mode/next_contact_s/usage_rev/pending` 并打 `device pull:` 日志、
+     `POST /deep`、deep 期间推送跳过且不计失败、接触后补推、pending 模板/OTA
+     排队与窗口内冲刷、`device.mode` 进入 Rust 模板校验与渲染 FFI。
+  4. **T5**：`cargo test --workspace` 全绿（隔离 `artifacts/cargo-target-sleepmodes`）；
+     `node tools/test-quad-preview.mjs` 全绿（含 deep 图标断言）；Python 测试桥
+     实现同语义 pull/`POST /deep`；`docs/power-state.md` §13 已改为“已实现”
+     并补 §13.8 实现映射。
+- **P0 未解（新窗口首要任务）**：**电池深睡后失联**。0.14.0 电池深睡后花屏+
+  不可达（面板电源未保持，0.14.1 已加 GPIO6/17 deep-sleep hold）；0.14.1 电池
+  回归 8 分钟无 pull、BOOT 无反应（插电时用 CLI `deep` 验证定时唤醒正常）。
+  0.14.2 已改为 thin 路径 `deepSleepRaw`（不碰 WiFi/BLE 驱动）、`deepSleepFor`
+  先判 `WiFi.getMode()`，并加 RTC 阶段码，**待电池回归**（步骤/判读见
+  `project-workflow/sleep-modes/prompt.md` §P0）。
+- **P1**：用户报告深睡 Zzz “覆盖蓝牙标识”，待拍屏取证；若是深睡渲染未擦除，
+  模板加 white erase rect 或引擎 icon 前清区域（三端同步）。
+- **ROM**：`artifacts/codex-status-0.14.2-bw.bin`（1619392 B）SHA256
+  `B5162217F6504052818D4F26A6C2E6023DDC467F4968C4132332085C68F5F00B`；
+  0.14.1 `741E4FEF…E124`、0.14.0（含图标支持）`AFE8FD71…E401`；回滚
+  `artifacts/codex-status-0.13.8-bw.bin`（`2E5CF982…1C5A`）。
+- **专项文档**：`project-workflow/sleep-modes/{status.md（详细）,prompt.md（新窗口交接）}`。
+- **未提交**：`PROGRESS.md`、`docs/power-state.md`、`src/*`、`bridge/crates/*`、
+  `tools/test-bridge/bridge.py`、`tools/generate-quad-preview.mjs`、
+  `tools/test-quad-preview.mjs`、`project-workflow/{deep-pull-test,sleep-modes}/`
+  （artifacts 不入库）。
+
+## 历史：2026-09-20 晚 — 时钟区域直写 A/B 实测 + v0.14 deep/light 双模式设计定稿
+
+- **现场**：设备已回滚 `0.13.8-bw`（ota_1，next ota_0，light sleep 在线，
+  电量 ~80%，`fw`/模板/owner 正常）；桥 debug 父 PID **42344** + watchdog
+  **33344**；A/B 测试固件 `0.13.9-clkwin` 已 OTA 验证并回滚。
+- **预留区域从激活模板计算**（测试固件实现）：扫描 `elements[]` 中
+  `bind=="device.now"` 的 text 元素，quad v9（`f12`,`x=161`,`y=9`）→ 预留
+  `x=161..195 y=9..20`（35×12px，窗口字节列 20..24、5×12B = **60B**）；模板无
+  该元素则不预留。
+- **A/B 实测（各 5 次，`artifacts/clkwin-ab-log.txt`）**：
+  - A（现行：模板渲染 + 整帧局刷）**864.4ms**（862.2–866.3）；
+  - B（时钟窗口直写）**795.6ms**（793.9–797.0）= build 0.45ms + 面板唤醒/
+    reset 215ms + 局部波形 580ms + 睡 0.03ms；
+  - 差异仅 ~69ms（渲染/diff 部分）；**面板波形与唤醒是与窗口大小无关的固定
+    成本**。B 的价值 = 深睡可用（仅 60B RTC 状态，不需 template/usage/帧缓存）。
+- **实现**：`EPD_SSD1681` 新增 `WakePartialWindow`/`DisplayPartWindow`
+  （Y 映射 `RAM y = 199 - screen y`；0x26 只用 RTC 旧像素回填窗口）；
+  `src/main.cpp` 测试块（`#ifdef CODEX_CLK_WINDOW_TEST`）保留，默认构建零影响。
+- **设计定稿**：`docs/power-state.md` **§13**（deep 时钟周期/网络周期、桥
+  `mode`/`next_contact_s` 决策 + 迟滞、离线 1m×3→5m×3→15m、回深 HTTP 通知、
+  手动唤醒、功耗估算与开放问题）；实现计划与新窗口交接
+  `project-workflow/sleep-modes/{plan,prompt}.md`。
+- **未提交**：`PROGRESS.md`、`docs/power-state.md`、`src/main.cpp`、
+  `src/EPD_SSD1681.{h,cpp}`、`bridge/crates/{core,app}` 与
+  `tools/test-bridge/bridge.py`（rate-limit 通知/3min 兜底，已写未启用）、
+  `project-workflow/{deep-pull-test,sleep-modes}/`。
+
+## 历史：2026-09-20 下午 — deep-pull 计时测试（0.13.9-dptest，已回滚 0.13.8-bw）
+
+- **现场**：设备已回滚 `0.13.8-bw`（ota_1，next ota_0，`fw`/`slot` 实测），
+  light sleep、push/owner/Template active=quad v9 正常，电量 91%；桥 debug
+  父 PID **35880** + watchdog **21568**（`tools/start-bridge.ps1` 新起）。
+- **目的**：实测"深睡唤醒 → 快连 Wi-Fi → 反向拉取 bridge `GET /usage` → 进入
+  light sleep"的墙钟与 CPU 时间（方案/结果：`project-workflow/deep-pull-test/`）。
+- **测试固件**（`#ifdef CODEX_DEEPPULL_TEST`，`src/main.cpp`；`FW_VERSION=0.13.9-dptest`/`-dptest2`，
+  经 `PLATFORMIO_BUILD_FLAGS=-DCODEX_DEEPPULL_TEST=1` 构建，默认构建零影响）：
+  OTA 后首 boot 正常连接一次并把 AP channel/BSSID 存 RTC，随后 5 个周期
+  `deepSleepFor(30)` → 无扫描 `WiFi.begin(ssid,pass,ch,bssid)` → `GET /usage`
+  （Bearer 取设备端 `EndpointRec.token`）→ 计时/模式统计存 RTC，第 5 周期后
+  进正常 light sleep 在线，供回滚 OTA。
+- **结果（两轮各 5 周期，10/10 `fast=1 code=200`）**：
+  - `wifi_ms`（关联+DHCP）**1.3–1.5s**（一次异常 3.3s）；`http_ms`（584B
+    envelope）**0.06–0.63s**；parse ~1ms；cycle 合计 **1.5–2.0s**；加 boot+setup
+    约 0.9s，**boot→拉取完成 ~2.7s**。
+  - CPU 时间（dptest2 末周期，`Time since boot 2 699 874 µs`）：SLEEP
+    0.59s(21%)、APB_MIN 0.62s(22%)、APB_MAX 0.74s(27%)、CPU_MAX 0.75s(27%)
+    → **CPU 运行态 2.11s（78%）**，等待期间由 Wi-Fi PM 锁维持 APB 档而非
+    light sleep；此前"CPU 0.3–0.7s"的估算偏乐观 3–4 倍。
+  - 能耗粗算一次 cycle ≈0.017mAh（模式电流粗估；测试时在充电，未用电压
+    斜率校准）：1min 间隔 ≈24mAh/天，5min ≈5mAh/天。
+- **结论**：反向拉取 + 定时深睡可行且稳定；主耗时是 Wi-Fi 关联/DHCP，不是
+  拉取本身；deep 窗口未启动 WebServer（桥无法 push/OTA），产品化需按需在
+  窗口内起 server 或先切 light sleep。
+- **回滚**：MCP `firmware_ota` `0.13.9-dptest2 -> 0.13.8-bw` 成功（`artifacts/
+  codex-status-0.13.8-bw.bin`）。证据：`artifacts/deep-pull-log-dptest{,2}.txt`。
+- **未提交**：`src/main.cpp`（ifdef 守卫测试代码）、`project-workflow/deep-pull-test/`、
+  本文件。平台配置未改（构建 flag 走环境变量）。
+
+## 历史：2026-09-19 深夜（三）— 0.13.8-bw：Wi-Fi 活跃窗口调优 + 1Hz 合并心跳
 
 - **现场**：设备 `0.13.8-bw`（ota_0，next ota_1，OTA 0.13.7→0.13.8 成功），
   active=quad v9（`417f22a7`）；桥 debug 父 PID 38876 + watchdog 24332，

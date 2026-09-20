@@ -3,6 +3,8 @@
 状态：2026-09-18 需求讨论定稿，尚未动代码。实现计划随后写在
 `project-workflow/`（v0.12 专项）。本文件是运行/电源行为的权威描述，
 与 `AGENTS.md`、`PROGRESS.md` 冲突时以本文件为准（实现完成后回归更新）。
+v0.12 已于 0.12.x 实现（§1–§12 描述现行固件）；v0.14 deep/light 双模式方案见
+§13（2026-09-20 设计定稿，待实现；实现后 §3/§6 相应回归更新）。
 
 ## 1. 背景
 
@@ -224,3 +226,156 @@ DevLog/`/log`），用于证明 light sleep 生效。0.13.0 起同一文本也�
 - USB 供电时 USB 锁使 light sleep 不可用属预期（插电本就不睡）。
 - 实现顺序建议：固件状态机 → 模板协议去 `mode` → bridge 去待机/缓存/UDP →
   watchdog → 三端测试与整机验收。
+
+## 13. v0.14 方案：deep/light 双模式 + 时钟区域直写（0.14.0 起已实现）
+
+状态：2026-09-20 设计定稿并实现（固件 `0.14.0-bw`、桥 `activity` 模块）。
+本节取代 §3 的"常开单模式"，§6 的 Wi-Fi 策略按本节修订。实现映射见 §13.8。
+
+### 13.1 状态与优先级
+
+| 模式 | 行为 | 功耗（估） |
+|---|---|---|
+| `deep`·时钟周期 | RTC 定时（60s）唤醒 → **只做时钟区域直写**（不联网）→ 深睡 | 地板 ~0.7–0.8mA |
+| `deep`·网络周期 | 按 `next_contact_s` 唤醒 → 快连 Wi-Fi → `GET /usage` 反向拉取 → 按响应执行转场 | 每次 ~0.03–0.04mAh |
+| `light` | 现行 light sleep 常连 + 桥推送（分钟时钟走 `device.now` 渲染） | 10–15mA（实测） |
+
+优先级：低电断电 > BLE 会话 > OTA 窗口 > 手动唤醒 > 桥指令 > 本地兜底。
+插电不参与 deep（保持 light + BLE 自动规则）；无 Wi-Fi 时时钟周期照走、
+网络唤醒按 1m×3 → 5m×3 → 15m 拉长（§6 现有节奏），时间只在网络成功时同步。
+
+### 13.2 时钟区域直写（A/B 已验证）
+
+- **预留区域从激活模板计算**：扫描 `elements[]` 中 `bind=="device.now"` 的
+  text 元素，取 `font`/`scale`/`x`/`y`（有 `rect`+`align` 按引擎规则换算）；
+  最大串固定 `HH:MM`（5 字符）。**模板无该元素 → 不预留**（该情况下 deep
+  分钟唤醒可直接省掉）。
+- 窗口字节对齐（SSD1681 `setWindow` 用 `x>>3`）。当前 quad v9 实测：
+  `x=161..195 y=9..20`（`f12` 7×12 → 35×12px，窗口 5×12B = **60B**）。
+- **RTC 状态**（`RTC_DATA_ATTR`）：`valid`、`fontId`、`scale`、`xOff`、
+  窗口 rect、窗口旧像素（60B）、`partialCount`。深睡不丢。
+- **驱动新增**（`EPD_SSD1681`）：`WakePartialWindow` / `DisplayPartWindow`；
+  Y 映射与整屏一致（`RAM y = HEIGHT-1 - screen y`），0x26 只用 RTC 旧像素
+  回填窗口（不整幅回填）。
+- **A/B 实测**（2026-09-20，`artifacts/clkwin-ab-log.txt`）：
+  - A（现行：模板渲染 + 整帧局刷）**864.4ms**（862.2–866.3）；
+  - B（窗口直写）**795.6ms**（793.9–797.0）= build 0.45ms + 面板唤醒/reset
+    215ms + 局部波形 580ms + 睡 0.03ms；
+  - 差异仅 ~69ms（渲染/diff 部分）；**波形与面板唤醒是固定成本，与窗口大小
+    无关**。B 的价值是深睡可用（只需 60B RTC 状态，不需要 template/usage/
+    帧缓存），不是提速。
+- **残影**：deep 期间局刷计数存 RTC；到阈值（建议 60–120 次或每日一次）在
+  网络窗口用缓存 usage 重渲 + 全刷清影（无网络时接受残影或强制一次网络窗口）。
+
+### 13.3 拉取、转场与通知（桥决定，设备执行）
+
+- **pull 请求**：`GET /usage`（Bearer endpoint token）带 `next_contact_s`
+  （设备计划）。**pull 响应**：`mode=deep|light` + `next_contact_s`（桥覆盖）
+  + `pending{ota,templates}` + `usage_rev`。
+- **桥的 activity 判定**：用量指纹**实际变化**时间（不是轮询时间）+ 手动/模板/
+  OTA 活动；有活动 → `light`，静默 → `deep`。带迟滞：升 light 后最少驻留
+  5min，连续 10–15min 无变化才降。
+- **light → deep**：设备本地计时（"无变化 X 分钟"）→ 回深前发一次 HTTP 通知
+  （`POST /deep` 或 pull 带参）→ 深睡；通知失败照睡，桥按"预期联系时间 +
+  宽限"判离线。
+- **手动唤醒**：deep 下 BOOT 单击 → light（不常驻，走同一 idle 规则）；再次
+  单击 → BLE 会话（`enterBleOn`）；关 BLE 后仍留 light。桥从 announce/pull
+  得知设备醒来并重置 idle 计时。
+- **自适应拉取**：桥可达时恒为 `next_contact_s=60`（升 light 延迟 ≤1min；
+  deep 期间同样按分钟接触）。`1m×3 → 5m×3 → 15m` 只用于**设备侧连不上
+  Wi‑Fi/桥的失败退避**（`retryDelaySec`，成功后复位），不是桥的"安静期"决策。
+
+### 13.4 桥侧改造
+
+- 维护 `last_change_at` 与 `usage_rev`（指纹变化才 +1；指纹沿用现有
+  `usage_fingerprint`，剔除 `server_time`）；pull 响应按它算 mode。
+- **deep 期间推送预期失败**：不计 `push_fail_streak`、不告警；收到 pull /
+  announce / claim 视为在线；lease 在 pull 机会里续或深睡期放宽。
+- **OTA/模板排队**：deep 时不能主动推；pull 响应带 `pending`，
+  设备保持窗口 + 起 server，桥在窗口内 `POST /doUpdate`（现有路径不变）。
+- 推送信封同时带 `mode`（light 期间的降级通道；设备也可本地超时兜底）。
+
+### 13.5 时间与持久化
+
+- 深睡时间用 `esp_rtc_get_time_us()` 差分（RTC 域连续）；当前
+  `CONFIG_RTC_CLK_SRC_INT_RC=y`（内部 RC，有漂移），可选
+  `CONFIG_RTC_CLK_SRC_EXT_CRYS`（需确认板上 32.768k 晶振）或使用板上
+  **PCF85063**（I2C，现固件未用）。
+- RTC/NVS 清单：`mode`、`usage_rev`、`last_change`、`next_net_at`、
+  `retryStage`、`epochAtSleep`+`rtcTimeAtSleepUs`、时钟 rect/旧像素/
+  `partialCount`；NVS 兜 OTA/软复位。
+
+### 13.6 功耗估算（按 A/B 实测修正）
+
+时钟唤醒 ≈ boot + ~800ms 面板操作；网络唤醒另加关联/DHCP 1.3–1.5s + HTTP。
+时钟周期 ~0.7–0.8mA。**注意（0.15.0 起）**：桥可达时 deep 也按 60s 接触
+（§13.3 修订，900s 仅失败退避），网络窗口成为主要开销——每次 ~0.03–0.04mAh
+× 1440 ≈ **45–55mAh/天**，400mAh 电池约 7–9 天（未含深睡底流）。此前
+"网络 15min ≈ 3mAh/天、12–18 天"的估算仅在长时间失败退避时成立。
+
+### 13.7 开放问题 / 风险
+
+1. 面板 mode1 + reset 后 0x24/0x26 的长期保持（A/B 单轮通过，需长期观察）。
+2. 窗口局刷残影累积由 `CLK_GHOST_LIMIT=90` 次触发网络窗口全刷控制；长期效果待观察。
+3. `device.offline_mins`/`OFF N M` 与 claim/lease 在 deep 语义下：deep 期间推送
+   失败不计 `push_fail_streak`；announce/pull/claim/HTTP 状态读都视为在线并清
+   除"预期 deep"。
+4. 旧固件/旧桥兼容：旧桥缺 `mode` → 设备按缺省保持 deep（§13.7 原条目）；
+   旧固件忽略新字段，走原 light 推送路径。
+5. 时区/夏令时（`device.now` 用 localtime）：每次 pull 成功都用桥
+   `server_time` 强制校时，RTC 漂移只在两次联系之间累积；时区随桥
+   `tz_offset_min`（0.15.0，§13.9），不再固定 `CST-8`。
+6. 板级深睡底流未实测（功耗模型最大不确定度）；T6 待回滚/长测。
+
+### 13.8 实现映射（0.14.0）
+
+固件 `src/main.cpp`：
+
+- `rtcMode`（RTC + NVS `pm`）默认 light；timer 唤醒且 `rtcMode=deep` 且未插电
+  时：未到 `rtcNextNetAt` 走 `deepThinWake()`（`epdThinBegin` + `clockTickWake`
+  + 睡到下一分钟），到期走 `deepNetworkCycle()`（`deepFastConnect` 缓存
+  BSSID/信道 + `GET /usage?...` + 执行 `mode/next_contact_s/usage_rev/pending`）。
+- 冷启动/EXT1（BOOT/PWR）/插电一律 light；light 空闲 `idleDeepS`（默认 600s，
+  `POST /diag?idle_deep_s=N` 可调）→ `POST /deep` 通知桥后深睡。推送信封
+  `mode:"deep"` 给 60s 宽限（`applyBridgeModeHint`）。
+- 时钟窗口从激活模板的 `device.now` 元素计算（prefix/suffix 存在则不预留），
+  上限 64B；`clockTickWake` 同时用于 light 分钟 tick（省去整帧 diff）。
+- `pending.ota`/`pending.templates` 非空 → 保持在线 `DEEP_PENDING_WINDOW_MS=180s`，
+  桥在窗口内 POST /doUpdate 或 /template。
+- `/status.json` 新增 `mode/idle_deep_s/next_contact_s/next_contact_in_s/usage_rev/
+  clk/clk_partials/deep{clock_wakes,net_windows,net_fails,clock_ticks,last_code,...}`；
+  串口 CLI 新增 `deep`/`light`。
+
+桥 `bridge/crates/core/src/activity.rs` + app 接线：
+
+- `usage_rev` 仅在指纹真变化时 +1（poller）；`last_change_at` 还被显式动作
+  （模板保存/推送、claim、手动同步）刷新。
+- pull 决策：pending 或被占/5min 驻留（`LIGHT_HOLD_S=300`）或静默 <600s →
+  `light`；静默 ≥600s → `deep`；两种情况 `next_contact_s` 都是 **60**（拉长到
+  15min 只是设备侧 Wi‑Fi 失败退避，桥不主动拉长）。
+- `POST /deep`、pull、announce、HTTP 状态读、claim、推送成功都 `note_contact`；
+  deep 预期离线时 push 跳过且不计失败。推送信封加 `mode/next_contact_s/usage_rev`。
+- 排队：deep 期间 `profile_push`/`firmware_ota` 失败即入队（`pending`），下一个
+  pull 接触由后台任务重放（模板直接 POST；OTA 走原 MCP 流程）。设备只在自身
+  pull 时醒来，故排队最坏等一个 `next_contact_s`。
+- `GET /usage` 无 pull 参数时行为与旧版一致（兼容）；Python 测试桥实现同样的
+  pull/`POST /deep` 语义。
+
+### 13.9 0.15.0：桥时钟/时区同步 + 深睡切换历史
+
+- **pull 响应的 `server_time` 取响应生成时刻**：桥 `http.rs` pull 分支用当前
+  时间覆盖缓存信封里的轮询时间（缓存可能滞后数十秒~分钟）；推送信封也在发送
+  时重写 `server_time`/`tz_offset_min`。设备"每次接触强制校时"语义不变。
+- **`tz_offset_min`**（本机 UTC 偏移，分钟，东为正）：桥 pull + 推送都带；
+  固件 `applyTzOffsetMin()` 按 POSIX 反向符号生成（+480 → `UTC-8:00`）并
+  持久化 NVS `pm/tz`；`/diag?tz=` 仍可手动覆盖，下次接触被桥值更新。缺省
+  `CST-8`，旧桥缺字段则保持现值；`configTzTime()` 不再硬编码 `CST-8`。
+- **深睡切换历史**：RTC 内存环 120 条 × 12B（`epoch` u32、`ev` u8、`stage`
+  u8、`batt` u8、`aux` u16），掉电清零、零 flash 磨损。记录点：boot/唤醒分类、
+  enter-deep（aux=`next_contact_s`）、每分钟 thin、网络窗口 net-ok/net-fail
+  （aux=HTTP code，未知 0）、to-light。`GET /history`（JSON 数组，时间序，
+  `?since=<seq>` 增量）；`/status.json` 暴露 `hist_count`（最新记录序号）与
+  `hist_head`（下一写槽），深睡 RAM 日志丢失后仍可取证。
+- 事件码：1 boot（aux=`esp_sleep_wakeup_cause_t`）、2 enter-deep、3 thin
+  （aux=1 已画时钟）、4 net-ok（aux=200）、5 net-fail、6 to-light
+  （aux=1 按钮唤醒）。

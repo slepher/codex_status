@@ -46,6 +46,7 @@ pub enum BindSpec {
     DeviceState,
     DeviceOfflineMins,
     DeviceNow,
+    DeviceMode,
     Bucket {
         bucket: String,
         win: WinSel,
@@ -69,6 +70,7 @@ pub fn parse_bind(path: &str) -> Option<BindSpec> {
         "device.state" => return Some(BindSpec::DeviceState),
         "device.offline_mins" => return Some(BindSpec::DeviceOfflineMins),
         "device.now" => return Some(BindSpec::DeviceNow),
+        "device.mode" => return Some(BindSpec::DeviceMode),
         _ => {}
     }
     let rest = path.strip_prefix("buckets[")?;

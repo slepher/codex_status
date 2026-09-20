@@ -261,3 +261,44 @@ void EPD_SSD1681_Sleep(void)
     sendCmd(0x10);
     sendData(0x01);             // deep sleep mode 1: retain RAM
 }
+
+// ---- sub-window partial refresh (clock region) ----
+// The full-screen calls use window Y = (HEIGHT-1 .. 0) with the cursor at
+// HEIGHT-1, so screen y maps to RAM row (HEIGHT-1 - y); the data rows are
+// written top-to-bottom. Mirror that mapping for an arbitrary sub-window.
+static void setWindowRegion(int x0, int y0, int x1, int y1)
+{
+    setWindow((UBYTE)x0, (UWORD)(EPD_SSD1681_HEIGHT - 1 - y0),
+              (UBYTE)x1, (UWORD)(EPD_SSD1681_HEIGHT - 1 - y1));
+}
+
+static void setCursorRegion(int x0, int y0)
+{
+    setCursor((UBYTE)x0, (UWORD)(EPD_SSD1681_HEIGHT - 1 - y0));
+}
+
+void EPD_SSD1681_WakePartialWindow(int x0, int y0, int x1, int y1,
+                                   const UBYTE *prev)
+{
+    EPD_SSD1681_Init_Partial();
+    if (!prev) return;
+    const UDOUBLE bytes = (UDOUBLE)((x1 >> 3) - (x0 >> 3) + 1) * (y1 - y0 + 1);
+    setWindowRegion(x0, y0, x1, y1);
+    setCursorRegion(x0, y0);
+    sendCmd(0x26);
+    sendDataN(prev, bytes);
+}
+
+void EPD_SSD1681_DisplayPartWindow(int x0, int y0, int x1, int y1,
+                                   const UBYTE *data)
+{
+    const UDOUBLE bytes = (UDOUBLE)((x1 >> 3) - (x0 >> 3) + 1) * (y1 - y0 + 1);
+    setWindowRegion(x0, y0, x1, y1);
+    setCursorRegion(x0, y0);
+    sendCmd(0x24);
+    sendDataN(data, bytes);
+    sendCmd(0x22);
+    sendData(0xCF);             // partial refresh vs previous RAM
+    sendCmd(0x20);
+    readBusy();
+}

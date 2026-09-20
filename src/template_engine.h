@@ -8,6 +8,7 @@ struct TplEnv {
     int battery = -1; // percentage, or -1 when the device value is unknown
     String state;                // AP / BLE ON / BLE OFF / WIFI OFF
     int offlineMins = -1;        // minutes since the last successful sync
+    String mode;                 // "deep" / "light" (v0.14 device.mode)
 };
 
 // Draw a template onto the current Paint image (caller has cleared the frame).

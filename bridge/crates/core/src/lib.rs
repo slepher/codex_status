@@ -1,3 +1,4 @@
+pub mod activity;
 pub mod codex;
 pub mod device;
 pub mod envelope;
@@ -11,6 +12,20 @@ pub mod template;
 pub fn short_id(input: &str) -> String {
     let full = format!("{:08x}", crc32fast::hash(input.as_bytes()));
     full[..4].to_string()
+}
+
+/// Wall-clock seconds since the Unix epoch (UTC).
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Local UTC offset in minutes (east positive: CST = +480). Sent to the device
+/// so it can follow the PC timezone (the firmware builds a POSIX TZ string).
+pub fn local_offset_minutes() -> i64 {
+    (chrono::Local::now().offset().local_minus_utc() as i64) / 60
 }
 
 /// Best-effort LAN IP advertised in the envelope (`bridge.host`) so the device

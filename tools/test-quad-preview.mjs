@@ -50,24 +50,25 @@ const countColor = (raster, x, y, w, h, color) => {
   }
   return count;
 };
-assert.ok(countColor(normal, 112, 4, 84, 18, 0) > 0 && countColor(normal, 112, 4, 84, 18, 255) > 0, 'metadata text has foreground and background');
+assert.ok(countColor(normal, 112, 46, 84, 18, 0) > 0 && countColor(normal, 112, 46, 84, 18, 255) > 0, 'metadata text has foreground and background');
 
 const fiveHourBinding = parseBind('buckets[codex].5h.remaining');
 const different = (first, second) => first.pixels.some((pixel, index) => pixel !== second.pixels[index]);
 assert.ok(different(normal, full), '100% fixture changes visible hero pixels');
 assert.ok(different(normal, missingFiveHour), 'missing 5h fixture changes the hero to static 100');
 assert.equal(bindResult(fiveHourBinding, usageFixture({ fiveHourUsed: 100 }), env).value, 0, '100% used means 0% remaining');
-assert.ok(countColor(used100, 4, 144, 84, 12, 0) > 0, 'present 5h window shows its reset time');
-assert.equal(countColor(missingFiveHour, 4, 144, 84, 12, 0), 0, 'missing 5h hides its reset time');
+assert.ok(countColor(used100, 4, 158, 84, 12, 0) > 0, 'present 5h window shows its reset time');
+assert.equal(countColor(missingFiveHour, 4, 158, 84, 12, 0), 0, 'missing 5h hides its reset time');
 assert.deepEqual(render(template, usageFixture({ fiveHourUsed: 11 }), env).pixels, normal.pixels, 'same fixture is deterministic');
 assert.ok(different(normal, render(template, usageFixture({ fiveHourUsed: 11 }), { ...env, battery: 77 })), 'battery change changes visible pixels');
 assert.ok(different(normal, render(template, usageFixture({ fiveHourUsed: 11 }), { ...env, state: 'BLE ON' })), 'state change changes visible pixels');
 
-assert.equal(countColor(normal, 112, 58, 84, 18, 0), 0, 'zero reset credits hide the RC line');
+const rcBind = parseBind('resetCredits.availableCount');
+assert.equal(bindResult(rcBind, usageFixture(), env).exists, false, 'missing reset credits hide the RC line');
 const withReset = render(template, usageFixture({ fiveHourUsed: 11, resetCount: 2 }), env);
-assert.ok(countColor(withReset, 112, 58, 84, 18, 0) > 0, 'available reset credits show the RC line');
+assert.equal(bindResult(rcBind, usageFixture({ resetCount: 2 }), env).value, 2, 'reset credit count is readable');
 assert.ok(different(normal, withReset), 'reset credits change visible pixels');
-assert.equal(countColor(render(template, usageFixture({ fiveHourUsed: 11, label: null }), env), 112, 22, 84, 18, 0), 0, 'missing username hides the label row');
+assert.equal(countColor(render(template, usageFixture({ fiveHourUsed: 11, label: null }), env), 112, 64, 84, 18, 0), 0, 'missing username hides the label row');
 const labelElement = template.elements.find((element) => element.bind === 'bridge.label');
 assert.ok(labelElement && !labelElement.prefix, 'bridge label has no LABEL prefix');
 
@@ -99,9 +100,16 @@ assert.equal(bindResult(offlineBind, usageFixture(), offlineEnv).value, 138, 'of
 assert.equal(bindResult(offlineBind, usageFixture(), env).exists, false, 'unknown offline minutes hide');
 assert.equal(bindResult(offlineBind, usageFixture(), { ...offlineEnv, offline_mins: -1 }).exists, false, 'negative offline minutes hide');
 assert.equal(bindResult(offlineBind, usageFixture(), { ...offlineEnv, offline_mins: 0 }).exists, true, 'zero is a valid value (device policy gates bridge-loss display)');
-assert.ok(countColor(normal, 4, 144, 84, 12, 0) > 0, '5H reset row sits at y=144');
-assert.ok(countColor(normal, 4, 158, 84, 12, 0) > 0, 'BATT row sits at y=158');
-assert.ok(countColor(normal, 4, 172, 84, 12, 0) > 0, 'state row sits at y=172');
+const modeBind = parseBind('device.mode');
+assert.equal(modeBind?.kind, 'device.mode', 'device.mode is a known bind');
+assert.equal(bindResult(modeBind, usageFixture(), env).value, 'light', 'preview defaults to light mode');
+assert.equal(bindResult(modeBind, usageFixture(), { ...env, mode: 'deep' }).value, 'deep', 'deep mode renders its value');
+const deep = render(template, usageFixture({ fiveHourUsed: 11 }), { ...env, state: 'DEEP', mode: 'deep' });
+assert.ok(different(normal, deep), 'deep mode changes visible pixels');
+assert.ok(countColor(deep, 101, 6, 16, 16, 0) > 0, 'deep mode draws the sleep glyph in the BT cell');
+assert.equal(countColor(normal, 101, 6, 16, 16, 0), 0, 'light mode leaves the BT cell empty (BLE off)');
+assert.ok(countColor(normal, 4, 158, 84, 12, 0) > 0, '5H reset row sits at y=158');
+assert.ok(countColor(normal, 4, 172, 84, 12, 0) > 0, 'BATT row sits at y=172');
 assert.ok(countColor(normal, 4, 186, 84, 12, 0) > 0, 'online SYNC row sits at y=186');
 assert.ok(countColor(offline, 4, 186, 84, 12, 0) > 0, 'OFF row shows when the bridge is unreachable');
 const syncElement = template.elements.find((element) => element.bind === 'device.sync_hhmm');

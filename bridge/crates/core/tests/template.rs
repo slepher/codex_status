@@ -20,10 +20,10 @@ fn hashes_match_python_test_bridge() {
     assert_eq!(full.version, 3);
     assert_eq!(mini.version, 2);
     let quad = library.get("quad").expect("quad template");
-    assert_eq!(quad.version, 7);
-    assert_eq!(quad.min_fw.as_deref(), Some("0.12"));
-    // v0.12 single layout, canonical hash checked against the Python format.
-    assert_eq!(quad.hash, "c598adc0");
+    assert_eq!(quad.version, 10);
+    assert_eq!(quad.min_fw.as_deref(), Some("0.14"));
+    // v0.14 adds the device.mode sleep glyph to the quad layout.
+    assert_eq!(quad.hash, "86a51357");
 }
 
 #[test]
@@ -63,6 +63,7 @@ fn parse_bind_grammar() {
         Some(BindSpec::DeviceOfflineMins)
     );
     assert_eq!(parse_bind("device.now"), Some(BindSpec::DeviceNow));
+    assert_eq!(parse_bind("device.mode"), Some(BindSpec::DeviceMode));
     assert_eq!(parse_bind("device.idle_reason"), None);
     assert_eq!(
         parse_bind("buckets[codex].monthly.remaining"),
