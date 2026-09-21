@@ -112,6 +112,82 @@ extern "C" {
         out_len: c_int,
     ) -> c_int;
     fn codex_validate(tmpl: *const c_char, err: *mut c_char, err_len: c_int) -> c_int;
+    fn codex_rgn_build(tmpl: *const c_char) -> c_int;
+    fn codex_rgn_decide(
+        old_fb: *const u8,
+        new_fb: *const u8,
+        trusted: c_int,
+        force_full: c_int,
+        clean: c_int,
+        out: *mut c_char,
+        out_len: c_int,
+    ) -> c_int;
+    fn codex_rgn_on_partial() -> c_int;
+    fn codex_rgn_on_full() -> c_int;
+    fn codex_rgn_dump(out: *mut c_char, out_len: c_int) -> c_int;
+}
+
+/// Derive the semantic refresh regions for a template (display-safety layer).
+/// Callers must serialize all `rgn_*` calls (the policy state is global, like
+/// the firmware's).
+pub fn rgn_build(template: &str) -> Result<usize, String> {
+    let tmpl = CString::new(template).map_err(|e| e.to_string())?;
+    let n = unsafe { codex_rgn_build(tmpl.as_ptr()) };
+    if n < 1 {
+        return Err("region derivation failed".to_string());
+    }
+    Ok(n as usize)
+}
+
+/// Policy decision for a frame pair. Returns the action (0 none, 1 partial,
+/// 2 full) and the JSON detail from the C++ side.
+pub fn rgn_decide(
+    old_fb: &[u8],
+    new_fb: &[u8],
+    trusted: bool,
+    force_full: bool,
+    clean: bool,
+) -> Result<(i32, String), String> {
+    if old_fb.len() != BUF_LEN || new_fb.len() != BUF_LEN {
+        return Err(format!("framebuffer must be {BUF_LEN} bytes"));
+    }
+    let mut detail = vec![0i8; 192];
+    let action = unsafe {
+        codex_rgn_decide(
+            old_fb.as_ptr(),
+            new_fb.as_ptr(),
+            trusted as c_int,
+            force_full as c_int,
+            clean as c_int,
+            detail.as_mut_ptr(),
+            detail.len() as c_int,
+        )
+    };
+    let bytes: Vec<u8> = detail
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    Ok((action, String::from_utf8_lossy(&bytes).to_string()))
+}
+
+pub fn rgn_on_partial() {
+    unsafe { codex_rgn_on_partial() };
+}
+
+pub fn rgn_on_full() {
+    unsafe { codex_rgn_on_full() };
+}
+
+pub fn rgn_dump() -> String {
+    let mut out = vec![0i8; 2048];
+    unsafe { codex_rgn_dump(out.as_mut_ptr(), out.len() as c_int) };
+    let bytes: Vec<u8> = out
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    String::from_utf8_lossy(&bytes).to_string()
 }
 
 pub struct Env<'a> {

@@ -78,24 +78,27 @@ static void sendDataN(const UBYTE *buf, UDOUBLE len)
 }
 
 // SSD1681 BUSY: HIGH while busy; wait for LOW. Timeout 5s.
-static void readBusy(void)
+// Returns false on timeout so the caller can refuse to trust the panel state
+// (design §8.4: no software baseline update after an unknown waveform).
+static bool readBusy(void)
 {
     UDOUBLE t0 = millis();
     while (digitalRead(EPD_BUSY_PIN) == HIGH) {
         if (millis() - t0 > 5000) {
             DevLog.println("[epd] busy timeout");
-            return;
+            return false;
         }
         delay(1);
     }
+    return true;
 }
 
-static void reset(void)
+static bool reset(void)
 {
     digitalWrite(EPD_RST_PIN, HIGH); delay(50);
     digitalWrite(EPD_RST_PIN, LOW);  delay(20);
     digitalWrite(EPD_RST_PIN, HIGH); delay(50);
-    readBusy();
+    return readBusy();
 }
 
 // Reference EPD_SetWindows: X in byte units, Y as 16-bit pixel address.
@@ -122,24 +125,25 @@ static void setCursor(UBYTE xPx, UWORD yPx)
     sendData((yPx >> 8) & 0xFF);
 }
 
-static void loadLut(const UBYTE *lut)
+static bool loadLut(const UBYTE *lut)
 {
     sendCmd(0x32);
     sendDataN(lut, 153);
-    readBusy();
+    bool ok = readBusy();
 
     sendCmd(0x3F); sendData(lut[153]);
     sendCmd(0x03); sendData(lut[154]);
     sendCmd(0x04); sendData(lut[155]); sendData(lut[156]); sendData(lut[157]);
     sendCmd(0x2C); sendData(lut[158]);
+    return ok;
 }
 
-void EPD_SSD1681_Init(void)
+bool EPD_SSD1681_Init(void)
 {
-    reset();
+    bool ok = reset();
 
     sendCmd(0x12);              // SW reset
-    readBusy();
+    ok = readBusy() && ok;
 
     // Driver output control: 200 gates, TB=1
     sendCmd(0x01);
@@ -163,15 +167,15 @@ void EPD_SSD1681_Init(void)
     sendCmd(0x20);
 
     setCursor(0, EPD_SSD1681_HEIGHT - 1);
-    readBusy();
+    ok = readBusy() && ok;
 
-    loadLut(WF_FULL);
+    return loadLut(WF_FULL) && ok;
 }
 
-void EPD_SSD1681_Init_Partial(void)
+bool EPD_SSD1681_Init_Partial(void)
 {
-    reset();
-    loadLut(WF_PARTIAL);
+    bool ok = reset();
+    ok = loadLut(WF_PARTIAL) && ok;
 
     sendCmd(0x37);              // partial-mode parameters (vendored)
     sendData(0x00); sendData(0x00); sendData(0x00); sendData(0x00); sendData(0x00);
@@ -183,24 +187,25 @@ void EPD_SSD1681_Init_Partial(void)
     sendCmd(0x22);              // enable clock+analog, arm partial mode
     sendData(0xC0);
     sendCmd(0x20);
-    readBusy();
+    return readBusy() && ok;
 }
 
 // Wake the controller from deep-sleep mode 1 and prepare a partial refresh.
 // Mode 1 retains RAM, but a reset after wake may not be trusted to keep the
 // "previous" RAM (cmd 0x26) baseline, so it is re-seeded from the frame that
 // is known to be on screen.
-void EPD_SSD1681_WakePartial(const UBYTE *PreviousImage)
+bool EPD_SSD1681_WakePartial(const UBYTE *PreviousImage)
 {
-    EPD_SSD1681_Init_Partial();
-    if (!PreviousImage) return;
+    bool ok = EPD_SSD1681_Init_Partial();
+    if (!PreviousImage) return ok;
     setWindow(0, EPD_SSD1681_HEIGHT - 1, EPD_SSD1681_WIDTH - 1, 0);
     setCursor(0, EPD_SSD1681_HEIGHT - 1);
     sendCmd(0x26);
     sendDataN(PreviousImage, FB_BYTES);
+    return ok;
 }
 
-void EPD_SSD1681_Clear(UBYTE color)
+bool EPD_SSD1681_Clear(UBYTE color)
 {
     static UBYTE chunk[500];
     UBYTE fill = (color == EPD_SSD1681_WHITE) ? 0xFF : 0x00;
@@ -221,10 +226,10 @@ void EPD_SSD1681_Clear(UBYTE color)
     sendCmd(0x22);
     sendData(0xC7);
     sendCmd(0x20);
-    readBusy();
+    return readBusy();
 }
 
-void EPD_SSD1681_Display(const UBYTE *Image)
+bool EPD_SSD1681_Display(const UBYTE *Image)
 {
     setWindow(0, EPD_SSD1681_HEIGHT - 1, EPD_SSD1681_WIDTH - 1, 0);
     setCursor(0, EPD_SSD1681_HEIGHT - 1);
@@ -239,10 +244,10 @@ void EPD_SSD1681_Display(const UBYTE *Image)
     sendCmd(0x22);
     sendData(0xC7);             // full refresh
     sendCmd(0x20);
-    readBusy();
+    return readBusy();
 }
 
-void EPD_SSD1681_DisplayPart(const UBYTE *Image)
+bool EPD_SSD1681_DisplayPart(const UBYTE *Image)
 {
     setWindow(0, EPD_SSD1681_HEIGHT - 1, EPD_SSD1681_WIDTH - 1, 0);
     setCursor(0, EPD_SSD1681_HEIGHT - 1);
@@ -253,7 +258,7 @@ void EPD_SSD1681_DisplayPart(const UBYTE *Image)
     sendCmd(0x22);
     sendData(0xCF);             // partial refresh vs previous RAM
     sendCmd(0x20);
-    readBusy();
+    return readBusy();
 }
 
 void EPD_SSD1681_Sleep(void)
@@ -277,19 +282,20 @@ static void setCursorRegion(int x0, int y0)
     setCursor((UBYTE)x0, (UWORD)(EPD_SSD1681_HEIGHT - 1 - y0));
 }
 
-void EPD_SSD1681_WakePartialWindow(int x0, int y0, int x1, int y1,
+bool EPD_SSD1681_WakePartialWindow(int x0, int y0, int x1, int y1,
                                    const UBYTE *prev)
 {
-    EPD_SSD1681_Init_Partial();
-    if (!prev) return;
+    bool ok = EPD_SSD1681_Init_Partial();
+    if (!prev) return ok;
     const UDOUBLE bytes = (UDOUBLE)((x1 >> 3) - (x0 >> 3) + 1) * (y1 - y0 + 1);
     setWindowRegion(x0, y0, x1, y1);
     setCursorRegion(x0, y0);
     sendCmd(0x26);
     sendDataN(prev, bytes);
+    return ok;
 }
 
-void EPD_SSD1681_DisplayPartWindow(int x0, int y0, int x1, int y1,
+bool EPD_SSD1681_DisplayPartWindow(int x0, int y0, int x1, int y1,
                                    const UBYTE *data)
 {
     const UDOUBLE bytes = (UDOUBLE)((x1 >> 3) - (x0 >> 3) + 1) * (y1 - y0 + 1);
@@ -300,5 +306,5 @@ void EPD_SSD1681_DisplayPartWindow(int x0, int y0, int x1, int y1,
     sendCmd(0x22);
     sendData(0xCF);             // partial refresh vs previous RAM
     sendCmd(0x20);
-    readBusy();
+    return readBusy();
 }

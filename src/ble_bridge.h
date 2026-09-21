@@ -7,6 +7,7 @@ typedef void (*TemplateCtrlHandler)(const String &json);
 typedef void (*TemplateDataHandler)(const uint8_t *data, size_t len);
 typedef void (*TemplateResetHandler)();
 typedef void (*AuthJsonHandler)(const String &json);
+typedef void (*V2CtrlHandler)(const String &json);
 
 void bleBegin(const String &deviceName, const String &fwVersion);
 void bleDeinit();
@@ -22,6 +23,11 @@ void bleAdvertiseStop();
 void bleSetHandlers(UsageJsonHandler onUsage, EndpointJsonHandler onEndpoint);
 void bleSetTemplateHandlers(TemplateCtrlHandler onCtrl, TemplateDataHandler onData,
                             TemplateResetHandler onReset = nullptr);
+// v2 rendezvous control split (design §5.1): a template-control JSON carrying
+// `"rv":2` is routed here instead of the legacy template handler. Without a
+// registered handler the device answers a bounded NACK, so an accidental v2
+// frame can never be parsed as an old template op.
+void bleSetV2Handler(V2CtrlHandler onV2);
 void bleSetAuthHandler(AuthJsonHandler onAuth);
 void bleSetInfoExtra(const String &json);
 void bleNotifyStatus(const String &json);

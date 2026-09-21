@@ -1,6 +1,148 @@
 # Codex Status 项目进度（交接文档）
 
-## 最新状态：2026-09-21 — 0.15.2 + quad v11：唤醒流程改版（先清 Zzz，Wi-Fi 图标随连接显示）
+## 最新状态：2026-09-21 — 0.15.7-bw：修复离开 deep 的 Zzz 残影 + 新需求仅入文档
+
+- **用户报告修复（0.15.7）**：自然睡眠唤醒后 Zzz 未被完全刷新，看起来仍在
+  睡眠。根因：定时网络窗口拉起 light 时，`deepNetworkCycle` 先按 deep 状态
+  渲染一帧，`startNormalMode` 再在它上面做**局刷**去掉 Zzz；局刷波形对深色
+  图标清除不净，留下 Zzz 残影。修复：在 pull 渲染前先按响应 `mode` 切到
+  light（`rtcMode=MODE_LIGHT`、`persistMode`），并把 `leavingDeep` 纳入渲染
+  条件与 `forceCleanRefresh`，使“去 Zzz + 进入 light 帧”在同一次**全刷**里
+  完成；`startNormalMode` 的唤醒首帧同样带 clean。现场日志验证：
+  `wake=4(timer) mode=deep` → pull ok → `mode=light` → `[tpl] rendered quad
+  (PULL)`；ROM `artifacts/codex-status-0.15.7-bw.bin`（1642272 B，SHA256
+  `81B9EDF8F04759A9B68B13288188B989B8CB16ED1595F6EBB5A12FAA4EA89E0E`），
+  已 OTA（0.15.6→0.15.7，直传 37s）。
+- **已知遗留（记入 task-10，勿忘）**：同一路径在 timer pull→light 时会画两
+  帧（pull 帧 + 唤醒帧），即两次全刷闪烁；RAM 标志 `wakeBaselineDrawn` 的修
+  复原型已因“仅文档”要求回退，待 task-10 一起做。
+- **新需求仅入文档（用户明确要求，本窗口不实现）**：`task-10.md`
+  - A：冷启动若存在 usage 缓存，直接进模板（`WIFI OFF`、Wi-Fi 图标灭、
+    桥显示断连），不等 Wi-Fi；连接成功后一次局刷点亮图标；失败保持模板并
+    走既有有界退避/回深，不再出现 `Connecting:` 页。
+  - B：Wi-Fi 连接过程中图标按 ~1Hz 闪烁，成功转常亮、失败/超时熄灭；模板
+    驱动（可能 quad v12 + 三端哈希同步），只用局刷；**功耗必须实测**后再定
+    周期/时长。
+- **现场**：设备 `0.15.7-bw`（light、在线）；已恢复调试设置
+  `idle_deep_s=600`、`frame_capture=0`，桥 `device_mode` 已回 auto。桥
+  fresh debug（父 PID 5216 + watchdog 14540）。token 规则未动。
+- **待办**：照片验收；90 次时钟预算长测；BOOT BLE 回归；task-10（A/B +
+  双帧修复）；随后阶段 3。未提交。
+
+## 历史：2026-09-21 — 0.15.6-bw：修复 BOOT/图标变化触发全刷 + OTA 重试事故处理
+
+- **用户报告修复**：按 BOOT（BLE 图标切换）现在只做局刷。根因：阶段 2 的区域
+  合并按“字节扩张相交”把图标并进了大黑块区域，任何图标变化都被黑块保守
+  guard 判成全刷。0.15.6 改为**只按真实像素相交合并**（字节列仅作为未来
+  窗口写入的元数据），区域统计按语义像素矩形并掩掉边缘字节；quad v11 得到
+  13 个独立区域（两块黑块、三个图标格、时钟格、右/下行文本）。现场实测
+  `[rgn] derived n=13 whole=0`，`render_mode=deep/light`（等价 BOOT 的图标
+  变化）均为 `partial/ok`（dirty 143/101）。主机测试新增“图标变化必须局刷”
+  断言。
+- **OTA 事故（已定位、已恢复，已记入 task-8 现场笔记）**：deep 期排队的
+  OTA 唤醒后每次尝试都在设备侧 `upload start` → `abort (aborted)`，桥按
+  60s→2m→4m 退避重试（屏上反复闪升级页）；直接 MCP 调用则因设备已停止
+  读取、客户端还在发 1.6MB 而卡到 120s 超时（看似挂死）。设备侧无故障：
+  curl multipart 直传同一 ROM **26s 成功（UPDATE OK）**；重启 `bridge-app`
+  后桥侧 dummy 上传也正常。结论：长跑桥进程的客户端连接状态异常，非固件
+  问题。阶段 5 将加 `pending_ota` 可见性、preflight 后短延时、上传超时有界
+  并报已发字节、OTA 与推送串行化。
+- **现场**：设备 `0.15.6-bw`（ota_1，light、在线、电量 ~72%，quad v11）；
+  0.15.6 已由 curl 上传方式落盘（桥重启后 26s 完成）。桥已重启为
+  新进程（父 PID 5216 + watchdog 14540）；桥日志在
+  `bridge/target/debug/data/logs/bridge-app.log.<date>`（事故证据为
+  反复 `doUpdate transport error`）。token 规则未动。
+- **安全发现（待处理）**：桥的错误日志会把 `?token=...` 完整打进 URL；
+  且已提交的 `project-workflow/sleep-modes/prompt.md`（e22d952）含明文设备
+  操作 token，当前仍可用。建议下次 BOOT 会话经绑定 BLE 轮换 token，并在
+  阶段 5 对桥日志 URL 做脱敏（已记入 `task-8.md`）。
+- **验证**：`pio run`；`node tools/test-quad-preview.mjs` 7/7；
+  `cargo test -p bridge-core --test template` 8/8；
+  `cargo test -p bridge-render --test policy` 1/1（隔离 target）；
+  `git diff --check` 干净。
+- **ROM**：`artifacts/codex-status-0.15.6-bw.bin`（1642192 B，SHA256
+  `21404F60965F8214603D2BAED599180AD81431902B2333600FA2D4A7508F2F79`）。
+- **待办**：照片验收（黑块局刷门槛，用户）；90 次时钟预算长测；BOOT BLE
+  回归（legacy 推送 + `rv:2` NACK）；随后阶段 3（v2 事务）。新窗口交接见
+  `project-workflow/ble-rendezvous-power/prompt.md`（不含任何凭据）。未提交。
+
+## 历史：2026-09-21 — 0.15.5-bw：阶段 2 显示安全层 + 修复冷启动卡 Connecting 页
+
+- **用户报告修复**：OTA 重启后曾卡在 `Connecting:` 页，按 BOOT 才回到模板。
+  日志根因：冷启动首次 bridge pull 超时（`http -11`），而渲染只发生在 pull
+  成功/唤醒路径。修复：Wi-Fi 上行后的冷启动统一 `renderCurrent()` 一次，
+  用缓存 usage/模板或状态页替换连接页（相同帧零写入）。已随 0.15.5 部署。
+- **阶段 2（task-5，显示安全层）落地**：
+  1. 新增 `src/refresh_policy.{h,cpp}`：从模板推导语义区域（filled rect =
+     solid、白字黑底 = inverted、`buckets[...]`/`resetCredits` = usage、
+     `device.now` = clock、icon/bar/line），按字节扩张相交合并并取最保守
+     类别；逐区域统计 changed/W2B/B2W/黑量；ghost 预算（黑块 4、低墨 10、
+     时钟 90）；判定顺序 = 基线可信 → clean/force → 相同帧 → 推导失败 →
+     >12.5% 面积 → 极性 → 黑块保守 guard → 预算 → 局刷。**照片验收前黑块
+     变化一律全刷**（阶段 2 保守口径）。
+  2. `main.cpp`：`epdFlush` 走策略；`forceCleanRefresh` 绕过相同帧捷径
+     （设计 §8.4）；波形成功后才记账/更新旧帧，失败置 untrusted；新增
+     `/status.json` 字段（`refresh_kind/reason/dirty_pixels/rgn/...`）与
+     `/diag?rgn=1`、`?policy=off|on`、`?clean=1`、`?busy_fail=1`。
+  3. **主机测试** `bridge/crates/render/tests/policy.rs`：build.rs 纳入
+     `refresh_policy.cpp`，同一份 C++ 策略断言 none/clean/trust/force/
+     低墨局刷/黑块全刷/12.5% 面积/预算耗尽与复位；`cargo test -p
+     bridge-render --test policy` 通过。
+  4. 现场实测（0.15.5-bw，token 门控）：`[rgn] derived n=5 whole=0`；
+     `/diag?rgn=1` 五区域（顶部合并黑块 + 右下黑块 + 三行低墨），低墨行
+     `partials=1 cumS=13 budget=9`；`clean=1` → `full/clean`；
+     `busy_fail=1` → `epd_trusted=false`，下次 `full/trust` 恢复；
+     `policy=off`+render → `partial/legacy`；`policy=on`+render →
+     `full/high_ink`。
+  5. 修复推导 bug：`RGN_MAX 20→32`（quad v11 约 29 个元素，合并前溢出会
+     退化为整帧全刷）。
+- **验证**：`pio run`；`node tools/test-quad-preview.mjs` 7/7；
+  `cargo test -p bridge-core --test template` 8/8；
+  `cargo test -p bridge-render --test policy` 1/1（隔离 target）；
+  `git diff --check` 干净。桥生产行为未改（仅 render 测试构建加入策略源）。
+- **ROM**：`artifacts/codex-status-0.15.5-bw.bin`（1641872 B，SHA256
+  `078ABFC8180D21BF790CE110E97069EA270C5E3EAADF272BA55101FFD0EC6E9A`）。
+- **待办**：固定机位照片验收（黑块局刷开放门槛，用户）；时钟 90 次预算的
+  长时观察（deep ≥1.5h）；用户按 BOOT 的 BLE 回归（legacy 推送 + `rv:2`
+  NACK）；随后进入阶段 3（v2 事务）。未提交。
+
+## 历史：2026-09-21 — 0.15.3-bw：BLE 会合/大黑块里程碑阶段 1（基线取证 + 显示基座）
+
+- **计划**：`project-workflow/ble-rendezvous-power/` 新增 task-4..task-9，
+  对应设计 §12 阶段 1–6（显示安全层 → v2 事务 → 固件会合/lease → 桥常驻
+  监听 → 小规模启用）；status.md 记录入口。桥未改，无 GATT 表变更。
+- **阶段 1（task-4）完成**：
+  1. **基线证据**：`artifacts/ble-rendezvous/`（status/history/log/帧 PBM；
+     帧 17 399 黑像素，TL 块 7 538、BR 块 7 463、时钟格 65、Wi-Fi 格 62、
+     Zzz 0）。复核发现 0.15.2 ROM 哈希此前记录少一位：实测
+     `D20BBFEF10D40C47E64BAFFA5FFF70F81BE90575D29DAD66BD851C78C2CF0FCA`
+     （本文件与 status.md 已更正）。
+  2. **RTC/堆审计**（新 `tools/rtc-budget.py`）：RTC slow 区 7 680 B，
+     当前 .rtc 用 1 668 B，余 **6 000 B**；5 000 B 旧帧理论可放但留白太少，
+     阶段 2 决定只保留时钟窗 + 紧凑区域/预算表，无旧像素的区域走全刷；
+     帧缓冲在堆（空闲 ~147 KB）。
+  3. **BUSY 返回值传播**：`EPD_SSD1681_*` 波形调用全部返回 bool；超时不再
+     静默。`main.cpp` 计数 `rtcEpdBusyFails`、`epdBaselineTrusted` 失效时
+     不更新 `lastDisplayedFrame`，下一次显示强制全刷；时钟窗口失败把
+     `rtcClkPartials` 拉到上限以便网络窗口重建。`/status.json` 新增
+     `epd_busy_fails`/`epd_trusted`（HTML 状态页同步）。
+  4. **GATT 兼容分流 + 回滚开关**：template-control 带 `"rv":2` 走 stub
+     （NACK `not_ready`，绝不按旧模板流解析）；INFO/`/status.json` 增加
+     `rendezvous_v`(0/2) 与 `rv_max=2`；token 门控 `POST /diag?rv2=1|0`
+     持久化到 NVS `pm/rv2`（默认 0，旧路径字节不变，无 Windows 重配对）。
+- **验证/部署**：`pio run`（Flash 1 599 448 B，RAM 20.5%，仅既有 NimBLE
+  deprecation 警告）；`node tools/test-quad-preview.mjs` 7/7；
+  `cargo test -p bridge-core --test template` 8/8（隔离 target）。MCP
+  `firmware_ota` OTA `0.15.2-bw -> 0.15.3-bw` 成功；现场
+  `fw=0.15.3-bw`、`rv2=0`、`rv_max=2`、`epd_busy_fails=0`、
+  `epd_trusted=true`、light、电量 72%；`/diag?rv2=1/0` 往返经 HTTP 实测。
+- **ROM**：`artifacts/codex-status-0.15.3-bw.bin`（1632336 B，SHA256
+  `DC6227B3EC4BA01F4A0FDD55D9AE79B166743CEE2BBF17A04EC1F9AD8B1437B2`）。
+- **待办**：需要用户按 BOOT 的 BLE 回归（legacy 模板推送仍可用、`rv:2`
+  得到 NACK）；固定机位照片验收（阶段 2 黑块局刷开放门槛）；
+  `task-5` 显示安全层实现中。未提交。
+
+## 历史：2026-09-21 — 0.15.2 + quad v11：唤醒流程改版（先清 Zzz，Wi-Fi 图标随连接显示）
 
 - **需求（用户修订）**：睡眠模式不显示 Wi-Fi 图标（未连接）；按 BOOT 先立即
   取消 Zzz，连接成功后显示 Wi-Fi 图标；进 deep 时 Wi-Fi 图标消失。取代 0.15.1
@@ -19,7 +161,9 @@
     `/diag?render_mode=light` + `GET /frame?which=last` → Wi-Fi 格 62 黑像素；
     `render_mode=deep` → 该格 0 黑像素、Zzz 格 39 黑像素（图标随状态正确）。
 - **ROM**：`artifacts/codex-status-0.15.2-bw.bin`（1629696 B，SHA256
-  `D20BBFEF10D0C47E64BAFFA5FFF70F81BE90575D29DAD66BD851C78C2CF0FCA`）。
+  `D20BBFEF10D40C47E64BAFFA5FFF70F81BE90575D29DAD66BD851C78C2CF0FCA`；
+  2026-09-21 复核：此前本文件与 status.md 记录的哈希少了一位字符，以上为
+  实测值）。
 - **现场验证（用户按 BOOT，通过）**：桥侧 debug deep 下 `/history` seq8
   `enter-deep(aux=60)` → seq11 `boot aux=3`（EXT1 按键）→ seq12 `to-light
   aux=1`；本次 boot `epd_writes=3`（唤醒清 Zzz 全刷 + 连上显 Wi-Fi 图标局刷

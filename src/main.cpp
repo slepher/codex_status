@@ -47,13 +47,14 @@
 #include "template_store.h"
 #include "template_engine.h"
 #include "template_xfer.h"
+#include "refresh_policy.h"
 
 #ifdef CODEX_DEEPPULL_TEST
 #define FW_VERSION    "0.13.9-dptest2"
 #elif defined(CODEX_CLK_WINDOW_TEST)
 #define FW_VERSION    "0.13.9-clkwin"
 #else
-#define FW_VERSION    "0.15.2-bw"
+#define FW_VERSION    "0.15.7-bw"
 #endif
 #define AP_PASSWORD   "codex1234"
 #define MAX_SLOTS     3
@@ -232,6 +233,13 @@ static uint32_t pendingWindowUntilMs = 0;
 static bool     deepWakePath = false;      // setup(): this boot is a deep pull
 static bool     wokeFromDeep = false;      // setup(): deep wake; panel holds the sleep frame
 static bool     panelThinReady = false;    // epdThinBegin() ran on this boot
+
+// BLE rendezvous protocol v2 gate (design §10). Default 0 = legacy path only;
+// persisted in NVS `pm/rv2` so a rollback survives OTA/reboot and can be
+// toggled at runtime with POST /diag?rv2=0|1. `rendezvous_v` in INFO reflects
+// this gate; the GATT table itself never changes (no Windows re-pairing).
+static uint8_t  rv2Enabled = 0;
+static const uint8_t RV2_SUPPORTED = 2;
 
 // v0.12 runtime state (docs/power-state.md §3-§6)
 static bool     plugged = false;          // PC USB host present (SOF)
@@ -577,6 +585,23 @@ static String lastChannel = "-";
 static int      epdPartialCount = 0;
 static bool     epdPartialReady = false;
 static bool     epdAsleep = false;
+static bool     epdFullLut = false;        // full-refresh LUT currently loaded
+static bool     epdBaselineTrusted = true; // software old-frame matches the panel
+// Panel BUSY timeouts (RTC: survives deep sleep, cleared on power-on). A
+// non-zero count means at least one waveform had an unknown state; the
+// baseline is then untrusted and the next required display is a full refresh.
+RTC_DATA_ATTR static uint32_t rtcEpdBusyFails = 0;
+
+// Display safety layer (design §8): semantic regions from the active template,
+// conservative escalation, ghost budgets. `rgnPolicyOn=false` restores the
+// legacy changed-pixels rule at runtime (token-gated /diag?policy=off).
+static RgnSet   rgnSet;
+static bool     rgnPolicyOn = true;
+static uint32_t rfnDecisions = 0;
+static String   rfnKind = "init";
+static String   rfnReason = "init";
+static uint16_t rfnDirty = 0;
+static bool     forceCleanRefresh = false;
 
 static void screen(const std::vector<String> &lines, UBYTE color = BLACK);
 static void epdFlush(bool forceFull = false);
@@ -718,8 +743,18 @@ static void epdBegin(bool clearPanel = true) {
     retainSleepCriticalGpio();
     delay(20);
     DEV_Module_Init();
-    EPD_SSD1681_Init();
-    if (clearPanel) EPD_SSD1681_Clear(EPD_SSD1681_WHITE);
+    epdFullLut = EPD_SSD1681_Init();
+    epdBaselineTrusted = false;
+    if (!epdFullLut) {
+        rtcEpdBusyFails++;
+        DevLog.println("[epd] init busy timeout; baseline untrusted");
+    }
+    if (clearPanel && EPD_SSD1681_Clear(EPD_SSD1681_WHITE)) {
+        epdBaselineTrusted = true;   // panel is white, lastDisplayedFrame is white
+    } else if (clearPanel) {
+        rtcEpdBusyFails++;
+        DevLog.println("[epd] clear busy timeout; baseline untrusted");
+    }
     panelThinReady = true;
     // Allocate once per boot: epdBegin() may be re-entered (OOM retry / future
     // callers) and overwriting the pointers would leak both 5000-byte buffers.
@@ -777,38 +812,88 @@ static void epdPanelSleep() {
     epdAsleep = true;
 }
 
+// Refresh decision: the display-safety layer (design §8) classifies changes by
+// semantic region and budgets; high-ink changes are conservative (full) until
+// the photo gate passes. `rgnPolicyOn=false` keeps the legacy rule at runtime.
 static void epdFlush(bool forceFull) {
     if (!frame) return;
-    if (lastDisplayedFrame && memcmp(frame, lastDisplayedFrame, EPD_FB_BYTES) == 0) return;
 
-    bool partial = !forceFull && epdPartialReady;
-    if (partial && lastDisplayedFrame) {
-        int changed = 0;
-        for (int i = 0; i < EPD_FB_BYTES; i++)
-            changed += __builtin_popcount((unsigned char)(frame[i] ^ lastDisplayedFrame[i]));
-        if (changed > EPD_W * EPD_H / 8) partial = false;
-    }
-    if (partial && ++epdPartialCount <= 30) {
-        if (epdAsleep) {
-            EPD_SSD1681_WakePartial(lastDisplayedFrame);
-            epdAsleep = false;
+    RfnDecision d;
+    if (rgnPolicyOn) {
+        d = rgnDecide(rgnSet, lastDisplayedFrame, frame,
+                      epdBaselineTrusted, forceFull, forceCleanRefresh);
+        forceCleanRefresh = false;
+        rfnKind = rfnActionName(d.action);
+        rfnReason = rfnReasonName(d.reason);
+        rfnDirty = d.dirty;
+        rfnDecisions++;
+        if (d.action == RFN_NONE) return;
+    } else {
+        forceCleanRefresh = false;
+        if (lastDisplayedFrame && memcmp(frame, lastDisplayedFrame, EPD_FB_BYTES) == 0) return;
+        bool full = forceFull || !epdPartialReady || !epdBaselineTrusted;
+        if (!full && lastDisplayedFrame) {
+            int changed = 0;
+            for (int i = 0; i < EPD_FB_BYTES; i++)
+                changed += __builtin_popcount((unsigned char)(frame[i] ^ lastDisplayedFrame[i]));
+            if (changed > EPD_W * EPD_H / 8) full = true;
         }
-        EPD_SSD1681_DisplayPart(frame);
-        epdWriteCount++;
-        if (lastDisplayedFrame) memcpy(lastDisplayedFrame, frame, EPD_FB_BYTES);
-        epdPanelSleep();
-        return;
+        d.action = full ? RFN_FULL : RFN_PARTIAL;
+        rfnKind = rfnActionName(d.action);
+        rfnReason = "legacy";
+        rfnDirty = 0;
     }
+
+    bool partial = (d.action == RFN_PARTIAL) && epdPartialReady;
+    if (partial && ++epdPartialCount > 30) partial = false;
+    if (partial) {
+        bool ok = true;
+        if (epdAsleep) ok = EPD_SSD1681_WakePartial(lastDisplayedFrame);
+        if (ok) ok = EPD_SSD1681_DisplayPart(frame);
+        if (ok) {
+            epdWriteCount++;
+            if (rgnPolicyOn) rgnOnPartial(rgnSet);
+            if (lastDisplayedFrame) memcpy(lastDisplayedFrame, frame, EPD_FB_BYTES);
+            epdPanelSleep();
+            return;
+        }
+        // Unknown waveform state: never keep the stale software baseline, and
+        // escalate to a full refresh so the panel converges (design §8.4).
+        rtcEpdBusyFails++;
+        epdBaselineTrusted = false;
+        if (rgnPolicyOn) rgnOnFull(rgnSet);
+        DevLog.println("[epd] partial failed; escalating to full refresh");
+    }
+    if (rgnPolicyOn && d.action == RFN_FULL) rgnOnFull(rgnSet);
 
     epdPartialCount = 0;
-    if (epdPartialReady || epdAsleep) EPD_SSD1681_Init();   // full LUT + wake
+    if (!epdFullLut || epdAsleep) {
+        if (!EPD_SSD1681_Init()) {
+            rtcEpdBusyFails++;
+            epdBaselineTrusted = false;
+            DevLog.println("[epd] full init busy timeout");
+        } else {
+            epdFullLut = true;
+        }
+    }
     epdAsleep = false;
-    EPD_SSD1681_Display(frame);
-    epdWriteCount++;
-    rtcClkPartials = 0;   // full waveform clears the clock-window ghosting
-    if (lastDisplayedFrame) memcpy(lastDisplayedFrame, frame, EPD_FB_BYTES);
-    EPD_SSD1681_Init_Partial();
-    epdPartialReady = true;
+    bool ok = EPD_SSD1681_Display(frame);
+    if (ok) {
+        epdWriteCount++;
+        rtcClkPartials = 0;   // full waveform clears the clock-window ghosting
+        if (lastDisplayedFrame) memcpy(lastDisplayedFrame, frame, EPD_FB_BYTES);
+        epdBaselineTrusted = true;
+        epdPartialReady = EPD_SSD1681_Init_Partial();
+        epdFullLut = false;
+        if (!epdPartialReady) {
+            rtcEpdBusyFails++;
+            DevLog.println("[epd] partial-mode init failed; next flush is full");
+        }
+    } else {
+        rtcEpdBusyFails++;
+        epdBaselineTrusted = false;
+        DevLog.println("[epd] full refresh busy timeout; baseline untrusted");
+    }
     epdPanelSleep();
 }
 
@@ -977,11 +1062,23 @@ static bool clockTickWake() {
     clkBlitString(buf, s);
     const int x0 = clkR.x0b * 8, x1 = clkR.x1b * 8 + 7;
     const uint64_t t1 = esp_timer_get_time();
-    EPD_SSD1681_WakePartialWindow(x0, clkR.y0, x1, clkR.y1,
-                                  clkPixelsValid ? clkPixels : nullptr);
+    bool ok = EPD_SSD1681_WakePartialWindow(x0, clkR.y0, x1, clkR.y1,
+                                            clkPixelsValid ? clkPixels : nullptr);
     const uint64_t t2 = esp_timer_get_time();
-    EPD_SSD1681_DisplayPartWindow(x0, clkR.y0, x1, clkR.y1, buf);
+    if (ok) ok = EPD_SSD1681_DisplayPartWindow(x0, clkR.y0, x1, clkR.y1, buf);
     const uint64_t t3 = esp_timer_get_time();
+    if (!ok) {
+        // The window waveform state is unknown: keep the previous clock pixels
+        // and schedule a full rebuild at the next opportunity.
+        rtcEpdBusyFails++;
+        rtcClkPartials = CLK_GHOST_LIMIT;
+        clkPixelsValid = false;
+        epdPartialReady = false;
+        epdFullLut = false;
+        epdAsleep = false;
+        DevLog.println("[clk] window write failed; full refresh required");
+        return false;
+    }
     memcpy(clkPixels, buf, n);
     clkPixelsValid = true;
     epdAsleep = false;
@@ -1151,7 +1248,8 @@ static void renderUsage(const String &json, const char *channel) {
 
 static void updateInfoExtra() {
     String items = "\"mac\":\"" + macText() + "\",\"ip\":\"" + ipText() +
-                   "\",\"http_port\":80,\"templates\":[";
+                   "\",\"http_port\":80,\"rendezvous_v\":" + String((unsigned)(rv2Enabled ? RV2_SUPPORTED : 0)) +
+                   ",\"rv_max\":" + String((unsigned)RV2_SUPPORTED) + ",\"templates\":[";
     String active = tplStoreActive();
     for (int i = 0; i < tplStoreCount(); i++) {
         TplMeta m;
@@ -1166,10 +1264,18 @@ static void updateInfoExtra() {
 
 static bool tplCacheLoad() {
     String id = tplStoreActive();
-    if (!id.length()) { activeTplJson = ""; activeTplId = ""; activeTplHasNow = false; return false; }
+    if (!id.length()) {
+        activeTplJson = ""; activeTplId = ""; activeTplHasNow = false;
+        rgnReset(rgnSet); rgnSet.wholeFrame = true;
+        return false;
+    }
     if (id == activeTplId && activeTplJson.length()) return true;
     String json;
-    if (!tplStoreLoad(id, json)) { activeTplJson = ""; activeTplId = ""; activeTplHasNow = false; return false; }
+    if (!tplStoreLoad(id, json)) {
+        activeTplJson = ""; activeTplId = ""; activeTplHasNow = false;
+        rgnReset(rgnSet); rgnSet.wholeFrame = true;
+        return false;
+    }
     activeTplJson = json;
     activeTplId = id;
     // Scan the (multi-KB, possibly PSRAM-backed) template once per load, not
@@ -1178,6 +1284,11 @@ static bool tplCacheLoad() {
     activeTplHasNow = activeTplJson.indexOf("device.now") >= 0;
     activeTplHasMode = activeTplJson.indexOf("device.mode") >= 0;
     clkComputeRect();
+    // Semantic refresh regions for the display-safety layer (design §8.1).
+    // Failure to derive them leaves wholeFrame=true (conservative full).
+    bool rgnOk = rgnBuild(activeTplJson, rgnSet);
+    DevLog.printf("[rgn] %s n=%u whole=%d\n", rgnOk ? "derived" : "fallback",
+                  (unsigned)rgnSet.n, rgnSet.wholeFrame ? 1 : 0);
     return true;
 }
 
@@ -1820,7 +1931,9 @@ static void handleStatus() {
     html += "<li>Templates: " + String(tplStoreCount()) + " (active: " + activeId +
             (activeHash.length() ? String(" hash ") + activeHash : String("")) + ")</li>";
     html += "<li>EPD writes: " + String(epdWriteCount) + " (partial " +
-            String(epdPartialReady ? "ready" : "off") + ", streak " + String(epdPartialCount) + ")</li>";
+            String(epdPartialReady ? "ready" : "off") + ", streak " + String(epdPartialCount) +
+            ", busy_fails " + String(rtcEpdBusyFails) + ", baseline " +
+            String(epdBaselineTrusted ? "trusted" : "untrusted") + ")</li>";
     {
         OwnerRec ownerCur;
         if (ownerGet(ownerCur)) {
@@ -1873,6 +1986,15 @@ static void handleStatusJson() {
     doc["epd_writes"] = epdWriteCount;
     doc["epd_partial"] = epdPartialReady;
     doc["epd_streak"] = epdPartialCount;
+    doc["epd_busy_fails"] = rtcEpdBusyFails;
+    doc["epd_trusted"] = epdBaselineTrusted;
+    doc["refresh_kind"] = rfnKind;
+    doc["refresh_reason"] = rfnReason;
+    doc["dirty_pixels"] = rfnDirty;
+    doc["refresh_decisions"] = rfnDecisions;
+    doc["rgn"] = rgnSet.n;
+    doc["rgn_whole"] = rgnSet.wholeFrame;
+    doc["rgn_policy"] = rgnPolicyOn;
     doc["wifi_slots"] = countWifiSlots();
     doc["ap_reason"] = AP_REASON_NAMES[rtcApReason < 3 ? rtcApReason : 0];
     // v0.14 deep/light mode (docs/power-state.md §13).
@@ -1887,6 +2009,8 @@ static void handleStatusJson() {
     doc["nvs_stage_boot"] = nvsStageAtBoot;
     doc["deep_usb"] = rtcDeepOnUsb;
     doc["frame_capture"] = rtcFrameCapture;
+    doc["rv2"] = rv2Enabled;
+    doc["rv_max"] = RV2_SUPPORTED;
     doc["tz"] = deviceTz;
     doc["hist_count"] = histCount;
     doc["hist_head"] = histHead;
@@ -2194,6 +2318,52 @@ static void handleDiag() {
         rtcFrameCapture = server.arg("frame_capture").toInt() ? 1 : 0;
         DevLog.printf("[diag] frame_capture=%u\n", (unsigned)rtcFrameCapture);
     }
+    // BLE rendezvous v2 gate (design §10): persisted rollback switch. Off by
+    // default; enabling only advertises `rendezvous_v` once the transaction
+    // layer exists (stage 3+).
+    if (server.hasArg("rv2")) {
+        rv2Enabled = server.arg("rv2").toInt() ? 1 : 0;
+        Preferences p;
+        p.begin("pm", false);
+        p.putUChar("rv2", rv2Enabled);
+        p.end();
+        updateInfoExtra();
+        DevLog.printf("[diag] rv2=%u\n", (unsigned)rv2Enabled);
+    }
+    // Display-safety layer controls (design §8).
+    if (server.hasArg("policy")) {
+        rgnPolicyOn = strcmp(server.arg("policy").c_str(), "off") != 0;
+        DevLog.printf("[diag] region policy %s\n", rgnPolicyOn ? "on" : "off");
+    }
+    if (server.hasArg("clean")) {
+        forceCleanRefresh = server.arg("clean").toInt() != 0;
+        if (forceCleanRefresh) renderCurrent();
+    }
+    if (server.hasArg("busy_fail")) {
+        rtcEpdBusyFails++;
+        epdBaselineTrusted = false;
+        DevLog.println("[diag] injected display failure: baseline untrusted");
+    }
+    if (server.hasArg("rgn")) {
+        JsonDocument doc;
+        JsonArray arr = doc.to<JsonArray>();
+        for (uint8_t i = 0; i < rgnSet.n; i++) {
+            Rgn &r = rgnSet.r[i];
+            JsonObject o = arr.add<JsonObject>();
+            o["cls"] = rgnClassName(r.cls);
+            o["hi"] = r.highInk;
+            o["x0"] = r.px0; o["x1"] = r.px1; o["y0"] = r.py0; o["y1"] = r.py1;
+            o["bx0"] = r.x0b; o["bx1"] = r.x1b;
+            o["area"] = r.area;
+            o["changed"] = r.changed; o["w2b"] = r.w2b; o["b2w"] = r.b2w;
+            o["bOld"] = r.bOld; o["bNew"] = r.bNew;
+            o["budget"] = r.budget; o["partials"] = r.partials; o["cumS"] = r.cumS;
+        }
+        String out;
+        serializeJson(doc, out);
+        server.send(200, "application/json", out);
+        return;
+    }
     // Debug: render the template as deep/light without sleeping (RAM only, not
     // persisted) so the sleep glyph can be inspected while the device is online.
     if (server.hasArg("render_mode")) {
@@ -2236,6 +2406,7 @@ static void handleDiag() {
                                           String((unsigned)rtcDeepOnUsb) + ", deep_now=" +
                                           String(deepNow ? 1 : 0) + ", tz=" + deviceTz +
                                           ", frame_capture=" + String((unsigned)rtcFrameCapture) +
+                                          ", rv2=" + String((unsigned)rv2Enabled) +
                                           "\n\n" + sleepDiagText());
 }
 
@@ -2406,6 +2577,21 @@ static void handleBleAuth(const String &json) {
     bleNotifyStatusQuiet(String("{\"ack\":\"auth\",\"ok\":true,\"token\":\"") + authToken + "\"}");
 }
 
+// v2 rendezvous control stub (design §5.1/§12.3). Stage 1 routes `rv:2`
+// frames here instead of the legacy template path and answers a bounded
+// NACK; the transaction layer arrives in stage 3 behind the same gate.
+static void handleBleV2Ctrl(const String &json) {
+    JsonDocument doc;
+    if (deserializeJson(doc, json)) {
+        bleNotifyStatusQuiet("{\"ack\":\"v2\",\"ok\":false,\"err\":\"malformed\"}");
+        return;
+    }
+    const char *op = doc["op"] | "";
+    DevLog.printf("[ble] v2 control op=%s enabled=%u (not implemented)\n",
+                  op, (unsigned)rv2Enabled);
+    bleNotifyStatusQuiet("{\"ack\":\"v2\",\"ok\":false,\"err\":\"not_ready\"}");
+}
+
 static void handleUpdatePage() {
     if (!requestAuthorized()) {
         server.send(401, "text/plain", "unauthorized: negotiate a token over BLE first");
@@ -2494,6 +2680,7 @@ static void enterBleOn(bool userInitiated) {
         bleSetHandlers(handleBleUsage, handleBleEndpoint);
         bleSetTemplateHandlers(tplXferHandleCtrl, tplXferHandleChunk, tplXferReset);
         bleSetAuthHandler(handleBleAuth);
+        bleSetV2Handler(handleBleV2Ctrl);
     }
     updateInfoExtra();
     if (!bleOn) {
@@ -2788,7 +2975,12 @@ static void startNormalMode(bool skipConnect = false) {
 
     // Deep wake: leave the sleep frame at once (Zzz gone) so BOOT has instant
     // feedback; Wi-Fi is not up yet, so the template keeps its icon hidden.
-    if (wokeFromDeep && rtcMode == MODE_LIGHT && (rtcDeepGlyph & 1)) renderCurrent();
+    // This first wake frame is a clean full baseline; a partial here can leave
+    // a Zzz ghost that reads as "still asleep".
+    if (wokeFromDeep && rtcMode == MODE_LIGHT && (rtcDeepGlyph & 1)) {
+        forceCleanRefresh = true;
+        renderCurrent();
+    }
 
     if (skipConnect && WiFi.status() == WL_CONNECTED) {
         // Deep pull already fast-connected: no scan, no second association.
@@ -2835,6 +3027,15 @@ static void startNormalMode(bool skipConnect = false) {
         if (wokeFromDeep && (rtcDeepGlyph & 1)) renderCurrent();
         if (plugged && !rtcDeepOnUsb && batteryPct > BLE_AUTO_PCT) enterBleOn(false);
         if (!deepWakePath && storeCount() > 0) tryWifiUsage();
+        // Cold boot: never leave the boot/connecting page up when the first
+        // pull failed. The cached usage (or the built-in status screen) is
+        // rendered once the link is up, so the panel is never stale. An
+        // identical frame costs no write (RFN_NONE).
+        if (!wokeFromDeep) renderCurrent();
+        // Cold boot: never leave the boot/connecting page up when the first
+        // pull failed. The cached usage (or the built-in status screen) is
+        // rendered once the link is up, so the panel is never stale.
+        if (!wokeFromDeep) renderCurrent();
         noteActivity(deepWakePath ? "deep-light" : "boot");
         sendAnnounce(bleOn);
     } else {
@@ -3075,6 +3276,17 @@ static int deepNetworkCycle() {
     lastChannel = "PULL";
 
     const char *mode = doc["mode"] | "deep";
+    // Decide the mode before rendering: leaving deep must be drawn as a light
+    // frame in the *same* full refresh that erases the Zzz glyph. Rendering
+    // the deep frame first and then a partial over it leaves a Zzz ghost that
+    // looks like the device is still asleep (design §3: the wake frame is a
+    // full baseline).
+    const bool toLight = !strcmp(mode, "light");
+    const bool leavingDeep = toLight && (rtcDeepGlyph & 1);
+    if (toLight) {
+        rtcMode = MODE_LIGHT;
+        persistMode();
+    }
     long ncs = doc["next_contact_s"] | 0L;
     if (ncs >= DEEP_CONTACT_MIN_S && ncs <= DEEP_CONTACT_MAX_S) {
         rtcNextContactS = (uint16_t)ncs;
@@ -3090,7 +3302,8 @@ static int deepNetworkCycle() {
     nvsStageMark(42);
 
     if (!frame || usageChanged || firstPull || activeTemplateChanged() ||
-        !clkPixelsValid || tzChanged || rtcClkPartials >= CLK_GHOST_LIMIT) {
+        !clkPixelsValid || tzChanged || rtcClkPartials >= CLK_GHOST_LIMIT ||
+        leavingDeep) {
         nvsStageMark(43);
         // setup() already ran epdBegin() on this boot (frame allocated); only
         // retry on OOM. A second full init used to re-enter
@@ -3098,6 +3311,11 @@ static int deepNetworkCycle() {
         // paramLock (taken once, never released) -- the 0.14.x battery hang.
         if (!frame) epdBegin(false);
         nvsStageMark(44);
+        // The clock budget path and the deep exit request a clean full
+        // waveform even when the pixels are unchanged (design §8.4).
+        if (rtcClkPartials >= CLK_GHOST_LIMIT || !epdBaselineTrusted || leavingDeep) {
+            forceCleanRefresh = true;
+        }
         renderActiveUsage(body, "PULL");
         nvsStageMark(45);
         clkCaptureFromFramebuffer();
@@ -3116,9 +3334,7 @@ static int deepNetworkCycle() {
                   pendingOta ? 1 : 0, pendingTpl, (unsigned)batteryPercent(),
                   (long long)(before ? (long long)(time(nullptr) - before) : 0));
 
-    if (!strcmp(mode, "light")) {
-        rtcMode = MODE_LIGHT;
-        persistMode();
+    if (toLight) {
         setStage(14);
         histAdd(HIST_TO_LIGHT, 0);
         return 1;
@@ -3398,6 +3614,7 @@ void setup() {
         Preferences p;
         p.begin("pm", true);
         nvsStageAtBoot = p.getUChar("stg", 0xFF);
+        rv2Enabled = p.getUChar("rv2", 0) ? 1 : 0;
         String tz = p.getString("tz", "");
         if (tz.length() && tz.length() < (int)sizeof(deviceTz)) {
             strncpy(deviceTz, tz.c_str(), sizeof(deviceTz) - 1);
@@ -3447,6 +3664,7 @@ void setup() {
         rtcApBssid[0] = 0;
         rtcApSlot = 0xFF;
         rtcClkPartials = 0;
+        rtcEpdBusyFails = 0;
         rtcTplActiveId[0] = 0;
         rtcTplHash[0] = 0;
         clkR.valid = false;
@@ -3795,8 +4013,13 @@ void loop() {
                     clkTestTick();
 #else
                     // Direct window write (v0.14): ~796 ms vs ~864 ms for a full
-                    // re-render; a full render every 30 partials clears ghosting.
-                    if (epdPartialCount >= 30 || !clockTickWake()) {
+                    // re-render; a full re-render every 30 partials clears
+                    // ghosting, and the clean request bypasses the identical-
+                    // frame early return (design §8.4).
+                    if (epdPartialCount >= 30) {
+                        forceCleanRefresh = true;
+                        renderCurrent();
+                    } else if (!clockTickWake()) {
                         renderCurrent();
                     }
 #endif

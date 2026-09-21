@@ -10,6 +10,7 @@ static TemplateCtrlHandler tplCtrlHandler  = nullptr;
 static TemplateDataHandler tplDataHandler  = nullptr;
 static TemplateResetHandler tplResetHandler = nullptr;
 static AuthJsonHandler     authHandler     = nullptr;
+static V2CtrlHandler       v2CtrlHandler   = nullptr;
 
 static bool     connected      = false;
 static bool     peerBonded     = false;
@@ -100,6 +101,27 @@ static bool writeAllowed(PeerRef peer) {
     if (peer.secure()) return true;
     DevLog.println("[ble] rejected unencrypted or unbonded write");
     return false;
+}
+
+// v2 compatibility split (design §5.1): only a control JSON that explicitly
+// declares `rv>=2` goes to the rendezvous handler; everything else keeps the
+// legacy template transfer path byte-for-byte. With no v2 handler registered
+// (stage 1/2) the frame gets a bounded NACK instead of an old-path parse.
+static void dispatchTemplateCtrl(const String &json) {
+    JsonDocument doc;
+    if (deserializeJson(doc, json) == DeserializationError::Ok) {
+        int rv = doc["rv"] | 0;
+        if (rv >= 2) {
+            if (v2CtrlHandler) {
+                v2CtrlHandler(json);
+            } else {
+                DevLog.println("[ble] v2 control rejected: handler not ready");
+                bleNotifyStatusQuiet("{\"ack\":\"v2\",\"ok\":false,\"err\":\"not_ready\"}");
+            }
+            return;
+        }
+    }
+    if (tplCtrlHandler) tplCtrlHandler(json);
 }
 
 static bool appendJson(String &buf, const std::string &value, size_t limit,
@@ -240,7 +262,7 @@ class TplCtrlCallbacks : public NimBLECharacteristicCallbacks {
         if (!writeAllowed(desc)) return;
         std::string v = c->getValue();
         appendJson(tplCtrlBuf, v, 512, "template-control",
-                   [](const String &json) { if (tplCtrlHandler) tplCtrlHandler(json); });
+                   [](const String &json) { dispatchTemplateCtrl(json); });
     }
 };
 
@@ -384,6 +406,10 @@ void bleSetTemplateHandlers(TemplateCtrlHandler onCtrl, TemplateDataHandler onDa
 
 void bleSetAuthHandler(AuthJsonHandler onAuth) {
     authHandler = onAuth;
+}
+
+void bleSetV2Handler(V2CtrlHandler onV2) {
+    v2CtrlHandler = onV2;
 }
 
 void bleSetInfoExtra(const String &json) {

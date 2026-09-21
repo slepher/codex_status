@@ -35,6 +35,22 @@ restored and the device returns to deep within the bounded timeout. The
 does not need the v2 BLE protocol: it is implemented ahead of it as a
 firmware + template change (task-2, revised by task-3).
 
+## Additional requirements (2026-09-21): cold-boot cached template + Wi-Fi blink
+
+Documented in `task-10.md`; **documentation only, implementation deferred to a
+new window**:
+
+1. Cold boot with a cached usage snapshot must render the active template
+   immediately (state `WIFI OFF`, Wi-Fi icon hidden) without the
+   `Connecting:` page; the Wi-Fi icon appears with one partial update after
+   the connection succeeds, and a failed connect keeps the template with
+   bounded retry/deep behavior.
+2. While connecting, the Wi-Fi icon blinks at ~1 Hz until connect (steady on)
+   or failure/timeout (hidden). Template-driven implementation (likely a new
+   state value or bind, quad v12 + three-end hash sync); partial/window
+   updates only; power cost must be measured and the period/duration decided
+   before shipping.
+
 ## Acceptance
 
 - Every wake path has a bounded timeout and deterministic return to deep sleep.

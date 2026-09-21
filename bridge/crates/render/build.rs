@@ -41,6 +41,7 @@ fn main() {
         .warnings(false)
         .flag_if_supported("/utf-8")
         .file(firmware.join("template_engine.cpp"))
+        .file(firmware.join("refresh_policy.cpp"))
         .file(firmware.join("GUI_Paint.cpp"))
         .file(&ffi);
     for name in ["font8", "font12", "font16", "font20", "font24"] {
@@ -48,7 +49,8 @@ fn main() {
     }
     build.compile("bridge_render");
 
-    for tracked in ["template_engine.cpp", "template_engine.h", "GUI_Paint.cpp", "GUI_Paint.h"] {
+    for tracked in ["template_engine.cpp", "template_engine.h", "GUI_Paint.cpp",
+                    "GUI_Paint.h", "refresh_policy.cpp", "refresh_policy.h"] {
         println!("cargo:rerun-if-changed={}", firmware.join(tracked).display());
     }
     println!("cargo:rerun-if-changed={}", ffi.display());
