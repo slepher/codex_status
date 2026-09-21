@@ -45,6 +45,23 @@
       "h": 16,
       "type": "icon",
       "w": 16,
+      "when": {
+        "bind": "device.state",
+        "equals": "BLE OFF"
+      },
+      "x": 121,
+      "y": 6
+    },
+    {
+      "bits": "AAADwB/4cA7AA4PBH/g4HCAEA8AH4AAAAAABgAGAAAA=",
+      "color": "black",
+      "h": 16,
+      "type": "icon",
+      "w": 16,
+      "when": {
+        "bind": "device.state",
+        "equals": "BLE ON"
+      },
       "x": 121,
       "y": 6
     },
@@ -55,19 +72,6 @@
       "type": "icon",
       "w": 16,
       "x": 141,
-      "y": 6
-    },
-    {
-      "bits": "AAABgB/4cY7Bg4GBHbg5nCGEAAAAAAAAAAABgAGAAAA=",
-      "color": "black",
-      "h": 16,
-      "type": "icon",
-      "w": 16,
-      "when": {
-        "bind": "device.state",
-        "equals": "WIFI OFF"
-      },
-      "x": 121,
       "y": 6
     },
     {
@@ -452,5 +456,5 @@
   "id": "quad",
   "min_fw": "0.14",
   "schema": 1,
-  "version": 10
+  "version": 11
 }

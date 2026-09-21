@@ -20,10 +20,11 @@ fn hashes_match_python_test_bridge() {
     assert_eq!(full.version, 3);
     assert_eq!(mini.version, 2);
     let quad = library.get("quad").expect("quad template");
-    assert_eq!(quad.version, 10);
+    assert_eq!(quad.version, 11);
     assert_eq!(quad.min_fw.as_deref(), Some("0.14"));
-    // v0.14 adds the device.mode sleep glyph to the quad layout.
-    assert_eq!(quad.hash, "86a51357");
+    // v11 gates the Wi-Fi icon on device.state (BLE ON/OFF) so deep/connecting
+    // frames show no Wi-Fi icon (v0.14 added the device.mode sleep glyph).
+    assert_eq!(quad.hash, "93199731");
 }
 
 #[test]

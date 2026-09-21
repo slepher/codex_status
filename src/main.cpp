@@ -53,7 +53,7 @@
 #elif defined(CODEX_CLK_WINDOW_TEST)
 #define FW_VERSION    "0.13.9-clkwin"
 #else
-#define FW_VERSION    "0.15.0-bw"
+#define FW_VERSION    "0.15.2-bw"
 #endif
 #define AP_PASSWORD   "codex1234"
 #define MAX_SLOTS     3
@@ -230,6 +230,7 @@ static time_t   lastActivityEpoch = 0;
 static uint32_t forceDeepAtMs = 0;
 static uint32_t pendingWindowUntilMs = 0;
 static bool     deepWakePath = false;      // setup(): this boot is a deep pull
+static bool     wokeFromDeep = false;      // setup(): deep wake; panel holds the sleep frame
 static bool     panelThinReady = false;    // epdThinBegin() ran on this boot
 
 // v0.12 runtime state (docs/power-state.md §3-§6)
@@ -1214,6 +1215,17 @@ static void renderCurrent() {
     else screenStatus();
 }
 
+// Put the sleep frame back without entering deep: used when a wake render
+// already removed Zzz but the link never came up, so the panel does not sit on
+// a stale light frame. Full baseline for the sleep glyph (see enterDeep/0.14.13).
+static void renderSleepGlyph() {
+    uint8_t saved = rtcMode;
+    rtcMode = MODE_DEEP;
+    epdPartialReady = false;
+    renderCurrent();
+    rtcMode = saved;
+}
+
 static void nextTemplate() {
     int n = tplStoreCount();
     if (n <= 0) return;
@@ -1610,7 +1622,7 @@ static bool hasWifiSlots() { return countWifiSlots() > 0; }
 // Scan once and connect to the saved slot with the best signal; the last-used
 // slot wins near-ties. When no saved network is visible, fall back to the
 // last-used slot so the 60 s retry cadence has credentials to retry with.
-static bool connectBest() {
+static bool connectBest(bool showProgress = true) {
     WiFi.mode(WIFI_STA);
     WiFi.setHostname(hostname.c_str());
     int n = WiFi.scanNetworks();
@@ -1659,7 +1671,7 @@ static bool connectBest() {
     wifiPass = prefs.getString(("p" + String(bestSlot)).c_str(), "");
     prefs.end();
     if (!wifiSsid.length()) return false;
-    screen({"CODEX STATUS", FW_VERSION, "", "Connecting:", wifiSsid});
+    if (showProgress) screen({"CODEX STATUS", FW_VERSION, "", "Connecting:", wifiSsid});
     DevLog.printf("[wifi] slot %d (%s) rssi=%d\n", bestSlot, wifiSsid.c_str(), bestRssi);
     WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
     uint32_t t0 = millis();
@@ -2774,11 +2786,15 @@ static void startNormalMode(bool skipConnect = false) {
     setupOtaPmLock();
     announceUdp.begin(0);
 
+    // Deep wake: leave the sleep frame at once (Zzz gone) so BOOT has instant
+    // feedback; Wi-Fi is not up yet, so the template keeps its icon hidden.
+    if (wokeFromDeep && rtcMode == MODE_LIGHT && (rtcDeepGlyph & 1)) renderCurrent();
+
     if (skipConnect && WiFi.status() == WL_CONNECTED) {
         // Deep pull already fast-connected: no scan, no second association.
         wifiUp = true;
     } else {
-        wifiUp = connectBest();
+        wifiUp = connectBest(!wokeFromDeep);
     }
     registerHttpRoutes();
     server.begin();
@@ -2813,6 +2829,10 @@ static void startNormalMode(bool skipConnect = false) {
         // (option 12) set by WiFi.setHostname still shows in the router.
         ArduinoOTA.setMdnsEnabled(false);
         ArduinoOTA.begin();
+        // Wi-Fi is up: render again so the Wi-Fi icon appears (the wake render
+        // drew the template while the state was still WIFI OFF). rtcDeepGlyph
+        // bit0 = the last deep entry actually drew the sleep glyph.
+        if (wokeFromDeep && (rtcDeepGlyph & 1)) renderCurrent();
         if (plugged && !rtcDeepOnUsb && batteryPct > BLE_AUTO_PCT) enterBleOn(false);
         if (!deepWakePath && storeCount() > 0) tryWifiUsage();
         noteActivity(deepWakePath ? "deep-light" : "boot");
@@ -2828,6 +2848,10 @@ static void startNormalMode(bool skipConnect = false) {
             if (rtcRetryStage < 7) rtcRetryStage++;
             DevLog.printf("[wifi] no link at boot (battery): deep sleep %us stage=%u\n",
                           (unsigned)delaySec, (unsigned)rtcRetryStage);
+            // The wake render already replaced the sleep frame; put it back
+            // before returning to deep so the panel does not sit on a stale
+            // light frame (full baseline, same reason as enterDeep).
+            if (wokeFromDeep && rtcMode == MODE_LIGHT && (rtcDeepGlyph & 1)) renderSleepGlyph();
             rtcNextNetAt = timeKnown() ? (uint32_t)time(nullptr) + delaySec : 0;
             sleepToNextEvent();
         }
@@ -3448,6 +3472,9 @@ void setup() {
     }
     if (plugged && !rtcDeepOnUsb) rtcMode = MODE_LIGHT;
     deepWakePath = deepTimerBoot;
+    // Any wake from deep wakes up on top of the sleep glyph: connect silently
+    // and replace it as soon as the wake render runs (docs/ble-rendezvous-power-design §3).
+    wokeFromDeep = woke;
 
     const esp_partition_t *running = esp_ota_get_running_partition();
     DevLog.printf("\n[codex-status] v%s mac=%s reset=%s slot=%s wake=%d(%s) usb=%d deepusb=%d mode=%s\n",

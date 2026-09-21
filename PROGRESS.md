@@ -1,5 +1,73 @@
 # Codex Status 项目进度（交接文档）
 
+## 最新状态：2026-09-21 — 0.15.2 + quad v11：唤醒流程改版（先清 Zzz，Wi-Fi 图标随连接显示）
+
+- **需求（用户修订）**：睡眠模式不显示 Wi-Fi 图标（未连接）；按 BOOT 先立即
+  取消 Zzz，连接成功后显示 Wi-Fi 图标；进 deep 时 Wi-Fi 图标消失。取代 0.15.1
+  的“保留 Zzz 到连上”流程；`Connecting:` 页仍只在冷启动/配网出现。
+- **实现**：
+  - 固件 `src/main.cpp`（0.15.2-bw）：`wokeFromDeep` 取代 `keepSleepImage`；
+    deep 唤醒后先渲染正常模板（Wi-Fi 未连，`state=WIFI OFF`，图标隐藏），
+    Wi-Fi 连上后重渲一帧显示图标（相对唤醒全刷的局刷）；电池失败退避路径在
+    回 deep 前用 `renderSleepGlyph()` 恢复睡眠帧（全刷基线）。
+  - 模板 `quad` v10→v11：Wi-Fi 图标 (121,6) 改为按 `device.state` 条件绘制
+    （`BLE OFF`/`BLE ON`），删除划叉 Wi-Fi 图标；seed hash `93199731`。
+- **验证**：
+  - `pio run`、`node tools/test-quad-preview.mjs`、`cargo test -p bridge-core
+    --test template`（已更新 quad v11/93199731）全部通过。
+  - 真机：OTA `0.15.1-bw -> 0.15.2-bw`，`profile_push default` 推送 quad v11；
+    `/diag?render_mode=light` + `GET /frame?which=last` → Wi-Fi 格 62 黑像素；
+    `render_mode=deep` → 该格 0 黑像素、Zzz 格 39 黑像素（图标随状态正确）。
+- **ROM**：`artifacts/codex-status-0.15.2-bw.bin`（1629696 B，SHA256
+  `D20BBFEF10D0C47E64BAFFA5FFF70F81BE90575D29DAD66BD851C78C2CF0FCA`）。
+- **现场验证（用户按 BOOT，通过）**：桥侧 debug deep 下 `/history` seq8
+  `enter-deep(aux=60)` → seq11 `boot aux=3`（EXT1 按键）→ seq12 `to-light
+  aux=1`；本次 boot `epd_writes=3`（唤醒清 Zzz 全刷 + 连上显 Wi-Fi 图标局刷
+  + usage 渲染）、`deep.glyph=5`（睡前 Zzz 已渲染）。用户确认新时序符合要求：
+  按下先清 Zzz、无 Connecting 页，连上后 Wi-Fi 图标出现。
+- **待办**：失败路径（AP/桥不可达 → 恢复 Zzz 回 deep）可断 AP 验证；提交前整理
+  （未提交）。桥 debug deep 已清回 auto。
+
+## 最新状态：2026-09-21 — 0.15.1：静默唤醒（BOOT 保留 Zzz，连上 Wi-Fi 再消）
+
+- **需求（用户）**：深睡时按 BOOT 不再跳全屏 `Connecting: <SSID>` 页；Wi-Fi 关联
+  期间面板保留睡眠 Zzz，连接成功后首帧正常渲染清除 Zzz；失败/超时保持 Zzz 并
+  有界回 deep。冷启动/配网仍显示连接页。已同步进
+  `docs/ble-rendezvous-power-design.md` §3（状态机图、建连超时行、§13 静默唤醒
+  测试行）、`project-workflow/ble-rendezvous-power/plan.md` 与 `task-2.md`。
+- **实现（`src/main.cpp`）**：`keepSleepImage = woke`（任何 deep 唤醒：BOOT/PWR
+  与失败退避的定时重试）；`connectBest(showProgress)` 在唤醒路径跳过连接页；
+  `startNormalMode()` 在 Wi-Fi 连上后按 `rtcDeepGlyph & 1` 调一次
+  `renderCurrent()` 清 Zzz（唤醒后首帧本就是全刷基线，不基于保留图像局刷）。
+- **ROM/部署**：`artifacts/codex-status-0.15.1-bw.bin`（1629616 B，SHA256
+  `5F1F81A6941229476A194BBED9B09FBCBAD2F9294E59E853BB71E94FCB3E2D52`）；
+  已 OTA `0.15.0-bw -> 0.15.1-bw`（现运行 ota_0），设备 light 在线、quad 正常。
+- **现场验证（用户按 BOOT，通过）**：`/history` seq5 `boot aux=3`（EXT1 按键）
+  → seq6 `to-light aux=1`；`deep.glyph=5`（睡前 Zzz 已渲染，bit0+bit2）；唤醒后
+  `epd_writes=1`（只有“连上后清 Zzz”的首帧全刷；若仍画 Connecting 页应为 2 次），
+  `/status.json` `wake=ext1`、`mode=light`、RSSI −37、Web/桥连接正常。用户现场
+  确认：无 Connecting 页、连上后 Zzz 消失。
+- **待办**：失败路径（AP/桥不可达时保持 Zzz 并按退避回 deep）可另行断 AP 验证；
+  提交前整理（本改动未提交）。
+
+## 最新状态：2026-09-21 — BLE 分钟会合 + 大黑块刷新目标设计完成（未实现）
+
+- 新增 `docs/ble-rendezvous-power-design.md`：目标架构把电池 deep 模式的每分钟
+  Wi-Fi pull 改为“时钟窗口局刷 → 短 BLE 会合”。会合三分支为：无指令直接
+  deep、BLE 原子下发小型 usage 后 ACK/deep、`WAKE_LIGHT(lease_s)` 后关闭 BLE
+  并进入有期限的 Wi-Fi light 会话。
+- BOOT 唤醒目标缺省 light lease 300s；仅显式 `RENEW_LIGHT` 续租，普通状态读取、
+  claim、相同 revision 和数据传输不隐式延长；模板、OTA、大包及持续交互才升
+  Wi-Fi。保持 `POST /claim` 为唯一 owner 创建/转移入口，token/绑定规则不放宽。
+- 大黑块不再只按全帧 changed-bit 比例判断：目标方案按语义区域、黑白转换方向、
+  黑像素占比和独立 ghost budget 决定窗口局刷或全刷；高墨量区初始保守预算4次，
+  基线不可信/反相/大量擦黑直接全刷。阈值均待照片、低温和功耗实测校准。
+- 文档明确区分现行0.15.0与目标方案；广播1–2s、事务/lease期限、RTC容量、BLE
+  能耗均为待测建议，不是已验证结果。复用现有GATT表优先，避免Windows缓存导致
+  重新配对。
+- 本里程碑仅文档：没有修改固件/桥、没有部署或改变现场运行状态；工作流与后续
+  阶段见 `project-workflow/ble-rendezvous-power/`。
+
 ## 最新状态：2026-09-21 凌晨二 — 0.15.0：时钟/时区随 PC + 深睡切换历史 + P2 端到端过半
 
 - **现场**：设备 `0.15.0-bw`（ota_1，USB 插电，light/deep 测试中，`tz=UTC-8:00`）；

@@ -280,7 +280,10 @@ DevLog/`/log`），用于证明 light sleep 生效。0.13.0 起同一文本也�
   宽限"判离线。
 - **手动唤醒**：deep 下 BOOT 单击 → light（不常驻，走同一 idle 规则）；再次
   单击 → BLE 会话（`enterBleOn`）；关 BLE 后仍留 light。桥从 announce/pull
-  得知设备醒来并重置 idle 计时。
+  得知设备醒来并重置 idle 计时。0.15.2 起唤醒流程：不显示 `Connecting:` 页，
+  唤醒立即以正常模板替换 Zzz；Wi-Fi 图标由模板按 `device.state` 条件仅在连上
+  后显示，进 deep 时 Zzz 恢复、Wi-Fi 图标消失；连接失败先恢复睡眠帧再按退避
+  回 deep（quad v11）。
 - **自适应拉取**：桥可达时恒为 `next_contact_s=60`（升 light 延迟 ≤1min；
   deep 期间同样按分钟接触）。`1m×3 → 5m×3 → 15m` 只用于**设备侧连不上
   Wi‑Fi/桥的失败退避**（`retryDelaySec`，成功后复位），不是桥的"安静期"决策。
