@@ -446,6 +446,9 @@ function generate() {
   const offlineEnv = { ...env, state: 'WIFI OFF', offline_mins: 138 };
   writePreview(template, usageFixture({ fiveHourUsed: 11 }), offlineEnv, 'quad-preview-offline.png');
   writePreview(template, usageFixture({ weeklyUsed: 91, fiveHourUsed: null }), { ...offlineEnv, battery: 21 }, 'quad-preview-offline-missing-5h.png');
+  // task-10 B: blink-on phase while associating (Wi-Fi icon visible, crossed
+  // link overlay steady); the WIFI OFF fixture above is the blink-off phase.
+  writePreview(template, usageFixture({ fiveHourUsed: 11 }), { ...env, state: 'WIFI CONN' }, 'quad-preview-conn.png');
   writePreview(template, usageFixture({ weeklyUsed: 12, weeklyMins: 43200, fiveHourUsed: null, plan: 'free' }), env, 'quad-preview-monthly.png');
   const deepEnv = { ...env, state: 'DEEP', mode: 'deep' };
   writePreview(template, usageFixture({ fiveHourUsed: 11 }), deepEnv, 'quad-preview-deep.png');

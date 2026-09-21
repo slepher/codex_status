@@ -1756,6 +1756,7 @@ async fn run_services(ctx: Arc<AppCtx>) {
             let mut last_ok: u64 = 0;
             let mut last_gate: u64 = 0;
             let mut last_contact_gen = ctx.activity.contact_generation();
+            let mut last_mode: Option<&'static str> = None;
             let mut deep_skip_logged = false;
             loop {
                 // Check the fingerprint every 3 s so an envelope change reaches
@@ -1775,6 +1776,13 @@ async fn run_services(ctx: Arc<AppCtx>) {
                 let contact_gen = ctx.activity.contact_generation();
                 let contact_new = contact_gen != last_contact_gen;
                 last_contact_gen = contact_gen;
+                // Bridge-controlled sleep: the desired mode is the same
+                // quiet/dwell decision as the pull response. A light->deep
+                // transition pushes immediately instead of waiting for the
+                // 5-minute heartbeat, so the device sleeps on the bridge's
+                // schedule (design §13.4).
+                let mode_now = ctx.activity.mode_str();
+                let mode_changed = last_mode != Some(mode_now);
                 // Expected deep sleep: the device pulls on its own schedule and
                 // cannot receive pushes; do not count failures or alert.
                 if ctx.activity.expects_deep() && !forced && !contact_new {
@@ -1804,7 +1812,8 @@ async fn run_services(ctx: Arc<AppCtx>) {
                 let push_needed = forced
                     || contact_new
                     || fp != last_fp
-                    || now.saturating_sub(last_ok) >= 300;
+                    || now.saturating_sub(last_ok) >= 300
+                    || mode_changed;
                 if !push_needed && !recheck && !renew_due {
                     continue;
                 }
@@ -1830,8 +1839,9 @@ async fn run_services(ctx: Arc<AppCtx>) {
                     // Renewal/recheck only: no data changed, keep the heartbeat.
                     continue;
                 }
-                // Push envelope carries the mode decision (docs §13.4) so a
-                // device still in light mode can fall back to deep locally.
+                last_mode = Some(mode_now);
+                // Push envelope carries the mode decision (docs §13.4) so the
+                // device follows the bridge's quiet/dwell sleep schedule.
                 // `server_time`/`tz_offset_min` are stamped fresh here (the
                 // cached envelope's timestamp can be minutes old) so the device
                 // clock/timezone follow this PC on every push.
@@ -1844,7 +1854,7 @@ async fn run_services(ctx: Arc<AppCtx>) {
                     );
                     obj.insert(
                         "mode".to_string(),
-                        Value::String(ctx.activity.mode_str().to_string()),
+                        Value::String(mode_now.to_string()),
                     );
                     obj.insert(
                         "next_contact_s".to_string(),

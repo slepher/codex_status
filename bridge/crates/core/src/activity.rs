@@ -101,6 +101,26 @@ pub struct Activity {
     debug_mode: AtomicU8,
 }
 
+/// Bridge-side sleep intent (docs §13.4): pending work, an unexpired light
+/// dwell, or recent usage activity keep the device light; otherwise it should
+/// go deep. Shared by the pull response and the push envelope so the two
+/// channels cannot disagree.
+fn light_wanted(g: &Inner, now: i64, debug_mode: u8) -> bool {
+    if debug_mode == 1 {
+        return false;
+    }
+    if debug_mode == 2 {
+        return true;
+    }
+    let quiet = g.last_change_at.map(|t| now - t).unwrap_or(i64::MAX);
+    let light_dwell = g
+        .light_since
+        .map(|t| now - t < LIGHT_HOLD_S)
+        .unwrap_or(false);
+    let has_pending = !g.pending_templates.is_empty() || g.pending_ota;
+    has_pending || (!g.deep && light_dwell) || quiet < QUIET_DEEP_S
+}
+
 impl Default for Activity {
     fn default() -> Self {
         Self::new()
@@ -215,19 +235,9 @@ impl Activity {
         g.last_deep_at = None;
         g.device_usage_rev = device_usage_rev;
         let pending_templates = g.pending_templates.clone();
-        let has_pending = !pending_templates.is_empty() || g.pending_ota;
 
-        let quiet = g.last_change_at.map(|t| now - t).unwrap_or(i64::MAX);
-        let light_dwell = g
-            .light_since
-            .map(|t| now - t < LIGHT_HOLD_S)
-            .unwrap_or(false);
         let debug_mode = self.debug_mode.load(Ordering::SeqCst);
-        let stay_light = match debug_mode {
-            1 => false,   // debug: force deep
-            2 => true,    // debug: force light
-            _ => has_pending || (!g.deep && light_dwell) || quiet < QUIET_DEEP_S,
-        };
+        let stay_light = light_wanted(&g, now, debug_mode);
 
         if stay_light {
             if g.deep {
@@ -262,13 +272,20 @@ impl Activity {
         out
     }
 
-    /// Mode for the push envelope (informational; device applies a grace).
+    /// Mode for the push envelope (docs §13.4). Uses the same quiet/dwell
+    /// decision as the pull response: a light device gets `deep` after
+    /// `QUIET_DEEP_S` even though the bridge's own renewals and 10 s status
+    /// polls keep contacting it (contact is not activity). This is the
+    /// bridge-controlled sleep path; the device's local idle timer is only a
+    /// fallback.
     pub fn mode_str(&self) -> &'static str {
-        match self.debug_mode.load(Ordering::SeqCst) {
-            1 => "deep",
-            2 => "light",
-            _ if self.expects_deep() => "deep",
-            _ => "light",
+        let g = self.inner.lock().unwrap();
+        let now = now_secs();
+        let debug = self.debug_mode.load(Ordering::SeqCst);
+        if light_wanted(&g, now, debug) {
+            "light"
+        } else {
+            "deep"
         }
     }
 
@@ -393,6 +410,26 @@ mod tests {
         assert!(a.expects_deep());
         a.note_contact("pull");
         assert!(!a.expects_deep());
+    }
+
+    #[test]
+    fn push_mode_follows_quiet_not_contact() {
+        let a = Activity::new();
+        a.note_envelope(&json!({"buckets": []}));
+        assert_eq!(a.mode_str(), "light", "fresh activity keeps light");
+        {
+            let mut g = a.inner.lock().unwrap();
+            g.last_change_at = Some(now_secs() - QUIET_DEEP_S - 1);
+            g.light_since = Some(now_secs() - LIGHT_HOLD_S - 1);
+            g.deep = false;
+        }
+        // The bridge's own renewal/status contact must not extend light: the
+        // push envelope is the bridge-controlled sleep command.
+        a.note_contact("claim");
+        assert_eq!(a.mode_str(), "deep");
+        // Pending work forces light again.
+        a.queue_templates(vec!["quad".into()], None);
+        assert_eq!(a.mode_str(), "light");
     }
 
     #[test]

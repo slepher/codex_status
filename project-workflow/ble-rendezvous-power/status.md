@@ -103,3 +103,55 @@ implementation plan task-4..task-9 written (stages 1-6); stage 1 in progress
   and device token were fine; curl uploaded the ROM in 26 s). Stage 5
   actions: pending-OTA visibility, preflight settle, shorter bounded
   upload timeout, push/OTA serialization.
+- 2026-09-21: **task-10 implemented and verified** (firmware 0.15.9-bw,
+  quad v12, hash `430cc188`; ROM `artifacts/codex-status-0.15.9-bw.bin`,
+  1 644 256 B, SHA256
+  `47C641DF254449751DA6678F4503AA8276B527FCC3688DFABDA076024F9B8549`):
+  - A: cached cold boot renders the template before association
+    (`WIFI OFF`, no `Connecting:` page); one link-up partial lights the icon;
+    failed connect keeps the template with unchanged retry/deep.
+  - B: `device.state` blinks `WIFI CONN`/`WIFI OFF` at 1 Hz in `connectBest`;
+    blink ticks stay `partial`/`blink`, bypass the icon ghost budget and the
+    30-partial streak, and are bounded to a cold boot / BOOT wake (deep
+    retries use `deepFastConnect`, no blink). quad v12 adds the `WIFI CONN`
+    icons so only the Wi-Fi cell toggles.
+  - Double-frame fix: `wakeBaselineDrawn` stops the timer pull -> light path
+    from drawing the wake frame twice (verified in the boot log: one full +
+    one partial).
+  - Measured via `/diag?blink_test=30`: avg 870 ms/tick, worst 875 ms,
+    waveform avg 829 ms; 30/30 partials, budgets untouched. Decision: keep
+    1 Hz (worst case <=30 ticks per failed boot ~= 0.4 mAh by the design
+    §9 model); `/diag?blink_ms=N` tunes or disables the phase at runtime.
+  - Intermediate 0.15.8-bw (ROM
+    `artifacts/codex-status-0.15.8-bw.bin`, SHA256
+    `FFECE66BF1062926CD18BAD27127F1FFA74CCF129CC3F7572237FBA8B0CD5006`)
+    was flashed for the first measurement round, then superseded by the
+    `blinkAllowed` baseline guard in 0.15.9.
+  - Still user/physical: BOOT-press blink check, no-AP failure run, and the
+    photo gate for stage 2 (unrelated to this task).
+  - Tests: `pio run`; `node tools/test-quad-preview.mjs` (blink assertions
+    added); `cargo test -p bridge-core --test template` (quad v12 hash);
+    `cargo test -p bridge-render --test policy`;
+    `cargo test --workspace` (isolated target dir); `git diff --check` clean.
+- 2026-09-21: **"never sleeps in light" fixed** (firmware 0.15.10-bw + bridge):
+  - Cause: the bridge renews the owner lease every 60 s and the device counted
+    a renew as activity (`noteActivity("claim")`), so the 600 s local idle
+    never fired; the 5-minute heartbeat push did the same. On the bridge side
+    the push `mode_str()` used `expects_deep()` (quiet>=600 s && silent>=120 s)
+    but the 10 s `/status.json` poll and the renewals counted as contact, so
+    every push carried `mode:"light"` — no light->deep path existed.
+  - Firmware: renew no longer resets the idle timer (new claim only); the
+    `/usage` push resets it only when `usage_rev` changed (missing rev =
+    conservative change). Design §6 ("claim/续 owner 不能续 light").
+  - Bridge: `activity.rs::light_wanted()` is shared by the pull response and
+    the push `mode_str()`; the push loop pushes immediately on a mode change
+    (`mode_changed`), so the bridge commands deep after light dwell
+    (300 s) + quiet (600 s) without waiting for the 5-minute heartbeat.
+  - Verified: with renews and heartbeats flowing, `idle_s` climbed to 600 and
+    the device slept on its own; with `/diag?idle_deep_s=3600` (rule out the
+    local fallback) the bridge's mode flip still put it to deep ~60 s later.
+    Bridge restarted watchdog-first (new PID 6392 + watchdog 42604).
+  - ROM `artifacts/codex-status-0.15.10-bw.bin` (1 644 320 B, SHA256
+    `79B0412320C08CDB297FB3141FB0B3B7831FEF1BD240B13BDD553E281EDCFCD0`);
+    `cargo test --workspace` green, new `push_mode_follows_quiet_not_contact`
+    unit test.

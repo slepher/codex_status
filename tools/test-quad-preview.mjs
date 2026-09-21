@@ -96,10 +96,25 @@ const offlineBind = parseBind('device.offline_mins');
 assert.equal(bindResult(stateBind, usageFixture(), env).value, 'BLE OFF', 'state bind renders the wire state');
 assert.equal(bindResult(stateBind, usageFixture(), { ...env, state: '' }).exists, false, 'empty state hides');
 assert.equal(bindResult(stateBind, usageFixture(), { ...env, state: 'WIFI OFF' }).value, 'WIFI OFF', 'WIFI OFF state renders');
+assert.equal(bindResult(stateBind, usageFixture(), { ...env, state: 'WIFI CONN' }).value, 'WIFI CONN', 'WIFI CONN blink state renders');
 assert.equal(bindResult(offlineBind, usageFixture(), offlineEnv).value, 138, 'offline minutes bind renders its value');
 assert.equal(bindResult(offlineBind, usageFixture(), env).exists, false, 'unknown offline minutes hide');
 assert.equal(bindResult(offlineBind, usageFixture(), { ...offlineEnv, offline_mins: -1 }).exists, false, 'negative offline minutes hide');
 assert.equal(bindResult(offlineBind, usageFixture(), { ...offlineEnv, offline_mins: 0 }).exists, true, 'zero is a valid value (device policy gates bridge-loss display)');
+const wifiOff = render(template, usageFixture({ fiveHourUsed: 11 }), { ...env, state: 'WIFI OFF' });
+const wifiConn = render(template, usageFixture({ fiveHourUsed: 11 }), { ...env, state: 'WIFI CONN' });
+const cellSlice = (raster, x, y) => {
+  const out = [];
+  for (let row = y; row < y + 16; row += 1) {
+    for (let col = x; col < x + 16; col += 1) out.push(raster.pixels[row * WIDTH + col]);
+  }
+  return out;
+};
+assert.equal(countColor(wifiOff, 121, 6, 16, 16, 0), 0, 'blink-off phase hides the Wi-Fi icon');
+assert.ok(countColor(wifiConn, 121, 6, 16, 16, 0) > 0, 'blink-on phase draws the Wi-Fi icon');
+assert.deepEqual(cellSlice(wifiConn, 141, 6), cellSlice(wifiOff, 141, 6), 'crossed link overlay stays steady while blinking');
+assert.notDeepEqual(cellSlice(wifiConn, 121, 6), cellSlice(wifiOff, 121, 6), 'blink toggles only the Wi-Fi icon cell');
+assert.deepEqual(cellSlice(wifiConn, 4, 4), cellSlice(wifiOff, 4, 4), 'blink leaves the usage tiles untouched');
 const modeBind = parseBind('device.mode');
 assert.equal(modeBind?.kind, 'device.mode', 'device.mode is a known bind');
 assert.equal(bindResult(modeBind, usageFixture(), env).value, 'light', 'preview defaults to light mode');

@@ -54,7 +54,7 @@
 #elif defined(CODEX_CLK_WINDOW_TEST)
 #define FW_VERSION    "0.13.9-clkwin"
 #else
-#define FW_VERSION    "0.15.7-bw"
+#define FW_VERSION    "0.15.10-bw"
 #endif
 #define AP_PASSWORD   "codex1234"
 #define MAX_SLOTS     3
@@ -66,6 +66,7 @@ static const int EPD_FB_BYTES = (EPD_W / 8) * EPD_H;
 #define ACTIVE_HOLD_S    600
 #define CONFIG_IDLE_MS   (5UL * 60UL * 1000UL)   // AP idle sleep (battery)
 #define WIFI_CONNECT_MS  30000UL                 // boot connect attempt
+#define WIFI_BLINK_MS    1000UL                  // Wi-Fi icon phase while connecting
 #define WIFI_LOST_MS     30000UL                 // link-loss declaration
 #define WIFI_RETRY_MS    60000UL                 // plugged retry cadence
 #define BLE_GRACE_MS     120000UL                // BLE keep-alive after last use
@@ -233,6 +234,16 @@ static uint32_t pendingWindowUntilMs = 0;
 static bool     deepWakePath = false;      // setup(): this boot is a deep pull
 static bool     wokeFromDeep = false;      // setup(): deep wake; panel holds the sleep frame
 static bool     panelThinReady = false;    // epdThinBegin() ran on this boot
+
+// task-10 B: the Wi-Fi icon blinks while a boot connect attempt is running.
+// `wifiConnActive` switches the template state to WIFI CONN (blink on) /
+// WIFI OFF (blink off); `rfnBlink` marks a blink tick so epdFlush keeps it a
+// partial waveform and does not consume the region ghost budget.
+static bool     wifiConnActive = false;
+static bool     wifiBlinkOn = false;
+static uint16_t wifiBlinkMs = WIFI_BLINK_MS;
+static uint32_t blinkTicks = 0;
+static bool     rfnBlink = false;
 
 // BLE rendezvous protocol v2 gate (design §10). Default 0 = legacy path only;
 // persisted in NVS `pm/rv2` so a rollback survives OTA/reboot and can be
@@ -454,6 +465,15 @@ static const char *deviceStateText() {
     return "BLE OFF";
 }
 
+// Template-visible state. While a boot connect attempt is running the Wi-Fi
+// icon cell blinks at ~1 Hz (task-10 B): `WIFI CONN` is the visible phase and
+// `WIFI OFF` the hidden one. The template can gate the icon on WIFI CONN and
+// keep the crossed-link overlay steady on both values.
+static const char *templateStateText() {
+    if (wifiConnActive) return wifiBlinkOn ? "WIFI CONN" : "WIFI OFF";
+    return deviceStateText();
+}
+
 static const char *wifiStateText() {
     if (configMode) return "ap";
     if (wifiUp)     return "connected";
@@ -602,6 +622,11 @@ static String   rfnKind = "init";
 static String   rfnReason = "init";
 static uint16_t rfnDirty = 0;
 static bool     forceCleanRefresh = false;
+static uint16_t rfnLastMs = 0;       // duration of the last epdFlush waveform
+// task-10 known issue: the timer pull path draws the wake frame inside
+// deepNetworkCycle and startNormalMode drew it a second time (two full
+// flashes). Set when the deep pull already removed the sleep glyph.
+static bool     wakeBaselineDrawn = false;
 
 static void screen(const std::vector<String> &lines, UBYTE color = BLACK);
 static void epdFlush(bool forceFull = false);
@@ -817,14 +842,24 @@ static void epdPanelSleep() {
 // the photo gate passes. `rgnPolicyOn=false` keeps the legacy rule at runtime.
 static void epdFlush(bool forceFull) {
     if (!frame) return;
+    const bool blink = rfnBlink;
+    rfnBlink = false;
+    const uint32_t flushT0 = millis();
 
     RfnDecision d;
     if (rgnPolicyOn) {
         d = rgnDecide(rgnSet, lastDisplayedFrame, frame,
                       epdBaselineTrusted, forceFull, forceCleanRefresh);
         forceCleanRefresh = false;
+        // Blink ticks must never flash a full waveform (task-10 B): the icon
+        // toggles are transient, so an exhausted icon ghost budget is the only
+        // full decision downgraded here. Any other full reason stays full.
+        if (blink && d.action == RFN_FULL && d.reason == RFNR_BUDGET && epdPartialReady) {
+            d.action = RFN_PARTIAL;
+            d.reason = RFNR_OK;
+        }
         rfnKind = rfnActionName(d.action);
-        rfnReason = rfnReasonName(d.reason);
+        rfnReason = (blink && d.action == RFN_PARTIAL) ? "blink" : rfnReasonName(d.reason);
         rfnDirty = d.dirty;
         rfnDecisions++;
         if (d.action == RFN_NONE) return;
@@ -840,21 +875,24 @@ static void epdFlush(bool forceFull) {
         }
         d.action = full ? RFN_FULL : RFN_PARTIAL;
         rfnKind = rfnActionName(d.action);
-        rfnReason = "legacy";
+        rfnReason = blink ? "blink" : "legacy";
         rfnDirty = 0;
     }
 
     bool partial = (d.action == RFN_PARTIAL) && epdPartialReady;
-    if (partial && ++epdPartialCount > 30) partial = false;
+    if (partial && !blink && ++epdPartialCount > 30) partial = false;
     if (partial) {
         bool ok = true;
         if (epdAsleep) ok = EPD_SSD1681_WakePartial(lastDisplayedFrame);
         if (ok) ok = EPD_SSD1681_DisplayPart(frame);
         if (ok) {
             epdWriteCount++;
-            if (rgnPolicyOn) rgnOnPartial(rgnSet);
+            if (blink) blinkTicks++;
+            if (rgnPolicyOn && !blink) rgnOnPartial(rgnSet);
             if (lastDisplayedFrame) memcpy(lastDisplayedFrame, frame, EPD_FB_BYTES);
             epdPanelSleep();
+            uint32_t elapsed = millis() - flushT0;
+            rfnLastMs = (uint16_t)(elapsed > 0xFFFF ? 0xFFFF : elapsed);
             return;
         }
         // Unknown waveform state: never keep the stale software baseline, and
@@ -895,6 +933,8 @@ static void epdFlush(bool forceFull) {
         DevLog.println("[epd] full refresh busy timeout; baseline untrusted");
     }
     epdPanelSleep();
+    uint32_t elapsed = millis() - flushT0;
+    rfnLastMs = (uint16_t)(elapsed > 0xFFFF ? 0xFFFF : elapsed);
 }
 
 // ---------------- clock window direct write (v0.14) ----------------
@@ -1300,7 +1340,7 @@ static void renderActiveUsage(const String &json, const char *channel) {
     env.ip       = ipText();
     env.syncHHMM = nowHHMM();
     env.battery  = batteryPercent();
-    env.state    = (rtcMode == MODE_DEEP) ? "DEEP" : deviceStateText();
+    env.state    = (rtcMode == MODE_DEEP) ? "DEEP" : templateStateText();
     env.mode     = (rtcMode == MODE_DEEP) ? "deep" : "light";
     env.offlineMins = -1;
     if (rtcLastSyncEpoch > 1600000000 && timeKnown()) {
@@ -1521,12 +1561,20 @@ static void handleUsagePost() {
     bool accepted = usageAccepted(mac, explicitActivate);
     markSynced();
     usageCacheSave(body);
+    // Heartbeat pushes repeat the same `usage_rev`; they must not reset the
+    // local 10-minute idle fallback (design §6), or the device could never go
+    // deep while the bridge keeps a 5-minute heartbeat. A missing rev (older
+    // bridge) is treated as a change to stay conservative.
+    bool hasRev = !parsed["usage_rev"].isNull();
+    uint32_t pushRev = (uint32_t)(parsed["usage_rev"] | 0L);
+    bool usageChanged = !hasRev || pushRev != rtcUsageRev;
+    if (hasRev) rtcUsageRev = pushRev;
     if (accepted) {
         setActiveMac(mac);
         rtcActiveAt = timeKnown() ? (uint32_t)time(nullptr) : 0;
         lastUsage = body;
         lastChannel = "PUSH";
-        noteActivity("push");
+        if (usageChanged) noteActivity("push");
         renderActiveUsage(lastUsage, "PUSH");
     } else {
         DevLog.printf("[wifi] push ignored (active=%s)\n", rtcActiveMac);
@@ -1786,10 +1834,35 @@ static bool connectBest(bool showProgress = true) {
     DevLog.printf("[wifi] slot %d (%s) rssi=%d\n", bestSlot, wifiSsid.c_str(), bestRssi);
     WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
     uint32_t t0 = millis();
+    uint32_t lastBlink = t0;
+    bool blinkDrew = false;
+    // task-10 B: blink the Wi-Fi icon cell while associating. Only when a
+    // template frame is actually on the panel and its baseline is usable (a
+    // cached usage + stored template, first frame already drawn); otherwise the
+    // Connecting/status page must not be disturbed and an untrusted baseline
+    // would turn every tick into a full flash.
+    const bool blinkAllowed = lastUsage.length() > 0 && epdPartialReady && epdBaselineTrusted;
+    if (blinkAllowed) {
+        wifiConnActive = true;
+        wifiBlinkOn = false;
+    }
     while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_CONNECT_MS) {
         delay(200);
+        if (blinkAllowed && wifiBlinkMs &&
+            (uint32_t)(millis() - lastBlink) >= wifiBlinkMs) {
+            lastBlink = millis();
+            wifiBlinkOn = !wifiBlinkOn;
+            rfnBlink = true;
+            renderCurrent();
+            blinkDrew = true;
+        }
         DevLog.print(".");
     }
+    wifiConnActive = false;
+    wifiBlinkOn = false;
+    // A failed attempt must not leave the last blink frame (icon visible) on
+    // the panel: settle on the real state, which hides the icon again.
+    if (blinkDrew && WiFi.status() != WL_CONNECTED) renderCurrent();
     DevLog.println();
     if (WiFi.status() != WL_CONNECTED) {
         DevLog.println("[wifi] connect timeout");
@@ -1992,6 +2065,11 @@ static void handleStatusJson() {
     doc["refresh_reason"] = rfnReason;
     doc["dirty_pixels"] = rfnDirty;
     doc["refresh_decisions"] = rfnDecisions;
+    doc["refresh_ms"] = rfnLastMs;
+    doc["blink_ms"] = wifiBlinkMs;
+    doc["blink_on"] = wifiBlinkOn;
+    doc["blink_ticks"] = blinkTicks;
+    doc["wifi_conn"] = wifiConnActive;
     doc["rgn"] = rgnSet.n;
     doc["rgn_whole"] = rgnSet.wholeFrame;
     doc["rgn_policy"] = rgnPolicyOn;
@@ -2344,6 +2422,50 @@ static void handleDiag() {
         epdBaselineTrusted = false;
         DevLog.println("[diag] injected display failure: baseline untrusted");
     }
+    // task-10 B measurement/ops knobs: `blink_ms` sets the connect-blink phase
+    // (0 disables), `blink_test=N` runs N blink ticks on the live template and
+    // reports the per-tick waveform cost so the shipped period is measured.
+    if (server.hasArg("blink_ms")) {
+        long v = server.arg("blink_ms").toInt();
+        if (v < 0 || v > 10000) {
+            server.send(400, "text/plain", "blink_ms out of range 0..10000");
+            return;
+        }
+        wifiBlinkMs = (uint16_t)v;
+        DevLog.printf("[diag] blink_ms=%u\n", (unsigned)wifiBlinkMs);
+    }
+    if (server.hasArg("blink_test")) {
+        long n = server.arg("blink_test").toInt();
+        if (n < 1 || n > 60) {
+            server.send(400, "text/plain", "blink_test out of range 1..60");
+            return;
+        }
+        uint32_t total = 0, worst = 0, sumRefresh = 0;
+        wifiConnActive = true;
+        for (long i = 0; i < n; i++) {
+            wifiBlinkOn = !wifiBlinkOn;
+            rfnBlink = true;
+            uint32_t t0 = millis();
+            renderCurrent();
+            uint32_t dt = millis() - t0;
+            total += dt;
+            sumRefresh += rfnLastMs;
+            if (dt > worst) worst = dt;
+        }
+        wifiConnActive = false;
+        wifiBlinkOn = false;
+        renderCurrent();   // restore the real link state on the panel
+        DevLog.printf("[diag] blink_test n=%ld avg=%ums worst=%ums refresh_avg=%ums\n",
+                      n, (unsigned)(total / (uint32_t)n), (unsigned)worst,
+                      (unsigned)(sumRefresh / (uint32_t)n));
+        server.send(200, "text/plain",
+                    "blink_test n=" + String(n) +
+                    " avg_ms=" + String(total / (uint32_t)n) +
+                    " worst_ms=" + String(worst) +
+                    " refresh_avg_ms=" + String(sumRefresh / (uint32_t)n) +
+                    " blink_ticks=" + String((unsigned)blinkTicks) + "\n");
+        return;
+    }
     if (server.hasArg("rgn")) {
         JsonDocument doc;
         JsonArray arr = doc.to<JsonArray>();
@@ -2407,6 +2529,7 @@ static void handleDiag() {
                                           String(deepNow ? 1 : 0) + ", tz=" + deviceTz +
                                           ", frame_capture=" + String((unsigned)rtcFrameCapture) +
                                           ", rv2=" + String((unsigned)rv2Enabled) +
+                                          ", blink_ms=" + String((unsigned)wifiBlinkMs) +
                                           "\n\n" + sleepDiagText());
 }
 
@@ -2557,7 +2680,10 @@ static void handleClaim() {
     req.lease = (uint32_t)lease;
     bool keepSince = have && cur.id == id;
     ownerClaim(req, keepSince);
-    noteActivity("claim");
+    // Design §6: a lease renewal is a protocol keep-alive, not user activity;
+    // it must not extend the light phase (idleDeepDue would never fire while
+    // the bridge renews every 60 s). Only a new claim resets the idle timer.
+    if (!keepSince) noteActivity("claim");
     DevLog.printf("[owner] %s id=%s name=%s host=%s:%u lease=%us force=%d\n",
                   keepSince ? "renew" : "claim", req.id.c_str(), req.name.c_str(),
                   req.host.c_str(), req.port, (unsigned)req.lease, force ? 1 : 0);
@@ -2976,17 +3102,26 @@ static void startNormalMode(bool skipConnect = false) {
     // Deep wake: leave the sleep frame at once (Zzz gone) so BOOT has instant
     // feedback; Wi-Fi is not up yet, so the template keeps its icon hidden.
     // This first wake frame is a clean full baseline; a partial here can leave
-    // a Zzz ghost that reads as "still asleep".
-    if (wokeFromDeep && rtcMode == MODE_LIGHT && (rtcDeepGlyph & 1)) {
+    // a Zzz ghost that reads as "still asleep". The timer pull path already
+    // drew that baseline inside deepNetworkCycle (wakeBaselineDrawn), so it
+    // must not draw a second full frame here.
+    if (!wakeBaselineDrawn && wokeFromDeep && rtcMode == MODE_LIGHT && (rtcDeepGlyph & 1)) {
         forceCleanRefresh = true;
         renderCurrent();
     }
+    wakeBaselineDrawn = false;
+
+    // task-10 A: cold boot with a cached usage snapshot shows the template at
+    // once (WIFI OFF, no Connecting page) instead of blocking on association.
+    // The link-up render below then adds the Wi-Fi icon with one partial.
+    const bool cachedColdBoot = !wokeFromDeep && lastUsage.length() > 0;
+    if (cachedColdBoot) renderCurrent();
 
     if (skipConnect && WiFi.status() == WL_CONNECTED) {
         // Deep pull already fast-connected: no scan, no second association.
         wifiUp = true;
     } else {
-        wifiUp = connectBest(!wokeFromDeep);
+        wifiUp = connectBest(!wokeFromDeep && !cachedColdBoot);
     }
     registerHttpRoutes();
     server.begin();
@@ -3030,11 +3165,9 @@ static void startNormalMode(bool skipConnect = false) {
         // Cold boot: never leave the boot/connecting page up when the first
         // pull failed. The cached usage (or the built-in status screen) is
         // rendered once the link is up, so the panel is never stale. An
-        // identical frame costs no write (RFN_NONE).
-        if (!wokeFromDeep) renderCurrent();
-        // Cold boot: never leave the boot/connecting page up when the first
-        // pull failed. The cached usage (or the built-in status screen) is
-        // rendered once the link is up, so the panel is never stale.
+        // identical frame costs no write (RFN_NONE). With a cached snapshot
+        // this is also the single link-up partial that lights the Wi-Fi icon
+        // (the template was already drawn with WIFI OFF before the connect).
         if (!wokeFromDeep) renderCurrent();
         noteActivity(deepWakePath ? "deep-light" : "boot");
         sendAnnounce(bleOn);
@@ -3317,6 +3450,9 @@ static int deepNetworkCycle() {
             forceCleanRefresh = true;
         }
         renderActiveUsage(body, "PULL");
+        // The Zzz-removing clean baseline is done: startNormalMode must not
+        // request a second full refresh for the same wake frame (task-10).
+        if (leavingDeep) wakeBaselineDrawn = true;
         nvsStageMark(45);
         clkCaptureFromFramebuffer();
         rememberActiveTemplate();

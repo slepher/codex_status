@@ -1,6 +1,121 @@
 # Codex Status 项目进度（交接文档）
 
-## 最新状态：2026-09-21 — 0.15.7-bw：修复离开 deep 的 Zzz 残影 + 新需求仅入文档
+## 架构文档：2026-09-21 — 通用多设备信息终端总设计完成（未实现）
+
+- 无对话上下文的 Astra 子代理独立撰写
+  `docs/generic-display-platform-design.md`，当前 BLE/功耗方案仅作为参考输入。
+- 总设计把 Codex 降为 Provider，Bridge 固定四标签：模板、设备、数据、MCP；
+  功耗为设备子菜单，MCP 与 UI 共用 Application Services，不得绕过安全或发布规则。
+- 设备可保存多个模板但任一时刻只有一个 active；模板安装/激活时编译
+  `DataRequirementPlan` + `RenderPlan`，日常会合、请求、deep 唤醒和局刷不得重新
+  解析模板 JSON。ViewSnapshot 绑定 manifest、active hash、plan hash 与
+  `activation_generation`，可拒绝切模板后在途旧数据。
+- 支持从现有设备只读观察导入模板、canonical/target/ABI 去重和 unresolved 占位，
+  生成 Profile + observed Deployment 基线；不 WAKE、不 claim、不重推、不改 active。
+- 多硬件分离 BSP/controller/panel profile/render target/firmware target；NOTE4 参数
+  仍标为待核实。每 target 独立 ROM，模板使用独立 variant，OTA 目标防错与回滚
+  能力需实证。
+- 本里程碑仅新增设计与工作流文档；没有修改固件/Bridge、没有构建、部署或改变现场。
+
+## 最新状态：2026-09-21 — 0.15.10-bw + 桥修复：修复“light 下永不休眠”（renew/心跳不再续 light + 桥主导回 deep）
+
+- **用户报告**：设备在 light 下长时间不休眠；诊断（2026-09-21 晚）：
+  1. 桥每 60s 续租 owner（`occupancy_gate`），设备 `handleClaim` 对 renew 也
+     调 `noteActivity("claim")`，600s 本地 idle 永远清零；桥每 300s 心跳推送
+     同样 `noteActivity("push")`。日志 `[owner] renew` 与 `[clk] tick` 数量
+     约 1:1，`idle_s` 采样 45→28→9 不断回零。
+  2. 桥侧 push 封包的 mode 用 `mode_str()`→`expects_deep()`（要求
+     quiet≥600s 且 silent≥120s），但 10s 的 `/status.json` 轮询与 60s 续租都
+     算 `note_contact`，`silent` 恒 <120s；且 `occupancy_gate` 在
+     `mode_str()` 之前续租，故 push 永远带 `mode:"light"`。
+  共同结果：light→deep 无可用路径（只有 `/diag?deep_now`/调试模式能睡）。
+- **固件修复（0.15.10-bw）**：
+  1. `handleClaim` 仅新 claim（`!keepSince`）才 `noteActivity`，renew 是协议
+     保活、不续 light（设计 §6）。
+  2. `/usage` 推送仅在 `usage_rev` 变化时 `noteActivity("push")`；无 rev 字段
+     （旧桥）保守视为变化。心跳推送不再重置 idle。
+- **桥修复（bridge-app）**：`activity.rs` 抽出 `light_wanted()`（pending /
+  light dwell / quiet<600 则 light），pull 响应与 push 共用；`mode_str()` 不再
+  依赖 contact 年龄。app push 循环增加 `mode_changed`：模式翻转（light→deep）
+  立即推送，不等 5 分钟心跳，实现桥主导的有界回 deep。
+- **验证**：
+  - 0.15.10 上，renew（每 60s）与心跳推送持续时 `idle_s` 从 11 单调涨到
+    543+，约 600s 时设备自然进 deep（证明固件修 1/2 生效；此前永远 <60s）。
+  - 用 `/diag?idle_deep_s=3600`（RAM）排除本地 idle 后唤醒设备：桥在
+    light dwell(300s)+quiet(≥600s) 到点后把 push mode 翻成 deep，设备约 60s
+    后进 deep（20:55 不可达），证明桥修 3 独立生效。
+  - 桥已按 watchdog-first 重启：旧 5216/14540 停止，新 PID 6392 + watchdog
+    42604（bridge/target/debug）；设备 deep 期间 renew/推送按 `expects_deep`
+    暂停属预期。
+- **ROM**：`artifacts/codex-status-0.15.10-bw.bin`（1 644 320 B，SHA256
+  `79B0412320C08CDB297FB3141FB0B3B7831FEF1BD240B13BDD553E281EDCFCD0`），
+  OTA 0.15.9→0.15.10 成功。`idle_deep_s=3600` 仅为验证用的 RAM 覆盖，
+  深睡重启后自动恢复默认 600。
+- **测试**：`cargo test --workspace`（隔离 target）通过；`bridge-core` 新增
+  单测 `push_mode_follows_quiet_not_contact`；`pio run`；`git diff --check`
+  干净。
+- **行为说明**：设备 deep 时每 60s 仍 pull；usage 有新变化（quiet<600s）时
+  桥在 pull 响应里回 `light`，设备自动回到 light；安静 600s 后桥主动回
+  `deep`。BOOT 在 deep 下仍按既有语义唤醒到 light。
+- **未提交**。
+
+## 历史：2026-09-21 — 0.15.9-bw + quad v12：task-10 落地（缓存冷启动直进模板 + Wi-Fi 图标 1Hz 闪烁 + 双帧修复）
+
+- **需求来源**：`project-workflow/ble-rendezvous-power/task-10.md`（此前用户明确
+  “仅入文档”，本窗口实现 A/B + 0.15.7 遗留的双帧修复）。
+- **需求 A（缓存冷启动）**：`startNormalMode` 在 `!wokeFromDeep &&
+  lastUsage.length()>0` 时先渲染缓存模板（`WIFI OFF`、Wi-Fi 图标灭、无
+  `Connecting:` 页）再建连；连上后的既有 link-up 渲染即“一次局刷点亮图标”；
+  失败保持模板并走既有有界退避/回深（不再画 Zzz）；无缓存仍走原
+  Connecting/状态页回退。同时删除了 0.15.5 起重复两次的冷启动渲染。
+- **需求 B（连接中闪烁）**：连接期间模板可见状态在 `WIFI CONN`（亮）/
+  `WIFI OFF`（灭）之间按 `WIFI_BLINK_MS`（默认 1000ms）交替；`connectBest`
+  等待循环驱动，失败后补一帧 settle 回 `WIFI OFF`。仅当模板已上屏且基线
+  trusted + partial-ready 才启用（不会污染 Connecting 页，也不会因基线不可信
+  每次变全刷）。闪烁帧在 `epdFlush` 中保持 `kind=partial, reason=blink`，
+  不消耗区域 ghost 预算、不计入 30 次局刷 streak；深睡定时重试用
+  `deepFastConnect`，不闪烁，因此闪烁仅在冷启动/BOOT 唤醒的一次建连内。
+- **quad v12**（seed `tools/test-bridge/templates/quad.json`，version 12，
+  canonical hash `430cc188`）：x=121 增加 `WIFI CONN` 的 Wi-Fi 图标（与
+  BLE ON/OFF 同图），x=141 增加 `WIFI CONN` 的划叉覆盖（与 WIFI OFF 同图），
+  使每次切换只改 Wi-Fi 图标格。三端同步：固件引擎无协议改动（复用
+  `when.equals`）、Rust canonical/测试更新、Python seed 更新、node 预览新增
+  `quad-preview-conn.png` 与“只切换图标格”断言。
+- **双帧修复**：`deepNetworkCycle` 在 `leavingDeep` 画完“去 Zzz”的干净全刷后
+  置 `wakeBaselineDrawn`，`startNormalMode` 据此跳过重复的 clean 首帧。
+  实测 timer pull→light 日志：仅一次全刷（PULL）+ 一次局刷显图标，随后
+  `epd_writes` 增量正常，无第二次全刷闪烁。
+- **实测（设备 192.168.3.163，电池、light）**：`/diag?blink_test=30` →
+  `avg_ms=870 worst_ms=875 refresh_avg_ms=829`，30/30 为 partial，
+  `epd_busy_fails=0`、`epd_trusted=true`、区域预算未被闪烁消耗。结论：维持
+  1 Hz（单次失败冷启动最坏 ≤30 tick ≈ 0.4mAh，按设计 §9 的 ~0.013mAh/次
+  事件模型；无电流仪，属面板活动时长核算）；`/diag?blink_ms=N` 可现场调周期
+  或置 0 关闭。新增 `/status.json` 字段：`refresh_ms`、`blink_ms`、
+  `blink_on`、`blink_ticks`、`wifi_conn`。
+- **真机验证（0.15.9 + quad v12）**：冷启动（OTA 后 software reset）日志顺序
+  `[tpl] rendered quad (-)`（连 Wi-Fi 之前，无 Connecting 页）→ 建连中 1 次
+  闪烁渲染（`blink_ticks=1`）→ `[wifi] connected` → link-up 局刷；
+  `[rgn] derived n=13 whole=0`（v12 两个新元素仍并入原图标格，31 个元素
+  < RGN_MAX 32）。
+- **ROM**：`artifacts/codex-status-0.15.9-bw.bin`（1 644 256 B，SHA256
+  `47C641DF254449751DA6678F4503AA8276B527FCC3688DFABDA076024F9B8549`），
+  已 OTA（0.15.8→0.15.9，直传成功）；中间版 0.15.8-bw（含首个测量轮，缺
+  `blinkAllowed` 基线保护）被 0.15.9 取代，ROM 见
+  `artifacts/codex-status-0.15.8-bw.bin`（SHA256
+  `FFECE66BF1062926CD18BAD27127F1FFA74CCF129CC3F7572237FBA8B0CD5006`）。
+- **验证**：`pio run`；`node tools/test-quad-preview.mjs`（新增闪烁断言）；
+  `cargo test -p bridge-core --test template`（quad v12/`430cc188`）；
+  `cargo test -p bridge-render --test policy`；`cargo test --workspace`
+  （隔离 target）；`git diff --check` 干净。
+- **现场**：设备 `0.15.9-bw`（ota_0，light、在线、quad v12 已推送、rv2=0、
+  `pm/rv2` 未动）；桥 debug（PID 5216 + watchdog 14540）`device_mode` 已回
+  auto；诊断开关 `idle_deep_s=600`、`frame_capture=0`、`blink_ms=1000`。
+  token 规则未动，未打印任何凭据。
+- **待办**：物理 BOOT 按压实测闪烁（1Hz、连上常亮、无 AP 时熄灭 + 有界回深）；
+  固定机位照片验收（阶段 2 黑块门槛）；90 次时钟预算长测；BOOT BLE 回归
+  （legacy 推送 + `rv:2` NACK）；随后阶段 3（v2 事务）。未提交。
+
+## 历史：2026-09-21 — 0.15.7-bw：修复离开 deep 的 Zzz 残影 + 新需求仅入文档
 
 - **用户报告修复（0.15.7）**：自然睡眠唤醒后 Zzz 未被完全刷新，看起来仍在
   睡眠。根因：定时网络窗口拉起 light 时，`deepNetworkCycle` 先按 deep 状态

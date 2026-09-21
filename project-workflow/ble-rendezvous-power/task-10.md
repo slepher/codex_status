@@ -1,7 +1,8 @@
-# Task 10 — boot UX: cached-template cold start + Wi-Fi icon blink (documentation only)
+# Task 10 — boot UX: cached-template cold start + Wi-Fi icon blink
 
-Status: requirements captured 2026-09-21 (user). **Documentation only — no
-implementation in this window.** All code work is deferred to a new window.
+Status: **implemented and on-device verified** (firmware 0.15.9-bw, quad v12,
+2026-09-21). Requirements captured 2026-09-21 (user). Implementation notes,
+measurements, and remaining user/physical checks are in the last section.
 
 Inputs: user requirements (2026-09-21), design §3 (wake/bounded timeouts),
 §4 (rendezvous visual state), §9 (power budget), task-2/task-3 (silent wake),
@@ -81,3 +82,80 @@ current cold-boot path in `src/main.cpp` (`setup` / `startNormalMode` /
   clean full refresh when leaving deep through the pull path
   (`deepNetworkCycle` sets light mode before rendering and requests
   `forceCleanRefresh`), fixing the "Zzz ghost looks like still asleep" report.
+
+## Implementation (2026-09-21, firmware 0.15.8/0.15.9-bw + quad v12)
+
+### Requirement A — cached cold boot enters the template at once
+
+- `startNormalMode`: with `!wokeFromDeep && lastUsage.length() > 0` the cached
+  template is rendered **before** `connectBest`; the connect page is suppressed
+  (`connectBest(!wokeFromDeep && !cachedColdBoot)`). Link down means the
+  template draws `WIFI OFF`; no `Connecting:` page.
+- After connect, the existing link-up `renderCurrent()` is the single partial
+  that lights the Wi-Fi icon (the duplicate cold-boot render in 0.15.5-0.15.7
+  was removed).
+- Failed connect: the template stays with `WIFI OFF`; the existing bounded
+  retry/backoff and deep return are unchanged (no sleep-glyph repaint on this
+  path, per the requirement).
+- No cache: unchanged fallback (boot status/connecting screen stays).
+
+### Requirement B — Wi-Fi icon blinks (~1 Hz) while connecting
+
+- Firmware adds a template-visible state pair: while a boot connect attempt is
+  running, `device.state` alternates `WIFI CONN` (blink on) / `WIFI OFF`
+  (blink off) every `WIFI_BLINK_MS` (default 1000 ms). `blinkAllowed` requires a
+  rendered template plus a trusted, partial-ready baseline, so the
+  Connecting/status page is never touched and an untrusted baseline can never
+  turn a tick into a full flash.
+- `connectBest` drives the blink inside its wait loop; on failure it re-renders
+  once to settle on `WIFI OFF` (icon hidden). On success the link-up render
+  shows the steady icon. Deep timer retries use `deepFastConnect` and never
+  blink, so the blink is bounded to one cold boot / BOOT wake.
+- `epdFlush` treats blink ticks specially: only an exhausted ghost budget
+  (`RFNR_BUDGET`) is downgraded to a partial; the tick is logged as
+  `refresh_kind=partial`, `refresh_reason=blink`, does not consume the region
+  ghost budget and does not count against the 30-partial legacy streak.
+- quad v12 adds the `WIFI CONN` icons: x=121 Wi-Fi icon (same bits as
+  BLE ON/OFF) and x=141 crossed-link overlay (same bits as `WIFI OFF`), so the
+  crossed overlay stays steady and only the Wi-Fi cell changes per tick.
+  Rust canonical hash `430cc188`, version 12 (`bridge/crates/core/tests/template.rs`,
+  `node tools/test-quad-preview.mjs`).
+
+### Double-frame fix
+
+- `wakeBaselineDrawn` is set in `deepNetworkCycle` when `leavingDeep` renders
+  the clean light frame; `startNormalMode` skips its own clean wake render then.
+  Verified on the timer pull -> light path: exactly one full (Zzz removal) plus
+  one partial (Wi-Fi icon), instead of two full flashes.
+
+### Measurement (device 192.168.3.163, battery, light)
+
+- `/diag?blink_test=N` (token-gated) runs N blink ticks on the live template
+  with the real policy and reports the per-tick cost; `/status.json` adds
+  `refresh_ms`, `blink_ms`, `blink_on`, `blink_ticks`, `wifi_conn`;
+  `/diag?blink_ms=N` tunes the phase (0 disables) at runtime.
+- Measured 0.15.9 + quad v12: n=30 -> `avg_ms=870`, `worst_ms=875`,
+  `refresh_avg_ms=829` (panel wake/reset + partial waveform). Per-tick cost is
+  stable and below the 1000 ms phase; all ticks were partials
+  (`blink_ticks` +30, `epd_busy_fails=0`, `epd_trusted=true`, region budgets
+  unchanged: x=121 budget 9 from the real link-up partial only).
+- Decision: keep the 1 Hz default. Worst case is one failed cold boot =
+  <= 30 ticks ~= 0.4 mAh at the design's ~0.013 mAh per clock-window event
+  (design §9 model; no current meter was available, so this is panel-activity
+  accounting, not a coulomb count). `blink_ms` remains available for field
+  tuning; a plugged-only variant was not needed because the blink never runs on
+  deep retries.
+- On-device boot evidence (0.15.9 + v12, cold boot after OTA): log shows
+  `[tpl] rendered quad (-)` **before** `[wifi] slot...` (Requirement A, no
+  connecting page), one blink render mid-association (`blink_ticks=1`), then
+  `[wifi] connected` and the link-up partial. `[rgn] derived n=13 whole=0`
+  (v12's two extra elements stay merged into the icon cells; `RGN_MAX=32`
+  still covers 31 pre-merge elements).
+
+### Remaining checks
+
+- Physical BOOT-press verification with the new template (blink phases, 1 Hz
+  cadence, steady icon on connect) and a no-AP failure run to confirm the icon
+  is hidden and the retry/deep behavior is unchanged.
+- Photo/visual sign-off of the blink frames is not covered by the pixel tests.
+- `blink_ms` default stays 1000 ms in the shipped ROM (`artifacts/codex-status-0.15.9-bw.bin`).

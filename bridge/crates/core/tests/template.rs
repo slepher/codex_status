@@ -20,11 +20,12 @@ fn hashes_match_python_test_bridge() {
     assert_eq!(full.version, 3);
     assert_eq!(mini.version, 2);
     let quad = library.get("quad").expect("quad template");
-    assert_eq!(quad.version, 11);
+    assert_eq!(quad.version, 12);
     assert_eq!(quad.min_fw.as_deref(), Some("0.14"));
-    // v11 gates the Wi-Fi icon on device.state (BLE ON/OFF) so deep/connecting
-    // frames show no Wi-Fi icon (v0.14 added the device.mode sleep glyph).
-    assert_eq!(quad.hash, "93199731");
+    // v12 adds the WIFI CONN blink phase (task-10 B): the Wi-Fi icon cell is
+    // drawn on WIFI CONN (blink on) / BLE ON / BLE OFF and hidden on WIFI OFF
+    // (blink off), so deep/connecting frames show no Wi-Fi icon.
+    assert_eq!(quad.hash, "430cc188");
 }
 
 #[test]
