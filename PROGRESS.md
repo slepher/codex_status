@@ -1,17 +1,41 @@
 # Codex Status 项目进度（交接文档）
 
+## 架构文档：2026-09-22 — 通用多设备信息终端简化架构 v2 完成（未实现）
+
+- Astra medium 子代理结合上一版总设计、BLE 功耗设计和累计产品决策，新建
+  `docs/generic-display-platform-design-v2.md`，作为唯一现行总设计；旧版已归档到
+  `docs/history/generic-display-platform-design-v1.md`，只保留决策历史。
+- 核心模型收敛为每设备一个 1–8 项 Profile、`CompiledTemplate`、单一
+  `active_context_id`、`DataSource + SourceSnapshot`、完整 A/B Bundle、单
+  `PublishJob` 和简单 ACK；删除模板 revision/history、资源图/GC、多层发布实体
+  及 Provider/Dataset 分层。
+- 设备不再区分短检查/长检查，也不解释 push/pull；定时或手动苏醒只广播并执行
+  Bridge 指令。Bridge 负责变化判定、完整同步阈值和正式 `PowerPlan`。push 变化
+  发送含 pull 字段的完整快照；pull-only 变化不推送、不续租。
+- BOOT provisional 300 秒从物理按键唤醒起算；正式计划只能由 Bridge 下发，设备
+  保留低电、最大期限、超时与 `plan_id` 幂等安全边界。deep 首次实时性受会合周期
+  限制，Wi-Fi light 内才可连续即时投递。
+- 屏幕刷新归设备端 framebuffer diff 与面板策略：黑块不因局部反白数字变化整体
+  重刷，dirty rect 对齐后按真实前后像素写入；局刷次数、擦除量、面积、时间、温度
+  和基线可信度共同决定清影全刷。SSD1681/SSD2683 差异留在驱动/面板适配层。
+- 本里程碑仅新增设计文档并更新交接记录；未修改固件/Bridge、未构建、部署或改变
+  设备现场。新 target 的空间、会合参数、续航与面板阈值仍需实测。
+
 ## 架构文档：2026-09-21 — 通用多设备信息终端总设计完成（未实现）
 
-- 无对话上下文的 Astra 子代理独立撰写
-  `docs/generic-display-platform-design.md`，当前 BLE/功耗方案仅作为参考输入。
+- 无对话上下文的 Astra 子代理独立撰写初版，现已归档为
+  `docs/history/generic-display-platform-design-v1.md`；当前总设计见
+  `docs/generic-display-platform-design-v2.md`。
 - 总设计把 Codex 降为 Provider，Bridge 固定四标签：模板、设备、数据、MCP；
   功耗为设备子菜单，MCP 与 UI 共用 Application Services，不得绕过安全或发布规则。
 - 设备可保存多个模板但任一时刻只有一个 active；模板安装/激活时编译
   `DataRequirementPlan` + `RenderPlan`，日常会合、请求、deep 唤醒和局刷不得重新
   解析模板 JSON。ViewSnapshot 绑定 manifest、active hash、plan hash 与
   `activation_generation`，可拒绝切模板后在途旧数据。
-- 支持从现有设备只读观察导入模板、canonical/target/ABI 去重和 unresolved 占位，
-  生成 Profile + observed Deployment 基线；不 WAKE、不 claim、不重推、不改 active。
+- 模板库不做用户可见版本管理：每个 template ID + target 只保留当前最新版；Profile
+  只引用 ID，显式发布时冻结一次性 ReleaseArtifact，保证排队内容不漂移，但不形成
+  历史版本/回滚入口。读取设备模板降为恢复/迁移角落流程；可 canonical/target/ABI
+  去重或 unresolved 占位，且不 WAKE、不 claim、不重推、不改 active。
 - 多硬件分离 BSP/controller/panel profile/render target/firmware target；NOTE4 参数
   仍标为待核实。每 target 独立 ROM，模板使用独立 variant，OTA 目标防错与回滚
   能力需实证。

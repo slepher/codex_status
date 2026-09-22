@@ -8,7 +8,11 @@ multi-source low-power information terminal.
 
 ## Deliverable
 
-`docs/generic-display-platform-design.md`
+`docs/generic-display-platform-design-v2.md`
+
+The independent first pass is retained only as decision history at
+`docs/history/generic-display-platform-design-v1.md`; it is not an active
+architecture specification.
 
 The document must cover the product/domain model, firmware/ROM architecture,
 Bridge architecture, template compilation and data-requirement flow, device

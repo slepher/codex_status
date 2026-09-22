@@ -48,25 +48,26 @@ flowchart LR
 
 | 实体 | 含义与所有权 | 关系 |
 |---|---|---|
-| Template | 人可编辑的逻辑模板身份与名称，含草稿 | 模板管理；1:N TemplateRevision |
-| TemplateRevision | 不可变 canonical 源、schema、render target、资源依赖 | 一个逻辑模板可有多个 revision/target variant |
-| Profile | 有序模板选择、enabled、默认规则的可复用集合 | 模板管理；编辑时可选当前 revision，发布时全部锁定 |
+| Template | 以逻辑 ID + target variant 标识的当前模板；库中只保留最新版 | 模板管理；保存直接替换当前内容，不提供历史版本选择 |
+| Profile | 有序模板选择、enabled、默认规则的可复用集合 | 模板管理；只引用模板 ID，发布时解析各 ID 的当前最新版 |
 | Device | Wi-Fi MAC 主键；名称/IP 是属性；能力、现场状态 | 设备管理；一台设备一个当前 Deployment 关系 |
-| Deployment | 某设备的模板安装集、绑定、同步许可及期望/实况 | 设备管理；引用冻结 ProfileRevision 和设备专属绑定 |
+| Deployment | 某设备的模板安装集、绑定、同步许可及期望/实况 | 设备管理；引用发布时冻结的 Profile 快照和设备专属绑定 |
 | ProviderType | 内建采集适配实现及配置描述 | 数据管理；Codex、Static JSON 等 |
 | SourceInstance | Provider 的一个配置实例与 credential_ref | 1:N Dataset；不绑定某个设备生命周期 |
 | Dataset | 有类型的最新有效值、来源、质量、时间元数据 | 供多个 Deployment 引用；不是设备全量镜像 |
 | ViewSnapshot | 一次构造的、仅含 active 所需字段的有界展示值 | 精确绑定 device/deployment/activation/requirements |
 
-Profile 不包含设备 token 或 SourceInstance 密钥，也不决定 Wi-Fi/BLE。Deployment 明确保存每个安装项的 slot→Dataset/字段映射；只有 active 项参与同步。UI 在设备详情直接显示“使用的 Profile、当前模板、数据绑定、同步许可、期望与实际版本”，不可把绑定藏在内部队列。模板页可跳转到使用它的设备，但不成为第二套设备状态。
+Profile 不包含设备 token 或 SourceInstance 密钥，也不决定 Wi-Fi/BLE。Deployment 明确保存每个安装项的 slot→Dataset/字段映射；只有 active 项参与同步。UI 在设备详情直接显示“使用的 Profile、当前模板、数据绑定、同步许可、期望与实际内容 hash”，不可把绑定藏在内部队列。模板页可跳转到使用它的设备，但不成为第二套设备状态。
 
 顶层严格四个标签：**模板管理、设备管理、数据管理、MCP**。功耗是设备管理内的子菜单；MCP 展示连接、工具、权限与调用诊断，不创建第五个业务领域。
 
 ## 4. 模板、Profile、Deployment 与激活
 
-### 4.1 不可变资源与 variant
+### 4.1 当前模板、variant 与发布制品
 
-schema 1 原始 ID/version 参与当前 canonical 内容，不改变旧 hash 算法。schema 2 将逻辑 ID/alias 放库元数据，canonical 内容显式包含 schema 与 render target；相同内容资源可被多个 ID 引用。每个 target variant 有独立 revision 与预览；200×200 不可自动缩放并宣称适配 400×300。将来可由 Bridge 离线编译布局到固定坐标，但编译产物仍须用户预览并冻结。
+schema 1 原始 ID/version 参与当前 canonical 内容，不改变旧 hash 算法；其中 version 只作为 legacy 协议兼容字段，由保存动作自动更新，不形成用户可管理的历史。schema 2 将逻辑 ID/alias 放库元数据，canonical 内容显式包含 schema 与 render target；相同内容资源可被多个 ID 引用。每个 target variant 只有一个当前最新版与预览；保存通过校验后直接替换当前内容，不提供历史列表、版本选择或模板回滚。200×200 不可自动缩放并宣称适配 400×300。将来可由 Bridge 离线编译布局到固定坐标，但编译产物仍须用户预览。
+
+用户点击发布时，Bridge 把该时刻各模板 ID 指向的最新版 canonical 字节、compiled plans、资源与绑定冻结成一次性的 `ReleaseArtifact`。它仅保证排队、重试和多设备发送期间内容不漂移，不进入模板历史库，也不能在 UI 中被选择为旧模板版本。任务完成或过期且不再被任何设备任务引用后即可垃圾回收。
 
 | 标识 | 覆盖范围与用途 |
 |---|---|
@@ -87,13 +88,15 @@ legacy CRC32 相同不能独自证明内容相等：本地有内容时比较 can
 ```json
 {
   "id": "desk-display", "device_mac": "70:04:1D:AA:BB:CC",
-  "deployment_revision": "17", "profile_revision": "daily:8",
+  "deployment_revision": "17", "profile_snapshot_hash": "sha256:...",
   "manifest_hash": "sha256:...", "origin": "published",
   "entries": [
-    {"slot": 0, "template_revision": "quota:12", "target": "bw200-v1",
+    {"slot": 0, "template_id": "quota", "target": "bw200-v1",
+     "artifact_hash": "sha256:...",
      "canonical_hash": "sha256:...", "requirements_hash": "sha256:...",
      "render_plan_hash": "sha256:...", "bindings": {"quota": "source1/limits"}},
-    {"slot": 1, "template_revision": "notice:1", "target": "bw200-v1",
+    {"slot": 1, "template_id": "notice", "target": "bw200-v1",
+     "artifact_hash": "sha256:...",
      "bindings": {"notice": "static1/message"}}
   ],
   "default_active_slot": 0,
@@ -104,15 +107,15 @@ legacy CRC32 相同不能独自证明内容相等：本地有内容时比较 can
 }
 ```
 
-模型分为不可变 desired manifest 与可变 observed/status；示例合并展示，实际序列化 manifest 只包含发布内容。发布后按钮切换 active 不重写 immutable manifest，而提交小型 ActivationRecord，引用 manifest + slot + 单调 activation_generation。所有安装项都唯一可定位，任何正常已配置状态恰有一个 active；无可用资源/出厂状态为显式 unconfigured，显示 ROM 恢复页，不能伪造 active。
+模型分为发布时冻结的 desired manifest 与可变 observed/status；示例合并展示，实际序列化 manifest 只包含本次发布内容。发布后按钮切换 active 不重写 manifest，而提交小型 ActivationRecord，引用 manifest + slot + 单调 activation_generation。所有安装项都唯一可定位，任何正常已配置状态恰有一个 active；无可用资源/出厂状态为显式 unconfigured，显示 ROM 恢复页，不能伪造 active。设备保留上一完整 manifest 只用于掉电恢复，不作为用户可选模板历史或产品级回滚功能。
 
-继续提供旧 Profile 最多 3 个 enabled、首个默认的编辑与发布语义。设备能力可另报物理资源容量和可切换项容量；首版产品仍限制 3，不因内部 4 份文件自动开放第 4 槽。导入观察可记录超过上限的完整清单，标记不可直接发布，不能悄悄丢一项。
+继续提供旧 Profile 最多 3 个 enabled、首个默认的编辑与发布语义。设备能力可另报物理资源容量和可切换项容量；首版产品仍限制 3，不因内部 4 份文件自动开放第 4 槽。恢复读取若发现超过上限的清单，应在报告中完整列出并阻止直接生成 Profile，不能悄悄丢一项。
 
 ### 4.3 保存、发布、同步
 
-保存只生成库草稿/revision。点击发布时 Application Service 锁定 Profile、所有模板字节/资源、各设备 variant、绑定配置 revision 和同步许可，生成不可变 ReleaseIntent 与每设备 job；排队后只读取这些 hash 对应资源。用户后来编辑模板、Profile 或映射产生新草稿，不改变队列。
+保存直接更新模板库中的当前最新版，但不发布。点击发布时 Application Service 解析 Profile 引用的当前最新版，锁定模板字节/资源、各设备 variant、绑定配置和同步许可，生成一次性 ReleaseIntent 与每设备 job；排队后只读取这些 hash 对应资源。用户后来再次保存模板、Profile 或映射不会改变已排队任务；下一次发布直接使用新的最新版。
 
-推荐默认：显式发布同时授权该 Deployment 持续同步 active 所需数据，确认界面展示节奏与来源；用户可暂停。恢复同步是单独动作，不重推模板。新设备、观察导入、仅保存、重新发现都不授予同步许可。暂停只停止以后投递，已提交的本地时钟/过期指示继续运行；正在提交的有界事务可能完成，UI 报告其结果。
+推荐默认：显式发布同时授权该 Deployment 持续同步 active 所需数据，确认界面展示节奏与来源；用户可暂停。恢复同步是单独动作，不重推模板。新设备、从设备恢复读取、仅保存、重新发现都不授予同步许可。暂停只停止以后投递，已提交的本地时钟/过期指示继续运行；正在提交的有界事务可能完成，UI 报告其结果。
 
 ## 5. 数据与运行计划
 
@@ -279,20 +282,20 @@ ACK 分为两个维度：`durability=volatile|rtc|durable`，`execution=received
 → typed snapshot apply → panel refresh → ACK/状态核对
 ```
 
-初次发布可连同已冻结的首帧 snapshot，但需要到执行时检查其有效期；过期则构造绑定不变的新 view，不改安装资源。预览值与实际执行值可能不同，确认界面应说明预览时间。多设备 job 分别 pending/succeeded/failed/cancelled/unknown，允许部分成功；失败设备重试同一 release 内容，不回滚成功设备。需要回滚时用户选择设备、引用上一 manifest 创建新的显式发布意图，不倒退 revision counter。
+初次发布可连同已冻结的首帧 snapshot，但需要到执行时检查其有效期；过期则构造绑定不变的新 view，不改安装资源。预览值与实际执行值可能不同，确认界面应说明预览时间。多设备 job 分别 pending/succeeded/failed/cancelled/unknown，允许部分成功；失败设备重试同一 release 内容，不回滚成功设备。需要修正时重新发布模板库当前最新版；上一 manifest 只供设备内部掉电恢复，不作为用户选择的模板版本。
 
-### 9.2 从设备一次性观察导入
+### 9.2 从设备读取模板（恢复/迁移角落流程）
 
-导入是仅本地写入的观察用例，不调用一般“发现后同步”链：
+从设备取得模板不是模板管理主流程，只用于 Bridge 数据丢失、接管旧设备或诊断现场差异。正常流程始终是 Bridge 保存最新版后向设备发布。该角落流程是仅本地写入的观察用例，不调用一般“发现后同步”链：
 
 1. 从用户所选 Device 的缓存或纯只读查询取得 MAC、能力、template 清单、slot 顺序、active、hash/版本；缓存导入注明 observed_at 与可能过时。设备睡眠时等待自然可读机会或使用缓存，不发 WAKE、claim、renew、template/usage。
 2. 若设备宣告只读源导出能力，读取各源；legacy 不存在导出端点时查本地库候选，不把 Bridge 的 `/template` 当设备导出。没有源则建立 unresolved entry，记录原 ID/hash/slot/target-knownness，不能生成空 JSON 假装成功。
-3. 对可得源执行 canonical/严格验证、完整 hash 检查；用 `(canonical bytes, schema, render target, compiler ABI compatibility)` 去重。相同 hash 不同 ID 可复用资源并保存 alias；legacy ID 嵌入内容导致 canonical 不同则不声称相同资源，可建立逻辑关联。相同 ID 不同 hash 创建独立 revision/冲突项，永不覆盖已有草稿。target 或 ABI 不明不能跨 variant 去重。
+3. 对可得源执行 canonical/严格验证、完整 hash 检查；用 `(canonical bytes, schema, render target, compiler ABI compatibility)` 去重。相同 hash 不同 ID 可复用当前资源并保存 alias；legacy ID 嵌入内容导致 canonical 不同则不声称相同资源，可建立逻辑关联。相同 ID 不同 hash 标记冲突，要求用户明确选择“保留 Bridge 当前最新版”或“以设备内容替换当前最新版”，不能同时建立历史版本，也不能静默覆盖。target 或 ABI 不明不能跨 variant 去重。
 4. 再读清单/active 对比观察前后 generation；legacy 无 generation 则比对 hash/顺序/active，两次不一致有限重试后输出 inconsistent report，不宣称一致导入。
-5. 本地原子创建新的 Profile 与 `origin=observed` 的 DeploymentBaseline，保留原 slot 顺序以及 observed_active 独立字段。Profile 的正常首个默认规则不改：以后点击发布默认明确展示“保留观察 active”选项；不能为了 active 在第2槽而悄悄重排。
+5. 用户明确选择“从设备恢复为 Profile”时，才在本地创建新的 Profile 与 `origin=observed` 的 DeploymentBaseline，保留原 slot 顺序以及 observed_active 独立字段。Profile 的正常首个默认规则不改：以后点击发布默认明确展示“保留观察 active”选项；不能为了 active 在第2槽而悄悄重排。
 6. 报告 resolved/reused/alias/conflict/unresolved/unsupported、观察时间与 active；无论全成功与否均 sync_authorization=false，不自动重推、不刷屏、不改active、不claim。缺源的项可被保留和查看，阻止发布直到用户补源或显式移除。
 
-若清单超3项，完整 observed inventory 保留，Profile 标记需要用户裁剪后可发布；不把第4项误当设备。为证明无写入，测试注入 transport spy，允许列表只有 read status/export；自动发现、contact/activity 副作用也需隔离。
+若清单超3项，完整 observed inventory 只保留在本次恢复报告中，生成 Profile 前要求用户裁剪；不把第4项误当设备。为证明无写入，测试注入 transport spy，允许列表只有 read status/export；自动发现、contact/activity 副作用也需隔离。
 
 ### 9.3 本地切换与同步
 
@@ -331,7 +334,7 @@ Wi-Fi MAC 是主键，名称、BLE地址、广告短摘要均不是认证凭证�
 
 普通运行数据仍在 `<exe>/data`，种子 `<exe>/seed`/开发只读回退。凭据不入仓库/日志；对请求 URL、异常链及 headers 统一脱敏。PROGRESS 已记录历史 token 日志风险，属于需单独修复/轮换的已知事项，本设计不复制任何 token。
 
-schema 1 用 LegacyCodexAdapter 提供旧信封与 bind；schema 2 不混入旧解析器。新桥配旧固件继续旧 HTTP/模板语义并显示“非原子发布”限制；旧桥配新固件默认 legacy，用户显式启用新 Deployment/功耗能力后才切换。新协议暂时失联不等于对端不支持，不因漏一轮会合自动永久改模式。BOOT 仍提供恢复入口。模板升级创建新 revision，保留旧 canonical；不能自动重写已发布资源。
+schema 1 用 LegacyCodexAdapter 提供旧信封与 bind；schema 2 不混入旧解析器。新桥配旧固件继续旧 HTTP/模板语义并显示“非原子发布”限制；旧桥配新固件默认 legacy，用户显式启用新 Deployment/功耗能力后才切换。新协议暂时失联不等于对端不支持，不因漏一轮会合自动永久改模式。BOOT 仍提供恢复入口。模板保存替换库中当前最新版，但不能改写已经冻结的在途 ReleaseArtifact 或设备上已安装内容；只有下一次显式发布才更新设备。
 
 ## 11. 失败模型与恢复
 
@@ -357,12 +360,12 @@ schema 1 用 LegacyCodexAdapter 提供旧信封与 bind；schema 2 不混入旧�
 ## 12. 四标签用户流程
 
 1. **数据管理**：创建 Codex 或 Static JSON SourceInstance → 测试读取 → 查看字段、类型、最后成功/观测/过期/错误；保存字段映射。凭据只显示引用与可用状态。
-2. **模板管理**：选择/编辑模板，选择目标 variant，预览正常/缺失/过期/边界数据；组合有序 Profile。也可“从设备导入现有模板”，结果带 observed/unresolved 标识。
+2. **模板管理**：选择/编辑模板当前最新版，选择目标 variant，预览正常/缺失/过期/边界数据；组合有序 Profile。模板不显示历史版本或回滚入口。
 3. **设备管理**：选设备 → 选 Profile → 为各项 slot 绑定 Dataset → 查看当前 active 与发布后默认 active → 预览该设备 target → 显式发布并授权同步节奏。批量列表逐台展示成功/等待/失败。
-4. **设备管理**的 Deployment 面板：持续同步/暂停、已安装与期望差异、按钮切换后的实况、重试/取消/回滚；**功耗子菜单**显示 lease、会合与刷新预算，提供明确控制动作。
+4. **设备管理**的 Deployment 面板：持续同步/暂停、已安装与当前最新版差异、按钮切换后的实况、重试/取消/重新发布最新版；**功耗子菜单**显示 lease、会合与刷新预算，提供明确控制动作。读取设备模板位于恢复/诊断入口，不占模板管理主界面。
 5. **MCP**：显示与上述同一用例的工具、请求/结果/诊断；agent 保存模板不会发布，显式 publish 工具接受冻结预览的引用与目标设备，错误与 UI 一致。
 
-模板/Profile 页展示“草稿有更新”而不是默认自动追踪推送。设备页展示“已安装但数据过期”与“数据已应用但显示失败”，不能统一叫同步失败。
+模板/Profile 页展示“最新版有未发布修改”而不是自动追踪推送。设备页展示“已安装内容不是当前最新版”“数据过期”与“数据已应用但显示失败”，不能统一叫同步失败。
 
 ## 13. 渐进迁移与准入
 
@@ -373,7 +376,7 @@ schema 1 用 LegacyCodexAdapter 提供旧信封与 bind；schema 2 不混入旧�
 | M2 第二 Provider | CodexAdapter + Static JSON、Dataset、revision/freshness、四标签导航 | Static JSON 独立预览；legacy Codex 输出逐字段兼容 |
 | M3 编译核心 | schema1 编译兼容层、schema2 slots、DataRequirementPlan/RenderPlan、target参数 | 共享C++逐像素一致；计数证明日常路径不解析JSON；未部署前测峰值 |
 | M4 Deployment store | 内容寻址资源、双manifest、ActivationRecord、typed snapshots/checkpoint | 断电注入通过；旧store只读迁移/保留回退，不就地覆写 |
-| M5 通用同步与导入 | active-only ViewBuilder、观察导入/冲突报告、持续授权与暂停 | 旧包拒绝、导入零设备写、多个slot/设备故障隔离 |
+| M5 通用同步与恢复读取 | active-only ViewBuilder、设备恢复读取/冲突报告、持续授权与暂停 | 旧包拒绝、恢复读取零设备写、多个slot/设备故障隔离 |
 | M6 BLE功耗协议 | 原子小快照、独立light lease、总截止、Windows调度 | 延续专项已完成显示基座；新协议默认仍需小规模实测后启用 |
 | M7 第二硬件 | 核实NOTE4输入、独立env/ROM、panel profile/variant | 全刷先通过、OTA防错、照片/功耗验收后开放局刷 |
 
@@ -393,7 +396,7 @@ M3/M4 可在主机完成后才进板端；M2 的 Static JSON 可先只在预览�
 | 数据质量 | 同值轮询、失败旧值、续valid_until、时钟未知/回拨、多slot skew | revision各司其职；过期可本地判断；无伪fresh |
 | 激活竞争 | A→B、A→B→A，BEGIN前/COMMIT前切换 | 旧包无应用/刷屏；active恰一个 |
 | 发布冻结 | deep排队后编辑模板/Profile/映射；取消/重试 | 资源字节不变；重试同release，编辑只影响下次发布 |
-| 导入 | 同hash异ID、同ID异hash、缺源、variant/ABI未知、清单变化 | alias/revision/unresolved正确；无claim/WAKE/usage/template/active写 |
+| 恢复读取 | 同hash异ID、同ID异hash、缺源、variant/ABI未知、清单变化 | alias/conflict/unresolved正确；无claim/WAKE/usage/template/active写 |
 | 存储故障 | 每资源写/manifest/marker/pointer/GC阶段断电 | 恢复完整旧或新版本；不组合半套；上一有效版本受保护 |
 | ACK恢复 | volatile/RTC/durable提交、波形失败、ACK丢失、冷复位 | 报告实际checkpoint，重放幂等，displayed不虚报 |
 | 安全 | 错MAC/token/owner、未bond/未加密、未知capability | 全部拒绝越权，无隐式claim、日志无凭据 |
@@ -411,19 +414,19 @@ M3/M4 可在主机完成后才进板端；M2 的 Static JSON 可先只在预览�
 | Keep | Change | Defer |
 |---|---|---|
 | MAC主键、token/claim、安全边界 | Codex从协议中心变Provider | 任意脚本、通用插件加载器 |
-| 3项Profile与单active、按钮切换 | immutable revision/每设备Deployment | 设备完整JSON Schema解释器 |
+| 3项Profile与单active、按钮切换 | 当前最新版+发布快照/每设备Deployment | 模板历史版本库与模板回滚UI |
 | 同源C++渲染与ASCII净化 | JSON安装期编译，typed运行快照 | Patch/Event通用传输 |
 | SSD1681安全全刷、独立clock预算 | target参数、BSP/panel边界 | 约束布局、自动缩放适配 |
-| portable data/seed、显式推送 | 应用用例共享、冻结队列、观察导入 | 多设备分布式原子事务 |
+| portable data/seed、显式推送 | 应用用例共享、冻结队列、恢复读取 | 多设备分布式原子事务 |
 | legacy可回退 | 双manifest/checkpoint、显式light lease | 通用历史库、NFC/音频业务、面板双相实验 |
 
 Decision Required（不阻塞保守实现）：
 
 - NOTE4实际硬件与panel参数：推荐在核实前只做target接口与模拟尺寸测试，不交付该板ROM。
 - 日常数据掉电保留保证：推荐默认RTC/定期durable，UI展示可能回退到checkpoint；需要每次durable的部署单独启用并验证flash寿命/功耗。
-- 观察导入后未来发布的active：推荐保留独立observed_active，发布确认默认保留它；新建Profile仍首个默认，任何改变都可见。
+- 从设备恢复Profile后的active：推荐保留独立observed_active，后续发布确认默认保留它；新建Profile仍首个默认，任何改变都可见。
 - 授权持续同步：推荐显式发布默认勾选且清晰显示、随时暂停；不把导入或claim视为同意。
 - 更大槽数、彩色/灰阶、通用提醒：先保持3项和黑白最小协议，有第二个真实需求后再扩展能力。
 - 新OTA包真实性：hash只保证完整性，推荐后续引入签名发布；无签名时仍必须token与target校验，不声称供应链认证。
 
-本设计的最小成功标准是：同一 Bridge 可管理两台设备及两种 Provider；每台只有一个 active 所需的有界数据在同步；冻结发布可重试、观察导入不碰设备；旧 Codex 设备继续可用；每条功耗路径都有设备端硬截止；不同 target 不会互刷 ROM 或误用模板。
+本设计的最小成功标准是：同一 Bridge 可管理两台设备及两种 Provider；每台只有一个 active 所需的有界数据在同步；当前最新版发布快照可重试、恢复读取不碰设备；旧 Codex 设备继续可用；每条功耗路径都有设备端硬截止；不同 target 不会互刷 ROM 或误用模板。
