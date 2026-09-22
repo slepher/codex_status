@@ -1,0 +1,771 @@
+//! Application-service front end for the four UI pages and MCP (v2 §2/§11).
+//!
+//! Both interfaces call these functions; there is no second business model.
+//! Saving never publishes, publishing never auto-enables sync, and every device
+//! write is a user-visible action that goes through the coordinator.
+
+use std::sync::Arc;
+
+use bridge_core::coordinator::DeliveryKind;
+use bridge_core::platform::model::{DeviceCapabilities, DeviceIdentity, Profile};
+use bridge_core::platform::service::PlatformService;
+use bridge_core::v2_client;
+use serde_json::{json, Value};
+use std::time::Duration;
+
+use crate::AppCtx;
+
+/// Resolved per-device transport facts (token from the cached device token).
+pub struct DeviceLink {
+    pub mac: String,
+    pub ip: String,
+    pub token: String,
+    pub bridge_id: String,
+}
+
+pub fn service(ctx: &AppCtx) -> &Arc<PlatformService> {
+    &ctx.platform
+}
+
+/// Device link from the live identity + cached device token; `None` when the
+/// token has not been negotiated yet (click BOOT to open the BLE session).
+pub fn device_link(ctx: &AppCtx) -> Option<DeviceLink> {
+    let ip = ctx.device_ip.lock().unwrap().clone();
+    if ip.is_empty() || ip == "0.0.0.0" {
+        return None;
+    }
+    let mac = ctx
+        .device_mac
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| "".to_string());
+    if mac.is_empty() {
+        return None;
+    }
+    // v2 business endpoints authenticate with the endpoint token the bridge
+    // wrote over BLE (the same trust as /usage and /template); the device
+    // operation token stays reserved for /claim, /update and /doUpdate.
+    let token = ctx.config.token.clone();
+    if token.is_empty() {
+        return None;
+    }
+    Some(DeviceLink {
+        mac,
+        ip,
+        token,
+        bridge_id: ctx.bridge_id.clone(),
+    })
+}
+
+fn timeout() -> Duration {
+    Duration::from_secs(6)
+}
+
+fn endpoint(ctx: &AppCtx) -> String {
+    ctx.device_ip.lock().unwrap().clone()
+}
+
+fn err_text(e: impl std::fmt::Display) -> String {
+    e.to_string()
+}
+
+/// Run the blocking std-socket client off the async runtime.
+async fn blocking<T, F>(f: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+// ---------------------------------------------------------------------------
+// Overview / templates / profiles
+// ---------------------------------------------------------------------------
+
+pub fn overview(ctx: &AppCtx) -> Value {
+    let mut value = service(ctx).overview();
+    value["device"] = device_summary(ctx);
+    value["legacy_device"] = json!(
+        !service(ctx).devices().is_empty()
+            && service(ctx).devices()[0]["legacy"]
+                .as_bool()
+                .unwrap_or(false)
+    );
+    value["link"] = match device_link(ctx) {
+        Some(link) => json!({"mac": link.mac, "ip": link.ip, "token_cached": true}),
+        None => {
+            json!({"mac": ctx.device_mac.lock().unwrap().clone(), "ip": endpoint(ctx), "token_cached": false})
+        }
+    };
+    value
+}
+
+fn device_summary(ctx: &AppCtx) -> Value {
+    let mac = ctx.device_mac.lock().unwrap().clone();
+    let name = ctx.device_name.lock().unwrap().clone();
+    json!({
+        "device_mac": mac,
+        "name": name,
+        "ip": endpoint(ctx),
+    })
+}
+
+pub fn device_rows(ctx: &AppCtx) -> Value {
+    json!({
+        "devices": service(ctx).devices(),
+        "templates": service(ctx).templates(),
+    })
+}
+
+pub fn templates(ctx: &AppCtx) -> Value {
+    json!({
+        "templates": service(ctx).templates(),
+        "targets": [target_contract("codex-status-154g", "epd-ssd1681-200x200-1bpp", true),
+                    target_contract("codex-status-154g-gray4", "epd-200x200-2bpp-gray4", false)],
+    })
+}
+
+fn target_contract(firmware_target: &str, render_target: &str, verified: bool) -> Value {
+    json!({
+        "firmware_target": firmware_target,
+        "render_target": render_target,
+        "hardware_verified": verified,
+        "note": if verified { "hardware-verified" } else { "blocked_by_hardware_arrival: compile/host tested only" },
+    })
+}
+
+pub fn template_get(ctx: &AppCtx, id: &str, render_target: Option<&str>) -> Result<Value, String> {
+    service(ctx)
+        .template_get(id, render_target)
+        .ok_or_else(|| format!("unknown template {id}"))
+}
+
+pub fn template_save(
+    ctx: &AppCtx,
+    id: &str,
+    render_target: &str,
+    source: &Value,
+) -> Result<Value, String> {
+    let saved = service(ctx)
+        .template_save(id, render_target, source, now_secs())
+        .map_err(err_text)?;
+    Ok(json!({
+        "saved": true,
+        "published": false,
+        "template_id": saved.key.template_id,
+        "render_target": saved.key.render_target,
+        "source_crc": saved.source_crc,
+        "compiled_crc": bridge_core::compile::compiled_crc(&saved.compiled),
+        "requirements": saved.compiled.requirements,
+        "note": "saved only; use publish on a device to push",
+    }))
+}
+
+pub fn template_validate(source: &Value) -> Value {
+    match bridge_core::compile::compile(source, "epd-ssd1681-200x200-1bpp") {
+        Ok(compiled) => json!({
+            "valid": true,
+            "compiler_abi": compiled.compiler_abi,
+            "requirements": compiled.requirements,
+            "resources": compiled.resources.len(),
+        }),
+        Err(e) => json!({"valid": false, "error": e.to_string()}),
+    }
+}
+
+pub fn template_preview(
+    ctx: &AppCtx,
+    id: Option<&str>,
+    source: Option<&Value>,
+    usage: Option<&str>,
+) -> Result<Value, String> {
+    let source = match source {
+        Some(s) => s.clone(),
+        None => {
+            let id = id.ok_or("template_preview needs id or json")?;
+            let stored = service(ctx)
+                .template_get(id, None)
+                .ok_or_else(|| format!("unknown template {id}"))?;
+            stored["source"].clone()
+        }
+    };
+    let text = serde_json::to_string(&source).map_err(err_text)?;
+    let usage = match usage {
+        Some(u) => u.to_string(),
+        None => service(ctx)
+            .coordinator_summary(&ctx.device_mac.lock().unwrap().clone().unwrap_or_default())
+            .and_then(|s| s.get("source_error").cloned())
+            .map(|_| String::new())
+            .unwrap_or_default(),
+    };
+    let bits = bridge_render::render_bits(&text, &usage, &bridge_render::Env::default())
+        .map_err(err_text)?;
+    let png = bridge_render::bits_to_png(&bits).map_err(err_text)?;
+    Ok(json!({
+        "render_target": "epd-ssd1681-200x200-1bpp",
+        "width": bridge_render::WIDTH,
+        "height": bridge_render::HEIGHT,
+        "png_len": png.len(),
+        "png_base64": base64(&png),
+    }))
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+pub fn profile_get(ctx: &AppCtx) -> Value {
+    let mac = ctx.device_mac.lock().unwrap().clone().unwrap_or_default();
+    json!({
+        "device_mac": mac,
+        "profile": service(ctx).profile_get(&mac),
+        "draft": Profile::draft(&mac),
+    })
+}
+
+pub fn profile_save(ctx: &AppCtx, profile: Profile) -> Result<Value, String> {
+    let saved = service(ctx)
+        .profile_save(profile, now_secs())
+        .map_err(err_text)?;
+    Ok(json!({
+        "saved": true,
+        "published": false,
+        "device_mac": saved.device_mac,
+        "template_ids": saved.template_ids,
+        "initial_active_id": saved.initial_active_id,
+        "sync_enabled": saved.sync_enabled,
+        "note": "profile saved only; publish is a separate explicit action",
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Publish / delivery
+// ---------------------------------------------------------------------------
+
+pub async fn publish(ctx: &AppCtx, mac: &str) -> Result<Value, String> {
+    let job = service(ctx).publish(mac, now_secs()).map_err(err_text)?;
+    let delivery = deliver(ctx, mac).await;
+    Ok(json!({
+        "job": job,
+        "delivery": delivery,
+        "state": service(ctx).job(mac),
+    }))
+}
+
+pub fn job_cancel(ctx: &AppCtx, mac: &str) -> Value {
+    service(ctx).cancel_job(mac);
+    json!({"cancelled": true, "job": service(ctx).job(mac)})
+}
+
+pub async fn activate(ctx: &AppCtx, mac: &str, template_id: &str) -> Result<Value, String> {
+    service(ctx).activate(mac, template_id).map_err(err_text)?;
+    Ok(deliver(ctx, mac).await)
+}
+
+/// Execute at most one pending coordinator action against the device.
+pub async fn deliver(ctx: &AppCtx, mac: &str) -> Value {
+    let Some(link) = device_link(ctx) else {
+        return json!({"result": "waiting_for_link", "reason": "device token/ip not available; open a BOOT session"});
+    };
+    let reachable = true;
+    let decision = service(ctx).next_delivery(mac, reachable, now_secs());
+    match decision["decision"].as_str().unwrap_or("none") {
+        "bundle" => {
+            let payload = match service(ctx).bundle_payload(mac) {
+                Ok(p) => p,
+                Err(e) => return json!({"result": "failed", "error": e.to_string()}),
+            };
+            let (ip, token, bridge_id) =
+                (link.ip.clone(), link.token.clone(), link.bridge_id.clone());
+            match blocking(move || {
+                v2_client::install_bundle(
+                    &ip,
+                    &token,
+                    &bridge_id,
+                    &payload,
+                    v2_client::BUNDLE_CHUNK_BYTES,
+                    Duration::from_secs(60),
+                )
+                .map_err(err_text)
+            })
+            .await
+            {
+                Ok(ack) => {
+                    let job_id = service(ctx)
+                        .job(mac)
+                        .and_then(|j| j["job_id"].as_str().map(str::to_string))
+                        .unwrap_or_default();
+                    if ack["result"] == "applied" {
+                        let ctx_id = ack["active_context_id"].as_str().unwrap_or("");
+                        service(ctx).retry_job(mac, &job_id, true, now_secs());
+                        if !ctx_id.is_empty() {
+                            let _ = service(ctx).adopt_activation_context(mac, ctx_id, now_secs());
+                        }
+                    } else {
+                        let _ = service(ctx).retry_job(mac, &job_id, false, now_secs());
+                    }
+                    json!({"result": "bundle", "ack": ack})
+                }
+                Err(e) => json!({"result": "deferred", "error": e}),
+            }
+        }
+        "activate" => {
+            let template_id = decision["template_id"].as_str().unwrap_or("").to_string();
+            let (ip, token, bridge_id) =
+                (link.ip.clone(), link.token.clone(), link.bridge_id.clone());
+            let id = template_id.clone();
+            match blocking(move || {
+                v2_client::activate(&ip, &token, &bridge_id, &id, timeout()).map_err(err_text)
+            })
+            .await
+            {
+                Ok(ack) => {
+                    if ack["result"] == "applied" {
+                        if let Some(ctx_id) = ack["active_context_id"].as_str() {
+                            let _ = service(ctx).note_activate_done(mac, ctx_id, now_secs());
+                        }
+                    }
+                    json!({"result": "activate", "ack": ack})
+                }
+                Err(e) => json!({"result": "deferred", "error": err_text(e)}),
+            }
+        }
+        "ble_data" | "light_data" => {
+            let body = service(ctx).data_message_body(mac);
+            let Some(body) = body else {
+                return json!({"result": "idle", "note": "no in-flight snapshot"});
+            };
+            let mut payload = body.clone();
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("bridge_id".into(), json!(link.bridge_id));
+            }
+            let (ip, token) = (link.ip.clone(), link.token.clone());
+            let sent = payload.clone();
+            match blocking(move || v2_client::data(&ip, &token, &sent, timeout()).map_err(err_text))
+                .await
+            {
+                Ok(ack) => {
+                    let applied = ack["result"] == "applied";
+                    let seq = body["seq"].as_u64().unwrap_or(0);
+                    let crc = body["crc"].as_str().unwrap_or("").to_string();
+                    let kind = if decision["decision"] == "ble_data" {
+                        DeliveryKind::BleData
+                    } else {
+                        DeliveryKind::LightData
+                    };
+                    service(ctx).note_ack(
+                        mac,
+                        kind,
+                        seq,
+                        &crc,
+                        applied,
+                        ack["display_state"].as_str().unwrap_or("unchanged"),
+                    );
+                    json!({"result": "data", "ack": ack})
+                }
+                Err(e) => json!({"result": "deferred", "error": e}),
+            }
+        }
+        "waiting_for_rendezvous" => json!(decision),
+        other => json!({"result": other}),
+    }
+}
+
+/// Formal plan decision for the current rendezvous (Bridge is the only decider).
+pub async fn send_plan(
+    ctx: &AppCtx,
+    mac: &str,
+    wake_reason: &str,
+    provisional_remaining_s: u32,
+) -> Value {
+    let Some(link) = device_link(ctx) else {
+        return json!({"result": "waiting_for_link"});
+    };
+    let plan = match service(ctx).plan_for_rendezvous(
+        mac,
+        now_secs(),
+        wake_reason,
+        provisional_remaining_s,
+    ) {
+        Ok(p) => p,
+        Err(e) => return json!({"result": "failed", "error": e.to_string()}),
+    };
+    let mut body = serde_json::to_value(&plan).unwrap_or(Value::Null);
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("bridge_id".into(), json!(link.bridge_id));
+    }
+    let (ip, token) = (link.ip.clone(), link.token.clone());
+    let sent = body.clone();
+    match blocking(move || v2_client::plan(&ip, &token, &sent, timeout()).map_err(err_text)).await {
+        Ok(ack) => {
+            let accepted = ack["result"] == "applied";
+            if let Some(remaining) = ack["accepted_remaining_s"].as_u64() {
+                let _ = service(ctx).note_plan_ack(
+                    mac,
+                    plan.plan_id,
+                    remaining as u32,
+                    plan.mode == bridge_core::platform::model::PlanMode::Light
+                        && provisional_remaining_s > 0,
+                );
+            }
+            json!({"result": "plan", "plan": plan, "ack": ack, "accepted": accepted})
+        }
+        Err(e) => json!({"result": "deferred", "error": e}),
+    }
+}
+
+/// Refresh the bridge-side view from the device's authenticated status.
+pub async fn refresh_status(ctx: &AppCtx, mac: &str) -> Value {
+    let Some(link) = device_link(ctx) else {
+        return json!({"result": "waiting_for_link"});
+    };
+    let (ip, token) = (link.ip.clone(), link.token.clone());
+    match blocking(move || v2_client::status(&ip, &token, timeout()).map_err(err_text)).await {
+        Ok(status) => {
+            let _ = service(ctx).note_device_status(mac, &status);
+            json!({"result": "ok", "status": status})
+        }
+        Err(e) => json!({"result": "offline", "error": e}),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Data sources
+// ---------------------------------------------------------------------------
+
+pub fn data_sources(ctx: &AppCtx) -> Value {
+    json!({
+        "sources": service(ctx).data_sources(),
+        "codex_envelope_available": service(ctx).codex_envelope_available(),
+    })
+}
+
+pub fn data_source_save(ctx: &AppCtx, source: Value) -> Result<Value, String> {
+    let parsed = bridge_core::datasource::parse_data_source(&source).map_err(err_text)?;
+    service(ctx).data_source_save(parsed).map_err(err_text)?;
+    Ok(json!({"saved": true, "sources": service(ctx).data_sources()}))
+}
+
+pub fn data_probe(ctx: &AppCtx, source_id: &str) -> Result<Value, String> {
+    let snapshot = service(ctx).data_probe(source_id).map_err(err_text)?;
+    Ok(json!({
+        "source_id": snapshot.source_id,
+        "quality": snapshot.quality,
+        "observed_at": snapshot.observed_at,
+        "valid_until": snapshot.valid_until,
+        "last_success_at": snapshot.last_success_at,
+        "error": snapshot.error,
+        "fields": snapshot.fields.iter().map(|(k, v)| json!({
+            "field": k, "value": v.value, "quality": v.quality,
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+/// Feed the Codex envelope into the platform (called by the poller/pull path).
+pub fn note_envelope(ctx: &AppCtx, envelope: &Value) {
+    let _ = service(ctx).note_codex_envelope(envelope);
+}
+
+// ---------------------------------------------------------------------------
+// Power (device submenu)
+// ---------------------------------------------------------------------------
+
+pub fn power_view(ctx: &AppCtx) -> Value {
+    let mac = ctx.device_mac.lock().unwrap().clone().unwrap_or_default();
+    let summary = service(ctx).coordinator_summary(&mac);
+    json!({
+        "device_mac": mac,
+        "coordinator": summary,
+        "note": "reads never extend the light deadline; only a formal PowerPlan does",
+    })
+}
+
+pub fn recovery(ctx: &AppCtx, digest: &Value) -> Result<Value, String> {
+    let mac = ctx.device_mac.lock().unwrap().clone().unwrap_or_default();
+    let profile = service(ctx)
+        .recovery_import(&mac, digest, now_secs())
+        .map_err(err_text)?;
+    Ok(json!({
+        "imported": true,
+        "sync_enabled": false,
+        "profile": profile,
+        "note": "recovered profiles start with data sync disabled",
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Device registration / MCP helper
+// ---------------------------------------------------------------------------
+
+/// Capabilities from a `/status.json` document. Firmware that reports
+/// `fw_target` speaks v2; anything older is legacy (≤3 templates, legacy
+/// channel) and must be shown as such instead of silently truncating.
+pub fn caps_from_status(raw: &Value) -> (DeviceCapabilities, bool) {
+    let fw_target = raw.get("fw_target").and_then(|v| v.as_str());
+    let Some(fw_target) = fw_target else {
+        let mut caps = DeviceCapabilities::ssd1681_154g();
+        caps.max_templates = 3;
+        caps.max_light_s = 600;
+        return (caps, true);
+    };
+    let render_target = raw
+        .get("render_target")
+        .and_then(|v| v.as_str())
+        .unwrap_or("epd-ssd1681-200x200-1bpp");
+    let verified = render_target == "epd-ssd1681-200x200-1bpp";
+    let caps = DeviceCapabilities {
+        firmware_target: fw_target.to_string(),
+        render_target: render_target.to_string(),
+        compiler_abi: raw
+            .get("compiler_abi")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(bridge_core::compile::COMPILER_ABI as u64) as u32,
+        max_templates: 8,
+        partial: verified,
+        hardware_verified: verified,
+        ..DeviceCapabilities::ssd1681_154g()
+    };
+    (caps, false)
+}
+
+/// Feed the device's own status digest (MAC-verified HTTP read) into the
+/// coordinator; the authenticated `/v2/status` remains authoritative for writes.
+pub fn note_status_json(ctx: &AppCtx, raw: &Value) {
+    let mac = ctx.device_mac.lock().unwrap().clone().unwrap_or_default();
+    if mac.is_empty() {
+        return;
+    }
+    let _ = service(ctx).note_device_status(&mac, raw);
+}
+
+/// Register/refresh the current device in the platform service. Legacy devices
+/// keep the legacy flag so the UI shows the limitation instead of truncating.
+pub fn ensure_device(ctx: &AppCtx, capabilities: DeviceCapabilities, legacy: bool) {
+    let mac = ctx.device_mac.lock().unwrap().clone().unwrap_or_default();
+    if mac.is_empty() {
+        return;
+    }
+    let name = ctx.device_name.lock().unwrap().clone();
+    if let Ok(identity) = DeviceIdentity::new(&mac, &name) {
+        let mut identity = identity;
+        identity.ip = Some(endpoint(ctx));
+        let _ = service(ctx).device_upsert(identity, capabilities, legacy);
+    }
+}
+
+/// True when the device speaks the v2 protocol: the legacy Wi-Fi push channel
+/// must then stay quiet (one device, one data channel).
+pub fn is_v2_device(ctx: &AppCtx) -> bool {
+    let mac = ctx.device_mac.lock().unwrap().clone().unwrap_or_default();
+    if mac.is_empty() {
+        return false;
+    }
+    service(ctx)
+        .device_get(&mac)
+        .map(|d| !d["legacy"].as_bool().unwrap_or(true))
+        .unwrap_or(false)
+}
+
+/// Run one coordinator cycle for the current device: optional authenticated
+/// status refresh and one pending delivery attempt.
+pub async fn cycle(ctx: &AppCtx, refresh: bool, deliver_now: bool) {
+    let mac = ctx.device_mac.lock().unwrap().clone().unwrap_or_default();
+    if mac.is_empty() {
+        return;
+    }
+    // Owner maintenance uses the exact legacy rules (free -> claim, self ->
+    // renew at >=60 s, other -> stop writing). Renewal is a protocol keep-alive
+    // and never extends the light deadline.
+    match crate::occupancy_gate(ctx).await {
+        crate::Occupancy::Owned | crate::Occupancy::Unsupported => {}
+        crate::Occupancy::Yielded | crate::Occupancy::Other(_) | crate::Occupancy::Failed(_) => {
+            return;
+        }
+    }
+    if refresh {
+        let _ = refresh_status(ctx, &mac).await;
+        // Formal plan for the current rendezvous: the Bridge is the only source
+        // of light/sleep decisions. A BOOT wake is answered with the *remaining*
+        // provisional window; everything else is a fresh decision. Repeats are
+        // idempotent on the device; a new id is only generated when the decision
+        // really changes or the window has expired.
+        let status = service(ctx)
+            .coordinator_summary(&mac)
+            .unwrap_or(Value::Null);
+        let provisional = status["session"]["power"]["provisional"]
+            .as_bool()
+            .unwrap_or(false);
+        let remaining = status["session"]["power"]["provisional_remaining_s"]
+            .as_u64()
+            .unwrap_or(0) as u32;
+        if provisional {
+            let _ = send_plan(ctx, &mac, "manual", remaining).await;
+        } else {
+            let _ = send_plan(ctx, &mac, "rendezvous", 0).await;
+        }
+    }
+    if deliver_now {
+        let _ = deliver(ctx, &mac).await;
+    }
+}
+
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// `json` tool argument: accept either an embedded object or a JSON string.
+fn json_arg(args: &Value) -> Result<Value, String> {
+    match args.get("json") {
+        Some(Value::String(text)) => serde_json::from_str(text).map_err(|e| format!("json: {e}")),
+        Some(value) => Ok(value.clone()),
+        None => Err("missing json".to_string()),
+    }
+}
+
+/// MCP-tool adapter: same service calls as the UI commands.
+pub async fn tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, String> {
+    let value = match name {
+        "platform_overview" => overview(ctx),
+        "template_list" => templates(ctx),
+        "template_get_v2" => {
+            let id = args
+                .get("id")
+                .and_then(|v| v.as_str())
+                .ok_or("missing id")?;
+            let target = args.get("render_target").and_then(|v| v.as_str());
+            template_get(ctx, id, target)?
+        }
+        "template_save_v2" => {
+            let id = args
+                .get("id")
+                .and_then(|v| v.as_str())
+                .ok_or("missing id")?;
+            let target = args
+                .get("render_target")
+                .and_then(|v| v.as_str())
+                .unwrap_or("epd-ssd1681-200x200-1bpp");
+            let source = json_arg(args)?;
+            template_save(ctx, id, target, &source)?
+        }
+        "template_validate_v2" => template_validate(&json_arg(args)?),
+        "profile_get_v2" => profile_get(ctx),
+        "profile_save_v2" => {
+            let profile: Profile =
+                serde_json::from_value(args.get("profile").cloned().ok_or("missing profile")?)
+                    .map_err(err_text)?;
+            profile_save(ctx, profile)?
+        }
+        "platform_publish" => {
+            let mac = device_mac(ctx)?;
+            publish(ctx, &mac).await?
+        }
+        "platform_publish_cancel" => {
+            let mac = device_mac(ctx)?;
+            job_cancel(ctx, &mac)
+        }
+        "template_activate" => {
+            let mac = device_mac(ctx)?;
+            let id = args
+                .get("id")
+                .and_then(|v| v.as_str())
+                .ok_or("missing id")?;
+            activate(ctx, &mac, id).await?
+        }
+        "data_sources_v2" => data_sources(ctx),
+        "data_source_save_v2" => {
+            let source = args.get("source").cloned().ok_or("missing source")?;
+            data_source_save(ctx, source)?
+        }
+        "data_probe_v2" => {
+            let id = args
+                .get("source_id")
+                .and_then(|v| v.as_str())
+                .ok_or("missing source_id")?;
+            data_probe(ctx, id)?
+        }
+        "power_view_v2" => power_view(ctx),
+        "power_plan" => {
+            let mac = device_mac(ctx)?;
+            let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("auto");
+            match mode {
+                "light" => send_plan(ctx, &mac, "explicit", 0).await,
+                "sleep" => {
+                    // A fresh id is required: reusing an old id (or 0) would be
+                    // rejected as stale by the device.
+                    let plan = service(ctx)
+                        .explicit_plan(
+                            &mac,
+                            bridge_core::platform::model::PlanMode::Sleep,
+                            0,
+                            "explicit",
+                        )
+                        .map_err(err_text)?;
+                    let mut body = serde_json::to_value(&plan).unwrap();
+                    body["bridge_id"] = json!(ctx.bridge_id);
+                    let link = device_link(ctx).ok_or("device token not cached")?;
+                    let (ip, token) = (link.ip.clone(), link.token.clone());
+                    let sent = body.clone();
+                    let ack = blocking(move || {
+                        v2_client::plan(&ip, &token, &sent, timeout()).map_err(err_text)
+                    })
+                    .await?;
+                    json!({"plan": body, "ack": ack})
+                }
+                other => return Err(format!("mode must be light|sleep (got {other})")),
+            }
+        }
+        "platform_status_refresh" => {
+            let mac = device_mac(ctx)?;
+            refresh_status(ctx, &mac).await
+        }
+        // Explicit user/agent action: deliver pending data now instead of
+        // waiting for the automatic cadence.
+        "platform_push_now" => {
+            let mac = device_mac(ctx)?;
+            deliver(ctx, &mac).await
+        }
+        "platform_recovery" => {
+            let digest = args.get("digest").cloned().ok_or("missing digest")?;
+            recovery(ctx, &digest)?
+        }
+        other => return Err(format!("unknown platform tool: {other}")),
+    };
+    serde_json::to_string_pretty(&value).map_err(err_text)
+}
+
+fn device_mac(ctx: &AppCtx) -> Result<String, String> {
+    ctx.device_mac
+        .lock()
+        .unwrap()
+        .clone()
+        .filter(|m| !m.is_empty())
+        .ok_or_else(|| "device MAC not learned yet".to_string())
+}

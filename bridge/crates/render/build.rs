@@ -41,6 +41,7 @@ fn main() {
         .warnings(false)
         .flag_if_supported("/utf-8")
         .file(firmware.join("template_engine.cpp"))
+        .file(firmware.join("v2_runtime.cpp"))
         .file(firmware.join("refresh_policy.cpp"))
         .file(firmware.join("GUI_Paint.cpp"))
         .file(&ffi);
@@ -50,7 +51,8 @@ fn main() {
     build.compile("bridge_render");
 
     for tracked in ["template_engine.cpp", "template_engine.h", "GUI_Paint.cpp",
-                    "GUI_Paint.h", "refresh_policy.cpp", "refresh_policy.h"] {
+                    "GUI_Paint.h", "refresh_policy.cpp", "refresh_policy.h",
+                    "v2_state.h", "v2_runtime.h", "v2_runtime.cpp"] {
         println!("cargo:rerun-if-changed={}", firmware.join(tracked).display());
     }
     println!("cargo:rerun-if-changed={}", ffi.display());

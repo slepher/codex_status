@@ -4,6 +4,7 @@ mod autostart;
 mod config;
 mod discovery;
 mod icon;
+mod platform;
 mod watchdog;
 
 use std::path::{Path, PathBuf};
@@ -126,6 +127,9 @@ struct AppCtx {
     mcp_port: Mutex<u16>,
     mcp_error: Mutex<Option<String>>,
     mcp_tx: tokio::sync::watch::Sender<u16>,
+    /// v2 platform application service: the single business model shared by the
+    /// four UI pages and MCP (templates, devices, data sources, power, MCP).
+    platform: Arc<bridge_core::platform::service::PlatformService>,
 }
 
 fn now_secs() -> i64 {
@@ -575,6 +579,48 @@ async fn mcp_handler(
                 .cloned()
                 .unwrap_or_else(|| json!({}));
             let response = match device_tool(&ctx, name, &args).await {
+                Ok(text) => json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {"content": [{"type": "text", "text": text}], "isError": false}
+                }),
+                Err(e) => json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {"content": [{"type": "text", "text": format!("error: {e}")}], "isError": true}
+                }),
+            };
+            return (
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                response.to_string(),
+            )
+                .into_response();
+        }
+        // v2 platform tools share the exact application service the UI uses.
+        if matches!(
+            name,
+            "platform_overview"
+                | "template_list"
+                | "template_get_v2"
+                | "template_save_v2"
+                | "profile_get_v2"
+                | "profile_save_v2"
+                | "platform_publish"
+                | "platform_publish_cancel"
+                | "template_activate"
+                | "data_sources_v2"
+                | "data_source_save_v2"
+                | "data_probe_v2"
+                | "power_view_v2"
+                | "power_plan"
+                | "platform_status_refresh"
+                | "platform_push_now"
+                | "platform_recovery"
+        ) {
+            let id = request.get("id").cloned().unwrap_or(Value::Null);
+            let args = request
+                .pointer("/params/arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let response = match platform::tool(&ctx, name, &args).await {
                 Ok(text) => json!({
                     "jsonrpc": "2.0", "id": id,
                     "result": {"content": [{"type": "text", "text": text}], "isError": false}
@@ -1162,6 +1208,174 @@ async fn release_device(state: State<'_, Arc<AppCtx>>) -> Result<Value, String> 
     Ok(json!({"result": text, "device": device_identity_json(&state)}))
 }
 
+// ---------------------------------------------------------------------------
+// v2 platform commands: the four UI pages call exactly the same service the MCP
+// tools use (no second business logic, no save-implies-publish).
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+async fn platform_overview(state: State<'_, Arc<AppCtx>>) -> Result<Value, String> {
+    Ok(platform::overview(&state))
+}
+
+#[tauri::command]
+async fn platform_templates(state: State<'_, Arc<AppCtx>>) -> Result<Value, String> {
+    Ok(platform::templates(&state))
+}
+
+#[tauri::command]
+async fn platform_devices(state: State<'_, Arc<AppCtx>>) -> Result<Value, String> {
+    Ok(platform::device_rows(&state))
+}
+
+#[tauri::command]
+async fn platform_template_get(
+    state: State<'_, Arc<AppCtx>>,
+    id: String,
+    render_target: Option<String>,
+) -> Result<Value, String> {
+    platform::template_get(&state, &id, render_target.as_deref())
+}
+
+#[tauri::command]
+async fn platform_template_validate(
+    state: State<'_, Arc<AppCtx>>,
+    json: Value,
+) -> Result<Value, String> {
+    let _ = &state;
+    Ok(platform::template_validate(&json))
+}
+
+#[tauri::command]
+async fn platform_template_preview(
+    state: State<'_, Arc<AppCtx>>,
+    id: Option<String>,
+    json: Option<Value>,
+    usage: Option<String>,
+) -> Result<Value, String> {
+    platform::template_preview(&state, id.as_deref(), json.as_ref(), usage.as_deref())
+}
+
+#[tauri::command]
+async fn platform_template_save(
+    state: State<'_, Arc<AppCtx>>,
+    id: String,
+    render_target: String,
+    json: Value,
+) -> Result<Value, String> {
+    let result = platform::template_save(&state, &id, &render_target, &json)?;
+    let _ = state.app_handle.get().map(|app| {
+        use tauri::Emitter;
+        let _ = app.emit("templates-changed", ());
+    });
+    Ok(result)
+}
+
+#[tauri::command]
+async fn platform_profile_get(state: State<'_, Arc<AppCtx>>) -> Result<Value, String> {
+    Ok(platform::profile_get(&state))
+}
+
+#[tauri::command]
+async fn platform_profile_save(
+    state: State<'_, Arc<AppCtx>>,
+    profile: Value,
+) -> Result<Value, String> {
+    let parsed: bridge_core::platform::model::Profile =
+        serde_json::from_value(profile).map_err(|e| e.to_string())?;
+    platform::profile_save(&state, parsed)
+}
+
+#[tauri::command]
+async fn platform_publish(
+    state: State<'_, Arc<AppCtx>>,
+    mac: Option<String>,
+) -> Result<Value, String> {
+    let mac = match mac {
+        Some(m) if !m.is_empty() => m,
+        _ => state
+            .device_mac
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "device MAC not learned yet".to_string())?,
+    };
+    platform::publish(&state, &mac).await
+}
+
+#[tauri::command]
+async fn platform_publish_cancel(state: State<'_, Arc<AppCtx>>) -> Result<Value, String> {
+    let mac = state.device_mac.lock().unwrap().clone().unwrap_or_default();
+    Ok(platform::job_cancel(&state, &mac))
+}
+
+#[tauri::command]
+async fn platform_activate(
+    state: State<'_, Arc<AppCtx>>,
+    id: String,
+) -> Result<Value, String> {
+    let mac = state
+        .device_mac
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or_else(|| "device MAC not learned yet".to_string())?;
+    platform::activate(&state, &mac, &id).await
+}
+
+#[tauri::command]
+async fn platform_data_sources(state: State<'_, Arc<AppCtx>>) -> Result<Value, String> {
+    Ok(platform::data_sources(&state))
+}
+
+#[tauri::command]
+async fn platform_data_source_save(
+    state: State<'_, Arc<AppCtx>>,
+    source: Value,
+) -> Result<Value, String> {
+    platform::data_source_save(&state, source)
+}
+
+#[tauri::command]
+async fn platform_data_probe(
+    state: State<'_, Arc<AppCtx>>,
+    source_id: String,
+) -> Result<Value, String> {
+    platform::data_probe(&state, &source_id)
+}
+
+#[tauri::command]
+async fn platform_power(state: State<'_, Arc<AppCtx>>) -> Result<Value, String> {
+    Ok(platform::power_view(&state))
+}
+
+#[tauri::command]
+async fn platform_plan(
+    state: State<'_, Arc<AppCtx>>,
+    mode: String,
+) -> Result<Value, String> {
+    let mac = state
+        .device_mac
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or_else(|| "device MAC not learned yet".to_string())?;
+    match mode.as_str() {
+        "light" => Ok(platform::send_plan(&state, &mac, "manual", 0).await),
+        "sleep" => {
+            let text = platform::tool(&state, "power_plan", &json!({"mode": "sleep"})).await?;
+            Ok(serde_json::from_str(&text).unwrap_or_else(|_| json!({"result": text})))
+        }
+        other => Err(format!("mode must be light|sleep (got {other})")),
+    }
+}
+
+#[tauri::command]
+async fn platform_status_refresh(state: State<'_, Arc<AppCtx>>) -> Result<Value, String> {
+    let mac = state.device_mac.lock().unwrap().clone().unwrap_or_default();
+    Ok(platform::refresh_status(&state, &mac).await)
+}
+
 #[tauri::command]
 async fn get_device_status(state: State<'_, Arc<AppCtx>>) -> Result<Value, String> {
     let cached = state.device_cache.lock().unwrap().clone();
@@ -1621,7 +1835,7 @@ async fn device_cache_loop(ctx: Arc<AppCtx>) {
             bridge_core::device::fetch(&fetch_ip, Duration::from_secs(3))
         })
         .await;
-        let (mut online, fields, mac, owner) = match result {
+        let (mut online, fields, mac, owner, raw) = match result {
             Ok(Ok(status)) => {
                 let mac = status.get("mac").map(str::to_string);
                 let owner = status
@@ -1630,21 +1844,28 @@ async fn device_cache_loop(ctx: Arc<AppCtx>) {
                     .and_then(|raw| raw.get("owner"))
                     .cloned()
                     .filter(|value| !value.is_null());
-                (true, status.fields, mac, owner)
+                (true, status.fields, mac, owner, status.raw)
             }
             Ok(Err(e)) => {
                 tracing::debug!("device status fetch {ip}: {e}");
-                (false, Vec::new(), None, None)
+                (false, Vec::new(), None, None, None)
             }
             Err(e) => {
                 tracing::debug!("device status task: {e}");
-                (false, Vec::new(), None, None)
+                (false, Vec::new(), None, None, None)
             }
         };
         if let Some(mac) = mac.as_deref().filter(|m| !m.is_empty()) {
             if !learn_mac(&ctx, mac, "http") {
                 tracing::warn!("device status at {ip} reports a different MAC; treating as offline");
                 online = false;
+            }
+        }
+        if online {
+            if let Some(raw) = raw.as_ref() {
+                let (caps, legacy) = platform::caps_from_status(raw);
+                platform::ensure_device(&ctx, caps, legacy);
+                platform::note_status_json(&ctx, raw);
             }
         }
         if online {
@@ -1736,6 +1957,84 @@ async fn run_services(ctx: Arc<AppCtx>) {
     let cache_ctx = ctx.clone();
     tokio::spawn(async move { device_cache_loop(cache_ctx).await });
 
+    // v2 platform loop: feed the Codex envelope into the DataSource and run one
+    // coordinator delivery per device on a bounded cadence. Never used to renew
+    // a light window (only data/publish/render actions trigger work).
+    {
+        let ctx = ctx.clone();
+        // Automatic delivery can be disabled for a debugging session
+        // (explicit publish/activate still delivers). Automatic attempts are
+        // throttled to one per minute so a device that hangs on install is not
+        // hammered every cycle.
+        let auto_deliver = std::env::var("CODEX_STATUS_PLATFORM_AUTODELIVER")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        tokio::spawn(async move {
+            let mut last_stamp = 0u64;
+            let mut tick = 0u64;
+            loop {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                tick += 1;
+                if ctx.status.lock().unwrap().paused {
+                    continue;
+                }
+                {
+                    let envelope = ctx.envelope.read().await.clone();
+                    if let Some(env) = envelope {
+                        let stamp = env
+                            .get("server_time")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        if stamp != last_stamp {
+                            last_stamp = stamp;
+                            platform::note_envelope(&ctx, &env);
+                        }
+                    }
+                }
+                if !platform::is_v2_device(&ctx) {
+                    continue;
+                }
+                // Pending v2 work must keep the *pull* response light, otherwise
+                // a timer-woken device bounces straight back to deep before the
+                // coordinator can deliver. Reads/status never extend the light
+                // lease; this only mirrors the legacy pending-work rule.
+                let mac = ctx.device_mac.lock().unwrap().clone().unwrap_or_default();
+                if !mac.is_empty() {
+                    if let Some(summary) = platform::service(&ctx).coordinator_summary(&mac) {
+                        let pending = summary["push_dirty"].as_bool().unwrap_or(false)
+                            || summary["in_flight"].is_object()
+                            || summary["pending_activate"].is_string()
+                            || summary["job"]
+                                .as_object()
+                                .map(|j| {
+                                    !matches!(
+                                        j.get("state").and_then(|s| s.as_str()),
+                                        Some("succeeded") | Some("failed") | Some("cancelled")
+                                    )
+                                })
+                                .unwrap_or(false);
+                        if pending {
+                            ctx.activity.note_activity("platform");
+                        }
+                    }
+                }
+                let online = ctx
+                    .device_cache
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|c| c.online)
+                    .unwrap_or(false);
+                if !online {
+                    // Deep/unreachable: keep the intent; the next rendezvous
+                    // (BOOT or a pull contact) picks it up. No radio wake.
+                    continue;
+                }
+                platform::cycle(&ctx, tick % 3 == 0, auto_deliver && tick % 6 == 0).await;
+            }
+        });
+    }
+
     // Usage push (docs/history/sleep-plan-v4.md §4.3/§4.6): POST the envelope to the device on
     // fingerprint change or 5 min heartbeat. Connection errors just mean the
     // device is in DEEP; the BLE/window path covers that.
@@ -1793,6 +2092,11 @@ async fn run_services(ctx: Arc<AppCtx>) {
                     continue;
                 }
                 deep_skip_logged = false;
+                // v2 devices use the coordinator data path (`/v2/data`), not the
+                // legacy Wi-Fi push: one device, one data channel.
+                if platform::is_v2_device(&ctx) {
+                    continue;
+                }
                 // While occupied/yielded, re-check every 15 s so a lease expiry
                 // or another bridge's release is picked up before the 5 min
                 // heartbeat (the gate itself only spends HTTP when claiming).
@@ -2208,6 +2512,12 @@ fn main() {
         mcp_port: Mutex::new(mcp_port),
         mcp_error: Mutex::new(None),
         mcp_tx,
+        platform: Arc::new(
+            bridge_core::platform::service::PlatformService::open(
+                &bridge_core::paths::data_root(),
+            )
+            .expect("open platform state"),
+        ),
     });
     if generated_name {
         save_identity(&ctx);
@@ -2245,7 +2555,25 @@ fn main() {
             device_discover,
             device_owner,
             claim_device,
-            release_device
+            release_device,
+            platform_overview,
+            platform_templates,
+            platform_devices,
+            platform_template_get,
+            platform_template_validate,
+            platform_template_preview,
+            platform_template_save,
+            platform_profile_get,
+            platform_profile_save,
+            platform_publish,
+            platform_publish_cancel,
+            platform_activate,
+            platform_data_sources,
+            platform_data_source_save,
+            platform_data_probe,
+            platform_power,
+            platform_plan,
+            platform_status_refresh
         ])
         .setup(move |app| {
             let _ = ctx_setup.app_handle.set(app.handle().clone());

@@ -1,4 +1,6 @@
 #include "template_engine.h"
+#include "platform_target.h"
+#include "v2_state.h"
 #include <ArduinoJson.h>
 #include <math.h>
 #include <string.h>
@@ -7,8 +9,21 @@
 #include "GUI_Paint.h"
 #include "fonts.h"
 
-static const int TPL_W = 200;
-static const int TPL_H = 200;
+// Canvas size is a target property (v2 §5): set once at boot (or by the host
+// harness) instead of being compiled in, so one engine serves 200x200 and
+// 400x300 render targets.
+static int sCanvasW = TARGET_WIDTH;
+static int sCanvasH = TARGET_HEIGHT;
+static inline int tplCanvasW() { return sCanvasW; }
+static inline int tplCanvasH() { return sCanvasH; }
+#define TPL_W (tplCanvasW())
+#define TPL_H (tplCanvasH())
+void tplSetCanvas(int w, int h) {
+    if (w > 0 && h > 0) {
+        sCanvasW = w;
+        sCanvasH = h;
+    }
+}
 static const UWORD COLOR_NONE = 0xFF;
 
 enum BindKind {
@@ -350,17 +365,6 @@ static bool parseCondition(JsonObject e, DrawCondition &condition) {
     return true;
 }
 
-static bool conditionMatches(const DrawCondition &condition, JsonDocument &usage,
-                             const TplEnv &env, bool haveUsage) {
-    if (!condition.active) return true;
-    if (condition.useEquals) {
-        String value;
-        if (!evalBind(condition.bind, TTF_DATE, usage, env, value)) return false;
-        return value == condition.equals;
-    }
-    return bindExists(condition.bind, usage, env, haveUsage) == condition.exists;
-}
-
 static bool textScale(JsonVariant value, int &scale) {
     if (value.isNull()) return false;
     if (!value.is<int>()) return false;
@@ -467,129 +471,373 @@ static bool clampRect(JsonArray r, int &x, int &y, int &w, int &h) {
     return w > 0 && h > 0;
 }
 
-static bool drawElements(JsonArray els, JsonDocument &usage, const TplEnv &env,
-                         bool haveUsage, bool dry) {
-    for (JsonObject e : els) {
+// ===========================================================================
+// Compiled template: parse once, draw from ops forever.
+// ===========================================================================
+
+static const char *CT_FONTS[] = {"f8", "f12", "f16", "f20", "f24"};
+
+static int fontIndex(sFONT *font) {
+    if (font == &Font8) return 0;
+    if (font == &Font12) return 1;
+    if (font == &Font16) return 2;
+    if (font == &Font20) return 3;
+    if (font == &Font24) return 4;
+    return -1;
+}
+
+static sFONT *fontByIndex(int idx) {
+    if (idx < 0 || idx > 4) return nullptr;
+    return fontByName(CT_FONTS[idx]);
+}
+
+static void ctCopy(char *dst, size_t cap, const char *src) {
+    if (!src) { dst[0] = 0; return; }
+    size_t n = strlen(src);
+    if (n >= cap) n = cap - 1;
+    memcpy(dst, src, n);
+    dst[n] = 0;
+}
+
+static int ctFindReq(const CtTemplate &ct, const String &path) {
+    for (int i = 0; i < ct.reqCount; i++) {
+        if (path == ct.reqs[i].path) return i;
+    }
+    return -1;
+}
+
+static int ctAddReq(CtTemplate &ct, const BindSpec &spec, const String &path) {
+    int found = ctFindReq(ct, path);
+    if (found >= 0) return found;
+    if (ct.reqCount >= CT_MAX_REQS) return -1;
+    CtReq &r = ct.reqs[ct.reqCount];
+    memset(&r, 0, sizeof(r));
+    r.kind = (uint8_t)spec.kind;
+    r.winMode = (uint8_t)spec.winMode;
+    r.winIndex = (int16_t)spec.winIndex;
+    ctCopy(r.bucket, sizeof(r.bucket), spec.bucket.c_str());
+    ctCopy(r.path, sizeof(r.path), path.c_str());
+    return ct.reqCount++;
+}
+
+static int ctFindRes(const CtTemplate &ct, const char *bits) {
+    for (int i = 0; i < ct.resCount; i++) {
+        if (!strcmp(ct.res[i].bits, bits)) return i;
+    }
+    return -1;
+}
+
+static bool ctBind(const CtReq &r, BindSpec &s) {
+    s.kind = (BindKind)r.kind;
+    s.bucket = r.bucket;
+    s.winMode = r.winMode;
+    s.winIndex = r.winIndex;
+    return true;
+}
+
+static bool ctEvalText(const CtTemplate &ct, uint8_t idx, TextTimeFormat fmt,
+                       JsonDocument &usage, const TplEnv &env, String &out) {
+    if (idx == CT_NONE_IDX || idx >= ct.reqCount) return false;
+    BindSpec s;
+    ctBind(ct.reqs[idx], s);
+    return evalBind(s, fmt, usage, env, out);
+}
+
+static bool ctExists(const CtTemplate &ct, uint8_t idx, JsonDocument &usage,
+                     const TplEnv &env, bool haveUsage) {
+    if (idx == CT_NONE_IDX || idx >= ct.reqCount) return false;
+    BindSpec s;
+    ctBind(ct.reqs[idx], s);
+    return bindExists(s, usage, env, haveUsage);
+}
+
+static bool ctCondMatches(const CtTemplate &ct, const CtOp &op, JsonDocument &usage,
+                          const TplEnv &env, bool haveUsage) {
+    if (op.whenMode == CTW_NONE) return true;
+    if (op.whenMode == CTW_EQ_NUM || op.whenMode == CTW_EQ_STR) {
+        String v;
+        if (!ctEvalText(ct, op.whenIdx, TTF_DATE, usage, env, v)) return false;
+        if (op.whenMode == CTW_EQ_NUM) return v == String((int)op.whenEqNum);
+        return v == String(op.whenEqStr);
+    }
+    bool exists = ctExists(ct, op.whenIdx, usage, env, haveUsage);
+    return exists == (op.whenMode == CTW_EXISTS_TRUE);
+}
+
+// Parse one element into a compiled op (also the validator for the JSON path).
+static bool parseElementCompiled(JsonObject e, CtTemplate &ct, CtOp &op) {
+    memset(&op, 0, sizeof(op));
+    op.bindIdx = CT_NONE_IDX;
+    op.whenIdx = CT_NONE_IDX;
+    op.resourceIdx = CT_NONE_IDX;
+    op.bg = 0xFF;
+    op.border = 1;
+    op.maxVal = 100;
+
+    // `when` (validated for every element; drawing applies it to all types).
+    if (e.containsKey("when")) {
         DrawCondition condition;
         if (!parseCondition(e, condition)) return false;
-        if (!dry) {
-            if (!conditionMatches(condition, usage, env, haveUsage)) continue;
-        }
-        const char *type = e["type"] | "";
-        if (!strcmp(type, "text")) {
-            sFONT *font = fontByName(e["font"] | "");
-            if (!font) return false;
-            const char *bind = e["bind"] | "";
-            const char *text = e["text"] | "";
-            if (!strlen(bind) && !strlen(text)) return false;
-            BindSpec spec;
-            if (strlen(bind) && !parseBind(String(bind), spec)) return false;
-            int scale = 1, rx = 0, ry = 0, rw = 0, rh = 0;
-            bool hasRegion = false;
-            TextTimeFormat format = TTF_DATE;
-            if (!parseTextLayout(e, strlen(bind) ? &spec : nullptr, scale,
-                                 hasRegion, rx, ry, rw, rh, format)) return false;
-            if (!dry) {
-                String val;
-                if (strlen(bind)) {
-                    if (!haveUsage) val = "--";
-                    else if (!evalBind(spec, format, usage, env, val)) val = "--";
-                } else {
-                    val = text;
-                }
-                val = asciiOnly(String((const char *)(e["prefix"] | "")) + val +
-                                String((const char *)(e["suffix"] | "")));
-                int fg = colorVal(e["color"], 0);
-                int bg = e["bg"] ? colorVal(e["bg"], 1) : 1;
-                int x = e["x"] | 0, y = e["y"] | 0;
-                if (!hasRegion && scale == 1) {
-                    Paint_DrawString_EN(x, y, val.c_str(), font, (UWORD)bg, (UWORD)fg);
-                } else {
-                    int useScale = scale;
-                    int textW = (int)val.length() * font->Width * useScale;
-                    while (hasRegion && useScale > 1 &&
-                           (textW > rw || font->Height * useScale > rh)) {
-                        useScale--;
-                        textW = (int)val.length() * font->Width * useScale;
-                    }
-                    if (hasRegion) {
-                        const char *align = e["align"] | "left";
-                        x = rx;
-                        if (!strcmp(align, "center")) x = rx + (rw - textW) / 2;
-                        else if (!strcmp(align, "right")) x = rx + rw - textW;
-                        y = ry + (rh - font->Height * useScale) / 2;
-                    }
-                    drawScaledText(val, font, x, y, useScale, fg, bg,
-                                   hasRegion, rx, ry, rw, rh);
-                }
-            }
-        } else if (!strcmp(type, "bar")) {
-            const char *bind = e["bind"] | "";
-            BindSpec spec;
-            if (!strlen(bind) || !parseBind(String(bind), spec)) return false;
-            int x, y, w, h;
-            if (!clampRect(e["rect"].as<JsonArray>(), x, y, w, h)) return false;
-            if (!dry) {
-                int fg = e["fg"] ? colorVal(e["fg"], 0) : 0;
-                int bg = e["bg"] ? colorVal(e["bg"], 1) : 1;
-                bool border = e["border"] | true;
-                double maxV = e["max"] | 100.0;
-                if (maxV <= 0) maxV = 100;
-                double v = 0;
-                if (haveUsage) evalBindNum(spec, usage, v);
-                if (bg != COLOR_NONE) {
-                    Paint_DrawRectangle(x, y, x + w - 1, y + h - 1, (UWORD)bg,
-                                        DOT_PIXEL_1X1, DRAW_FILL_FULL);
-                }
-                int fw = (int)lround(w * (v / maxV));
-                if (fw < 0) fw = 0;
-                if (fw > w) fw = w;
-                if (fw > 0) {
-                    Paint_DrawRectangle(x, y, x + fw - 1, y + h - 1, (UWORD)fg,
-                                        DOT_PIXEL_1X1, DRAW_FILL_FULL);
-                }
-                if (border) {
-                    Paint_DrawRectangle(x, y, x + w - 1, y + h - 1, (UWORD)fg,
-                                        DOT_PIXEL_1X1, DRAW_FILL_EMPTY);
-                }
-            }
-        } else if (!strcmp(type, "rect")) {
-            int x, y, w, h;
-            if (!clampRect(e["rect"].as<JsonArray>(), x, y, w, h)) return false;
-            if (!dry) {
-                int color = colorVal(e["color"], 0);
-                bool fill = e["fill"] | false;
-                Paint_DrawRectangle(x, y, x + w - 1, y + h - 1, (UWORD)color,
-                                    DOT_PIXEL_1X1,
-                                    fill ? DRAW_FILL_FULL : DRAW_FILL_EMPTY);
-            }
-        } else if (!strcmp(type, "line")) {
-            int x1 = e["x1"] | 0, y1 = e["y1"] | 0, x2 = e["x2"] | 0, y2 = e["y2"] | 0;
-            if (e["x1"].isNull() || e["y1"].isNull() || e["x2"].isNull() || e["y2"].isNull())
-                return false;
-            if (!dry) {
-                int color = colorVal(e["color"], 0);
-                Paint_DrawLine(x1, y1, x2, y2, (UWORD)color,
-                               DOT_PIXEL_1X1, LINE_STYLE_SOLID);
-            }
-        } else if (!strcmp(type, "icon")) {
-            int x = e["x"] | 0, y = e["y"] | 0;
-            int w = e["w"] | 0, h = e["h"] | 0;
-            const char *b64 = e["bits"] | "";
-            if (w <= 0 || h <= 0 || !strlen(b64)) return false;
-            if (!dry) {
-                int fg = colorVal(e["color"], 0);
-                size_t need = (size_t)((w + 7) / 8) * h;
-                uint8_t *buf = (uint8_t *)malloc(need);
-                if (!buf) return false;
-                bool ok = decodeBase64(b64, buf, need);
-                if (ok) drawIcon(buf, x, y, w, h, fg);
-                free(buf);
-                if (!ok) return false;
+        const char *bind = e["when"]["bind"] | "";
+        int whenIdx = ctAddReq(ct, condition.bind, String(bind));
+        if (whenIdx < 0) return false;
+        op.whenIdx = (uint8_t)whenIdx;
+        if (condition.useEquals) {
+            if (e["when"]["equals"].is<const char *>()) {
+                op.whenMode = CTW_EQ_STR;
+                ctCopy(op.whenEqStr, sizeof(op.whenEqStr),
+                       e["when"]["equals"].as<const char *>());
+            } else {
+                op.whenMode = CTW_EQ_NUM;
+                op.whenEqNum = (int16_t)(e["when"]["equals"].as<long long>());
             }
         } else {
-            return false;
+            op.whenMode = condition.exists ? CTW_EXISTS_TRUE : CTW_EXISTS_FALSE;
         }
+    }
+
+    const char *type = e["type"] | "";
+    if (!strcmp(type, "text")) {
+        sFONT *font = fontByName(e["font"] | "");
+        if (!font) return false;
+        int fi = fontIndex(font);
+        if (fi < 0) return false;
+        const char *bind = e["bind"] | "";
+        const char *text = e["text"] | "";
+        if (!strlen(bind) && !strlen(text)) return false;
+        BindSpec spec;
+        if (strlen(bind) && !parseBind(String(bind), spec)) return false;
+        int scale = 1, rx = 0, ry = 0, rw = 0, rh = 0;
+        bool hasRegion = false;
+        TextTimeFormat format = TTF_DATE;
+        if (!parseTextLayout(e, strlen(bind) ? &spec : nullptr, scale, hasRegion,
+                             rx, ry, rw, rh, format)) return false;
+        op.type = CT_TEXT;
+        op.font = (uint8_t)fi;
+        op.scale = (uint8_t)scale;
+        op.color = (uint8_t)colorVal(e["color"], 0);
+        if (e["bg"]) op.bg = (uint8_t)colorVal(e["bg"], 1);
+        if (!strlen(bind) || strcmp(bind, "device.now") == 0) {
+            // device.now is rendered by the runtime clock path; still compiled.
+        }
+        if (strlen(bind)) {
+            int idx = ctAddReq(ct, spec, String(bind));
+            if (idx < 0) return false;
+            op.bindIdx = (uint8_t)idx;
+        }
+        op.x = (int16_t)(e["x"] | 0);
+        op.y = (int16_t)(e["y"] | 0);
+        if (hasRegion) {
+            op.flags |= 0x02;
+            op.x = (int16_t)rx;
+            op.y = (int16_t)ry;
+            op.w = (int16_t)rw;
+            op.h = (int16_t)rh;
+            const char *align = e["align"] | "left";
+            if (!strcmp(align, "center")) op.align = 1;
+            else if (!strcmp(align, "right")) op.align = 2;
+            if (e.containsKey("align")) op.flags |= 0x04;
+        }
+        if (e.containsKey("time_format")) {
+            op.flags |= 0x08;
+            op.timeFormat = (format == TTF_HHMM) ? 1 : 0;
+        }
+        ctCopy(op.text, sizeof(op.text), text);
+        ctCopy(op.prefix, sizeof(op.prefix), e["prefix"] | "");
+        ctCopy(op.suffix, sizeof(op.suffix), e["suffix"] | "");
+        return true;
+    }
+    if (!strcmp(type, "bar")) {
+        const char *bind = e["bind"] | "";
+        BindSpec spec;
+        if (!strlen(bind) || !parseBind(String(bind), spec)) return false;
+        int x, y, w, h;
+        if (!clampRect(e["rect"].as<JsonArray>(), x, y, w, h)) return false;
+        int idx = ctAddReq(ct, spec, String(bind));
+        if (idx < 0) return false;
+        op.type = CT_BAR;
+        op.bindIdx = (uint8_t)idx;
+        op.x = (int16_t)x; op.y = (int16_t)y; op.w = (int16_t)w; op.h = (int16_t)h;
+        op.fg = (uint8_t)(e["fg"] ? colorVal(e["fg"], 0) : 0);
+        op.bg = (uint8_t)(e["bg"] ? colorVal(e["bg"], 1) : 1);
+        op.border = (e["border"] | true) ? 1 : 0;
+        double maxV = e["max"] | 100.0;
+        if (maxV <= 0) maxV = 100;
+        op.maxVal = (int16_t)maxV;
+        return true;
+    }
+    if (!strcmp(type, "rect")) {
+        int x, y, w, h;
+        if (!clampRect(e["rect"].as<JsonArray>(), x, y, w, h)) return false;
+        op.type = CT_RECT;
+        op.x = (int16_t)x; op.y = (int16_t)y; op.w = (int16_t)w; op.h = (int16_t)h;
+        op.color = (uint8_t)colorVal(e["color"], 0);
+        if (e["fill"] | false) op.flags |= 0x01;
+        return true;
+    }
+    if (!strcmp(type, "line")) {
+        if (e["x1"].isNull() || e["y1"].isNull() || e["x2"].isNull() || e["y2"].isNull())
+            return false;
+        op.type = CT_LINE;
+        op.x = (int16_t)(e["x1"] | 0); op.y = (int16_t)(e["y1"] | 0);
+        op.x2 = (int16_t)(e["x2"] | 0); op.y2 = (int16_t)(e["y2"] | 0);
+        op.color = (uint8_t)colorVal(e["color"], 0);
+        return true;
+    }
+    if (!strcmp(type, "icon")) {
+        int x = e["x"] | 0, y = e["y"] | 0;
+        int w = e["w"] | 0, h = e["h"] | 0;
+        const char *b64 = e["bits"] | "";
+        if (w <= 0 || h <= 0 || !strlen(b64)) return false;
+        int existing = ctFindRes(ct, b64);
+        if (existing < 0) {
+            if (ct.resCount >= CT_MAX_RES) return false;
+            existing = ct.resCount;
+            ctCopy(ct.res[existing].bits, sizeof(ct.res[existing].bits), b64);
+            ct.res[existing].w = (uint8_t)w;
+            ct.res[existing].h = (uint8_t)h;
+            ct.resCount++;
+        }
+        op.type = CT_ICON;
+        op.x = (int16_t)x; op.y = (int16_t)y; op.w = (int16_t)w; op.h = (int16_t)h;
+        op.color = (uint8_t)colorVal(e["color"], 0);
+        op.resourceIdx = (uint8_t)existing;
+        return true;
+    }
+    return false;
+}
+
+static bool drawCtOp(const CtTemplate &ct, const CtOp &op, JsonDocument &usage,
+                     const TplEnv &env, bool haveUsage, bool dry) {
+    if (!dry && !ctCondMatches(ct, op, usage, env, haveUsage)) return true;
+    sFONT *font = nullptr;
+    switch (op.type) {
+    case CT_TEXT: {
+        if (dry) return true;
+        font = fontByIndex(op.font);
+        if (!font) return false;
+        String val;
+        if (op.bindIdx != CT_NONE_IDX) {
+            TextTimeFormat fmt = op.flags & 0x08 ? (op.timeFormat ? TTF_HHMM : TTF_DATE) : TTF_DATE;
+            if (!haveUsage) val = "--";
+            else if (!ctEvalText(ct, op.bindIdx, fmt, usage, env, val)) val = "--";
+        } else {
+            val = op.text;
+        }
+        val = asciiOnly(String(op.prefix) + val + String(op.suffix));
+        bool hasRegion = (op.flags & 0x02) != 0;
+        int scale = op.scale ? op.scale : 1;
+        int fg = op.color, bg = op.bg == 0xFF ? 1 : op.bg;
+        int x = op.x, y = op.y;
+        if (!hasRegion && scale == 1) {
+            Paint_DrawString_EN(x, y, val.c_str(), font, (UWORD)bg, (UWORD)fg);
+        } else {
+            int useScale = scale;
+            int textW = (int)val.length() * font->Width * useScale;
+            while (hasRegion && useScale > 1 &&
+                   (textW > op.w || font->Height * useScale > op.h)) {
+                useScale--;
+                textW = (int)val.length() * font->Width * useScale;
+            }
+            if (hasRegion) {
+                x = op.x;
+                if (op.align == 1) x = op.x + (op.w - textW) / 2;
+                else if (op.align == 2) x = op.x + op.w - textW;
+                y = op.y + (op.h - font->Height * useScale) / 2;
+            }
+            drawScaledText(val, font, x, y, useScale, fg, bg, hasRegion,
+                           op.x, op.y, op.w, op.h);
+        }
+        return true;
+    }
+    case CT_BAR: {
+        if (dry) return true;
+        int x = op.x, y = op.y, w = op.w, h = op.h;
+        int fg = op.fg, bg = op.bg;
+        double maxV = op.maxVal > 0 ? op.maxVal : 100;
+        double v = 0;
+        if (haveUsage && op.bindIdx != CT_NONE_IDX) {
+            BindSpec spec;
+            ctBind(ct.reqs[op.bindIdx], spec);
+            evalBindNum(spec, usage, v);
+        }
+        if (bg != COLOR_NONE) {
+            Paint_DrawRectangle(x, y, x + w - 1, y + h - 1, (UWORD)bg,
+                                DOT_PIXEL_1X1, DRAW_FILL_FULL);
+        }
+        int fw = (int)lround(w * (v / maxV));
+        if (fw < 0) fw = 0;
+        if (fw > w) fw = w;
+        if (fw > 0) {
+            Paint_DrawRectangle(x, y, x + fw - 1, y + h - 1, (UWORD)fg,
+                                DOT_PIXEL_1X1, DRAW_FILL_FULL);
+        }
+        if (op.border) {
+            Paint_DrawRectangle(x, y, x + w - 1, y + h - 1, (UWORD)fg,
+                                DOT_PIXEL_1X1, DRAW_FILL_EMPTY);
+        }
+        return true;
+    }
+    case CT_RECT:
+        if (dry) return true;
+        Paint_DrawRectangle(op.x, op.y, op.x + op.w - 1, op.y + op.h - 1,
+                            (UWORD)op.color, DOT_PIXEL_1X1,
+                            (op.flags & 0x01) ? DRAW_FILL_FULL : DRAW_FILL_EMPTY);
+        return true;
+    case CT_LINE:
+        if (dry) return true;
+        Paint_DrawLine(op.x, op.y, op.x2, op.y2, (UWORD)op.color,
+                       DOT_PIXEL_1X1, LINE_STYLE_SOLID);
+        return true;
+    case CT_ICON: {
+        if (dry) return true;
+        if (op.resourceIdx == CT_NONE_IDX || op.resourceIdx >= ct.resCount) return false;
+        const CtResource &res = ct.res[op.resourceIdx];
+        size_t need = (size_t)((res.w + 7) / 8) * res.h;
+        uint8_t *buf = (uint8_t *)malloc(need);
+        if (!buf) return false;
+        bool ok = decodeBase64(res.bits, buf, need);
+        if (ok) drawIcon(buf, op.x, op.y, res.w, res.h, op.color);
+        free(buf);
+        return ok;
+    }
+    default:
+        return false;
+    }
+}
+
+bool tplValidateCt(const CtTemplate &ct, String &err) {
+    if (ct.abi != CT_ABI) { err = "ct_abi"; return false; }
+    if (ct.opCount == 0 || ct.opCount > CT_MAX_OPS) { err = "ct_ops"; return false; }
+    if (ct.reqCount > CT_MAX_REQS || ct.resCount > CT_MAX_RES) { err = "ct_bounds"; return false; }
+    if (ct.id[0] == 0) { err = "ct_id"; return false; }
+    for (int i = 0; i < ct.opCount; i++) {
+        const CtOp &op = ct.ops[i];
+        if (op.type > CT_ICON) { err = "ct_op_type"; return false; }
+        if (op.bindIdx != CT_NONE_IDX && op.bindIdx >= ct.reqCount) { err = "ct_bind"; return false; }
+        if (op.whenIdx != CT_NONE_IDX && op.whenIdx >= ct.reqCount) { err = "ct_when"; return false; }
+        if (op.resourceIdx != CT_NONE_IDX && op.resourceIdx >= ct.resCount) { err = "ct_res"; return false; }
+        if (op.type == CT_TEXT && op.font > 4) { err = "ct_font"; return false; }
+        if (op.type == CT_TEXT && op.bindIdx == CT_NONE_IDX && op.text[0] == 0) {
+            err = "ct_text"; return false;
+        }
+    }
+    for (int i = 0; i < ct.reqCount; i++) {
+        if (ct.reqs[i].path[0] == 0) { err = "ct_req"; return false; }
+    }
+    return true;
+}
+
+bool tplDrawCt(const CtTemplate &ct, const String &usageJson, const TplEnv &env) {
+    String err;
+    if (!tplValidateCt(ct, err)) {
+        Serial.printf("[tpl] ct reject: %s\n", err.c_str());
+        return false;
+    }
+    JsonDocument ud;
+    bool haveUsage = usageJson.length() > 0 && !deserializeJson(ud, usageJson);
+    for (int i = 0; i < ct.opCount; i++) {
+        if (!drawCtOp(ct, ct.ops[i], ud, env, haveUsage, false)) return false;
     }
     return true;
 }
@@ -607,34 +855,72 @@ static bool parseTemplate(const String &tmplJson, JsonDocument &td, JsonArray &e
     return true;
 }
 
-bool tplValidate(const String &tmplJson, String &err) {
+bool tplCompile(const String &tmplJson, CtTemplate &out, String &err) {
     JsonDocument td;
     JsonArray els;
     if (!parseTemplate(tmplJson, td, els, err)) return false;
-    JsonDocument empty;
-    TplEnv env;
-    env.channel = "--";
-    env.ip = "--";
-    env.syncHHMM = "--:--";
-    env.battery = -1;
-    if (!drawElements(els, empty, env, false, true)) { err = "element"; return false; }
-    return true;
+    memset(&out, 0, sizeof(out));
+    out.abi = CT_ABI;
+    out.sourceCrc = v2Crc32((const uint8_t *)tmplJson.c_str(), tmplJson.length());
+    ctCopy(out.id, sizeof(out.id), td["id"] | "");
+    if (els.size() > CT_MAX_OPS) { err = "elements"; return false; }
+    for (JsonObject e : els) {
+        if (out.opCount >= CT_MAX_OPS) { err = "elements"; return false; }
+        CtOp op;
+        if (!parseElementCompiled(e, out, op)) { err = "element"; return false; }
+        out.ops[out.opCount++] = op;
+    }
+    return tplValidateCt(out, err);
+}
+
+bool tplValidate(const String &tmplJson, String &err) {
+    static CtTemplate scratch;
+    return tplCompile(tmplJson, scratch, err);
 }
 
 bool tplDraw(const String &tmplJson, const String &usageJson, const TplEnv &env) {
-    JsonDocument td;
-    JsonArray els;
+    static CtTemplate scratch;
     String err;
-    if (!parseTemplate(tmplJson, td, els, err)) {
+    if (!tplCompile(tmplJson, scratch, err)) {
         Serial.printf("[tpl] reject: %s\n", err.c_str());
         return false;
     }
-    JsonDocument ud;
-    bool haveUsage = usageJson.length() > 0 && !deserializeJson(ud, usageJson);
-    if (!drawElements(els, ud, env, haveUsage, true)) {
-        Serial.println("[tpl] reject: element");
-        return false;
-    }
-    drawElements(els, ud, env, haveUsage, false);
+    return tplDrawCt(scratch, usageJson, env);
+}
+
+size_t tplCtSize() { return sizeof(CtTemplate); }
+
+// Fixed-layout record: magic | size | abi | crc32 | CtTemplate bytes.
+bool tplCtSerialize(const CtTemplate &ct, uint8_t *out, size_t cap, size_t &written) {
+    const size_t payload = sizeof(CtTemplate);
+    const size_t total = 4 + 2 + 2 + 4 + payload;
+    written = total;
+    if (cap < total) return false;
+    uint32_t magic = 0x31505443u;  // "CTP1" little-endian
+    memcpy(out, &magic, 4);
+    uint16_t size = (uint16_t)payload;
+    memcpy(out + 4, &size, 2);
+    uint16_t abi = CT_ABI;
+    memcpy(out + 6, &abi, 2);
+    uint32_t crc = v2Crc32((const uint8_t *)&ct, payload);
+    memcpy(out + 8, &crc, 4);
+    memcpy(out + 12, &ct, payload);
     return true;
+}
+
+bool tplCtDeserialize(const uint8_t *in, size_t len, CtTemplate &out, String &err) {
+    if (len < 12) { err = "ct_short"; return false; }
+    uint32_t magic = 0;
+    memcpy(&magic, in, 4);
+    if (magic != 0x31505443u) { err = "ct_magic"; return false; }
+    uint16_t size = 0, abi = 0;
+    memcpy(&size, in + 4, 2);
+    memcpy(&abi, in + 6, 2);
+    if (size != sizeof(CtTemplate) || abi != CT_ABI) { err = "ct_abi"; return false; }
+    if (len < 12 + size) { err = "ct_short"; return false; }
+    uint32_t crc = 0;
+    memcpy(&crc, in + 8, 4);
+    if (crc != v2Crc32(in + 12, size)) { err = "ct_crc"; return false; }
+    memcpy(&out, in + 12, size);
+    return tplValidateCt(out, err);
 }

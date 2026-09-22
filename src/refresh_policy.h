@@ -65,9 +65,18 @@ struct RfnDecision {
     uint16_t outside = 0;   // changed pixels not covered by any region
 };
 
+#include "template_engine.h"
+
+// Panel geometry (target property); called at boot / by the host harness.
+void rgnSetPanel(int w, int h);
+
 // Parse the active template and derive semantic regions. Always fills `out`;
 // on parse/layout failure sets wholeFrame (decision then escalates to full).
 bool rgnBuild(const String &tmplJson, RgnSet &out);
+
+// Same derivation from the compiled template: the runtime path on activation,
+// with no template JSON parsing (v2 §8).
+bool rgnBuildCt(const CtTemplate &ct, RgnSet &out);
 void rgnReset(RgnSet &out);
 
 // Evaluate old/new framebuffers against the policy, filling per-region stats.

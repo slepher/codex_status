@@ -4,12 +4,26 @@
 #include <string.h>
 
 #include "fonts.h"
+#include "platform_target.h"
 
 namespace {
 
-const int PANEL_W = 200;
-const int PANEL_H = 200;
-const int STRIDE = PANEL_W / 8;
+// Panel geometry is a target property (v2 §5): set at boot / by the host
+// harness so the same policy serves 200x200 and 400x300 panels.
+static int sPanelW = TARGET_WIDTH;
+static int sPanelH = TARGET_HEIGHT;
+static inline int panelW() { return sPanelW; }
+static inline int panelH() { return sPanelH; }
+static inline int panelStride() { return sPanelW / 8; }
+#define PANEL_W (panelW())
+#define PANEL_H (panelH())
+#define STRIDE  (panelStride())
+void rgnSetPanel(int w, int h) {
+    if (w > 0 && h > 0) {
+        sPanelW = w;
+        sPanelH = h;
+    }
+}
 
 // The firmware toolchain is xtensa GCC; the host preview build may use MSVC.
 inline int popcount8(uint8_t v) {
@@ -256,6 +270,100 @@ bool rgnBuild(const String &tmplJson, RgnSet &out) {
     }
     mergeRegions(out);
     // addRegion sets wholeFrame on overflow; keep that conservative outcome.
+    return !out.wholeFrame;
+}
+
+// Compiled-template region derivation (v2 §8): identical classification to
+// rgnBuild, but from the bounded compiled ops so no template JSON is parsed on
+// an active switch.
+bool rgnBuildCt(const CtTemplate &ct, RgnSet &out) {
+    rgnReset(out);
+    if (ct.opCount == 0) {
+        out.wholeFrame = true;
+        return false;
+    }
+    for (uint8_t i = 0; i < ct.opCount; i++) {
+        const CtOp &op = ct.ops[i];
+        const char *bind = op.bindIdx != CT_NONE_IDX ? ct.reqs[op.bindIdx].path : "";
+        switch (op.type) {
+        case CT_TEXT: {
+            sFONT *font = nullptr;
+            switch (op.font) {
+            case 0: font = &Font8; break;
+            case 1: font = &Font12; break;
+            case 2: font = &Font16; break;
+            case 3: font = &Font20; break;
+            case 4: font = &Font24; break;
+            default: break;
+            }
+            if (!font) { out.wholeFrame = true; return false; }
+            int fw = font->Width;
+            int fh = font->Height;
+            int x, y, w, h;
+            if (op.flags & 0x02) {
+                x = op.x; y = op.y; w = op.w; h = op.h;
+            } else {
+                int scale = op.scale ? op.scale : 1;
+                if (scale < 1) scale = 1;
+                if (scale > 3) scale = 3;
+                int chars;
+                if (strlen(op.text)) {
+                    chars = (int)strlen(op.text) + (int)strlen(op.prefix) +
+                            (int)strlen(op.suffix);
+                } else if (!strcmp(bind, "device.now")) {
+                    chars = 5;
+                } else {
+                    chars = 12;
+                }
+                x = op.x;
+                y = op.y;
+                w = chars * fw * scale;
+                h = fh * scale;
+            }
+            int fg = op.color;
+            int bg = op.bg == 0xFF ? 1 : op.bg;
+            bool inverted = (bg == 0 && fg == 1);
+            bool highInk = (bg == 0);
+            uint8_t cls;
+            if (!strcmp(bind, "device.now")) cls = RGN_CLOCK;
+            else if (!strncmp(bind, "buckets[", 8) || !strncmp(bind, "resetCredits.", 13))
+                cls = RGN_USAGE_DIGIT;
+            else if (inverted) cls = RGN_INVERTED;
+            else cls = RGN_TEXT;
+            addRegion(out, x, y, w, h, cls, highInk);
+            break;
+        }
+        case CT_RECT: {
+            bool fill = (op.flags & 0x01) != 0;
+            bool highInk = fill && op.color == 0;
+            addRegion(out, op.x, op.y, op.w, op.h,
+                      fill ? (highInk ? RGN_SOLID : RGN_TEXT) : RGN_LINE, highInk);
+            break;
+        }
+        case CT_ICON:
+            addRegion(out, op.x, op.y, op.w, op.h, RGN_ICON, false);
+            break;
+        case CT_BAR:
+            addRegion(out, op.x, op.y, op.w, op.h, RGN_BAR, false);
+            break;
+        case CT_LINE: {
+            int x = op.x < op.x2 ? op.x : op.x2;
+            int y = op.y < op.y2 ? op.y : op.y2;
+            int w = (op.x < op.x2 ? op.x2 - op.x : op.x - op.x2) + 1;
+            int h = (op.y < op.y2 ? op.y2 - op.y : op.y - op.y2) + 1;
+            addRegion(out, x, y, w, h, RGN_LINE, false);
+            break;
+        }
+        default:
+            out.wholeFrame = true;
+            return false;
+        }
+    }
+    if (out.n == 0) {
+        out.wholeFrame = true;
+        return false;
+    }
+    mergeRegions(out);
     return !out.wholeFrame;
 }
 

@@ -1,4 +1,5 @@
-//! MCP stdio server: template authoring tools for an external agent.
+#![recursion_limit = "512"]
+
 //!
 //! Tools render/validate with the firmware's own C++ engine (bridge-render),
 //! persist templates with version bumps and backups, and push over HTTP
@@ -851,6 +852,163 @@ fn tool_definitions() -> Value {
                 "required": ["s"],
                 "additionalProperties": false
             }
+        },
+        {
+            "name": "platform_overview",
+            "description": "v2 platform overview: templates (latest per id+render_target), devices (MAC/profile/count), data sources, pending states. Same application service as the UI.",
+            "annotations": {"readOnlyHint": true},
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+        },
+        {
+            "name": "template_list",
+            "description": "List saved templates with their render target, CRCs, sizes and referencing devices (read-only).",
+            "annotations": {"readOnlyHint": true},
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+        },
+        {
+            "name": "template_get_v2",
+            "description": "Read a saved template source + compiled plan by id (optional render_target).",
+            "annotations": {"readOnlyHint": true},
+            "inputSchema": {
+                "type": "object",
+                "properties": {"id": {"type": "string"}, "render_target": {"type": "string"}},
+                "required": ["id"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "template_validate_v2",
+            "description": "Compile/validate template JSON with the firmware-equivalent engine (no save).",
+            "annotations": {"readOnlyHint": true},
+            "inputSchema": {
+                "type": "object",
+                "properties": {"json": {"type": "string"}},
+                "required": ["json"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "template_save_v2",
+            "description": "Save a template (latest per id+render_target) WITHOUT publishing; replacement is explicit.",
+            "annotations": {"readOnlyHint": false, "destructiveHint": false},
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "render_target": {"type": "string"},
+                    "json": {"type": "string"}
+                },
+                "required": ["id", "json"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "profile_get_v2",
+            "description": "Per-device Profile (1-8 ordered template ids, initial active, bindings, sync flag).",
+            "annotations": {"readOnlyHint": true},
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+        },
+        {
+            "name": "profile_save_v2",
+            "description": "Save a Profile (1-8 ordered ids) WITHOUT publishing.",
+            "annotations": {"readOnlyHint": false},
+            "inputSchema": {
+                "type": "object",
+                "properties": {"profile": {"type": "object"}},
+                "required": ["profile"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "platform_publish",
+            "description": "Explicit publish: freeze the profile into one Bundle and deliver it at the next reachable opportunity. Save is not publish.",
+            "annotations": {"readOnlyHint": false, "destructiveHint": false},
+            "inputSchema": {"type": "object", "properties": {"mac": {"type": "string"}}, "additionalProperties": false}
+        },
+        {
+            "name": "platform_publish_cancel",
+            "description": "Cancel the queued (unstarted) publish job for the device.",
+            "annotations": {"readOnlyHint": false},
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+        },
+        {
+            "name": "template_activate",
+            "description": "Explicit remote activation of an installed template (creates a new device context).",
+            "annotations": {"readOnlyHint": false},
+            "inputSchema": {
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "data_sources_v2",
+            "description": "DataSource list with latest SourceSnapshot, push/pull triggers, quality and validity.",
+            "annotations": {"readOnlyHint": true},
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+        },
+                {
+            "name": "data_source_save_v2",
+            "description": "Create/replace a DataSource (Codex or Static JSON). Saving never triggers a device push.",
+            "annotations": {"readOnlyHint": false},
+            "inputSchema": {
+                "type": "object",
+                "properties": {"source": {"type": "object"}},
+                "required": ["source"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "data_probe_v2",
+            "description": "Collect once from a DataSource and report the resulting snapshot.",
+            "annotations": {"readOnlyHint": false, "idempotentHint": true},
+            "inputSchema": {
+                "type": "object",
+                "properties": {"source_id": {"type": "string"}},
+                "required": ["source_id"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "power_view_v2",
+            "description": "Current PowerPlan/provisional/remaining/rendezvous state (read-only; a read never extends the light deadline).",
+            "annotations": {"readOnlyHint": true},
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+        },
+        {
+            "name": "power_plan",
+            "description": "Explicit debug power action: mode=light (formal plan) or mode=sleep.",
+            "annotations": {"readOnlyHint": false},
+            "inputSchema": {
+                "type": "object",
+                "properties": {"mode": {"type": "string"}},
+                "required": ["mode"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "platform_status_refresh",
+            "description": "Read the authenticated device status and reconcile the bridge view.",
+            "annotations": {"readOnlyHint": true},
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+        },
+                {
+            "name": "platform_push_now",
+            "description": "Deliver pending coordinator data to the device immediately (explicit action; never renews the light lease by itself).",
+            "annotations": {"readOnlyHint": false},
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+        },
+        {
+            "name": "platform_recovery",
+            "description": "Import a profile from a device recovery digest; the imported profile starts with sync disabled.",
+            "annotations": {"readOnlyHint": false},
+            "inputSchema": {
+                "type": "object",
+                "properties": {"digest": {"type": "object"}},
+                "required": ["digest"],
+                "additionalProperties": false
+            }
         }
     ])
 }
@@ -1112,6 +1270,15 @@ async fn call_tool(cfg: &McpConfig, name: &str, args: &Value) -> Result<Vec<Valu
             // Implemented in bridge-app (live identity/occupancy state); this
             // library copy has no running app to mutate.
             Err("device tools are only available in the tray app (bridge-app)".to_string())
+        }
+        // v2 platform tools share the app's application service; without a
+        // running app there is no live state to read or change.
+        "platform_overview" | "template_list" | "template_get_v2" | "template_save_v2"
+        | "template_validate_v2" | "profile_get_v2" | "profile_save_v2"
+        | "platform_publish" | "platform_publish_cancel" | "template_activate"
+        | "data_sources_v2" | "data_source_save_v2" | "data_probe_v2" | "power_view_v2" | "power_plan"
+        | "platform_status_refresh" | "platform_push_now" | "platform_recovery" => {
+            Err("platform tools are only available in the tray app (bridge-app)".to_string())
         }
         other => Err(format!("unknown tool: {other}")),
     }

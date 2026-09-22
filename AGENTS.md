@@ -2,7 +2,7 @@
 
 ## 项目概览
 
-便携墨水屏显示本机 Codex 余量：ESP32-S3（Waveshare 1.54" 200×200 B/W，SSD1681，局刷 ~300ms）本地渲染；Rust 桥接（Tauri v2 托盘进程）通过 `codex app-server` JSON-RPC 取数，经 Wi-Fi HTTP（主通道）或 BLE GATT（备选）下发 usage 与模板。换样式只换模板 JSON，不刷固件。当前固件 0.13.4-bw（关 mDNS；设备身份 = Wi-Fi MAC + 可编辑显示名；显式 claim/lease 占用，桥按空闲自动占用）。
+便携墨水屏显示本机 Codex 余量：ESP32-S3（Waveshare 1.54" 200×200 B/W，SSD1681，局刷 ~300ms）本地渲染；Rust 桥接（Tauri v2 托盘进程）通过 `codex app-server` JSON-RPC 取数，经 Wi-Fi HTTP（主通道）或 BLE GATT（备选）下发 usage 与模板。换样式只换模板 JSON，不刷固件。当前固件 0.16.0-bw（v2 通用平台：每设备 Profile 1–8 全按键循环、CompiledTemplate、完整 A/B Bundle、单一 active context、Bridge 生成 PowerPlan、Codex 只是 DataSource；关 mDNS；设备身份 = Wi-Fi MAC + 可编辑显示名；显式 claim/lease 占用，桥按空闲自动占用）。设计见 `docs/generic-display-platform-design-v2.md`，实现工作区 `project-workflow/generic-display-platform-implementation/`。legacy（≤0.15.10）继续走旧通道与 ≤3 槽，不得把 8 项静默裁剪成 3 项。
 
 先读 `PROGRESS.md` 最新一节：它是权威交接文档，含设备现场、ROM SHA256 与待办。历史背景见 `docs/history/request.md`、`docs/device-setup-experience.md`；早期讨论见 `docs/history/discussion-summary.md`（历史资料）。
 
@@ -14,7 +14,7 @@
 | `bridge/crates/core` | app-server 客户端、usage 信封、模板库（canonical JSON + CRC32）、LAN HTTP `/usage` `/template` |
 | `bridge/crates/ble` | btleplug central：endpoint/usage/模板推送 |
 | `bridge/crates/render` | 把固件同一份 C++ 引擎编进宿主，像素级预览/离线对拍 |
-| `bridge/crates/mcp` | MCP 工具（status/get/validate/render/save/profile_save/profile_push/firmware_ota/pm_stats/device_rename/device_discover/device_owner/device_claim/device_release/device_sleep/device_wake/device_mode/device_contact_s，后四个为调试用），由托盘内建 HTTP 端点 `http://127.0.0.1:8766/mcp` 提供（见 `opencode.jsonc`；设备类工具由 app 侧实现） |
+| `bridge/crates/mcp` | MCP 工具（legacy：status/get/validate/render/save/profile_save/profile_push/firmware_ota/pm_stats/device_* 调试；v2：platform_overview/template_list/template_get_v2/template_validate_v2/template_save_v2/profile_get_v2/profile_save_v2/platform_publish(_cancel)/template_activate/data_sources_v2/data_probe_v2/power_view_v2/power_plan/platform_status_refresh/platform_recovery），由托盘内建 HTTP 端点 `http://127.0.0.1:8766/mcp` 提供（见 `opencode.jsonc`；设备类与 v2 平台工具由 app 侧实现，与 UI 共用 application service） |
 | `bridge/crates/app` | 生产形态：单实例托盘 + 内建 HTTP/BLE/MCP，运行数据在 `<exe>/data/`；`src/discovery.rs` 为 ARP 发现回退；身份/发现/占用见 `docs/power-state.md` §9.1/§9.2 |
 | `tools/test-bridge` | Python 测试桥（`start.ps1`/`stop.ps1`）、模板库 `templates/*.json`、`profiles.seed.json` |
 | `tools/device-auth` | `request_token.py`：经已绑定 BLE 链路协商 Wi-Fi 操作 token |
@@ -68,7 +68,9 @@ git diff --check                   # 提交前必查
 - 占用只走显式 `POST /claim`：`usage`/`template` 永不创建/转移 owner（仅刷新匹配 id 的 `last_seen`）；owner 有效且 `bridge.hostId`（template 用 `bridge_id`）不符一律 409，`activate` 无旁路；lease 到期只清空。桥空闲自动 claim、60s 续约、他人占用不推送；推送仍是用户显式动作（claim 是协议行为，不等于推送模板）。
 - 改 GATT 特征表后 Windows 会缓存旧属性，需解除配对再重配（或后续评估 Service Changed）。
 - 便携数据布局：运行数据 `<exe>/data/`，种子 `<exe>/seed/`（开发回退 `tools/test-bridge/`）；程序不写仓库。
-- 推送是用户显式动作（以 profile 为单位，≤3 启用）；保存模板只落盘，不得自动推送。
+- 推送是用户显式动作：v2 下 Profile = 1–8 个有序模板（全部参与按键循环，无 enabled 子集），显式发布冻结一个完整 Bundle；保存模板/Profile、MCP save、UI save 都只落盘，不得自动发布。legacy 设备保持 ≤3 槽限制并显式提示。
+- v2 数据语义：字段仅在 Bridge 绑定合同中分 push/pull；push 可见值/缺失/质量变化发送完整最新快照，pull-only 变化只更新缓存、不推送、不改 PowerPlan；只有成功 ACK 才更新确认指纹与 full_sync_deadline。设备不接收 push/pull 分类。
+- v2 电源：只有 Bridge 的正式 PowerPlan 改变 light deadline；读取/传输/claim/owner renew 都不隐式续租；BOOT provisional 300s 从物理唤醒起算，timer wake 不获得。
 - 版本号 `FW_VERSION` 在 `src/main.cpp`；固件发布后在 `PROGRESS.md` 记录 ROM 路径与 SHA256。
 - 显示规则（权威）：5h 桶不存在时显示静态 100 并隐藏其重置时间；`resetCredits.availableCount<=0` 时隐藏 RC 行；label 取不到用户名时整行隐藏。
 

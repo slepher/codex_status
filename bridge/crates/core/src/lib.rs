@@ -1,12 +1,17 @@
 pub mod activity;
 pub mod codex;
+pub mod compile;
+pub mod coordinator;
+pub mod datasource;
 pub mod device;
 pub mod envelope;
 pub mod http;
 pub mod paths;
+pub mod platform;
 pub mod profile;
 pub mod runtime;
 pub mod template;
+pub mod v2_client;
 
 /// Deterministic short id used for `bridge.hostId`.
 pub fn short_id(input: &str) -> String {

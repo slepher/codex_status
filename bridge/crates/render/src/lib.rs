@@ -9,7 +9,20 @@ use std::sync::OnceLock;
 /// The firmware engine draws into a single global Paint buffer, so all render
 /// jobs go through one dedicated worker thread (a serialized engine queue)
 /// instead of racing on a shared lock from many caller threads.
+/// Engine operations are serialized on one worker because the firmware engine
+/// has one global Paint buffer and one global compiled template.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Op {
+    RenderJson,
+    Compile,
+    RenderCompiled,
+    Serialize,
+    Deserialize,
+    ReqList,
+}
+
 struct Job {
+    op: Op,
     template: String,
     usage: String,
     channel: String,
@@ -19,7 +32,8 @@ struct Job {
     state: String,
     offline_mins: i32,
     mode: String,
-    reply: Sender<(i32, Vec<u8>)>,
+    blob: Vec<u8>,
+    reply: Sender<(i32, Vec<u8>, String)>,
 }
 
 static ENGINE_TX: OnceLock<SyncSender<Job>> = OnceLock::new();
@@ -37,17 +51,81 @@ fn engine() -> &'static SyncSender<Job> {
 
 fn engine_loop(rx: Receiver<Job>) {
     for job in rx {
-        let mut out = vec![0u8; BUF_LEN];
-        let rc = render_job(&job, &mut out);
-        let _ = job.reply.send((rc, out));
+        // Large enough for the serialized compiled record; render ops truncate.
+        let mut out = vec![0u8; 64 * 1024];
+        let mut message = String::new();
+        let rc = run_job(&job, &mut out, &mut message);
+        if matches!(job.op, Op::RenderJson | Op::RenderCompiled) {
+            out.truncate(BUF_LEN);
+        } else if rc > 0 && (rc as usize) <= out.len() {
+            out.truncate(rc as usize);
+        }
+        let _ = job.reply.send((rc, out, message));
     }
 }
 
-fn render_job(job: &Job, out: &mut [u8]) -> i32 {
-    let tmpl = match CString::new(job.template.as_str()) {
-        Ok(value) => value,
-        Err(_) => return -3,
-    };
+fn run_job(job: &Job, out: &mut [u8], message: &mut String) -> i32 {
+    match job.op {
+        Op::Compile => {
+            let tmpl = match CString::new(job.template.as_str()) {
+                Ok(value) => value,
+                Err(_) => return -3,
+            };
+            let mut err = vec![0i8; 128];
+            let ok = unsafe { codex_compile(tmpl.as_ptr(), err.as_mut_ptr(), err.len() as c_int) };
+            if ok != 1 {
+                *message = cstr(&err);
+            }
+            return ok;
+        }
+        Op::Serialize => {
+            let mut blob = vec![0u8; 64 * 1024];
+            let n = unsafe { codex_ct_serialize(blob.as_mut_ptr(), blob.len() as c_int) };
+            if n <= 0 {
+                return -1;
+            }
+            blob.truncate(n as usize);
+            out[..blob.len()].copy_from_slice(&blob);
+            return n;
+        }
+        Op::Deserialize => {
+            let mut err = vec![0i8; 128];
+            let ok = unsafe {
+                codex_ct_deserialize(
+                    job.blob.as_ptr(),
+                    job.blob.len() as c_int,
+                    err.as_mut_ptr(),
+                    err.len() as c_int,
+                )
+            };
+            if ok != 1 {
+                *message = cstr(&err);
+            }
+            return ok;
+        }
+        Op::ReqList => {
+            let count = unsafe { codex_ct_req_count() };
+            if count < 0 {
+                return -1;
+            }
+            let mut text = String::new();
+            for i in 0..count {
+                let mut buf = vec![0i8; 96];
+                let ok = unsafe { codex_ct_req_path(i, buf.as_mut_ptr(), buf.len() as c_int) };
+                if ok != 1 {
+                    return -1;
+                }
+                if i > 0 {
+                    text.push('\n');
+                }
+                text.push_str(&cstr(&buf));
+            }
+            let bytes = text.into_bytes();
+            out[..bytes.len()].copy_from_slice(&bytes);
+            return bytes.len() as i32;
+        }
+        Op::RenderCompiled | Op::RenderJson => {}
+    }
     let usage = match CString::new(job.usage.as_str()) {
         Ok(value) => value,
         Err(_) => return -3,
@@ -72,6 +150,26 @@ fn render_job(job: &Job, out: &mut [u8]) -> i32 {
         Ok(value) => value,
         Err(_) => return -3,
     };
+    if job.op == Op::RenderCompiled {
+        return unsafe {
+            codex_render_compiled(
+                usage.as_ptr(),
+                channel.as_ptr(),
+                ip.as_ptr(),
+                sync.as_ptr(),
+                job.battery,
+                state.as_ptr(),
+                job.offline_mins,
+                mode.as_ptr(),
+                out.as_mut_ptr(),
+                BUF_LEN as c_int,
+            )
+        };
+    }
+    let tmpl = match CString::new(job.template.as_str()) {
+        Ok(value) => value,
+        Err(_) => return -3,
+    };
     unsafe {
         codex_render(
             tmpl.as_ptr(),
@@ -86,6 +184,106 @@ fn render_job(job: &Job, out: &mut [u8]) -> i32 {
             out.as_mut_ptr(),
             BUF_LEN as c_int,
         )
+    }
+}
+
+fn cstr(buf: &[i8]) -> String {
+    let bytes: Vec<u8> = buf
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    String::from_utf8_lossy(&bytes).to_string()
+}
+
+fn run_engine(op: Op, template: &str, job: Job) -> anyhow::Result<(i32, Vec<u8>, String)> {
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+    let mut job = job;
+    job.op = op;
+    job.template = template.to_string();
+    job.reply = reply_tx;
+    engine()
+        .send(job)
+        .map_err(|_| anyhow::anyhow!("render queue stopped"))?;
+    reply_rx
+        .recv()
+        .map_err(|_| anyhow::anyhow!("render worker dropped the job"))
+}
+
+fn base_job(template: &str, env: &Env<'_>) -> Job {
+    Job {
+        op: Op::RenderJson,
+        template: template.to_string(),
+        usage: String::new(),
+        channel: env.channel.to_string(),
+        ip: env.ip.to_string(),
+        sync_hhmm: env.sync_hhmm.to_string(),
+        battery: env.battery,
+        state: env.state.to_string(),
+        offline_mins: env.offline_mins,
+        mode: env.mode.to_string(),
+        blob: Vec::new(),
+        reply: std::sync::mpsc::channel().0,
+    }
+}
+
+/// Compile a template into the engine's active compiled record (one parse).
+pub fn compile(template: &str) -> Result<(), String> {
+    let job = base_job(template, &Env::default());
+    let (rc, _, message) = run_engine(Op::Compile, template, job).map_err(|e| e.to_string())?;
+    if rc == 1 {
+        Ok(())
+    } else {
+        Err(message)
+    }
+}
+
+/// Requirements (field paths, index order) of the active compiled template.
+pub fn compiled_requirements() -> Result<Vec<String>, String> {
+    let job = base_job("", &Env::default());
+    let (rc, out, message) = run_engine(Op::ReqList, "", job).map_err(|e| e.to_string())?;
+    if rc < 0 {
+        return Err(message);
+    }
+    let text = String::from_utf8_lossy(&out[..rc as usize]).to_string();
+    Ok(text.split('\n').map(|s| s.to_string()).collect())
+}
+
+pub fn compiled_source_crc() -> u32 {
+    unsafe { codex_ct_source_crc() as u32 }
+}
+
+/// Render using the compiled template (no template JSON parsing).
+pub fn render_compiled_bits(usage: &str, env: &Env<'_>) -> anyhow::Result<Vec<u8>> {
+    let mut job = base_job("", env);
+    job.usage = usage.to_string();
+    let (rc, out, message) = run_engine(Op::RenderCompiled, "", job)?;
+    match rc {
+        1 => Ok(out),
+        0 => anyhow::bail!("compiled template rejected the render"),
+        other => anyhow::bail!("compiled render failed (rc={other}) {message}"),
+    }
+}
+
+/// Serialize the active compiled template (fixed layout, ABI checked).
+pub fn compiled_serialize() -> anyhow::Result<Vec<u8>> {
+    let job = base_job("", &Env::default());
+    let (rc, out, message) = run_engine(Op::Serialize, "", job)?;
+    if rc <= 0 {
+        anyhow::bail!("compiled serialize failed {message}");
+    }
+    Ok(out[..rc as usize].to_vec())
+}
+
+/// Load a compiled template from its fixed layout (validates ABI/CRC/bounds).
+pub fn compiled_deserialize(blob: &[u8]) -> Result<(), String> {
+    let mut job = base_job("", &Env::default());
+    job.blob = blob.to_vec();
+    let (rc, _, message) = run_engine(Op::Deserialize, "", job).map_err(|e| e.to_string())?;
+    if rc == 1 {
+        Ok(())
+    } else {
+        Err(message)
     }
 }
 
@@ -112,7 +310,26 @@ extern "C" {
         out_len: c_int,
     ) -> c_int;
     fn codex_validate(tmpl: *const c_char, err: *mut c_char, err_len: c_int) -> c_int;
+    fn codex_compile(tmpl: *const c_char, err: *mut c_char, err_len: c_int) -> c_int;
+    fn codex_render_compiled(
+        usage: *const c_char,
+        channel: *const c_char,
+        ip: *const c_char,
+        sync_hhmm: *const c_char,
+        battery: c_int,
+        state: *const c_char,
+        offline_mins: c_int,
+        mode: *const c_char,
+        out: *mut u8,
+        out_len: c_int,
+    ) -> c_int;
+    fn codex_ct_req_count() -> c_int;
+    fn codex_ct_req_path(i: c_int, out: *mut c_char, cap: c_int) -> c_int;
+    fn codex_ct_source_crc() -> c_int;
+    fn codex_ct_serialize(out: *mut u8, cap: c_int) -> c_int;
+    fn codex_ct_deserialize(blob: *const u8, len: c_int, err: *mut c_char, err_len: c_int) -> c_int;
     fn codex_rgn_build(tmpl: *const c_char) -> c_int;
+    fn codex_rgn_build_ct(blob: *const u8, len: c_int, err: *mut c_char, errcap: c_int) -> c_int;
     fn codex_rgn_decide(
         old_fb: *const u8,
         new_fb: *const u8,
@@ -179,6 +396,23 @@ pub fn rgn_on_full() {
     unsafe { codex_rgn_on_full() };
 }
 
+/// Derive refresh regions from the compiled record (activation path).
+pub fn rgn_build_compiled(blob: &[u8]) -> Result<usize, String> {
+    let mut err = vec![0i8; 128];
+    let n = unsafe {
+        codex_rgn_build_ct(
+            blob.as_ptr(),
+            blob.len() as c_int,
+            err.as_mut_ptr(),
+            err.len() as c_int,
+        )
+    };
+    if n < 0 {
+        return Err(cstr(&err));
+    }
+    Ok(n as usize)
+}
+
 pub fn rgn_dump() -> String {
     let mut out = vec![0i8; 2048];
     unsafe { codex_rgn_dump(out.as_mut_ptr(), out.len() as c_int) };
@@ -219,28 +453,12 @@ impl Default for Env<'_> {
 
 /// 1-bit raster in the device framebuffer layout (bit set = white, clear = ink).
 pub fn render_bits(template: &str, usage: &str, env: &Env<'_>) -> anyhow::Result<Vec<u8>> {
-    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-    let job = Job {
-        template: template.to_string(),
-        usage: usage.to_string(),
-        channel: env.channel.to_string(),
-        ip: env.ip.to_string(),
-        sync_hhmm: env.sync_hhmm.to_string(),
-        battery: env.battery,
-        state: env.state.to_string(),
-        offline_mins: env.offline_mins,
-        mode: env.mode.to_string(),
-        reply: reply_tx,
-    };
-    engine()
-        .send(job)
-        .map_err(|_| anyhow::anyhow!("render queue stopped"))?;
-    let (rc, out) = reply_rx
-        .recv()
-        .map_err(|_| anyhow::anyhow!("render worker dropped the job"))?;
+    let mut job = base_job(template, env);
+    job.usage = usage.to_string();
+    let (rc, out, message) = run_engine(Op::RenderJson, template, job)?;
     match rc {
         1 => Ok(out),
-        0 => anyhow::bail!("template rejected by the firmware engine"),
+        0 => anyhow::bail!("template rejected by the firmware engine {message}"),
         other => anyhow::bail!("render failed (rc={other})"),
     }
 }

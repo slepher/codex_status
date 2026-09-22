@@ -37,7 +37,7 @@
 
 #include "DEV_Config.h"
 #include "dev_log.h"
-#include "EPD_SSD1681.h"
+#include "epd_target.h"
 #include "GUI_Paint.h"
 #include "fonts.h"
 #include "ble_bridge.h"
@@ -48,19 +48,35 @@
 #include "template_engine.h"
 #include "template_xfer.h"
 #include "refresh_policy.h"
+#include "v2_state.h"
+#include "v2_runtime.h"
+#include "bundle_store.h"
+
+// v2 platform targets (src/platform_target.h): the render/firmware target
+// contract is validated on both sides, including OTA.
+#include "platform_target.h"
+
+// A target whose panel combination is not hardware-verified refuses normal
+// operation: the ROM builds and is host-tested, but it must not pretend the
+// panel contract is proven. Set CODEX_GRAY4_PANEL_CONFIRMED only after the
+// hardware facts (panel model, controller datasheet, pins, waveform) exist.
+#if !TARGET_VERIFIED && !defined(CODEX_GRAY4_PANEL_CONFIRMED)
+#define CODEX_TARGET_UNVERIFIED 1
+#endif
+static bool targetUnverified = false;
 
 #ifdef CODEX_DEEPPULL_TEST
 #define FW_VERSION    "0.13.9-dptest2"
 #elif defined(CODEX_CLK_WINDOW_TEST)
 #define FW_VERSION    "0.13.9-clkwin"
 #else
-#define FW_VERSION    "0.15.10-bw"
+#define FW_VERSION    "0.16.8-bw"
 #endif
 #define AP_PASSWORD   "codex1234"
 #define MAX_SLOTS     3
 
-static const int EPD_W = EPD_SSD1681_WIDTH;
-static const int EPD_H = EPD_SSD1681_HEIGHT;
+static const int EPD_W = TARGET_WIDTH;
+static const int EPD_H = TARGET_HEIGHT;
 static const int EPD_FB_BYTES = (EPD_W / 8) * EPD_H;
 
 #define ACTIVE_HOLD_S    600
@@ -600,6 +616,34 @@ static String activeTplId;
 static bool   activeTplHasNow = false;
 static bool   activeTplHasMode = false;
 
+// v2 platform runtime: one committed Bundle (A/B), one compiled active
+// template, one active context, Bridge-owned PowerPlan.
+static CtTemplate     v2Ct;
+static bool           v2CtValid = false;
+static BsProfile      v2Profile;
+static bool           v2BundleReady = false;
+static V2PlanState    v2Plan;
+static V2DataSeq      v2DataSeq;
+static V2ContextGen   v2CtxGen;
+static uint64_t       v2BootMs = 0;              // physical wake instant
+static bool           v2Provisional = false;     // BOOT 300 s window active
+static uint64_t       v2LightDeadlineMs = 0;     // accepted plan deadline (monotonic)
+static uint64_t       v2LastAckAtMs = 0;
+static uint64_t       v2LastAckSeq = 0;
+static String         v2AppliedFields;           // bounded last applied Data fields
+static uint8_t        v2DisplayState = 0;        // 0 none,1 displayed,2 pending,3 failed
+static uint64_t       v2RxDeadlineMs = 0;        // bounded bundle receive window
+// Device safety cap: with a committed bundle but no formal PowerPlan (or before
+// the Bridge answers) the light session is bounded by the max light lease.
+static uint64_t       v2SafetyDeadlineMs = 0;
+static uint32_t       v2RxOffset = 0;
+static String         v2RxPath = "/bundle/rx.bin";
+static uint32_t       v2RxCrc = 0;
+static String         v2PlanReason = "init";
+
+static uint64_t v2NowMs() { return (uint64_t)(esp_timer_get_time() / 1000ULL); }
+static uint32_t v2Millis32() { return (uint32_t)(esp_timer_get_time() / 1000ULL); }
+
 static String lastUsage;
 static String lastChannel = "-";
 static int      epdPartialCount = 0;
@@ -634,6 +678,7 @@ static int  batteryPercent();
 static bool requestAuthorized();
 static void deepSleepFor(uint32_t sec);
 static void renderCurrent();
+static void persistMode();
 static void otaUploadCleanup(const char *reason);
 static void enterBleOn(bool userInitiated);
 static void bleOff(const char *reason);
@@ -768,13 +813,13 @@ static void epdBegin(bool clearPanel = true) {
     retainSleepCriticalGpio();
     delay(20);
     DEV_Module_Init();
-    epdFullLut = EPD_SSD1681_Init();
+    epdFullLut = EPD_TGT_Init();
     epdBaselineTrusted = false;
     if (!epdFullLut) {
         rtcEpdBusyFails++;
         DevLog.println("[epd] init busy timeout; baseline untrusted");
     }
-    if (clearPanel && EPD_SSD1681_Clear(EPD_SSD1681_WHITE)) {
+    if (clearPanel && EPD_TGT_Clear(EPD_TGT_WHITE)) {
         epdBaselineTrusted = true;   // panel is white, lastDisplayedFrame is white
     } else if (clearPanel) {
         rtcEpdBusyFails++;
@@ -833,7 +878,7 @@ static void epdThinBegin() {
 // refresh and is woken/re-initialized before the next draw.
 static void epdPanelSleep() {
     if (epdAsleep) return;
-    EPD_SSD1681_Sleep();
+    EPD_TGT_Sleep();
     epdAsleep = true;
 }
 
@@ -883,8 +928,8 @@ static void epdFlush(bool forceFull) {
     if (partial && !blink && ++epdPartialCount > 30) partial = false;
     if (partial) {
         bool ok = true;
-        if (epdAsleep) ok = EPD_SSD1681_WakePartial(lastDisplayedFrame);
-        if (ok) ok = EPD_SSD1681_DisplayPart(frame);
+        if (epdAsleep) ok = EPD_TGT_WakePartial(lastDisplayedFrame);
+        if (ok) ok = EPD_TGT_DisplayPart(frame);
         if (ok) {
             epdWriteCount++;
             if (blink) blinkTicks++;
@@ -906,7 +951,7 @@ static void epdFlush(bool forceFull) {
 
     epdPartialCount = 0;
     if (!epdFullLut || epdAsleep) {
-        if (!EPD_SSD1681_Init()) {
+        if (!EPD_TGT_Init()) {
             rtcEpdBusyFails++;
             epdBaselineTrusted = false;
             DevLog.println("[epd] full init busy timeout");
@@ -915,13 +960,13 @@ static void epdFlush(bool forceFull) {
         }
     }
     epdAsleep = false;
-    bool ok = EPD_SSD1681_Display(frame);
+    bool ok = EPD_TGT_Display(frame);
     if (ok) {
         epdWriteCount++;
         rtcClkPartials = 0;   // full waveform clears the clock-window ghosting
         if (lastDisplayedFrame) memcpy(lastDisplayedFrame, frame, EPD_FB_BYTES);
         epdBaselineTrusted = true;
-        epdPartialReady = EPD_SSD1681_Init_Partial();
+        epdPartialReady = EPD_TGT_Init_Partial();
         epdFullLut = false;
         if (!epdPartialReady) {
             rtcEpdBusyFails++;
@@ -1048,6 +1093,66 @@ static void clkComputeRect() {
     DevLog.println("[clk] template has no device.now; no reservation");
 }
 
+// Compiled-template variant: identical reservation rules without parsing the
+// template JSON at activation time (v2 §8).
+static void clkComputeRectCt() {
+    clkR.valid = false;
+    if (!v2CtValid) return;
+    for (uint8_t i = 0; i < v2Ct.opCount; i++) {
+        const CtOp &op = v2Ct.ops[i];
+        if (op.type != CT_TEXT) continue;
+        if (op.bindIdx == CT_NONE_IDX) continue;
+        if (strcmp(v2Ct.reqs[op.bindIdx].path, "device.now") != 0) continue;
+        if (strlen(op.prefix) || strlen(op.suffix)) {
+            DevLog.println("[clk] device.now has prefix/suffix; no reservation");
+            return;
+        }
+        sFONT *f = clkFontById(op.font);
+        if (!f) { DevLog.println("[clk] clock font unknown"); return; }
+        int scale = op.scale ? op.scale : 1;
+        int x = op.x, y = op.y;
+        if (op.flags & 0x02) {
+            int textW = 5 * f->Width * scale;
+            x = op.x;
+            if (op.align == 1) x = op.x + (op.w - textW) / 2;
+            else if (op.align == 2) x = op.x + op.w - textW;
+            y = op.y + (op.h - f->Height * scale) / 2;
+        }
+        int w = 5 * f->Width * scale;
+        int h = f->Height * scale;
+        if (x < 0) x = 0;
+        if (y < 0) y = 0;
+        if (x + w > EPD_W) w = EPD_W - x;
+        if (y + h > EPD_H) h = EPD_H - y;
+        if (w <= 0 || h <= 0) { DevLog.println("[clk] clock outside panel"); return; }
+        const int x0 = (x >> 3) << 3;
+        int x1 = ((x + w - 1) >> 3) * 8 + 7;
+        if (x1 > EPD_W - 1) x1 = EPD_W - 1;
+        const int bw = (x1 >> 3) - (x0 >> 3) + 1;
+        const int bytes = bw * h;
+        if (bytes > CLK_MAX_BYTES) {
+            DevLog.printf("[clk] region %d bytes over cap\n", bytes);
+            return;
+        }
+        clkR.valid = true;
+        clkR.fontId = op.font;
+        clkR.x0b = x0 >> 3;
+        clkR.x1b = x1 >> 3;
+        clkR.y0 = (uint16_t)y;
+        clkR.y1 = (uint16_t)(y + h - 1);
+        clkR.bw = (uint8_t)bw;
+        clkR.rows = (uint8_t)h;
+        clkR.scale = (uint8_t)scale;
+        clkR.xOff = (uint8_t)(x - x0);
+        clkR.yOff = 0;
+        clkPixelsValid = false;
+        DevLog.printf("[clk] reserved x=%d..%d y=%d..%d box=%dx%d win=%dx%dB\n",
+                      x, x + w - 1, y, y + h - 1, w, h, bw, bytes);
+        return;
+    }
+    DevLog.println("[clk] template has no device.now; no reservation");
+}
+
 // Copy the clock window bytes off the framebuffer that is currently on screen.
 static void clkCaptureFromFramebuffer() {
     if (!clkR.valid || !lastDisplayedFrame) return;
@@ -1102,10 +1207,10 @@ static bool clockTickWake() {
     clkBlitString(buf, s);
     const int x0 = clkR.x0b * 8, x1 = clkR.x1b * 8 + 7;
     const uint64_t t1 = esp_timer_get_time();
-    bool ok = EPD_SSD1681_WakePartialWindow(x0, clkR.y0, x1, clkR.y1,
+    bool ok = EPD_TGT_WakePartialWindow(x0, clkR.y0, x1, clkR.y1,
                                             clkPixelsValid ? clkPixels : nullptr);
     const uint64_t t2 = esp_timer_get_time();
-    if (ok) ok = EPD_SSD1681_DisplayPartWindow(x0, clkR.y0, x1, clkR.y1, buf);
+    if (ok) ok = EPD_TGT_DisplayPartWindow(x0, clkR.y0, x1, clkR.y1, buf);
     const uint64_t t3 = esp_timer_get_time();
     if (!ok) {
         // The window waveform state is unknown: keep the previous clock pixels
@@ -1332,9 +1437,57 @@ static bool tplCacheLoad() {
     return true;
 }
 
+// Load the committed Bundle's initial compiled template (or the current one)
+// and prime refresh regions + clock reservation from the compiled record.
+static bool v2ActiveLoad() {
+    if (!v2BundleReady) { v2CtValid = false; return false; }
+    String err;
+    if (!bsLoadCompiled(v2Profile.initial, v2Ct, err)) {
+        DevLog.printf("[v2] active load failed: %s\n", err.c_str());
+        v2CtValid = false;
+        return false;
+    }
+    v2CtValid = true;
+    activeTplId = v2Profile.ids[v2Profile.initial];
+    activeTplJson = "";
+    activeTplHasNow = false;
+    activeTplHasMode = false;
+    for (int i = 0; i < v2Ct.reqCount; i++) {
+        const char *p = v2Ct.reqs[i].path;
+        if (!strcmp(p, "device.now")) activeTplHasNow = true;
+        if (!strcmp(p, "device.mode")) activeTplHasMode = true;
+    }
+    bool rgnOk = rgnBuildCt(v2Ct, rgnSet);
+    DevLog.printf("[rgn] ct %s n=%u whole=%d\n", rgnOk ? "derived" : "fallback",
+                  (unsigned)rgnSet.n, rgnSet.wholeFrame ? 1 : 0);
+    clkComputeRectCt();
+    return true;
+}
+
+// Active-template switch (BOOT key cycle): new context, re-prime regions.
+static void v2SwitchActive(uint8_t index) {
+    char ctx[BS_CTX_LEN];
+    snprintf(ctx, sizeof(ctx), "%08x%08x", v2CtxGen.next(), (unsigned)esp_random());
+    String err;
+    if (!bsSetActive(index, ctx, err)) {
+        DevLog.printf("[v2] activate failed: %s\n", err.c_str());
+        return;
+    }
+    bsProfile(v2Profile);
+    v2DataSeq.beginContext(v2NowMs(), 1);
+    v2AppliedFields = "";
+    if (!v2ActiveLoad()) {
+        // Controlled recovery: fall back to the first installed template.
+        v2Profile.initial = 0;
+        v2ActiveLoad();
+    }
+    DevLog.printf("[v2] active=%s ctx=%s\n", activeTplId.c_str(), v2Profile.contextId);
+}
+
 static void renderActiveUsage(const String &json, const char *channel) {
     if (!frame) return;
-    if (!tplCacheLoad()) { screenStatus(); return; }
+    bool ready = v2BundleReady ? v2ActiveLoad() : tplCacheLoad();
+    if (!ready) { screenStatus(); return; }
     TplEnv env;
     env.channel  = channel ? channel : "";
     env.ip       = ipText();
@@ -1351,7 +1504,9 @@ static void renderActiveUsage(const String &json, const char *channel) {
     }
     Paint_SelectImage(frame);
     Paint_Clear(WHITE);
-    if (tplDraw(activeTplJson, json, env)) {
+    bool drawn = v2CtValid ? tplDrawCt(v2Ct, json, env)
+                           : tplDraw(activeTplJson, json, env);
+    if (drawn) {
         epdFlush(false);
         DevLog.printf("[tpl] rendered %s (%s)\n", activeTplId.c_str(), channel ? channel : "");
         return;
@@ -1378,6 +1533,16 @@ static void renderSleepGlyph() {
 }
 
 static void nextTemplate() {
+    // v2 Bundle: every installed template participates in the key cycle, and a
+    // switch generates a new unreusable context (v2 §4/§10).
+    if (v2BundleReady && v2Profile.count > 0) {
+        uint8_t next = (uint8_t)((v2Profile.initial + 1) % v2Profile.count);
+        v2SwitchActive(next);
+        pendingTplChanged = true;
+        noteActivity("template-switch");
+        DevLog.printf("[v2] local switch -> %s\n", v2Profile.ids[v2Profile.initial]);
+        return;
+    }
     int n = tplStoreCount();
     if (n <= 0) return;
     String active = tplStoreActive();
@@ -2092,6 +2257,38 @@ static void handleStatusJson() {
     doc["tz"] = deviceTz;
     doc["hist_count"] = histCount;
     doc["hist_head"] = histHead;
+    // ------------------------------------------------------------------
+    // v2 platform state (device is authoritative; the Bridge reconciles).
+    // ------------------------------------------------------------------
+    doc["fw_target"] = FW_TARGET_ID;
+    doc["render_target"] = RENDER_TARGET_ID;
+    doc["compiler_abi"] = CT_ABI;
+    doc["v2_bundle"] = v2BundleReady;
+    doc["commit_seq"] = (unsigned)bsCommitSeq();
+    doc["active_context_id"] = v2Profile.contextId;
+    doc["active_template_id"] = (v2BundleReady && v2Profile.count)
+                                    ? String(v2Profile.ids[v2Profile.initial])
+                                    : tplStoreActive();
+    doc["committed_job_id"] = v2Profile.jobId;
+    doc["data_seq"] = (unsigned long)v2DataSeq.appliedSeq();
+    doc["applied_seq"] = (unsigned long)v2DataSeq.appliedSeq();
+    doc["last_acked_at_ms"] = (unsigned long)v2LastAckAtMs;
+    doc["display_state"] = v2DisplayState == 1 ? "displayed"
+                          : v2DisplayState == 2 ? "pending"
+                          : v2DisplayState == 3 ? "failed"
+                                                : "unchanged";
+    doc["v2_templates"] = v2Profile.count;
+    {
+        JsonObject power = doc["power"].to<JsonObject>();
+        power["mode"] = (rtcMode == MODE_DEEP) ? "sleep" : "light";
+        power["plan_id"] = (unsigned long)v2Plan.acceptedId();
+        power["remaining_s"] = v2Plan.remainingS(v2NowMs());
+        power["granted_s"] = v2Plan.grantedS();
+        power["provisional"] = v2Provisional && !v2Plan.accepted();
+        power["provisional_remaining_s"] =
+            v2Provisional ? V2PlanState::bootProvisionalRemaining(v2BootMs, v2NowMs()) : 0;
+        power["rendezvous_period_s"] = V2_RENDEZVOUS_S;
+    }
     {
         uint32_t nowEpoch = timeKnown() ? (uint32_t)time(nullptr) : 0;
         doc["next_contact_in_s"] = (rtcNextNetAt && nowEpoch && rtcNextNetAt > nowEpoch)
@@ -2985,6 +3182,427 @@ static void otaUploadCleanup(const char *reason) {
     if (frame) renderCurrent();
 }
 
+// ===========================================================================
+// v2 protocol endpoints (auth: endpoint token + owner; no implicit renewal).
+// ===========================================================================
+
+// `bridge_id` arrives in the JSON body for data/plan; bundle/activate calls also
+// carry it there (the query/form fallback exists for simple curl tests).
+static String v2BodyBridgeId(const String &body) {
+    JsonDocument doc;
+    if (deserializeJson(doc, body)) return server.arg("bridge_id");
+    const char *id = doc["bridge_id"] | "";
+    return strlen(id) ? String(id) : server.arg("bridge_id");
+}
+
+static bool v2OwnerOk(const char *bridgeId) {
+    if (!ownerAllows(bridgeId)) {
+        server.send(409, "application/json",
+                    String("{\"result\":\"rejected\",\"error\":\"occupied\",\"owner\":") +
+                        ownerJson() + "}");
+        DevLog.printf("[v2] rejected: owner conflict id=%s\n", bridgeId ? bridgeId : "?");
+        return false;
+    }
+    return true;
+}
+
+static void v2Ack(const char *op, const char *result, const char *display,
+                  const char *retention, const char *error, long seq, uint64_t planId,
+                  const char *context, uint32_t acceptedRemainingS) {
+    JsonDocument doc;
+    doc["op"] = op;
+    doc["result"] = result;
+    doc["display_state"] = display;
+    doc["retention"] = retention;
+    if (error && *error) doc["error"] = error;
+    if (seq >= 0) doc["data_seq"] = seq;
+    if (planId) doc["plan_id"] = planId;
+    if (context && *context) doc["active_context_id"] = context;
+    if (acceptedRemainingS != UINT32_MAX) doc["accepted_remaining_s"] = acceptedRemainingS;
+    doc["fw_target"] = FW_TARGET_ID;
+    String out;
+    serializeJson(doc, out);
+    server.send(200, "application/json", out);
+}
+
+// GET /v2/status: authenticated authoritative state (the beacon only points).
+// Business channel auth = endpoint token (same trust as /usage and /template);
+// the device operation token keeps gating /claim, /update, /doUpdate, /diag.
+static void handleV2Status() {
+    DevLog.printf("[v2] req status heap=%u", (unsigned)ESP.getFreeHeap());
+    String mac;
+    if (!endpointTokenAuthorized(mac)) {
+        server.send(401, "application/json", "{\"result\":\"unauthorized\"}");
+        return;
+    }
+    JsonDocument doc;
+    doc["result"] = "applied";
+    doc["active_context_id"] = v2Profile.contextId;
+    doc["active_template_id"] =
+        (v2BundleReady && v2Profile.count) ? v2Profile.ids[v2Profile.initial] : activeTplId;
+    doc["committed_job_id"] = v2Profile.jobId;
+    doc["data_seq"] = (unsigned long)v2DataSeq.appliedSeq();
+    doc["applied_seq"] = (unsigned long)v2DataSeq.appliedSeq();
+    doc["display_state"] = v2DisplayState == 1 ? "displayed"
+                          : v2DisplayState == 2 ? "pending"
+                          : v2DisplayState == 3 ? "failed"
+                                                : "unchanged";
+    doc["commit_seq"] = (unsigned)bsCommitSeq();
+    doc["configured"] = v2BundleReady;
+    doc["template_ids"] = JsonArray();
+    for (uint8_t i = 0; i < v2Profile.count; i++) doc["template_ids"].add(v2Profile.ids[i]);
+    JsonObject power = doc["power"].to<JsonObject>();
+    power["mode"] = (rtcMode == MODE_DEEP) ? "sleep" : "light";
+    power["plan_id"] = (unsigned long)v2Plan.acceptedId();
+    power["remaining_s"] = v2Plan.remainingS(v2NowMs());
+    power["granted_s"] = v2Plan.grantedS();
+    power["provisional"] = v2Provisional && !v2Plan.accepted();
+    power["provisional_remaining_s"] =
+        v2Provisional ? V2PlanState::bootProvisionalRemaining(v2BootMs, v2NowMs()) : 0;
+    power["rendezvous_period_s"] = V2_RENDEZVOUS_S;
+    power["battery"] = batteryPercent();
+    String out;
+    serializeJson(doc, out);
+    server.send(200, "application/json", out);
+}
+
+// POST /v2/data: atomic complete snapshot inside the current context.
+static void handleV2Data() {
+    DevLog.printf("[v2] req data heap=%u", (unsigned)ESP.getFreeHeap());
+    String mac;
+    if (!endpointTokenAuthorized(mac)) {
+        server.send(401, "application/json", "{\"result\":\"unauthorized\"}");
+        return;
+    }
+    String body = server.arg("plain");
+    JsonDocument peek;
+    if (deserializeJson(peek, body)) {
+        v2Ack("data", "rejected", "failed", "ram", "json", -1, 0, nullptr, UINT32_MAX);
+        return;
+    }
+    if (!v2OwnerOk(peek["bridge_id"] | "")) return;
+    if (!v2BundleReady || !v2CtValid) {
+        v2Ack("data", "rejected", "failed", "ram", "unconfigured", -1, 0, nullptr,
+              UINT32_MAX);
+        return;
+    }
+    uint64_t seq = peek["seq"] | 0ULL;
+    uint32_t crc = 0;
+    strtoul(peek["crc"] | "", nullptr, 16);
+    V2DataAck obs = v2DataSeq.observe(seq, 0);
+    String usage, err;
+    V2DataAck rc = v2ApplyData(v2Ct, body, v2Profile.contextId, usage, err);
+    if (rc == V2_DATA_CONTEXT_MISMATCH) {
+        v2Ack("data", "rejected", "pending", "ram", "context", (long)seq, 0,
+              v2Profile.contextId, UINT32_MAX);
+        return;
+    }
+    if (rc != V2_DATA_APPLIED) {
+        v2Ack("data", "rejected", "failed", "ram", err.c_str(), (long)seq, 0,
+              v2Profile.contextId, UINT32_MAX);
+        return;
+    }
+    if (obs == V2_DATA_UNCHANGED) {
+        v2Ack("data", "applied", "unchanged", "ram", nullptr, (long)seq, 0,
+              v2Profile.contextId, UINT32_MAX);
+        return;
+    }
+    if (obs == V2_DATA_CONFLICT || obs == V2_DATA_STALE) {
+        v2Ack("data", "rejected", "unchanged", "ram",
+              obs == V2_DATA_CONFLICT ? "seq_conflict" : "stale_seq", (long)seq, 0,
+              v2Profile.contextId, UINT32_MAX);
+        return;
+    }
+    v2AppliedFields = "";
+    serializeJson(peek["fields"], v2AppliedFields);
+    v2DataSeq.noteApplied(seq, 0);
+    v2LastAckSeq = seq;
+    v2LastAckAtMs = v2NowMs();
+    // Bounded RAM/RTC retention: checkpoint at most once per minute.
+    static uint32_t lastCheckpointAt = 0;
+    if (v2Millis32() - lastCheckpointAt > 60000UL) {
+        lastCheckpointAt = v2Millis32();
+        Preferences p;
+        p.begin("v2", false);
+        p.putULong64("dseq", seq);
+        p.putString("dfields", v2AppliedFields.length() > 4000
+                                   ? v2AppliedFields.substring(0, 4000)
+                                   : v2AppliedFields);
+        p.end();
+    }
+    uint32_t before = epdWriteCount;
+    uint32_t busyBefore = rtcEpdBusyFails;
+    lastUsage = usage;
+    lastChannel = "PULL";
+    renderActiveUsage(usage, "PULL");
+    const char *display = "unchanged";
+    if (rtcEpdBusyFails != busyBefore) {
+        display = "failed";
+        v2DisplayState = 3;
+    } else if (epdWriteCount != before) {
+        display = "displayed";
+        v2DisplayState = 1;
+    } else {
+        v2DisplayState = 1;
+    }
+    v2Ack("data", "applied", display, "ram", nullptr, (long)seq, 0, v2Profile.contextId,
+          UINT32_MAX);
+}
+
+// POST /v2/plan: the only way to change the light deadline.
+static void handleV2Plan() {
+    DevLog.printf("[v2] req plan heap=%u", (unsigned)ESP.getFreeHeap());
+    String mac;
+    if (!endpointTokenAuthorized(mac)) {
+        server.send(401, "application/json", "{\"result\":\"unauthorized\"}");
+        return;
+    }
+    String body = server.arg("plain");
+    JsonDocument doc;
+    if (deserializeJson(doc, body)) {
+        v2Ack("plan", "rejected", "unchanged", "ram", "json", -1, 0, nullptr, UINT32_MAX);
+        return;
+    }
+    if (!v2OwnerOk(doc["bridge_id"] | "")) return;
+    V2PowerPlan plan;
+    plan.planId = doc["plan_id"] | 0ULL;
+    const char *mode = doc["mode"] | "sleep";
+    plan.mode = strcmp(mode, "light") == 0 ? V2_PLAN_LIGHT : V2_PLAN_SLEEP;
+    plan.lightDurationS = doc["light_duration_s"] | 0u;
+    plan.rendezvousPeriodS = doc["rendezvous_period_s"] | V2_RENDEZVOUS_S;
+    V2PlanAck rc = v2Plan.accept(plan, v2NowMs(), false,
+                                 v2Provisional ? V2_BOOT_PROVISIONAL_S : V2_MAX_LIGHT_S);
+    if (rc == V2_PLAN_STALE_ID || rc == V2_PLAN_CONFLICT) {
+        v2Ack("plan", "rejected", "unchanged", "ram",
+              rc == V2_PLAN_STALE_ID ? "stale_plan" : "plan_conflict", -1, plan.planId,
+              v2Profile.contextId, UINT32_MAX);
+        return;
+    }
+    v2PlanReason = "bridge";
+    if (plan.mode == V2_PLAN_LIGHT) {
+        v2LightDeadlineMs = v2NowMs() + (uint64_t)v2Plan.grantedS() * 1000ULL;
+        v2Provisional = false;
+        if (rtcMode != MODE_LIGHT) {
+            rtcMode = MODE_LIGHT;
+            persistMode();
+        }
+        DevLog.printf("[v2] plan %lu light %us\n", (unsigned long)plan.planId,
+                      (unsigned)v2Plan.grantedS());
+    } else {
+        v2LightDeadlineMs = 0;
+        v2Provisional = false;
+        DevLog.printf("[v2] plan %lu sleep\n", (unsigned long)plan.planId);
+    }
+    v2Ack("plan", "applied", rtcMode == MODE_LIGHT ? "unchanged" : "unchanged", "ram",
+          nullptr, -1, plan.planId, v2Profile.contextId, v2Plan.grantedS());
+}
+
+// POST /v2/activate?id=: explicit remote activation (new device context).
+static void handleV2Activate() {
+    DevLog.printf("[v2] req activate heap=%u", (unsigned)ESP.getFreeHeap());
+    String mac;
+    if (!endpointTokenAuthorized(mac)) {
+        server.send(401, "application/json", "{\"result\":\"unauthorized\"}");
+        return;
+    }
+    String id = server.arg("id");
+    String bridgeId = v2BodyBridgeId(server.arg("plain"));
+    if (!v2OwnerOk(bridgeId.c_str())) return;
+    if (!v2BundleReady) {
+        v2Ack("activate", "rejected", "unchanged", "ram", "unconfigured", -1, 0, nullptr,
+              UINT32_MAX);
+        return;
+    }
+    int index = -1;
+    for (uint8_t i = 0; i < v2Profile.count; i++) {
+        if (id == v2Profile.ids[i]) { index = i; break; }
+    }
+    if (index < 0) {
+        v2Ack("activate", "rejected", "unchanged", "ram", "unknown_template", -1, 0,
+              v2Profile.contextId, UINT32_MAX);
+        return;
+    }
+    v2SwitchActive((uint8_t)index);
+    renderCurrent();
+    v2Ack("activate", "applied", "displayed", "flash", nullptr, -1, 0,
+          v2Profile.contextId, UINT32_MAX);
+}
+
+// POST /v2/bundle: bounded complete Bundle install (whole body <= 256 KiB).
+static void handleV2Bundle() {
+    DevLog.printf("[v2] req bundle heap=%u", (unsigned)ESP.getFreeHeap());
+    String mac;
+    if (!endpointTokenAuthorized(mac)) {
+        server.send(401, "application/json", "{\"result\":\"unauthorized\"}");
+        return;
+    }
+    String body = server.arg("plain");
+    if (body.length() == 0 || body.length() > BS_MAX_BUNDLE_BYTES) {
+        v2Ack("bundle", "rejected", "unchanged", "flash", "size", -1, 0, nullptr,
+              UINT32_MAX);
+        return;
+    }
+    JsonDocument peek;
+    if (deserializeJson(peek, body)) {
+        v2Ack("bundle", "rejected", "unchanged", "flash", "json", -1, 0, nullptr,
+              UINT32_MAX);
+        return;
+    }
+    if (!v2OwnerOk(peek["bridge_id"] | "")) return;
+    char ctx[BS_CTX_LEN];
+    snprintf(ctx, sizeof(ctx), "%08x%08x", v2CtxGen.next(), (unsigned)esp_random());
+    String err;
+    if (!bsInstall(body, FW_TARGET_ID, RENDER_TARGET_ID, ctx, err)) {
+        // Failed installs leave the current slot and context untouched.
+        v2Ack("bundle", "rejected", "unchanged", "flash", err.c_str(), -1, 0,
+              v2Profile.contextId, UINT32_MAX);
+        return;
+    }
+    bsProfile(v2Profile);
+    v2BundleReady = true;
+    v2DataSeq.beginContext(v2NowMs(), 1);
+    v2AppliedFields = "";
+    v2ActiveLoad();
+    renderCurrent();
+    v2Ack("bundle", "applied", "displayed", "flash", nullptr, -1, 0, v2Profile.contextId,
+          UINT32_MAX);
+}
+
+// Bounded BEGIN/CHUNK/COMMIT transport for large bundles (offset checked).
+static void handleV2BundleBegin() {
+    DevLog.printf("[v2] req bundle/begin heap=%u", (unsigned)ESP.getFreeHeap());
+    String mac;
+    if (!endpointTokenAuthorized(mac)) {
+        server.send(401, "application/json", "{\"result\":\"unauthorized\"}");
+        return;
+    }
+    String bridgeId = v2BodyBridgeId(server.arg("plain"));
+    if (!v2OwnerOk(bridgeId.c_str())) return;
+    uint32_t len = (uint32_t)server.arg("len").toInt();
+    if (len == 0 || len > BS_MAX_BUNDLE_BYTES) {
+        v2Ack("bundle", "rejected", "unchanged", "flash", "size", -1, 0, nullptr,
+              UINT32_MAX);
+        return;
+    }
+    if (!LittleFS.exists("/bundle")) LittleFS.mkdir("/bundle");
+    File f = LittleFS.open(v2RxPath, "w");
+    if (!f) {
+        DevLog.printf("[v2] bundle begin open failed (dir=%d)\n",
+                      LittleFS.exists("/bundle") ? 1 : 0);
+        v2Ack("bundle", "rejected", "unchanged", "flash", "open", -1, 0, nullptr,
+              UINT32_MAX);
+        return;
+    }
+    f.close();
+    v2RxOffset = 0;
+    v2RxCrc = 0;
+    v2RxDeadlineMs = v2NowMs() + 120000ULL;   // bounded receive window
+    server.send(200, "application/json", "{\"result\":\"applied\",\"op\":\"bundle_begin\"}");
+}
+
+static void handleV2BundleChunk() {
+    String mac;
+    if (!endpointTokenAuthorized(mac)) {
+        server.send(401, "application/json", "{\"result\":\"unauthorized\"}");
+        return;
+    }
+    if (v2RxDeadlineMs == 0 || v2NowMs() > v2RxDeadlineMs) {
+        v2RxOffset = 0;
+        v2RxDeadlineMs = 0;
+        v2Ack("bundle", "rejected", "unchanged", "flash", "timeout", -1, 0, nullptr,
+              UINT32_MAX);
+        return;
+    }
+    uint32_t offset = (uint32_t)server.arg("offset").toInt();
+    if (offset != v2RxOffset) {
+        v2RxOffset = 0;
+        v2RxDeadlineMs = 0;
+        v2Ack("bundle", "rejected", "unchanged", "flash", "offset", -1, 0, nullptr,
+              UINT32_MAX);
+        return;
+    }
+    String body = server.arg("plain");
+    if (body.length() == 0 || v2RxOffset + body.length() > BS_MAX_BUNDLE_BYTES) {
+        v2RxOffset = 0;
+        v2RxDeadlineMs = 0;
+        v2Ack("bundle", "rejected", "unchanged", "flash", "size", -1, 0, nullptr,
+              UINT32_MAX);
+        return;
+    }
+    File f = LittleFS.open(v2RxPath, v2RxOffset == 0 ? "w" : "a");
+    if (!f) {
+        v2RxDeadlineMs = 0;
+        v2Ack("bundle", "rejected", "unchanged", "flash", "open", -1, 0, nullptr,
+              UINT32_MAX);
+        return;
+    }
+    bool ok = f.write((const uint8_t *)body.c_str(), body.length()) == body.length();
+    f.close();
+    if (!ok) {
+        v2RxDeadlineMs = 0;
+        v2Ack("bundle", "rejected", "unchanged", "flash", "write", -1, 0, nullptr,
+              UINT32_MAX);
+        return;
+    }
+    v2RxOffset += body.length();
+    v2RxCrc = v2Crc32((const uint8_t *)body.c_str(), body.length());
+    server.send(200, "application/json",
+                String("{\"result\":\"applied\",\"op\":\"bundle_chunk\",\"next_offset\":") +
+                    String(v2RxOffset) + "}");
+}
+
+static void handleV2BundleCommit() {
+    DevLog.printf("[v2] req bundle/commit heap=%u", (unsigned)ESP.getFreeHeap());
+    String mac;
+    if (!endpointTokenAuthorized(mac)) {
+        server.send(401, "application/json", "{\"result\":\"unauthorized\"}");
+        return;
+    }
+    String bridgeId = v2BodyBridgeId(server.arg("plain"));
+    if (!v2OwnerOk(bridgeId.c_str())) return;
+    uint32_t len = (uint32_t)server.arg("len").toInt();
+    if (v2RxDeadlineMs == 0 || v2RxOffset != len || len == 0) {
+        v2RxDeadlineMs = 0;
+        v2Ack("bundle", "rejected", "unchanged", "flash", "length", -1, 0, nullptr,
+              UINT32_MAX);
+        return;
+    }
+    File f = LittleFS.open(v2RxPath, "r");
+    if (!f) {
+        v2RxDeadlineMs = 0;
+        v2Ack("bundle", "rejected", "unchanged", "flash", "open", -1, 0, nullptr,
+              UINT32_MAX);
+        return;
+    }
+    String body;
+    body.reserve(len);
+    while (f.available()) body += (char)f.read();
+    f.close();
+    v2RxDeadlineMs = 0;
+    v2RxOffset = 0;
+    if ((uint32_t)body.length() != len) {
+        v2Ack("bundle", "rejected", "unchanged", "flash", "short", -1, 0, nullptr,
+              UINT32_MAX);
+        return;
+    }
+    char ctx[BS_CTX_LEN];
+    snprintf(ctx, sizeof(ctx), "%08x%08x", v2CtxGen.next(), (unsigned)esp_random());
+    String err;
+    if (!bsInstall(body, FW_TARGET_ID, RENDER_TARGET_ID, ctx, err)) {
+        v2Ack("bundle", "rejected", "unchanged", "flash", err.c_str(), -1, 0,
+              v2Profile.contextId, UINT32_MAX);
+        return;
+    }
+    bsProfile(v2Profile);
+    v2BundleReady = true;
+    v2DataSeq.beginContext(v2NowMs(), 1);
+    v2AppliedFields = "";
+    v2ActiveLoad();
+    renderCurrent();
+    v2Ack("bundle", "applied", "displayed", "flash", nullptr, -1, 0, v2Profile.contextId,
+          UINT32_MAX);
+}
+
 static void registerHttpRoutes() {
     server.on("/", HTTP_GET, handleStatus);
     server.on("/status.json", HTTP_GET, handleStatusJson);
@@ -2996,6 +3614,16 @@ static void registerHttpRoutes() {
     server.on("/usage", HTTP_POST, handleUsagePost);
     server.on("/template", HTTP_POST, handleTemplatePost);
     server.on("/claim", HTTP_POST, handleClaim);
+    // v2 platform protocol: authenticated business endpoints (token + owner);
+    // none of them extend the light deadline implicitly.
+    server.on("/v2/status", HTTP_GET, handleV2Status);
+    server.on("/v2/data", HTTP_POST, handleV2Data);
+    server.on("/v2/plan", HTTP_POST, handleV2Plan);
+    server.on("/v2/activate", HTTP_POST, handleV2Activate);
+    server.on("/v2/bundle", HTTP_POST, handleV2Bundle);
+    server.on("/v2/bundle/begin", HTTP_POST, handleV2BundleBegin);
+    server.on("/v2/bundle/chunk", HTTP_POST, handleV2BundleChunk);
+    server.on("/v2/bundle/commit", HTTP_POST, handleV2BundleCommit);
     server.on("/update", HTTP_GET, handleUpdatePage);
     server.on("/doUpdate", HTTP_POST,
         []() {
@@ -3013,6 +3641,14 @@ static void registerHttpRoutes() {
                 if (!requestAuthorized()) {
                     otaUploadDenied = true;
                     DevLog.println("[ota] rejected: unauthorized");
+                    return;
+                }
+                // Dual-side target check: a ROM built for another firmware
+                // target must never be accepted (v2 §5/§9).
+                if (server.hasArg("target") && server.arg("target") != FW_TARGET_ID) {
+                    otaUploadDenied = true;
+                    DevLog.printf("[ota] rejected: target %s != %s\n",
+                                  server.arg("target").c_str(), FW_TARGET_ID);
                     return;
                 }
                 otaUploadDenied = false;
@@ -3816,13 +4452,18 @@ void setup() {
         p.end();
     }
     lastPersistedSync = rtcLastSyncEpoch;
+    // v2: the BOOT provisional window starts at the physical wake instant; a
+    // timer wake never gets this fallback (docs/generic-display-platform-design-v2 §7).
+    v2BootMs = v2NowMs();
+    v2Provisional = (cause == ESP_SLEEP_WAKEUP_EXT1);
     if (cause == ESP_SLEEP_WAKEUP_EXT1) {
         // Manual wake (BOOT/PWR): leave deep and behave as light (docs §13.3).
         rtcMode = MODE_LIGHT;
         persistMode();
         rtcRetryStage = 0;   // button wake replays the retry cadence from the top
         histAdd(HIST_TO_LIGHT, 1);   // aux=1: button wake
-        DevLog.println("[pm] button wake: light mode, retry stage reset");
+        DevLog.printf("[pm] button wake: light mode, provisional %us\n",
+                      (unsigned)V2_BOOT_PROVISIONAL_S);
     }
     if (plugged && !rtcDeepOnUsb) rtcMode = MODE_LIGHT;
     deepWakePath = deepTimerBoot;
@@ -3830,6 +4471,14 @@ void setup() {
     // and replace it as soon as the wake render runs (docs/ble-rendezvous-power-design §3).
     wokeFromDeep = woke;
 
+#ifdef CODEX_TARGET_UNVERIFIED
+    targetUnverified = true;
+    epdPartialReady = false;
+    epdBaselineTrusted = false;
+    DevLog.printf("[target] %s (%s) unverified: compile/host-tested only; "
+                  "hardware facts missing (blocked_by_hardware_arrival)\n",
+                  FW_TARGET_ID, RENDER_TARGET_ID);
+#endif
     const esp_partition_t *running = esp_ota_get_running_partition();
     DevLog.printf("\n[codex-status] v%s mac=%s reset=%s slot=%s wake=%d(%s) usb=%d deepusb=%d mode=%s\n",
                   FW_VERSION, macText().c_str(), resetReasonName(),
@@ -3841,6 +4490,23 @@ void setup() {
 
     tplStoreBegin();
     tplXferBegin(FW_VERSION, []() { pendingTplChanged = true; });
+    // v2 Bundle store: a committed A/B bundle takes over the active template
+    // path; without one the legacy store continues to serve templates.
+    v2CtxGen.seed(esp_random());
+    v2BundleReady = bsBegin();
+    if (v2BundleReady) {
+        bsProfile(v2Profile);
+        DevLog.printf("[v2] bundle job=%s active=%s templates=%u ctx=%s commit=%u\n",
+                      v2Profile.jobId, v2Profile.ids[v2Profile.initial],
+                      (unsigned)v2Profile.count, v2Profile.contextId,
+                      (unsigned)bsCommitSeq());
+        v2ActiveLoad();
+        v2DataSeq.beginContext(v2NowMs(), 1);
+        v2Provisional = v2Provisional || (cause == ESP_SLEEP_WAKEUP_EXT1);
+        v2SafetyDeadlineMs = v2NowMs() + (uint64_t)V2_MAX_LIGHT_S * 1000ULL;
+    } else {
+        DevLog.println("[v2] no committed bundle; legacy template store active");
+    }
     String cached;
     if (usageCacheLoad(cached)) lastUsage = cached;
 
@@ -3983,6 +4649,17 @@ void loop() {
     }
     handleSerialCli();
     server.handleClient();
+    if (targetUnverified) {
+        // Unverified panel combination: stay recoverable over USB serial and
+        // never drive data, templates, radios or the panel runtime.
+        static uint32_t lastNote = 0;
+        if (millis() - lastNote > 10000UL) {
+            lastNote = millis();
+            DevLog.printf("[target] %s unverified; normal operation refused\n", FW_TARGET_ID);
+        }
+        delay(50);
+        return;
+    }
     blePoll();
 
     static uint32_t pwrDownAt = 0;
@@ -4098,14 +4775,37 @@ void loop() {
     serviceAnnounce();
     serviceLed();
 
+    // v2: only a new formal PowerPlan moves the light deadline; reads, data,
+    // claims and status polls never do. The BOOT provisional 300 s closes the
+    // radio when the Bridge stays unreachable (v2 §7/§12).
+    if (v2BundleReady && rtcMode == MODE_LIGHT) {
+        if (v2Plan.accepted()) {
+            if (!v2Plan.lightActive(v2NowMs())) {
+                DevLog.printf("[v2] formal light window ended (%s)\n", v2PlanReason.c_str());
+                enterDeep("v2 plan");
+            }
+        } else if (v2Provisional &&
+                   V2PlanState::bootProvisionalRemaining(v2BootMs, v2NowMs()) == 0) {
+            DevLog.println("[v2] boot provisional 300s expired without a formal plan");
+            enterDeep("v2 provisional");
+        } else if (!v2Provisional && v2SafetyDeadlineMs &&
+                   v2NowMs() >= v2SafetyDeadlineMs) {
+            DevLog.println("[v2] no formal plan within the max light lease; sleeping");
+            enterDeep("v2 safety");
+        }
+    }
+
     // v0.14 mode transitions: a pending-window expiry or the local idle timer
     // (plus a bridge `mode:"deep"` hint) sends the device back to deep sleep.
-    if (pendingWindowUntilMs && (int32_t)(millis() - pendingWindowUntilMs) >= 0) {
-        pendingWindowUntilMs = 0;
-        enterDeep("pending window");
-    }
-    if (idleDeepDue()) {
-        enterDeep(forceDeepAtMs ? "bridge deep" : "idle");
+    // With a v2 bundle the Bridge-owned plan is authoritative.
+    if (!v2BundleReady) {
+        if (pendingWindowUntilMs && (int32_t)(millis() - pendingWindowUntilMs) >= 0) {
+            pendingWindowUntilMs = 0;
+            enterDeep("pending window");
+        }
+        if (idleDeepDue()) {
+            enterDeep(forceDeepAtMs ? "bridge deep" : "idle");
+        }
     }
 
     // 1 Hz housekeeping tick: read the clock once per second and share it

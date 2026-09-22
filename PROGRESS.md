@@ -1,5 +1,147 @@
 # Codex Status 项目进度（交接文档）
 
+## 进行中：2026-09-22 — 第二硬件 target（4.2" 400×300 SSD2683 / ZecTrix Note4）
+
+用户已确认面板事实：**4.2 英寸黑白、400×300、SSD2683**；按键 = 侧边 PGUP/PGDN、
+正面 ENTER（原理图 net：`KEY_PGUP` / `KEY_ESP32_EN` / `KEY_ENTER`）。
+本轮已完成（编译/宿主验证，未 OTA）：
+- **几何参数化**：`template_engine`（`tplSetCanvas`）、`refresh_policy`（`rgnSetPanel`）、
+  `platform_target.h`（`TARGET_WIDTH/HEIGHT/ROW_BYTES/FB_BYTES`）——同一引擎可服务
+  200×200 与 400×300；200×200 宿主逐像素/区域一致性测试仍全绿。
+- **驱动选择层** `src/epd_target.h`：`EPD_TGT_*` 别名按 target 选 SSD1681/SSD2683；
+  `main.cpp` 已改为别名（200×200 行为不变）。
+- **SSD2683 驱动骨架** `src/EPD_SSD2683.{h,cpp}`：400×300/1bpp（50B/行、15000B 帧）、
+  窗口/双 plane/BUSY 传播/局刷窗口接口；仅 `CODEX_TARGET_NOTE4` 编译。
+- **第二 ROM 环境（未启用）**：`platformio.ini` 的 note4 env、waveform LUT 与引脚
+  全部以 `#error` 显式列出（不猜），故不加入默认 `pio run`。
+- **ROM**：`artifacts/codex-status-0.16.8-bw.bin`（1 684 928 B，SHA256
+  `7AA6A96C1B9B07B6501B7EA6C10DE758DBF1B5A52D25D0D34EC6F22AA09297A3`，含几何参数化，
+  **未 OTA**；设备现场仍为 0.16.7 的 `687A611B…`）。
+
+**继续所需的硬件事实（缺一不可，勿猜）**
+1. ESP32-S3 侧 EPD GPIO：`EPD_SCK/EPD_MOSI/EPD_CS/EPD_DC/EPD_RST/EPD_BUSY/EPD3V3_EN`
+   对应 GPIO 号（原理图放大截图或文字对照）。
+2. 三个按键 `KEY_PGUP/KEY_PGDN/KEY_ENTER` 的 GPIO 号。
+3. SSD2683 面板的时序参数（gate 数、方向/数据入口、border、温度曲线）与
+   **两套 waveform LUT**（厂商样例/规格书），用于 `ssd2683_luts.h`。
+4. 该板 flash/PSRAM 型号与容量（独立 ROM 的分区/帧缓存规划；400×300 1bpp 单帧
+   15000B，A/B 双帧 + 编译产物仍需容量审计）。
+
+拿到 1–4 后：填 `src/platform_target.h`/`DEV_Config.h` 的 NOTE4 映射 → 启用 env →
+`TARGET_PARTIAL` 仅在波形/BUSY 实测后打开 → 模板 variant（`render_target=
+epd-ssd2683-400x300-1bpp`）与 OTA 双端防错已在协议/桥侧就绪 → 逐项实机清单见
+`project-workflow/generic-display-platform-implementation/status.md`。
+桥侧 400×300 target 注册/画布校验/预览与 variant 路径尚未接线（下一步）。
+
+## 实机验证：2026-09-22 — v2 平台在 200×200 SSD1681 设备上跑通（固件 0.16.7-bw）
+
+设备 `70041DD7A340` / 192.168.3.163，桥为本次实现构建（`bridge/target/debug`）。
+过程固件：0.15.10 → 0.16.0 → 0.16.7（每轮都是实机暴露问题后的修复，全部 OTA 验证）。
+
+**已验证（实机）**
+- **legacy 回归**：装 v2 Bundle 前 `[v2] no committed bundle; legacy template store active`，
+  quad 正常渲染、区域策略 `n=13`、Wi-Fi push 正常。
+- **完整 Bundle 安装**：BEGIN/CHUNK/COMMIT 提交成功；`v2_bundle=true`、3 模板、
+  `commit_seq=2`、设备生成 context；变更模板后再次发布走另一槽（A/B），
+  `commit_seq` 递增、context 重新生成。
+- **数据投递**：`data_seq` 单调（1→5），`display=displayed`，`epd_writes` 递增；
+  字段 CRC 与桥逐字节一致。
+- **局刷与清影**：黑块反白数字变化 `refresh=partial/ok dirty=37`（未整块重刷）；
+  连续 89↔90 多次后按预算升级为 `full/clean`（实机观察到阈值行为）。
+- **正式 PowerPlan**：plan_id 1/4/6/7；`remaining_s` 单调递减（跨多次状态读取与一次数据推送
+  不续租）；旧 plan_id（0）被 `stale_plan` 拒绝。
+- **BOOT provisional**：`wake=ext1` 后 `prov=True prov_rem=276`（从物理唤醒起算）；
+  桥保持原窗口下发 `granted=267`（不是新的 300），随后用新 plan_id 延长到 600。
+- **deep 与 timer wake**：上下文在正常 deep 唤醒后保持同一 `active_context_id`；
+  deep 期间排队的 push 在唤醒后的首个会合窗口投递（约 60–70s）。
+- **A→B→A**：远程显式激活产生三个互不相同的 context。
+- **OTA target 防错**：错误 target 返回 401，设备日志
+  `[ota] rejected: target codex-status-154g-gray4 != codex-status-154g`，固件未变。
+- **安装中断 + 掉电**：写入半个 Bundle 后深睡/重启，已提交包与 job 完好。
+- **PM**：`light_sleep_counts=2822`、SLEEP 占比 79%，无 OTA/USB 锁泄漏。
+
+**实机暴露并修复的问题**（全部已回归）
+1. `/v2/*` 认证应为 endpoint token（桥业务通道），非设备操作 token。
+2. BEGIN/COMMIT/ACTIVATE 的 `bridge_id` 在 JSON body 中（此前误读 query）。
+3. Bundle 槽尺寸少算 12B 序列化头 → 读回长度校验失败。
+4. `bsInstall` 的 9KB `CtTemplate` 落在 8KB loop 栈 → 栈溢出（int-wdt）。
+5. `LittleFS.begin` 用默认 label 覆盖挂载标签 → `totalBytes()=0`、空间检查误拒。
+6. Bundle 必须能在没有 context 时投递（它是 context 的来源）。
+7. 设备空 `active_context_id` 不得被当作文成 context 采纳。
+8. activate 成功后未清 `pending_activate` → 周期性重复激活/新 context。
+9. plan 内容相同但窗口过期后必须换新 plan_id（否则无法重新授予 light）。
+10. 有 Bundle 但无正式计划时需要设备侧 max light lease 兜底。
+11. v2 有待投递数据时 legacy pull 响应必须回 light（否则 timer wake 立刻回 deep）。
+
+- **桥不可达时的 BOOT 300s 兜底**（实机，桥停机）：`wake=ext1` 后 provisional 从 288 单调
+  递减（Wi-Fi 已连、`http -1` 重试），到 `prov_rem=3`（≈t_boot+293s）后设备关闭无线并回
+  deep，此后 ~1 分钟无响应；全程未接受任何正式计划（`plan=0`）。
+- **桥重启后的恢复**：设备 timer 唤醒后保持同一 context；桥用已持久化的计数继续
+  （`data_seq=9` 跳号被接受），并下发新的正式计划（id 7，600s），`display=displayed`。
+
+**ROM**：`artifacts/codex-status-0.16.7-bw.bin`（1 684 864 B，SHA256
+`687A611B6DF655A62A3F9314328DFD8FFFDEA0C8F5E7D8D51CABCBA6ED8250CB`，与当前源码重建一致，
+已 OTA 到设备 ota_0/ota_1 轮换）；中间构建保留 0.16.0–0.16.6（sha 见各自 artifacts）。
+**交互验证产物**：`artifacts/panel-*.png`（电脑摄像头拍摄：清洁全刷参考 + 局刷后对比；
+自动面板定位置信度不足）。用户要求残影定量照片“后续再拍”，当前以
+`partial/ok dirty=37`、连续变化后自动 `full/clean`、跨 deep 基线与零刷新作为软件证据。
+
+**剩余（非阻塞）**：固定机位残影照片定量判定；新硬件 target（面板/控制器资料未到，
+`blocked_by_hardware_arrival`）。
+
+## 实现：2026-09-22 — 通用多设备墨水屏平台 v2（M0–M6 实现，SSD1681 实机验证待设备在线）
+
+- **工作区**：`project-workflow/generic-display-platform-implementation/`（plan/status +
+  task-0…task-6）。架构权威：`docs/generic-display-platform-design-v2.md`。
+- **固件 0.16.0-bw**（`src/main.cpp` FW_VERSION，target 见 `src/platform_target.h`）：
+  - `v2_state.h`（纯状态机，固件与宿主共用）：PowerPlan 幂等/旧 ID 拒绝/设备上限缩短、
+    BOOT provisional 300s（从物理唤醒单调计时）、data_seq 幂等/冲突/乱序、退出路径锁。
+  - `template_engine.{h,cpp}`：`tplCompile/tplDrawCt/tplCtSerialize/tplCtDeserialize`。
+    模板 JSON 只在保存/安装时解析一次；运行、按键切换、重绘、data 应用都不再解析模板 JSON。
+    编译产物定长、无指针、ABI/索引/资源边界重校验；8 个模板不会同时展开 DOM。
+  - `bundle_store.{h,cpp}`：完整 Bundle A/B 槽（littlefs `/bundle/a|b|littlefs meta 双副本`），
+    先编译全部模板→写非当前槽→读回 CRC→写防撕裂提交记录→才切换；空间不足拒绝且不删有效包；
+    上一完整包仅用于失败恢复；`active_context_id` 在提交/激活/恢复时重建。
+  - `v2_runtime.{h,cpp}`：Data 按编译后的 requirement 索引校验并重建 usage 文档；
+    字段 CRC 与桥 `data_fields_crc` 逐字节一致（宿主交叉测试）。
+  - HTTP：`GET /v2/status`、`POST /v2/data|/v2/plan|/v2/activate`、`POST /v2/bundle` 与
+    有界 `BEGIN/CHUNK(offset,超时)/COMMIT`；全部走 endpoint token + owner，均不隐式续租。
+    `/status.json` 增加 fw/render target、context、active、job、data_seq、power 等字段；
+    OTA 增加 `?target=` 双端防错。
+  - `refresh_policy`：新增 `rgnBuildCt`（从编译产物推导安全区域，激活路径不解析 JSON），
+    与 JSON 推导在宿主逐区域一致。
+  - 第二 target：`esp32-s3-epaper-154g-gray4`（2bpp/4gray，独立 ROM，`partial=false`）；
+    `CODEX_TARGET_UNVERIFIED` 在缺少面板/引脚事实时拒绝正常运行，属
+    `blocked_by_hardware_arrival`。
+- **Bridge（未提交）**：
+  - `bridge-core`：`compile.rs`（CompiledTemplate）、`datasource.rs`（Codex/Static JSON、
+    push/pull 真值表、SourceSnapshot）、`coordinator.rs`（每设备串行协调器：单 active context、
+    push/full 指纹、ack 基线、full_sync_deadline、单调 data_seq、单 PublishJob、
+    PowerPlan 幂等/BOOT remaining、merge/指纹）、`platform/service.rs`（共享应用服务）、
+    `platform/store.rs`（原子写入）、`v2_client.rs`（HTTP Status/Data/Plan/Activate/Bundle）。
+  - Profile 1–8 全部参与循环、无 enabled 子集、无 revision；保存≠发布；发布冻结；排队编辑不漂移；
+    target 不匹配两端拒绝；ACK 丢失重试同 seq/同内容，旧 ACK 不确认新数据。
+  - `crates/render`：新增 `compile/compiled_serialize/compiled_deserialize/render_compiled_bits/
+    rgn_build_compiled` FFI；宿主测试证明编译路径与 JSON 引擎逐像素一致（quad/mini/full×
+    正常/缺失态）、区域推导一致、CRC 与桥/Rust 交叉一致。
+  - app：`platform.rs` 四页共用服务 + 19 个 Tauri 命令 + v2 交付循环；v2 设备自动停用 legacy
+    Wi-Fi 推送（一台设备一个数据通道）。MCP 新增 15 个 v2 工具（与 UI 同服务，save 不 publish）。
+  - UI：模板库（target/引用/预览）、设备 v2（Profile 顺序/active/发布/job/恢复）、
+    功耗（正式/provisional/剩余/显式 light|sleep）、数据页（DataSource/字段 push-pull/采集）。
+- **测试**：`cargo test --workspace`（隔离 target）81 项全过；`pio run` 两个 env 成功；
+  `node tools/test-quad-preview.mjs` 7/7；Python canonical hash 与 Rust/固件一致
+  （c1a2faaf/e6ba459e/430cc188）；`git diff --check` 干净。
+  `cargo fmt --check` 在**未改动的既有文件**（如 `app/src/autostart.rs`）已有格式差异；
+  本次新增/修改的文件已单独 rustfmt。
+- **ROM（未烧录）**：`artifacts/codex-status-0.16.0-bw.bin`（1 684 208 B，SHA256
+  `6C7D58BF7FC8F21DB4C8760EF711655207CB72457228074F61CEEC1CDE5D3EF2`）；
+  `artifacts/codex-status-0.16.0-gray4-unverified.bin`（1 684 560 B，SHA256
+  `AFE8415AFE1107AD76597C90FA45C251C70128ADE70478DD05D593CCECAC6B3D`）。
+- **现场阻塞**：设备（MAC `70041DD7A340`，IP 192.168.3.163）自实现开始即 deep/离线，
+  OTA 与实机清单无法执行；运行中的桥是旧二进制（未重启，未改动其数据）。
+  实机验证清单见 `project-workflow/generic-display-platform-implementation/status.md`。
+- **未提交**；未回退任何用户改动；未停止/替换运行中的桥。
+
 ## 架构文档：2026-09-22 — 通用多设备信息终端简化架构 v2 完成（未实现）
 
 - Astra medium 子代理结合上一版总设计、BLE 功耗设计和累计产品决策，新建

@@ -513,8 +513,10 @@ name = "bridge-render"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bridge-core",
  "cc",
  "png 0.17.16",
+ "serde_json",
 ]
 
 [[package]]
