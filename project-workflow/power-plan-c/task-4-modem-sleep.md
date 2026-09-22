@@ -19,6 +19,9 @@ Status: pending（第一/二阶段可独立验收；本任务决定 3s 窗口的
 ## 验收与回归
 
 - 实机实测：窗口期平均电流（PPK2/Joulescope 或按 pmstats 口径估算）与广播/连接稳定性；
+- **估算口径（无电流仪，2026-09-22 定）**：base 与 btpm 各 ≥30 个 deep 周期，用
+  `node tools/estimate-power.mjs` 输出每周期 awake/BLE/render 分段与 mAh/day 区间对照
+  （见 task-3 §7）；同表记录连接成功率与 connect/discovery 时长；
 - 回归：BLE 连接成功率、`reserved` 计划处理、OTA、Wi-Fi light 会话不受影响；
 - 若出现连接不稳（社区已知 40MHz min 会掉线），回退 min=80 并记录；
 - 结果决定：3s 窗口保留或回调至 1.5s（能量差 ~10mAh/天）。
@@ -26,4 +29,9 @@ Status: pending（第一/二阶段可独立验收；本任务决定 3s 窗口的
 ## 风险
 
 - BT modem sleep 与 Wi-Fi/BLE 共存、与 DFS 组合存在历史 bug（esp-idf #947/#15891），需整机回归；
-- 无 32k 晶振时勿尝试 light sleep + BLE。
+- **#15891（2025，open）**：BLE→Wi-Fi→BLE 循环后残留 **~2mA**（coex 资源不释放）；我们“BLE 会合
+  + 偶发 Wi-Fi light”会踩到，A/B 必须包含“经历一次 Wi-Fi light 后”的基线，而不只开机态；
+- 无 32k 晶振时勿尝试 light sleep + BLE；
+- A/B 附加项：连接成功率、connect/GATT discovery 时长、单次 wake `awake_ms`（modem sleep 不应
+  让握手变慢）；PC 蓝牙与 2.4G Wi-Fi 共射频时，PC 侧 coex 也会影响命中率，记录 PC 网络形态
+  （有线/5GHz/2.4GHz）。

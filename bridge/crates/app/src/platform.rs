@@ -385,7 +385,7 @@ pub async fn deliver(ctx: &AppCtx, mac: &str) -> Value {
                         ack["display_state"].as_str().unwrap_or("unchanged"),
                     );
                     tracing::info!(device = mac, seq, outcome = %outcome["outcome"],
-                        transport = "http", "v2 data acknowledgement");
+                        transport = "http", ack = %ack, "v2 data acknowledgement");
                     json!({"result": "data", "transport": "http", "ack": ack, "confirmation": outcome})
                 }
                 Err(e) => json!({"result": "deferred", "error": e}),
@@ -592,13 +592,27 @@ pub fn is_v2_device(ctx: &AppCtx) -> bool {
         .unwrap_or(false)
 }
 
+/// Outcome of one v2 BLE opportunity (Plan C window accounting).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BleOpportunity {
+    /// The device was not advertising; no connection was attempted.
+    NoDevice,
+    /// One connection/handshake was attempted for this rendezvous window.
+    Attempted,
+}
+
 /// One real GATT rendezvous. Small snapshots stay on BLE; larger work receives
 /// a formal light plan and is then delivered by the HTTP cycle.
-pub async fn ble_cycle(ctx: &AppCtx) -> Result<(), String> {
+pub async fn ble_cycle(ctx: &AppCtx) -> Result<BleOpportunity, String> {
     let _delivery = ctx.v2_delivery.lock().await;
     let mac = ctx.device_mac.lock().unwrap().clone().ok_or("unknown device")?;
-    let mut link = bridge_ble::V2Connection::connect(&mac, &ctx.config.token, &ctx.bridge_id)
-        .await.map_err(err_text)?;
+    let mut link = match bridge_ble::V2Connection::connect(&mac, &ctx.config.token, &ctx.bridge_id)
+        .await
+        .map_err(err_text)?
+    {
+        Some(link) => link,
+        None => return Ok(BleOpportunity::NoDevice),
+    };
     let work = async {
         let state = link.command("status", json!({})).await.map_err(err_text)?;
         if state["result"] != "applied" { return Err("BLE status rejected".to_owned()); }
@@ -613,7 +627,7 @@ pub async fn ble_cycle(ctx: &AppCtx) -> Result<(), String> {
                     body["seq"].as_u64().unwrap_or(0), body["crc"].as_str().unwrap_or(""),
                     applied, ack["display_state"].as_str().unwrap_or("unchanged"));
                 tracing::info!(device = mac, outcome = %outcome["outcome"], transport = "ble",
-                    "v2 data acknowledgement");
+                    ack = %ack, "v2 data acknowledgement");
             }
         }
         let remaining = state["power"]["provisional_remaining_s"].as_u64().unwrap_or(0) as u32;
@@ -630,7 +644,13 @@ pub async fn ble_cycle(ctx: &AppCtx) -> Result<(), String> {
     let result = tokio::time::timeout(Duration::from_secs(10), work).await
         .map_err(|_| "BLE rendezvous timed out".to_owned()).and_then(|r| r);
     link.close().await;
-    result
+    // Plan C acceptance evidence: one line per attempted rendezvous (a found
+    // device), so the bridge log shows at most one per 60 s window.
+    match &result {
+        Ok(()) => tracing::info!(device = mac, transport = "ble", "v2 rendezvous complete"),
+        Err(error) => tracing::warn!(device = mac, transport = "ble", %error, "v2 rendezvous failed"),
+    }
+    result.map(|_| BleOpportunity::Attempted)
 }
 
 /// Run one coordinator cycle for the current device: optional authenticated

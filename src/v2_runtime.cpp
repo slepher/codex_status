@@ -108,14 +108,23 @@ static V2DataAck applyEntries(const CtTemplate &ct, JsonArrayConst fields,
                               JsonDocument &doc, String &err, uint32_t expectedCrc) {
     uint32_t crc = v2DataFieldsCrc(fields);
     if (crc != expectedCrc) { err = "crc"; return V2_DATA_REJECTED; }
-    if (fields.size() != ct.reqCount) { err = "incomplete"; return V2_DATA_REJECTED; }
-    int expectedIndex = 0;
+    // The Bridge sends exactly the remote requirements (device-local binds like
+    // device.now are never transmitted, and are not renumbered away): a complete
+    // snapshot is one entry per remote requirement at its compiled index.
+    uint8_t remoteCount = 0;
+    for (uint8_t i = 0; i < ct.reqCount; i++) {
+        if (ct.reqs[i].kind <= 9) remoteCount++;
+    }
+    if (fields.size() != remoteCount) { err = "incomplete"; return V2_DATA_REJECTED; }
+    int lastIndex = -1;
     for (JsonObjectConst entry : fields) {
         int i = entry["i"] | -1;
         const char *k = entry["k"] | "";
-        if (i != expectedIndex++ || i >= ct.reqCount) { err = "index"; return V2_DATA_REJECTED; }
+        if (i < 0 || i >= ct.reqCount) { err = "index"; return V2_DATA_REJECTED; }
         if (strcmp(k, ct.reqs[i].path) != 0) { err = "field"; return V2_DATA_REJECTED; }
-        if (ct.reqs[i].kind > 9) continue;  // device-local requirements are ignored
+        if (ct.reqs[i].kind > 9) { err = "local"; return V2_DATA_REJECTED; }
+        if (i <= lastIndex) { err = "order"; return V2_DATA_REJECTED; }
+        lastIndex = i;
         JsonVariantConst v = entry["v"];
         if (v.isNull()) {
             // Missing/expired: leave the node absent so the template's

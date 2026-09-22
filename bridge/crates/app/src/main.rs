@@ -2325,6 +2325,13 @@ async fn run_services(ctx: Arc<AppCtx>) {
     // and no template transfers. A cycle runs only when the device asks for a
     // handshake in its UDP announce (`ble=1`), which refreshes the endpoint
     // record (host/port/token) over the bonded link. Templates go over HTTP.
+    //
+    // Plan C: the v2 rendezvous window is a hard 3 s, so this loop retries the
+    // opportunity every 250 ms (effectively continuous scan coverage on a
+    // mains-powered PC) and remembers a successful connect so one 60 s
+    // rendezvous period never gets a second connection. Scan misses while the
+    // device is not advertising are expected and stay at debug level.
+    let mut last_v2_ok: Option<i64> = None;
     loop {
         if ctx.status.lock().unwrap().paused {
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -2332,13 +2339,21 @@ async fn run_services(ctx: Arc<AppCtx>) {
         }
         tokio::select! {
             _ = ctx.force_ble.notified() => {}
-            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
         }
         let udp_request = ctx.udp_ble.swap(false, Ordering::SeqCst);
         if !udp_request {
             if platform::is_v2_device(&ctx) {
-                if let Err(error) = platform::ble_cycle(&ctx).await {
-                    tracing::debug!(%error, "v2 BLE opportunity unavailable");
+                let now = now_secs();
+                let already_connected = last_v2_ok.is_some_and(|at| now.saturating_sub(at) < 55);
+                if !already_connected {
+                    match platform::ble_cycle(&ctx).await {
+                        Ok(platform::BleOpportunity::Attempted) => last_v2_ok = Some(now_secs()),
+                        Ok(platform::BleOpportunity::NoDevice) => {}
+                        Err(error) => {
+                            tracing::debug!(%error, "v2 BLE opportunity unavailable");
+                        }
+                    }
                 }
             }
             continue;

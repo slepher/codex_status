@@ -325,6 +325,10 @@ void bleBegin(const String &deviceName, const String &fw) {
     svc->start();
 
     NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
+    // Plan C: fast advertising explicitly (30-60 ms, units of 0.625 ms) instead
+    // of relying on the NimBLE default; the rendezvous window is a hard 3 s.
+    adv->setMinInterval(0x30);
+    adv->setMaxInterval(0x60);
 #if CODEX_NIMBLE_V2
     // NimBLE 2.x advertises no name unless set explicitly, and the scan
     // response must be enabled explicitly as well; bridges scan by the

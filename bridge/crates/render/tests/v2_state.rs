@@ -25,6 +25,10 @@ extern "C" {
     fn codex_v2_boot_remaining(t_boot_ms: u64, now_ms: u64) -> u32;
     fn codex_v2_seq_new() -> *mut c_void;
     fn codex_v2_accept_data(p: *mut c_void, message: *const std::os::raw::c_char) -> c_int;
+    fn codex_v2_accept_data_template(
+        source: *const std::os::raw::c_char,
+        message: *const std::os::raw::c_char,
+    ) -> c_int;
     fn codex_v2_seq_free(p: *mut c_void);
     fn codex_v2_seq_begin(p: *mut c_void, now_ms: u64, keep_next: u32);
     fn codex_v2_seq_observe(p: *mut c_void, seq: u64, crc: u32) -> c_int;
@@ -154,6 +158,57 @@ fn transport_runtime_validates_crc_before_advancing_sequence() {
         assert_eq!(accept(p, &message), DATA_APPLIED);
         codex_v2_seq_free(p);
     }
+}
+
+#[test]
+fn remote_data_snapshot_covers_all_non_local_requirements() {
+    // Regression: the bridge sends exactly the remote requirements (device.*
+    // binds are local and never transmitted); a complete snapshot must be
+    // accepted for a template that also declares device.now.
+    let template = r#"{"schema":1,"id":"t","canvas":{"w":200,"h":200},"elements":[
+        {"type":"text","bind":"bridge.label","x":8,"y":8,"font":"f12"},
+        {"type":"text","bind":"device.now","x":8,"y":40,"font":"f12"}]}"#;
+    let fields = serde_json::json!([{"i":0,"k":"bridge.label","v":"first","q":"good"}]);
+    let sign = |m: &mut serde_json::Value| {
+        m["crc"] = format!(
+            "{:08x}",
+            bridge_core::coordinator::data_fields_crc(m["fields"].as_array().unwrap())
+        )
+        .into();
+    };
+    let accept = |m: &serde_json::Value| unsafe {
+        let source = std::ffi::CString::new(template).unwrap();
+        let text = std::ffi::CString::new(m.to_string()).unwrap();
+        codex_v2_accept_data_template(source.as_ptr(), text.as_ptr())
+    };
+    let mut message = serde_json::json!({
+        "active_context_id": "ctx", "seq": 1, "fields": fields
+    });
+    sign(&mut message);
+    assert_eq!(accept(&message), DATA_APPLIED);
+    // The device-local entry must not be transmitted by the bridge.
+    let mut with_local = serde_json::json!({
+        "active_context_id": "ctx", "seq": 2,
+        "fields": [
+            {"i":0,"k":"bridge.label","v":"first","q":"good"},
+            {"i":1,"k":"device.now","v":"12:00","q":"good"}
+        ]
+    });
+    sign(&mut with_local);
+    assert_eq!(accept(&with_local), 5);
+    // A remote field may not be dropped from the complete snapshot.
+    let mut missing = serde_json::json!({
+        "active_context_id": "ctx", "seq": 3, "fields": []
+    });
+    sign(&mut missing);
+    assert_eq!(accept(&missing), 5);
+    // Index/path tampering stays rejected.
+    let mut swapped = serde_json::json!({
+        "active_context_id": "ctx", "seq": 4,
+        "fields": [{"i":1,"k":"device.now","v":"12:00","q":"good"}]
+    });
+    sign(&mut swapped);
+    assert_eq!(accept(&swapped), 5);
 }
 
 #[test]

@@ -70,7 +70,7 @@ static bool targetUnverified = false;
 #elif defined(CODEX_CLK_WINDOW_TEST)
 #define FW_VERSION    "0.13.9-clkwin"
 #else
-#define FW_VERSION    "0.16.9-bw"
+#define FW_VERSION    "0.17.2-bw"
 #endif
 #define AP_PASSWORD   "codex1234"
 #define MAX_SLOTS     3
@@ -103,6 +103,15 @@ static const int EPD_FB_BYTES = (EPD_W / 8) * EPD_H;
 #define DEEP_PENDING_WINDOW_MS 180000UL  // stay awake when pull reports pending
 #define CLK_GHOST_LIMIT        90      // deep clock partials before a full redraw
 #define CLK_MAX_BYTES          64      // reserved clock window cap (60 B for quad)
+
+// Plan C rendezvous timing: the BLE window is a hard 3 s cap for waiting on
+// the bridge and closes shortly after the bridge's plan ACK. A connected
+// handshake gets its own bounded budget: Windows connect+service discovery
+// often exceeds 3 s before the first command can arrive. The single wake
+// render runs after the radio is off (see v2Rendezvous / v2RendezvousRender).
+#define V2_RENDEZVOUS_WINDOW_MS    3000
+#define V2_RENDEZVOUS_CONNECTED_MS 6000
+#define V2_RENDEZVOUS_ACK_GRACE_MS 200
 
 static Preferences prefs;
 static WebServer   server(80);
@@ -360,11 +369,14 @@ static void configurePowerManagement() {
 #ifdef CODEX_PM
     esp_pm_config_t cfg = {};
     cfg.max_freq_mhz = 240;
-    cfg.min_freq_mhz = 40;
+    // Plan C: 80 MHz floor keeps the BLE controller stable during a rendezvous
+    // window; DFS drops below it automatically while waiting (flash stays 40 MHz,
+    // that is a separate setting).
+    cfg.min_freq_mhz = 80;
     cfg.light_sleep_enable = true;
     esp_err_t err = esp_pm_configure(&cfg);
     pmLightSleep = (err == ESP_OK);
-    DevLog.printf("[pm] esp_pm_configure(light_sleep=1, 240/40MHz): %s\n", esp_err_to_name(err));
+    DevLog.printf("[pm] esp_pm_configure(light_sleep=1, 240/80MHz): %s\n", esp_err_to_name(err));
 #if CONFIG_PM_LIGHT_SLEEP_CALLBACKS
     esp_pm_sleep_cbs_register_config_t cbs = {};
     cbs.enter_cb = sleepEnterCb;
@@ -429,29 +441,101 @@ enum : uint8_t {
     HIST_NET_OK = 4,      // network window success, aux = HTTP code (200)
     HIST_NET_FAIL = 5,    // network window failure, aux = HTTP code (0 unknown)
     HIST_TO_LIGHT = 6,    // returned/switched to light
+    HIST_WAKE = 7,        // wake summary at deep entry, aux = wake result (below)
+};
+// Wake-result codes for HIST_WAKE (Plan C task-3). The summary record also
+// carries dur_ms and the clock source of that wake.
+enum : uint8_t {
+    WAKE_LIGHT = 0,       // light session (idle/plugged/HTTP)
+    WAKE_THIN = 1,        // thin deep clock wake
+    WAKE_RV_SLEEP = 2,    // v2 rendezvous answered with a sleep plan
+    WAKE_RV_LIGHT = 3,    // v2 rendezvous answered with a light plan
+    WAKE_NET = 4,         // legacy deep network window
+};
+// Clock provenance for /status.json `time_source` and HIST_WAKE.src.
+enum : uint8_t {
+    TIME_NONE = 0,
+    TIME_BLE = 1,
+    TIME_RTC = 2,
 };
 struct HistRec {
     uint32_t epoch;
     uint8_t ev;
     uint8_t stage;
     uint8_t batt;      // 0xFF = unknown
+    uint8_t src;       // TIME_* of the recorded wake (HIST_WAKE)
     uint16_t aux;
+    uint32_t dur_ms;   // awake duration of the recorded wake (0 when unknown)
 };
-static_assert(sizeof(HistRec) == 12, "history record layout changed");
+static_assert(sizeof(HistRec) == 16, "history record layout changed");
 RTC_DATA_ATTR static HistRec histRing[HIST_CAP];
 RTC_DATA_ATTR static uint32_t histCount = 0;   // records ever written
 RTC_DATA_ATTR static uint16_t histHead = 0;    // next write slot
 
-static void histAdd(uint8_t ev, uint16_t aux) {
+static void histAddFull(uint8_t ev, uint16_t aux, uint32_t durMs, uint8_t src) {
     if (histHead >= HIST_CAP) histHead = 0;
     HistRec &r = histRing[histHead];
     r.epoch = timeKnown() ? (uint32_t)time(nullptr) : 0;
     r.ev = ev;
     r.stage = rtcStage;
     r.batt = (batteryPct < 0 || batteryPct > 100) ? 0xFF : (uint8_t)batteryPct;
+    r.src = src;
     r.aux = aux;
+    r.dur_ms = durMs;
     histHead = (uint16_t)((histHead + 1) % HIST_CAP);
     histCount++;
+}
+
+static void histAdd(uint8_t ev, uint16_t aux) { histAddFull(ev, aux, 0, 0); }
+
+// ---- Plan C wake telemetry (task-3) ----
+// millis() is boot-relative on every deep wake, so `awake_ms` is live until the
+// next deep sleep. deepSleepRaw() snapshots the final values into RTC for
+// /status.json (`deep.last_*`) and /history (`HIST_WAKE`).
+static uint32_t bootRenderCount = 0;      // waveforms written on this wake
+static uint32_t wakeRenderMs = 0;         // waveform ms accumulated this wake
+static uint32_t bleOnAccumMs = 0;         // BLE radio ms accumulated this wake
+static uint32_t bleOnSinceMs = 0;         // millis() when BLE went on; 0 = off
+static uint8_t  wakeResult = WAKE_LIGHT;  // what this wake turned out to be
+static uint8_t  timeSource = TIME_NONE;   // clock provenance of this wake
+RTC_DATA_ATTR static uint32_t rtcLastAwakeMs = 0;
+RTC_DATA_ATTR static uint32_t rtcLastBleMs = 0;
+RTC_DATA_ATTR static uint32_t rtcLastRenders = 0;
+RTC_DATA_ATTR static uint8_t  rtcLastTimeSource = TIME_NONE;
+RTC_DATA_ATTR static uint8_t  rtcLastWakeResult = WAKE_LIGHT;
+// Plan C power estimate: cumulative totals over completed deep cycles only
+// (light sessions are excluded), so /status.json can report per-cycle averages
+// without a current meter. See task-3 "功耗预估" and tools/estimate-power.mjs.
+RTC_DATA_ATTR static uint32_t rtcAccCycles = 0;
+RTC_DATA_ATTR static uint32_t rtcAccAwakeMs = 0;
+RTC_DATA_ATTR static uint32_t rtcAccBleMs = 0;
+RTC_DATA_ATTR static uint32_t rtcAccRenderMs = 0;
+
+static void bleRadioMark(bool on) {
+    if (on && !bleOnSinceMs) {
+        bleOnSinceMs = millis();
+    } else if (!on && bleOnSinceMs) {
+        bleOnAccumMs += millis() - bleOnSinceMs;
+        bleOnSinceMs = 0;
+    }
+}
+
+static uint32_t bleRadioMs() {
+    return bleOnAccumMs + (bleOnSinceMs ? millis() - bleOnSinceMs : 0);
+}
+
+static const char *timeSourceName(uint8_t src) {
+    return src == TIME_BLE ? "ble" : src == TIME_RTC ? "rtc" : "none";
+}
+
+static const char *wakeResultName(uint8_t result) {
+    switch (result) {
+        case WAKE_THIN: return "thin";
+        case WAKE_RV_SLEEP: return "rendezvous-sleep";
+        case WAKE_RV_LIGHT: return "rendezvous-light";
+        case WAKE_NET: return "net";
+        default: return "light";
+    }
 }
 
 static byte hostMac[6] = {0};
@@ -530,6 +614,7 @@ static void adoptServerTime(JsonDocument &doc) {
     if (!timeKnown() && st > 1600000000) {
         struct timeval tv = {(time_t)st, 0};
         settimeofday(&tv, nullptr);
+        timeSource = TIME_BLE;
         DevLog.printf("[pm] clock set from bridge: %lld\n", st);
     }
     adoptTzOffset(doc);
@@ -543,6 +628,7 @@ static bool adoptServerTimeForce(JsonDocument &doc) {
     if (st > 1600000000) {
         struct timeval tv = {(time_t)st, 0};
         settimeofday(&tv, nullptr);
+        timeSource = TIME_BLE;
     }
     return adoptTzOffset(doc);
 }
@@ -640,6 +726,13 @@ static String         v2SessionNonce;
 static uint64_t       v2SafetyDeadlineMs = 0;
 static String         v2RxPath = "/bundle/rx.bin";
 static String         v2PlanReason = "init";
+// Plan C: while the rendezvous window is open the screen is not touched; the
+// single wake render happens after bleOff (clock window, or the light plan's
+// first frame in startNormalMode). Other BLE paths keep their immediate render.
+static bool           v2InRendezvous = false;
+// A BLE data snapshot accepted during the window is rendered with the clock in
+// one frame after the radio is off (v2RendezvousRender).
+static bool           v2WakeRenderPending = false;
 
 static uint64_t v2NowMs() { return (uint64_t)(esp_timer_get_time() / 1000ULL); }
 static uint32_t v2Millis32() { return (uint32_t)(esp_timer_get_time() / 1000ULL); }
@@ -949,12 +1042,14 @@ static void epdFlush(bool forceFull) {
         free(pixels);
         if (ok) {
             epdWriteCount++;
+            bootRenderCount++;
             if (blink) blinkTicks++;
             if (rgnPolicyOn && !blink) rgnOnPartial(rgnSet);
             if (lastDisplayedFrame) memcpy(lastDisplayedFrame, frame, EPD_FB_BYTES);
             epdPanelSleep();
             uint32_t elapsed = millis() - flushT0;
             rfnLastMs = (uint16_t)(elapsed > 0xFFFF ? 0xFFFF : elapsed);
+            wakeRenderMs += elapsed;
             return;
         }
         // Unknown waveform state: never keep the stale software baseline, and
@@ -980,6 +1075,7 @@ static void epdFlush(bool forceFull) {
     bool ok = EPD_TGT_Display(frame);
     if (ok) {
         epdWriteCount++;
+        bootRenderCount++;
         rtcClkPartials = 0;   // full waveform clears the clock-window ghosting
         if (lastDisplayedFrame) memcpy(lastDisplayedFrame, frame, EPD_FB_BYTES);
         epdBaselineTrusted = true;
@@ -997,6 +1093,7 @@ static void epdFlush(bool forceFull) {
     epdPanelSleep();
     uint32_t elapsed = millis() - flushT0;
     rfnLastMs = (uint16_t)(elapsed > 0xFFFF ? 0xFFFF : elapsed);
+    wakeRenderMs += elapsed;
 }
 
 // ---------------- clock window direct write (v0.14) ----------------
@@ -1245,11 +1342,13 @@ static bool clockTickWake() {
     clkPixelsValid = true;
     epdAsleep = false;
     epdPanelSleep();
+    bootRenderCount++;
     rtcClockTicks++;
     rtcClkPartials++;
     if (rtcClkPartials > CLK_GHOST_LIMIT) rtcClkPartials = CLK_GHOST_LIMIT;
     epdPartialCount++;   // window writes count toward the light-mode ghost reset
     const uint64_t t4 = esp_timer_get_time();
+    wakeRenderMs += (uint32_t)((t4 - t0) / 1000);
     DevLog.printf("[clk] tick build=%uus wake=%uus write=%uus zzz=%uus total=%uus\n",
                   (unsigned)(t1 - t0), (unsigned)(t2 - t1), (unsigned)(t3 - t2),
                   (unsigned)(t4 - t3), (unsigned)(t4 - t0));
@@ -1897,6 +1996,22 @@ static void releaseWakeHolds() {
 static void deepSleepRaw(uint32_t sec) {
     if (sec < 2) sec = 2;
     if (sec > 3600) sec = 3600;
+    // Plan C telemetry: snapshot this wake's totals into RTC (RAM accounting
+    // dies with the boot) for /status.json `deep.last_*` and /history.
+    rtcLastAwakeMs = millis();
+    rtcLastBleMs = bleRadioMs();
+    rtcLastRenders = bootRenderCount;
+    rtcLastTimeSource = timeSource;
+    rtcLastWakeResult = wakeResult;
+    histAddFull(HIST_WAKE, wakeResult, rtcLastAwakeMs, timeSource);
+    // Power estimate (no current meter): accumulate only deep cycles so the
+    // per-cycle averages are not dominated by long light sessions.
+    if (wakeResult != WAKE_LIGHT) {
+        rtcAccCycles++;
+        rtcAccAwakeMs += rtcLastAwakeMs;
+        rtcAccBleMs += rtcLastBleMs;
+        rtcAccRenderMs += wakeRenderMs;
+    }
     rtcEpochAtSleep = timeKnown() ? (uint32_t)time(nullptr) : 0;
     rtcClkUsAtSleep = esp_rtc_get_time_us();
     armWakeSources((uint64_t)sec * 1000000ULL);
@@ -1912,6 +2027,7 @@ static void deepSleepFor(uint32_t sec) {
     epdPanelSleep();
     nvsStageMark(48);
     if (bleInitialized()) {
+        bleRadioMark(false);
         bleAdvertiseStop();
         bleDeinit();
     }
@@ -2199,6 +2315,12 @@ static void handleStatus() {
             String(epdPartialReady ? "ready" : "off") + ", streak " + String(epdPartialCount) +
             ", busy_fails " + String(rtcEpdBusyFails) + ", baseline " +
             String(epdBaselineTrusted ? "trusted" : "untrusted") + ")</li>";
+    html += "<li>Wake: " + String(millis()) + " ms awake, BLE " + String(bleRadioMs()) +
+            " ms, renders " + String(bootRenderCount) + ", time " +
+            String(timeSourceName(timeSource)) + " (last: " +
+            String(wakeResultName(rtcLastWakeResult)) + " " + String(rtcLastAwakeMs) +
+            " ms, renders " + String(rtcLastRenders) + ", time " +
+            String(timeSourceName(rtcLastTimeSource)) + ")</li>";
     {
         OwnerRec ownerCur;
         if (ownerGet(ownerCur)) {
@@ -2284,6 +2406,19 @@ static void handleStatusJson() {
     doc["tz"] = deviceTz;
     doc["hist_count"] = histCount;
     doc["hist_head"] = histHead;
+    // Plan C wake telemetry (task-3): live values of the current wake; the
+    // previous wake's final values are in `deep.last_*` below.
+    doc["awake_ms"] = millis();
+    doc["ble_on_ms"] = bleRadioMs();
+    doc["render_count"] = bootRenderCount;
+    doc["time_source"] = timeSourceName(timeSource);
+    doc["render_ms"] = wakeRenderMs;
+#if defined(CODEX_PM) && CONFIG_PM_LIGHT_SLEEP_CALLBACKS
+    // Time-based power estimate (no current meter): light-sleep share lets the
+    // estimator subtract it from the awake window instead of charging CPU mA.
+    doc["light_sleep_ms"] = (uint32_t)(sleepDiag.total_us / 1000ULL);
+    doc["light_sleep_count"] = sleepDiag.count;
+#endif
     // ------------------------------------------------------------------
     // v2 platform state (device is authoritative; the Bridge reconciles).
     // ------------------------------------------------------------------
@@ -2332,6 +2467,17 @@ static void handleStatusJson() {
         deep["glyph"] = rtcDeepGlyph;
         deep["tpl_has_mode"] = activeTplHasMode ? 1 : 0;
         deep["captures"] = rtcFrameCaptures;
+        // Last completed wake (RTC snapshot taken at deep entry, task-3).
+        deep["last_wake_result"] = wakeResultName(rtcLastWakeResult);
+        deep["last_awake_ms"] = rtcLastAwakeMs;
+        deep["last_ble_ms"] = rtcLastBleMs;
+        deep["last_renders"] = rtcLastRenders;
+        deep["last_time_source"] = timeSourceName(rtcLastTimeSource);
+        // Cumulative deep-cycle totals for the time-based power estimate.
+        deep["acc_cycles"] = rtcAccCycles;
+        deep["acc_awake_ms"] = rtcAccAwakeMs;
+        deep["acc_ble_ms"] = rtcAccBleMs;
+        deep["acc_render_ms"] = rtcAccRenderMs;
     }
     JsonArray templates = doc["templates"].to<JsonArray>();
     String activeId = tplStoreActive();
@@ -2393,6 +2539,8 @@ static void handleHistory() {
         item["stage"] = r.stage;
         item["batt"] = r.batt;
         item["aux"] = r.aux;
+        item["dur_ms"] = r.dur_ms;
+        item["src"] = r.src;
     }
     String out;
     serializeJson(doc, out);
@@ -3035,6 +3183,7 @@ static void enterBleOn(bool userInitiated) {
         ledFlash();
         DevLog.println("[ble] session on");
     }
+    bleRadioMark(true);
     bleAdvertiseStart();
     if (userInitiated) {
         bleOpenPairingWindow(120000);
@@ -3043,13 +3192,14 @@ static void enterBleOn(bool userInitiated) {
     lastBleAuto = autoCond;
     bleOffDeadline = autoCond ? 0 : millis() + BLE_GRACE_MS;
     requestAnnounce(true);
-    renderCurrent();
+    if (!v2InRendezvous) renderCurrent();
 }
 
 static void bleOff(const char *reason) {
     if (!bleOn) return;
     bleOn = false;
     lastBleAuto = false;
+    bleRadioMark(false);
     bleAdvertiseStop();
     bleDeinit();
     V2BleMessage *pending = nullptr;
@@ -3058,7 +3208,7 @@ static void bleOff(const char *reason) {
     ledFlash();
     DevLog.printf("[ble] session off (%s)\n", reason ? reason : "");
     requestAnnounce(false);
-    renderCurrent();
+    if (!v2InRendezvous) renderCurrent();
 }
 
 // BLE keep-alive: infinite while plugged and >20%, otherwise 120 s after the
@@ -3375,20 +3525,29 @@ static void applyV2Data(const String &body) {
     // truncated field JSON; timer/physical deep wakes retain the exact baseline.
     v2DataCheckpoint.save(v2Profile.contextId, v2DataSeq);
     usageCacheSave(usage);
-    uint32_t before = epdWriteCount;
-    uint32_t busyBefore = rtcEpdBusyFails;
     lastUsage = usage;
     lastChannel = v2ReplyOverBle ? "BLE" : "PULL";
-    renderActiveUsage(usage, lastChannel.c_str());
     const char *display = "unchanged";
-    if (rtcEpdBusyFails != busyBefore) {
-        display = "failed";
-        v2DisplayState = 3;
-    } else if (epdWriteCount != before) {
-        display = "displayed";
-        v2DisplayState = 1;
+    if (v2ReplyOverBle) {
+        // Plan C: do not render inside the rendezvous window. The snapshot is
+        // drawn once after the radio is off, together with the clock
+        // (v2RendezvousRender); the ACK reports it as pending.
+        v2WakeRenderPending = true;
+        v2DisplayState = 2;
+        display = "pending";
     } else {
-        v2DisplayState = 1;
+        uint32_t before = epdWriteCount;
+        uint32_t busyBefore = rtcEpdBusyFails;
+        renderActiveUsage(usage, lastChannel.c_str());
+        if (rtcEpdBusyFails != busyBefore) {
+            display = "failed";
+            v2DisplayState = 3;
+        } else if (epdWriteCount != before) {
+            display = "displayed";
+            v2DisplayState = 1;
+        } else {
+            v2DisplayState = 1;
+        }
     }
     v2Ack("data", "applied", display, "ram", nullptr, (int64_t)seq, 0, v2Profile.contextId,
           UINT32_MAX);
@@ -3648,6 +3807,10 @@ static void serviceV2Ble() {
         v2Ack("command", "rejected", "unchanged", "ram",
               authenticated ? "disabled" : "unauthorized", -1, 0, nullptr, UINT32_MAX);
     } else {
+        // Plan C: the bridge stamps server_time/tz_offset_min into every
+        // rendezvous command (status/plan/data); adopt them before any handler
+        // renders or replies. Missing fields keep the local RTC fallback.
+        if (!doc["server_time"].isNull()) adoptServerTimeForce(doc);
         const char *op = doc["op"] | "";
         if (!strcmp(op, "status")) {
             JsonDocument state;
@@ -3680,22 +3843,105 @@ static void serviceV2Ble() {
 }
 
 // Timer wakes only open BLE; Wi-Fi requires an accepted light plan.
+// Plan C: hard 3 s window; after a plan ACK it closes 200 ms later. No screen
+// work happens while the radio is on -- the caller renders once afterwards.
+static void v2RendezvousRender(bool light);
 static bool v2Rendezvous() {
+    v2InRendezvous = true;
     enterBleOn(false);
-    const uint64_t deadline = v2NowMs() + 15000;
+    const uint64_t windowStart = v2NowMs();
+    uint64_t deadline = windowStart + V2_RENDEZVOUS_WINDOW_MS;
     uint64_t answeredAt = 0;
+    uint64_t connectedAt = 0;
     while (v2NowMs() < deadline) {
         blePoll();
         serviceV2Ble();
+        if (!connectedAt && bleIsConnected()) {
+            // The central is in; the wait deadline is done. Give the command
+            // exchange its own bound instead of cutting a working link.
+            connectedAt = v2NowMs();
+            deadline = connectedAt + V2_RENDEZVOUS_CONNECTED_MS;
+            DevLog.printf("[v2] rendezvous peer connected at %ums\n",
+                          (unsigned)(connectedAt - windowStart));
+        }
         if (v2Plan.accepted()) {
             if (!answeredAt) answeredAt = v2NowMs();
-            if (v2NowMs() - answeredAt >= 500) break;
+            if (v2NowMs() - answeredAt >= V2_RENDEZVOUS_ACK_GRACE_MS) break;
         }
         delay(10);
     }
     bool light = v2Plan.lightActive(v2NowMs());
     bleOff("rendezvous complete");
+    v2InRendezvous = false;
+    wakeResult = light ? WAKE_RV_LIGHT : WAKE_RV_SLEEP;
+    rtcNetCycles++;
+    DevLog.printf("[v2] rendezvous %s plan=%lu time=%s awake=%ums ble=%ums win=%ums\n",
+                  answeredAt ? "answered" : "timeout", (unsigned long)v2Plan.acceptedId(),
+                  timeKnown() ? timeSourceName(timeSource) : "none", (unsigned)millis(),
+                  (unsigned)bleRadioMs(), (unsigned)(v2NowMs() - windowStart));
+    v2RendezvousRender(light);
     return light;
+}
+
+// Plan C: the single wake render, after the BLE window is closed. The reserved
+// clock window is written directly (same partial path as thin deep wakes) so
+// the sleep frame stays untouched; a full frame is only the failure fallback.
+// No clock in the template (or unknown time) -> nothing to draw.
+static void v2RendezvousClockRender() {
+    if (!clkR.valid || !activeTplHasNow || !timeKnown()) {
+        DevLog.printf("[v2] rendezvous render skipped (clk=%d now=%d time=%d)\n",
+                      clkR.valid ? 1 : 0, activeTplHasNow ? 1 : 0, timeKnown() ? 1 : 0);
+        return;
+    }
+    if (!panelThinReady) epdThinBegin();
+    const uint32_t t0 = millis();
+    // First wake after a cold boot/OTA: the software old-window is unknown, so
+    // seed it from the framebuffer (full baseline) instead of a window write.
+    if (!clkPixelsValid) {
+        forceCleanRefresh = true;
+        renderCurrent();
+        clkCaptureFromFramebuffer();
+        DevLog.printf("[v2] rendezvous full frame (no clock baseline) in %ums\n",
+                      (unsigned)(millis() - t0));
+        return;
+    }
+    if (!clockTickWake()) {
+        DevLog.println("[v2] rendezvous clock window failed; full frame");
+        forceCleanRefresh = true;
+        renderCurrent();
+        clkCaptureFromFramebuffer();
+        return;
+    }
+    DevLog.printf("[v2] rendezvous clock rendered in %ums (src=%s)\n",
+                  (unsigned)(millis() - t0), timeSourceName(timeSource));
+}
+
+// Plan C: the one render after the window. A BLE snapshot applied during the
+// window is drawn as a full frame (data + clock together); a light plan keeps
+// its clock for the light first frame; a sleep plan otherwise writes only the
+// reserved clock window.
+static void v2RendezvousRender(bool light) {
+    if (v2WakeRenderPending) {
+        const uint32_t t0 = millis();
+        const uint32_t busyBefore = rtcEpdBusyFails;
+        // Light: this frame is the Zzz-removing wake baseline, so
+        // startNormalMode must not force a second full refresh (task-10).
+        if (light) forceCleanRefresh = true;
+        renderActiveUsage(lastUsage, lastChannel.c_str());
+        if (light) wakeBaselineDrawn = true;
+        v2WakeRenderPending = false;
+        clkCaptureFromFramebuffer();
+        v2DisplayState = (rtcEpdBusyFails != busyBefore) ? 3 : 1;
+        DevLog.printf("[v2] rendezvous %s frame (data+clock) in %ums\n",
+                      light ? "light" : "sleep", (unsigned)(millis() - t0));
+        return;
+    }
+    if (light) {
+        // The clock rides in the light first frame (startNormalMode).
+        DevLog.println("[v2] rendezvous light plan; clock in the first light frame");
+        return;
+    }
+    v2RendezvousClockRender();
 }
 
 static void registerHttpRoutes() {
@@ -4501,6 +4747,7 @@ void setup() {
     plugged = usb_serial_jtag_is_connected();
     batteryPct = batteryPercent();
     if (rtcMagic == 0xC0DE0001) restoreTimeFromRtc();
+    if (timeKnown()) timeSource = TIME_RTC;
 
     // v0.14 deep timer wake: if no network contact is due, this boot is a thin
     // clock-only wake (panel + reserved window, no Wi-Fi/NVS/template work).
@@ -4509,7 +4756,9 @@ void setup() {
                           (!plugged || rtcDeepOnUsb));
     nvsStageMark(5);      // wake classified (deepTimerBoot known)
     histAdd(HIST_BOOT, (uint16_t)cause);
+    wakeResult = deepTimerBoot ? WAKE_NET : WAKE_LIGHT;
     if (deepTimerBoot && !deepNetDue()) {
+        wakeResult = WAKE_THIN;
         deepThinWake();   // never returns
     }
 
@@ -4535,6 +4784,10 @@ void setup() {
         rtcEpdBusyFails = 0;
         rtcTplActiveId[0] = 0;
         rtcTplHash[0] = 0;
+        rtcAccCycles = 0;
+        rtcAccAwakeMs = 0;
+        rtcAccBleMs = 0;
+        rtcAccRenderMs = 0;
         clkR.valid = false;
         clkPixelsValid = false;
         DevLog.println("[pm] RTC state initialized");
@@ -4623,6 +4876,9 @@ void setup() {
     if (hasWifiSlots()) {
         if (deepWakePath && v2BundleReady) {
             if (rv2Enabled && !v2Rendezvous()) {
+                // Plan C: v2Rendezvous already rendered once after the radio
+                // was closed (clock window or deferred data frame); the sleep
+                // plan path only has to schedule the next rendezvous.
                 rtcNextContactS = V2_RENDEZVOUS_S;
                 rtcNextNetAt = timeKnown() ? (uint32_t)time(nullptr) + rtcNextContactS : 0;
                 sleepToNextEvent();

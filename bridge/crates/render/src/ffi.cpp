@@ -295,6 +295,18 @@ int codex_v2_accept_data(void *p, const char *message) {
     String usage, error;
     return v2AcceptData(ct, String(message), "ctx", *(V2DataSeq *)p, usage, error);
 }
+
+// Host-test hook: validate a Data message against a freshly compiled template,
+// so tests cover local (device.*) requirements the bridge does not transmit.
+int codex_v2_accept_data_template(const char *source, const char *message) {
+    if (!source || !message) return -99;
+    CtTemplate ct{};
+    String error;
+    if (!tplCompile(String(source), ct, error)) return -98;
+    V2DataSeq seq;
+    String usage;
+    return v2AcceptData(ct, String(message), "ctx", seq, usage, error);
+}
 void codex_v2_seq_free(void *p) { delete (V2DataSeq *)p; }
 void codex_v2_seq_begin(void *p, uint64_t now_ms, uint32_t keep_next) {
     ((V2DataSeq *)p)->beginContext(now_ms, keep_next);

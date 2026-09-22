@@ -91,7 +91,13 @@ impl Pusher {
             .ok_or_else(|| anyhow!("no bluetooth adapter"))
     }
 
-    async fn wait_for_device(adapter: &Adapter, prefix: &str, timeout: Duration) -> Result<Peripheral> {
+    /// One scan pass for the device prefix. `Ok(None)` means it never
+    /// advertised inside the timeout (no connection was attempted).
+    async fn find_device(
+        adapter: &Adapter,
+        prefix: &str,
+        timeout: Duration,
+    ) -> Result<Option<Peripheral>> {
         adapter
             .start_scan(ScanFilter::default())
             .await
@@ -100,18 +106,24 @@ impl Pusher {
         loop {
             if tokio::time::Instant::now() >= deadline {
                 let _ = adapter.stop_scan().await;
-                bail!("device {prefix}* not found");
+                return Ok(None);
             }
             for peripheral in adapter.peripherals().await? {
                 let props = peripheral.properties().await?;
                 let name = props.and_then(|p| p.local_name).unwrap_or_default();
                 if name.starts_with(prefix) {
                     let _ = adapter.stop_scan().await;
-                    return Ok(peripheral);
+                    return Ok(Some(peripheral));
                 }
             }
             tokio::time::sleep(Duration::from_millis(400)).await;
         }
+    }
+
+    async fn wait_for_device(adapter: &Adapter, prefix: &str, timeout: Duration) -> Result<Peripheral> {
+        Self::find_device(adapter, prefix, timeout)
+            .await?
+            .with_context(|| format!("device {prefix}* not found"))
     }
 
     fn peer_bonded(info: &serde_json::Value) -> bool {
@@ -436,6 +448,14 @@ impl Pusher {
     }
 }
 
+/// Plan C: stamp every rendezvous command with the bridge's wall clock and UTC
+/// offset so the device can sync before its single post-window render. Missing
+/// or invalid fields leave the device on its local-RTC fallback.
+fn stamp_clock(body: &mut serde_json::Value) {
+    body["server_time"] = json!(bridge_core::now_secs());
+    body["tz_offset_min"] = json!(bridge_core::local_offset_minutes());
+}
+
 /// Authenticated v2 opportunity on the existing GATT table. The status value
 /// is read as a long attribute, so an ACK is not lost to notification MTU cuts.
 pub struct V2Connection {
@@ -447,23 +467,45 @@ pub struct V2Connection {
 }
 
 impl V2Connection {
-    pub async fn connect(mac: &str, token: &str, bridge_id: &str) -> Result<Self> {
+    /// `Ok(None)` = the device was not advertising (rendezvous window closed):
+    /// no connection was attempted and the caller may scan again immediately.
+    pub async fn connect(mac: &str, token: &str, bridge_id: &str) -> Result<Option<Self>> {
         let compact = bridge_core::platform::model::DeviceIdentity::normalized_mac(mac)
             .context("invalid device MAC")?;
         let adapter = Pusher::adapter().await?;
-        let found = Pusher::wait_for_device(&adapter,
-            &format!("CodexStatus-{}", &compact[6..]), Duration::from_secs(3)).await;
+        let found = Pusher::find_device(
+            &adapter,
+            &format!("CodexStatus-{}", &compact[6..]),
+            Duration::from_secs(3),
+        )
+        .await;
         let _ = adapter.stop_scan().await;
-        let peripheral = found?;
-        let connected = tokio::time::timeout(Duration::from_secs(4), peripheral.connect()).await
+        let Some(peripheral) = found? else {
+            return Ok(None);
+        };
+        tracing::debug!("v2 BLE device found at {}", peripheral.address());
+        let mut connected = tokio::time::timeout(Duration::from_secs(4), peripheral.connect()).await
             .map_err(anyhow::Error::from).and_then(|r| r.map_err(anyhow::Error::from));
+        if connected.is_err() {
+            // Windows refuses the first connect to a just-seen advertisement
+            // often enough to lose the whole rendezvous; retry inside the
+            // window instead of waiting for the next scan tick.
+            tracing::debug!("v2 BLE connect retry");
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            connected = tokio::time::timeout(Duration::from_secs(4), peripheral.connect()).await
+                .map_err(anyhow::Error::from).and_then(|r| r.map_err(anyhow::Error::from));
+        }
         if let Err(error) = connected {
             let _ = peripheral.disconnect().await;
-            return Err(error.into());
+            return Err(error.context("ble connect"));
         }
         let setup = async {
-            tokio::time::timeout(Duration::from_secs(3), peripheral.discover_services()).await??;
-            let info = tokio::time::timeout(Duration::from_secs(3), Pusher::read_info(&peripheral)).await??;
+            tokio::time::timeout(Duration::from_secs(3), peripheral.discover_services()).await
+                .context("discover timeout")?.context("discover")?;
+            let info = tokio::time::timeout(Duration::from_secs(3), Pusher::read_info(&peripheral))
+                .await
+                .map_err(|_| anyhow!("info timeout"))?
+                .map_err(|e| e.context("info"))?;
             if bridge_core::platform::model::DeviceIdentity::normalized_mac(
                 info["mac"].as_str().unwrap_or("")) != Some(compact.clone()) {
                 bail!("BLE device identity mismatch");
@@ -479,7 +521,7 @@ impl V2Connection {
         }
         let device_mac = compact.as_bytes().chunks(2)
             .map(|p| std::str::from_utf8(p).unwrap()).collect::<Vec<_>>().join(":");
-        Ok(Self { peripheral, token: token.to_owned(), bridge_id: bridge_id.to_owned(), nonce: String::new(), device_mac })
+        Ok(Some(Self { peripheral, token: token.to_owned(), bridge_id: bridge_id.to_owned(), nonce: String::new(), device_mac }))
     }
 
     pub async fn command(&mut self, op: &str, mut body: serde_json::Value) -> Result<serde_json::Value> {
@@ -492,6 +534,7 @@ impl V2Connection {
         body["bridge_id"] = json!(self.bridge_id);
         body["device_mac"] = json!(self.device_mac);
         body["token"] = json!(self.token);
+        stamp_clock(&mut body);
         let bytes = serde_json::to_vec(&body)?;
         if bytes.len() > 8192 { bail!("v2 BLE command exceeds 8192 bytes"); }
         let status = self.peripheral.characteristics().into_iter()
@@ -536,5 +579,18 @@ mod tests {
         assert!(Pusher::peer_bonded(&json!({"peerBonded": true})));
         assert!(!Pusher::peer_bonded(&json!({"peerBonded": false, "peerEncrypted": true})));
         assert!(!Pusher::peer_bonded(&json!({"peerEncrypted": true})));
+    }
+
+    #[test]
+    fn rendezvous_commands_carry_the_bridge_clock() {
+        let mut body = json!({"op": "plan"});
+        super::stamp_clock(&mut body);
+        let now = body["server_time"].as_u64().unwrap();
+        assert!(now > 1_600_000_000, "server_time must be a fresh epoch");
+        let tz = body["tz_offset_min"].as_i64().unwrap();
+        assert!(
+            (-840..=840).contains(&tz),
+            "tz_offset_min out of range: {tz}"
+        );
     }
 }
