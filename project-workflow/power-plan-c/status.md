@@ -1,9 +1,9 @@
 # Plan C — status
 
 Updated: 2026-09-22
-Status: task-1/2/3 已代码落地并实机上线（本文件最后部署记录为 0.17.2-bw 已 OTA，桥已重建重启，rv2=1）；
-发现并修复了一个 0.16.9 收敛引入的 v2 Data 校验回归。30–60 分钟基线（task-3）与
-btpm A/B（task-4）待跑。未提交（工作树）。
+Status: task-1/2/3 已代码落地并实机上线；固件已推进到 0.17.9-bw（OTA），桥已重建重启，rv2=1；
+发现并修复了 0.16.9 收敛引入的 v2 Data 校验回归与 rv2 离线显示同步遗漏。30–60 分钟基线
+（task-3）、task-6 实现与 A1–A5 A/B（含 DFS/btpm）待跑。提交：`99ef3c0`（上一基线 `e1e93fc`）。
 
 ## 当前状态
 
@@ -33,7 +33,7 @@ btpm A/B（task-4）待跑。未提交（工作树）。
 
 ## 实现与证据（2026-09-23，task-2 §4 定稿 + bridge_first spike）
 
-### 桥侧实现（`bridge/crates/ble/src/lib.rs`，工作树未提交）
+### 桥侧实现（`bridge/crates/ble/src/lib.rs`，已提交 `99ef3c0`）
 
 - **发现**：`find_device` 改为事件驱动（`adapter.events()`，命中即 `stop_scan`），替代
   400ms 轮询；每周期新建 adapter（`Manager` 为 ZST，Windows watcher handler 无法注销，

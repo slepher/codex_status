@@ -1,9 +1,10 @@
 # Codex Status 项目进度（交接文档）
 
-## 实机推进：2026-09-23 — 桥提速定稿 + bridge_first spike + 0.17.9 固件（未提交）
+## 实机推进：2026-09-23 — 桥提速定稿 + bridge_first spike + 0.17.9 固件（已提交 99ef3c0）
 
-工作树推进，未提交。权威细节与证据见 `project-workflow/power-plan-c/status.md`（09-23 节）
-与 `task-6-bridge-first-impl.md`（含 §1 spike 结果、§5 统一 A/B 排期）。
+已提交 **`99ef3c0`**（上一基线 `e1e93fc`）。权威细节与证据见
+`project-workflow/power-plan-c/status.md`（09-23 节）与 `task-6-bridge-first-impl.md`
+（含 §1 spike 结果、§5 统一 A/B 排期）。
 
 **桥（`bridge/crates/ble/src/lib.rs` 等，已重建运行）**
 - task-2 §4 定稿：事件驱动发现（`adapter.events()`，命中即停扫描）、每次机会新建 adapter
@@ -39,7 +40,7 @@
 
 **现场与结论**
 - 设备 `192.168.3.163` / `70041DD7A340`，现运行 **0.17.9-bw**、rv2=1；桥
-  `bridge/target/debug`（parent 2032 / watchdog 50320，pidfile=2032，未提交重建件）。
+  `bridge/target/debug`（parent 2032 / watchdog 50320，pidfile=2032，本地重建件）。
 - OTA 失败归因：与 ROM 大小/内容无关；失败为 `[ota] abort (aborted) err=0`（TCP 中断），
   ping RTT 5–12ms/1s 交替（PS listen=10）在弱信号下拖垮 1.7MB 上传；挪近后 rssi -42
   一次通过。0.17.5+ 的 PS-off 已把这条修掉。

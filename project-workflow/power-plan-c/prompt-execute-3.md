@@ -19,7 +19,7 @@
 - 桥：`bridge/target/debug`（工作树重建件，含 task-2 §4 定稿 + post_ota_window），
   MCP `http://127.0.0.1:8766/mcp`，数据目录 `bridge/target/debug/data/`，
   token 缓存 `data/device-token.json`，pidfile `artifacts/bridge-app-run.pid`。
-- 工作树未提交（基线 `e1e93fc`）：`src/main.cpp`、`src/ble_bridge.{h,cpp}`、
+- 已提交 **`99ef3c0`**（上一基线 `e1e93fc`），本次提交包含：`src/main.cpp`、`src/ble_bridge.{h,cpp}`、
   `bridge/crates/ble/{lib.rs,Cargo.toml,examples/adv-spike.rs}`、
   `bridge/crates/{app/src/{main,platform}.rs, core/src/{coordinator.rs,platform/service.rs}}`、
   plan/status/task-2/4/5 文档、新增 task-6；`docs/generic-display-platform-design-v2.md` 与
