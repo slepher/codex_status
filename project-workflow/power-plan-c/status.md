@@ -1,32 +1,92 @@
 # Plan C — status
 
 Updated: 2026-09-22
-Status: task-1/2/3 已代码落地并实机上线（0.17.1-bw 已 OTA，桥已重建重启，rv2=1）；
+Status: task-1/2/3 已代码落地并实机上线（本文件最后部署记录为 0.17.2-bw 已 OTA，桥已重建重启，rv2=1）；
 发现并修复了一个 0.16.9 收敛引入的 v2 Data 校验回归。30–60 分钟基线（task-3）与
 btpm A/B（task-4）待跑。未提交（工作树）。
 
 ## 当前状态
 
-- 设计已确认：窗口 3s、回复/超时后渲染一次、回复带时间校时、DFS min 80MHz、第二阶段 BT modem sleep。
-- task-1/2/3 实现见下文“实现与证据”；设备现场仍为 0.16.7 / rv2=0，运行中的桥未动。
+- 第一阶段目标：回复/超时后渲染一次、带时间校时、DFS min 80MHz、第二阶段 BT modem sleep。
+  实际等待连接 3s、连接后另给 6s，尚不满足总 wake 目标，见下方实机记录。
+- task-1/2/3 实现见下文；最后部署记录为 0.17.2 / rv2=1，桥已重建。此处为记录核对，未重新探测现场。
+- task-5 双策略需求与候选协议已整理并同步权威 v2 设计，需 Windows/空口/安全 spike，尚未实现或启用。
 - 本计划不改变安全语义（token/claim/owner），不做 light 会话优化。
 
 ## 任务状态
 
 | Task | 状态 | 备注 |
 |---|---|---|
-| task-1 固件窗口/渲染/校时/时钟修复/DFS | 已上线（0.17.1-bw 已 OTA） | 含连接期窗口扩展；见下实机记录 |
-| task-2 桥时间下发/连续扫描/窗口去重 | 已上线（桥已重建重启） | connect 重试 + 250ms；`BleOpportunity` 去重 |
+| task-1 固件窗口/渲染/校时/时钟修复/DFS | 已上线（0.17.1，后续 0.17.2） | 含连接期窗口扩展；见下实机记录 |
+| task-2 桥时间下发/连续扫描/窗口去重 | 已上线；§4 提速已实测定稿（见 09-23 节） | 事件驱动发现 + 每周期 disconnect/discover + 20ms ACK；常驻 adapter/扫描与跳 discovery 实测失败 |
 | task-3 遥测与验收 | 埋点+预估工具已上线；30–60min 基线 pending | 实测 wake 6.2–8.6s 待调参；见下功耗预估 |
-| task-4 BT modem sleep 实测定值 | pending | 等 task-3 基线后切 btpm env A/B |
-| task-5 广告会合/窗口对齐 | 候选（文档就绪） | 见 `task-5-advert-rendezvous.md` |
+| task-4 BT modem sleep 实测定值 | pending | 等 task-3 基线后切 btpm env A/B；DFS 40/80 臂见 task-6 §5 |
+| task-5 双策略会合/窗口对齐 | 权威设计已同步，需 spike | device_first / bridge_first 独立 A/B；未实现 |
+| task-6 bridge_first 实现 + 统一 A/B | spike 首轮完成（见 09-23 节） | 计划见 `task-6-bridge-first-impl.md` |
 
 ## 现场记录
 
-- 设备：192.168.3.163 / MAC 70041DD7A340，0.16.7-bw，rv2=0；
-- 桥：`bridge/target/debug`（14:03 构建）运行中，PID 17096/32248；
-- 0.16.9 固件源码在树、本地构建通过，未固化 ROM、未 OTA；
+- 设备：192.168.3.163 / MAC 70041DD7A340；本文件末次部署记录 0.17.2-bw 已 OTA（rv2=1 沿用前次记录）；
+- 桥：`bridge/target/debug` 已重建重启，下文部署时记录 parent 15012 / watchdog 56212；不是本轮实时进程检查；
+- 原 0.16.7/rv2=0、14:03 旧桥及 0.16.9 未 OTA 是启动基线，已被后续部署记录取代；
 - 实测结论与日志进 `artifacts/`，不入库。
+
+## 实现与证据（2026-09-23，task-2 §4 定稿 + bridge_first spike）
+
+### 桥侧实现（`bridge/crates/ble/src/lib.rs`，工作树未提交）
+
+- **发现**：`find_device` 改为事件驱动（`adapter.events()`，命中即 `stop_scan`），替代
+  400ms 轮询；每周期新建 adapter（`Manager` 为 ZST，Windows watcher handler 无法注销，
+  复用同一 adapter 反复 start/stop 会累积 handler）。
+- **实测否决两条“提速”路线（本机 Windows）**：
+  - 常驻 adapter + 持续扫描 + connect 期间不停扫描 → 隔次 connect 两次 4s 超时（≈50% 丢窗）；
+  - 不 disconnect/复用 GATT 缓存并跳过 discover → 同样隔次失败；
+  - 结论：每周期 `disconnect` + `discover_services` 是硬要求；INFO 读取改为每会话探测
+    （MAC/绑定仍每次核对），缓存只在不破坏身份校验时才有意义。
+- **保留**：ACK 轮询 20ms（原 80ms）；connect 首败重试；55s 去重；分阶段计时
+  `timings=[find,connect,discover,info,status,data,plan]` 入 debug 日志。
+- **实机**：桥 15:52:56Z 重启后至 16:13Z 所有会合窗口成功（个别窗口内首败重试后恢复），
+  分阶段典型值 find 0.3–2.9s（等窗口）/ connect 0.26–1.0s / discover 0.23–0.35s /
+  info 0.03–0.05s / 命令 0.01–0.15s；原始日志
+  `bridge/target/debug/data/logs/bridge-app.log.2026-09-22`。
+
+### bridge_first spike（task-6 §1；`bridge/crates/ble/examples/adv-spike.rs`）
+
+- `Start→Started` P50 17.5ms / P95 22.3ms；发布期间 watcher 持续收包（≈24 条/s）；
+  `Stop→首条广播` P50 98.9ms / P95 109.4ms；状态序列 `Waiting→Started→Stopped`；
+- 同机 watcher 收不到自身 beacon（Windows 过滤），非连接性/实际 31B AD/首包 P50 需第二接收端；
+- 发布 170s 期间 device_first 会合 1/1 成功（connect 282ms）。
+- 证据：`artifacts/adv-spike-2026-09-23.jsonl`、`artifacts/adv-spike-hold-2026-09-23.jsonl`。
+
+### 回归
+
+- `cargo test --workspace` 全绿（`artifacts/cargo-test-powerc-task2s4-2026-09-23.log`）；
+- `node tools/test-quad-preview.mjs` 7 fixtures 通过；`git diff --check` 通过；
+- 新增行 `rustfmt --check` 干净（既有 drift 未动）。
+
+### 固件与链路修复（0.17.3–0.17.9，均已 OTA）
+
+- **离线显示修复（用户可见）**：`markSynced()` 只在 legacy HTTP push/pull 调用，rv2 下
+  `rtcLastSyncEpoch` 冻结 → 屏幕 `device.offline_mins` 连续数小时误报；0.17.9 起 BLE
+  已认证会合命令与 `/v2/status|data|plan` 都刷新同步时间（`last_push` 实测 6s 内）。
+- **OTA 可靠性**：上传期 `esp_wifi_set_ps(WIFI_PS_NONE)`（CPU light sleep 早有
+  `otaPmLock`）；post-OTA 5 分钟 light 窗口用 **NVS** 标记（本板 RTC 内存不跨软复位），
+  实测 `post_ota_hold_s≈255`；桥侧 `post_ota_window` 另发 300s 显式 light 计划
+  （plan_id 86/88/90 ack）——固件保底 + 桥控制两层。
+- **诊断入口**：`/diag?blescan=N&company=`（token）与串口 `blescan N`；修了
+  `NimBLEScan::start()` 毫秒/异步语义、扫描期 Wi-Fi PS 饥饿、JSON 根节点类型三个问题
+  （见 task-6 §1.2）。
+- **ROM**：0.17.5 `6D46A6A0…`、0.17.6 `C1C43933…`、0.17.7 `9EF5981B…`、0.17.8
+  `31F7EA73…`、0.17.9 `36359E9D…`（`artifacts/codex-status-0.17.*.bin`）。
+- **OTA 失败归因（实测）**：与 ROM 大小/内容无关；失败时设备日志
+  `[ota] abort (aborted) err=0`（TCP 中断），ping RTT 5–12ms/1s 交替（PS listen=10），
+  rssi -72 时 1.7MB 上传在 131KB–1MB 处断；挪近/重启后 rssi -42 一次通过。
+
+### 待办
+
+1. task-6 §2–§4 实现（spike Go；设备侧接收端已具备）；
+2. A1 桥提速 30 周期统计与设备 `/history`（需一次 light 会话）；
+3. A2/A3 DFS×btpm、A5 节奏、A4 双策略按 task-6 §5 统一排期。
 
 ## 实现与证据（2026-09-22，task-1/2/3）
 
@@ -76,7 +136,7 @@ btpm A/B（task-4）待跑。未提交（工作树）。
     已 OTA，但随即发现 v2 数据校验回归（见下），**已被 0.17.1 取代**。
   - `artifacts/codex-status-0.17.1-bw.bin`（1 700 048 B，SHA256
     `A0932C0F657E55EFDCDE74A690E2D2286D3F81563087D263600ED3D340C5D43E`）——
-    **当前设备运行版本**（OTA 成功：`0.17.0-bw -> 0.17.1-bw`）。
+    **当次运行版本，后由 0.17.2 取代**（OTA 成功：`0.17.0-bw -> 0.17.1-bw`）。
   - `artifacts/codex-status-0.17.2-bw.bin`（1 700 640 B，SHA256
     `74414AEAEC1F5A1096F288B7FE253BAC4CD8D65C3BF9057B2334289CFAC511E0`）——
     **功率预估埋点版，已 OTA**（新增 `render_ms`/`light_sleep_ms` 与
@@ -136,7 +196,7 @@ btpm A/B（task-4）待跑。未提交（工作树）。
 ### 留给编译窗口 / 后续
 
 1. ~~正式 ROM（task-1/2/3 行为，非 btpm）~~：已由本窗口完成（0.17.1-bw，已 OTA，见上）。
-   `FW_VERSION` 现为 `0.17.1-bw`；0.17.0 同版本件已弃用（仅留痕）。
+   后续功率预估埋点 ROM 0.17.2 也已 OTA，见上；0.17.0 被取代（仅留痕）。
 2. **btpm 实验 ROM（task-4 A/B）**：等 task-3 基线采集后再切
    `esp32-s3-epaper-154g-btpm` 构建（勿在任务 1–3 阶段用 btpm）。
 3. task-3 30–60 分钟基线与调参（会合时长/周期）由后续窗口执行；
@@ -144,20 +204,23 @@ btpm A/B（task-4）待跑。未提交（工作树）。
 
 ## 下一步
 
+0. 按 `task-6-bridge-first-impl.md` 执行：先 Windows publisher spike，再 bridge_first 协议/
+   切换实现；实现完成后按 §5 统一 A/B 排期（A1 桥提速 → A2/A3 DFS×btpm → A5 节奏 → A4 双策略）；
 1. 收尾 v2 收敛工作树（提交/文档/桥重建）或确认与本计划改动合并方式；
-2. 按 task-3 做 30–60 分钟基线采集（当前非 btpm 0.17.1 + 新桥），
+2. 按 task-3 做 30–60 分钟基线采集（本文件最后部署记录为非 btpm 0.17.2 + 新桥），
    重点核对 wake 时长（当前 6.2–8.6s 超预算）与会合周期（偶见 2 分钟）；
 3. 桥侧按 task-2 §4 提速（常驻扫描/复用 Peripheral/跳过 INFO/快轮询），目标无数据 ≤3s；
-4. 仍不达标则启动 task-5（苏醒心跳 + 窗口对齐，候选方案见
-   `task-5-advert-rendezvous.md`）；
+4. 基线后开展 task-5 双策略 spike：device_first 与 bridge_first 独立 A/B，
+   认证指令/每窗口必回 StatusBeacon、并行 HTTP 等待、设备硬截止及策略恢复见 task-5；
 5. 基线通过后按 task-4 切 btpm env 做 A/B。
 
 ## 调研与文档更新（2026-09-22）
 
 - 同类项目与社区实测、BLE 广播空口事实、Windows/btleplug 限制、回复广播 vs 静默的成本结论
   已写入 `plan.md`「调研补充」；
-- 新增候选任务文档 `task-5-advert-rendezvous.md`（广告会合/窗口对齐：设备心跳广播带
-  `next_wake_in_s`，PC 预测窗口替代连续扫描；无事不连接，数据仍走 GATT）；
+- `task-5-advert-rendezvous.md` 已收敛为双策略候选：PC 每窗口广播，设备扫描并必回状态；
+  OPEN_WIFI 后并行等待状态/HTTP，复用现有 coordinator/认证交付，未实现、需 spike。
+  明文 hasWork、设备主动连接既有 GATT、回复成本为零等旧草案不再适用；
 - task-1 增“连接期预算/心跳 metadata”、task-2 增“单次 wake 压缩/窗口预测”、
   task-3 增“分阶段计时与通道对照”、task-4 增 coex 残余电流与共射频风险。
 
@@ -195,4 +258,4 @@ btpm A/B（task-4）待跑。未提交（工作树）。
   - 框架包漂移（非配置项）：`BOOTLOADER_VDDSDIO_BOOST_1_8V` 出现、`SR_NSN_NSNET3`、
     `SR_WN_WN10_*` 5 项。
 - **影响**：task-4 的 env 配置已验证可编译；task-1 落地后需在同一 env 重编正式 ROM
-  （预演件不含 Plan C 行为，不用于实机验证）。
+  （预演件不含 Plan C 行为，不用于实机验证；task-1 后来已上线，仍需重编正式 btpm 件）。

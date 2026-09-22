@@ -181,6 +181,11 @@ pub struct Coordinator {
     /// Observed plan-id high water mark accepted by the device.
     pub device_plan_high: u64,
     pub last_sequence_reason: Option<String>,
+    /// Bridge-controlled minimum light window (epoch seconds). While
+    /// `now < light_hold_until` rendezvous plans keep granting light; the
+    /// device still follows the formal PowerPlan deadline, which extended
+    /// holds refresh. Used for the post-OTA control window.
+    pub light_hold_until: u64,
 }
 
 pub const DEFAULT_FULL_SYNC_S: u64 = 3600;
@@ -207,7 +212,13 @@ impl Coordinator {
             session: DeviceSession::default(),
             device_plan_high: 0,
             last_sequence_reason: None,
+            light_hold_until: 0,
         }
+    }
+
+    /// Raise the bridge-side light hold (never shortens an existing hold).
+    pub fn hold_light(&mut self, until: u64) {
+        self.light_hold_until = self.light_hold_until.max(until);
     }
 
     /// Rebuild the active requirement/trigger contract (context switch, profile

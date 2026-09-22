@@ -1036,7 +1036,8 @@ impl PlatformService {
             .coordinators
             .get(&mac)
             .map(|c| {
-                (c.sync_enabled && c.data.push_dirty)
+                now < c.light_hold_until
+                    || (c.sync_enabled && c.data.push_dirty)
                     || c.data.in_flight.is_some()
                     || c.pending_activate.is_some()
                     || c.job
@@ -1066,6 +1067,18 @@ impl PlatformService {
             )
         };
         Ok(plan)
+    }
+
+    /// Raise the bridge-side light hold for one device (post-OTA control
+    /// window). Rendezvous plans grant light until this epoch.
+    pub fn hold_light(&self, mac: &str, until: u64) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let c = inner
+            .coordinators
+            .get_mut(&mac.to_uppercase())
+            .context("unknown device")?;
+        c.hold_light(until);
+        Ok(())
     }
 
     /// Explicit user/debug power action with a freshly allocated plan id.

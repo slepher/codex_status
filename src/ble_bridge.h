@@ -34,6 +34,13 @@ void bleNotifyStatus(const String &json);
 void bleNotifyStatusQuiet(const String &json);
 void blePoll();
 void bleClearBonds();
+// Diagnostic scan (Plan C task-6 §1.1): the device as the independent BLE
+// receiver for the Windows publisher spike, and the SCAN half of the
+// bridge_first candidate. Scans `seconds`, keeping records whose manufacturer
+// payload starts with `companyFilter` (0 = all devices), and returns a JSON
+// summary with per-advertisement arrival times, RSSI, connectability and raw
+// payload. Blocking; call only while the device is awake.
+String bleScanJson(uint32_t seconds, uint16_t companyFilter, uint8_t maxRecords);
 
 #define BLE_SVC_UUID   "e7f1a000-4b2a-4c9e-9a11-3c0d5e9a0000"
 #define BLE_CHR_INFO   "e7f1a001-4b2a-4c9e-9a11-3c0d5e9a0000"

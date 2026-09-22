@@ -1,6 +1,6 @@
 # 通用多设备墨水屏平台：简化架构 v2
 
-日期：2026-09-22。状态：目标设计，未实现、未部署。本文件以本次累计确认需求为准；与旧设计冲突的容量、数据模型和功耗职责由本文替代。协议字段是待实现合同，不表示现有接口已支持。
+日期：2026-09-23。状态：现行权威设计；主体 v2 已实现并在 200×200 SSD1681 设备实机验证，双策略会合仍是待 spike、未实现的候选扩展。本文件以累计确认需求为准；与旧设计冲突的容量、数据模型和功耗职责由本文替代。候选协议字段不表示现有接口已支持。
 
 ## 1. 目标、非目标与现状
 
@@ -10,7 +10,7 @@
 
 本版不做模板版本历史、历史选择/回滚 UI、资源图/GC、Provider/Dataset 分层、通用脚本插件、增量数据补丁、多设备原子发布或通用历史数据库。不承诺一种 ROM 支持任意 MCU，不把屏幕尺寸缩放当作硬件适配，也不承诺 deep 中即时远程唤醒。
 
-现状依据：`PROGRESS.md` 顶部总设计记录仍为“未实现”；紧邻最新现场记录为 0.15.10-bw，已修复 owner renew/心跳导致 light 不休眠的问题。旧总设计 §2 的 0.15.9 和 BLE 专项 §2 的 0.15.0 均不是最新现场。本次未查询设备或重新核验 ROM。现有“最多 3 个 enabled”、每次模板 JSON 解析和 legacy Wi-Fi pull 是迁移输入，不是新平台约束。
+现状依据：`PROGRESS.md` 记录 v2 主体已实现并在 200×200 SSD1681 上验证；`project-workflow/power-plan-c/status.md` 的最后部署记录为 0.17.2-bw、rv2=1。双策略会合仅完成设计同步，尚未实现、构建或部署。本次未查询设备或重新核验 ROM。现有 legacy“最多 3 个 enabled”与旧 Wi-Fi pull 是兼容输入，不是新平台约束。
 
 ## 2. 简化后的组件边界
 
@@ -121,11 +121,24 @@ Bridge 时间到 full_sync_deadline → 排完整同步（可包含 pull 的新�
 
 Bridge 是正式 PowerPlan 唯一业务决策者。Bridge 根据待发布操作、push 活跃情况、用户功耗设置、当前可达性决定本轮 NOOP/SLEEP、BLE 更新、Bundle 更新或进入/继续 Wi-Fi light。pull-only 变化不改任何电源计划；完整同步到期可由 Bridge 决定传输所需计划，但不会让设备自行升档。
 
+会合发现支持两个可切换策略，但它们只分叉“怎样建立本轮可达机会”，不复制 coordinator、owner、Data、Bundle、PowerPlan 或业务 ACK：
+
+- `device_first`（默认与恢复）：设备发可连接广播，PC 扫描并作为 central 连接设备 GATT server；小 Data 可在既有认证 BLE 会话完成，大任务由正式 PowerPlan 转入 HTTP。
+- `bridge_first`（候选、需能力协商与 spike）：PC 在每个预定窗口都重复广播认证 RendezvousDirective，无工作也明确发送 ACCEPT_SLEEP；设备扫描、验证后每窗口必发认证 StatusBeacon，再按决定休眠或打开一次有界 Wi-Fi bootstrap。PC 收到或发出 OPEN_WIFI 后并行等待 StatusBeacon 与设备 HTTP 端口，认证 HTTP 可用即进入同一 coordinator；回复漏收不阻塞已验证的 HTTP 交付。
+
+`bridge_first` 的广播是有界、目标明确、认证且防重放的会合控制面，不是公开 hint，也不是第二套业务消息通道。OPEN_WIFI 只允许本窗口的一次短时 HTTP 可达机会，不创建 owner、不设置或延长 light deadline、不获得 BOOT provisional，也不授权 Data/Bundle 写入；随后仍须在 HTTP 中核对完整 MAC、bridge、owner、endpoint token、context，并由正式 PowerPlan 决定继续在线期限。ACCEPT_SLEEP 只结束本轮 bootstrap，不撤销仍有效的正式 light/BOOT 期限。
+
 ```text
-DEEP --timer--> 本地必要时钟/维护 → RENDEZVOUS：发 Beacon，短暂等指令
-  ├─ 无响应/超时/NOOP/SLEEP → 关无线 → DEEP
-  ├─ 小完整数据包          → 校验/应用/简单 ACK → 关无线 → 本地显示 → DEEP
-  └─ 正式 PowerPlan(light) → 关 BLE → 有界 Wi-Fi 连接 → WIFI_LIGHT
+DEEP --timer--> 本地必要时钟/维护 → RENDEZVOUS(strategy)
+  ├─ device_first：设备广播 → PC GATT 会合
+  │    ├─ 无响应/超时/NOOP/SLEEP → 关无线 → DEEP
+  │    ├─ 小完整数据包          → 校验/业务 ACK → 关无线 → 本地显示 → DEEP
+  │    └─ 正式 PowerPlan(light) → 关 BLE → 有界 Wi-Fi 连接 → WIFI_LIGHT
+  └─ bridge_first：设备扫描 PC Directive → 必发 StatusBeacon
+       ├─ ACCEPT_SLEEP/NO_DIRECTIVE → 关 BLE → 本地显示 → DEEP
+       └─ OPEN_WIFI → WIFI_BOOTSTRAP（本地硬截止）
+            ├─ HTTP 认证 + 正式 PowerPlan → WIFI_LIGHT/有界交付
+            └─ 超时/拒绝/低电 → 关无线 → DEEP
 
 DEEP --BOOT--> 立即建立 provisional 截止(t_boot + 300s)
               → 手动 Beacon 通知 Bridge → 有界 Wi-Fi 连接 → WIFI_LIGHT
@@ -143,6 +156,8 @@ light deadline 使用设备单调时钟，`accepted_at + granted_duration`；Bri
 
 owner lease 与 light lease 完全分开。空闲设备只能通过 token 保护的显式 POST /claim 建立 owner；不能借 BLE 数据创建 owner。owner 过期时，已绑定并通过设备 token 的 Bridge 可请求有限 light 会话以执行 HTTP claim，该例外只给电源机会，不给数据/Bundle 写权限；有效他人 owner 拒绝此机会和写入。claim 成功后仍需原来的同步/发布授权。owner 续约不影响电源期限。
 
+双策略切换通过当前可用的认证通道提交完整配置并由设备持久化 ACK，在约定的未来窗口生效；Bridge 收到 ACK 或认证读取确认前不能显示“已切换”。默认始终为 device_first。bridge_first 即使持续收到有效指令也按固定日程开放 device_first 恢复窗口，连续无有效指令可提前恢复；BOOT 始终允许 device_first。恢复窗口不自行改持久策略，正式回退仍走认证配置与 ACK。
+
 初始实验参数沿用专项候选：rendezvous 60 秒、广播约 1.5 秒、BLE 总窗口约 15 秒、Wi-Fi 建连约 15 秒、正式单次 light 最大 600 秒。它们必须按 target 和实测定值，只有 BOOT 300 秒兜底是本次已确认产品语义。PC USB/配网等模式若需要不同策略，必须成为明确配置和有界入口，不混入普通数据活动。
 
 ### “实时”的上界
@@ -153,11 +168,13 @@ Wi-Fi light 有效且链路可达期间，后续 push 可立即排完整数据�
 
 ## 8. 最小消息与幂等规则
 
-所有有副作用命令在已认证通道执行，公共字段为 `protocol, device_mac, bridge_id, request_id, session_nonce`。session_nonce 绑定当前认证会话；广播只作为发现提示。公开 Beacon 使用协议、设备短索引、wake_reason、上下文/状态摘要即可，完整 MAC、上下文与能力通过认证状态握手核对；不在广告放业务数据或 token。
+所有业务副作用命令在已认证会话执行，公共字段为 `protocol, device_mac, bridge_id, request_id, session_nonce`。session_nonce 绑定当前认证会话。公开发现 Beacon 仍只作 hint；bridge_first 另定义经过预配置密钥认证、防重放的紧凑 Directive/StatusBeacon，它只能选择本轮 SLEEP 或有界 OPEN_WIFI，不能承载业务数据、token、claim、Bundle、Data 或正式 PowerPlan。完整 MAC、上下文与能力仍通过认证 HTTP/GATT 状态握手核对。
 
 | 消息 | 必需业务字段 | 语义 |
 |---|---|---|
 | RendezvousBeacon / Status | wake_reason；认证 Status 含完整 active_context_id、active_template_id、已提交 job_id、data_seq、能力及剩余功耗期限 | Bridge 据此重建真实状态，摘要不构成授权 |
+| RendezvousDirective（候选） | 短目标、config_epoch、window_seq、ACCEPT_SLEEP/OPEN_WIFI、schedule_hint、auth_tag | PC 每个 bridge_first 窗口冻结并重复同一指令；只决定是否开放本轮 Wi-Fi bootstrap |
+| RendezvousStatusBeacon（候选） | 短目标、同一 epoch/window、ACCEPT_SLEEP/WIFI_OPENING/NO_DIRECTIVE/REJECTED、reason、auth_tag | 设备每窗口必发并重复；证明本窗口活跃/决定，不是 Wi-Fi ready 或业务 ACK |
 | NOOP | 可选校时与时区 | 不更新数据、不改期限；窗口结束回 deep |
 | PowerPlan | plan_id、mode=sleep/light、light_duration_s、rendezvous_period_s | 明确修改电源计划；SLEEP 是 mode=sleep 的同一命令，避免另造租约实体 |
 | Data | active_context_id、data_seq、完整 fields | 原子替换当前数据；字段索引按当前 CompiledTemplate 校验 |
@@ -170,6 +187,8 @@ Wi-Fi light 有效且链路可达期间，后续 push 可立即排完整数据�
 提交前再次检查身份、owner、上下文、长度、校验、类型和全部字段。相同 context+data_seq 且相同内容返回原结果，较旧 seq 拒绝，同 seq 不同内容冲突。seq 跳号允许合并中间快照。切模板产生新 context，旧包无论 BEGIN 或 COMMIT 在途都拒绝。
 
 plan_id 在设备认证会话内单调递增，设备保留最高已接受值及原期限；同值同内容幂等，同值不同内容冲突，旧值拒绝。新连接先核对当前最高值，不能重新编号来重放历史计划；冷重启废止旧会话 nonce，不能恢复旧 light 承诺。request_id 重试远程 Activate 需返回先前结果，不能生成第二个上下文。
+
+候选广播一窗口只允许一条冻结 Directive；相同 epoch/window 的重复同字节包返回同一决定，不重复开网或续任何截止，同序号不同内容、旧 epoch、过期/未来窗口和错目标全部拒绝。设备即使未收到有效 Directive 也发送基于本地预期窗口的 NO_DIRECTIVE。PC 分别记录 directive、StatusBeacon、HTTP 认证和业务 ACK：WIFI_OPENING 不等于端口已开，端口开放不等于身份通过，只有业务 ACK 更新指纹、deadline、job 或 plan 状态。
 
 简单 ACK 区分 `result=applied/rejected` 和 `display_state=unchanged/displayed/pending/failed`；附 `retention=ram/rtc/flash`，不引入 received/validated/prepared 等产品状态。链路层 Write Response 不算业务 ACK。无线窗口不足时先应用并回 pending，之后本地完成显示；Bridge 下一次读取实际状态。显示失败由设备本地安全全刷恢复，同一 Data 重发不反复触发波形。
 
@@ -195,11 +214,16 @@ Bundle 两槽均为完整自包含包。写非当前槽时当前槽始终可用�
 
 身份继续以 Wi-Fi MAC 为主键，显示名、IP、BLE 地址和广播摘要不是凭证；IP→UDP→ARP→BLE 发现结果均核对 MAC，不依赖 mDNS。token 保护 `/update`、`/doUpdate`、ArduinoOTA、POST /claim；新功耗/Bundle/激活写入口保持认证和 owner 校验。401/409 停写并显示原因，不静默抢占。token 仅经既有绑定 BLE 安全链路取得/轮换，不进入模板、仓库、日志；数据源凭据与设备 token 分离。
 
+bridge_first 的每对 Bridge/设备控制密钥与策略、epoch、窗口锚点一起，只经已绑定加密 GATT 安装或轮换；不直接复用或广播 bearer token，不经普通 HTTP 传输新密钥。候选 legacy 31B 广告采用固定有界二进制布局、方向域分隔和截断 HMAC；短身份只作路由，完整 MAC/bridge_id 进入 tag 上下文。具体 Company ID、字段预算、tag 长度、密钥生命周期及冷启动序号恢复必须经过安全评审和抓包 spike 后冻结。
+
 GATT 优先复用现有表并明确协议协商；修改特征表必须考虑 Windows 缓存和重新配对。周期会合不开放新绑定。未授权连接、半包、过大包、无限碎片都不能推迟无线总截止。BLE 回调仅入有界队列，主任务串行提交/驱动，不在回调里建 Wi-Fi 或等待面板。
 
 | 异常 | 确定行为 |
 |---|---|
 | Bridge/PC 离线、漏会合 | 保留显示，到窗口截止睡眠；Bridge 留待办，下次机会重试 |
+| bridge_first 无有效 Directive | 设备必发 NO_DIRECTIVE 后按本地硬截止睡眠；周期/提前恢复窗口尝试 device_first |
+| StatusBeacon 漏收但 HTTP 已认证 | 正常进入共用交付，单列 reply_missing；不因遥测漏包浪费已开启的 Wi-Fi 窗口 |
+| OPEN_WIFI 后 HTTP 不可达 | PC 在总截止内有界重试；设备 bootstrap 硬截止独立到期关网，重复探测不续期 |
 | 发布 ACK 丢失 | 查询当前 job_id/完整包状态后幂等处理；结果未定显示 unknown，不擅自重建任务覆盖 |
 | Bundle 写入/编译失败 | 当前完整包继续使用，任务明确失败；不更新 active |
 | 数据已应用但显示失败 | ACK 如实报告 failed；本地有界全刷修复，不能声称已显示 |
@@ -243,8 +267,8 @@ GATT 优先复用现有表并明确协议协商；修改特征表必须考虑 Wi
 | M1 Bridge 简化模型 | 共享 UI/MCP 服务、DataSource+SourceSnapshot、Codex+Static JSON、每设备 Profile、单 PublishJob | 两源/两设备互不耦合；保存零推送；排队编辑不漂移；push/pull 真值表与 ACK 丢失测试 |
 | M2 CompiledTemplate | 合并字段需求/渲染计划，target 参数化，安装编译和持久加载 | 宿主/固件逐像素一致；三端 canonical 合同一致；正常千次唤醒/渲染模板解析计数 0；8 项资源峰值合格 |
 | M3 完整 Bundle 与上下文 | A/B 全包、原子激活、一个 active_context、简单 Data/ACK | 写入/提交各阶段断电；A→B→A 旧包拒绝；丢 ACK 重试无重复刷屏；旧包恢复可启动 |
-| M4 rendezvous/PowerPlan | Bridge 统一决策、设备有界执行、BOOT provisional、HTTP/BLE 同义消息 | timer 无 300 秒兜底；BOOT 最迟 300 秒；读取/claim/数据不续期；重复 plan 幂等；所有退出释放无线锁 |
-| M5 画质与实机场景 | 按面板实施 diff/对齐/独立预算，Windows 会合及电池测量 | 黑底数字长期照片、跨 deep/异常基线、温度/BUSY；会合命中率/P95和24h电量，不能仅以软件测试证明省电 |
+| M4 rendezvous/PowerPlan | Bridge 统一决策、设备有界执行、BOOT provisional、HTTP/BLE 同义消息；默认 device_first | timer 无 300 秒兜底；BOOT 最迟 300 秒；读取/claim/数据不续期；重复 plan 幂等；所有退出释放无线锁 |
+| M5 画质与实机场景 | 按面板实施 diff/对齐/独立预算；device_first 提速与 bridge_first 候选独立 A/B；Windows 会合及电池测量 | 黑底数字长期照片、跨 deep/异常基线、温度/BUSY；双策略各自命中率/P95/丢包/恢复与24h电量；bridge_first 认证/重放/切换/截止故障注入，不能仅以软件测试证明省电 |
 | M6 第二硬件与四页闭环 | 核实第二 MCU/屏幕目标，独立 ROM、模板变体、OTA 防错 | 不同分辨率/像素格式完整链路；无局刷目标正常全刷；双端错误 target 拒绝；UI/MCP 行为一致 |
 
 每阶段先拆任务和验收，再改代码并更新 PROGRESS；本设计本身不授权部署或提交。现有显示安全修复应复用而非重写。旧桥/旧固件维持 legacy 能力，新协议须双方协商并显式启用；新协议运行期间漏会合不是自动退回周期 Wi-Fi 的理由。旧 3 项限制只在 legacy 适配中存在，新 Profile 不能被静默裁剪。
@@ -257,7 +281,7 @@ GATT 优先复用现有表并明确协议协商；修改特征表必须考虑 Wi
 
 暂缓 patch/event 协议、通用历史查询、脚本插件、资源去重、复杂布局求解器、跨设备原子发布、实验清白双相波形。恢复导出保留最小入口，不成为模板管理主流程。
 
-待测项不阻塞保守方案：8 项 A/B 的实际空间与编译峰值、各 MCU 的 RTC 数据保留、Windows 广播命中与加密耗时、面板温度/黑底局刷门槛、owner 到期带来的偶发 Wi-Fi 成本、数据检查点的 flash 寿命。缺数据时采用全包、全刷、有界等待和真实状态报告，不承诺续航天数或固定毫秒级实时性。
+待测项不阻塞保守的 device_first：8 项 A/B 的实际空间与编译峰值、各 MCU 的 RTC 数据保留、Windows 广播/扫描并发与单次 TX→RX 退化、31B 实际载荷、认证耗时、双策略命中/恢复、面板温度/黑底局刷门槛、owner 到期带来的偶发 Wi-Fi 成本、数据检查点的 flash 寿命。缺数据时采用默认策略、全包、全刷、有界等待和真实状态报告，不承诺续航天数或固定毫秒级实时性。
 
 ## 15. 设计依据与优先级
 
@@ -265,5 +289,6 @@ GATT 优先复用现有表并明确协议协商；修改特征表必须考虑 Wi
 - `PROGRESS.md` 顶部总设计节及 0.15.10 最新现场节：区分提案和部署，续租/心跳引起常亮问题说明必须分开占用与电源期限。
 - `docs/history/generic-display-platform-design-v1.md`（已归档）：其 §4–7 的模板编译、目标边界和原子安装，以及 §9–14 的竞争/恢复/安全验收输入已吸收到本文；该文件不再是现行设计依据。
 - `docs/ble-rendezvous-power-design.md`：完整阅读；§3–7 提供有界会合、BOOT、owner/电源分离与传输故障模型，§8 提供黑块/旧帧依据，§9、§13 提供功耗与照片验收方法；其旧本地决策、容量与命令模型不覆盖本次确认需求。
+- `project-workflow/power-plan-c/task-5-advert-rendezvous.md`：双策略会合候选的空口预算、Windows spike、切换恢复和故障注入细化；与本文冲突时以本文的业务、安全和电源边界为准。
 
 本文是通用平台唯一现行总设计。BLE 专项文档只提供仍适用的底层证据和实测方法，归档 v1 只保留决策历史；现状事实仍以最新交接和后续实测为准。

@@ -455,6 +455,63 @@ pub async fn refresh_status(ctx: &AppCtx, mac: &str) -> Value {
     }
 }
 
+/// Post-OTA window. The fresh firmware keeps a minimum light window on its own
+/// (`rtcPostOtaHoldS`, 300 s); this is the bridge taking control: raise the
+/// coordinator light hold and, once the rebooted device answers HTTP, send one
+/// explicit 300 s light PowerPlan. Run from a spawned task: the bounded wait
+/// (reboot + Wi-Fi) must not delay the MCP response.
+pub async fn post_ota_window(ctx: &AppCtx, secs: u32) {
+    let mac = ctx.device_mac.lock().unwrap().clone().unwrap_or_default();
+    if mac.is_empty() {
+        return;
+    }
+    if let Err(e) = service(ctx).hold_light(&mac, now_secs() + secs as u64) {
+        tracing::debug!("post-OTA hold: {e}");
+        return;
+    }
+    let mut online = false;
+    for _ in 0..20 {
+        if refresh_status(ctx, &mac).await["result"].as_str() == Some("ok") {
+            online = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+    if !online {
+        tracing::info!("post-OTA window: device did not answer HTTP; hold stays for the next rendezvous");
+        return;
+    }
+    let Ok(plan) = service(ctx).explicit_plan(
+        &mac,
+        bridge_core::platform::model::PlanMode::Light,
+        secs,
+        "post-ota",
+    ) else {
+        return;
+    };
+    let Some(link) = device_link(ctx) else {
+        return;
+    };
+    let mut body = serde_json::to_value(&plan).unwrap_or(Value::Null);
+    body["bridge_id"] = json!(ctx.bridge_id);
+    let (ip, token) = (link.ip.clone(), link.token.clone());
+    let sent = body.clone();
+    match blocking(move || v2_client::plan(&ip, &token, &sent, timeout()).map_err(err_text)).await {
+        Ok(ack) => {
+            if ack["result"] == "applied" {
+                let _ = service(ctx).note_plan_ack(
+                    &mac,
+                    plan.plan_id,
+                    ack["accepted_remaining_s"].as_u64().unwrap_or(0) as u32,
+                    false,
+                );
+            }
+            tracing::info!(device = mac, %ack, "post-OTA light plan");
+        }
+        Err(e) => tracing::warn!("post-OTA light plan failed: {e}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Data sources
 // ---------------------------------------------------------------------------

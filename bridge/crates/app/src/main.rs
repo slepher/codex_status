@@ -706,6 +706,12 @@ async fn mcp_handler(
                     .into_response();
             }
             let ok = !is_error;
+            if ok && tool.as_deref() == Some("firmware_ota") {
+                // The fresh firmware keeps a minimum light window by itself;
+                // take control of it with a formal 300 s light PowerPlan.
+                let ctx2 = ctx.clone();
+                tokio::spawn(async move { platform::post_ota_window(&ctx2, 300).await; });
+            }
             if ok && matches!(tool.as_deref(), Some("template_save") | Some("profile_save")) {
                 ctx.activity.note_activity("template-save");
                 if let Some(handle) = ctx.app_handle.get() {
@@ -2311,6 +2317,8 @@ async fn run_services(ctx: Arc<AppCtx>) {
                         } else {
                             ctx.activity.clear_pending_ota();
                             *ctx.pending_ota_rom.lock().unwrap() = None;
+                            let ctx2 = ctx.clone();
+                            tokio::spawn(async move { platform::post_ota_window(&ctx2, 300).await; });
                         }
                     } else {
                         ctx.activity.clear_pending_ota();

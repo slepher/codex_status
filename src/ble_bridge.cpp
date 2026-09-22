@@ -3,6 +3,8 @@
 #include <NimBLEDevice.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
 
 static UsageJsonHandler    usageHandler    = nullptr;
 static EndpointJsonHandler endpointHandler = nullptr;
@@ -455,4 +457,159 @@ void bleClearBonds() {
         p.end();
     }
     pairingUntil = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostic scan (Plan C task-6 §1.1)
+// ---------------------------------------------------------------------------
+
+static String hexBytes(const uint8_t *data, size_t len) {
+    static const char digits[] = "0123456789abcdef";
+    String out;
+    out.reserve(len * 2);
+    for (size_t i = 0; i < len; i++) {
+        out += digits[(data[i] >> 4) & 0x0F];
+        out += digits[data[i] & 0x0F];
+    }
+    return out;
+}
+
+class DiagScanCallbacks : public NimBLEScanCallbacks {
+  public:
+    // Root stays an object; per-record data lives in `records` and every
+    // observed manufacturer company id (bounded) is counted in `companies`,
+    // so an empty match list can be told apart from a dead scan.
+    JsonDocument doc;
+    JsonArray records;
+    JsonArray companies;
+    uint32_t t0 = 0;
+    uint32_t total = 0;
+    uint32_t matched = 0;
+    uint32_t firstMatchMs = 0;
+    bool haveFirst = false;
+    int scanEndReason = -1;
+
+    DiagScanCallbacks(uint16_t companyFilter, uint8_t maxRecords)
+        : filter_(companyFilter), maxRecords_(maxRecords) {
+        records = doc["records"].to<JsonArray>();
+        companies = doc["companies"].to<JsonArray>();
+    }
+
+    void onScanEnd(const NimBLEScanResults &results, int reason) override {
+        (void)results;
+        scanEndReason = reason;
+    }
+
+    void onResult(const NimBLEAdvertisedDevice *dev) override {
+        total++;
+        const uint32_t tMs = (uint32_t)(millis() - t0);
+        bool hasMfr = dev->haveManufacturerData();
+        uint16_t company = 0;
+        std::string mfr;
+        if (hasMfr) {
+            mfr = dev->getManufacturerData();
+            if (mfr.size() >= 2) {
+                company = (uint8_t)mfr[0] | ((uint16_t)(uint8_t)mfr[1] << 8);
+            }
+            // Bounded census of observed company ids: an empty match list with
+            // a non-empty census means the scan works but the beacon is absent.
+            bool counted = false;
+            for (JsonObject c : companies) {
+                if (c["id"].as<uint16_t>() == company) {
+                    c["n"] = c["n"].as<uint32_t>() + 1;
+                    counted = true;
+                    break;
+                }
+            }
+            if (!counted && companies.size() < 8) {
+                JsonObject c = companies.add<JsonObject>();
+                c["id"] = company;
+                c["n"] = 1;
+            }
+        }
+        const bool match = hasMfr && (!filter_ || company == filter_);
+        if (match) {
+            matched++;
+            if (!haveFirst) {
+                haveFirst = true;
+                firstMatchMs = tMs;
+            }
+        } else if (filter_) {
+            return;   // filtered mode records only the target company
+        }
+        if ((uint8_t)records.size() >= maxRecords_) return;
+        JsonObject o = records.add<JsonObject>();
+        o["t_ms"] = tMs;
+        o["addr"] = dev->getAddress().toString().c_str();
+        o["rssi"] = dev->getRSSI();
+        o["conn"] = dev->isConnectable();
+        o["len"] = dev->getAdvLength();
+        if (dev->haveName()) o["name"] = dev->getName();
+        if (hasMfr) {
+            o["company"] = company;
+            const size_t skip = mfr.size() >= 2 ? 2 : 0;
+            o["mfr"] = hexBytes(reinterpret_cast<const uint8_t *>(mfr.data()) + skip,
+                                mfr.size() - skip);
+        }
+        const std::vector<uint8_t> &raw = dev->getPayload();
+        if (filter_ && raw.size()) {
+            o["raw"] = hexBytes(raw.data(), raw.size());
+        }
+    }
+
+  private:
+    uint16_t filter_;
+    uint8_t maxRecords_;
+};
+
+String bleScanJson(uint32_t seconds, uint16_t companyFilter, uint8_t maxRecords) {
+    if (seconds < 1) seconds = 1;
+    if (seconds > 30) seconds = 30;
+    if (maxRecords < 1) maxRecords = 1;
+    bool initHere = false;
+    if (!NimBLEDevice::isInitialized()) {
+        NimBLEDevice::init("CodexStatus-diag");
+        initHere = true;
+    }
+    const bool wasAdvertising = advertising;
+    if (wasAdvertising) bleAdvertiseStop();
+    // Wi-Fi power save starves the shared-radio BLE scan (coex time-slicing):
+    // keep the modem awake for the diagnostic window and restore afterwards.
+    esp_wifi_set_ps(WIFI_PS_NONE);
+
+    NimBLEScan *scan = NimBLEDevice::getScan();
+    scan->setActiveScan(true);
+    scan->setInterval(100);
+    scan->setWindow(80);
+    scan->setDuplicateFilter(0);
+    scan->clearResults();
+    DiagScanCallbacks cb(companyFilter, maxRecords);
+    cb.t0 = millis();
+    scan->setScanCallbacks(&cb, true);
+    // NimBLEScan::start() takes milliseconds and returns immediately: keep the
+    // callbacks registered and wait for the controller to finish (bounded).
+    const bool ok = scan->start(seconds * 1000);
+    if (ok) {
+        const uint32_t deadline = millis() + seconds * 1000 + 2000;
+        while (scan->isScanning() && (int32_t)(millis() - deadline) < 0) {
+            delay(20);
+        }
+        if (scan->isScanning()) scan->stop();
+    }
+    scan->setScanCallbacks(nullptr);
+
+    cb.doc["scan_s"] = seconds;
+    cb.doc["ok"] = ok;
+    cb.doc["init"] = NimBLEDevice::isInitialized();
+    cb.doc["scan_end"] = cb.scanEndReason;
+    cb.doc["total"] = cb.total;
+    cb.doc["matched"] = cb.matched;
+    if (cb.haveFirst) cb.doc["first_match_ms"] = cb.firstMatchMs;
+    String out;
+    serializeJson(cb.doc, out);
+
+    esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+    if (wasAdvertising) bleAdvertiseStart();
+    if (initHere) bleDeinit();
+    return out;
 }

@@ -14,7 +14,10 @@ Status: pending（第一/二阶段可独立验收；本任务决定 3s 窗口的
    - `CONFIG_BT_CTRL_MODEM_SLEEP=y`（名称以当前 IDF 版本 Kconfig 为准，构建后核对生成的 sdkconfig）；
    - 保持 `CONFIG_PM_ENABLE/DFS_INIT_AUTO`；
 2. `src/main.cpp:363` min_freq 80MHz（与 task-1 同）；
-3. 若固件在 BLE 会话期间持有 PM 锁导致降频不生效，按 IDF 文档确认锁行为，不绕过安全语义。
+3. 若固件在 BLE 会话期间持有 PM 锁导致降频不生效，按 IDF 文档确认锁行为，不绕过安全语义；
+4. DFS 自身作为独立 A/B 臂：`min_freq` 40 vs 80（同 base env），以 `/pmstats?diag=1`
+   的 mode residency（SLEEP/APB_MIN/APB_MAX/CPU_MAX）核对会合窗口内是否真降频、哪些锁
+   挡住降频；臂与判定统一见 `task-6-bridge-first-impl.md` §5（A2/A3）。
 
 ## 验收与回归
 

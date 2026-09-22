@@ -70,7 +70,7 @@ static bool targetUnverified = false;
 #elif defined(CODEX_CLK_WINDOW_TEST)
 #define FW_VERSION    "0.13.9-clkwin"
 #else
-#define FW_VERSION    "0.17.2-bw"
+#define FW_VERSION    "0.17.9-bw"
 #endif
 #define AP_PASSWORD   "codex1234"
 #define MAX_SLOTS     3
@@ -166,6 +166,12 @@ RTC_DATA_ATTR static char     rtcTplHash[9] = {0};
 // 90 raw-sleep, 99 normal boot.
 RTC_DATA_ATTR static uint8_t  rtcStage = 0;
 RTC_DATA_ATTR static uint8_t  rtcLastWake = 0xFF;
+// Post-OTA minimum light window: set in NVS just before an OTA reboot (RTC
+// memory does not survive a software/OTA reset on this board), read and
+// cleared on the first post-OTA boot. The bridge extends it with a formal
+// light PowerPlan.
+static uint16_t bootPostOtaS = 0;
+static uint32_t postOtaHoldUntilMs = 0;
 // P1 diagnosis: did the light -> deep glyph render run? bit0 set = the
 // `device.mode` template flag was set, bit1 = it was clear, bit2 = render
 // returned. Read via /status.json `deep.glyph`.
@@ -403,6 +409,16 @@ static void setOtaLock(bool held) {
     if (held) esp_pm_lock_acquire(otaPmLock);
     else      esp_pm_lock_release(otaPmLock);
     DevLog.printf("[pm] OTA NO_LIGHT_SLEEP %s\n", held ? "acquired" : "released");
+}
+
+// OTA: keep the Wi-Fi modem awake too. CPU light sleep is already blocked by
+// otaPmLock, but WIFI_PS_MAX_MODEM lets the AP buffer frames until the next
+// listen interval, which stalled the 1.7 MB upload on a weak link (observed as
+// client resets at ~130-330 KB). Restored to MAX_MODEM after the upload.
+static void setOtaWifiAwake(bool awake) {
+    esp_err_t err = esp_wifi_set_ps(awake ? WIFI_PS_NONE : WIFI_PS_MAX_MODEM);
+    DevLog.printf("[ota] wifi ps=%s (%s)\n", awake ? "NONE" : "MAX_MODEM",
+                  esp_err_to_name(err));
 }
 
 // CONFIG_PM_SLP_DISABLE_GPIO floats every pad during automatic light sleep.
@@ -2413,6 +2429,12 @@ static void handleStatusJson() {
     doc["render_count"] = bootRenderCount;
     doc["time_source"] = timeSourceName(timeSource);
     doc["render_ms"] = wakeRenderMs;
+    // Post-OTA minimum light window remaining (0 = not in one), so the bridge
+    // can verify the window it is responsible for extending.
+    doc["post_ota_hold_s"] =
+        postOtaHoldUntilMs && (int32_t)(millis() - postOtaHoldUntilMs) < 0
+            ? (uint32_t)((postOtaHoldUntilMs - millis()) / 1000)
+            : 0;
 #if defined(CODEX_PM) && CONFIG_PM_LIGHT_SLEEP_CALLBACKS
     // Time-based power estimate (no current meter): light-sleep share lets the
     // estimator subtract it from the awake window instead of charging CPU mA.
@@ -2728,6 +2750,26 @@ static void handleFrame() {
 static void handleDiag() {
     if (!requestAuthorized()) {
         server.send(401, "text/plain", "unauthorized");
+        return;
+    }
+    // Diagnostic BLE scan (Plan C task-6 §1.1): independent receiver for the
+    // Windows publisher spike / bridge_first SCAN half. Blocking for the scan
+    // duration; keep the client timeout above it.
+    if (server.hasArg("blescan")) {
+        long sec = server.arg("blescan").toInt();
+        if (sec < 1 || sec > 30) {
+            server.send(400, "text/plain", "blescan out of range 1..30");
+            return;
+        }
+        long company = server.hasArg("company") ? server.arg("company").toInt() : 65535;
+        if (company < 0 || company > 65535) {
+            server.send(400, "text/plain", "company out of range 0..65535");
+            return;
+        }
+        String out = bleScanJson((uint32_t)sec, (uint16_t)company, 48);
+        DevLog.printf("[diag] blescan %lds company=%ld -> %u bytes\n",
+                      sec, company, (unsigned)out.length());
+        server.send(200, "application/json", out);
         return;
     }
     // Remote recovery for a stuck/aborted OTA (UpdateClass left "running").
@@ -3352,6 +3394,7 @@ static void otaUploadCleanup(const char *reason) {
     Update.abort();
     otaInProgress = false;
     setOtaLock(false);
+    setOtaWifiAwake(false);
     otaUploadDenied = false;
     if (frame) renderCurrent();
 }
@@ -3450,6 +3493,7 @@ static void handleV2Status() {
         server.send(401, "application/json", "{\"result\":\"unauthorized\"}");
         return;
     }
+    markSynced();   // authenticated bridge contact (v2 HTTP channel)
     JsonDocument doc;
     doc["result"] = "applied";
     doc["protocol"] = 2;
@@ -3560,6 +3604,7 @@ static void handleV2Data() {
         server.send(401, "application/json", "{\"result\":\"unauthorized\"}");
         return;
     }
+    markSynced();   // authenticated bridge contact (v2 HTTP channel)
     applyV2Data(server.arg("plain"));
 }
 
@@ -3612,6 +3657,7 @@ static void handleV2Plan() {
         server.send(401, "application/json", "{\"result\":\"unauthorized\"}");
         return;
     }
+    markSynced();   // authenticated bridge contact (v2 HTTP channel)
     applyV2Plan(server.arg("plain"));
 }
 
@@ -3811,6 +3857,11 @@ static void serviceV2Ble() {
         // rendezvous command (status/plan/data); adopt them before any handler
         // renders or replies. Missing fields keep the local RTC fallback.
         if (!doc["server_time"].isNull()) adoptServerTimeForce(doc);
+        // An authenticated rendezvous command is a successful bridge contact:
+        // refresh the sync timestamp that drives the offline_mins row. The v2
+        // channel never went through the legacy HTTP markSynced() paths, so
+        // rv2 devices used to show a stale "offline N hours" while in contact.
+        markSynced();
         const char *op = doc["op"] | "";
         if (!strcmp(op, "status")) {
             JsonDocument state;
@@ -3974,6 +4025,7 @@ static void registerHttpRoutes() {
                 return;
             }
             setOtaLock(false);
+            setOtaWifiAwake(false);
             server.send(200, "text/plain", Update.hasError() ? "UPDATE FAILED" : "UPDATE OK");
         },
         []() {
@@ -3995,6 +4047,7 @@ static void registerHttpRoutes() {
                 otaUploadDenied = false;
                 otaInProgress = true;
                 setOtaLock(true);
+                setOtaWifiAwake(true);
                 otaLastDataMs = millis();
                 DevLog.printf("[ota] upload start: %s\n", up.filename.c_str());
                 std::vector<String> lines = {"OTA update", FW_VERSION, up.filename};
@@ -4016,6 +4069,11 @@ static void registerHttpRoutes() {
                 if (Update.end(true)) {
                     DevLog.printf("[ota] success %u bytes, rebooting shortly\n", (unsigned)up.totalSize);
                     screen({"OTA success", "Rebooting..."});
+                    // 5 min light window for the bridge (NVS survives the OTA).
+                    Preferences p;
+                    p.begin("pm", false);
+                    p.putUShort("post_ota_s", 300);
+                    p.end();
                     otaRebootPending = true;
                     otaRebootAt = millis() + 1500;
                 } else {
@@ -4219,6 +4277,9 @@ static void noteActivity(const char *reason) {
 static bool idleDeepDue() {
     if ((plugged && !rtcDeepOnUsb) || bleOn || otaInProgress || configMode) return false;
     if (!wifiUp || !timeKnown()) return false;
+    // Post-OTA minimum window: never descend before it elapses; the bridge can
+    // still extend the online time with a formal light PowerPlan.
+    if (postOtaHoldUntilMs && (int32_t)(millis() - postOtaHoldUntilMs) < 0) return false;
     if (forceDeepAtMs && (int32_t)(millis() - forceDeepAtMs) >= 0) return true;
     time_t since = lastActivityEpoch ? lastActivityEpoch : (time_t)rtcLastSyncEpoch;
     if (!since) return false;
@@ -4729,6 +4790,7 @@ void setup() {
         p.begin("pm", true);
         nvsStageAtBoot = p.getUChar("stg", 0xFF);
         rv2Enabled = p.getUChar("rv2", 1) ? 1 : 0;
+        bootPostOtaS = p.getUShort("post_ota_s", 0);
         String tz = p.getString("tz", "");
         if (tz.length() && tz.length() < (int)sizeof(deviceTz)) {
             strncpy(deviceTz, tz.c_str(), sizeof(deviceTz) - 1);
@@ -4815,6 +4877,20 @@ void setup() {
                       (unsigned)V2_BOOT_PROVISIONAL_S);
     }
     if (plugged && !rtcDeepOnUsb) rtcMode = MODE_LIGHT;
+    if (bootPostOtaS) {
+        // Fresh firmware after an OTA: stay light for the minimum window so the
+        // bridge can reach HTTP and install/refresh the formal light plan.
+        rtcMode = MODE_LIGHT;
+        persistMode();
+        postOtaHoldUntilMs = millis() + (uint32_t)bootPostOtaS * 1000UL;
+        DevLog.printf("[ota] post-OTA light window %us (bridge may extend)\n",
+                      (unsigned)bootPostOtaS);
+        Preferences p;
+        p.begin("pm", false);
+        p.remove("post_ota_s");
+        p.end();
+        bootPostOtaS = 0;
+    }
     deepWakePath = deepTimerBoot;
     // Any wake from deep wakes up on top of the sleep glyph: connect silently
     // and replace it as soon as the wake render runs (docs/ble-rendezvous-power-design §3).
@@ -4986,6 +5062,11 @@ static void handleSerialCli() {
             DevLog.println("[cli] frame_capture=0");
         } else if (line == "pmstats") {
             dumpPmStats();
+        } else if (line.startsWith("blescan")) {
+            long sec = line.length() > 8 ? line.substring(8).toInt() : 10;
+            if (sec < 1 || sec > 30) sec = 10;
+            DevLog.printf("[cli] blescan %lds\n", sec);
+            DevLog.printf("[ble] scan: %s\n", bleScanJson((uint32_t)sec, 0xFFFF, 48).c_str());
         } else if (line == "timers") {
             DevLog.printf("[pm] timers:\n%s", timerStatsText().c_str());
         } else if (line == "diag") {
@@ -4993,7 +5074,7 @@ static void handleSerialCli() {
             DevLog.printf("[pm] %s", taskStatsText().c_str());
             DevLog.printf("[pm] timers:\n%s", timerStatsText().c_str());
         } else if (line.length()) {
-            DevLog.println("[cli] commands: wifi <ssid> <pass> | status | batt | pair | deep | light | deepusb on|off | framecap on|off | pmstats | timers | diag");
+            DevLog.println("[cli] commands: wifi <ssid> <pass> | status | batt | pair | deep | light | deepusb on|off | framecap on|off | pmstats | blescan [1..30] | timers | diag");
         }
     }
 }

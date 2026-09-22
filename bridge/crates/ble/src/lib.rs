@@ -4,11 +4,11 @@
 
 use std::net::UdpSocket;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use btleplug::api::{
-    Central, Manager as _, Peripheral as _, ScanFilter, ValueNotification, WriteType,
+    Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter, ValueNotification, WriteType,
 };
 use btleplug::platform::{Adapter, Manager, Peripheral};
 use futures::StreamExt;
@@ -80,6 +80,12 @@ impl Pusher {
         Uuid::parse_str(s).expect("static uuid")
     }
 
+    /// A fresh Windows GATT central. Each rendezvous attempt gets its own
+    /// adapter (and therefore its own advertisement watcher): reusing one
+    /// adapter and restarting its scan re-registers the WinRT advertisement
+    /// handler on every resume (btleplug has no unregister API), and the
+    /// Manager itself is a zero-sized wrapper, so recreating is the cheap,
+    /// leak-free option here.
     pub async fn adapter() -> Result<Adapter> {
         let manager = Manager::new().await.context("bluetooth manager")?;
         manager
@@ -91,8 +97,13 @@ impl Pusher {
             .ok_or_else(|| anyhow!("no bluetooth adapter"))
     }
 
-    /// One scan pass for the device prefix. `Ok(None)` means it never
-    /// advertised inside the timeout (no connection was attempted).
+    /// One scan pass for the device prefix, driven by advertisement events
+    /// instead of polling. `Ok(None)` means it never advertised inside the
+    /// timeout (no connection was attempted).
+    ///
+    /// The scan is stopped before returning a match: measured on this Windows
+    /// host, connecting while the advertisement watcher is scanning made every
+    /// second rendezvous hang both connect attempts for the full 4 s timeout.
     async fn find_device(
         adapter: &Adapter,
         prefix: &str,
@@ -102,21 +113,33 @@ impl Pusher {
             .start_scan(ScanFilter::default())
             .await
             .context("start scan")?;
+        let mut events = adapter.events().await.context("scan events")?;
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            if tokio::time::Instant::now() >= deadline {
-                let _ = adapter.stop_scan().await;
-                return Ok(None);
-            }
-            for peripheral in adapter.peripherals().await? {
-                let props = peripheral.properties().await?;
-                let name = props.and_then(|p| p.local_name).unwrap_or_default();
-                if name.starts_with(prefix) {
+            match tokio::time::timeout_at(deadline, events.next()).await {
+                Ok(Some(CentralEvent::DeviceDiscovered(id)))
+                | Ok(Some(CentralEvent::DeviceUpdated(id))) => {
+                    let Ok(peripheral) = adapter.peripheral(&id).await else {
+                        continue;
+                    };
+                    let name = peripheral
+                        .properties()
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|p| p.local_name)
+                        .unwrap_or_default();
+                    if name.starts_with(prefix) {
+                        let _ = adapter.stop_scan().await;
+                        return Ok(Some(peripheral));
+                    }
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) | Err(_) => {
                     let _ = adapter.stop_scan().await;
-                    return Ok(Some(peripheral));
+                    return Ok(None);
                 }
             }
-            tokio::time::sleep(Duration::from_millis(400)).await;
         }
     }
 
@@ -464,64 +487,109 @@ pub struct V2Connection {
     bridge_id: String,
     nonce: String,
     device_mac: String,
+    /// Stage timings (`find`, `connect`, `discover`, `info`, one entry per
+    /// command) for the Plan C wake-budget evidence.
+    timings: Vec<(String, u128)>,
 }
 
 impl V2Connection {
-    /// `Ok(None)` = the device was not advertising (rendezvous window closed):
-    /// no connection was attempted and the caller may scan again immediately.
+    /// `Ok(None)` = the device was not *freshly* advertising (rendezvous window
+    /// closed or stale scan entry): no connection was attempted and the caller
+    /// may scan again immediately.
     pub async fn connect(mac: &str, token: &str, bridge_id: &str) -> Result<Option<Self>> {
         let compact = bridge_core::platform::model::DeviceIdentity::normalized_mac(mac)
             .context("invalid device MAC")?;
         let adapter = Pusher::adapter().await?;
+        let find_start = Instant::now();
         let found = Pusher::find_device(
             &adapter,
             &format!("CodexStatus-{}", &compact[6..]),
             Duration::from_secs(3),
         )
         .await;
-        let _ = adapter.stop_scan().await;
         let Some(peripheral) = found? else {
             return Ok(None);
         };
+        let mut timings: Vec<(String, u128)> =
+            vec![("find".to_string(), find_start.elapsed().as_millis())];
         tracing::debug!("v2 BLE device found at {}", peripheral.address());
-        let mut connected = tokio::time::timeout(Duration::from_secs(4), peripheral.connect()).await
-            .map_err(anyhow::Error::from).and_then(|r| r.map_err(anyhow::Error::from));
+        let connect_start = Instant::now();
+        let mut connected = tokio::time::timeout(Duration::from_secs(4), peripheral.connect())
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|r| r.map_err(anyhow::Error::from));
         if connected.is_err() {
             // Windows refuses the first connect to a just-seen advertisement
             // often enough to lose the whole rendezvous; retry inside the
             // window instead of waiting for the next scan tick.
             tracing::debug!("v2 BLE connect retry");
             tokio::time::sleep(Duration::from_millis(120)).await;
-            connected = tokio::time::timeout(Duration::from_secs(4), peripheral.connect()).await
-                .map_err(anyhow::Error::from).and_then(|r| r.map_err(anyhow::Error::from));
+            connected = tokio::time::timeout(Duration::from_secs(4), peripheral.connect())
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|r| r.map_err(anyhow::Error::from));
         }
         if let Err(error) = connected {
             let _ = peripheral.disconnect().await;
             return Err(error.context("ble connect"));
         }
+        timings.push(("connect".to_string(), connect_start.elapsed().as_millis()));
         let setup = async {
-            tokio::time::timeout(Duration::from_secs(3), peripheral.discover_services()).await
-                .context("discover timeout")?.context("discover")?;
+            let mut stages: Vec<(String, u128)> = Vec::new();
+            let discover_start = Instant::now();
+            // Re-discovery is not optional here: `close` must call
+            // `disconnect` (see below), which clears btleplug's GATT object
+            // cache, and skipping both on a kept-open link made every second
+            // rendezvous lose its connect. Measured on the Windows backend:
+            // discover ~300 ms, INFO ~30 ms.
+            tokio::time::timeout(Duration::from_secs(3), peripheral.discover_services())
+                .await
+                .context("discover timeout")?
+                .context("discover")?;
+            stages.push(("discover".to_string(), discover_start.elapsed().as_millis()));
+            let info_start = Instant::now();
             let info = tokio::time::timeout(Duration::from_secs(3), Pusher::read_info(&peripheral))
                 .await
                 .map_err(|_| anyhow!("info timeout"))?
                 .map_err(|e| e.context("info"))?;
-            if bridge_core::platform::model::DeviceIdentity::normalized_mac(
-                info["mac"].as_str().unwrap_or("")) != Some(compact.clone()) {
-                bail!("BLE device identity mismatch");
-            }
-            if info["rendezvous_v"].as_u64().unwrap_or(0) < 2 {
-                bail!("device BLE rendezvous is disabled");
-            }
-            Ok(())
-        }.await;
-        if let Err(error) = setup {
-            let _ = peripheral.disconnect().await;
-            return Err(error);
+            stages.push(("info".to_string(), info_start.elapsed().as_millis()));
+            Ok::<_, anyhow::Error>((info, stages))
         }
-        let device_mac = compact.as_bytes().chunks(2)
-            .map(|p| std::str::from_utf8(p).unwrap()).collect::<Vec<_>>().join(":");
-        Ok(Some(Self { peripheral, token: token.to_owned(), bridge_id: bridge_id.to_owned(), nonce: String::new(), device_mac }))
+        .await;
+        let (info, stages) = match setup {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = peripheral.disconnect().await;
+                return Err(error);
+            }
+        };
+        timings.extend(stages);
+        if bridge_core::platform::model::DeviceIdentity::normalized_mac(
+            info["mac"].as_str().unwrap_or(""),
+        ) != Some(compact.clone())
+        {
+            let _ = peripheral.disconnect().await;
+            bail!("BLE device identity mismatch");
+        }
+        if info["rendezvous_v"].as_u64().unwrap_or(0) < 2 {
+            let _ = peripheral.disconnect().await;
+            bail!("device BLE rendezvous is disabled");
+        }
+        tracing::debug!(?timings, "v2 link ready");
+        let device_mac = compact
+            .as_bytes()
+            .chunks(2)
+            .map(|p| std::str::from_utf8(p).unwrap())
+            .collect::<Vec<_>>()
+            .join(":");
+        Ok(Some(Self {
+            peripheral,
+            token: token.to_owned(),
+            bridge_id: bridge_id.to_owned(),
+            nonce: String::new(),
+            device_mac,
+            timings,
+        }))
     }
 
     pub async fn command(&mut self, op: &str, mut body: serde_json::Value) -> Result<serde_json::Value> {
@@ -540,23 +608,40 @@ impl V2Connection {
         let status = self.peripheral.characteristics().into_iter()
             .find(|c| c.uuid == Pusher::uuid(CHR_STATUS)).context("status characteristic")?;
         Pusher::write_json(&self.peripheral, CHR_TPL_CTRL, &bytes).await?;
+        let started = Instant::now();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             let raw = tokio::time::timeout_at(deadline, self.peripheral.read(&status)).await??;
             if let Ok(reply) = serde_json::from_slice::<serde_json::Value>(&raw) {
                 if reply["ack"] == "v2" && reply["request_id"] == id {
                     if op == "status" && reply["result"] == "applied" {
-                        self.nonce = reply["session_nonce"].as_str().context("session nonce")?.to_owned();
+                        self.nonce = reply["session_nonce"]
+                            .as_str()
+                            .context("session nonce")?
+                            .to_owned();
                     }
+                    let ms = started.elapsed().as_millis();
+                    self.timings.push((op.to_string(), ms));
+                    tracing::debug!(op, ms, "v2 command acknowledged");
                     return Ok(reply);
                 }
             }
-            if tokio::time::Instant::now() >= deadline { bail!("v2 BLE ACK timed out"); }
-            tokio::time::sleep(Duration::from_millis(80)).await;
+            if tokio::time::Instant::now() >= deadline {
+                bail!("v2 BLE ACK timed out");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
-    pub async fn close(self) { let _ = self.peripheral.disconnect().await; }
+    /// Close the link explicitly. Measured 2026-09-22: leaving the Windows
+    /// GATT device object alive across cycles (no disconnect) made every
+    /// second rendezvous fail both connect attempts. `disconnect` also clears
+    /// btleplug's cached GATT objects, so `discover_services` must run on
+    /// every cycle (that is why discovery is not skipped in `connect`).
+    pub async fn close(self) {
+        let _ = self.peripheral.disconnect().await;
+        tracing::debug!(timings = ?self.timings, "v2 rendezvous link closed");
+    }
 }
 
 #[cfg(test)]

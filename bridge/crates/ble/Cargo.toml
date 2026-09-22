@@ -5,6 +5,16 @@ edition.workspace = true
 license.workspace = true
 description = "Codex Status bridge BLE central: endpoint/usage/template push (btleplug)"
 
+[dev-dependencies]
+# adv-spike example only: Windows publisher + watcher concurrency measurement
+# (same major version btleplug already pulls in). Never used by production code.
+windows = { version = "0.61", features = [
+    "Devices_Bluetooth_Advertisement",
+    "Foundation",
+    "Storage_Streams",
+] }
+serde = { version = "1", features = ["derive"] }
+
 [dependencies]
 bridge-core = { path = "../core" }
 btleplug = "0.11"
