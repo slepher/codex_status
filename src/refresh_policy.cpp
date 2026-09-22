@@ -1,5 +1,32 @@
 #include "refresh_policy.h"
 
+bool rgnDirtyWindow(const uint8_t *oldFrame, const uint8_t *newFrame,
+                    uint16_t width, uint16_t height, DirtyWindow &out) {
+    if (!oldFrame || !newFrame || !width || !height || width % 8) return false;
+    int x0 = width, y0 = height, x1 = -1, y1 = -1;
+    const int stride = width / 8;
+    for (int y = 0; y < height; ++y) {
+        for (int bx = 0; bx < stride; ++bx) {
+            uint8_t diff = oldFrame[y * stride + bx] ^ newFrame[y * stride + bx];
+            if (!diff) continue;
+            for (int bit = 0; bit < 8; ++bit) {
+                if (!(diff & (0x80 >> bit))) continue;
+                int x = bx * 8 + bit;
+                if (x < x0) x0 = x;
+                if (x > x1) x1 = x;
+            }
+            if (y < y0) y0 = y;
+            if (y > y1) y1 = y;
+        }
+    }
+    if (x1 < 0) return false;
+    out.x0 = (x0 > 0 ? x0 - 1 : 0) & ~7;
+    out.x1 = ((x1 + 1 < width ? x1 + 1 : width - 1) | 7);
+    out.y0 = y0 > 0 ? y0 - 1 : 0;
+    out.y1 = y1 + 1 < height ? y1 + 1 : height - 1;
+    return true;
+}
+
 #include <ArduinoJson.h>
 #include <string.h>
 

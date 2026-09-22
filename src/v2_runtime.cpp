@@ -107,11 +107,13 @@ static bool writeField(JsonDocument &doc, const CtReq &req, JsonVariantConst val
 static V2DataAck applyEntries(const CtTemplate &ct, JsonArrayConst fields,
                               JsonDocument &doc, String &err, uint32_t expectedCrc) {
     uint32_t crc = v2DataFieldsCrc(fields);
-    if (expectedCrc != 0 && crc != expectedCrc) { err = "crc"; return V2_DATA_REJECTED; }
+    if (crc != expectedCrc) { err = "crc"; return V2_DATA_REJECTED; }
+    if (fields.size() != ct.reqCount) { err = "incomplete"; return V2_DATA_REJECTED; }
+    int expectedIndex = 0;
     for (JsonObjectConst entry : fields) {
         int i = entry["i"] | -1;
         const char *k = entry["k"] | "";
-        if (i < 0 || i >= ct.reqCount) { err = "index"; return V2_DATA_REJECTED; }
+        if (i != expectedIndex++ || i >= ct.reqCount) { err = "index"; return V2_DATA_REJECTED; }
         if (strcmp(k, ct.reqs[i].path) != 0) { err = "field"; return V2_DATA_REJECTED; }
         if (ct.reqs[i].kind > 9) continue;  // device-local requirements are ignored
         JsonVariantConst v = entry["v"];
@@ -141,7 +143,11 @@ V2DataAck v2ApplyData(const CtTemplate &ct, const String &messageJson,
     doc["schema"] = 1;
     uint32_t crc = 0;
     const char *crcText = in["crc"] | "";
-    if (strlen(crcText) == 8) crc = strtoul(crcText, nullptr, 16);
+    if (!v2ParseCrc(crcText, crc)) { errorOut = "crc"; return V2_DATA_REJECTED; }
+    if (!in["seq"].is<uint64_t>() || in["seq"].as<uint64_t>() == 0) {
+        errorOut = "seq";
+        return V2_DATA_REJECTED;
+    }
     V2DataAck rc = applyEntries(ct, fields, doc, errorOut, crc);
     if (rc != V2_DATA_APPLIED) return rc;
     usageOut = "";
@@ -153,6 +159,20 @@ V2DataAck v2ApplyData(const CtTemplate &ct, const String &messageJson,
     return rc;
 }
 
+V2DataAck v2AcceptData(const CtTemplate &ct, const String &messageJson,
+                     const char *currentContext, V2DataSeq &state,
+                     String &usageOut, String &errorOut) {
+    V2DataAck rc = v2ApplyData(ct, messageJson, currentContext, usageOut, errorOut);
+    if (rc != V2_DATA_APPLIED) return rc;
+    JsonDocument in;
+    if (deserializeJson(in, messageJson)) { errorOut = "json"; return V2_DATA_REJECTED; }
+    uint64_t seq = in["seq"].as<uint64_t>();
+    uint32_t crc = v2DataFieldsCrc(in["fields"].as<JsonArrayConst>());
+    rc = state.observe(seq, crc);
+    if (rc == V2_DATA_APPLIED) state.noteApplied(seq, crc);
+    return rc;
+}
+
 bool v2UsageFromFields(const CtTemplate &ct, const String &storedFieldsJson,
                        String &usageOut, String &errorOut) {
     JsonDocument in;
@@ -161,7 +181,7 @@ bool v2UsageFromFields(const CtTemplate &ct, const String &storedFieldsJson,
     if (fields.isNull()) { errorOut = "fields"; return false; }
     JsonDocument doc;
     doc["schema"] = 1;
-    V2DataAck rc = applyEntries(ct, fields, doc, errorOut, 0);
+    V2DataAck rc = applyEntries(ct, fields, doc, errorOut, v2DataFieldsCrc(fields));
     if (rc != V2_DATA_APPLIED) return false;
     usageOut = "";
     serializeJson(doc, usageOut);

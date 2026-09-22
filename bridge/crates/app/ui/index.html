@@ -103,9 +103,7 @@
   <nav class="tabs">
     <button class="on" data-tab="templates">模板</button>
     <button data-tab="device">设备</button>
-    <button data-tab="power">功耗</button>
     <button data-tab="data">数据</button>
-    <button data-tab="actions">操作</button>
     <button data-tab="mcp">MCP</button>
   </nav>
 
@@ -214,10 +212,9 @@
           <button onclick="recoverPlatform()">从设备摘要导入</button>
         </div>
       </div>
-    </section>
-
-    <section class="panel" id="tab-power">
-      <div class="card">
+      <details class="card" id="device-power" ontoggle="if(this.open){refreshPmStats(false);refreshPlatformPower();}">
+        <summary>功耗与同步计划</summary>
+<div class="card">
         <div class="bar">
           <div class="status" id="pm-state">读取中…</div>
           <div class="menus"><button onclick="refreshPmStats(true)">采样</button></div>
@@ -267,6 +264,21 @@
           <div class="actions" style="margin-top:8px"><button onclick="copyText($('pm-raw').value)">复制</button></div>
         </details>
       </div>
+      </details>
+      <details class="card">
+        <summary>设备操作</summary>
+<div class="card">
+        <h2>操作</h2>
+        <div class="actions">
+          <button id="btn-pause" onclick="togglePause()">暂停推送</button>
+          <button onclick="forceSync()">立即同步</button>
+          <button disabled>升级固件…</button>
+          <button disabled>打开设备页</button>
+          <button disabled>开机自启</button>
+        </div>
+        <div class="sub" id="last-error"></div>
+      </div>
+      </details>
     </section>
 
     <section class="panel" id="tab-data">
@@ -293,20 +305,6 @@
           <button onclick="savePlatformSource()">保存数据源</button>
         </div>
         <div class="sub">每设备完整同步阈值在设备同步设置中显示（默认 3600s）。</div>
-      </div>
-    </section>
-
-    <section class="panel" id="tab-actions">
-      <div class="card">
-        <h2>操作</h2>
-        <div class="actions">
-          <button id="btn-pause" onclick="togglePause()">暂停推送</button>
-          <button onclick="forceSync()">立即同步</button>
-          <button disabled>升级固件…</button>
-          <button disabled>打开设备页</button>
-          <button disabled>开机自启</button>
-        </div>
-        <div class="sub" id="last-error"></div>
       </div>
     </section>
 
@@ -372,7 +370,6 @@
       document.querySelectorAll('.panel').forEach((p) => p.classList.toggle('on', p.id === 'tab-' + button.dataset.tab));
       if (button.dataset.tab === 'templates') { refreshProfiles(); refreshPlatformTemplates(); }
       if (button.dataset.tab === 'device') { refreshDevice(); refreshPlatformDevice(); }
-      if (button.dataset.tab === 'power') { refreshPmStats(false); refreshPlatformPower(); }
       if (button.dataset.tab === 'data') refreshPlatformData();
       if (button.dataset.tab === 'mcp') { refreshMcp(); refreshPlatformOverview(); }
     });

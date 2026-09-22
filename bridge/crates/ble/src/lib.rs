@@ -407,9 +407,9 @@ impl Pusher {
         let result = async {
             self.push_endpoint(&peripheral).await?;
             tokio::time::sleep(Duration::from_millis(500)).await;
-            self.push_usage(&peripheral).await?;
+            if info["v2_bundle"] != true { self.push_usage(&peripheral).await?; }
             tokio::time::sleep(Duration::from_millis(500)).await;
-            self.push_templates(&peripheral, &info).await?;
+            if info["v2_bundle"] != true { self.push_templates(&peripheral, &info).await?; }
             Ok::<_, anyhow::Error>(())
         }
         .await;
@@ -434,6 +434,86 @@ impl Pusher {
             tokio::time::sleep(interval).await;
         }
     }
+}
+
+/// Authenticated v2 opportunity on the existing GATT table. The status value
+/// is read as a long attribute, so an ACK is not lost to notification MTU cuts.
+pub struct V2Connection {
+    peripheral: Peripheral,
+    token: String,
+    bridge_id: String,
+    nonce: String,
+    device_mac: String,
+}
+
+impl V2Connection {
+    pub async fn connect(mac: &str, token: &str, bridge_id: &str) -> Result<Self> {
+        let compact = bridge_core::platform::model::DeviceIdentity::normalized_mac(mac)
+            .context("invalid device MAC")?;
+        let adapter = Pusher::adapter().await?;
+        let found = Pusher::wait_for_device(&adapter,
+            &format!("CodexStatus-{}", &compact[6..]), Duration::from_secs(3)).await;
+        let _ = adapter.stop_scan().await;
+        let peripheral = found?;
+        let connected = tokio::time::timeout(Duration::from_secs(4), peripheral.connect()).await
+            .map_err(anyhow::Error::from).and_then(|r| r.map_err(anyhow::Error::from));
+        if let Err(error) = connected {
+            let _ = peripheral.disconnect().await;
+            return Err(error.into());
+        }
+        let setup = async {
+            tokio::time::timeout(Duration::from_secs(3), peripheral.discover_services()).await??;
+            let info = tokio::time::timeout(Duration::from_secs(3), Pusher::read_info(&peripheral)).await??;
+            if bridge_core::platform::model::DeviceIdentity::normalized_mac(
+                info["mac"].as_str().unwrap_or("")) != Some(compact.clone()) {
+                bail!("BLE device identity mismatch");
+            }
+            if info["rendezvous_v"].as_u64().unwrap_or(0) < 2 {
+                bail!("device BLE rendezvous is disabled");
+            }
+            Ok(())
+        }.await;
+        if let Err(error) = setup {
+            let _ = peripheral.disconnect().await;
+            return Err(error);
+        }
+        let device_mac = compact.as_bytes().chunks(2)
+            .map(|p| std::str::from_utf8(p).unwrap()).collect::<Vec<_>>().join(":");
+        Ok(Self { peripheral, token: token.to_owned(), bridge_id: bridge_id.to_owned(), nonce: String::new(), device_mac })
+    }
+
+    pub async fn command(&mut self, op: &str, mut body: serde_json::Value) -> Result<serde_json::Value> {
+        let id = format!("r{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos());
+        body["rv"] = json!(2);
+        body["protocol"] = json!(2);
+        body["op"] = json!(op);
+        body["request_id"] = json!(id);
+        body["session_nonce"] = json!(self.nonce);
+        body["bridge_id"] = json!(self.bridge_id);
+        body["device_mac"] = json!(self.device_mac);
+        body["token"] = json!(self.token);
+        let bytes = serde_json::to_vec(&body)?;
+        if bytes.len() > 8192 { bail!("v2 BLE command exceeds 8192 bytes"); }
+        let status = self.peripheral.characteristics().into_iter()
+            .find(|c| c.uuid == Pusher::uuid(CHR_STATUS)).context("status characteristic")?;
+        Pusher::write_json(&self.peripheral, CHR_TPL_CTRL, &bytes).await?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let raw = tokio::time::timeout_at(deadline, self.peripheral.read(&status)).await??;
+            if let Ok(reply) = serde_json::from_slice::<serde_json::Value>(&raw) {
+                if reply["ack"] == "v2" && reply["request_id"] == id {
+                    if op == "status" && reply["result"] == "applied" {
+                        self.nonce = reply["session_nonce"].as_str().context("session nonce")?.to_owned();
+                    }
+                    return Ok(reply);
+                }
+            }
+            if tokio::time::Instant::now() >= deadline { bail!("v2 BLE ACK timed out"); }
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+    }
+
+    pub async fn close(self) { let _ = self.peripheral.disconnect().await; }
 }
 
 #[cfg(test)]

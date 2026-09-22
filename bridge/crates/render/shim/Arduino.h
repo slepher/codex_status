@@ -12,6 +12,9 @@
 #define LOW 0
 #define HIGH 1
 #define F(x) x
+#ifdef _MSC_VER
+#define __attribute__(x)
+#endif
 
 inline void delay(unsigned long) {}
 inline void digitalWrite(int, int) {}

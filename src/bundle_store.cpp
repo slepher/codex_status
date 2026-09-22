@@ -46,6 +46,7 @@ struct MetaRecord {
     char contextId[BS_CTX_LEN];
     char firmwareTarget[32];
     char renderTarget[32];
+    uint32_t recordCrc;
 };
 #pragma pack(pop)
 
@@ -65,7 +66,7 @@ bool slotCrc(const char *path, uint32_t &crc, uint32_t &len) {
     File f = LittleFS.open(path, "r");
     if (!f) return false;
     uint64_t total = f.size();
-    if (total > BS_MAX_BUNDLE_BYTES + 4096) { f.close(); return false; }
+    if (total > BS_MAX_BUNDLE_BYTES * 2 + 4096) { f.close(); return false; }
     uint8_t buf[256];
     uint32_t c = 0xFFFFFFFFu;
     uint32_t n = 0;
@@ -97,9 +98,15 @@ bool readSlotHeader(uint8_t slot, SlotHeader &h) {
 bool readMeta(uint8_t copy, MetaRecord &r) {
     File f = LittleFS.open(META_PATH[copy], "r");
     if (!f) return false;
-    bool ok = f.read((uint8_t *)&r, sizeof(r)) == sizeof(r);
+    const size_t oldSize = offsetof(MetaRecord, recordCrc);
+    const size_t size = f.size();
+    memset(&r, 0, sizeof(r));
+    bool ok = (size == sizeof(r) || size == oldSize) &&
+              f.read((uint8_t *)&r, size) == size;
     f.close();
-    return ok && r.magic == META_MAGIC;
+    if (size == sizeof(r)) ok = ok && r.recordCrc == v2Crc32((const uint8_t *)&r, oldSize);
+    else ok = ok && !(r.reserved & 0x80); // only old records may lack a checksum
+    return ok && r.magic == META_MAGIC && r.slot < 2;
 }
 
 bool writeMeta(uint8_t copy, const MetaRecord &r) {
@@ -115,19 +122,23 @@ bool commitSlot(uint8_t slot, uint8_t prev, uint32_t fileLen, uint32_t fileCrc,
     MetaRecord r;
     memset(&r, 0, sizeof(r));
     r.magic = META_MAGIC;
-    r.seq = ++g_seq;
+    r.seq = g_seq + 1;
     r.slot = slot;
     r.prevSlot = prev;
     r.configured = 1;
+    r.reserved = 0x80 | h.initial; // independent activation, never patch the slot
     r.fileLen = fileLen;
     r.fileCrc = fileCrc;
     strncpy(r.jobId, h.jobId, sizeof(r.jobId) - 1);
     strncpy(r.contextId, h.contextId, sizeof(r.contextId) - 1);
     strncpy(r.firmwareTarget, h.firmwareTarget, sizeof(r.firmwareTarget) - 1);
     strncpy(r.renderTarget, h.renderTarget, sizeof(r.renderTarget) - 1);
+    r.recordCrc = v2Crc32((const uint8_t *)&r, offsetof(MetaRecord, recordCrc));
     // Alternating double copies: the older copy stays intact if power is lost.
     uint8_t target = g_metaNext;
     if (!writeMeta(target, r)) return false;
+    MetaRecord check;
+    if (!readMeta(target, check) || memcmp(&r, &check, sizeof(r))) return false;
     g_metaNext = (uint8_t)(target ^ 1);
     g_seq = r.seq;
     g_slot = slot;
@@ -228,6 +239,10 @@ bool bsBegin() {
             return false;
         }
         fillProfile(h);
+        if (best.reserved & 0x80) {
+            g_profile.initial = best.reserved & 0x7f;
+            strncpy(g_profile.contextId, best.contextId, sizeof(g_profile.contextId) - 1);
+        }
         g_profile.bundleCrc = best.fileCrc;
         // Template order lives inside the slot file; read it once here.
         File f = LittleFS.open(SLOT_PATH[g_slot], "r");
@@ -271,8 +286,8 @@ bool bsInstall(const String &bundleJson, const char *expectedFirmware,
         err = "size";
         return false;
     }
-    // Narrow filter: the device compiles from sources and ignores the bridge's
-    // compiled artifact/bindings, so they never allocate on the device.
+    // Keep only the fields used during installation in RAM. The exact complete
+    // Bundle is retained in the slot, including the Bridge-only binding contract.
     JsonDocument filter;
     filter["job_id"] = true;
     filter["firmware_target"] = true;
@@ -284,6 +299,7 @@ bool bsInstall(const String &bundleJson, const char *expectedFirmware,
     filter["templates"][0]["key"]["template_id"] = true;
     filter["templates"][0]["key"]["render_target"] = true;
     filter["templates"][0]["source"] = true;
+    filter["templates"][0]["compiled"]["binary"] = true;
     JsonDocument doc;
     DeserializationError de = deserializeJson(doc, bundleJson, DeserializationOption::Filter(filter));
     if (de) { err = "json"; return false; }
@@ -313,7 +329,7 @@ bool bsInstall(const String &bundleJson, const char *expectedFirmware,
     }
 
     // Shape/target pre-check before any compile or write.
-    uint32_t total = sizeof(SlotHeader);
+    uint32_t total = sizeof(SlotHeader) + bundleJson.length();
     for (size_t i = 0; i < order.size(); i++) {
         const char *id = order[i] | "";
         if (!strlen(id) || strlen(id) >= BS_ID_LEN) { err = "id"; return false; }
@@ -324,7 +340,7 @@ bool bsInstall(const String &bundleJson, const char *expectedFirmware,
         // 12-byte serialize header + fixed record, matching tplCtSerialize.
         total += BS_ID_LEN + 4 + 12 + (uint32_t)tplCtSize();
     }
-    if (total > BS_MAX_BUNDLE_BYTES) { err = "size"; return false; }
+    if (total > BS_MAX_BUNDLE_BYTES * 2) { err = "size"; return false; }
     // Never delete the only valid copy: require room for a full extra slot.
     const size_t freeBytes = bsFreeBytes();
     DevLog.printf("[bundle] install total=%u free=%u fs_total=%u fs_used=%u\n",
@@ -359,24 +375,42 @@ bool bsInstall(const String &bundleJson, const char *expectedFirmware,
         String source;
         serializeJson(tpl["source"], source);
         String cerr;
-        if (!tplCompile(source, compiled, cerr)) {
-            err = "compile:" + cerr;
-            ok = false;
-            break;
-        }
         size_t written = 0;
-        if (!tplCtSerialize(compiled, blob, blobCap, written)) {
-            err = "serialize";
-            ok = false;
-            break;
+        const char *hex = tpl["compiled"]["binary"] | "";
+        if (*hex) {
+            const size_t chars = strlen(hex);
+            if (chars % 2 || chars / 2 > blobCap) { err = "compiled_size"; ok = false; break; }
+            written = chars / 2;
+            for (size_t j = 0; j < written; ++j) {
+                char word[9] = {'0','0','0','0','0','0',hex[j*2],hex[j*2+1],0};
+                uint32_t byte = 0;
+                if (!v2ParseCrc(word, byte)) { ok = false; break; }
+                blob[j] = (uint8_t)byte;
+            }
+            if (!ok || !tplCtDeserialize(blob, written, compiled, cerr) ||
+                compiled.sourceCrc != v2Crc32((const uint8_t *)source.c_str(), source.length()) ||
+                strcmp(compiled.id, order[i] | "")) {
+                err = "compiled:" + cerr; ok = false; break;
+            }
+        } else {
+            // Compatibility for previously frozen v2 jobs: compile their source
+            // with the very same C++ compiler used by the current Bridge.
+            if (!tplCompile(source, compiled, cerr) ||
+                !tplCtSerialize(compiled, blob, blobCap, written)) {
+                err = "compile:" + cerr; ok = false; break;
+            }
         }
-        const char *id = order[i] | "";
-        ok = f.write((const uint8_t *)id, BS_ID_LEN) == BS_ID_LEN;
+        char id[BS_ID_LEN] = {};
+        strncpy(id, order[i] | "", sizeof(id) - 1);
+        ok = f.write((const uint8_t *)id, sizeof(id)) == sizeof(id);
         uint32_t len = (uint32_t)written;
         ok = ok && f.write((const uint8_t *)&len, 4) == 4;
         ok = ok && f.write(blob, written) == written;
     }
     free(blob);
+    // Retain the exact frozen contract, including source/bindings/resources and
+    // the Bridge artifact. The per-template compiled table is only a cache.
+    if (ok) ok = writeAll(f, bundleJson.c_str(), bundleJson.length());
     f.close();
     if (!ok) {
         LittleFS.remove(SLOT_PATH[slot]);
@@ -393,6 +427,8 @@ bool bsInstall(const String &bundleJson, const char *expectedFirmware,
     h.magic = SLOT_MAGIC;
     h.count = (uint16_t)order.size();
     h.initial = (uint8_t)initial;
+    h.flags = 1; // complete source Bundle appended after the compiled table
+    h.reserved = bundleJson.length();
     h.payloadCrc = v2Crc32((const uint8_t *)bundleJson.c_str(), bundleJson.length());
     strncpy(h.jobId, doc["job_id"] | "", sizeof(h.jobId) - 1);
     strncpy(h.contextId, newContextId ? newContextId : "", sizeof(h.contextId) - 1);
@@ -439,6 +475,30 @@ bool bsLoadCompiled(uint8_t index, CtTemplate &out, String &err) {
     bool ok = readOk && tplCtDeserialize(buf, ctLen, out, err);
     if (!readOk) err = "read";
     free(buf);
+    if (!ok && bsHasSource(index)) {
+        // ABI/cache recovery uses the source retained in this same slot. The
+        // complete payload CRC is checked independently of the compiled cache.
+        SlotHeader h;
+        if (!readSlotHeader(g_slot, h)) return false;
+        File sourceFile = LittleFS.open(SLOT_PATH[g_slot], "r");
+        if (!sourceFile || sourceFile.size() < h.reserved + sizeof(h) ||
+            !sourceFile.seek(sourceFile.size() - h.reserved)) return false;
+        String payload;
+        payload.reserve(h.reserved);
+        while (sourceFile.available()) payload += (char)sourceFile.read();
+        sourceFile.close();
+        if (v2Crc32((const uint8_t *)payload.c_str(), payload.length()) != h.payloadCrc) {
+            err = "source_crc"; return false;
+        }
+        JsonDocument filter, doc;
+        filter["templates"][0]["source"] = true;
+        if (deserializeJson(doc, payload, DeserializationOption::Filter(filter))) {
+            err = "source_json"; return false;
+        }
+        String source;
+        serializeJson(doc["templates"][index]["source"], source);
+        ok = tplCompile(source, out, err) && !strcmp(out.id, g_profile.ids[index]);
+    }
     return ok;
 }
 
@@ -449,11 +509,6 @@ bool bsSetActive(uint8_t index, const char *newContextId, String &err) {
     if (!readSlotHeader(g_slot, h)) { err = "slot"; return false; }
     h.initial = index;
     strncpy(h.contextId, newContextId ? newContextId : "", sizeof(h.contextId) - 1);
-    File f = LittleFS.open(SLOT_PATH[g_slot], "r+");
-    if (!f) { err = "open"; return false; }
-    bool ok = f.seek(0) && writeAll(f, &h, sizeof(h));
-    f.close();
-    if (!ok) { err = "write"; return false; }
     uint32_t crc = 0, len = 0;
     if (!slotCrc(SLOT_PATH[g_slot], crc, len)) { err = "crc"; return false; }
     if (!commitSlot(g_slot, g_slot, len, crc, h)) { err = "commit"; return false; }
@@ -465,9 +520,9 @@ bool bsSetActive(uint8_t index, const char *newContextId, String &err) {
 
 bool bsHasSource(uint8_t index) {
     if (!g_configured || index >= g_profile.count) return false;
-    char id[BS_ID_LEN] = {0};
-    uint32_t ctLen = 0, ctOffset = 0;
-    return slotTemplateAt(g_slot, index, id, ctLen, ctOffset);
+    SlotHeader h;
+    return readSlotHeader(g_slot, h) && (h.flags & 1) && h.reserved > 0 &&
+           h.reserved <= BS_MAX_BUNDLE_BYTES;
 }
 
 bool bsRecoveryDigest(String &out) {

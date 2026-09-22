@@ -94,6 +94,7 @@ fn spawn_fake() -> (String, FakeDevice) {
                     &json!({
                         "result": "applied",
                         "active_context_id": "ctx-1",
+                        "device_mac": "70:04:1D:D7:A3:40", "session_nonce": "0123456789abcdef0123456789abcdef",
                         "active_template_id": "quad",
                         "data_seq": 4,
                         "power": {"mode": "light", "plan_id": 7, "remaining_s": 120}
@@ -119,11 +120,15 @@ fn spawn_fake() -> (String, FakeDevice) {
                     }),
                 );
             } else if path.starts_with("/v2/bundle/begin") {
-                let query = path.split("len=").nth(1).unwrap_or("0");
-                len.store(query.parse().unwrap_or(0), Ordering::SeqCst);
+                let command: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(command["protocol"], 2);
+                assert_eq!(command["bridge_id"], "bridge-1");
+                assert_eq!(command["session_nonce"], "0123456789abcdef0123456789abcdef");
+                assert_eq!(command["request_id"], "bundle-job-1");
+                len.store(command["length"].as_u64().unwrap() as usize, Ordering::SeqCst);
                 offset.store(0, Ordering::SeqCst);
                 payload.lock().unwrap().clear();
-                respond(&mut stream, 200, &json!({"result": "applied"}));
+                respond(&mut stream, 200, &json!({"result": "applied", "next_offset": 0}));
             } else if path.starts_with("/v2/bundle/chunk") {
                 let stated: usize = path
                     .split("offset=")
@@ -151,6 +156,9 @@ fn spawn_fake() -> (String, FakeDevice) {
                 );
             } else if path.starts_with("/v2/bundle/commit") {
                 let store = payload.lock().unwrap();
+                let command: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(command["content_crc"], format!("{:08x}", crc32fast::hash(&store)));
+                assert_eq!(command["request_id"], "bundle-job-1");
                 let ok = store.len() == len.load(Ordering::SeqCst) && !store.is_empty();
                 respond(
                     &mut stream,
@@ -158,6 +166,11 @@ fn spawn_fake() -> (String, FakeDevice) {
                     &json!({"result": if ok {"applied"} else {"rejected"}, "error": if ok {""} else {"length"}}),
                 );
             } else if path.starts_with("/v2/activate") {
+                let command: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(command["expected_active_context_id"], "ctx-1");
+                assert_eq!(command["request_id"], "activate-ctx-1-mini");
+                assert_eq!(command["template_id"], "mini");
+                assert_eq!(command["session_nonce"], "0123456789abcdef0123456789abcdef");
                 respond(
                     &mut stream,
                     200,
@@ -198,13 +211,12 @@ fn status_data_plan_activate_round_trip() {
     .unwrap();
     assert_eq!(ack["accepted_remaining_s"], 300);
 
-    let ack = v2_client::activate(&addr, token, "bridge-1", "mini", timeout).unwrap();
+    let ack = v2_client::activate(&addr, token, "bridge-1", "mini", "ctx-1", timeout).unwrap();
     assert_eq!(ack["active_context_id"], "ctx-2");
     let calls = fake.calls.lock().unwrap().clone();
     assert!(calls[0].starts_with("/v2/status"));
-    assert!(calls[1].starts_with("/v2/data"));
-    assert!(calls[2].starts_with("/v2/plan"));
-    assert!(calls[3].starts_with("/v2/activate"));
+    let writes: Vec<_> = calls.iter().filter(|p| *p != "/v2/status").cloned().collect();
+    assert_eq!(writes, vec!["/v2/data", "/v2/plan", "/v2/activate"]);
 }
 
 #[test]
@@ -239,7 +251,8 @@ fn bundle_install_is_ordered_and_complete() {
     assert_eq!(ack["result"], "applied");
     assert_eq!(fake.payload.lock().unwrap().len(), padded.len());
     let calls = fake.calls.lock().unwrap().clone();
-    assert!(calls[0].starts_with("/v2/bundle/begin"));
+    assert!(calls[0].starts_with("/v2/status"));
+    assert!(calls[1].starts_with("/v2/bundle/begin"));
     assert_eq!(
         calls
             .iter()
@@ -259,8 +272,12 @@ fn owner_conflict_stops_the_write_without_retrying() {
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { break };
-            let _ = read_request(&mut stream);
-            respond(&mut stream, 409, &json!({"owner": {"name": "other"}}));
+            let (_, path, _) = read_request(&mut stream);
+            if path == "/v2/status" {
+                respond(&mut stream, 200, &json!({"device_mac": "70:04:1D:D7:A3:40", "session_nonce": "0123456789abcdef0123456789abcdef"}));
+            } else {
+                respond(&mut stream, 409, &json!({"owner": {"name": "other"}}));
+            }
         }
     });
     let ack = v2_client::data(

@@ -7,6 +7,22 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
+
+inline bool v2ParseCrc(const char *text, uint32_t &out) {
+    if (!text || strlen(text) != 8) return false;
+    uint32_t value = 0;
+    for (unsigned i = 0; i < 8; ++i) {
+        char c = text[i];
+        unsigned digit = c >= '0' && c <= '9' ? c - '0'
+                       : c >= 'a' && c <= 'f' ? c - 'a' + 10
+                       : c >= 'A' && c <= 'F' ? c - 'A' + 10 : 16;
+        if (digit > 15) return false;
+        value = (value << 4) | digit;
+    }
+    out = value;
+    return true;
+}
 
 // v2 design defaults (`docs/generic-display-platform-design-v2.md` §7).
 static const uint32_t V2_BOOT_PROVISIONAL_S = 300;
@@ -51,7 +67,8 @@ class V2PlanState {
         if (plan.planId < highId_) return V2_PLAN_STALE_ID;
         if (plan.planId == highId_ && haveAccepted_) {
             // Same id: identical content is idempotent, different content conflicts.
-            if (plan.mode != acceptedMode_ || plan.lightDurationS != acceptedDurationS_)
+            if (plan.mode != acceptedMode_ || plan.lightDurationS != requestedDurationS_ ||
+                plan.rendezvousPeriodS != requestedPeriodS_)
                 return V2_PLAN_CONFLICT;
             // Returning the original result must not move the deadline.
             return V2_PLAN_ACCEPTED;
@@ -60,7 +77,8 @@ class V2PlanState {
         if (plan.mode == V2_PLAN_LIGHT) {
             uint32_t limit = maxLightS ? maxLightS : V2_MAX_LIGHT_S;
             if (duration > limit) duration = limit;   // device may shorten
-            if (duration < V2_MIN_LIGHT_S) duration = V2_MIN_LIGHT_S;
+            const uint32_t minimum = limit < V2_MIN_LIGHT_S ? limit : V2_MIN_LIGHT_S;
+            if (duration < minimum) duration = minimum;
         } else {
             duration = 0;
         }
@@ -68,6 +86,8 @@ class V2PlanState {
         haveAccepted_ = true;
         acceptedId_ = plan.planId;
         acceptedMode_ = plan.mode;
+        requestedDurationS_ = plan.lightDurationS;
+        requestedPeriodS_ = plan.rendezvousPeriodS;
         acceptedDurationS_ = duration;
         acceptedAtMs_ = nowMs;
         sourceBoot_ = provisional;
@@ -87,6 +107,7 @@ class V2PlanState {
     }
 
     uint32_t grantedS() const { return acceptedDurationS_; }
+    uint64_t deadlineMs() const { return acceptedAtMs_ + (uint64_t)acceptedDurationS_ * 1000ULL; }
     uint64_t acceptedId() const { return acceptedId_; }
     uint64_t highId() const { return highId_; }
     bool accepted() const { return haveAccepted_; }
@@ -105,6 +126,8 @@ class V2PlanState {
     uint64_t acceptedId_ = 0;
     uint8_t acceptedMode_ = V2_PLAN_SLEEP;
     uint32_t acceptedDurationS_ = 0;
+    uint32_t requestedDurationS_ = 0;
+    uint32_t requestedPeriodS_ = 0;
     uint64_t acceptedAtMs_ = 0;
     bool sourceBoot_ = false;
 };
@@ -172,6 +195,30 @@ inline uint32_t v2Crc32(const uint8_t *data, size_t len) {
     return ~crc;
 }
 
+// RTC checkpoint is bound to the committed activation context. It contains no
+// pointers and is never trusted after a cold reset or a checksum failure.
+struct V2DataCheckpoint {
+    char context[33];
+    uint64_t seq;
+    uint32_t contentCrc;
+    uint32_t checksum;
+
+    void save(const char *id, const V2DataSeq &state) {
+        memset(this, 0, sizeof(*this));
+        if (!id || strlen(id) >= sizeof(context) || !state.haveApplied()) return;
+        strcpy(context, id);
+        seq = state.appliedSeq();
+        contentCrc = state.appliedCrc();
+        checksum = v2Crc32((const uint8_t *)this, offsetof(V2DataCheckpoint, checksum));
+    }
+    bool restore(const char *id, V2DataSeq &state) const {
+        if (!id || !seq || context[sizeof(context) - 1] || strcmp(context, id) ||
+            checksum != v2Crc32((const uint8_t *)this, offsetof(V2DataCheckpoint, checksum))) return false;
+        state.noteApplied(seq, contentCrc);
+        return true;
+    }
+};
+
 // Context ids are non-reusable: a rolling counter plus an entropy word.
 class V2ContextGen {
   public:
@@ -183,6 +230,39 @@ class V2ContextGen {
 
   private:
     uint32_t counter_ = 1;
+};
+
+// One bounded Bundle receive transaction. Transport authentication is checked
+// separately on every operation; these fields prevent mixing authenticated jobs.
+struct V2BundleRx {
+    char owner[65] = {};
+    char request[65] = {};
+    char nonce[65] = {};
+    uint32_t length = 0;
+    uint32_t crc = 0;
+    uint32_t offset = 0;
+    uint64_t deadline = 0;
+
+    bool matches(const char *bridge, const char *id, const char *session) const {
+        return !strcmp(owner, bridge) && !strcmp(request, id) && !strcmp(nonce, session);
+    }
+    bool live(uint64_t now) const { return deadline && now < deadline; }
+    bool begin(const char *bridge, const char *id, const char *session,
+               uint32_t len, uint32_t sum, uint64_t now) {
+        if (!*bridge || !*id || !*session || strlen(bridge) >= sizeof(owner) ||
+            strlen(id) >= sizeof(request) || strlen(session) >= sizeof(nonce) ||
+            !len || len > 262144) return false;
+        strcpy(owner, bridge); strcpy(request, id); strcpy(nonce, session);
+        length = len; crc = sum; offset = 0; deadline = now + 120000;
+        return true;
+    }
+    bool append(uint32_t at, uint32_t size, uint64_t now) const {
+        return live(now) && at == offset && size && size <= 16384 &&
+               offset <= length && size <= length - offset;
+    }
+    bool complete(uint32_t len, uint32_t sum, uint64_t now) const {
+        return live(now) && offset == length && len == length && sum == crc;
+    }
 };
 
 // Exit-path bookkeeping: every radio/PM resource must be released on all paths.

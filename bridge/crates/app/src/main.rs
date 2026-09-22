@@ -87,6 +87,7 @@ struct AppCtx {
     envelope: Arc<RwLock<Option<Value>>>,
     library: Arc<RwLock<Library>>,
     force_ble: Arc<Notify>,
+    v2_delivery: tokio::sync::Mutex<()>,
     status: Mutex<RuntimeStatus>,
     /// Live device address (attribute): seeded from config, updated by UDP.
     device_ip: Mutex<String>,
@@ -2335,6 +2336,11 @@ async fn run_services(ctx: Arc<AppCtx>) {
         }
         let udp_request = ctx.udp_ble.swap(false, Ordering::SeqCst);
         if !udp_request {
+            if platform::is_v2_device(&ctx) {
+                if let Err(error) = platform::ble_cycle(&ctx).await {
+                    tracing::debug!(%error, "v2 BLE opportunity unavailable");
+                }
+            }
             continue;
         }
         let adapter = match Pusher::adapter().await {
@@ -2476,6 +2482,7 @@ fn main() {
         envelope: Arc::new(RwLock::new(None)),
         library: Arc::new(RwLock::new(library)),
         force_ble: Arc::new(Notify::new()),
+        v2_delivery: tokio::sync::Mutex::new(()),
         status: Mutex::new(RuntimeStatus {
             last_sync: None,
             last_error: None,

@@ -406,6 +406,14 @@ impl Coordinator {
         let Some(kind) = delivery.kind() else {
             return Err("delivery has no pinnable payload".into());
         };
+        if let Some(flight) = self.data.in_flight.as_mut() {
+            // Retry the frozen bytes AND their original fingerprints. A source
+            // update during the flight must still be dirty after its ACK.
+            flight.attempts = flight.attempts.saturating_add(1);
+            flight.kind = kind;
+            flight.sent_at = now;
+            return Ok(flight.clone());
+        }
         let Some(context) = self.context.as_mut() else {
             return Err("no active context".into());
         };
@@ -417,7 +425,7 @@ impl Coordinator {
                 fields: BTreeMap::new(),
             },
         };
-        let content_crc = format!("{:08x}", crc32(&payload_bytes(&payload)));
+        let content_crc = format!("{:08x}", data_fields_crc(&wire_fields(&self.requirements, &payload)));
         let flight = InFlight {
             kind,
             seq: context.next_seq,
@@ -739,21 +747,7 @@ impl Coordinator {
     /// validates `i` against its own compiled requirement table).
     pub fn data_message_body(&self) -> Option<Value> {
         let flight = self.data.in_flight.as_ref()?;
-        let mut entries: Vec<&FieldRequirement> = self.requirements.iter().collect();
-        entries.sort_by_key(|r| r.index);
-        let mut fields = Vec::with_capacity(entries.len());
-        for r in entries {
-            let (value, quality) = match flight.payload.fields.get(&r.field) {
-                Some(f) => (f.value.clone(), f.quality),
-                None => (Value::Null, Quality::Missing),
-            };
-            fields.push(serde_json::json!({
-                "i": r.index,
-                "k": r.field,
-                "v": value,
-                "q": quality,
-            }));
-        }
+        let fields = wire_fields(&self.requirements, &flight.payload);
         Some(serde_json::json!({
             "op": "data",
             "active_context_id": flight.payload.active_context_id,
@@ -861,6 +855,25 @@ pub fn data_fields_crc(fields: &[Value]) -> u32 {
         text.push(';');
     }
     crc32(text.as_bytes())
+}
+
+fn wire_fields(requirements: &[FieldRequirement], payload: &DataSnapshot) -> Vec<Value> {
+        let mut entries: Vec<&FieldRequirement> = requirements.iter().collect();
+        entries.sort_by_key(|r| r.index);
+        let mut fields = Vec::with_capacity(entries.len());
+        for r in entries {
+            let (value, quality) = match payload.fields.get(&r.field) {
+                Some(f) => (f.value.clone(), f.quality),
+                None => (Value::Null, Quality::Missing),
+            };
+            fields.push(serde_json::json!({
+                "i": r.index,
+                "k": r.field,
+                "v": value,
+                "q": quality,
+            }));
+        }
+    fields
 }
 
 pub fn payload_bytes(payload: &DataSnapshot) -> Vec<u8> {
@@ -1104,6 +1117,15 @@ mod tests {
             .note_delivery_started(&Delivery::BleData(retry), 1004)
             .unwrap();
         assert_eq!(retry_flight.content_crc, flight.content_crc);
+        assert_eq!(retry_flight.push_fp, flight.push_fp);
+        assert_eq!(retry_flight.full_fp, flight.full_fp);
+        assert_eq!(c.note_ack(DeliveryKind::BleData, flight.seq, &flight.content_crc,
+                             true, "unchanged", 1005), AckOutcome::Applied);
+        assert!(c.data.push_dirty, "ACK for frozen old content must not confirm a newer push");
+        let next = c.next_delivery(1006, true);
+        let fresh = c.note_delivery_started(&next, 1006).unwrap();
+        assert_eq!(fresh.seq, flight.seq + 1);
+        assert_ne!(fresh.content_crc, flight.content_crc);
     }
 
     #[test]

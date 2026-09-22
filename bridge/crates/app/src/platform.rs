@@ -289,11 +289,12 @@ pub async fn activate(ctx: &AppCtx, mac: &str, template_id: &str) -> Result<Valu
 
 /// Execute at most one pending coordinator action against the device.
 pub async fn deliver(ctx: &AppCtx, mac: &str) -> Value {
+    let _delivery = ctx.v2_delivery.lock().await;
     let Some(link) = device_link(ctx) else {
         return json!({"result": "waiting_for_link", "reason": "device token/ip not available; open a BOOT session"});
     };
     let reachable = true;
-    let decision = service(ctx).next_delivery(mac, reachable, now_secs());
+    let decision = service(ctx).next_http_delivery(mac, reachable, now_secs());
     match decision["decision"].as_str().unwrap_or("none") {
         "bundle" => {
             let payload = match service(ctx).bundle_payload(mac) {
@@ -339,8 +340,9 @@ pub async fn deliver(ctx: &AppCtx, mac: &str) -> Value {
             let (ip, token, bridge_id) =
                 (link.ip.clone(), link.token.clone(), link.bridge_id.clone());
             let id = template_id.clone();
+            let expected_context = decision["expected_active_context_id"].as_str().unwrap_or("").to_owned();
             match blocking(move || {
-                v2_client::activate(&ip, &token, &bridge_id, &id, timeout()).map_err(err_text)
+                v2_client::activate(&ip, &token, &bridge_id, &id, &expected_context, timeout()).map_err(err_text)
             })
             .await
             {
@@ -355,7 +357,7 @@ pub async fn deliver(ctx: &AppCtx, mac: &str) -> Value {
                 Err(e) => json!({"result": "deferred", "error": err_text(e)}),
             }
         }
-        "ble_data" | "light_data" => {
+        "light_data" => {
             let body = service(ctx).data_message_body(mac);
             let Some(body) = body else {
                 return json!({"result": "idle", "note": "no in-flight snapshot"});
@@ -373,12 +375,8 @@ pub async fn deliver(ctx: &AppCtx, mac: &str) -> Value {
                     let applied = ack["result"] == "applied";
                     let seq = body["seq"].as_u64().unwrap_or(0);
                     let crc = body["crc"].as_str().unwrap_or("").to_string();
-                    let kind = if decision["decision"] == "ble_data" {
-                        DeliveryKind::BleData
-                    } else {
-                        DeliveryKind::LightData
-                    };
-                    service(ctx).note_ack(
+                    let kind = DeliveryKind::LightData;
+                    let outcome = service(ctx).note_ack(
                         mac,
                         kind,
                         seq,
@@ -386,7 +384,9 @@ pub async fn deliver(ctx: &AppCtx, mac: &str) -> Value {
                         applied,
                         ack["display_state"].as_str().unwrap_or("unchanged"),
                     );
-                    json!({"result": "data", "ack": ack})
+                    tracing::info!(device = mac, seq, outcome = %outcome["outcome"],
+                        transport = "http", "v2 data acknowledgement");
+                    json!({"result": "data", "transport": "http", "ack": ack, "confirmation": outcome})
                 }
                 Err(e) => json!({"result": "deferred", "error": e}),
             }
@@ -403,6 +403,7 @@ pub async fn send_plan(
     wake_reason: &str,
     provisional_remaining_s: u32,
 ) -> Value {
+    let _delivery = ctx.v2_delivery.lock().await;
     let Some(link) = device_link(ctx) else {
         return json!({"result": "waiting_for_link"});
     };
@@ -589,6 +590,47 @@ pub fn is_v2_device(ctx: &AppCtx) -> bool {
         .device_get(&mac)
         .map(|d| !d["legacy"].as_bool().unwrap_or(true))
         .unwrap_or(false)
+}
+
+/// One real GATT rendezvous. Small snapshots stay on BLE; larger work receives
+/// a formal light plan and is then delivered by the HTTP cycle.
+pub async fn ble_cycle(ctx: &AppCtx) -> Result<(), String> {
+    let _delivery = ctx.v2_delivery.lock().await;
+    let mac = ctx.device_mac.lock().unwrap().clone().ok_or("unknown device")?;
+    let mut link = bridge_ble::V2Connection::connect(&mac, &ctx.config.token, &ctx.bridge_id)
+        .await.map_err(err_text)?;
+    let work = async {
+        let state = link.command("status", json!({})).await.map_err(err_text)?;
+        if state["result"] != "applied" { return Err("BLE status rejected".to_owned()); }
+        service(ctx).note_device_status(&mac, &state).map_err(err_text)?;
+        let decision = service(ctx).next_delivery(&mac, true, now_secs());
+        if decision["decision"] == "ble_data" {
+            if let Some(body) = service(ctx).data_message_body(&mac) {
+                let ack = link.command("data", body.clone()).await.map_err(err_text)?;
+                let applied = ack["result"] == "applied" && ack["data_seq"] == body["seq"] &&
+                    ack["active_context_id"] == body["active_context_id"];
+                let outcome = service(ctx).note_ack(&mac, DeliveryKind::BleData,
+                    body["seq"].as_u64().unwrap_or(0), body["crc"].as_str().unwrap_or(""),
+                    applied, ack["display_state"].as_str().unwrap_or("unchanged"));
+                tracing::info!(device = mac, outcome = %outcome["outcome"], transport = "ble",
+                    "v2 data acknowledgement");
+            }
+        }
+        let remaining = state["power"]["provisional_remaining_s"].as_u64().unwrap_or(0) as u32;
+        let plan = service(ctx).plan_for_rendezvous(&mac, now_secs(),
+            if remaining > 0 { "manual" } else { "rendezvous" }, remaining).map_err(err_text)?;
+        let ack = link.command("plan", serde_json::to_value(&plan).map_err(err_text)?)
+            .await.map_err(err_text)?;
+        if ack["result"] == "applied" {
+            service(ctx).note_plan_ack(&mac, plan.plan_id,
+                ack["accepted_remaining_s"].as_u64().unwrap_or(0) as u32, remaining > 0);
+        }
+        Ok(())
+    };
+    let result = tokio::time::timeout(Duration::from_secs(10), work).await
+        .map_err(|_| "BLE rendezvous timed out".to_owned()).and_then(|r| r);
+    link.close().await;
+    result
 }
 
 /// Run one coordinator cycle for the current device: optional authenticated

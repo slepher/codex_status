@@ -24,6 +24,7 @@ extern "C" {
     fn codex_v2_plan_light_active(p: *mut c_void, now_ms: u64) -> c_int;
     fn codex_v2_boot_remaining(t_boot_ms: u64, now_ms: u64) -> u32;
     fn codex_v2_seq_new() -> *mut c_void;
+    fn codex_v2_accept_data(p: *mut c_void, message: *const std::os::raw::c_char) -> c_int;
     fn codex_v2_seq_free(p: *mut c_void);
     fn codex_v2_seq_begin(p: *mut c_void, now_ms: u64, keep_next: u32);
     fn codex_v2_seq_observe(p: *mut c_void, seq: u64, crc: u32) -> c_int;
@@ -32,6 +33,42 @@ extern "C" {
     fn codex_v2_seq_applied(p: *mut c_void) -> u64;
     fn codex_v2_crc(data: *const u8, len: c_int) -> u32;
     fn codex_v2_fields_crc(fields_json: *const std::os::raw::c_char) -> u32;
+    fn codex_v2_checkpoint_check() -> c_int;
+    fn codex_v2_bundle_rx_check() -> c_int;
+    fn codex_dirty_window(old: *const u8, new: *const u8, w: c_int, h: c_int, rect: *mut u16) -> c_int;
+}
+
+#[test]
+fn wake_checkpoint_and_bundle_transfer_guards() {
+    unsafe {
+        assert_eq!(codex_v2_checkpoint_check(), 0);
+        assert_eq!(codex_v2_bundle_rx_check(), 0);
+    }
+}
+
+#[test]
+fn dirty_windows_cover_changes_and_stay_inside_both_targets() {
+    for (w, h) in [(200usize, 200usize), (400, 300)] {
+        let old = vec![255u8; w * h / 8];
+        for (x, y) in [(0, 0), (w - 1, h - 1), (8, 12), (w / 2, h / 2)] {
+            let mut new = old.clone();
+            new[y * w / 8 + x / 8] ^= 0x80 >> (x % 8);
+            let mut rect = [0u16; 4];
+            unsafe {
+                assert_eq!(codex_dirty_window(old.as_ptr(), new.as_ptr(), w as i32, h as i32, rect.as_mut_ptr()), 1);
+            }
+            let [x0, y0, x1, y1] = rect.map(usize::from);
+            assert!(x0 <= x && x1 >= x && y0 <= y && y1 >= y);
+            assert_eq!(x0 % 8, 0);
+            assert_eq!(x1 % 8, 7);
+            assert!(x1 < w && y1 < h);
+            assert!(x1 - x0 < 24 && y1 - y0 <= 2);
+        }
+        unsafe {
+            let mut rect = [0u16; 4];
+            assert_eq!(codex_dirty_window(old.as_ptr(), old.as_ptr(), w as i32, h as i32, rect.as_mut_ptr()), 0);
+        }
+    }
 }
 
 const ACCEPTED: i32 = 0;
@@ -73,9 +110,49 @@ fn device_safety_shortens_an_oversized_plan() {
         let p = codex_v2_plan_new();
         assert_eq!(codex_v2_plan_accept(p, 7, 1, 3600, 0, 0, 600), ACCEPTED);
         assert_eq!(codex_v2_plan_remaining(p, 0), 600);
+        assert_eq!(codex_v2_plan_accept(p, 7, 1, 3600, 60_000, 0, 600), ACCEPTED);
+        assert_eq!(codex_v2_plan_remaining(p, 60_000), 540);
         assert_eq!(codex_v2_plan_accept(p, 8, 1, 1, 0, 0, 600), ACCEPTED);
         assert_eq!(codex_v2_plan_remaining(p, 0), 30, "minimum light window");
         codex_v2_plan_free(p);
+    }
+}
+
+#[test]
+fn transport_runtime_validates_crc_before_advancing_sequence() {
+    let mut message = serde_json::json!({
+        "active_context_id": "ctx", "seq": 1,
+        "fields": [{"i":0,"k":"bridge.label","v":"first","q":"good"}]
+    });
+    let sign = |m: &mut serde_json::Value| {
+        m["crc"] = format!("{:08x}", bridge_core::coordinator::data_fields_crc(
+            m["fields"].as_array().unwrap())).into();
+    };
+    let accept = |p, m: &serde_json::Value| unsafe {
+        let text = std::ffi::CString::new(m.to_string()).unwrap();
+        codex_v2_accept_data(p, text.as_ptr())
+    };
+    unsafe {
+        let p = codex_v2_seq_new();
+        assert_eq!(accept(p, &message), 5, "missing CRC must not bypass validation");
+        message["crc"] = "00000000".into();
+        assert_eq!(accept(p, &message), 5, "zero is a CRC, not a validation bypass");
+        message["crc"] = "zzzzzzzz".into();
+        assert_eq!(accept(p, &message), 5);
+        sign(&mut message);
+        assert_eq!(accept(p, &message), DATA_APPLIED);
+        assert_eq!(accept(p, &message), DATA_UNCHANGED);
+        message["fields"][0]["v"] = "second".into();
+        assert_eq!(accept(p, &message), 5, "tampered contents");
+        sign(&mut message);
+        assert_eq!(accept(p, &message), DATA_CONFLICT);
+        message["seq"] = 2.into();
+        message["active_context_id"] = "old".into();
+        assert_eq!(accept(p, &message), 4);
+        assert_eq!(codex_v2_seq_applied(p), 1, "rejection must not advance seq");
+        message["active_context_id"] = "ctx".into();
+        assert_eq!(accept(p, &message), DATA_APPLIED);
+        codex_v2_seq_free(p);
     }
 }
 

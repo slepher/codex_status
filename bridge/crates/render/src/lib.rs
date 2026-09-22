@@ -19,6 +19,7 @@ enum Op {
     Serialize,
     Deserialize,
     ReqList,
+    Artifact,
 }
 
 struct Job {
@@ -66,6 +67,19 @@ fn engine_loop(rx: Receiver<Job>) {
 
 fn run_job(job: &Job, out: &mut [u8], message: &mut String) -> i32 {
     match job.op {
+        Op::Artifact => {
+            let source = match CString::new(job.template.as_str()) {
+                Ok(value) => value,
+                Err(_) => return -3,
+            };
+            let mut meta = vec![0i8; 16384];
+            let result = unsafe { codex_ct_artifact(
+                if job.template.is_empty() { std::ptr::null() } else { source.as_ptr() },
+                job.blob.as_ptr(), job.blob.len() as c_int,
+                out.as_mut_ptr(), out.len() as c_int, meta.as_mut_ptr(), meta.len() as c_int) };
+            *message = cstr(&meta);
+            return result;
+        }
         Op::Compile => {
             let tmpl = match CString::new(job.template.as_str()) {
                 Ok(value) => value,
@@ -238,6 +252,17 @@ pub fn compile(template: &str) -> Result<(), String> {
     }
 }
 
+/// Shared C++ wire compiler/validator. Returns binary CTP1 bytes and metadata
+/// obtained from that same record in one serialized engine operation.
+pub fn compiled_artifact(source: Option<&str>, blob: &[u8]) -> anyhow::Result<(Vec<u8>, String)> {
+    let source = source.unwrap_or("");
+    let mut job = base_job(source, &Env::default());
+    job.blob = blob.to_vec();
+    let (rc, out, metadata) = run_engine(Op::Artifact, source, job)?;
+    if rc <= 0 { anyhow::bail!("compiled artifact: {metadata}"); }
+    Ok((out, metadata))
+}
+
 /// Requirements (field paths, index order) of the active compiled template.
 pub fn compiled_requirements() -> Result<Vec<String>, String> {
     let job = base_job("", &Env::default());
@@ -296,6 +321,8 @@ pub const ROW_BYTES: usize = (WIDTH as usize + 7) / 8;
 pub const BUF_LEN: usize = ROW_BYTES * HEIGHT as usize;
 
 extern "C" {
+    fn codex_ct_artifact(source: *const c_char, blob: *const u8, len: c_int,
+        out: *mut u8, cap: c_int, metadata: *mut c_char, meta_cap: c_int) -> c_int;
     fn codex_render(
         tmpl: *const c_char,
         usage: *const c_char,

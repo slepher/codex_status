@@ -78,7 +78,12 @@ impl PlatformService {
             plans,
         } = persisted;
         let mut templates = BTreeMap::new();
-        for t in persisted_templates {
+        for mut t in persisted_templates {
+            // Old Rust render-plan records migrate from their retained source.
+            // Saving the migration never publishes a bundle.
+            if crate::compile::validate(&t.compiled).is_err() {
+                t.compiled = crate::compile::compile(&t.source, &t.key.render_target)?;
+            }
             templates.insert(t.key.clone(), t);
         }
         let mut sources: BTreeMap<String, DataSource> = persisted_sources
@@ -194,7 +199,7 @@ impl PlatformService {
                     "bytes": crate::template::canonical_bytes(&t.source).len(),
                     "saved_at": t.saved_at,
                     "requirements": t.compiled.requirements.len(),
-                    "render_ops": t.compiled.render_ops.len(),
+                    "render_ops": t.compiled.op_count,
                     "used_by": self.profiles_referencing(&inner, &t.key.template_id),
                 })
             })
@@ -929,11 +934,22 @@ impl PlatformService {
     /// Decide and pin the next delivery for one device. `reachable` is an
     /// authenticated rendezvous opportunity right now.
     pub fn next_delivery(&self, mac: &str, reachable: bool, now: u64) -> Value {
+        self.delivery_for_transport(mac, reachable, now, true)
+    }
+
+    pub fn next_http_delivery(&self, mac: &str, reachable: bool, now: u64) -> Value {
+        self.delivery_for_transport(mac, reachable, now, false)
+    }
+
+    fn delivery_for_transport(&self, mac: &str, reachable: bool, now: u64, ble: bool) -> Value {
         let mut inner = self.inner.lock().unwrap();
         let Some(c) = inner.coordinators.get_mut(&mac.to_uppercase()) else {
             return json!({"decision": "unknown_device"});
         };
-        let decision = c.next_delivery(now, reachable);
+        let decision = match c.next_delivery(now, reachable) {
+            Delivery::BleData(snapshot) if !ble => Delivery::LightData(snapshot),
+            other => other,
+        };
         let mut out = match &decision {
             Delivery::Idle => json!({"decision": "idle"}),
             Delivery::WaitingForRendezvous { reason } => {
@@ -1592,10 +1608,15 @@ mod tests {
         let decision = svc.next_delivery(mac, true, t);
         assert_eq!(decision["decision"], "ble_data");
         let seq = decision["data_seq"].as_u64().unwrap();
-        let crc = decision["content_crc"].as_str().unwrap().to_string();
+        // Exercise the actual app delivery contract: ACK correlation uses the
+        // CRC from the device message, not a test-only coordinator fingerprint.
+        let body = svc.data_message_body(mac).unwrap();
+        let crc = body["crc"].as_str().unwrap().to_string();
+        assert_eq!(decision["content_crc"], body["crc"]);
         // ACK confirms and starts the deadline clock.
         let ack = svc.note_ack(mac, DeliveryKind::BleData, seq, &crc, true, "displayed");
         assert_eq!(ack["outcome"], "applied");
+        assert!(svc.coordinator_summary(mac).unwrap()["in_flight"].is_null());
         let deadline_before = svc.coordinator_summary(mac).unwrap()["context"]
             ["full_sync_deadline"]
             .as_u64()

@@ -20,6 +20,12 @@ uint32_t v2DataFieldsCrc(JsonArrayConst fields);
 V2DataAck v2ApplyData(const CtTemplate &ct, const String &messageJson,
                       const char *currentContext, String &usageOut, String &errorOut);
 
+// The transport-facing path: validate the complete message, then atomically
+// advance the sequence fingerprint. Rejected messages never alter the baseline.
+V2DataAck v2AcceptData(const CtTemplate &ct, const String &messageJson,
+                     const char *currentContext, V2DataSeq &state,
+                     String &usageOut, String &errorOut);
+
 // Build a synthetic usage document from already-applied field values (used at
 // boot to re-render the last data without a fresh message).
 bool v2UsageFromFields(const CtTemplate &ct, const String &storedFieldsJson,

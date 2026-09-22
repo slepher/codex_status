@@ -5,6 +5,11 @@
 #pragma once
 #include <Arduino.h>
 
+struct DirtyWindow { uint16_t x0, y0, x1, y1; };
+// Inclusive coordinates, one-pixel padding, X rounded out to whole bytes.
+bool rgnDirtyWindow(const uint8_t *oldFrame, const uint8_t *newFrame,
+                    uint16_t width, uint16_t height, DirtyWindow &out);
+
 // Conservative first release: high-ink regions always take the full waveform
 // until the fixed-rig photo gate passes (design §8.2). Low-ink regions may use
 // the partial waveform while their own budget allows.

@@ -261,7 +261,7 @@ class TplCtrlCallbacks : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic *c, PEER_ARG) override {
         if (!writeAllowed(desc)) return;
         std::string v = c->getValue();
-        appendJson(tplCtrlBuf, v, 512, "template-control",
+        appendJson(tplCtrlBuf, v, 8192, "template-control",
                    [](const String &json) { dispatchTemplateCtrl(json); });
     }
 };

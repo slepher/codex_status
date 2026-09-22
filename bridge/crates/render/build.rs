@@ -42,6 +42,7 @@ fn main() {
         .flag_if_supported("/utf-8")
         .file(firmware.join("template_engine.cpp"))
         .file(firmware.join("v2_runtime.cpp"))
+        .file(firmware.join("bundle_store.cpp"))
         .file(firmware.join("refresh_policy.cpp"))
         .file(firmware.join("GUI_Paint.cpp"))
         .file(&ffi);
@@ -52,7 +53,8 @@ fn main() {
 
     for tracked in ["template_engine.cpp", "template_engine.h", "GUI_Paint.cpp",
                     "GUI_Paint.h", "refresh_policy.cpp", "refresh_policy.h",
-                    "v2_state.h", "v2_runtime.h", "v2_runtime.cpp"] {
+                    "v2_state.h", "v2_runtime.h", "v2_runtime.cpp",
+                    "bundle_store.h", "bundle_store.cpp"] {
         println!("cargo:rerun-if-changed={}", firmware.join(tracked).display());
     }
     println!("cargo:rerun-if-changed={}", ffi.display());

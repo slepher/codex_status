@@ -70,7 +70,7 @@ static bool targetUnverified = false;
 #elif defined(CODEX_CLK_WINDOW_TEST)
 #define FW_VERSION    "0.13.9-clkwin"
 #else
-#define FW_VERSION    "0.16.8-bw"
+#define FW_VERSION    "0.16.9-bw"
 #endif
 #define AP_PASSWORD   "codex1234"
 #define MAX_SLOTS     3
@@ -261,7 +261,7 @@ static uint16_t wifiBlinkMs = WIFI_BLINK_MS;
 static uint32_t blinkTicks = 0;
 static bool     rfnBlink = false;
 
-// BLE rendezvous protocol v2 gate (design §10). Default 0 = legacy path only;
+// BLE rendezvous protocol v2 gate (design §10). New installs default to v2;
 // persisted in NVS `pm/rv2` so a rollback survives OTA/reboot and can be
 // toggled at runtime with POST /diag?rv2=0|1. `rendezvous_v` in INFO reflects
 // this gate; the GATT table itself never changes (no Windows re-pairing).
@@ -624,6 +624,7 @@ static BsProfile      v2Profile;
 static bool           v2BundleReady = false;
 static V2PlanState    v2Plan;
 static V2DataSeq      v2DataSeq;
+RTC_DATA_ATTR static V2DataCheckpoint v2DataCheckpoint = {};
 static V2ContextGen   v2CtxGen;
 static uint64_t       v2BootMs = 0;              // physical wake instant
 static bool           v2Provisional = false;     // BOOT 300 s window active
@@ -632,13 +633,12 @@ static uint64_t       v2LastAckAtMs = 0;
 static uint64_t       v2LastAckSeq = 0;
 static String         v2AppliedFields;           // bounded last applied Data fields
 static uint8_t        v2DisplayState = 0;        // 0 none,1 displayed,2 pending,3 failed
-static uint64_t       v2RxDeadlineMs = 0;        // bounded bundle receive window
+static V2BundleRx     v2Rx;
+static String         v2SessionNonce;
 // Device safety cap: with a committed bundle but no formal PowerPlan (or before
 // the Bridge answers) the light session is bounded by the max light lease.
 static uint64_t       v2SafetyDeadlineMs = 0;
-static uint32_t       v2RxOffset = 0;
 static String         v2RxPath = "/bundle/rx.bin";
-static uint32_t       v2RxCrc = 0;
 static String         v2PlanReason = "init";
 
 static uint64_t v2NowMs() { return (uint64_t)(esp_timer_get_time() / 1000ULL); }
@@ -927,9 +927,26 @@ static void epdFlush(bool forceFull) {
     bool partial = (d.action == RFN_PARTIAL) && epdPartialReady;
     if (partial && !blink && ++epdPartialCount > 30) partial = false;
     if (partial) {
-        bool ok = true;
-        if (epdAsleep) ok = EPD_TGT_WakePartial(lastDisplayedFrame);
-        if (ok) ok = EPD_TGT_DisplayPart(frame);
+        DirtyWindow window;
+        bool ok = epdBaselineTrusted &&
+                  rgnDirtyWindow(lastDisplayedFrame, frame, EPD_W, EPD_H, window);
+        const size_t stride = ok ? (window.x1 - window.x0 + 1) / 8 : 0;
+        const size_t bytes = ok ? stride * (window.y1 - window.y0 + 1) : 0;
+        uint8_t *pixels = bytes ? (uint8_t *)malloc(bytes) : nullptr;
+        ok = ok && pixels;
+        if (ok) {
+            for (int y = window.y0; y <= window.y1; ++y)
+                memcpy(pixels + (y - window.y0) * stride,
+                       lastDisplayedFrame + y * (EPD_W / 8) + window.x0 / 8, stride);
+            ok = EPD_TGT_WakePartialWindow(window.x0, window.y0, window.x1, window.y1, pixels);
+            if (ok) {
+                for (int y = window.y0; y <= window.y1; ++y)
+                    memcpy(pixels + (y - window.y0) * stride,
+                           frame + y * (EPD_W / 8) + window.x0 / 8, stride);
+                ok = EPD_TGT_DisplayPartWindow(window.x0, window.y0, window.x1, window.y1, pixels);
+            }
+        }
+        free(pixels);
         if (ok) {
             epdWriteCount++;
             if (blink) blinkTicks++;
@@ -1394,7 +1411,8 @@ static void renderUsage(const String &json, const char *channel) {
 static void updateInfoExtra() {
     String items = "\"mac\":\"" + macText() + "\",\"ip\":\"" + ipText() +
                    "\",\"http_port\":80,\"rendezvous_v\":" + String((unsigned)(rv2Enabled ? RV2_SUPPORTED : 0)) +
-                   ",\"rv_max\":" + String((unsigned)RV2_SUPPORTED) + ",\"templates\":[";
+                   ",\"rv_max\":" + String((unsigned)RV2_SUPPORTED) +
+                   ",\"v2_bundle\":" + String(v2BundleReady ? "true" : "false") + ",\"templates\":[";
     String active = tplStoreActive();
     for (int i = 0; i < tplStoreCount(); i++) {
         TplMeta m;
@@ -1465,23 +1483,22 @@ static bool v2ActiveLoad() {
 }
 
 // Active-template switch (BOOT key cycle): new context, re-prime regions.
-static void v2SwitchActive(uint8_t index) {
+static bool v2SwitchActive(uint8_t index) {
     char ctx[BS_CTX_LEN];
     snprintf(ctx, sizeof(ctx), "%08x%08x", v2CtxGen.next(), (unsigned)esp_random());
     String err;
     if (!bsSetActive(index, ctx, err)) {
         DevLog.printf("[v2] activate failed: %s\n", err.c_str());
-        return;
+        return false;
     }
     bsProfile(v2Profile);
     v2DataSeq.beginContext(v2NowMs(), 1);
     v2AppliedFields = "";
     if (!v2ActiveLoad()) {
-        // Controlled recovery: fall back to the first installed template.
-        v2Profile.initial = 0;
-        v2ActiveLoad();
+        return false;
     }
     DevLog.printf("[v2] active=%s ctx=%s\n", activeTplId.c_str(), v2Profile.contextId);
+    return true;
 }
 
 static void renderActiveUsage(const String &json, const char *channel) {
@@ -1603,6 +1620,7 @@ static void applyEnvelopeMeta(JsonDocument &doc, const String &mac) {
 // endpoint; otherwise try same-BSSID endpoints first (MRU), then the rest.
 // Per-endpoint timeout is 2 s.
 static bool tryWifiUsage() {
+    if (v2BundleReady) return false;
     if (WiFi.status() != WL_CONNECTED) return false;
     int n = storeCount();
     if (n <= 0) return false;
@@ -1717,6 +1735,10 @@ static void handleUsagePost() {
         server.send(409, "application/json",
                     String("{\"accepted\":false,\"error\":\"occupied\",\"owner\":") +
                         ownerJson() + "}");
+        return;
+    }
+    if (v2BundleReady) {
+        server.send(409, "application/json", "{\"accepted\":false,\"error\":\"v2_required\"}");
         return;
     }
     adoptServerTime(parsed);
@@ -1900,6 +1922,11 @@ static void deepSleepFor(uint32_t sec) {
 }
 
 static void handleBleUsage(const String &json) {
+    if (v2BundleReady) {
+        bleNotifyStatusQuiet("{\"ack\":\"usage\",\"ok\":false,\"err\":\"v2_required\"}");
+        return;
+    }
+
     JsonDocument parsed;
     if (deserializeJson(parsed, json) || parsed.as<JsonObject>().isNull()) {
         bleNotifyStatus("{\"ack\":\"usage\",\"ok\":false}");
@@ -2270,8 +2297,8 @@ static void handleStatusJson() {
                                     ? String(v2Profile.ids[v2Profile.initial])
                                     : tplStoreActive();
     doc["committed_job_id"] = v2Profile.jobId;
-    doc["data_seq"] = (unsigned long)v2DataSeq.appliedSeq();
-    doc["applied_seq"] = (unsigned long)v2DataSeq.appliedSeq();
+    doc["data_seq"] = v2DataSeq.appliedSeq();
+    doc["applied_seq"] = v2DataSeq.appliedSeq();
     doc["last_acked_at_ms"] = (unsigned long)v2LastAckAtMs;
     doc["display_state"] = v2DisplayState == 1 ? "displayed"
                           : v2DisplayState == 2 ? "pending"
@@ -2281,7 +2308,7 @@ static void handleStatusJson() {
     {
         JsonObject power = doc["power"].to<JsonObject>();
         power["mode"] = (rtcMode == MODE_DEEP) ? "sleep" : "light";
-        power["plan_id"] = (unsigned long)v2Plan.acceptedId();
+        power["plan_id"] = v2Plan.acceptedId();
         power["remaining_s"] = v2Plan.remainingS(v2NowMs());
         power["granted_s"] = v2Plan.grantedS();
         power["provisional"] = v2Provisional && !v2Plan.accepted();
@@ -2594,7 +2621,7 @@ static void handleDiag() {
         DevLog.printf("[diag] frame_capture=%u\n", (unsigned)rtcFrameCapture);
     }
     // BLE rendezvous v2 gate (design §10): persisted rollback switch. Off by
-    // default; enabling only advertises `rendezvous_v` once the transaction
+    // a diagnostic rollback; enabling advertises `rendezvous_v` once the transaction
     // layer exists (stage 3+).
     if (server.hasArg("rv2")) {
         rv2Enabled = server.arg("rv2").toInt() ? 1 : 0;
@@ -2900,19 +2927,13 @@ static void handleBleAuth(const String &json) {
     bleNotifyStatusQuiet(String("{\"ack\":\"auth\",\"ok\":true,\"token\":\"") + authToken + "\"}");
 }
 
-// v2 rendezvous control stub (design §5.1/§12.3). Stage 1 routes `rv:2`
-// frames here instead of the legacy template path and answers a bounded
-// NACK; the transaction layer arrives in stage 3 behind the same gate.
+// Bounded mailbox from NimBLE's callback task to the device loop task.
+static QueueHandle_t v2BleQueue = nullptr;
+struct V2BleMessage { String body; String peer; };
 static void handleBleV2Ctrl(const String &json) {
-    JsonDocument doc;
-    if (deserializeJson(doc, json)) {
-        bleNotifyStatusQuiet("{\"ack\":\"v2\",\"ok\":false,\"err\":\"malformed\"}");
-        return;
-    }
-    const char *op = doc["op"] | "";
-    DevLog.printf("[ble] v2 control op=%s enabled=%u (not implemented)\n",
-                  op, (unsigned)rv2Enabled);
-    bleNotifyStatusQuiet("{\"ack\":\"v2\",\"ok\":false,\"err\":\"not_ready\"}");
+    if (!v2BleQueue || json.length() > 8192 || !blePeerIsBonded() || !blePeerIsEncrypted()) return;
+    auto *message = new V2BleMessage{json, blePeerAddress()};
+    if (xQueueSend(v2BleQueue, &message, 0) != pdTRUE) delete message;
 }
 
 static void handleUpdatePage() {
@@ -2997,7 +3018,8 @@ static void serviceLed() {
 }
 
 static void enterBleOn(bool userInitiated) {
-    if (!wifiUp) return;
+    if (!wifiUp && !(rv2Enabled && v2BundleReady)) return;
+    if (!v2BleQueue) v2BleQueue = xQueueCreate(2, sizeof(V2BleMessage *));
     if (!bleInitialized()) {
         bleBegin("CodexStatus-" + macSuffix(), FW_VERSION);
         bleSetHandlers(handleBleUsage, handleBleEndpoint);
@@ -3030,6 +3052,8 @@ static void bleOff(const char *reason) {
     lastBleAuto = false;
     bleAdvertiseStop();
     bleDeinit();
+    V2BleMessage *pending = nullptr;
+    while (v2BleQueue && xQueueReceive(v2BleQueue, &pending, 0) == pdTRUE) delete pending;
     ledSet(false);
     ledFlash();
     DevLog.printf("[ble] session off (%s)\n", reason ? reason : "");
@@ -3188,6 +3212,19 @@ static void otaUploadCleanup(const char *reason) {
 
 // `bridge_id` arrives in the JSON body for data/plan; bundle/activate calls also
 // carry it there (the query/form fallback exists for simple curl tests).
+static bool v2ReplyOverBle = false;
+static String v2RequestId;
+static void v2Response(int status, const String &body) {
+    if (!v2ReplyOverBle) { server.send(status, "application/json", body); return; }
+    JsonDocument doc;
+    if (deserializeJson(doc, body)) return;
+    doc["ack"] = "v2";
+    doc["request_id"] = v2RequestId;
+    String reply;
+    serializeJson(doc, reply);
+    bleNotifyStatusQuiet(reply);
+}
+
 static String v2BodyBridgeId(const String &body) {
     JsonDocument doc;
     if (deserializeJson(doc, body)) return server.arg("bridge_id");
@@ -3197,7 +3234,7 @@ static String v2BodyBridgeId(const String &body) {
 
 static bool v2OwnerOk(const char *bridgeId) {
     if (!ownerAllows(bridgeId)) {
-        server.send(409, "application/json",
+        v2Response(409,
                     String("{\"result\":\"rejected\",\"error\":\"occupied\",\"owner\":") +
                         ownerJson() + "}");
         DevLog.printf("[v2] rejected: owner conflict id=%s\n", bridgeId ? bridgeId : "?");
@@ -3207,7 +3244,7 @@ static bool v2OwnerOk(const char *bridgeId) {
 }
 
 static void v2Ack(const char *op, const char *result, const char *display,
-                  const char *retention, const char *error, long seq, uint64_t planId,
+                  const char *retention, const char *error, int64_t seq, uint64_t planId,
                   const char *context, uint32_t acceptedRemainingS) {
     JsonDocument doc;
     doc["op"] = op;
@@ -3222,7 +3259,35 @@ static void v2Ack(const char *op, const char *result, const char *display,
     doc["fw_target"] = FW_TARGET_ID;
     String out;
     serializeJson(doc, out);
-    server.send(200, "application/json", out);
+    v2Response(200, out);
+}
+
+// Only authenticated status exposes this boot session nonce.
+static const String &v2Nonce() {
+    if (!v2SessionNonce.length()) {
+        char nonce[33];
+        snprintf(nonce, sizeof(nonce), "%08x%08x%08x%08x", (unsigned)esp_random(),
+                 (unsigned)esp_random(), (unsigned)esp_random(), (unsigned)esp_random());
+        v2SessionNonce = nonce;
+    }
+    return v2SessionNonce;
+}
+
+static bool v2Command(const String &body, JsonDocument &doc) {
+    if (deserializeJson(doc, body)) {
+        v2Ack("command", "rejected", "unchanged", "ram", "json", -1, 0, nullptr, UINT32_MAX);
+        return false;
+    }
+    if (!v2OwnerOk(doc["bridge_id"] | "")) return false;
+    const char *request = doc["request_id"] | "";
+    v2RequestId = request;
+    if ((doc["protocol"] | 0) != 2 || String(doc["device_mac"] | "") != macText() ||
+        !*request || strlen(request) > 64 ||
+        v2Nonce() != (doc["session_nonce"] | "")) {
+        v2Ack("command", "rejected", "unchanged", "ram", "session", -1, 0, nullptr, UINT32_MAX);
+        return false;
+    }
+    return true;
 }
 
 // GET /v2/status: authenticated authoritative state (the beacon only points).
@@ -3237,12 +3302,15 @@ static void handleV2Status() {
     }
     JsonDocument doc;
     doc["result"] = "applied";
+    doc["protocol"] = 2;
+    doc["device_mac"] = macText();
+    doc["session_nonce"] = v2Nonce();
     doc["active_context_id"] = v2Profile.contextId;
     doc["active_template_id"] =
         (v2BundleReady && v2Profile.count) ? v2Profile.ids[v2Profile.initial] : activeTplId;
     doc["committed_job_id"] = v2Profile.jobId;
-    doc["data_seq"] = (unsigned long)v2DataSeq.appliedSeq();
-    doc["applied_seq"] = (unsigned long)v2DataSeq.appliedSeq();
+    doc["data_seq"] = v2DataSeq.appliedSeq();
+    doc["applied_seq"] = v2DataSeq.appliedSeq();
     doc["display_state"] = v2DisplayState == 1 ? "displayed"
                           : v2DisplayState == 2 ? "pending"
                           : v2DisplayState == 3 ? "failed"
@@ -3253,7 +3321,7 @@ static void handleV2Status() {
     for (uint8_t i = 0; i < v2Profile.count; i++) doc["template_ids"].add(v2Profile.ids[i]);
     JsonObject power = doc["power"].to<JsonObject>();
     power["mode"] = (rtcMode == MODE_DEEP) ? "sleep" : "light";
-    power["plan_id"] = (unsigned long)v2Plan.acceptedId();
+    power["plan_id"] = v2Plan.acceptedId();
     power["remaining_s"] = v2Plan.remainingS(v2NowMs());
     power["granted_s"] = v2Plan.grantedS();
     power["provisional"] = v2Provisional && !v2Plan.accepted();
@@ -3267,74 +3335,51 @@ static void handleV2Status() {
 }
 
 // POST /v2/data: atomic complete snapshot inside the current context.
-static void handleV2Data() {
-    DevLog.printf("[v2] req data heap=%u", (unsigned)ESP.getFreeHeap());
-    String mac;
-    if (!endpointTokenAuthorized(mac)) {
-        server.send(401, "application/json", "{\"result\":\"unauthorized\"}");
-        return;
-    }
-    String body = server.arg("plain");
+static void applyV2Data(const String &body) {
     JsonDocument peek;
-    if (deserializeJson(peek, body)) {
-        v2Ack("data", "rejected", "failed", "ram", "json", -1, 0, nullptr, UINT32_MAX);
-        return;
-    }
-    if (!v2OwnerOk(peek["bridge_id"] | "")) return;
+    if (!v2Command(body, peek)) return;
     if (!v2BundleReady || !v2CtValid) {
         v2Ack("data", "rejected", "failed", "ram", "unconfigured", -1, 0, nullptr,
               UINT32_MAX);
         return;
     }
     uint64_t seq = peek["seq"] | 0ULL;
-    uint32_t crc = 0;
-    strtoul(peek["crc"] | "", nullptr, 16);
-    V2DataAck obs = v2DataSeq.observe(seq, 0);
     String usage, err;
-    V2DataAck rc = v2ApplyData(v2Ct, body, v2Profile.contextId, usage, err);
+    V2DataAck rc = v2AcceptData(v2Ct, body, v2Profile.contextId, v2DataSeq, usage, err);
     if (rc == V2_DATA_CONTEXT_MISMATCH) {
-        v2Ack("data", "rejected", "pending", "ram", "context", (long)seq, 0,
+        v2Ack("data", "rejected", "pending", "ram", "context", (int64_t)seq, 0,
               v2Profile.contextId, UINT32_MAX);
         return;
     }
-    if (rc != V2_DATA_APPLIED) {
-        v2Ack("data", "rejected", "failed", "ram", err.c_str(), (long)seq, 0,
+    if (rc == V2_DATA_REJECTED) {
+        v2Ack("data", "rejected", "failed", "ram", err.c_str(), (int64_t)seq, 0,
               v2Profile.contextId, UINT32_MAX);
         return;
     }
-    if (obs == V2_DATA_UNCHANGED) {
-        v2Ack("data", "applied", "unchanged", "ram", nullptr, (long)seq, 0,
+    if (rc == V2_DATA_UNCHANGED) {
+        v2Ack("data", "applied", "unchanged", "ram", nullptr, (int64_t)seq, 0,
               v2Profile.contextId, UINT32_MAX);
         return;
     }
-    if (obs == V2_DATA_CONFLICT || obs == V2_DATA_STALE) {
+    if (rc == V2_DATA_CONFLICT || rc == V2_DATA_STALE) {
         v2Ack("data", "rejected", "unchanged", "ram",
-              obs == V2_DATA_CONFLICT ? "seq_conflict" : "stale_seq", (long)seq, 0,
+              rc == V2_DATA_CONFLICT ? "seq_conflict" : "stale_seq", (int64_t)seq, 0,
               v2Profile.contextId, UINT32_MAX);
         return;
     }
     v2AppliedFields = "";
     serializeJson(peek["fields"], v2AppliedFields);
-    v2DataSeq.noteApplied(seq, 0);
     v2LastAckSeq = seq;
     v2LastAckAtMs = v2NowMs();
-    // Bounded RAM/RTC retention: checkpoint at most once per minute.
-    static uint32_t lastCheckpointAt = 0;
-    if (v2Millis32() - lastCheckpointAt > 60000UL) {
-        lastCheckpointAt = v2Millis32();
-        Preferences p;
-        p.begin("v2", false);
-        p.putULong64("dseq", seq);
-        p.putString("dfields", v2AppliedFields.length() > 4000
-                                   ? v2AppliedFields.substring(0, 4000)
-                                   : v2AppliedFields);
-        p.end();
-    }
+    // Update on every accepted snapshot, before replying. No NVS wear and no
+    // truncated field JSON; timer/physical deep wakes retain the exact baseline.
+    v2DataCheckpoint.save(v2Profile.contextId, v2DataSeq);
+    usageCacheSave(usage);
     uint32_t before = epdWriteCount;
     uint32_t busyBefore = rtcEpdBusyFails;
     lastUsage = usage;
-    lastChannel = "PULL";
-    renderActiveUsage(usage, "PULL");
+    lastChannel = v2ReplyOverBle ? "BLE" : "PULL";
+    renderActiveUsage(usage, lastChannel.c_str());
     const char *display = "unchanged";
     if (rtcEpdBusyFails != busyBefore) {
         display = "failed";
@@ -3345,28 +3390,32 @@ static void handleV2Data() {
     } else {
         v2DisplayState = 1;
     }
-    v2Ack("data", "applied", display, "ram", nullptr, (long)seq, 0, v2Profile.contextId,
+    v2Ack("data", "applied", display, "ram", nullptr, (int64_t)seq, 0, v2Profile.contextId,
           UINT32_MAX);
 }
 
-// POST /v2/plan: the only way to change the light deadline.
-static void handleV2Plan() {
-    DevLog.printf("[v2] req plan heap=%u", (unsigned)ESP.getFreeHeap());
+static void handleV2Data() {
+    DevLog.printf("[v2] req data heap=%u", (unsigned)ESP.getFreeHeap());
     String mac;
     if (!endpointTokenAuthorized(mac)) {
         server.send(401, "application/json", "{\"result\":\"unauthorized\"}");
         return;
     }
-    String body = server.arg("plain");
+    applyV2Data(server.arg("plain"));
+}
+
+// POST /v2/plan: the only way to change the light deadline.
+static void applyV2Plan(const String &body) {
     JsonDocument doc;
-    if (deserializeJson(doc, body)) {
-        v2Ack("plan", "rejected", "unchanged", "ram", "json", -1, 0, nullptr, UINT32_MAX);
-        return;
-    }
-    if (!v2OwnerOk(doc["bridge_id"] | "")) return;
+    if (!v2Command(body, doc)) return;
     V2PowerPlan plan;
     plan.planId = doc["plan_id"] | 0ULL;
     const char *mode = doc["mode"] | "sleep";
+    if (!doc["plan_id"].is<uint64_t>() || (!strcmp(mode, "light") && !doc["light_duration_s"].is<uint32_t>()) ||
+        (strcmp(mode, "light") && strcmp(mode, "sleep"))) {
+        v2Ack("plan", "rejected", "unchanged", "ram", "plan_shape", -1, 0, nullptr, UINT32_MAX);
+        return;
+    }
     plan.mode = strcmp(mode, "light") == 0 ? V2_PLAN_LIGHT : V2_PLAN_SLEEP;
     plan.lightDurationS = doc["light_duration_s"] | 0u;
     plan.rendezvousPeriodS = doc["rendezvous_period_s"] | V2_RENDEZVOUS_S;
@@ -3380,7 +3429,7 @@ static void handleV2Plan() {
     }
     v2PlanReason = "bridge";
     if (plan.mode == V2_PLAN_LIGHT) {
-        v2LightDeadlineMs = v2NowMs() + (uint64_t)v2Plan.grantedS() * 1000ULL;
+        v2LightDeadlineMs = v2Plan.deadlineMs();
         v2Provisional = false;
         if (rtcMode != MODE_LIGHT) {
             rtcMode = MODE_LIGHT;
@@ -3397,202 +3446,174 @@ static void handleV2Plan() {
           nullptr, -1, plan.planId, v2Profile.contextId, v2Plan.grantedS());
 }
 
-// POST /v2/activate?id=: explicit remote activation (new device context).
-static void handleV2Activate() {
-    DevLog.printf("[v2] req activate heap=%u", (unsigned)ESP.getFreeHeap());
+static void handleV2Plan() {
+    DevLog.printf("[v2] req plan heap=%u", (unsigned)ESP.getFreeHeap());
     String mac;
     if (!endpointTokenAuthorized(mac)) {
         server.send(401, "application/json", "{\"result\":\"unauthorized\"}");
         return;
     }
-    String id = server.arg("id");
-    String bridgeId = v2BodyBridgeId(server.arg("plain"));
-    if (!v2OwnerOk(bridgeId.c_str())) return;
-    if (!v2BundleReady) {
-        v2Ack("activate", "rejected", "unchanged", "ram", "unconfigured", -1, 0, nullptr,
-              UINT32_MAX);
+    applyV2Plan(server.arg("plain"));
+}
+
+// One activation result per boot session. Expected context prevents delayed
+// commands from activating after a local switch or a subsequent publication.
+static String v2ActivateRequest, v2ActivateOwner, v2ActivateExpected;
+static String v2ActivateTemplate, v2ActivateContext;
+static void handleV2Activate() {
+    String mac;
+    if (!endpointTokenAuthorized(mac)) {
+        server.send(401, "application/json", "{\"result\":\"unauthorized\"}");
+        return;
+    }
+    JsonDocument doc;
+    if (!v2Command(server.arg("plain"), doc)) return;
+    String id = doc["template_id"] | "";
+    String owner = doc["bridge_id"] | "";
+    String request = doc["request_id"] | "";
+    String expected = doc["expected_active_context_id"] | "";
+    if (request == v2ActivateRequest && owner == v2ActivateOwner) {
+        bool same = id == v2ActivateTemplate && expected == v2ActivateExpected;
+        v2Ack("activate", same ? "applied" : "rejected", "unchanged", "flash",
+              same ? nullptr : "request_conflict", -1, 0,
+              v2ActivateContext.c_str(), UINT32_MAX);
+        return;
+    }
+    if (!v2BundleReady || expected != v2Profile.contextId) {
+        v2Ack("activate", "rejected", "unchanged", "flash", "context", -1, 0,
+              v2Profile.contextId, UINT32_MAX);
         return;
     }
     int index = -1;
     for (uint8_t i = 0; i < v2Profile.count; i++) {
         if (id == v2Profile.ids[i]) { index = i; break; }
     }
-    if (index < 0) {
-        v2Ack("activate", "rejected", "unchanged", "ram", "unknown_template", -1, 0,
+    if (index < 0 || !v2SwitchActive((uint8_t)index)) {
+        v2Ack("activate", "rejected", "unchanged", "flash",
+              index < 0 ? "unknown_template" : "activation_failed", -1, 0,
               v2Profile.contextId, UINT32_MAX);
         return;
     }
-    v2SwitchActive((uint8_t)index);
+    v2ActivateRequest = request; v2ActivateOwner = owner; v2ActivateExpected = expected;
+    v2ActivateTemplate = id; v2ActivateContext = v2Profile.contextId;
     renderCurrent();
     v2Ack("activate", "applied", "displayed", "flash", nullptr, -1, 0,
           v2Profile.contextId, UINT32_MAX);
 }
 
-// POST /v2/bundle: bounded complete Bundle install (whole body <= 256 KiB).
-static void handleV2Bundle() {
-    DevLog.printf("[v2] req bundle heap=%u", (unsigned)ESP.getFreeHeap());
-    String mac;
-    if (!endpointTokenAuthorized(mac)) {
-        server.send(401, "application/json", "{\"result\":\"unauthorized\"}");
-        return;
-    }
-    String body = server.arg("plain");
-    if (body.length() == 0 || body.length() > BS_MAX_BUNDLE_BYTES) {
-        v2Ack("bundle", "rejected", "unchanged", "flash", "size", -1, 0, nullptr,
-              UINT32_MAX);
-        return;
-    }
-    JsonDocument peek;
-    if (deserializeJson(peek, body)) {
-        v2Ack("bundle", "rejected", "unchanged", "flash", "json", -1, 0, nullptr,
-              UINT32_MAX);
-        return;
-    }
-    if (!v2OwnerOk(peek["bridge_id"] | "")) return;
-    char ctx[BS_CTX_LEN];
-    snprintf(ctx, sizeof(ctx), "%08x%08x", v2CtxGen.next(), (unsigned)esp_random());
-    String err;
-    if (!bsInstall(body, FW_TARGET_ID, RENDER_TARGET_ID, ctx, err)) {
-        // Failed installs leave the current slot and context untouched.
-        v2Ack("bundle", "rejected", "unchanged", "flash", err.c_str(), -1, 0,
-              v2Profile.contextId, UINT32_MAX);
-        return;
-    }
-    bsProfile(v2Profile);
-    v2BundleReady = true;
-    v2DataSeq.beginContext(v2NowMs(), 1);
-    v2AppliedFields = "";
-    v2ActiveLoad();
-    renderCurrent();
-    v2Ack("bundle", "applied", "displayed", "flash", nullptr, -1, 0, v2Profile.contextId,
-          UINT32_MAX);
+// Owner/session-bound transfer; reading and writing never renews power.
+static String v2CommittedRequest, v2CommittedOwner, v2CommittedContext;
+static uint32_t v2CommittedCrc = 0, v2CommittedLength = 0;
+
+static void v2BundleError(const char *error) {
+    v2Ack("bundle", "rejected", "unchanged", "flash", error, -1, 0,
+          v2Profile.contextId, UINT32_MAX);
 }
 
-// Bounded BEGIN/CHUNK/COMMIT transport for large bundles (offset checked).
+static bool v2BundleReplay(JsonDocument &doc) {
+    if (v2CommittedRequest != (doc["request_id"] | "") ||
+        v2CommittedOwner != (doc["bridge_id"] | "")) return false;
+    uint32_t crc = 0;
+    if (!v2ParseCrc(doc["content_crc"] | "", crc) || crc != v2CommittedCrc ||
+        (doc["length"] | 0u) != v2CommittedLength) {
+        v2BundleError("request_conflict");
+    } else {
+        v2Ack("bundle", "applied", "unchanged", "flash", nullptr, -1, 0,
+              v2CommittedContext.c_str(), UINT32_MAX);
+    }
+    return true;
+}
+
 static void handleV2BundleBegin() {
-    DevLog.printf("[v2] req bundle/begin heap=%u", (unsigned)ESP.getFreeHeap());
     String mac;
     if (!endpointTokenAuthorized(mac)) {
-        server.send(401, "application/json", "{\"result\":\"unauthorized\"}");
-        return;
+        server.send(401, "application/json", "{\"result\":\"unauthorized\"}"); return;
     }
-    String bridgeId = v2BodyBridgeId(server.arg("plain"));
-    if (!v2OwnerOk(bridgeId.c_str())) return;
-    uint32_t len = (uint32_t)server.arg("len").toInt();
-    if (len == 0 || len > BS_MAX_BUNDLE_BYTES) {
-        v2Ack("bundle", "rejected", "unchanged", "flash", "size", -1, 0, nullptr,
-              UINT32_MAX);
-        return;
+    JsonDocument doc;
+    if (!v2Command(server.arg("plain"), doc) || v2BundleReplay(doc)) return;
+    const char *owner = doc["bridge_id"] | "";
+    const char *request = doc["request_id"] | "";
+    uint32_t len = doc["length"] | 0u, crc = 0;
+    if (!v2ParseCrc(doc["content_crc"] | "", crc)) { v2BundleError("crc"); return; }
+    if (v2Rx.live(v2NowMs())) {
+        if (!v2Rx.matches(owner, request, v2Nonce().c_str())) { v2BundleError("busy"); return; }
+        if (v2Rx.length != len || v2Rx.crc != crc) { v2BundleError("request_conflict"); return; }
+    } else {
+        V2BundleRx next;
+        if (!next.begin(owner, request, v2Nonce().c_str(), len, crc, v2NowMs())) {
+            v2BundleError("size"); return;
+        }
+        if (!LittleFS.exists("/bundle")) LittleFS.mkdir("/bundle");
+        File f = LittleFS.open(v2RxPath, "w");
+        if (!f) { v2BundleError("open"); return; }
+        f.close();
+        v2Rx = next;
     }
-    if (!LittleFS.exists("/bundle")) LittleFS.mkdir("/bundle");
-    File f = LittleFS.open(v2RxPath, "w");
-    if (!f) {
-        DevLog.printf("[v2] bundle begin open failed (dir=%d)\n",
-                      LittleFS.exists("/bundle") ? 1 : 0);
-        v2Ack("bundle", "rejected", "unchanged", "flash", "open", -1, 0, nullptr,
-              UINT32_MAX);
-        return;
-    }
-    f.close();
-    v2RxOffset = 0;
-    v2RxCrc = 0;
-    v2RxDeadlineMs = v2NowMs() + 120000ULL;   // bounded receive window
-    server.send(200, "application/json", "{\"result\":\"applied\",\"op\":\"bundle_begin\"}");
+    server.send(200, "application/json", String("{\"result\":\"applied\",\"next_offset\":") +
+                String(v2Rx.offset) + "}");
 }
 
 static void handleV2BundleChunk() {
     String mac;
     if (!endpointTokenAuthorized(mac)) {
-        server.send(401, "application/json", "{\"result\":\"unauthorized\"}");
-        return;
+        server.send(401, "application/json", "{\"result\":\"unauthorized\"}"); return;
     }
-    if (v2RxDeadlineMs == 0 || v2NowMs() > v2RxDeadlineMs) {
-        v2RxOffset = 0;
-        v2RxDeadlineMs = 0;
-        v2Ack("bundle", "rejected", "unchanged", "flash", "timeout", -1, 0, nullptr,
-              UINT32_MAX);
-        return;
-    }
+    if (!v2OwnerOk(v2Rx.owner)) return;
+    if (server.arg("request_id") != v2Rx.request || server.arg("session_nonce") != v2Rx.nonce ||
+        !v2Rx.live(v2NowMs())) { v2BundleError("session"); return; }
     uint32_t offset = (uint32_t)server.arg("offset").toInt();
-    if (offset != v2RxOffset) {
-        v2RxOffset = 0;
-        v2RxDeadlineMs = 0;
-        v2Ack("bundle", "rejected", "unchanged", "flash", "offset", -1, 0, nullptr,
-              UINT32_MAX);
-        return;
-    }
     String body = server.arg("plain");
-    if (body.length() == 0 || v2RxOffset + body.length() > BS_MAX_BUNDLE_BYTES) {
-        v2RxOffset = 0;
-        v2RxDeadlineMs = 0;
-        v2Ack("bundle", "rejected", "unchanged", "flash", "size", -1, 0, nullptr,
-              UINT32_MAX);
-        return;
+    // An ACK-lost chunk is a replay only when every stored byte is identical.
+    if (offset < v2Rx.offset && body.length() && body.length() <= 16384 &&
+        body.length() <= v2Rx.offset - offset) {
+        File f = LittleFS.open(v2RxPath, "r");
+        bool same = f && f.seek(offset);
+        for (size_t i = 0; same && i < body.length(); ++i) same = f.read() == (uint8_t)body[i];
+        if (f) f.close();
+        if (!same) { v2BundleError("chunk_conflict"); return; }
+    } else {
+        if (!v2Rx.append(offset, body.length(), v2NowMs())) { v2BundleError("offset_or_size"); return; }
+        File f = LittleFS.open(v2RxPath, "a");
+        bool ok = f && f.write((const uint8_t *)body.c_str(), body.length()) == body.length();
+        if (f) f.close();
+        if (!ok) { v2Rx.deadline = 0; v2BundleError("write"); return; }
+        v2Rx.offset += body.length();
     }
-    File f = LittleFS.open(v2RxPath, v2RxOffset == 0 ? "w" : "a");
-    if (!f) {
-        v2RxDeadlineMs = 0;
-        v2Ack("bundle", "rejected", "unchanged", "flash", "open", -1, 0, nullptr,
-              UINT32_MAX);
-        return;
-    }
-    bool ok = f.write((const uint8_t *)body.c_str(), body.length()) == body.length();
-    f.close();
-    if (!ok) {
-        v2RxDeadlineMs = 0;
-        v2Ack("bundle", "rejected", "unchanged", "flash", "write", -1, 0, nullptr,
-              UINT32_MAX);
-        return;
-    }
-    v2RxOffset += body.length();
-    v2RxCrc = v2Crc32((const uint8_t *)body.c_str(), body.length());
-    server.send(200, "application/json",
-                String("{\"result\":\"applied\",\"op\":\"bundle_chunk\",\"next_offset\":") +
-                    String(v2RxOffset) + "}");
+    server.send(200, "application/json", String("{\"result\":\"applied\",\"next_offset\":") +
+                String(v2Rx.offset) + "}");
 }
 
 static void handleV2BundleCommit() {
-    DevLog.printf("[v2] req bundle/commit heap=%u", (unsigned)ESP.getFreeHeap());
     String mac;
     if (!endpointTokenAuthorized(mac)) {
-        server.send(401, "application/json", "{\"result\":\"unauthorized\"}");
-        return;
+        server.send(401, "application/json", "{\"result\":\"unauthorized\"}"); return;
     }
-    String bridgeId = v2BodyBridgeId(server.arg("plain"));
-    if (!v2OwnerOk(bridgeId.c_str())) return;
-    uint32_t len = (uint32_t)server.arg("len").toInt();
-    if (v2RxDeadlineMs == 0 || v2RxOffset != len || len == 0) {
-        v2RxDeadlineMs = 0;
-        v2Ack("bundle", "rejected", "unchanged", "flash", "length", -1, 0, nullptr,
-              UINT32_MAX);
-        return;
-    }
+    JsonDocument doc;
+    if (!v2Command(server.arg("plain"), doc) || v2BundleReplay(doc)) return;
+    const char *owner = doc["bridge_id"] | "";
+    const char *request = doc["request_id"] | "";
+    uint32_t crc = 0;
+    if (!v2ParseCrc(doc["content_crc"] | "", crc)) { v2BundleError("crc"); return; }
+    if (!v2Rx.matches(owner, request, v2Nonce().c_str()) ||
+        !v2Rx.complete(doc["length"] | 0u, crc, v2NowMs())) { v2BundleError("session_or_length"); return; }
     File f = LittleFS.open(v2RxPath, "r");
-    if (!f) {
-        v2RxDeadlineMs = 0;
-        v2Ack("bundle", "rejected", "unchanged", "flash", "open", -1, 0, nullptr,
-              UINT32_MAX);
-        return;
-    }
+    if (!f || f.size() != v2Rx.length) { if (f) f.close(); v2BundleError("length"); return; }
     String body;
-    body.reserve(len);
+    body.reserve(v2Rx.length);
     while (f.available()) body += (char)f.read();
     f.close();
-    v2RxDeadlineMs = 0;
-    v2RxOffset = 0;
-    if ((uint32_t)body.length() != len) {
-        v2Ack("bundle", "rejected", "unchanged", "flash", "short", -1, 0, nullptr,
-              UINT32_MAX);
-        return;
-    }
+    if (body.length() != v2Rx.length || v2CrcOf(body) != crc) { v2BundleError("crc"); return; }
+    if (v2BodyBridgeId(body) != owner) { v2BundleError("owner"); return; }
     char ctx[BS_CTX_LEN];
     snprintf(ctx, sizeof(ctx), "%08x%08x", v2CtxGen.next(), (unsigned)esp_random());
     String err;
     if (!bsInstall(body, FW_TARGET_ID, RENDER_TARGET_ID, ctx, err)) {
-        v2Ack("bundle", "rejected", "unchanged", "flash", err.c_str(), -1, 0,
-              v2Profile.contextId, UINT32_MAX);
-        return;
+        v2BundleError(err.c_str()); return;
     }
+    v2CommittedOwner = owner; v2CommittedRequest = request;
+    v2CommittedCrc = crc; v2CommittedLength = v2Rx.length; v2CommittedContext = ctx;
+    v2Rx.deadline = 0;
+    LittleFS.remove(v2RxPath);
     bsProfile(v2Profile);
     v2BundleReady = true;
     v2DataSeq.beginContext(v2NowMs(), 1);
@@ -3601,6 +3622,80 @@ static void handleV2BundleCommit() {
     renderCurrent();
     v2Ack("bundle", "applied", "displayed", "flash", nullptr, -1, 0, v2Profile.contextId,
           UINT32_MAX);
+}
+
+static void serviceV2Ble() {
+    if (!v2BleQueue) return;
+    V2BleMessage *message = nullptr;
+    if (xQueueReceive(v2BleQueue, &message, 0) != pdTRUE) return;
+    String body = message->body, peer = message->peer;
+    delete message;
+    if (!blePeerIsBonded() || !blePeerIsEncrypted() || peer != blePeerAddress()) return;
+    JsonDocument doc;
+    if (deserializeJson(doc, body)) return;
+    v2RequestId = doc["request_id"] | "";
+    if (!v2RequestId.length() || v2RequestId.length() > 64) return;
+    bool authenticated = false;
+    for (int i = 0; i < storeCount(); ++i) {
+        EndpointRec endpoint;
+        if (storeGet(i, endpoint) && endpoint.token.length() &&
+            endpoint.token == (doc["token"] | "") && endpoint.mac == peer) {
+            authenticated = true; break;
+        }
+    }
+    v2ReplyOverBle = true;
+    if (!authenticated || !rv2Enabled) {
+        v2Ack("command", "rejected", "unchanged", "ram",
+              authenticated ? "disabled" : "unauthorized", -1, 0, nullptr, UINT32_MAX);
+    } else {
+        const char *op = doc["op"] | "";
+        if (!strcmp(op, "status")) {
+            JsonDocument state;
+            state["result"] = "applied";
+            state["session_nonce"] = v2Nonce();
+            state["device_mac"] = macText();
+            state["active_context_id"] = v2Profile.contextId;
+            state["active_template_id"] = v2Profile.count ? v2Profile.ids[v2Profile.initial] : "";
+            state["committed_job_id"] = v2Profile.jobId;
+            state["applied_seq"] = v2DataSeq.appliedSeq();
+            state["data_seq"] = v2DataSeq.appliedSeq();
+            state["power"]["mode"] = v2Plan.lightActive(v2NowMs()) ? "light" : "sleep";
+            state["power"]["plan_id"] = v2Plan.acceptedId();
+            state["power"]["remaining_s"] = v2Plan.remainingS(v2NowMs());
+            state["power"]["provisional_remaining_s"] = v2Provisional ?
+                V2PlanState::bootProvisionalRemaining(v2BootMs, v2NowMs()) : 0;
+            String out;
+            serializeJson(state, out);
+            v2Response(200, out);
+        } else if (!strcmp(op, "data")) {
+            applyV2Data(body);
+        } else if (!strcmp(op, "plan")) {
+            applyV2Plan(body);
+        } else {
+            v2Ack(op, "rejected", "unchanged", "ram", "http_required", -1, 0, nullptr, UINT32_MAX);
+        }
+    }
+    v2ReplyOverBle = false;
+    v2RequestId = "";
+}
+
+// Timer wakes only open BLE; Wi-Fi requires an accepted light plan.
+static bool v2Rendezvous() {
+    enterBleOn(false);
+    const uint64_t deadline = v2NowMs() + 15000;
+    uint64_t answeredAt = 0;
+    while (v2NowMs() < deadline) {
+        blePoll();
+        serviceV2Ble();
+        if (v2Plan.accepted()) {
+            if (!answeredAt) answeredAt = v2NowMs();
+            if (v2NowMs() - answeredAt >= 500) break;
+        }
+        delay(10);
+    }
+    bool light = v2Plan.lightActive(v2NowMs());
+    bleOff("rendezvous complete");
+    return light;
 }
 
 static void registerHttpRoutes() {
@@ -3620,7 +3715,7 @@ static void registerHttpRoutes() {
     server.on("/v2/data", HTTP_POST, handleV2Data);
     server.on("/v2/plan", HTTP_POST, handleV2Plan);
     server.on("/v2/activate", HTTP_POST, handleV2Activate);
-    server.on("/v2/bundle", HTTP_POST, handleV2Bundle);
+
     server.on("/v2/bundle/begin", HTTP_POST, handleV2BundleBegin);
     server.on("/v2/bundle/chunk", HTTP_POST, handleV2BundleChunk);
     server.on("/v2/bundle/commit", HTTP_POST, handleV2BundleCommit);
@@ -3797,7 +3892,7 @@ static void startNormalMode(bool skipConnect = false) {
         // bit0 = the last deep entry actually drew the sleep glyph.
         if (wokeFromDeep && (rtcDeepGlyph & 1)) renderCurrent();
         if (plugged && !rtcDeepOnUsb && batteryPct > BLE_AUTO_PCT) enterBleOn(false);
-        if (!deepWakePath && storeCount() > 0) tryWifiUsage();
+        if (!v2BundleReady && !deepWakePath && storeCount() > 0) tryWifiUsage();
         // Cold boot: never leave the boot/connecting page up when the first
         // pull failed. The cached usage (or the built-in status screen) is
         // rendered once the link is up, so the panel is never stale. An
@@ -4123,7 +4218,8 @@ static int deepNetworkCycle() {
 static void enterDeep(const char *reason) {
     setStage(19);
     if (clkR.valid && lastDisplayedFrame) clkCaptureFromFramebuffer();
-    if (!rtcNextContactS) rtcNextContactS = DEEP_CONTACT_DEFAULT_S;
+    if (v2BundleReady && rv2Enabled) rtcNextContactS = V2_RENDEZVOUS_S;
+    else if (!rtcNextContactS) rtcNextContactS = DEEP_CONTACT_DEFAULT_S;
     if (WiFi.status() == WL_CONNECTED && storeCount() > 0) {
         EndpointRec rec;
         if (pickEndpoint(rec)) {
@@ -4386,7 +4482,7 @@ void setup() {
         Preferences p;
         p.begin("pm", true);
         nvsStageAtBoot = p.getUChar("stg", 0xFF);
-        rv2Enabled = p.getUChar("rv2", 0) ? 1 : 0;
+        rv2Enabled = p.getUChar("rv2", 1) ? 1 : 0;
         String tz = p.getString("tz", "");
         if (tz.length() && tz.length() < (int)sizeof(deviceTz)) {
             strncpy(deviceTz, tz.c_str(), sizeof(deviceTz) - 1);
@@ -4502,6 +4598,17 @@ void setup() {
                       (unsigned)bsCommitSeq());
         v2ActiveLoad();
         v2DataSeq.beginContext(v2NowMs(), 1);
+        if (esp_reset_reason() == ESP_RST_DEEPSLEEP) {
+            v2DataCheckpoint.restore(v2Profile.contextId, v2DataSeq);
+        }
+        if (!v2DataSeq.haveApplied()) {
+            // Unknown retention (cold reset, corrupt RTC, or new context): rotate
+            // context so an in-flight old snapshot cannot be mistaken for new.
+            if (!v2SwitchActive(v2Profile.initial)) {
+                v2CtValid = false;
+                DevLog.println("[v2] cannot rotate unknown-retention context; data disabled");
+            }
+        }
         v2Provisional = v2Provisional || (cause == ESP_SLEEP_WAKEUP_EXT1);
         v2SafetyDeadlineMs = v2NowMs() + (uint64_t)V2_MAX_LIGHT_S * 1000ULL;
     } else {
@@ -4514,7 +4621,20 @@ void setup() {
     if (dpTestMain(cause)) return;
 #endif
     if (hasWifiSlots()) {
-        if (deepWakePath) {
+        if (deepWakePath && v2BundleReady) {
+            if (rv2Enabled && !v2Rendezvous()) {
+                rtcNextContactS = V2_RENDEZVOUS_S;
+                rtcNextNetAt = timeKnown() ? (uint32_t)time(nullptr) + rtcNextContactS : 0;
+                sleepToNextEvent();
+            }
+            if (!rv2Enabled) {
+                // Explicit diagnostic rollback: bounded HTTP opportunity, never
+                // legacy envelope application into a v2 context.
+                v2SafetyDeadlineMs = v2NowMs() + 15000;
+                rtcMode = MODE_LIGHT;
+            }
+            startNormalMode();
+        } else if (deepWakePath) {
             // Network window: pull the envelope, then either go back to sleep
             // or switch to light / stay awake for a pending push.
             int r = deepNetworkCycle();
@@ -4661,6 +4781,7 @@ void loop() {
         return;
     }
     blePoll();
+    serviceV2Ble();
 
     static uint32_t pwrDownAt = 0;
     static bool pwrHandled = false;

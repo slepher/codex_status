@@ -99,12 +99,23 @@ pub fn status(ip: &str, token: &str, timeout: Duration) -> Result<Value> {
 
 /// Complete bounded Data snapshot (atomic apply + simple ACK).
 pub fn data(ip: &str, token: &str, message: &Value, timeout: Duration) -> Result<Value> {
-    post_json(ip, "/v2/data", token, message, timeout)
+    session_post(ip, "/v2/data", token, message, timeout)
 }
 
 /// Formal PowerPlan (the only thing that changes the light deadline).
 pub fn plan(ip: &str, token: &str, plan: &Value, timeout: Duration) -> Result<Value> {
-    post_json(ip, "/v2/plan", token, plan, timeout)
+    session_post(ip, "/v2/plan", token, plan, timeout)
+}
+
+fn session_post(ip: &str, path: &str, token: &str, message: &Value, timeout: Duration) -> Result<Value> {
+    let mut command = message.clone();
+    let (nonce, device_mac) = session_nonce(ip, token, timeout)?;
+    command["protocol"] = json!(2);
+    command["session_nonce"] = json!(nonce);
+    command["device_mac"] = json!(device_mac);
+    command["request_id"] = json!(format!("{}-{:08x}", path.rsplit('/').next().unwrap_or("command"),
+        crc32fast::hash(&crate::template::canonical_bytes(message))));
+    post_json(ip, path, token, &command, timeout)
 }
 
 /// Explicit remote activation.
@@ -113,10 +124,26 @@ pub fn activate(
     token: &str,
     bridge_id: &str,
     template_id: &str,
+    expected_context: &str,
     timeout: Duration,
 ) -> Result<Value> {
-    let path = format!("/v2/activate?id={template_id}");
-    post_json(ip, &path, token, &json!({"bridge_id": bridge_id}), timeout)
+    let (nonce, device_mac) = session_nonce(ip, token, timeout)?;
+    let request_id = format!("activate-{expected_context}-{template_id}");
+    post_json(ip, "/v2/activate", token, &json!({
+        "protocol": 2, "device_mac": device_mac, "bridge_id": bridge_id, "session_nonce": nonce,
+        "request_id": request_id, "template_id": template_id,
+        "expected_active_context_id": expected_context,
+    }), timeout)
+}
+
+fn session_nonce(ip: &str, token: &str, timeout: Duration) -> Result<(String, String)> {
+    let state = status(ip, token, timeout)?;
+    let nonce = state["session_nonce"].as_str().unwrap_or("");
+    if nonce.len() != 32 || !nonce.bytes().all(|c| c.is_ascii_hexdigit()) {
+        bail!("device lacks v2 session protection; update firmware before publishing or activating");
+    }
+    let mac = state["device_mac"].as_str().context("device MAC in authenticated status")?;
+    Ok((nonce.to_owned(), mac.to_owned()))
 }
 
 /// Bounded BEGIN/CHUNK/COMMIT install of a complete Bundle payload.
@@ -132,15 +159,31 @@ pub fn install_bundle(
         bail!("bundle payload size {} out of range", payload.len());
     }
     let chunk_bytes = chunk_bytes.clamp(256, 16 * 1024);
-    let begin = format!("/v2/bundle/begin?len={}", payload.len());
-    let ack = post_json(ip, &begin, token, &json!({"bridge_id": bridge_id}), timeout)?;
+    let (nonce, device_mac) = session_nonce(ip, token, timeout)?;
+    let content_crc = format!("{:08x}", crc32fast::hash(payload));
+    let bundle: Value = serde_json::from_slice(payload).context("bundle JSON")?;
+    let job_id = bundle["job_id"].as_str().filter(|s| !s.is_empty())
+        .context("bundle job_id")?;
+    let request_id = format!("bundle-{job_id}");
+    if request_id.len() > 64 || !request_id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_') {
+        bail!("invalid bundle job_id");
+    }
+    let command = json!({"protocol": 2, "device_mac": device_mac, "bridge_id": bridge_id,
+        "request_id": request_id, "session_nonce": nonce,
+        "length": payload.len(), "content_crc": content_crc});
+    let ack = post_json(ip, "/v2/bundle/begin", token, &command, timeout)?;
     if ack["result"] != "applied" {
         return Ok(ack);
     }
-    let mut offset = 0usize;
+    // A completed BEGIN replay returns the original committed context.
+    if ack["active_context_id"].as_str().is_some_and(|s| !s.is_empty()) {
+        return Ok(ack);
+    }
+    let mut offset = ack["next_offset"].as_u64().context("bundle begin next_offset")? as usize;
+    if offset > payload.len() { bail!("bundle begin offset exceeds payload"); }
     while offset < payload.len() {
         let end = (offset + chunk_bytes).min(payload.len());
-        let path = format!("/v2/bundle/chunk?offset={offset}");
+        let path = format!("/v2/bundle/chunk?request_id={request_id}&session_nonce={nonce}&offset={offset}");
         let (status, body) = request(
             ip,
             "POST",
@@ -162,12 +205,11 @@ pub fn install_bundle(
         }
         offset = end;
     }
-    let commit = format!("/v2/bundle/commit?len={}", payload.len());
     post_json(
         ip,
-        &commit,
+        "/v2/bundle/commit",
         token,
-        &json!({"bridge_id": bridge_id}),
+        &command,
         timeout,
     )
 }
