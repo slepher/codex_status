@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use bridge_core::coordinator::DeliveryKind;
-use bridge_core::platform::model::{DeviceCapabilities, DeviceIdentity, Profile};
+use bridge_core::platform::model::{DeviceCapabilities, DeviceIdentity, FamilyProfile, Profile};
 use bridge_core::platform::service::PlatformService;
 use bridge_core::v2_client;
 use serde_json::{json, Value};
@@ -55,6 +55,34 @@ pub fn device_link(ctx: &AppCtx) -> Option<DeviceLink> {
         ip,
         token,
         bridge_id: ctx.bridge_id.clone(),
+    })
+}
+
+fn device_link_for_mac(ctx: &AppCtx, requested_mac: &str) -> Option<DeviceLink> {
+    let mac = DeviceIdentity::normalized_mac(requested_mac)?;
+    let device = service(ctx).device_get(&mac)?;
+    device_link_from_identity(&mac, Some(&device), &ctx.config.token, &ctx.bridge_id)
+}
+
+fn device_link_from_identity(
+    mac: &str,
+    device: Option<&Value>,
+    token: &str,
+    bridge_id: &str,
+) -> Option<DeviceLink> {
+    let device = device?;
+    if device["device_mac"].as_str()? != mac {
+        return None;
+    }
+    let ip = device["ip"].as_str()?.to_string();
+    if ip.is_empty() || ip == "0.0.0.0" || token.is_empty() {
+        return None;
+    }
+    Some(DeviceLink {
+        mac: mac.to_string(),
+        ip,
+        token: token.to_string(),
+        bridge_id: bridge_id.to_string(),
     })
 }
 
@@ -197,10 +225,12 @@ pub fn template_preview(
     let text = serde_json::to_string(&source).map_err(err_text)?;
     let usage = match usage {
         Some(u) => u.to_string(),
-        None => service(ctx)
-            .coordinator_summary(&ctx.device_mac.lock().unwrap().clone().unwrap_or_default())
-            .and_then(|s| s.get("source_error").cloned())
-            .map(|_| String::new())
+        None => ctx
+            .envelope
+            .try_read()
+            .ok()
+            .and_then(|envelope| envelope.clone())
+            .and_then(|envelope| serde_json::to_string(&envelope).ok())
             .unwrap_or_default(),
     };
     let bits = bridge_render::render_bits(&text, &usage, &bridge_render::Env::default())
@@ -266,6 +296,54 @@ pub fn profile_save(ctx: &AppCtx, profile: Profile) -> Result<Value, String> {
     }))
 }
 
+pub fn family_profiles(ctx: &AppCtx, render_target: Option<&str>) -> Value {
+    use bridge_core::platform::model::{RENDER_TARGET_154G, RENDER_TARGET_GRAY4, RENDER_TARGET_NOTE4};
+
+    let mut families = vec![
+        (RENDER_TARGET_154G, "200×200 黑白"),
+        (RENDER_TARGET_NOTE4, "Note4 400×300 黑白"),
+        (RENDER_TARGET_GRAY4, "200×200 灰阶"),
+    ];
+    families.sort_unstable_by_key(|(render_target, _)| *render_target);
+    json!({
+        "families": families.into_iter().map(|(render_target, label)| json!({
+            "render_target": render_target,
+            "label": label,
+        })).collect::<Vec<_>>(),
+        "profiles": service(ctx).family_profiles(render_target),
+    })
+}
+
+pub fn family_profile_save(ctx: &AppCtx, profile: FamilyProfile) -> Result<Value, String> {
+    let saved = service(ctx)
+        .family_profile_save(profile, now_secs())
+        .map_err(err_text)?;
+    Ok(json!({"saved": saved, "published": false}))
+}
+
+pub fn family_profile_delete(
+    ctx: &AppCtx,
+    render_target: &str,
+    id: &str,
+) -> Result<Value, String> {
+    let deleted = service(ctx)
+        .family_profile_delete(render_target, id)
+        .map_err(err_text)?;
+    Ok(json!({"deleted": deleted}))
+}
+
+pub fn family_profile_copy_from_device(
+    ctx: &AppCtx,
+    mac: &str,
+    id: &str,
+    name: &str,
+) -> Result<Value, String> {
+    let saved = service(ctx)
+        .family_profile_copy_from_device(mac, id, name, now_secs())
+        .map_err(err_text)?;
+    Ok(json!({"saved": saved}))
+}
+
 // ---------------------------------------------------------------------------
 // Publish / delivery
 // ---------------------------------------------------------------------------
@@ -308,7 +386,7 @@ pub async fn deliver(ctx: &AppCtx, mac: &str) -> Value {
     if service(ctx).asset_job_pending(mac) {
         return json!({"result": "waiting_for_device_protocol", "reason": "versioned manifest/object endpoints are pending joint device confirmation"});
     }
-    let Some(link) = device_link(ctx) else {
+    let Some(link) = device_link_for_mac(ctx, mac) else {
         return json!({"result": "waiting_for_link", "reason": "device token/ip not available; open a BOOT session"});
     };
     let reachable = true;
@@ -730,6 +808,52 @@ mod capability_tests {
         complete["width"] = json!(200);
         assert!(caps_from_status(&complete).unwrap_err().contains("disagrees"));
     }
+
+    #[test]
+    fn note4_delivery_uses_its_saved_ip_when_global_selection_is_154() {
+        let global_selected_ip = "192.168.1.50";
+        let note4 = json!({"device_mac": "7C4FADB93408", "ip": "192.168.3.177"});
+        let link = device_link_from_identity(
+            "7C4FADB93408",
+            Some(&note4),
+            "endpoint-token",
+            "bridge-id",
+        )
+        .unwrap();
+
+        assert_eq!(global_selected_ip, "192.168.1.50");
+        assert_eq!(link.ip, "192.168.3.177");
+        assert_ne!(link.ip, global_selected_ip);
+    }
+
+    #[test]
+    fn unknown_device_cannot_borrow_a_saved_or_global_link() {
+        assert!(device_link_from_identity(
+            "AAAAAAAAAAAA",
+            None,
+            "endpoint-token",
+            "bridge-id",
+        )
+        .is_none());
+
+        let other_device = json!({"device_mac": "70041DD7A340", "ip": "192.168.1.50"});
+        assert!(device_link_from_identity(
+            "AAAAAAAAAAAA",
+            Some(&other_device),
+            "endpoint-token",
+            "bridge-id",
+        )
+        .is_none());
+
+        let device_without_ip = json!({"device_mac": "AAAAAAAAAAAA", "ip": null});
+        assert!(device_link_from_identity(
+            "AAAAAAAAAAAA",
+            Some(&device_without_ip),
+            "endpoint-token",
+            "bridge-id",
+        )
+        .is_none());
+    }
 }
 
 /// Feed the device's own status digest (MAC-verified HTTP read) into the
@@ -925,6 +1049,30 @@ pub async fn tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, Stri
                 serde_json::from_value(args.get("profile").cloned().ok_or("missing profile")?)
                     .map_err(err_text)?;
             profile_save(ctx, profile)?
+        }
+        "family_profiles_v2" => {
+            family_profiles(ctx, args.get("render_target").and_then(Value::as_str))
+        }
+        "family_profile_save_v2" => {
+            let profile: FamilyProfile = serde_json::from_value(
+                args.get("profile").cloned().ok_or("missing profile")?,
+            )
+            .map_err(err_text)?;
+            family_profile_save(ctx, profile)?
+        }
+        "family_profile_delete_v2" => {
+            let render_target = args
+                .get("render_target")
+                .and_then(Value::as_str)
+                .ok_or("missing render_target")?;
+            let id = args.get("id").and_then(Value::as_str).ok_or("missing id")?;
+            family_profile_delete(ctx, render_target, id)?
+        }
+        "family_profile_copy_v2" => {
+            let mac = args.get("mac").and_then(Value::as_str).ok_or("missing mac")?;
+            let id = args.get("id").and_then(Value::as_str).ok_or("missing id")?;
+            let name = args.get("name").and_then(Value::as_str).ok_or("missing name")?;
+            family_profile_copy_from_device(ctx, mac, id, name)?
         }
         "platform_publish" => {
             let mac = device_mac(ctx)?;

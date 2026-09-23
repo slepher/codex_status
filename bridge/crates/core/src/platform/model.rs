@@ -2,8 +2,8 @@
 //!
 //! Minimal records, no per-entity services: Device, TemplateKey, Profile (1–8
 //! ordered ids), CompiledTemplate (in `compile`), Bundle, PublishJob, PowerPlan.
-//! `template_id + render_target` keeps only the latest content; Profile entries
-//! are plain ids with no revision and no enabled subset.
+//! `template_id + render_target` keeps only the latest content; per-device
+//! Profile entries are plain ids with no revision or enabled subset.
 
 use std::collections::BTreeMap;
 
@@ -149,9 +149,9 @@ impl DeviceCapabilities {
         if self.asset_publish_protocol > 0 && (self.max_object_bytes == 0 || self.max_manifest_bytes == 0 || self.install_peak_bytes == 0 || self.free_bytes == 0) {
             bail!("capabilities: incremental publish limits missing");
         }
-        if self.compiler_abi != COMPILER_ABI {
+        if !(1..=COMPILER_ABI).contains(&self.compiler_abi) {
             bail!(
-                "capabilities: compiler_abi {} unsupported (bridge {COMPILER_ABI})",
+                "capabilities: compiler_abi {} unsupported (bridge supports 1..={COMPILER_ABI})",
                 self.compiler_abi
             );
         }
@@ -223,6 +223,135 @@ pub struct Profile {
     pub full_sync_s: u64,
     #[serde(default)]
     pub updated_at: u64,
+}
+
+/// Reusable v2 Profile draft shared by every device with the same render target.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FamilyProfile {
+    pub render_target: String,
+    pub id: String,
+    pub name: String,
+    pub template_ids: Vec<String>,
+    #[serde(default)]
+    pub enabled_template_ids: Option<Vec<String>>,
+    pub initial_active_id: Option<String>,
+    #[serde(default)]
+    pub font_ids: BTreeMap<String, String>,
+    #[serde(default)]
+    pub bindings: Vec<Binding>,
+    #[serde(default)]
+    pub sync_enabled: bool,
+    #[serde(default = "default_full_sync_s")]
+    pub full_sync_s: u64,
+    #[serde(default)]
+    pub updated_at: u64,
+}
+
+impl FamilyProfile {
+    /// Enabled ids in profile order. Missing subsets from older drafts mean all enabled.
+    pub fn enabled_ids(&self) -> Vec<String> {
+        match &self.enabled_template_ids {
+            Some(enabled) => self
+                .template_ids
+                .iter()
+                .filter(|id| enabled.contains(id))
+                .cloned()
+                .collect(),
+            None => self.template_ids.clone(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if ![
+            RENDER_TARGET_154G,
+            RENDER_TARGET_NOTE4,
+            RENDER_TARGET_GRAY4,
+        ]
+        .contains(&self.render_target.as_str())
+        {
+            bail!("unsupported render_target {}", self.render_target);
+        }
+        if self.id.is_empty()
+            || !self
+                .id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            bail!("invalid family profile id: use ASCII letters, digits, _ or -");
+        }
+        if self.template_ids.len() > MAX_PROFILE_TEMPLATES {
+            bail!("at most {MAX_PROFILE_TEMPLATES} templates are allowed");
+        }
+        if let Some(enabled) = &self.enabled_template_ids {
+            let mut seen = std::collections::BTreeSet::new();
+            for id in enabled {
+                if !self.template_ids.contains(id) {
+                    bail!("enabled template {id} is not in the profile order");
+                }
+                if !seen.insert(id) {
+                    bail!("duplicate enabled template: {id}");
+                }
+            }
+        }
+        Profile {
+            device_mac: String::new(),
+            template_ids: self.template_ids.clone(),
+            render_target: Some(self.render_target.clone()),
+            font_ids: self.font_ids.clone(),
+            initial_active_id: self.initial_active_id.clone(),
+            bindings: self.bindings.clone(),
+            sync_enabled: self.sync_enabled,
+            full_sync_s: self.full_sync_s,
+            updated_at: self.updated_at,
+        }
+        .validate()
+    }
+}
+
+#[cfg(test)]
+mod family_profile_tests {
+    use super::*;
+
+    fn draft(id: &str) -> FamilyProfile {
+        FamilyProfile {
+            render_target: RENDER_TARGET_154G.into(),
+            id: id.into(),
+            name: "默认".into(),
+            template_ids: Vec::new(),
+            enabled_template_ids: None,
+            initial_active_id: None,
+            font_ids: BTreeMap::new(),
+            bindings: Vec::new(),
+            sync_enabled: false,
+            full_sync_s: default_full_sync_s(),
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn family_profile_id_uses_ascii_letters_digits_underscore_and_hyphen() {
+        assert!(draft("Default_2-x").validate().is_ok());
+        assert!(draft("").validate().is_err());
+        assert!(draft("含中文").validate().is_err());
+        assert!(draft("with space").validate().is_err());
+        assert!(draft("bad/id").validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod capability_abi_tests {
+    use super::*;
+
+    #[test]
+    fn capabilities_accept_abi1_and_current_abi_but_reject_unknown_versions() {
+        let mut capabilities = DeviceCapabilities::ssd1681_154g();
+        capabilities.compiler_abi = 1;
+        assert!(capabilities.validate().is_ok());
+        capabilities.compiler_abi = COMPILER_ABI;
+        assert!(capabilities.validate().is_ok());
+        capabilities.compiler_abi = COMPILER_ABI + 1;
+        assert!(capabilities.validate().is_err());
+    }
 }
 
 pub fn default_full_sync_s() -> u64 {

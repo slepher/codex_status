@@ -605,6 +605,10 @@ async fn mcp_handler(
                 | "template_validate_v2"
                 | "profile_get_v2"
                 | "profile_save_v2"
+                | "family_profiles_v2"
+                | "family_profile_save_v2"
+                | "family_profile_delete_v2"
+                | "family_profile_copy_v2"
                 | "platform_publish"
                 | "platform_publish_preview"
                 | "platform_font_list"
@@ -626,10 +630,17 @@ async fn mcp_handler(
                 .cloned()
                 .unwrap_or_else(|| json!({}));
             let response = match platform::tool(&ctx, name, &args).await {
-                Ok(text) => json!({
-                    "jsonrpc": "2.0", "id": id,
-                    "result": {"content": [{"type": "text", "text": text}], "isError": false}
-                }),
+                Ok(text) => {
+                    if name == "template_save_v2" {
+                        if let Some(handle) = ctx.app_handle.get() {
+                            let _ = handle.emit("templates-changed", ());
+                        }
+                    }
+                    json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": {"content": [{"type": "text", "text": text}], "isError": false}
+                    })
+                }
                 Err(e) => json!({
                     "jsonrpc": "2.0", "id": id,
                     "result": {"content": [{"type": "text", "text": format!("error: {e}")}], "isError": true}
@@ -1296,6 +1307,43 @@ async fn platform_profile_save(
     let parsed: bridge_core::platform::model::Profile =
         serde_json::from_value(profile).map_err(|e| e.to_string())?;
     platform::profile_save(&state, parsed)
+}
+
+#[tauri::command]
+async fn platform_family_profiles(
+    state: State<'_, Arc<AppCtx>>,
+    render_target: Option<String>,
+) -> Result<Value, String> {
+    Ok(platform::family_profiles(&state, render_target.as_deref()))
+}
+
+#[tauri::command]
+async fn platform_family_profile_save(
+    state: State<'_, Arc<AppCtx>>,
+    profile: Value,
+) -> Result<Value, String> {
+    let parsed: bridge_core::platform::model::FamilyProfile =
+        serde_json::from_value(profile).map_err(|e| e.to_string())?;
+    platform::family_profile_save(&state, parsed)
+}
+
+#[tauri::command]
+async fn platform_family_profile_delete(
+    state: State<'_, Arc<AppCtx>>,
+    render_target: String,
+    id: String,
+) -> Result<Value, String> {
+    platform::family_profile_delete(&state, &render_target, &id)
+}
+
+#[tauri::command]
+async fn platform_family_profile_copy_from_device(
+    state: State<'_, Arc<AppCtx>>,
+    mac: String,
+    id: String,
+    name: String,
+) -> Result<Value, String> {
+    platform::family_profile_copy_from_device(&state, &mac, &id, &name)
 }
 
 #[tauri::command]
@@ -2449,6 +2497,95 @@ async fn run_services(ctx: Arc<AppCtx>) {
     }
 }
 
+fn write_family_import_marker(path: &Path, label: &str) {
+    if let Err(error) = std::fs::write(path, b"complete") {
+        tracing::warn!(marker = label, path = %path.display(), error = %error, "family Profile import marker could not be written");
+    }
+}
+
+fn migrate_family_profiles(ctx: &AppCtx) {
+    let now = now_secs().max(0) as u64;
+    let data_root = bridge_core::paths::data_root();
+    let legacy_marker = data_root.join("family-profile-154g-imported");
+    if !legacy_marker.exists() {
+        match bridge_core::profile::ProfilesFile::load(&ctx.config.profiles) {
+            Ok(profiles) => {
+                let mut complete = true;
+                for profile in profiles.profiles {
+                    if ctx
+                        .platform
+                        .family_profile_get(
+                            bridge_core::platform::model::RENDER_TARGET_154G,
+                            &profile.id,
+                        )
+                        .is_some()
+                    {
+                        continue;
+                    }
+                    let family = bridge_core::platform::model::FamilyProfile {
+                        render_target: bridge_core::platform::model::RENDER_TARGET_154G.into(),
+                        id: profile.id.clone(),
+                        name: profile.name.clone(),
+                        template_ids: profile
+                            .templates
+                            .iter()
+                            .map(|entry| entry.id.clone())
+                            .collect(),
+                        enabled_template_ids: Some(profile.enabled_ids()),
+                        initial_active_id: None,
+                        font_ids: Default::default(),
+                        bindings: Vec::new(),
+                        sync_enabled: false,
+                        full_sync_s: bridge_core::platform::model::default_full_sync_s(),
+                        updated_at: now,
+                    };
+                    if let Err(error) = ctx.platform.family_profile_save(family, now) {
+                        complete = false;
+                        tracing::warn!(profile_id = %profile.id, error = %error, "legacy Profile migration skipped");
+                    }
+                }
+                if complete {
+                    write_family_import_marker(&legacy_marker, "154g");
+                }
+            }
+            Err(error) => tracing::warn!(path = %ctx.config.profiles.display(), error = %error, "legacy Profile migration skipped"),
+        }
+    }
+
+    let note4_marker = data_root.join("family-profile-note4-imported");
+    if note4_marker.exists() {
+        return;
+    }
+    let note4_has_family_profiles = !ctx
+        .platform
+        .family_profiles(Some(bridge_core::platform::model::RENDER_TARGET_NOTE4))
+        .is_empty();
+    if note4_has_family_profiles {
+        write_family_import_marker(&note4_marker, "Note4");
+        return;
+    }
+    let note4_devices: Vec<_> = ctx
+        .platform
+        .devices()
+        .into_iter()
+        .filter(|device| {
+            device["legacy"].as_bool() == Some(false)
+                && device["capabilities"]["render_target"].as_str()
+                    == Some(bridge_core::platform::model::RENDER_TARGET_NOTE4)
+                && !device["profile"].is_null()
+        })
+        .collect();
+    if let [device] = note4_devices.as_slice() {
+        let Some(mac) = device["device_mac"].as_str() else {
+            return;
+        };
+        match ctx.platform.family_profile_copy_from_device(mac, "default", "默认", now) {
+            Ok(_) => write_family_import_marker(&note4_marker, "Note4"),
+            Err(error) => tracing::warn!(device_mac = %mac, error = %error, "Note4 Profile migration skipped"),
+        }
+    }
+}
+
 fn main() {
     // Hidden watchdog mode: supervise the given pid, restart on abnormal exit.
     let argv: Vec<String> = std::env::args().collect();
@@ -2577,6 +2714,7 @@ fn main() {
             .expect("open platform state"),
         ),
     });
+    migrate_family_profiles(&ctx);
     if generated_name {
         save_identity(&ctx);
     }
@@ -2623,6 +2761,10 @@ fn main() {
             platform_template_save,
             platform_profile_get,
             platform_profile_save,
+            platform_family_profiles,
+            platform_family_profile_save,
+            platform_family_profile_delete,
+            platform_family_profile_copy_from_device,
             platform_publish,
             platform_publish_preview,
             platform_font_list,

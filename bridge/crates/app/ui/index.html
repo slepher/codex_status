@@ -28,7 +28,8 @@
   .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
   select, input { padding: 5px 8px; border-radius: 8px; border: 1px solid var(--line); background: transparent; color: inherit; }
   canvas.big { width: 340px; height: 340px; image-rendering: pixelated; border: 1px solid var(--line); border-radius: 6px; background: #fff; }
-  canvas.thumb { display: block; width: 56px; height: 56px; image-rendering: pixelated; border: 1px solid var(--line); border-radius: 5px; background: #fff; flex: none; }
+  canvas.thumb, img.thumb { display: block; width: 56px; height: 56px; image-rendering: pixelated; border: 1px solid var(--line); border-radius: 5px; background: #fff; flex: none; }
+  img.thumb { object-fit: contain; }
   .rings { display: flex; gap: 18px; justify-content: center; padding: 6px 0; }
   .ring { width: 96px; height: 96px; border-radius: 50%; border: 6px solid var(--line); display: flex; flex-direction: column; align-items: center; justify-content: center; }
   .ring b { font-size: 22px; }
@@ -114,6 +115,10 @@
           <div class="status" id="profile-status"></div>
           <div class="menus">
             <div class="menu-wrap">
+              <button id="family-btn" onclick="toggleMenu('menu-family', event)">1.54 黑白 ▾</button>
+              <div class="menu" id="menu-family"></div>
+            </div>
+            <div class="menu-wrap">
               <button id="profile-btn" onclick="toggleMenu('menu-profile', event)">配置 ▾</button>
               <div class="menu" id="menu-profile"></div>
             </div>
@@ -126,14 +131,6 @@
       </div>
       <div class="card">
         <div id="profile-rows" class="plist todo">加载中…</div>
-      </div>
-      <div class="card">
-        <div class="bar">
-          <div class="status">模板库（v2：同 ID + render target 只保留最新版）</div>
-          <div class="menus"><button onclick="refreshPlatformTemplates()">刷新</button></div>
-        </div>
-        <div id="pt-templates" class="plist todo">加载中…</div>
-        <div class="sub">保存只落盘，不推送；“被哪些设备 Profile 引用”在每项右侧显示。无版本历史/回滚。</div>
       </div>
     </section>
 
@@ -365,12 +362,17 @@
   const invoke = window.__TAURI__.core.invoke;
   const $ = (id) => document.getElementById(id);
   let paused = false;
-  let knownTemplates = [];
-  let knownProfiles = [];
-  let currentProfileId = null;
-  let modalPreviewId = null;
-  let dragId = null;
-  const thumbCache = new Map();
+  const RENDER_TARGET_154G = 'epd-ssd1681-200x200-1bpp';
+  const RENDER_TARGET_NOTE4 = 'epd-ssd2683-400x300-1bpp';
+  let selectedRenderTarget = localStorage.getItem('codex-status-family-target');
+  if (![RENDER_TARGET_154G, RENDER_TARGET_NOTE4].includes(selectedRenderTarget)) {
+    selectedRenderTarget = RENDER_TARGET_154G;
+  }
+  let familyProfiles = [];
+  let selectedFamilyProfileId = null;
+  let familyProfile = null;
+  let familyDragIndex = null;
+  const familyThumbCache = new Map();
 
   function relTime(ts) {
     if (!ts) return '从未';
@@ -406,6 +408,7 @@
       menu.classList.add('open');
       if (id === 'menu-profile') renderProfileMenu();
       if (id === 'menu-actions') renderActionsMenu();
+      if (id === 'menu-family') renderFamilyMenu();
     }
   }
 
@@ -422,358 +425,356 @@
 
   function closeModal() {
     $('backdrop').classList.remove('open');
-    modalPreviewId = null;
   }
 
-  function modalNewProfile() {
-    openModal(`
-      <h3>新建配置</h3>
-      <div>输入配置名称</div>
-      <input class="field" id="modal-name" placeholder="例如：日常">
-      <div class="foot">
-        <button onclick="closeModal()">取消</button>
-        <button class="primary" onclick="createProfile()">创建</button>
-      </div>`);
-    $('modal-name').focus();
+  async function familyTemplatePng(renderTarget, id) {
+    const key = `${renderTarget}\u0000${id}`;
+    if (familyThumbCache.has(key)) return familyThumbCache.get(key);
+    const template = await invoke('platform_template_get', { id, renderTarget });
+    const preview = await invoke('platform_template_preview', { json: template.source });
+    familyThumbCache.set(key, preview.png_base64);
+    return preview.png_base64;
   }
 
-  function modalRenameProfile() {
-    const profile = currentProfile();
-    if (!profile) return;
-    openModal(`
-      <h3>重命名配置</h3>
-      <div>输入新的配置名称</div>
-      <input class="field" id="modal-name" value="${escapeAttr(profile.name || '')}">
-      <div class="foot">
-        <button onclick="closeModal()">取消</button>
-        <button class="primary" onclick="renameProfile()">保存</button>
-      </div>`);
-    $('modal-name').focus();
-  }
-
-  function modalDeleteProfile() {
-    const profile = currentProfile();
-    if (!profile) return;
-    openModal(`
-      <h3>删除配置「${escapeHtml(profile.name || profile.id)}」？</h3>
-      <div class="muted">此操作不可撤销。</div>
-      <div class="foot">
-        <button onclick="closeModal()">取消</button>
-        <button class="danger" onclick="confirmDeleteProfile()">删除</button>
-      </div>`);
-  }
-
-  function modalAddTemplates() {
-    const profile = currentProfile();
-    if (!profile) return;
-    const existing = new Set(profile.templates.map((t) => t.id));
-    const available = knownTemplates.filter((t) => !existing.has(t.id));
-    const rows = available.length
-      ? available.map((t) => `
-          <div class="prow">
-            <canvas class="thumb" data-id="${t.id}" width="200" height="200"></canvas>
-            <span class="name">${t.id}</span>
-            <span class="ctl"><input type="checkbox" value="${t.id}" class="pick-box"></span>
-          </div>`).join('')
-      : '<div class="todo" style="padding:10px">没有可添加的模板（都已在配置中）</div>';
-    openModal(`
-      <h3>添加模板到「${escapeHtml(profile.name || profile.id)}」</h3>
-      <div class="all"><span class="muted">可用模板</span><button class="icon" onclick="togglePickAll()">全选</button></div>
-      <div class="pick">${rows}</div>
-      <div class="foot">
-        <button onclick="closeModal()">取消</button>
-        <button class="primary" onclick="addTemplatesToProfile()">添加</button>
-      </div>`);
-    drawPickThumbs();
-  }
-
-  function togglePickAll() {
-    const boxes = [...document.querySelectorAll('.pick-box')];
-    const allOn = boxes.every((b) => b.checked);
-    boxes.forEach((b) => { b.checked = !allOn; });
-  }
-
-  async function drawPickThumbs() {
-    for (const canvas of document.querySelectorAll('#modal canvas.thumb')) {
-      await drawThumbFor(canvas);
-    }
-  }
-
-  async function drawThumbFor(canvas) {
-    const id = canvas.dataset.id;
+  async function drawFamilyThumb(img) {
+    const renderTarget = img.dataset.renderTarget;
+    const id = img.dataset.id;
     try {
-      let bits = thumbCache.get(id);
-      if (!bits) {
-        const r = await invoke('preview_template', { id });
-        bits = r.bits;
-        thumbCache.set(id, bits);
+      const png = await familyTemplatePng(renderTarget, id);
+      if (img.dataset.renderTarget === renderTarget && img.dataset.id === id) {
+        img.src = `data:image/png;base64,${png}`;
       }
-      drawBits(canvas, bits);
     } catch (e) { /* thumbnails are best-effort */ }
+  }
+
+  function drawFamilyThumbs(root = document) {
+    root.querySelectorAll('img.family-thumb').forEach(img => drawFamilyThumb(img));
   }
 
   /* ---------- menus ---------- */
 
+  function familyLabel(renderTarget) {
+    return renderTarget === RENDER_TARGET_NOTE4 ? 'Note4' : '1.54 黑白';
+  }
+
+  function renderFamilyMenu() {
+    const families = [RENDER_TARGET_154G, RENDER_TARGET_NOTE4];
+    $('menu-family').innerHTML = families.map(renderTarget =>
+      `<div class="item" onclick="selectFamily('${renderTarget}')">` +
+      `<span class="check">${renderTarget === selectedRenderTarget ? '✓' : ''}</span>` +
+      `<span>${familyLabel(renderTarget)}</span></div>`).join('');
+    $('family-btn').textContent = familyLabel(selectedRenderTarget) + ' ▾';
+  }
+
+  async function selectFamily(renderTarget) {
+    if (![RENDER_TARGET_154G, RENDER_TARGET_NOTE4].includes(renderTarget) || renderTarget === selectedRenderTarget) {
+      closeMenus();
+      return;
+    }
+    selectedRenderTarget = renderTarget;
+    selectedFamilyProfileId = null;
+    familyProfile = null;
+    localStorage.setItem('codex-status-family-target', renderTarget);
+    await refreshProfiles();
+    renderFamilyMenu();
+    closeMenus();
+  }
+
   function renderProfileMenu() {
     const menu = $('menu-profile');
+    const selectedId = selectedFamilyProfileId;
+    const entries = familyProfiles.map(p =>
+      `<div class="item" onclick="selectFamilyProfile('${escapeAttr(p.id)}')">` +
+      `<span class="check">${p.id === selectedId ? '✓' : ''}</span>` +
+      `<span>${escapeHtml(p.name || p.id)}</span></div>`).join('') ||
+      '<div class="item muted">此族暂无 Profile</div>';
     menu.innerHTML =
-      `<div class="item" onclick="closeMenus(); modalNewProfile()">＋ 新建配置</div>` +
-      `<div class="sep"></div>` +
-      knownProfiles.map((p) =>
-        `<div class="item" onclick="selectProfile('${p.id}')">` +
-        `<span class="check">${p.id === currentProfileId ? '✓' : ''}</span>` +
-        `<span>${escapeHtml(p.name || p.id)}</span></div>`).join('');
-    $('profile-btn').textContent = (currentProfile()?.name || '配置') + ' ▾';
+      `<div class="item" onclick="closeMenus(); modalNewFamilyProfile()">＋ 新建配置</div>` +
+      `<div class="sep"></div>` + entries;
+    $('profile-btn').textContent = (familyProfile?.name || '配置') + ' ▾';
   }
 
   function renderActionsMenu() {
+    const hasProfile = !!familyProfile;
     $('menu-actions').innerHTML =
-      `<div class="item" onclick="closeMenus(); modalAddTemplates()">＋ 添加模板</div>` +
+      `<div class="item" ${hasProfile ? '' : 'style="opacity:.45"'} onclick="closeMenus(); ${hasProfile ? 'modalAddFamilyTemplates()' : ''}">＋ 添加模板</div>` +
       `<div class="sep"></div>` +
-      `<div class="item" onclick="closeMenus(); pushCurrentProfile()">⇪ 推送到设备</div>` +
-      `<div class="item" onclick="closeMenus(); modalRenameProfile()">✎ 重命名</div>` +
-      `<div class="item" onclick="closeMenus(); modalDeleteProfile()">🗑 删除</div>`;
+      `<div class="item" style="opacity:.45" title="待按 MAC 选择设备">⇪ 推送到设备（待按 MAC 选择）</div>` +
+      `<div class="item" ${hasProfile ? '' : 'style="opacity:.45"'} onclick="closeMenus(); ${hasProfile ? 'modalRenameFamilyProfile()' : ''}">✎ 重命名</div>` +
+      `<div class="item" ${hasProfile ? '' : 'style="opacity:.45"'} onclick="closeMenus(); ${hasProfile ? 'modalDeleteFamilyProfile()' : ''}">🗑 删除</div>`;
   }
 
   /* ---------- profiles ---------- */
 
-  function currentProfile() {
-    return knownProfiles.find((p) => p.id === currentProfileId) || null;
-  }
-
-  function selectProfile(id) {
-    currentProfileId = id;
-    closeMenus();
-    renderProfileRows();
-    renderProfileMenu();
-  }
-
   async function refreshProfiles() {
     try {
-      const data = await invoke('get_profiles');
-      knownProfiles = data.profiles || [];
-      if (data.templates && data.templates.length) knownTemplates = data.templates;
-      if (!knownProfiles.some((p) => p.id === currentProfileId)) {
-        currentProfileId = knownProfiles.length ? knownProfiles[0].id : null;
+      const data = await invoke('platform_family_profiles', { renderTarget: selectedRenderTarget });
+      familyProfiles = (data.profiles || []).filter(p => p.render_target === selectedRenderTarget);
+      const remembered = localStorage.getItem(`codex-status-family-profile:${selectedRenderTarget}`);
+      if (!familyProfiles.some(p => p.id === selectedFamilyProfileId)) {
+        selectedFamilyProfileId = familyProfiles.some(p => p.id === remembered) ? remembered : familyProfiles[0]?.id || null;
       }
+      familyProfile = familyProfiles.find(p => p.id === selectedFamilyProfileId) || null;
+      if (selectedFamilyProfileId) localStorage.setItem(`codex-status-family-profile:${selectedRenderTarget}`, selectedFamilyProfileId);
+      else localStorage.removeItem(`codex-status-family-profile:${selectedRenderTarget}`);
       renderProfileMenu();
       renderProfileRows();
+      renderActionsMenu();
+      updateFamilyProfileStatus();
     } catch (e) {
-      $('profile-rows').textContent = '读取失败：' + e;
+      $('profile-status').textContent = '读取配置失败：' + e;
     }
   }
 
-  async function persistProfile(templates, statusText) {
-    const profile = currentProfile();
-    if (!profile) return;
-    try {
-      await invoke('save_profile', { id: profile.id, name: profile.name, templates });
-      await refreshProfiles();
-      if (statusText) $('profile-status').textContent = statusText;
-    } catch (e) {
-      $('profile-status').textContent = '保存失败：' + e;
-      renderProfileRows();
+  function selectFamilyProfile(id) {
+    selectedFamilyProfileId = id || null;
+    localStorage.setItem(`codex-status-family-profile:${selectedRenderTarget}`, selectedFamilyProfileId || '');
+    familyProfile = familyProfiles.find(p => p.id === selectedFamilyProfileId) || null;
+    closeMenus();
+    renderProfileMenu();
+    renderProfileRows();
+    renderActionsMenu();
+    updateFamilyProfileStatus();
+  }
+
+  function modalNewFamilyProfile() {
+    openModal(`<h3>新建配置</h3>
+      <div>配置 ID（ASCII 字母、数字、_、-）</div>
+      <input class="field" id="family-modal-id" placeholder="例如：default">
+      <div>配置名称</div>
+      <input class="field" id="family-modal-name" placeholder="例如：Note4 日常">
+      <div class="foot"><button onclick="closeModal()">取消</button><button class="primary" onclick="createFamilyProfile()">创建</button></div>`);
+    $('family-modal-id').focus();
+  }
+
+  function modalRenameFamilyProfile() {
+    if (!familyProfile) return;
+    openModal(`<h3>重命名配置</h3>
+      <div>输入新的配置名称</div>
+      <input class="field" id="family-modal-name" value="${escapeAttr(familyProfile.name || '')}">
+      <div class="foot"><button onclick="closeModal()">取消</button><button class="primary" onclick="renameFamilyProfile()">保存</button></div>`);
+    $('family-modal-name').focus();
+  }
+
+  function modalDeleteFamilyProfile() {
+    if (!familyProfile) return;
+    openModal(`<h3>删除配置「${escapeHtml(familyProfile.name || familyProfile.id)}」？</h3>
+      <div class="muted">只删除族草稿，不影响设备 Profile 或发布任务。</div>
+      <div class="foot"><button onclick="closeModal()">取消</button><button class="danger" onclick="deleteFamilyProfile()">删除</button></div>`);
+  }
+
+  async function modalAddFamilyTemplates() {
+    if (!familyProfile) return;
+    if (!platformTemplates.length) {
+      const data = await invoke('platform_templates');
+      platformTemplates = data.templates || [];
     }
+    const existing = new Set(familyProfile.template_ids || []);
+    const available = platformTemplates.filter(t => t.render_target === selectedRenderTarget && !existing.has(t.template_id));
+    const rows = available.length ? available.map(t => `
+      <div class="prow"><img class="thumb family-thumb" data-render-target="${escapeAttr(selectedRenderTarget)}" data-id="${escapeAttr(t.template_id)}" alt="">
+      <span class="order">·</span><span class="name" onclick="previewFamilyTemplate('${escapeAttr(t.template_id)}')">${escapeHtml(t.template_id)}</span>
+      <span class="ctl"><input type="checkbox" class="family-template-pick" value="${escapeAttr(t.template_id)}"></span></div>`).join('')
+      : '<div class="todo" style="padding:10px">没有可添加的模板变体</div>';
+    openModal(`<h3>添加模板到「${escapeHtml(familyProfile.name || familyProfile.id)}」</h3>
+      <div class="all"><span class="muted">可用模板</span><button class="icon" onclick="toggleFamilyPickAll()">全选</button></div>
+      <div class="pick">${rows}</div>
+      <div class="foot"><button onclick="closeModal()">取消</button><button class="primary" onclick="addFamilyTemplates()">添加</button></div>`);
+    drawFamilyThumbs($('modal'));
+  }
+
+  function toggleFamilyPickAll() {
+    const boxes = [...document.querySelectorAll('.family-template-pick')];
+    const allOn = boxes.length > 0 && boxes.every(box => box.checked);
+    boxes.forEach(box => { box.checked = !allOn; });
+  }
+
+  function enabledFamilyTemplateIds(profile = familyProfile) {
+    if (!profile) return [];
+    const ids = profile.template_ids || [];
+    if (!Array.isArray(profile.enabled_template_ids)) return [...ids];
+    const selected = new Set(profile.enabled_template_ids);
+    return ids.filter(id => selected.has(id));
+  }
+
+  function updateFamilyProfileStatus() {
+    const ids = familyProfile?.template_ids || [];
+    if (ids.length && enabledFamilyTemplateIds().length === 0) {
+      $('profile-status').textContent = '未启用模板，暂不同步';
+    } else if ($('profile-status').textContent === '未启用模板，暂不同步') {
+      $('profile-status').textContent = '';
+    }
+  }
+
+  async function addFamilyTemplates() {
+    if (!familyProfile) return;
+    const picked = [...document.querySelectorAll('.family-template-pick:checked')].map(box => box.value);
+    if (!picked.length) { closeModal(); return; }
+    if (familyProfile.template_ids.length + picked.length > 8) {
+      $('profile-status').textContent = '一个配置最多 8 个模板';
+      return;
+    }
+    const enabled = new Set(enabledFamilyTemplateIds());
+    familyProfile.template_ids.push(...picked);
+    picked.forEach(id => enabled.add(id));
+    familyProfile.enabled_template_ids = familyProfile.template_ids.filter(id => enabled.has(id));
+    closeModal();
+    renderProfileRows();
+    await saveFamilyProfile();
+  }
+
+  function familyProfileError(action, error) {
+    $('profile-status').textContent = `${action}失败：${error}`;
+  }
+
+  async function saveFamilyProfile() {
+    if (!familyProfile) return false;
+    try {
+      const result = await invoke('platform_family_profile_save', { profile: familyProfile });
+      familyProfile = result.saved;
+      selectedFamilyProfileId = familyProfile.id;
+      await refreshProfiles();
+      $('profile-status').textContent = familyProfile.template_ids.length && enabledFamilyTemplateIds().length === 0
+        ? '未启用模板，暂不同步' : '族配置已保存，未发布';
+      return true;
+    } catch (e) { familyProfileError('保存', e); return false; }
+  }
+
+  async function createFamilyProfile() {
+    const id = $('family-modal-id').value.trim();
+    const name = $('family-modal-name').value.trim();
+    if (!id || !name) return;
+    familyProfile = {
+      render_target: selectedRenderTarget, id, name, template_ids: [], enabled_template_ids: [], initial_active_id: null,
+      font_ids: {}, bindings: [], sync_enabled: false, full_sync_s: 3600, updated_at: 0,
+    };
+    try {
+      const result = await invoke('platform_family_profile_save', { profile: familyProfile });
+      selectedFamilyProfileId = result.saved.id;
+      closeModal();
+      await refreshProfiles();
+      $('profile-status').textContent = '族配置已创建';
+    } catch (e) { familyProfileError('创建', e); }
+  }
+
+  async function renameFamilyProfile() {
+    if (!familyProfile) return;
+    familyProfile.name = $('family-modal-name').value.trim();
+    if (await saveFamilyProfile()) closeModal();
+  }
+
+  async function deleteFamilyProfile() {
+    if (!familyProfile) return;
+    try {
+      const result = await invoke('platform_family_profile_delete', {
+        renderTarget: selectedRenderTarget, id: selectedFamilyProfileId,
+      });
+      selectedFamilyProfileId = null;
+      closeModal();
+      await refreshProfiles();
+      $('profile-status').textContent = result.deleted ? '族配置已删除' : '族配置不存在';
+    } catch (e) { familyProfileError('删除', e); }
   }
 
   function renderProfileRows() {
     const box = $('profile-rows');
-    const profile = currentProfile();
-    if (!profile) {
+    if (!familyProfile) {
       box.className = 'plist todo';
-      box.textContent = knownProfiles.length ? '请选择一个配置' : '还没有配置，点左上"配置 ▾ → 新建配置"';
+      box.textContent = familyProfiles.length ? '请选择一个配置' : '此族暂无配置，点“配置 → ＋ 新建配置”';
       return;
     }
-    if (!profile.templates.length) {
+    const ids = familyProfile.template_ids || [];
+    if (!ids.length) {
       box.className = 'plist todo';
-      box.textContent = '配置为空——用"⋯ → 添加模板"加入模板';
+      box.textContent = '配置为空——用“⋯ → 添加模板”加入模板';
       return;
     }
     box.className = 'plist';
-    box.innerHTML = profile.templates.map((entry, index) => `
-      <div class="prow" draggable="true" data-id="${entry.id}" data-index="${index}">
+    const enabled = new Set(enabledFamilyTemplateIds());
+    box.innerHTML = ids.map((id, index) => {
+      const exists = platformTemplates.some(t => t.template_id === id && t.render_target === selectedRenderTarget);
+      const isEnabled = enabled.has(id);
+      return `<div class="prow family-prow" draggable="true" data-index="${index}">
         <span class="handle" title="拖拽排序">⠿</span>
         <span class="order">${index + 1}</span>
-        <canvas class="thumb" data-id="${entry.id}" width="200" height="200"></canvas>
-        <span class="name" onclick="openPreviewModal('${entry.id}')">${entry.id}</span>
+        <img class="thumb family-thumb" data-render-target="${escapeAttr(selectedRenderTarget)}" data-id="${escapeAttr(id)}" alt="">
+        <span class="name" onclick="previewFamilyTemplate('${escapeAttr(id)}')">${escapeHtml(id)}${exists ? '' : '（缺少此族模板变体）'}</span>
         <span class="ctl">
-          <span class="muted" style="font-size:12px">${entry.enabled ? '已启用' : '已禁用'}</span>
-          <span class="switch ${entry.enabled ? 'on' : ''}" onclick="toggleEnabled('${entry.id}')"></span>
-          <button class="xbtn" title="从配置删除" onclick="removeFromProfile('${entry.id}')">×</button>
+          <span class="muted" style="font-size:12px">${isEnabled ? '已启用' : '已禁用'}</span>
+          <span class="switch ${isEnabled ? 'on' : ''}" onclick="toggleFamilyTemplate('${escapeAttr(id)}')"></span>
+          <button class="xbtn" title="从配置删除" onclick="removeFamilyTemplate(${index})">×</button>
         </span>
-      </div>`).join('');
-    bindDrag();
-    box.querySelectorAll('canvas.thumb').forEach((c) => drawThumbFor(c));
+      </div>`;
+    }).join('');
+    bindFamilyDrag();
+    drawFamilyThumbs(box);
   }
 
-  async function toggleEnabled(id) {
-    const profile = currentProfile();
-    if (!profile) return;
-    const enabledCount = profile.templates.filter((t) => t.enabled).length;
-    const entry = profile.templates.find((t) => t.id === id);
-    if (!entry) return;
-    if (!entry.enabled && enabledCount >= 3) {
-      $('profile-status').textContent = '设备只有 3 个槽位，最多启用 3 个模板';
-      return;
-    }
-    const templates = profile.templates.map((t) => ({ id: t.id, enabled: t.id === id ? !t.enabled : t.enabled }));
-    persistProfile(templates, entry.enabled ? `已禁用 ${id}` : `已启用 ${id}`);
-  }
-
-  function removeFromProfile(id) {
-    const profile = currentProfile();
-    if (!profile) return;
-    persistProfile(profile.templates.filter((t) => t.id !== id).map((t) => ({ id: t.id, enabled: t.enabled })), `已从配置删除 ${id}`);
-  }
-
-  async function addTemplatesToProfile() {
-    const profile = currentProfile();
-    if (!profile) return;
-    const picked = [...document.querySelectorAll('.pick-box:checked')].map((b) => b.value);
-    if (!picked.length) { closeModal(); return; }
-    let enabledCount = profile.templates.filter((t) => t.enabled).length;
-    const entries = profile.templates.map((t) => ({ id: t.id, enabled: t.enabled }));
-    let overflow = 0;
-    for (const id of picked) {
-      const enabled = enabledCount < 3;
-      if (enabled) enabledCount++;
-      else overflow++;
-      entries.push({ id, enabled });
-    }
-    closeModal();
-    await persistProfile(entries, overflow
-      ? `已添加 ${picked.length} 个模板，其中 ${overflow} 个未启用（设备仅 3 槽）`
-      : `已添加 ${picked.length} 个模板`);
-  }
-
-  /* ---------- drag & drop ---------- */
-
-  function bindDrag() {
-    const rows = [...document.querySelectorAll('#profile-rows .prow')];
-    rows.forEach((row) => {
-      row.addEventListener('dragstart', (event) => {
-        dragId = row.dataset.id;
+  function bindFamilyDrag() {
+    const rows = [...document.querySelectorAll('#profile-rows .family-prow')];
+    rows.forEach(row => {
+      row.addEventListener('dragstart', event => {
+        familyDragIndex = Number(row.dataset.index);
         row.classList.add('dragging');
         event.dataTransfer.effectAllowed = 'move';
-        event.dataTransfer.setData('text/plain', dragId);
+        event.dataTransfer.setData('text/plain', String(familyDragIndex));
       });
       row.addEventListener('dragend', () => {
-        dragId = null;
-        rows.forEach((r) => r.classList.remove('dragging', 'drop-above', 'drop-below'));
+        familyDragIndex = null;
+        rows.forEach(item => item.classList.remove('dragging', 'drop-above', 'drop-below'));
       });
-      row.addEventListener('dragover', (event) => {
+      row.addEventListener('dragover', event => {
         event.preventDefault();
-        if (!dragId || row.dataset.id === dragId) return;
+        if (familyDragIndex == null || Number(row.dataset.index) === familyDragIndex) return;
         const rect = row.getBoundingClientRect();
         const above = event.clientY < rect.top + rect.height / 2;
         row.classList.toggle('drop-above', above);
         row.classList.toggle('drop-below', !above);
       });
       row.addEventListener('dragleave', () => row.classList.remove('drop-above', 'drop-below'));
-      row.addEventListener('drop', (event) => {
+      row.addEventListener('drop', async event => {
         event.preventDefault();
-        const profile = currentProfile();
-        if (!profile || !dragId) return;
-        const targetId = row.dataset.id;
+        if (!familyProfile || familyDragIndex == null) return;
+        const targetIndex = Number(row.dataset.index);
         const above = row.classList.contains('drop-above');
-        const entries = profile.templates.map((t) => ({ id: t.id, enabled: t.enabled }));
-        const from = entries.findIndex((t) => t.id === dragId);
-        if (from < 0) return;
-        const [moved] = entries.splice(from, 1);
-        let to = entries.findIndex((t) => t.id === targetId);
-        if (to < 0) to = entries.length;
-        else if (!above) to += 1;
-        entries.splice(to, 0, moved);
-        rows.forEach((r) => r.classList.remove('drop-above', 'drop-below'));
-        persistProfile(entries, '顺序已更新');
+        const enabled = new Set(enabledFamilyTemplateIds());
+        const [moved] = familyProfile.template_ids.splice(familyDragIndex, 1);
+        let insertAt = targetIndex;
+        if (familyDragIndex < targetIndex) insertAt--;
+        if (!above) insertAt++;
+        familyProfile.template_ids.splice(insertAt, 0, moved);
+        familyProfile.enabled_template_ids = familyProfile.template_ids.filter(id => enabled.has(id));
+        familyDragIndex = null;
+        renderProfileRows();
+        await saveFamilyProfile();
       });
     });
   }
 
-  /* ---------- create / rename / delete ---------- */
-
-  async function createProfile() {
-    const name = $('modal-name').value.trim() || '配置';
-    const id = 'config-' + Math.random().toString(36).slice(2, 6);
-    try {
-      await invoke('save_profile', { id, name, templates: [] });
-      closeModal();
-      currentProfileId = id;
-      await refreshProfiles();
-      $('profile-status').textContent = '已创建空配置';
-    } catch (e) {
-      $('profile-status').textContent = '创建失败：' + e;
-      closeModal();
-    }
+  async function toggleFamilyTemplate(id) {
+    if (!familyProfile || !familyProfile.template_ids.includes(id)) return;
+    const enabled = new Set(enabledFamilyTemplateIds());
+    if (enabled.has(id)) enabled.delete(id); else enabled.add(id);
+    familyProfile.enabled_template_ids = familyProfile.template_ids.filter(templateId => enabled.has(templateId));
+    renderProfileRows();
+    await saveFamilyProfile();
   }
 
-  async function renameProfile() {
-    const profile = currentProfile();
-    if (!profile) return;
-    const name = $('modal-name').value.trim();
-    try {
-      await invoke('save_profile', {
-        id: profile.id,
-        name,
-        templates: profile.templates.map((t) => ({ id: t.id, enabled: t.enabled })),
-      });
-      closeModal();
-      await refreshProfiles();
-      $('profile-status').textContent = '已重命名';
-    } catch (e) {
-      $('profile-status').textContent = '重命名失败：' + e;
-      closeModal();
-    }
+  async function removeFamilyTemplate(index) {
+    if (!familyProfile) return;
+    const enabled = new Set(enabledFamilyTemplateIds());
+    familyProfile.template_ids.splice(index, 1);
+    familyProfile.enabled_template_ids = familyProfile.template_ids.filter(id => enabled.has(id));
+    renderProfileRows();
+    await saveFamilyProfile();
   }
 
-  async function confirmDeleteProfile() {
-    const profile = currentProfile();
-    if (!profile) return;
+  async function previewFamilyTemplate(id, renderTarget = selectedRenderTarget) {
     try {
-      await invoke('delete_profile', { id: profile.id });
-      closeModal();
-      currentProfileId = null;
-      await refreshProfiles();
-      $('profile-status').textContent = '已删除配置';
-    } catch (e) {
-      $('profile-status').textContent = '删除失败：' + e;
-      closeModal();
-    }
-  }
-
-  async function pushCurrentProfile() {
-    const profile = currentProfile();
-    if (!profile) return;
-    $('profile-status').textContent = '正在通过 HTTP 推送…';
-    try {
-      const summary = await invoke('push_profile', { id: profile.id });
-      $('profile-status').textContent = '推送完成：' + summary;
-    } catch (e) {
-      $('profile-status').textContent = '推送失败：' + e;
-    }
-  }
-
-  function openPreviewModal(id) {
-    modalPreviewId = id;
-    openModal(`
-      <h3>${escapeHtml(id)} 预览</h3>
-      <canvas id="modal-preview" class="big" width="200" height="200"></canvas>
-      <div class="foot">
-        <button onclick="refreshModalPreview('${id}')">刷新</button>
-        <button class="primary" onclick="closeModal()">关闭</button>
-      </div>`);
-    refreshModalPreview(id);
-  }
-
-  async function refreshModalPreview(id) {
-    try {
-      const r = await invoke('preview_template', { id });
-      drawBits($('modal-preview'), r.bits);
-    } catch (e) {
-      $('modal-preview').replaceWith(Object.assign(document.createElement('div'), {
-        className: 'todo', textContent: '渲染失败：' + e,
-      }));
-    }
+      const template = await invoke('platform_template_get', { id, renderTarget });
+      const preview = await invoke('platform_template_preview', { json: template.source });
+      openModal(`<h3>预览 ${escapeHtml(id)}</h3><img style="max-width:400px;max-height:400px;image-rendering:pixelated;border:1px solid var(--line)" src="data:image/png;base64,${preview.png_base64}"><div class="foot"><button onclick="closeModal()">关闭</button></div>`);
+    } catch (e) { familyProfileError('预览', e); }
   }
 
   function escapeHtml(text) {
@@ -801,7 +802,6 @@
       paused = !!s.paused;
       $('btn-pause').textContent = paused ? '恢复推送' : '暂停推送';
       $('dot').className = 'dot ' + (s.last_error ? 'err' : (s.last_sync ? 'ok' : 'warn'));
-      knownTemplates = s.templates || [];
       if (document.querySelector('.tabs button[data-tab="device"]').classList.contains('on')
           && Date.now() - lastDeviceFetch > 15000) {
         refreshDevice();
@@ -813,11 +813,9 @@
 
   if (window.__TAURI__.event) {
     window.__TAURI__.event.listen('templates-changed', () => {
-      thumbCache.clear();
+      familyThumbCache.clear();
       refreshProfiles();
-      if (modalPreviewId && $('backdrop').classList.contains('open')) {
-        refreshModalPreview(modalPreviewId);
-      }
+      refreshPlatformTemplates();
     });
   }
 
@@ -1119,34 +1117,8 @@
       const data = await invoke('platform_templates');
       platformTemplates = data.templates || [];
       if (platformDevice) renderPlatformOrder();
-      const rows = (data.templates || []).map((t) => `
-        <div class="prow">
-          <div class="pmeta">
-            <b>${escapeHtml(t.template_id)}</b>
-            <small>${escapeHtml(t.render_target)} · crc ${escapeHtml(t.source_crc)} · ${t.bytes}B</small>
-            <small>引用设备：${(t.used_by || []).map(escapeHtml).join(', ') || '无'}</small>
-          </div>
-          <div class="pactions">
-            <button onclick="previewPlatformTemplate('${escapeAttr(t.template_id)}')">预览</button>
-          </div>
-        </div>`).join('');
-      $('pt-templates').innerHTML = rows || '<div class="muted">尚无已保存模板；先做一次“保存模板”。</div>';
-    } catch (e) {
-      $('pt-templates').innerHTML = '<div class="muted">模板库读取失败：' + escapeHtml(String(e)) + '</div>';
-    }
-  }
-
-  async function previewPlatformTemplate(id) {
-    try {
-      const data = await invoke('platform_template_preview', { id });
-      openModal(`<h3>预览 ${escapeHtml(id)}</h3>
-        <img style="max-width:400px;image-rendering:pixelated;border:1px solid var(--line)"
-             src="data:image/png;base64,${data.png_base64}">
-        <div class="foot"><button onclick="closeModal()">关闭</button></div>`);
-    } catch (e) {
-      openModal(`<h3>预览失败</h3><div>${escapeHtml(String(e))}</div>
-        <div class="foot"><button onclick="closeModal()">关闭</button></div>`);
-    }
+      renderProfileRows();
+    } catch (e) { /* templates are loaded for family selection and validation */ }
   }
 
   async function refreshPlatformDevice() {
@@ -1422,6 +1394,7 @@
     }
   }
 
+  renderFamilyMenu();
   refresh();
   refreshProfiles();
   refreshPlatformTemplates();

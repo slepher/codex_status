@@ -16,7 +16,8 @@ use crate::coordinator::{AckOutcome, Coordinator, Delivery, DeliveryKind, DEFAUL
 use crate::datasource::{DataSource, DataSourceKind};
 use crate::platform::model::{
     Binding, Bundle, BundleProfile, BundleResource, DeviceCapabilities, DeviceIdentity,
-    DeviceRecord, FieldRequirement, PlanMode, PowerPlan, Profile, PublishState, SourceSnapshot,
+    DeviceRecord, FamilyProfile, FieldRequirement, PlanMode, PowerPlan, Profile, PublishState,
+    SourceSnapshot,
     Template, TemplateKey, PublishJob, MAX_PROFILE_TEMPLATES,
 };
 use crate::platform::store;
@@ -50,6 +51,8 @@ pub struct PersistedState {
     pub templates: Vec<Template>,
     #[serde(default)]
     pub devices: Vec<DeviceRecord>,
+    #[serde(default)]
+    pub family_profiles: Vec<FamilyProfile>,
     /// Bounded terminal job summaries (no browsable content versions).
     #[serde(default)]
     pub jobs: Vec<Value>,
@@ -76,6 +79,7 @@ struct Inner {
     sources: BTreeMap<String, DataSource>,
     snapshots: BTreeMap<String, SourceSnapshot>,
     templates: BTreeMap<TemplateKey, Template>,
+    family_profiles: BTreeMap<(String, String), FamilyProfile>,
     devices: BTreeMap<String, DeviceRecord>,
     coordinators: BTreeMap<String, Coordinator>,
     codex_envelope: Option<Value>,
@@ -98,6 +102,7 @@ impl PlatformService {
             sources: persisted_sources,
             templates: persisted_templates,
             devices: persisted_devices,
+            family_profiles: persisted_family_profiles,
             jobs: mut persisted_jobs,
             asset_jobs: mut persisted_asset_jobs,
             bundle_jobs: persisted_bundle_jobs,
@@ -133,6 +138,10 @@ impl PlatformService {
             }
             templates.insert(t.key.clone(), t);
         }
+        let family_profiles = persisted_family_profiles
+            .into_iter()
+            .map(|profile| ((profile.render_target.clone(), profile.id.clone()), profile))
+            .collect();
         let mut sources: BTreeMap<String, DataSource> = persisted_sources
             .into_iter()
             .map(|s| (s.source_id.clone(), s))
@@ -189,6 +198,7 @@ impl PlatformService {
                 sources,
                 snapshots: BTreeMap::new(),
                 templates,
+                family_profiles,
                 devices,
                 coordinators,
                 codex_envelope: None,
@@ -264,6 +274,7 @@ impl PlatformService {
         let state = PersistedState {
             sources: inner.sources.values().cloned().collect(),
             templates: inner.templates.values().cloned().collect(),
+            family_profiles: inner.family_profiles.values().cloned().collect(),
             devices: inner.devices.values().cloned().collect(),
             jobs,
             asset_jobs: inner.asset_jobs.clone(),
@@ -438,6 +449,123 @@ impl PlatformService {
     }
 
     // ---- Profiles --------------------------------------------------------
+
+    pub fn family_profiles(&self, render_target: Option<&str>) -> Vec<FamilyProfile> {
+        self.inner
+            .lock()
+            .unwrap()
+            .family_profiles
+            .values()
+            .filter(|profile| render_target.map_or(true, |target| profile.render_target == target))
+            .cloned()
+            .collect()
+    }
+
+    pub fn family_profile_get(&self, render_target: &str, id: &str) -> Option<FamilyProfile> {
+        self.inner
+            .lock()
+            .unwrap()
+            .family_profiles
+            .get(&(render_target.into(), id.into()))
+            .cloned()
+    }
+
+    fn validate_family_profile(&self, inner: &Inner, profile: &FamilyProfile) -> Result<()> {
+        profile.validate()?;
+        let mut font_names = Vec::new();
+        for id in &profile.template_ids {
+            let template = inner
+                .templates
+                .get(&TemplateKey::new(id, &profile.render_target))
+                .with_context(|| {
+                    format!("template {id} has no {} variant", profile.render_target)
+                })?;
+            collect_font_names(&template.source, &mut font_names);
+        }
+        let plan = FontPlan::for_selected(&self.font_library()?, &font_names, &profile.font_ids)?;
+        if plan.required.len() != profile.font_ids.len() {
+            bail!("family profile contains a font_id selection unused by its templates");
+        }
+        Ok(())
+    }
+
+    pub fn family_profile_save(
+        &self,
+        mut profile: FamilyProfile,
+        now: u64,
+    ) -> Result<FamilyProfile> {
+        profile.initial_active_id = profile.enabled_ids().into_iter().next();
+        profile.updated_at = now;
+        let mut inner = self.inner.lock().unwrap();
+        self.validate_family_profile(&inner, &profile)?;
+        inner.family_profiles.insert(
+            (profile.render_target.clone(), profile.id.clone()),
+            profile.clone(),
+        );
+        Self::persist(&inner, &self.state_path())?;
+        Ok(profile)
+    }
+
+    pub fn family_profile_delete(&self, render_target: &str, id: &str) -> Result<bool> {
+        let mut inner = self.inner.lock().unwrap();
+        let removed = inner
+            .family_profiles
+            .remove(&(render_target.into(), id.into()))
+            .is_some();
+        if removed {
+            Self::persist(&inner, &self.state_path())?;
+        }
+        Ok(removed)
+    }
+
+    pub fn family_profile_copy_from_device(
+        &self,
+        mac: &str,
+        id: &str,
+        name: &str,
+        now: u64,
+    ) -> Result<FamilyProfile> {
+        let mac = mac.to_uppercase();
+        let mut inner = self.inner.lock().unwrap();
+        let record = inner.devices.get(&mac).context("unknown device")?;
+        record.capabilities.validate()?;
+        let render_target = record.capabilities.render_target.clone();
+        let source = record
+            .profile
+            .as_ref()
+            .context("device has no Profile to copy")?;
+        if source
+            .render_target
+            .as_deref()
+            .is_some_and(|target| target != render_target)
+        {
+            bail!(
+                "device Profile render_target does not match verified device capabilities"
+            );
+        }
+        let key = (render_target.clone(), id.to_owned());
+        if inner.family_profiles.contains_key(&key) {
+            bail!("family Profile id {id} already exists for {render_target}");
+        }
+        let mut profile = FamilyProfile {
+            render_target,
+            id: id.into(),
+            name: name.into(),
+            template_ids: source.template_ids.clone(),
+            enabled_template_ids: None,
+            initial_active_id: None,
+            font_ids: source.font_ids.clone(),
+            bindings: source.bindings.clone(),
+            sync_enabled: source.sync_enabled,
+            full_sync_s: source.full_sync_s,
+            updated_at: now,
+        };
+        profile.initial_active_id = profile.enabled_ids().into_iter().next();
+        self.validate_family_profile(&inner, &profile)?;
+        inner.family_profiles.insert(key, profile.clone());
+        Self::persist(&inner, &self.state_path())?;
+        Ok(profile)
+    }
 
     pub fn profile_get(&self, mac: &str) -> Option<Profile> {
         let inner = self.inner.lock().unwrap();
@@ -1851,6 +1979,60 @@ mod tests {
     }
 
     #[test]
+    fn family_profile_copy_and_save_persist_without_publishing() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = service_with_device(dir.path());
+        svc.template_save(
+            "quad",
+            crate::platform::model::RENDER_TARGET_154G,
+            &quad_source(),
+            1000,
+        )
+            .unwrap();
+        let mut device_profile = Profile::draft("AA:BB:CC:DD:EE:FF");
+        device_profile.template_ids = vec!["quad".into()];
+        device_profile.initial_active_id = Some("quad".into());
+        let device_profile = svc.profile_save(device_profile, 1001).unwrap();
+
+        let copied = svc
+            .family_profile_copy_from_device("aa:bb:cc:dd:ee:ff", "copied", "Copied", 1002)
+            .unwrap();
+        assert_eq!(copied.render_target, crate::platform::model::RENDER_TARGET_154G);
+        assert_eq!(copied.template_ids, ["quad"]);
+        assert_eq!(svc.profile_get("AA:BB:CC:DD:EE:FF").unwrap(), device_profile);
+        assert!(svc.job("AA:BB:CC:DD:EE:FF").is_none());
+        assert!(svc
+            .family_profile_copy_from_device("AA:BB:CC:DD:EE:FF", "copied", "Duplicate", 1003)
+            .is_err());
+
+        let draft = FamilyProfile {
+            render_target: crate::platform::model::RENDER_TARGET_154G.into(),
+            id: "default".into(),
+            name: "Default".into(),
+            template_ids: vec!["quad".into()],
+            enabled_template_ids: None,
+            initial_active_id: Some("quad".into()),
+            font_ids: BTreeMap::new(),
+            bindings: Vec::new(),
+            sync_enabled: false,
+            full_sync_s: 3600,
+            updated_at: 0,
+        };
+        svc.family_profile_save(draft, 1004).unwrap();
+        drop(svc);
+
+        let restored = PlatformService::open(dir.path()).unwrap();
+        assert!(restored
+            .family_profile_get(crate::platform::model::RENDER_TARGET_154G, "default")
+            .is_some());
+        assert!(restored
+            .family_profile_get(crate::platform::model::RENDER_TARGET_154G, "copied")
+            .is_some());
+        assert_eq!(restored.profile_get("AA:BB:CC:DD:EE:FF").unwrap(), device_profile);
+        assert!(restored.job("AA:BB:CC:DD:EE:FF").is_none());
+    }
+
+    #[test]
     fn profile_order_1_to_8_and_rejections() {
         let dir = tempfile::tempdir().unwrap();
         let svc = service_with_device(dir.path());
@@ -2127,7 +2309,7 @@ mod tests {
         let inner = svc.inner.lock().unwrap();
         let bundle = &inner.coordinators["7C4FADB93408"].job.as_ref().unwrap().frozen_bundle;
         assert_eq!(bundle.render_target, crate::platform::model::RENDER_TARGET_NOTE4);
-        assert_eq!(bundle.compiler_abi, 1);
+        assert_eq!(bundle.compiler_abi, 2);
         assert!(bundle.total_len <= 262_144);
         assert_eq!(bundle.profile.template_ids, ["codex-status-a"]);
         bundle.verify().unwrap();

@@ -920,6 +920,56 @@ fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "family_profiles_v2",
+            "description": "List supported render target families and their reusable v2 Profile drafts.",
+            "annotations": {"readOnlyHint": true},
+            "inputSchema": {
+                "type": "object",
+                "properties": {"render_target": {"type": "string"}},
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "family_profile_save_v2",
+            "description": "Save a family Profile draft without changing a device or publishing.",
+            "annotations": {"readOnlyHint": false, "destructiveHint": false},
+            "inputSchema": {
+                "type": "object",
+                "properties": {"profile": {"type": "object"}},
+                "required": ["profile"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "family_profile_delete_v2",
+            "description": "Delete a family Profile draft only.",
+            "annotations": {"readOnlyHint": false, "destructiveHint": false},
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "render_target": {"type": "string"},
+                    "id": {"type": "string"}
+                },
+                "required": ["render_target", "id"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "family_profile_copy_v2",
+            "description": "Copy one explicitly selected device Profile into a new family draft.",
+            "annotations": {"readOnlyHint": false, "destructiveHint": false},
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "mac": {"type": "string"},
+                    "id": {"type": "string"},
+                    "name": {"type": "string"}
+                },
+                "required": ["mac", "id", "name"],
+                "additionalProperties": false
+            }
+        },
+        {
             "name": "platform_publish",
             "description": "Explicit publish: freeze the profile into one Bundle and deliver it at the next reachable opportunity. Save is not publish.",
             "annotations": {"readOnlyHint": false, "destructiveHint": false},
@@ -1295,6 +1345,8 @@ async fn call_tool(cfg: &McpConfig, name: &str, args: &Value) -> Result<Vec<Valu
         // running app there is no live state to read or change.
         "platform_overview" | "template_list" | "template_get_v2" | "template_save_v2"
         | "template_validate_v2" | "profile_get_v2" | "profile_save_v2"
+        | "family_profiles_v2" | "family_profile_save_v2"
+        | "family_profile_delete_v2" | "family_profile_copy_v2"
         | "platform_publish" | "platform_publish_preview" | "platform_font_list" | "platform_font_import" | "platform_publish_cancel" | "template_activate"
         | "data_sources_v2" | "data_source_save_v2" | "data_probe_v2" | "power_view_v2" | "power_plan"
         | "platform_status_refresh" | "platform_push_now" | "platform_recovery" => {
