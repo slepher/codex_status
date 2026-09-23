@@ -38,6 +38,7 @@ fn main() {
         .include(&firmware)
         .include(&arduinojson)
         .define("ARDUINOJSON_ENABLE_ARDUINO_STRING", "1")
+        .define("CODEX_RENDER_NOTE4_FONTS", "1")
         .warnings(false)
         .flag_if_supported("/utf-8")
         .file(firmware.join("template_engine.cpp"))
@@ -62,6 +63,7 @@ fn main() {
                     "bundle_store.h", "bundle_store.cpp", "fonts.h",
                     "font_noto.h", "font_noto_nt16.h", "font_noto_nt30.h",
                     "font_noto_ntthin18.h", "font_noto_ntreg64.h",
+                    "font_noto_ntreg96.h",
                     "font_asset.h", "font_asset.cpp",
                     "font_store.h", "font_store.cpp",
                     "platform_target.h"] {

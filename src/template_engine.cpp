@@ -563,6 +563,9 @@ static const TplFontEntry TPL_FONTS[] = {
     // compiled templates must keep resolving to the same glyph tables.
     {"ntthin18", FONT_KIND_PROP, nullptr, &note4_ntthin18},  // normal text, Thin 100 @18
     {"ntreg64",  FONT_KIND_PROP, nullptr, &note4_ntreg64},   // large text, Regular 400 @64
+#if defined(CODEX_TARGET_NOTE4) || defined(CODEX_RENDER_NOTE4_FONTS)
+    {"ntreg96",  FONT_KIND_PROP, nullptr, &note4_ntreg96},   // large text, Regular 400 @96
+#endif
 };
 
 int tplFontCount() {

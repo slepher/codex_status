@@ -13,7 +13,7 @@ fn firmware_consumes_bridge_binary_and_survives_torn_storage_writes() {
     let compiled = bridge_core::compile::compile(&source, "epd-ssd1681-200x200-1bpp").unwrap();
     let bundle = json!({
         "job_id": "job-test", "firmware_target": "codex-status-154g",
-        "render_target": "epd-ssd1681-200x200-1bpp", "compiler_abi": 1,
+        "render_target": "epd-ssd1681-200x200-1bpp", "compiler_abi": 2,
         "profile": {"template_ids": ["quad"], "initial_active_id": "quad"},
         "templates": [{"key": {"template_id": "quad", "render_target": "epd-ssd1681-200x200-1bpp"},
                        "source": source, "compiled": compiled}],

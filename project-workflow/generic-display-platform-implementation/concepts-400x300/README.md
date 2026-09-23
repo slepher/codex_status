@@ -28,7 +28,7 @@
 
 ## 首版实际模板与预览
 
-`codex-status-a-400x300.json` 为已选 A 方案的 v2 模板源；`status_icons.py` 生成 20×20 图标及放大检查图，`make-template.py` 写出 JSON。为适配当前 CTP1 的单资源长度上限，每个图标拆为左右两个 10×20 位图，最终视觉尺寸仍是 20×20。`bridge-off-icons8-20203-100.png` 来自用户选定的 [Icons8 TV Off 原图](https://img.icons8.com/?size=100&id=20203&format=png&color=000000)，在本项目命名为 **Bridge Off**；`Bridge On` 使用同一显示器轮廓加勾。`icons8-battery-59804-100.png` 来自用户选定的 [Icons8 电池原图](https://img.icons8.com/?size=100&id=59804&format=png&color=000000)，据此外框生成 0/25/50/75/100% 五档图标。模板用同一外框与 `device.battery` 进度条实时填充，右侧数字也来自 `device.battery`。蓝牙和 Wi-Fi 沿用此前准备的同尺寸黑白图形；当前连接图标仍是固定图形。
+`codex-status-a-400x300.json` 为已选 A 方案的 v2 模板源；`status_icons.py` 生成 20×20 图标及放大检查图，`make-template.py` 写出 JSON。为适配当前 CTP1 的单资源长度上限，每个图标拆为左右两个 10×20 位图，最终视觉尺寸仍是 20×20。`bridge-off-icons8-20203-100.png` 来自用户选定的 [Icons8 TV Off 原图](https://img.icons8.com/?size=100&id=20203&format=png&color=000000)，在本项目命名为 **Bridge Off**；`Bridge On` 使用同一显示器轮廓加勾。`icons8-battery-59804-100.png` 来自用户选定的 [Icons8 电池原图](https://img.icons8.com/?size=100&id=59804&format=png&color=000000)，据此外框生成 0/25/50/75/100% 五档图标。模板用同一外框与 `device.battery` 进度条实时填充，右侧数字也来自 `device.battery`。蓝牙和 Wi-Fi 沿用此前准备的同尺寸黑白图形；状态联动待完成。
 
 2026-09-23 二次修订：状态栏文字与电池填充按像素实测重新对齐（见下节），新增离线行，主区 `%` 改为与数字垂直居中。当前版本已通过本机 Bridge MCP 的 `template_validate_v2` / `template_save_v2`，仅保存到 v2 库（`source_crc=2b523381`，`compiled_crc=41c31abd`，`published=false`），未发布、未刷机。
 
@@ -102,6 +102,12 @@
 | `python measure-preview.py <png> …` | 对齐实测与 `--selftest` 通过；各预览 `400x300 colors=2` |
 
 `--compare-compiled` 与画布感知的 `--diff` 是本次新增的宿主校验入口（`bridge/crates/render`）：它们同时修掉了“compiled 渲染路径默认按 200×200 分配帧缓冲、`png_to_bits` 只认 200×200”的缺口，因此 400×300 的 JSON/compiled 像素一致性与 CTP1 编解码现在可复现验证。宿主预览不等于 Note4 实机验收。
+
+### 96px 数字排版（2026-09-24）
+
+`codex-status-a-400x300.json` 已改用 `ntreg96` 显示双桶与 weekly-only 数字。双桶区域为 `[12,62,176,132]`、`[212,62,176,132]`；weekly-only 数字区域为 `[12,62,376,132]`，`WEEK` 与重置时间居中。百分号保留为小字，双桶分别位于 x=183/383，weekly-only 位于 x=285；重置时间保留，所有可见 `RESET` 字样已移除。宿主预览确认 `100` 不裁切，weekly-only 数字与时间居中。
+
+`status_icons.py` 生成带单条 2px 斜线的 `bluetooth-off`、`wifi-off` 变体和阶梯式 `zzz` 深睡图标，均有 20×20 位图及放大 PNG。模板使用正常图标底图，并在 BLE OFF、Wi-Fi OFF/CONN/AP/DEEP 等状态叠加对应的斜线图标；deep 模式在状态栏 Bluetooth 左侧绘制 `zzz`，离线 Bridge 状态叠加 Bridge Off。黑色图标像素只能增加，因此此处以正常图标为底、断开图标作条件叠加。完整状态映射需要 57 个操作和 16 个不同半片资源，现已通过 ABI 2 的 64-op/16-resource 宿主编译与往返渲染校验。
 
 ### 仍待确认
 

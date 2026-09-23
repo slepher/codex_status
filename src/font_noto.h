@@ -34,6 +34,9 @@ typedef struct {
 #include "font_noto_nt30.h"
 #include "font_noto_ntthin18.h"
 #include "font_noto_ntreg64.h"
+#if defined(CODEX_TARGET_NOTE4) || defined(CODEX_RENDER_NOTE4_FONTS)
+#include "font_noto_ntreg96.h"
+#endif
 
 static const Note4PropFont note4_nt16 = {
     font_nt16_blob, font_nt16_glyphs, FONT_NT16_LINE_HEIGHT, FONT_NT16_BASE_LINE,
@@ -52,3 +55,8 @@ static const Note4PropFont note4_ntthin18 = {
 static const Note4PropFont note4_ntreg64 = {
     font_ntreg64_blob, font_ntreg64_glyphs, FONT_NTREG64_LINE_HEIGHT,
     FONT_NTREG64_BASE_LINE, FONT_NTREG64_MAX_ADV};
+#if defined(CODEX_TARGET_NOTE4) || defined(CODEX_RENDER_NOTE4_FONTS)
+static const Note4PropFont note4_ntreg96 = {
+    font_ntreg96_blob, font_ntreg96_glyphs, FONT_NTREG96_LINE_HEIGHT,
+    FONT_NTREG96_BASE_LINE, FONT_NTREG96_MAX_ADV};
+#endif

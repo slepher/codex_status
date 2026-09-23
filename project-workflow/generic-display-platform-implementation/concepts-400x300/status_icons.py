@@ -102,6 +102,36 @@ def line(pixels, x1, y1, x2, y2, thick=1):
             pixels[y + 1][x] = True
 
 
+def crossed(pixels):
+    """Add a two-pixel diagonal strike over a 20x20 on-state icon."""
+    result = [row.copy() for row in pixels]
+    for step in range(2, 18):
+        x, y = step, 18 - step
+        result[y][x] = True
+        result[y + 1][x] = True
+    return result
+
+
+def draw_z(pixels, x, y, width, height):
+    for dx in range(width):
+        pixels[y][x + dx] = True
+        pixels[y + 1][x + dx] = True
+        pixels[y + height - 2][x + dx] = True
+        pixels[y + height - 1][x + dx] = True
+    for dy in range(height):
+        col = x + width - 1 - round(dy * (width - 1) / (height - 1))
+        pixels[y + dy][col] = True
+        pixels[y + dy][col - 1] = True
+
+
+def zzz_icon():
+    pixels = [[False] * 20 for _ in range(20)]
+    draw_z(pixels, 1, 13, 6, 6)
+    draw_z(pixels, 7, 8, 6, 6)
+    draw_z(pixels, 13, 3, 6, 6)
+    return pixels
+
+
 def icon_set():
     off = rows(TV_OFF)
     for y in range(7, 12):
@@ -132,9 +162,12 @@ def icon_set():
             outline[y][x] = False
     icons = {
         "bluetooth": bluetooth,
+        "bluetooth-off": crossed(bluetooth),
         "wifi": from_bits(WIFI),
+        "wifi-off": crossed(from_bits(WIFI)),
         "bridge-off": off,
         "bridge-on": on,
+        "zzz": zzz_icon(),
         "battery-outline": outline,
     }
     for level in (0, 25, 50, 75, 100):

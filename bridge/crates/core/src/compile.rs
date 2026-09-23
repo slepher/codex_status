@@ -6,7 +6,7 @@ use serde_json::Value;
 use crate::template::{parse_bind, BindSpec, CANVAS, NOTE4_WIDTH, NOTE4_HEIGHT};
 use crate::platform::model::{FieldRequirement, MissingPolicy};
 
-pub const COMPILER_ABI: u32 = 1;
+pub const COMPILER_ABI: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompiledTemplate {
@@ -212,6 +212,74 @@ mod tests {
         let n = bytes.len();
         bytes[n / 2] ^= 0x01;
         assert!(decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn compiled_template_accepts_sixteen_distinct_resources_and_rejects_seventeen() {
+        fn template_with_icons(count: usize) -> Value {
+            let bits = [
+                "AQ==", "Ag==", "Aw==", "BA==", "BQ==", "Bg==", "Bw==", "CA==",
+                "CQ==", "Cg==", "Cw==", "DA==", "DQ==", "Dg==", "Dw==", "EA==",
+                "EQ==",
+            ];
+            let mut template = quad();
+            template["elements"] = Value::Array(
+                bits[..count]
+                    .iter()
+                    .map(|bits| {
+                        json!({
+                            "type": "icon",
+                            "x": 0,
+                            "y": 0,
+                            "w": 8,
+                            "h": 1,
+                            "bits": bits,
+                        })
+                    })
+                    .collect(),
+            );
+            template
+        }
+
+        let compiled = compile(
+            &template_with_icons(16),
+            crate::platform::model::RENDER_TARGET_154G,
+        )
+        .expect("16 unique bitmap resources fit the compiled resource table");
+        assert_eq!(compiled.resources.len(), 16);
+        assert_eq!(compiled.compiler_abi, COMPILER_ABI);
+
+        assert!(compile(
+            &template_with_icons(17),
+            crate::platform::model::RENDER_TARGET_154G,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn compiled_template_accepts_sixty_four_ops_and_rejects_sixty_five() {
+        fn template_with_rects(count: usize) -> Value {
+            let mut template = quad();
+            template["elements"] = Value::Array(
+                (0..count)
+                    .map(|_| json!({"type": "rect", "rect": [0, 0, 1, 1]}))
+                    .collect(),
+            );
+            template
+        }
+
+        let compiled = compile(
+            &template_with_rects(64),
+            crate::platform::model::RENDER_TARGET_154G,
+        )
+        .expect("64 operations fit the compiled operation table");
+        assert_eq!(compiled.op_count, 64);
+
+        assert!(compile(
+            &template_with_rects(65),
+            crate::platform::model::RENDER_TARGET_154G,
+        )
+        .is_err());
     }
 
     #[test]

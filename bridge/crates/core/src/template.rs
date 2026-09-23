@@ -14,10 +14,10 @@ use crate::envelope::TemplateRef;
 /// display's fixed-cell bitmap family, `nt16`/`nt30` the proportional Noto
 /// family cropped from the LVGL component, and `ntthin18`/`ntreg64` the
 /// FreeType-rasterized pair: Thin 100 @18 px for normal text and Regular 400
-/// @64 px tabular digits for large text. The families are independent: a
-/// template picks one font per element.
-pub const FONTS: [&str; 9] = [
-    "f8", "f12", "f16", "f20", "f24", "nt16", "nt30", "ntthin18", "ntreg64",
+/// @64 px tabular digits, and Note4-only Regular 400 @96 px tabular digits.
+/// The families are independent: a template picks one font per element.
+pub const FONTS: [&str; 10] = [
+    "f8", "f12", "f16", "f20", "f24", "nt16", "nt30", "ntthin18", "ntreg64", "ntreg96",
 ];
 pub const CANVAS: i64 = 200;
 pub const NOTE4_WIDTH: i64 = 400;
@@ -218,7 +218,12 @@ fn validate_condition(e: &Value) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_element(e: &Value, canvas_w: i64, canvas_h: i64) -> Result<(), String> {
+fn validate_element(
+    e: &Value,
+    canvas_w: i64,
+    canvas_h: i64,
+    render_target: Option<&str>,
+) -> Result<(), String> {
     validate_condition(e)?;
     let ty = e.get("type").and_then(|v| v.as_str()).ok_or("type")?;
     match ty {
@@ -226,6 +231,12 @@ fn validate_element(e: &Value, canvas_w: i64, canvas_h: i64) -> Result<(), Strin
             let font = e.get("font").and_then(|v| v.as_str()).ok_or("font")?;
             if !FONTS.contains(&font) {
                 return Err(format!("font {font}"));
+            }
+            if font == "ntreg96"
+                && ((canvas_w, canvas_h) != (NOTE4_WIDTH, NOTE4_HEIGHT)
+                    || render_target != Some("epd-ssd2683-400x300-1bpp"))
+            {
+                return Err("font ntreg96 requires the Note4 render target".into());
             }
             let bind = e.get("bind").and_then(|v| v.as_str()).unwrap_or("");
             let text = e.get("text").and_then(|v| v.as_str()).unwrap_or("");
@@ -314,6 +325,7 @@ pub fn validate_template(v: &Value) -> Result<(), String> {
         return Err("canvas size".into());
     }
     let (w, h) = (w.unwrap(), h.unwrap());
+    let render_target = v.get("render_target").and_then(Value::as_str);
     let els = v
         .get("elements")
         .and_then(|x| x.as_array())
@@ -322,7 +334,7 @@ pub fn validate_template(v: &Value) -> Result<(), String> {
         return Err("elements empty".into());
     }
     for e in els {
-        validate_element(e, w, h)?;
+        validate_element(e, w, h, render_target)?;
     }
     Ok(())
 }
@@ -448,5 +460,59 @@ impl Library {
                 )
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_template;
+    use serde_json::json;
+
+    fn one_text_template(
+        width: i64,
+        height: i64,
+        font: &str,
+        render_target: &str,
+    ) -> serde_json::Value {
+        json!({
+            "schema": 1,
+            "render_target": render_target,
+            "canvas": {"w": width, "h": height},
+            "elements": [{"type": "text", "font": font, "text": "100"}]
+        })
+    }
+
+    #[test]
+    fn ntreg96_is_note4_only() {
+        assert!(validate_template(&one_text_template(
+            400,
+            300,
+            "ntreg96",
+            "epd-ssd2683-400x300-1bpp"
+        ))
+        .is_ok());
+        assert!(validate_template(&one_text_template(
+            200,
+            200,
+            "ntreg96",
+            "epd-ssd1681-200x200-1bpp"
+        ))
+        .unwrap_err()
+        .contains("requires the Note4 render target"));
+        assert!(validate_template(&one_text_template(
+            400,
+            300,
+            "ntreg96",
+            "epd-200x200-2bpp-gray4"
+        ))
+        .unwrap_err()
+        .contains("requires the Note4 render target"));
+        assert!(validate_template(&one_text_template(
+            200,
+            200,
+            "ntreg64",
+            "epd-ssd1681-200x200-1bpp"
+        ))
+        .is_ok());
     }
 }

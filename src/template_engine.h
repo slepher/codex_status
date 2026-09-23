@@ -68,10 +68,10 @@ void tplSetCanvas(int w, int h);
 // runtime wake/data/switch/render paths address ops and requirement indices.
 // ---------------------------------------------------------------------------
 
-#define CT_ABI          1
-#define CT_MAX_OPS      48
+#define CT_ABI          2
+#define CT_MAX_OPS      64
 #define CT_MAX_REQS     32
-#define CT_MAX_RES      8
+#define CT_MAX_RES      16
 #define CT_BIND_MAX     64
 #define CT_TEXT_MAX     48
 #define CT_STR_MAX      12
