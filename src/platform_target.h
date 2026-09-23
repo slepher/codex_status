@@ -11,8 +11,8 @@
 //                             (blocked_by_hardware_arrival).
 //   zectrix-note4-400x300   : ZecTrix Note4 V1.0 board (ESP32-S3) with a 4.2"
 //                             400x300 B/W panel and an SSD2683 controller.
-//                             Official V1.0 pin map and OTP full-refresh path
-//                             are used. Partial refresh awaits hardware tests.
+//                             Official V1.0 pin map and OTP full/partial driver
+//                             paths are used; partial hardware validation remains.
 #pragma once
 
 #if defined(CODEX_TARGET_NOTE4)
@@ -20,7 +20,7 @@
 #define RENDER_TARGET_ID   "epd-ssd2683-400x300-1bpp"
 #define TARGET_PIXEL_FORMAT "1bpp"
 #define TARGET_COLORS      "bw"
-#define TARGET_PARTIAL     0   // enable only after waveform/BUSY verification
+#define TARGET_PARTIAL     1   // OTP driver ported; hardware verification pending
 #define TARGET_VERIFIED    1   // Note4 V1.0 pin map and OTP full-refresh path
 #define TARGET_WIDTH  400
 #define TARGET_HEIGHT 300

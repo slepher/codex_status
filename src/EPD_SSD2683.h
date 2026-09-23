@@ -2,8 +2,8 @@
 * | File      	:   EPD_SSD2683.h
 * | Function    :   4.2" 400x300 B/W e-Paper - SSD2683 controller (ZecTrix
 * |                 Note4 V1.0 target). Driver structure and BUSY/window/plane
-* |                 full-refresh sequence uses the Note4 reference OTP waveform.
-* |                 Partial refresh remains disabled until waveform/BUSY tests.
+* |                 full and partial-refresh sequences use the Note4 reference
+* |                 OTP waveform.
 ******************************************************************************/
 #ifndef __EPD_SSD2683_H_
 #define __EPD_SSD2683_H_
@@ -28,6 +28,8 @@ bool EPD_SSD2683_WakePartial(const UBYTE *PreviousImage);
 bool EPD_SSD2683_Clear(UBYTE color);
 bool EPD_SSD2683_Display(const UBYTE *Image);
 bool EPD_SSD2683_DisplayPart(const UBYTE *Image);
+// Window coordinates are inclusive. Data is packed 1bpp, row-major, with
+// ceil((x1-x0+1)/8) bytes per row. Wake prev uses the same window layout.
 bool EPD_SSD2683_WakePartialWindow(int x0, int y0, int x1, int y1,
                                    const UBYTE *prev);
 bool EPD_SSD2683_DisplayPartWindow(int x0, int y0, int x1, int y1,

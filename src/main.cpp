@@ -72,7 +72,7 @@ static bool targetUnverified = false;
 #define FW_VERSION    "0.13.9-clkwin"
 #elif defined(CODEX_TARGET_NOTE4)
 #ifdef CODEX_NOTE4_ROM_B
-#define FW_VERSION    "0.18.19-note4-b"
+#define FW_VERSION    "0.18.20-note4-b"
 #else
 #define FW_VERSION    "0.18.19-note4-a"
 #endif
@@ -4699,7 +4699,7 @@ static void sleepToNextEvent() {
 }
 
 // Thin deep wake: panel + clock window only, no Wi-Fi/NVS/template work.
-static void deepThinWake() {
+static bool deepThinWake() {
     const uint64_t t0 = esp_timer_get_time();
     setStage(2);
     epdThinBegin();
@@ -4710,7 +4710,7 @@ static void deepThinWake() {
     setStage(3);
     DevLog.printf("[deep] thin wake drew=%d total=%uus\n", drew ? 1 : 0,
                   (unsigned)(esp_timer_get_time() - t0));
-    sleepToNextEvent();
+    return drew;
 }
 
 // ---------------- deep-pull test rig (CODEX_DEEPPULL_TEST only) ----------------
@@ -4930,17 +4930,18 @@ void setup() {
     if (rtcMagic == 0xC0DE0001) restoreTimeFromRtc();
     if (timeKnown()) timeSource = TIME_RTC;
 
-    // v0.14 deep timer wake: if no network contact is due, this boot is a thin
-    // clock-only wake (panel + reserved window, no Wi-Fi/NVS/template work).
-    // Buttons and USB still fall through to the normal light-mode path.
+    // A deep timer wake before the next contact first tries the retained clock
+    // window. If the panel lacks a usable baseline, setup falls through to the
+    // local full-render fallback below. Buttons and USB use the normal path.
     bool deepTimerBoot = (cause == ESP_SLEEP_WAKEUP_TIMER && rtcMode == MODE_DEEP &&
                           (!plugged || rtcDeepOnUsb));
+    bool deepClockOnlyBoot = deepTimerBoot && !deepNetDue();
     nvsStageMark(5);      // wake classified (deepTimerBoot known)
     histAdd(HIST_BOOT, (uint16_t)cause);
     wakeResult = deepTimerBoot ? WAKE_NET : WAKE_LIGHT;
-    if (deepTimerBoot && !deepNetDue()) {
+    if (deepClockOnlyBoot) {
         wakeResult = WAKE_THIN;
-        deepThinWake();   // never returns
+        if (deepThinWake()) sleepToNextEvent();
     }
 
     epdBegin(!woke);
@@ -5045,25 +5046,42 @@ void setup() {
                       (unsigned)v2Profile.count, v2Profile.contextId,
                       (unsigned)bsCommitSeq());
         v2ActiveLoad();
-        v2DataSeq.beginContext(v2NowMs(), 1);
-        if (esp_reset_reason() == ESP_RST_DEEPSLEEP) {
-            v2DataCheckpoint.restore(v2Profile.contextId, v2DataSeq);
-        }
-        if (!v2DataSeq.haveApplied()) {
-            // Unknown retention (cold reset, corrupt RTC, or new context): rotate
-            // context so an in-flight old snapshot cannot be mistaken for new.
-            if (!v2SwitchActive(v2Profile.initial)) {
-                v2CtValid = false;
-                DevLog.println("[v2] cannot rotate unknown-retention context; data disabled");
+        if (!deepClockOnlyBoot) {
+            v2DataSeq.beginContext(v2NowMs(), 1);
+            if (esp_reset_reason() == ESP_RST_DEEPSLEEP) {
+                v2DataCheckpoint.restore(v2Profile.contextId, v2DataSeq);
+            }
+            if (!v2DataSeq.haveApplied()) {
+                // Unknown retention (cold reset, corrupt RTC, or new context): rotate
+                // context so an in-flight old snapshot cannot be mistaken for new.
+                if (!v2SwitchActive(v2Profile.initial)) {
+                    v2CtValid = false;
+                    DevLog.println("[v2] cannot rotate unknown-retention context; data disabled");
+                }
             }
         }
         v2Provisional = v2Provisional || (cause == ESP_SLEEP_WAKEUP_EXT1);
-        v2SafetyDeadlineMs = v2NowMs() + (uint64_t)V2_MAX_LIGHT_S * 1000ULL;
+        if (!deepClockOnlyBoot) {
+            v2SafetyDeadlineMs = v2NowMs() + (uint64_t)V2_MAX_LIGHT_S * 1000ULL;
+        }
     } else {
         DevLog.println("[v2] no committed bundle; legacy template store active");
     }
     String cached;
     if (usageCacheLoad(cached)) lastUsage = cached;
+
+    // Clock-only wakes never initialize data sequence state or a safety plan.
+    // If the retained window failed, use the local Bundle and usage cache to
+    // rebuild the full frame, then keep the existing rendezvous schedule.
+    if (deepClockOnlyBoot) {
+        bool clockTemplateReady = v2BundleReady
+            ? v2CtValid && activeTplHasNow
+            : tplCacheLoad() && activeTplHasNow;
+        if (clockTemplateReady && lastUsage.length()) {
+            renderActiveUsage(lastUsage, "RTC");
+        }
+        sleepToNextEvent();   // no network, owner claim, or data-sequence change
+    }
 
 #ifdef CODEX_DEEPPULL_TEST
     if (dpTestMain(cause)) return;
