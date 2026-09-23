@@ -18,7 +18,7 @@ struct FakeDevice {
     pub len: Arc<AtomicUsize>,
 }
 
-fn read_request(stream: &mut TcpStream) -> (String, String, Vec<u8>) {
+fn read_request(stream: &mut TcpStream) -> (String, String, String, Vec<u8>) {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 1024];
     // Read until the end of headers.
@@ -26,7 +26,7 @@ fn read_request(stream: &mut TcpStream) -> (String, String, Vec<u8>) {
     loop {
         let n = stream.read(&mut tmp).unwrap();
         if n == 0 {
-            return (String::new(), String::new(), buf);
+            return (String::new(), String::new(), String::new(), buf);
         }
         buf.extend_from_slice(&tmp[..n]);
         if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -55,7 +55,14 @@ fn read_request(stream: &mut TcpStream) -> (String, String, Vec<u8>) {
     body.truncate(content_len);
     let line = head.lines().next().unwrap_or("").to_string();
     let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
-    (line, path, body)
+    (line, path, head, body)
+}
+
+fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.eq_ignore_ascii_case(name).then_some(value.trim())
+    })
 }
 
 fn respond(stream: &mut TcpStream, status: u16, body: &Value) {
@@ -66,6 +73,20 @@ fn respond(stream: &mut TcpStream, status: u16, body: &Value) {
     );
     let _ = stream.write_all(head.as_bytes());
     let _ = stream.write_all(text.as_bytes());
+}
+
+#[test]
+fn complete_ack_does_not_wait_for_socket_close() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _ = read_request(&mut stream);
+        respond(&mut stream, 200, &json!({"result": "applied"}));
+        std::thread::sleep(Duration::from_secs(1));
+    });
+    let status = v2_client::status(&addr.to_string(), "tok", Duration::from_millis(300)).unwrap();
+    assert_eq!(status["result"], "applied");
 }
 
 fn spawn_fake() -> (String, FakeDevice) {
@@ -85,7 +106,7 @@ fn spawn_fake() -> (String, FakeDevice) {
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { break };
-            let (_line, path, body) = read_request(&mut stream);
+            let (_line, path, head, body) = read_request(&mut stream);
             calls.lock().unwrap().push(path.clone());
             if path == "/v2/status" {
                 respond(
@@ -136,6 +157,10 @@ fn spawn_fake() -> (String, FakeDevice) {
                     .unwrap_or("0")
                     .parse()
                     .unwrap_or(0);
+                assert_eq!(header(&head, "X-Request-Id"), Some("bundle-job-1"));
+                assert_eq!(header(&head, "X-Session-Nonce"), Some("0123456789abcdef0123456789abcdef"));
+                let expected_offset = stated.to_string();
+                assert_eq!(header(&head, "X-Offset"), Some(expected_offset.as_str()));
                 let expected = offset.load(Ordering::SeqCst);
                 if stated != expected {
                     respond(
@@ -272,7 +297,7 @@ fn owner_conflict_stops_the_write_without_retrying() {
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { break };
-            let (_, path, _) = read_request(&mut stream);
+            let (_, path, _, _) = read_request(&mut stream);
             if path == "/v2/status" {
                 respond(&mut stream, 200, &json!({"device_mac": "70:04:1D:D7:A3:40", "session_nonce": "0123456789abcdef0123456789abcdef"}));
             } else {

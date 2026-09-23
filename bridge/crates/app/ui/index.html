@@ -198,12 +198,28 @@
         <h2>Profile（1–8 项，顺序即按键循环）</h2>
         <div id="pt-profile" class="plist todo">加载中…</div>
         <div class="toolbar" style="margin-top:8px">
+          <label>绑定目标 <select id="pt-render-target" onchange="renderPlatformOrder();refreshPlatformFonts()">
+            <option value="epd-ssd1681-200x200-1bpp">200×200 BW / SSD1681</option>
+            <option value="epd-ssd2683-400x300-1bpp">400×300 BW / Note4 SSD2683</option>
+            <option value="epd-200x200-2bpp-gray4">200×200 gray4</option>
+          </select></label>
+          <label>添加模板 <select id="pt-add-template"></select></label>
+          <button onclick="addPlatformTemplate()">添加</button>
+        </div>
+        <div id="pt-fonts" class="plist muted">字体版本加载中…</div>
+        <div class="toolbar" style="margin-top:8px">
+          <input id="pt-font-path" style="min-width:260px" placeholder="CSFN .bin 本机路径">
+          <button onclick="importPlatformFont()">导入 CSFN</button>
+        </div>
+        <div class="sub">源字体 TTF/OTF 转换尚未在 Bridge 生产版提供；请先导入设备可读的 CSFN .bin。</div>
+        <div class="toolbar" style="margin-top:8px">
           <label class="muted"><input type="checkbox" id="pt-sync"> 允许数据同步</label>
           <button onclick="savePlatformProfile()">保存 Profile</button>
+          <button onclick="previewPlatformPublish()">发布预检</button>
           <button class="primary" onclick="publishPlatform()">显式发布</button>
           <button onclick="cancelPlatformPublish()">取消未开始发布</button>
         </div>
-        <div class="sub">全部已安装模板参与循环，任一时刻只有一个 active。发布冻结当时内容，之后编辑不漂移。</div>
+        <div class="sub">全部已安装模板参与循环。改顺序、初始项、目标或字体后先保存；目标必须与设备当前 ROM 一致。发布冻结当时内容，之后编辑不漂移。</div>
       </div>
       <div class="card">
         <h2>恢复读取（最小入口）</h2>
@@ -1069,6 +1085,8 @@
 
   let platformDevice = null;
   let platformProfile = null;
+  let platformTemplates = [];
+  let platformPreviewTargetId = null;
 
   function platformStateBadge(kind) {
     const text = {
@@ -1099,6 +1117,8 @@
   async function refreshPlatformTemplates() {
     try {
       const data = await invoke('platform_templates');
+      platformTemplates = data.templates || [];
+      if (platformDevice) renderPlatformOrder();
       const rows = (data.templates || []).map((t) => `
         <div class="prow">
           <div class="pmeta">
@@ -1120,7 +1140,7 @@
     try {
       const data = await invoke('platform_template_preview', { id });
       openModal(`<h3>预览 ${escapeHtml(id)}</h3>
-        <img style="width:200px;height:200px;image-rendering:pixelated;border:1px solid var(--line)"
+        <img style="max-width:400px;image-rendering:pixelated;border:1px solid var(--line)"
              src="data:image/png;base64,${data.png_base64}">
         <div class="foot"><button onclick="closeModal()">关闭</button></div>`);
     } catch (e) {
@@ -1146,22 +1166,99 @@
         `${caps.firmware_target || '--'} / ${caps.render_target || '--'} · abi ${caps.compiler_abi || '--'}`;
       $('pt-active').textContent =
         `${device.active_template_id || '--'} / ${(device.observed || {}).active_context_id || '--'}`;
-      $('pt-jobinfo').textContent =
-        `${(device.job || {}).job_id || '--'}（${(device.job || {}).state || '无任务'}）`;
+      const job = device.job || {};
+      $('pt-jobinfo').textContent = `${job.job_id || '--'}（${job.state || '无任务'}）` +
+        (job.transport ? ` · ${job.transport}` : '') +
+        (job.bytes != null ? ` · ${job.transferred_bytes || 0}/${job.bytes} B` : '') +
+        (job.last_error ? ` · ${job.last_error}` : '') +
+        (job.ack ? ` · ACK ${job.ack}` : '');
       $('pt-expect').textContent = (data.devices || []).length > 1
         ? '多设备：每台独立协调器，不做跨设备原子发布。' : '';
       const profile = device.profile;
       platformProfile = profile || null;
-      const order = profile && profile.template_ids.length
-        ? profile.template_ids.map((id, i) =>
-            `<div class="prow"><div class="pmeta"><b>${i + 1}. ${escapeHtml(id)}</b>
-              ${profile.initial_active_id === id ? '<small>初始 active</small>' : ''}</div></div>`).join('')
-        : '<div class="muted">尚无 Profile（空草稿可保存但不能发布）</div>';
-      $('pt-profile').innerHTML = order;
+      $('pt-render-target').value = (profile && profile.render_target) || caps.render_target || '';
+      renderPlatformOrder();
       $('pt-sync').checked = !!(profile && profile.sync_enabled);
+      await refreshPlatformFonts();
     } catch (e) {
       $('pt-device-state').textContent = '平台状态读取失败：' + String(e);
     }
+  }
+
+  function editablePlatformProfile() {
+    if (!platformProfile) platformProfile = {template_ids: [], font_ids: {}, bindings: []};
+    return platformProfile;
+  }
+
+  function renderPlatformOrder() {
+    const profile = editablePlatformProfile();
+    const target = $('pt-render-target').value || (platformDevice?.capabilities || {}).render_target;
+    const variants = platformTemplates.filter(t => t.render_target === target && !profile.template_ids.includes(t.template_id));
+    $('pt-add-template').innerHTML = variants.map(t => `<option value="${escapeAttr(t.template_id)}">${escapeHtml(t.template_id)}</option>`).join('');
+    $('pt-profile').innerHTML = profile.template_ids.length ? profile.template_ids.map((id, i) => `
+      <div class="prow"><div class="pmeta"><b>${i + 1}. ${escapeHtml(id)}</b>
+      ${profile.initial_active_id === id ? '<small>初始 active</small>' : ''}</div>
+      <div class="pactions"><button onclick="movePlatformTemplate(${i}, -1)" ${i === 0 ? 'disabled' : ''}>↑</button>
+      <button onclick="movePlatformTemplate(${i}, 1)" ${i + 1 === profile.template_ids.length ? 'disabled' : ''}>↓</button>
+      <button onclick="setPlatformInitial(${i})">设为初始</button>
+      <button onclick="removePlatformTemplate(${i})">移除</button></div></div>`).join('')
+      : '<div class="muted">空草稿可保存，但不能发布。</div>';
+  }
+
+  function addPlatformTemplate() {
+    const id = $('pt-add-template').value;
+    const p = editablePlatformProfile();
+    if (id && p.template_ids.length < 8 && !p.template_ids.includes(id)) {
+      p.template_ids.push(id);
+      p.initial_active_id ||= id;
+      renderPlatformOrder(); refreshPlatformFonts();
+    }
+  }
+  function movePlatformTemplate(i, delta) {
+    const p = editablePlatformProfile(), j = i + delta;
+    if (j < 0 || j >= p.template_ids.length) return;
+    [p.template_ids[i], p.template_ids[j]] = [p.template_ids[j], p.template_ids[i]];
+    renderPlatformOrder();
+  }
+  function setPlatformInitial(i) { editablePlatformProfile().initial_active_id = platformProfile.template_ids[i]; renderPlatformOrder(); }
+  function removePlatformTemplate(i) {
+    const p = editablePlatformProfile(); p.template_ids.splice(i, 1);
+    if (!p.template_ids.includes(p.initial_active_id)) p.initial_active_id = p.template_ids[0] || null;
+    renderPlatformOrder(); refreshPlatformFonts();
+  }
+
+  async function refreshPlatformFonts() {
+    try {
+      const p = editablePlatformProfile();
+      const target = $('pt-render-target').value;
+      const library = (await invoke('platform_font_list')).fonts || [];
+      const names = new Set();
+      const collect = value => { if (!value || typeof value !== 'object') return;
+        if (typeof value.font === 'string') names.add(value.font);
+        Object.values(value).forEach(collect); };
+      for (const id of p.template_ids) {
+        const t = await invoke('platform_template_get', {id, renderTarget: target});
+        collect(t.source);
+      }
+      $('pt-fonts').innerHTML = [...names].sort().map(name => {
+        const versions = library.filter(f => f.name === name);
+        if (!versions.length) return `<div class="row"><span>${escapeHtml(name)}</span><span>固件内置</span></div>`;
+        const current = (p.font_ids || {})[name] || '';
+        return `<div class="row"><span>${escapeHtml(name)}</span><select onchange="selectPlatformFont('${escapeAttr(name)}', this.value)">
+          <option value="">请选择 CSFN 版本</option>${versions.map(f => `<option value="${escapeAttr(f.id)}" ${f.id === current ? 'selected' : ''}>${escapeHtml(f.id)} · ${f.size_px}px / ${f.weight} · ${f.bytes}B</option>`).join('')}</select></div>`;
+      }).join('') || '<div class="muted">所选模板未引用字体。</div>';
+    } catch (e) { $('pt-fonts').textContent = '字体依赖读取失败：' + String(e); }
+  }
+  function selectPlatformFont(name, id) {
+    const p = editablePlatformProfile(); p.font_ids ||= {};
+    if (id) p.font_ids[name] = id; else delete p.font_ids[name];
+  }
+  async function importPlatformFont() {
+    try {
+      const result = await invoke('platform_font_import', {path: $('pt-font-path').value});
+      await refreshPlatformFonts();
+      openModal(`<h3>CSFN 已导入</h3><pre>${escapeHtml(JSON.stringify(result, null, 2))}</pre><div class="foot"><button onclick="closeModal()">关闭</button></div>`);
+    } catch (e) { openModal(`<h3>导入失败</h3><div>${escapeHtml(String(e))}</div><div class="foot"><button onclick="closeModal()">关闭</button></div>`); }
   }
 
   async function savePlatformProfile() {
@@ -1170,6 +1267,8 @@
       const body = {
         device_mac: (platformDevice && platformDevice.device_mac) || '',
         template_ids: profile.template_ids || [],
+        render_target: $('pt-render-target').value || null,
+        font_ids: profile.font_ids || {},
         initial_active_id: profile.initial_active_id || (profile.template_ids || [])[0] || null,
         bindings: profile.bindings || [],
         sync_enabled: $('pt-sync').checked,
@@ -1186,7 +1285,26 @@
 
   async function publishPlatform() {
     try {
-      const result = await invoke('platform_publish', {});
+      const preview = await invoke('platform_publish_preview');
+      platformPreviewTargetId = preview.target_id || null;
+      openModal(`<h3>确认发布目标</h3>
+        <pre style="white-space:pre-wrap;font-size:12px">${escapeHtml(JSON.stringify(preview, null, 2))}</pre>
+        <div class="foot"><button onclick="closeModal()">取消</button><button class="primary" onclick="confirmPlatformPublish()">显式发布此目标</button></div>`);
+    } catch (e) {
+      openModal(`<h3>发布预检失败</h3><div>${escapeHtml(String(e))}</div>
+        <div class="foot"><button onclick="closeModal()">关闭</button></div>`);
+    }
+  }
+
+  async function previewPlatformPublish() {
+    try { const result = await invoke('platform_publish_preview');
+      openModal(`<h3>发布预检</h3><pre style="white-space:pre-wrap;font-size:12px">${escapeHtml(JSON.stringify(result, null, 2))}</pre><div class="foot"><button onclick="closeModal()">关闭</button></div>`);
+    } catch (e) { openModal(`<h3>预检失败</h3><div>${escapeHtml(String(e))}</div><div class="foot"><button onclick="closeModal()">关闭</button></div>`); }
+  }
+
+  async function confirmPlatformPublish() {
+    try {
+      const result = await invoke('platform_publish', {expectedTargetId: platformPreviewTargetId});
       openModal(`<h3>发布已排队</h3>
         <pre style="white-space:pre-wrap;font-size:12px">${escapeHtml(JSON.stringify(result, null, 2))}</pre>
         <div class="sub">发布冻结当前内容；等待设备会合/唤醒后提交。保存不会自动发布。</div>

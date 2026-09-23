@@ -126,6 +126,8 @@ fn legacy_three_entry_profile_loads_and_migrates_without_truncation() {
     let migrated = V2Profile {
         device_mac: "AA:BB:CC:DD:EE:FF".into(),
         template_ids: enabled.clone(),
+        render_target: Some(bridge_core::platform::model::RENDER_TARGET_154G.into()),
+        font_ids: Default::default(),
         initial_active_id: Some(enabled[0].clone()),
         bindings: vec![],
         sync_enabled: false,

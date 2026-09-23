@@ -54,6 +54,8 @@ UI 和 MCP 调用同一套保存、预览、发布、同步开关、激活、cla
 | 运行数据快照 | `active_context_id, data_seq, fields[]`；完整包含当前 active 所需的全部远程字段及其质量/有效期，不包含其他模板的数据 |
 | PowerPlan | `plan_id, mode, light_duration_s, rendezvous_period_s`；Bridge 唯一生成正式业务计划；设备回报实际接受期限 |
 
+**Note4 增量资产扩展（待设备/Bridge 双方确认）：**上表的自包含 Bundle 与下文完整 A/B 包仍是现有设备的已实现路径。新协议的完整发布目标由一份 manifest 和它引用的已校验内容对象构成；传输仅发送未被当前/回退已提交清单引用的对象，设备在全部引用可用后原子激活新 manifest。当前与回退清单的引用集合必须同时保留，清理只能在持久提交后进行。此处的清单 A/B 与应用 ROM A/B OTA 是两层独立机制；详细字段和断电顺序见 `project-workflow/note4-bridge-publish/protocol.md`。设备尚未实现该扩展，不能将 Note4 ROM OTA 成功视为资产协议可用。
+
 配置完成的设备恰有一个 active；出厂/两槽均不可恢复时为 unconfigured，显示 ROM 恢复页。空 Profile 可留作 Bridge 编辑草稿，但不能发布。
 
 `active_context_id` 是唯一运行上下文标识：设备每次发布提交、有效激活切换和不能恢复上下文的冷启动生成一个不可复用的值，关联当前 Bundle、模板和 CompiledTemplate。A→B→A 必须得到三个不同值。正常 deep 唤醒恢复已保存的同一个值。无需再同时携带 template revision、manifest revision、plan hash、activation generation 等运行比较字段。

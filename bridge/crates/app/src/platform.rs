@@ -165,7 +165,9 @@ pub fn template_save(
 }
 
 pub fn template_validate(source: &Value) -> Value {
-    match bridge_core::compile::compile(source, "epd-ssd1681-200x200-1bpp") {
+    let target = source.get("render_target").and_then(|v| v.as_str())
+        .unwrap_or("epd-ssd1681-200x200-1bpp");
+    match bridge_core::compile::compile(source, target) {
         Ok(compiled) => json!({
             "valid": true,
             "compiler_abi": compiled.compiler_abi,
@@ -203,11 +205,12 @@ pub fn template_preview(
     };
     let bits = bridge_render::render_bits(&text, &usage, &bridge_render::Env::default())
         .map_err(err_text)?;
-    let png = bridge_render::bits_to_png(&bits).map_err(err_text)?;
+    let (width, height) = bridge_render::canvas_size(&text).ok_or("unsupported canvas")?;
+    let png = bridge_render::bits_to_png_size(&bits, width, height).map_err(err_text)?;
     Ok(json!({
-        "render_target": "epd-ssd1681-200x200-1bpp",
-        "width": bridge_render::WIDTH,
-        "height": bridge_render::HEIGHT,
+        "render_target": source.get("render_target").and_then(|v| v.as_str()).unwrap_or("epd-ssd1681-200x200-1bpp"),
+        "width": width,
+        "height": height,
         "png_len": png.len(),
         "png_base64": base64(&png),
     }))
@@ -267,14 +270,26 @@ pub fn profile_save(ctx: &AppCtx, profile: Profile) -> Result<Value, String> {
 // Publish / delivery
 // ---------------------------------------------------------------------------
 
-pub async fn publish(ctx: &AppCtx, mac: &str) -> Result<Value, String> {
-    let job = service(ctx).publish(mac, now_secs()).map_err(err_text)?;
+pub async fn publish(ctx: &AppCtx, mac: &str, expected_target_id: Option<&str>) -> Result<Value, String> {
+    let job = service(ctx).publish_checked(mac, now_secs(), expected_target_id, Some(&ctx.bridge_id)).map_err(err_text)?;
     let delivery = deliver(ctx, mac).await;
     Ok(json!({
         "job": job,
         "delivery": delivery,
         "state": service(ctx).job(mac),
     }))
+}
+
+pub fn publish_preview(ctx: &AppCtx, mac: &str) -> Result<Value, String> {
+    service(ctx).publish_preview(mac).map_err(err_text)
+}
+
+pub fn font_list(ctx: &AppCtx) -> Result<Value, String> {
+    service(ctx).font_list().map_err(err_text)
+}
+
+pub fn font_import(ctx: &AppCtx, path: &str) -> Result<Value, String> {
+    service(ctx).font_import(std::path::Path::new(path)).map_err(err_text)
 }
 
 pub fn job_cancel(ctx: &AppCtx, mac: &str) -> Value {
@@ -290,6 +305,9 @@ pub async fn activate(ctx: &AppCtx, mac: &str, template_id: &str) -> Result<Valu
 /// Execute at most one pending coordinator action against the device.
 pub async fn deliver(ctx: &AppCtx, mac: &str) -> Value {
     let _delivery = ctx.v2_delivery.lock().await;
+    if service(ctx).asset_job_pending(mac) {
+        return json!({"result": "waiting_for_device_protocol", "reason": "versioned manifest/object endpoints are pending joint device confirmation"});
+    }
     let Some(link) = device_link(ctx) else {
         return json!({"result": "waiting_for_link", "reason": "device token/ip not available; open a BOOT session"});
     };
@@ -297,6 +315,9 @@ pub async fn deliver(ctx: &AppCtx, mac: &str) -> Value {
     let decision = service(ctx).next_http_delivery(mac, reachable, now_secs());
     match decision["decision"].as_str().unwrap_or("none") {
         "bundle" => {
+            if let Err(e) = service(ctx).bind_pending_bundle_owner(mac, &link.bridge_id) {
+                return json!({"result": "failed", "error": e.to_string()});
+            }
             let payload = match service(ctx).bundle_payload(mac) {
                 Ok(p) => p,
                 Err(e) => return json!({"result": "failed", "error": e.to_string()}),
@@ -312,7 +333,7 @@ pub async fn deliver(ctx: &AppCtx, mac: &str) -> Value {
                     v2_client::BUNDLE_CHUNK_BYTES,
                     Duration::from_secs(60),
                 )
-                .map_err(err_text)
+                .map_err(|e| format!("{e:#}"))
             })
             .await
             {
@@ -440,6 +461,41 @@ pub async fn send_plan(
     }
 }
 
+/// User-requested light window. Freeze one formal plan before attempting any
+/// transport so a deep-sleeping device receives the same ID over BLE later.
+pub async fn request_light(ctx: &AppCtx, mac: &str) -> Value {
+    let _delivery = ctx.v2_delivery.lock().await;
+    let (plan, already_pending) = match service(ctx).queue_explicit_light(mac, now_secs()) {
+        Ok(value) => value,
+        Err(e) => return json!({"result": "failed", "error": e.to_string()}),
+    };
+    ctx.force_ble.notify_one();
+    let online = ctx.device_cache.lock().unwrap().as_ref().is_some_and(|c| c.online);
+    if !online {
+        return json!({"result": "queued", "transport": "ble_rendezvous",
+            "plan": plan, "already_pending": already_pending, "ack": null});
+    }
+    let Some(link) = device_link(ctx) else {
+        return json!({"result": "queued", "transport": "waiting_for_link",
+            "plan": plan, "already_pending": already_pending, "ack": null});
+    };
+    let mut body = serde_json::to_value(&plan).unwrap_or(Value::Null);
+    body["bridge_id"] = json!(link.bridge_id);
+    let (ip, token) = (link.ip, link.token);
+    match blocking(move || v2_client::plan(&ip, &token, &body, timeout()).map_err(err_text)).await {
+        Ok(ack) if ack["result"] == "applied" => {
+            let remaining = ack["accepted_remaining_s"].as_u64().unwrap_or(0) as u32;
+            let confirmation = service(ctx).note_plan_ack(mac, plan.plan_id, remaining, false);
+            json!({"result": "applied", "transport": "http", "plan": plan,
+                "already_pending": already_pending, "ack": ack, "confirmation": confirmation})
+        }
+        Ok(ack) => json!({"result": "queued", "transport": "ble_rendezvous",
+            "plan": plan, "already_pending": already_pending, "ack": ack}),
+        Err(error) => json!({"result": "queued", "transport": "ble_rendezvous",
+            "plan": plan, "already_pending": already_pending, "ack": null, "http_error": error}),
+    }
+}
+
 /// Refresh the bridge-side view from the device's authenticated status.
 pub async fn refresh_status(ctx: &AppCtx, mac: &str) -> Value {
     let Some(link) = device_link(ctx) else {
@@ -556,9 +612,18 @@ pub fn note_envelope(ctx: &AppCtx, envelope: &Value) {
 pub fn power_view(ctx: &AppCtx) -> Value {
     let mac = ctx.device_mac.lock().unwrap().clone().unwrap_or_default();
     let summary = service(ctx).coordinator_summary(&mac);
+    let explicit = summary.as_ref().map(|s| &s["plan"]);
+    let pending = explicit.map(|p| &p["pending_explicit_light"]);
+    let ack = explicit.map(|p| &p["last_explicit_light_ack"]);
+    let hold_until = explicit.and_then(|p| p["light_hold_until"].as_u64()).unwrap_or(0);
     json!({
         "device_mac": mac,
         "coordinator": summary,
+        "explicit_light": {"state": if pending.is_some_and(|p| !p.is_null()) { "queued" }
+            else if ack.is_some_and(|a| !a.is_null()) {
+                if now_secs() < hold_until { "applied" } else { "expired" }
+            } else { "none" },
+            "pending_plan": pending, "ack": ack},
         "note": "reads never extend the light deadline; only a formal PowerPlan does",
     })
 }
@@ -583,32 +648,88 @@ pub fn recovery(ctx: &AppCtx, digest: &Value) -> Result<Value, String> {
 /// Capabilities from a `/status.json` document. Firmware that reports
 /// `fw_target` speaks v2; anything older is legacy (≤3 templates, legacy
 /// channel) and must be shown as such instead of silently truncating.
-pub fn caps_from_status(raw: &Value) -> (DeviceCapabilities, bool) {
+pub fn caps_from_status(raw: &Value) -> Result<(DeviceCapabilities, bool), String> {
     let fw_target = raw.get("fw_target").and_then(|v| v.as_str());
     let Some(fw_target) = fw_target else {
         let mut caps = DeviceCapabilities::ssd1681_154g();
         caps.max_templates = 3;
         caps.max_light_s = 600;
-        return (caps, true);
+        return Ok((caps, true));
     };
     let render_target = raw
         .get("render_target")
         .and_then(|v| v.as_str())
         .unwrap_or("epd-ssd1681-200x200-1bpp");
+    let note4 = render_target == bridge_core::platform::model::RENDER_TARGET_NOTE4;
     let verified = render_target == "epd-ssd1681-200x200-1bpp";
+    let required = |key: &str| -> Result<u64, String> {
+        raw.get(key).and_then(Value::as_u64).ok_or_else(|| format!("Note4 status missing {key}"))
+    };
+    let checked_u32 = |value: u64, key: &str| -> Result<u32, String> {
+        u32::try_from(value).map_err(|_| format!("device {key} exceeds u32"))
+    };
+    let (width, height, pixel_format, colors, partial) = if note4 {
+        (checked_u32(required("width")?, "width")?, checked_u32(required("height")?, "height")?,
+         raw.get("pixel_format").and_then(Value::as_str).ok_or("Note4 status missing pixel_format")?.to_string(),
+         raw.get("colors").and_then(Value::as_str).ok_or("Note4 status missing colors")?.to_string(),
+         raw.get("partial").and_then(Value::as_bool).ok_or("Note4 status missing partial")?)
+    } else if render_target == bridge_core::platform::model::RENDER_TARGET_GRAY4 {
+        (200, 200, "2bpp".into(), "gray4".into(), false)
+    } else { (200, 200, "1bpp".into(), "bw".into(), verified) };
+    let max_templates = checked_u32(if note4 { required("max_templates")? } else {
+        raw.get("max_templates").and_then(Value::as_u64).unwrap_or(8)
+    }, "max_templates")?;
+    let max_bundle_bytes = if note4 { required("max_bundle_bytes")? } else {
+        raw.get("max_bundle_bytes").and_then(Value::as_u64).unwrap_or(262_144)
+    };
     let caps = DeviceCapabilities {
         firmware_target: fw_target.to_string(),
         render_target: render_target.to_string(),
-        compiler_abi: raw
+        width, height, pixel_format, colors,
+        compiler_abi: checked_u32(raw
             .get("compiler_abi")
             .and_then(|v| v.as_u64())
-            .unwrap_or(bridge_core::compile::COMPILER_ABI as u64) as u32,
-        max_templates: 8,
-        partial: verified,
-        hardware_verified: verified,
+            .unwrap_or(bridge_core::compile::COMPILER_ABI as u64), "compiler_abi")?,
+        max_templates,
+        max_bundle_bytes,
+        asset_publish_protocol: checked_u32(raw.get("asset_publish_protocol").and_then(Value::as_u64).unwrap_or(0), "asset_publish_protocol")?,
+        max_object_bytes: raw.get("max_object_bytes").and_then(Value::as_u64).unwrap_or(0),
+        max_manifest_bytes: raw.get("max_manifest_bytes").and_then(Value::as_u64).unwrap_or(0),
+        install_peak_bytes: raw.get("install_peak_bytes").and_then(Value::as_u64).unwrap_or(0),
+        free_bytes: raw.get("free_bytes").and_then(Value::as_u64).unwrap_or(0),
+        filesystem_overhead_bytes: raw.get("filesystem_overhead_bytes").and_then(Value::as_u64).unwrap_or(0),
+        partial,
+        hardware_verified: raw.get("hardware_verified").and_then(Value::as_bool).unwrap_or(verified),
         ..DeviceCapabilities::ssd1681_154g()
     };
-    (caps, false)
+    caps.validate().map_err(|e| e.to_string())?;
+    Ok((caps, false))
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    #[test]
+    fn note4_requires_reported_geometry_and_never_infers_hardware_verification() {
+        let status = json!({"fw_target":"zectrix-note4-400x300",
+            "render_target":"epd-ssd2683-400x300-1bpp", "compiler_abi":1});
+        assert!(caps_from_status(&status).unwrap_err().contains("missing width"));
+        let mut complete = status;
+        complete["width"] = json!(400);
+        complete["height"] = json!(300);
+        complete["pixel_format"] = json!("1bpp");
+        complete["colors"] = json!("bw");
+        complete["partial"] = json!(false);
+        complete["max_templates"] = json!(8);
+        complete["max_bundle_bytes"] = json!(262_144);
+        let (caps, legacy) = caps_from_status(&complete).unwrap();
+        assert!(!legacy);
+        assert_eq!((caps.width, caps.height), (400, 300));
+        assert!(!caps.hardware_verified);
+        complete["width"] = json!(200);
+        assert!(caps_from_status(&complete).unwrap_err().contains("disagrees"));
+    }
 }
 
 /// Feed the device's own status digest (MAC-verified HTTP read) into the
@@ -692,10 +813,13 @@ pub async fn ble_cycle(ctx: &AppCtx) -> Result<BleOpportunity, String> {
             if remaining > 0 { "manual" } else { "rendezvous" }, remaining).map_err(err_text)?;
         let ack = link.command("plan", serde_json::to_value(&plan).map_err(err_text)?)
             .await.map_err(err_text)?;
-        if ack["result"] == "applied" {
-            service(ctx).note_plan_ack(&mac, plan.plan_id,
-                ack["accepted_remaining_s"].as_u64().unwrap_or(0) as u32, remaining > 0);
+        if ack["result"] != "applied" {
+            return Err(format!("BLE PowerPlan rejected: {ack}"));
         }
+        let confirmation = service(ctx).note_plan_ack(&mac, plan.plan_id,
+            ack["accepted_remaining_s"].as_u64().unwrap_or(0) as u32, remaining > 0);
+        tracing::info!(device = mac, plan_id = plan.plan_id, ack = %ack,
+            confirmation = %confirmation, "v2 PowerPlan acknowledgement");
         Ok(())
     };
     let result = tokio::time::timeout(Duration::from_secs(10), work).await
@@ -804,7 +928,16 @@ pub async fn tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, Stri
         }
         "platform_publish" => {
             let mac = device_mac(ctx)?;
-            publish(ctx, &mac).await?
+            publish(ctx, &mac, args.get("expected_target_id").and_then(Value::as_str)).await?
+        }
+        "platform_publish_preview" => {
+            let mac = device_mac(ctx)?;
+            publish_preview(ctx, &mac)?
+        }
+        "platform_font_list" => font_list(ctx)?,
+        "platform_font_import" => {
+            let path = args.get("path").and_then(Value::as_str).ok_or("missing path")?;
+            font_import(ctx, path)?
         }
         "platform_publish_cancel" => {
             let mac = device_mac(ctx)?;
@@ -835,7 +968,7 @@ pub async fn tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, Stri
             let mac = device_mac(ctx)?;
             let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("auto");
             match mode {
-                "light" => send_plan(ctx, &mac, "explicit", 0).await,
+                "light" => request_light(ctx, &mac).await,
                 "sleep" => {
                     // A fresh id is required: reusing an old id (or 0) would be
                     // rejected as stale by the device.

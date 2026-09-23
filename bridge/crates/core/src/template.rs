@@ -9,8 +9,19 @@ use serde_json::Value;
 
 use crate::envelope::TemplateRef;
 
-pub const FONTS: [&str; 5] = ["f8", "f12", "f16", "f20", "f24"];
+/// Font names accepted by the shared engine; the order is the engine's index
+/// order, so entries may only be appended. The first five are the small
+/// display's fixed-cell bitmap family, `nt16`/`nt30` the proportional Noto
+/// family cropped from the LVGL component, and `ntthin18`/`ntreg64` the
+/// FreeType-rasterized pair: Thin 100 @18 px for normal text and Regular 400
+/// @64 px tabular digits for large text. The families are independent: a
+/// template picks one font per element.
+pub const FONTS: [&str; 9] = [
+    "f8", "f12", "f16", "f20", "f24", "nt16", "nt30", "ntthin18", "ntreg64",
+];
 pub const CANVAS: i64 = 200;
+pub const NOTE4_WIDTH: i64 = 400;
+pub const NOTE4_HEIGHT: i64 = 300;
 pub const MAX_TEMPLATE_BYTES: usize = 32768;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +57,7 @@ pub enum BindSpec {
     DeviceState,
     DeviceOfflineMins,
     DeviceNow,
+    DeviceDate,
     DeviceMode,
     Bucket {
         bucket: String,
@@ -70,6 +82,7 @@ pub fn parse_bind(path: &str) -> Option<BindSpec> {
         "device.state" => return Some(BindSpec::DeviceState),
         "device.offline_mins" => return Some(BindSpec::DeviceOfflineMins),
         "device.now" => return Some(BindSpec::DeviceNow),
+        "device.date" => return Some(BindSpec::DeviceDate),
         "device.mode" => return Some(BindSpec::DeviceMode),
         _ => {}
     }
@@ -103,7 +116,7 @@ pub fn parse_bind(path: &str) -> Option<BindSpec> {
     })
 }
 
-fn rect_ok(rect: Option<&Value>) -> bool {
+fn rect_ok(rect: Option<&Value>, canvas_w: i64, canvas_h: i64) -> bool {
     let Some(arr) = rect.and_then(|r| r.as_array()) else {
         return false;
     };
@@ -126,19 +139,19 @@ fn rect_ok(rect: Option<&Value>) -> bool {
         h += y;
         y = 0;
     }
-    if x >= CANVAS || y >= CANVAS {
+    if x >= canvas_w || y >= canvas_h {
         return false;
     }
-    if x + w > CANVAS {
-        w = CANVAS - x;
+    if x + w > canvas_w {
+        w = canvas_w - x;
     }
-    if y + h > CANVAS {
-        h = CANVAS - y;
+    if y + h > canvas_h {
+        h = canvas_h - y;
     }
     w > 0 && h > 0
 }
 
-fn text_region_ok(region: Option<&Value>) -> bool {
+fn text_region_ok(region: Option<&Value>, canvas_w: i64, canvas_h: i64) -> bool {
     let Some(arr) = region.and_then(|r| r.as_array()) else {
         return false;
     };
@@ -152,8 +165,8 @@ fn text_region_ok(region: Option<&Value>) -> bool {
     let (Some(x), Some(y), Some(w), Some(h)) = (x, y, w, h) else {
         return false;
     };
-    x >= 0 && y >= 0 && x < CANVAS && y < CANVAS && w > 0 && h > 0
-        && w <= CANVAS && h <= CANVAS && x <= CANVAS - w && y <= CANVAS - h
+    x >= 0 && y >= 0 && x < canvas_w && y < canvas_h && w > 0 && h > 0
+        && w <= canvas_w && h <= canvas_h && x <= canvas_w - w && y <= canvas_h - h
 }
 
 fn epoch_bind(bind: &str) -> bool {
@@ -205,7 +218,7 @@ fn validate_condition(e: &Value) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_element(e: &Value) -> Result<(), String> {
+fn validate_element(e: &Value, canvas_w: i64, canvas_h: i64) -> Result<(), String> {
     validate_condition(e)?;
     let ty = e.get("type").and_then(|v| v.as_str()).ok_or("type")?;
     match ty {
@@ -228,7 +241,7 @@ fn validate_element(e: &Value) -> Result<(), String> {
                     return Err("scale".into());
                 }
             }
-            if e.get("region").is_some() && !text_region_ok(e.get("region")) {
+            if e.get("region").is_some() && !text_region_ok(e.get("region"), canvas_w, canvas_h) {
                 return Err("region".into());
             }
             if let Some(align) = e.get("align") {
@@ -255,12 +268,12 @@ fn validate_element(e: &Value) -> Result<(), String> {
             if parse_bind(bind).is_none() {
                 return Err(format!("bind {bind}"));
             }
-            if !rect_ok(e.get("rect")) {
+            if !rect_ok(e.get("rect"), canvas_w, canvas_h) {
                 return Err("rect".into());
             }
         }
         "rect" => {
-            if !rect_ok(e.get("rect")) {
+            if !rect_ok(e.get("rect"), canvas_w, canvas_h) {
                 return Err("rect".into());
             }
         }
@@ -296,11 +309,11 @@ pub fn validate_template(v: &Value) -> Result<(), String> {
         return Err("schema".into());
     }
     let canvas = v.get("canvas").ok_or("canvas")?;
-    if canvas.get("w").and_then(|x| x.as_i64()) != Some(CANVAS)
-        || canvas.get("h").and_then(|x| x.as_i64()) != Some(CANVAS)
-    {
+    let (w, h) = (canvas.get("w").and_then(|x| x.as_i64()), canvas.get("h").and_then(|x| x.as_i64()));
+    if !matches!((w, h), (Some(CANVAS), Some(CANVAS)) | (Some(NOTE4_WIDTH), Some(NOTE4_HEIGHT))) {
         return Err("canvas size".into());
     }
+    let (w, h) = (w.unwrap(), h.unwrap());
     let els = v
         .get("elements")
         .and_then(|x| x.as_array())
@@ -309,7 +322,7 @@ pub fn validate_template(v: &Value) -> Result<(), String> {
         return Err("elements empty".into());
     }
     for e in els {
-        validate_element(e)?;
+        validate_element(e, w, h)?;
     }
     Ok(())
 }

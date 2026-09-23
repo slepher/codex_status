@@ -49,6 +49,8 @@ bool bsLoadCompiled(uint8_t index, CtTemplate &out, String &err);
 // The committed profile (order + initial active + context/job ids).
 bool bsProfile(BsProfile &out);
 bool bsConfigured();
+// Return the source payload CRC when the active committed slot has this job.
+bool bsActiveJobPayload(const char *jobId, uint32_t &payloadCrc);
 
 // Local active switch (BOOT key cycle): new initial template and new context.
 bool bsSetActive(uint8_t index, const char *newContextId, String &err);

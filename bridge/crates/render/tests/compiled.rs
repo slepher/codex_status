@@ -134,10 +134,38 @@ fn compiled_regions_match_the_json_region_derivation() {
         let json_regions = bridge_render::rgn_dump();
         compile(&tmpl).unwrap();
         let blob = compiled_serialize().unwrap();
-        bridge_render::rgn_build_compiled(&blob).unwrap_or_else(|e| panic!("{id}: {e}"));
+        let (w, h) = bridge_render::canvas_size(&tmpl).unwrap();
+        bridge_render::rgn_build_compiled(&blob, w, h).unwrap_or_else(|e| panic!("{id}: {e}"));
         let ct_regions = bridge_render::rgn_dump();
         assert_eq!(json_regions, ct_regions, "{id} region derivation differs");
     }
+}
+
+/// The region policy keeps one global panel size, so a 400x300 template must be
+/// derived against its own canvas rather than the 200x200 default. A wrong panel
+/// size makes ops fall outside the panel, which the policy answers with the
+/// whole-frame fallback (`rgn_build` then fails), so a successful derivation of
+/// this template is the regression guard.
+#[test]
+fn note4_regions_use_the_template_canvas() {
+    let _guard = SERIAL.lock().unwrap();
+    let tmpl = std::fs::read_to_string(
+        repo_root().join(
+            "project-workflow/generic-display-platform-implementation/\
+             concepts-400x300/codex-status-a-400x300.json",
+        ),
+    )
+    .expect("400x300 canonical template fixture");
+    let (w, h) = bridge_render::canvas_size(&tmpl).expect("canvas");
+    assert_eq!((w, h), (400, 300));
+    let n = bridge_render::rgn_build(&tmpl)
+        .unwrap_or_else(|e| panic!("400x300 region derivation fell back to whole-frame: {e}"));
+    assert!(n > 0);
+    let json_regions = bridge_render::rgn_dump();
+    compile(&tmpl).unwrap();
+    let blob = compiled_serialize().unwrap();
+    bridge_render::rgn_build_compiled(&blob, w, h).unwrap();
+    assert_eq!(json_regions, bridge_render::rgn_dump());
 }
 
 #[test]

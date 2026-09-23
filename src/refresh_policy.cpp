@@ -32,8 +32,7 @@ bool rgnDirtyWindow(const uint8_t *oldFrame, const uint8_t *newFrame,
 
 #include "fonts.h"
 #include "platform_target.h"
-
-namespace {
+#include "template_engine.h"
 
 // Panel geometry is a target property (v2 §5): set at boot / by the host
 // harness so the same policy serves 200x200 and 400x300 panels.
@@ -45,12 +44,18 @@ static inline int panelStride() { return sPanelW / 8; }
 #define PANEL_W (panelW())
 #define PANEL_H (panelH())
 #define STRIDE  (panelStride())
+
+// Declared in refresh_policy.h and called from the host FFI, so this one must
+// keep external linkage: a definition inside the anonymous namespace below is
+// invisible to other translation units and fails at link time.
 void rgnSetPanel(int w, int h) {
     if (w > 0 && h > 0) {
         sPanelW = w;
         sPanelH = h;
     }
 }
+
+namespace {
 
 // The firmware toolchain is xtensa GCC; the host preview build may use MSVC.
 inline int popcount8(uint8_t v) {
@@ -63,15 +68,9 @@ inline int popcount8(uint8_t v) {
 #endif
 }
 
-sFONT *fontByName(const char *name) {
-    if (!name) return nullptr;
-    if (!strcmp(name, "f8"))  return &Font8;
-    if (!strcmp(name, "f12")) return &Font12;
-    if (!strcmp(name, "f16")) return &Font16;
-    if (!strcmp(name, "f20")) return &Font20;
-    if (!strcmp(name, "f24")) return &Font24;
-    return nullptr;
-}
+// Text cell metrics come from the shared font registry
+// (tplFontCellByName / tplFontCellByIndex in template_engine.h) so this file no
+// longer keeps its own copy of the font list.
 
 // Mirror of the template engine's color mapping (B/W panel: accents collapse
 // to black ink).
@@ -139,7 +138,7 @@ bool addRegion(RgnSet &out, int x, int y, int w, int h, uint8_t cls, bool highIn
     r.py1 = (uint16_t)(y + h - 1);
     r.x0b = (uint8_t)(x >> 3);
     r.x1b = (uint8_t)((x + w - 1) >> 3);
-    r.area = (uint16_t)(w * h);
+    r.area = (uint32_t)w * (uint32_t)h;
     r.budget = (uint8_t)classDefaultBudget(cls);
     return true;
 }
@@ -179,7 +178,7 @@ void mergeRegions(RgnSet &out) {
                 m.x1b = (uint8_t)(m.px1 >> 3);
                 m.highInk = a.highInk || b.highInk;
                 if (classRank(b.cls) > classRank(a.cls)) m.cls = b.cls;
-                m.area = (uint16_t)((m.px1 - m.px0 + 1) * (m.py1 - m.py0 + 1));
+                m.area = (uint32_t)(m.px1 - m.px0 + 1) * (uint32_t)(m.py1 - m.py0 + 1);
                 m.budget = (uint8_t)classDefaultBudget(m.cls);
                 out.r[j] = out.r[--out.n];
                 merged = true;
@@ -217,8 +216,8 @@ bool rgnBuild(const String &tmplJson, RgnSet &out) {
     for (JsonObject e : els) {
         const char *type = e["type"] | "";
         if (!strcmp(type, "text")) {
-            sFONT *font = fontByName(e["font"] | "");
-            if (!font) { out.wholeFrame = true; return false; }
+            int fw = 0, fh = 0;
+            if (!tplFontCellByName(e["font"] | "", fw, fh)) { out.wholeFrame = true; return false; }
             const char *bind = e["bind"] | "";
             const char *text = e["text"] | "";
             if (!strlen(bind) && !strlen(text)) { out.wholeFrame = true; return false; }
@@ -242,8 +241,8 @@ bool rgnBuild(const String &tmplJson, RgnSet &out) {
                 }
                 x = e["x"] | 0;
                 y = e["y"] | 0;
-                w = chars * font->Width * scale;
-                h = font->Height * scale;
+                w = chars * fw * scale;
+                h = fh * scale;
             }
             int fg = colorVal(e["color"], 0);
             int bg = e["bg"] ? colorVal(e["bg"], 1) : 1;
@@ -314,18 +313,8 @@ bool rgnBuildCt(const CtTemplate &ct, RgnSet &out) {
         const char *bind = op.bindIdx != CT_NONE_IDX ? ct.reqs[op.bindIdx].path : "";
         switch (op.type) {
         case CT_TEXT: {
-            sFONT *font = nullptr;
-            switch (op.font) {
-            case 0: font = &Font8; break;
-            case 1: font = &Font12; break;
-            case 2: font = &Font16; break;
-            case 3: font = &Font20; break;
-            case 4: font = &Font24; break;
-            default: break;
-            }
-            if (!font) { out.wholeFrame = true; return false; }
-            int fw = font->Width;
-            int fh = font->Height;
+            int fw = 0, fh = 0;
+            if (!tplFontCellByIndex(op.font, fw, fh)) { out.wholeFrame = true; return false; }
             int x, y, w, h;
             if (op.flags & 0x02) {
                 x = op.x; y = op.y; w = op.w; h = op.h;

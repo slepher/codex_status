@@ -22,6 +22,7 @@ fn request(
     path: &str,
     token: &str,
     body: Option<&[u8]>,
+    extra_headers: &[(&str, &str)],
     timeout: Duration,
 ) -> Result<(u16, String)> {
     let target = if ip.contains(':') {
@@ -47,31 +48,70 @@ fn request(
             bytes.len()
         ));
     }
+    for (name, value) in extra_headers {
+        head.push_str(name);
+        head.push_str(": ");
+        head.push_str(value);
+        head.push_str("\r\n");
+    }
     head.push_str("\r\n");
     stream.write_all(head.as_bytes())?;
     if let Some(bytes) = body {
         stream.write_all(bytes)?;
     }
     let mut raw = Vec::new();
-    stream.read_to_end(&mut raw)?;
+    let mut chunk = [0u8; 2048];
+    let mut expected_len = None;
+    loop {
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        raw.extend_from_slice(&chunk[..read]);
+        if raw.len() > 64 * 1024 {
+            bail!("device HTTP response exceeds 64 KiB");
+        }
+        if let Some(head_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+            let body_start = head_end + 4;
+            if expected_len.is_none() {
+                let head = String::from_utf8_lossy(&raw[..head_end]);
+                expected_len = head.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("Content-Length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                });
+            }
+            if let Some(len) = expected_len {
+                if len > 64 * 1024 {
+                    bail!("device HTTP response body exceeds 64 KiB");
+                }
+                if raw.len() >= body_start + len {
+                    raw.truncate(body_start + len);
+                    break;
+                }
+            }
+        }
+    }
+    let body_start = raw.windows(4).position(|w| w == b"\r\n\r\n")
+        .map(|p| p + 4).context("incomplete device HTTP headers")?;
+    if expected_len.is_some_and(|len| raw.len() < body_start + len) {
+        bail!("incomplete device HTTP response body");
+    }
     let text = String::from_utf8_lossy(&raw).to_string();
     let status = text
         .split_whitespace()
         .nth(1)
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(0);
-    let response_body = text
-        .split("\r\n\r\n")
-        .nth(1)
-        .unwrap_or("")
-        .trim()
-        .to_string();
+    let response_body = String::from_utf8_lossy(&raw[body_start..]).trim().to_string();
     Ok((status, response_body))
 }
 
 fn post_json(ip: &str, path: &str, token: &str, body: &Value, timeout: Duration) -> Result<Value> {
     let text = serde_json::to_vec(body)?;
-    let (status, body) = request(ip, "POST", path, token, Some(&text), timeout)?;
+    let (status, body) = request(ip, "POST", path, token, Some(&text), &[], timeout)
+        .with_context(|| format!("POST {path}"))?;
     let parsed: Value = serde_json::from_str(&body).unwrap_or(json!({"raw": body}));
     if status == 409 {
         return Ok(json!({"result": "rejected", "error": "occupied", "detail": parsed}));
@@ -87,7 +127,7 @@ fn post_json(ip: &str, path: &str, token: &str, body: &Value, timeout: Duration)
 
 /// Authenticated Status read: the only authoritative device state.
 pub fn status(ip: &str, token: &str, timeout: Duration) -> Result<Value> {
-    let (status, body) = request(ip, "GET", "/v2/status", token, None, timeout)?;
+    let (status, body) = request(ip, "GET", "/v2/status", token, None, &[], timeout)?;
     if status == 401 {
         bail!("device rejected the endpoint token (401)");
     }
@@ -184,14 +224,16 @@ pub fn install_bundle(
     while offset < payload.len() {
         let end = (offset + chunk_bytes).min(payload.len());
         let path = format!("/v2/bundle/chunk?request_id={request_id}&session_nonce={nonce}&offset={offset}");
+        let offset_text = offset.to_string();
         let (status, body) = request(
             ip,
             "POST",
             &path,
             token,
             Some(&payload[offset..end]),
+            &[("X-Request-Id", &request_id), ("X-Session-Nonce", &nonce), ("X-Offset", &offset_text)],
             timeout,
-        )?;
+        ).with_context(|| format!("bundle chunk at offset {offset}"))?;
         if !(200..300).contains(&status) {
             bail!("bundle chunk at {offset} failed: HTTP {status} {body}");
         }

@@ -1,0 +1,13 @@
+{
+  "account": {"plan": "PRO"},
+  "bridge": {"label": "ACCOUNT"},
+  "buckets": [
+    {"id": "codex",
+      "windows": [
+        {"windowMins": 300, "usedPercent": 6, "resetsAt": 1790202900},
+        {"windowMins": 10080, "usedPercent": 75, "resetsAt": 1790722800}
+      ]
+    }
+  ],
+  "resetCredits": {"availableCount": 2}
+}

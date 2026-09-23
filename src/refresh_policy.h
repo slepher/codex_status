@@ -13,10 +13,10 @@ bool rgnDirtyWindow(const uint8_t *oldFrame, const uint8_t *newFrame,
 // Conservative first release: high-ink regions always take the full waveform
 // until the fixed-rig photo gate passes (design §8.2). Low-ink regions may use
 // the partial waveform while their own budget allows.
-// quad v11 declares ~29 elements; regions are merged only after all elements
-// are added, so the cap must cover the pre-merge count (overflow falls back to
-// whole-frame full refreshes).
-#define RGN_MAX            32
+// The cap must cover the pre-merge element count of every supported template
+// (overflow falls back to whole-frame full refreshes): quad v11 declares ~29
+// elements, the 400x300 A variant 38, so 64 leaves room for both plus growth.
+#define RGN_MAX            64
 #define RGN_STR_MAX        24
 
 enum RgnClass : uint8_t {
@@ -39,7 +39,10 @@ struct Rgn {
     // tile and forced unrelated full refreshes.
     uint16_t px0 = 0, py0 = 0, px1 = 0, py1 = 0;
     uint8_t  x0b = 0, x1b = 0;  // byte columns (inclusive) for window writes
-    uint16_t area = 0;          // pixel area of the semantic rect
+    // Pixel area of the semantic rect. 32-bit because a 400x300 panel has
+    // 120,000 pixels: a merged/whole-panel region overflows 16 bits, which would
+    // corrupt every changed/area ratio the decision rules use.
+    uint32_t area = 0;
     // Last computed statistics (valid after rgnDecide).
     uint16_t changed = 0, w2b = 0, b2w = 0, bOld = 0, bNew = 0;
     // Ghost budget (partials allowed before a full refresh, and cumulative

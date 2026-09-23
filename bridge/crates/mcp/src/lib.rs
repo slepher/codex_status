@@ -656,7 +656,7 @@ fn tool_definitions() -> Value {
         {
             "name": "template_render",
             "title": "渲染预览",
-            "description": "用固件同源引擎渲染 200x200 预览（返回 PNG 图像与文件路径）。usage 省略时取桥的实时数据；也可传 id 或 json。改模板后应先渲染给用户确认",
+            "description": "用固件同源引擎按模板画布渲染预览（返回 PNG 图像与文件路径）。usage 省略时取桥的实时数据；也可传 id 或 json。改模板后应先渲染给用户确认",
             "annotations": {"readOnlyHint": true},
             "inputSchema": {
                 "type": "object",
@@ -923,7 +923,25 @@ fn tool_definitions() -> Value {
             "name": "platform_publish",
             "description": "Explicit publish: freeze the profile into one Bundle and deliver it at the next reachable opportunity. Save is not publish.",
             "annotations": {"readOnlyHint": false, "destructiveHint": false},
-            "inputSchema": {"type": "object", "properties": {"mac": {"type": "string"}}, "additionalProperties": false}
+            "inputSchema": {"type": "object", "properties": {"mac": {"type": "string"}, "expected_target_id": {"type": "string"}}, "additionalProperties": false}
+        },
+        {
+            "name": "platform_publish_preview",
+            "description": "Read-only full target and conservative byte/space preview. Reuse remains unknown until authenticated asset status is available.",
+            "annotations": {"readOnlyHint": true},
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+        },
+        {
+            "name": "platform_font_list",
+            "description": "List imported CSFN versions; TTF/OTF conversion is unavailable.",
+            "annotations": {"readOnlyHint": true},
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+        },
+        {
+            "name": "platform_font_import",
+            "description": "Import a local CSFN .bin into the content-addressed font library; does not publish.",
+            "annotations": {"readOnlyHint": false},
+            "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": false}
         },
         {
             "name": "platform_publish_cancel",
@@ -978,7 +996,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "power_plan",
-            "description": "Explicit debug power action: mode=light (formal plan) or mode=sleep.",
+            "description": "Explicit formal PowerPlan: light is queued durably for the next authenticated BLE rendezvous when offline; power_view_v2 reports its ACK. sleep requests sleep immediately.",
             "annotations": {"readOnlyHint": false},
             "inputSchema": {
                 "type": "object",
@@ -1109,7 +1127,8 @@ async fn call_tool(cfg: &McpConfig, name: &str, args: &Value) -> Result<Vec<Valu
                 .unwrap_or_else(|| "{}".to_string());
             let env = env_from_args(args);
             let bits = bridge_render::render_bits(&template, &usage, &env).map_err(|e| e.to_string())?;
-            let png = bridge_render::bits_to_png(&bits).map_err(|e| e.to_string())?;
+            let (w, h) = bridge_render::canvas_size(&template).ok_or("unsupported canvas")?;
+            let png = bridge_render::bits_to_png_size(&bits, w, h).map_err(|e| e.to_string())?;
             let preview_dir = cfg.data_root.join("previews");
             std::fs::create_dir_all(&preview_dir).map_err(|e| e.to_string())?;
             let file = preview_dir.join(format!("{label}-{}.png", now_secs()));
@@ -1160,7 +1179,8 @@ async fn call_tool(cfg: &McpConfig, name: &str, args: &Value) -> Result<Vec<Valu
                 ..Default::default()
             };
             if let Ok(bits) = bridge_render::render_bits(&pretty, &usage, &env) {
-                if let Ok(png) = bridge_render::bits_to_png(&bits) {
+                let (w, h) = bridge_render::canvas_size(&pretty).unwrap_or((200, 200));
+                if let Ok(png) = bridge_render::bits_to_png_size(&bits, w, h) {
                     content.push(image_block(&png));
                 }
             }
@@ -1275,7 +1295,7 @@ async fn call_tool(cfg: &McpConfig, name: &str, args: &Value) -> Result<Vec<Valu
         // running app there is no live state to read or change.
         "platform_overview" | "template_list" | "template_get_v2" | "template_save_v2"
         | "template_validate_v2" | "profile_get_v2" | "profile_save_v2"
-        | "platform_publish" | "platform_publish_cancel" | "template_activate"
+        | "platform_publish" | "platform_publish_preview" | "platform_font_list" | "platform_font_import" | "platform_publish_cancel" | "template_activate"
         | "data_sources_v2" | "data_source_save_v2" | "data_probe_v2" | "power_view_v2" | "power_plan"
         | "platform_status_refresh" | "platform_push_now" | "platform_recovery" => {
             Err("platform tools are only available in the tray app (bridge-app)".to_string())

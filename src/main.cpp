@@ -24,6 +24,7 @@
 #include <vector>
 #include <esp_sleep.h>
 #include <esp_ota_ops.h>
+#include <esp_partition.h>
 #include <esp_system.h>
 #include <esp_pm.h>
 #include <esp_wifi.h>
@@ -69,6 +70,12 @@ static bool targetUnverified = false;
 #define FW_VERSION    "0.13.9-dptest2"
 #elif defined(CODEX_CLK_WINDOW_TEST)
 #define FW_VERSION    "0.13.9-clkwin"
+#elif defined(CODEX_TARGET_NOTE4)
+#ifdef CODEX_NOTE4_ROM_B
+#define FW_VERSION    "0.18.19-note4-b"
+#else
+#define FW_VERSION    "0.18.19-note4-a"
+#endif
 #else
 #define FW_VERSION    "0.17.9-bw"
 #endif
@@ -102,7 +109,15 @@ static const int EPD_FB_BYTES = (EPD_W / 8) * EPD_H;
 #define DEEP_CONTACT_MAX_S     3600
 #define DEEP_PENDING_WINDOW_MS 180000UL  // stay awake when pull reports pending
 #define CLK_GHOST_LIMIT        90      // deep clock partials before a full redraw
-#define CLK_MAX_BYTES          64      // reserved clock window cap (60 B for quad)
+// Reserved clock window cap. The 200x200 quad window is 60 B; the larger panel
+// needs room for the proportional clock face, and the cap only bounds the
+// window (the fast path still declines above it) so 200x200 behaviour is
+// unchanged.
+#if TARGET_WIDTH > 200
+#define CLK_MAX_BYTES          512
+#else
+#define CLK_MAX_BYTES          64
+#endif
 
 // Plan C rendezvous timing: the BLE window is a hard 3 s cap for waiting on
 // the bridge and closes shortly after the bridge's plan ACK. A connected
@@ -910,11 +925,18 @@ static void screen(const std::vector<String> &lines, UBYTE color) {
 }
 
 static void epdBegin(bool clearPanel = true) {
+#if defined(CODEX_TARGET_NOTE4)
+    // Note4's EPD rail is active HIGH; the 1.54-inch board is active LOW.
+    pinMode(EPD_PWR_PIN, OUTPUT);
+    digitalWrite(EPD_PWR_PIN, HIGH);
+    delay(20);
+#else
     pinMode(EPD_PWR_PIN, OUTPUT);
     digitalWrite(EPD_PWR_PIN, HIGH);
     delay(500);
     digitalWrite(EPD_PWR_PIN, LOW);
     delay(200);
+#endif
     pinMode(42, OUTPUT);
     digitalWrite(42, LOW);
     pinMode(17, OUTPUT);
@@ -964,11 +986,17 @@ static void epdBegin(bool clearPanel = true) {
 // LUT themselves, so the full init/clear and the framebuffer stay untouched.
 static void epdThinBegin() {
     if (panelThinReady) return;
+#if defined(CODEX_TARGET_NOTE4)
+    pinMode(EPD_PWR_PIN, OUTPUT);
+    digitalWrite(EPD_PWR_PIN, HIGH);
+    delay(20);
+#else
     pinMode(EPD_PWR_PIN, OUTPUT);
     digitalWrite(EPD_PWR_PIN, HIGH);
     delay(10);
     digitalWrite(EPD_PWR_PIN, LOW);
     delay(100);
+#endif
     pinMode(42, OUTPUT);
     digitalWrite(42, LOW);
     pinMode(17, OUTPUT);
@@ -1033,6 +1061,11 @@ static void epdFlush(bool forceFull) {
         rfnDirty = 0;
     }
 
+    if (!TARGET_PARTIAL && d.action == RFN_PARTIAL) {
+        d.action = RFN_FULL;
+        rfnKind = rfnActionName(RFN_FULL);
+        rfnReason = "target_full_only";
+    }
     bool partial = (d.action == RFN_PARTIAL) && epdPartialReady;
     if (partial && !blink && ++epdPartialCount > 30) partial = false;
     if (partial) {
@@ -1095,9 +1128,9 @@ static void epdFlush(bool forceFull) {
         rtcClkPartials = 0;   // full waveform clears the clock-window ghosting
         if (lastDisplayedFrame) memcpy(lastDisplayedFrame, frame, EPD_FB_BYTES);
         epdBaselineTrusted = true;
-        epdPartialReady = EPD_TGT_Init_Partial();
+        epdPartialReady = TARGET_PARTIAL && EPD_TGT_Init_Partial();
         epdFullLut = false;
-        if (!epdPartialReady) {
+        if (TARGET_PARTIAL && !epdPartialReady) {
             rtcEpdBusyFails++;
             DevLog.println("[epd] partial-mode init failed; next flush is full");
         }
@@ -1134,25 +1167,11 @@ RTC_DATA_ATTR static ClkRegion clkR = {};
 RTC_DATA_ATTR static uint8_t  clkPixels[CLK_MAX_BYTES] = {};
 RTC_DATA_ATTR static bool     clkPixelsValid = false;
 
-static sFONT *clkFontById(uint8_t id) {
-    switch (id) {
-        case 0: return &Font8;
-        case 1: return &Font12;
-        case 2: return &Font16;
-        case 3: return &Font20;
-        case 4: return &Font24;
-        default: return nullptr;
-    }
-}
-
+// The clock fast path reads the shared font registry (template_engine) instead
+// of keeping its own copy of the font list; both the bitmap family (f8..f24)
+// and the proportional family (nt16/nt30) are recognised.
 static int clkFontId(const char *name) {
-    if (!name) return -1;
-    if (!strcmp(name, "f8"))  return 0;
-    if (!strcmp(name, "f12")) return 1;
-    if (!strcmp(name, "f16")) return 2;
-    if (!strcmp(name, "f20")) return 3;
-    if (!strcmp(name, "f24")) return 4;
-    return -1;
+    return tplFontIndexByName(name);
 }
 
 // Reserve the clock cell from the active template. The bind prints exactly
@@ -1160,6 +1179,7 @@ static int clkFontId(const char *name) {
 // scale/x/y. No `device.now` element -> no reservation (clkR.valid stays false).
 static void clkComputeRect() {
     clkR.valid = false;
+    if (!TARGET_PARTIAL) return;
     if (!activeTplJson.length()) { DevLog.println("[clk] no active template"); return; }
     JsonDocument doc;
     if (deserializeJson(doc, activeTplJson)) { DevLog.println("[clk] template parse failed"); return; }
@@ -1173,23 +1193,26 @@ static void clkComputeRect() {
             return;
         }
         const int fid = clkFontId(e["font"] | "");
-        sFONT *f = (fid >= 0) ? clkFontById((uint8_t)fid) : nullptr;
-        if (!f) { DevLog.println("[clk] clock font unknown"); return; }
+        if (fid < 0) { DevLog.println("[clk] clock font unknown"); return; }
         int scale = e["scale"] | 1;
         if (scale < 1) scale = 1;
         int x = e["x"] | 0, y = e["y"] | 0;
+        int textW = 0, textH = 0;
+        if (!tplFontClockBox(fid, scale, textW, textH)) {
+            DevLog.println("[clk] clock font unknown");
+            return;
+        }
         JsonArray rect = e["rect"].as<JsonArray>();
         if (!rect.isNull() && rect.size() == 4) {
             int rx = rect[0] | 0, ry = rect[1] | 0, rw = rect[2] | 0;
-            int textW = 5 * f->Width * scale;
             const char *align = e["align"] | "left";
             x = rx;
             if (!strcmp(align, "center")) x = rx + (rw - textW) / 2;
             else if (!strcmp(align, "right")) x = rx + rw - textW;
-            y = ry + (rect[3].as<int>() - f->Height * scale) / 2;
+            y = ry + (rect[3].as<int>() - textH) / 2;
         }
-        int w = 5 * f->Width * scale;
-        int h = f->Height * scale;
+        int w = textW;
+        int h = textH;
         if (x < 0) x = 0;
         if (y < 0) y = 0;
         if (x + w > EPD_W) w = EPD_W - x;
@@ -1227,6 +1250,7 @@ static void clkComputeRect() {
 // template JSON at activation time (v2 §8).
 static void clkComputeRectCt() {
     clkR.valid = false;
+    if (!TARGET_PARTIAL) return;
     if (!v2CtValid) return;
     for (uint8_t i = 0; i < v2Ct.opCount; i++) {
         const CtOp &op = v2Ct.ops[i];
@@ -1237,19 +1261,21 @@ static void clkComputeRectCt() {
             DevLog.println("[clk] device.now has prefix/suffix; no reservation");
             return;
         }
-        sFONT *f = clkFontById(op.font);
-        if (!f) { DevLog.println("[clk] clock font unknown"); return; }
         int scale = op.scale ? op.scale : 1;
         int x = op.x, y = op.y;
+        int textW = 0, textH = 0;
+        if (!tplFontClockBox(op.font, scale, textW, textH)) {
+            DevLog.println("[clk] clock font unknown");
+            return;
+        }
         if (op.flags & 0x02) {
-            int textW = 5 * f->Width * scale;
             x = op.x;
             if (op.align == 1) x = op.x + (op.w - textW) / 2;
             else if (op.align == 2) x = op.x + op.w - textW;
-            y = op.y + (op.h - f->Height * scale) / 2;
+            y = op.y + (op.h - textH) / 2;
         }
-        int w = 5 * f->Width * scale;
-        int h = f->Height * scale;
+        int w = textW;
+        int h = textH;
         if (x < 0) x = 0;
         if (y < 0) y = 0;
         if (x + w > EPD_W) w = EPD_W - x;
@@ -1296,27 +1322,8 @@ static void clkCaptureFromFramebuffer() {
 }
 
 static void clkBlitString(uint8_t *buf, const char *s) {
-    sFONT *f = clkFontById(clkR.fontId);
-    if (!f) return;
-    const int stride = (f->Width + 7) / 8;
-    const int scale = clkR.scale;
-    const int bufW = clkR.bw * 8;
-    for (int i = 0; s[i]; i++) {
-        const unsigned char *ptr =
-            &f->table[(s[i] - ' ') * f->Height * stride];
-        for (int row = 0; row < f->Height; row++) {
-            for (int col = 0; col < f->Width; col++) {
-                if (!(ptr[row * stride + col / 8] & (0x80 >> (col % 8)))) continue;
-                for (int dy = 0; dy < scale; dy++) {
-                    for (int dx = 0; dx < scale; dx++) {
-                        const int px = clkR.xOff + (i * f->Width + col) * scale + dx;
-                        const int py = clkR.yOff + row * scale + dy;
-                        if (px < 0 || px >= bufW || py < 0 || py >= clkR.rows) continue;
-                        buf[py * clkR.bw + (px >> 3)] &= ~(0x80 >> (px & 7));
-                    }
-                }
-            }
-        }
+    if (!tplFontDrawClock(buf, clkR.bw, clkR.rows, clkR.xOff, clkR.fontId, s, clkR.scale)) {
+        DevLog.println("[clk] clock font unavailable at blit");
     }
 }
 
@@ -2386,6 +2393,10 @@ static void handleStatusJson() {
     doc["battery"] = batteryPercent();
     doc["battery_mv"] = batteryMilliVolts();
     doc["heap"] = ESP.getFreeHeap();
+#if defined(CODEX_TARGET_NOTE4)
+    doc["heap_max_alloc"] = ESP.getMaxAllocHeap();
+    doc["psram_free"] = ESP.getFreePsram();
+#endif
     doc["epd_writes"] = epdWriteCount;
     doc["epd_partial"] = epdPartialReady;
     doc["epd_streak"] = epdPartialCount;
@@ -2447,6 +2458,15 @@ static void handleStatusJson() {
     doc["fw_target"] = FW_TARGET_ID;
     doc["render_target"] = RENDER_TARGET_ID;
     doc["compiler_abi"] = CT_ABI;
+    doc["width"] = TARGET_WIDTH;
+    doc["height"] = TARGET_HEIGHT;
+    doc["pixel_format"] = TARGET_PIXEL_FORMAT;
+    doc["colors"] = TARGET_COLORS;
+    doc["partial"] = bool(TARGET_PARTIAL);
+    doc["hardware_verified"] = bool(TARGET_VERIFIED);
+    doc["max_templates"] = 8;
+    doc["max_bundle_bytes"] = BS_MAX_BUNDLE_BYTES;
+    doc["asset_publish_protocol"] = 0; // Existing complete Bundle path only.
     doc["v2_bundle"] = v2BundleReady;
     doc["commit_seq"] = (unsigned)bsCommitSeq();
     doc["active_context_id"] = v2Profile.contextId;
@@ -3277,9 +3297,15 @@ static void serviceBleSession() {
 
 static void pollPlug() {
     static uint32_t lastPoll = 0;
+    static uint32_t unplugStarted = 0;
     if (millis() - lastPoll < 500) return;
     lastPoll = millis();
     bool now = usb_serial_jtag_is_connected();
+    if (now) unplugStarted = 0;
+    else if (plugged) {
+        if (!unplugStarted) unplugStarted = millis();
+        if (millis() - unplugStarted < 10000) return;
+    }
     if (now == plugged) return;
     plugged = now;
     DevLog.printf("[pm] usb %s\n", plugged ? "plugged" : "unplugged");
@@ -3758,31 +3784,97 @@ static void handleV2BundleBegin() {
                 String(v2Rx.offset) + "}");
 }
 
-static void handleV2BundleChunk() {
-    String mac;
-    if (!endpointTokenAuthorized(mac)) {
-        server.send(401, "application/json", "{\"result\":\"unauthorized\"}"); return;
+// WebServer's ordinary POST parser duplicates the complete body several times
+// before calling the handler. On the BLE-enabled Note4 its internal heap is
+// too small for repeated 4096-byte chunks. The raw callback streams from the
+// parser's fixed 1436-byte buffer directly to LittleFS.
+static File v2ChunkFile;
+static bool v2ChunkOk = false;
+static bool v2ChunkReplay = false;
+static bool v2ChunkWriting = false;
+static uint32_t v2ChunkOffset = 0;
+static uint32_t v2ChunkBytes = 0;
+static const char *v2ChunkFailure = "session";
+
+static void handleV2BundleChunkRaw() {
+    HTTPRaw &raw = server.raw();
+    if (raw.status == RAW_START) {
+        if (v2ChunkFile) v2ChunkFile.close();
+        v2ChunkOk = false;
+        v2ChunkWriting = false;
+        v2ChunkBytes = 0;
+        v2ChunkFailure = "session";
+        String mac;
+        if (!endpointTokenAuthorized(mac)) { v2ChunkFailure = "unauthorized"; return; }
+        if (!ownerAllows(v2Rx.owner)) { v2ChunkFailure = "occupied"; return; }
+        if (server.header("X-Request-Id") != v2Rx.request ||
+            server.header("X-Session-Nonce") != v2Rx.nonce ||
+            !v2Rx.live(v2NowMs())) return;
+        String offsetText = server.header("X-Offset");
+        if (!offsetText.length()) return;
+        for (char c : offsetText) if (c < '0' || c > '9') return;
+        uint64_t parsedOffset = strtoull(offsetText.c_str(), nullptr, 10);
+        if (parsedOffset > v2Rx.offset) { v2ChunkFailure = "offset_or_size"; return; }
+        v2ChunkOffset = (uint32_t)parsedOffset;
+        v2ChunkReplay = v2ChunkOffset < v2Rx.offset;
+        v2ChunkWriting = !v2ChunkReplay;
+        v2ChunkFile = LittleFS.open(v2RxPath, v2ChunkReplay ? "r" : "a");
+        if (!v2ChunkFile || (v2ChunkReplay && !v2ChunkFile.seek(v2ChunkOffset))) {
+            v2ChunkFailure = "open"; return;
+        }
+        v2ChunkOk = true;
+        return;
     }
-    if (!v2OwnerOk(v2Rx.owner)) return;
-    if (server.arg("request_id") != v2Rx.request || server.arg("session_nonce") != v2Rx.nonce ||
-        !v2Rx.live(v2NowMs())) { v2BundleError("session"); return; }
-    uint32_t offset = (uint32_t)server.arg("offset").toInt();
-    String body = server.arg("plain");
-    // An ACK-lost chunk is a replay only when every stored byte is identical.
-    if (offset < v2Rx.offset && body.length() && body.length() <= 16384 &&
-        body.length() <= v2Rx.offset - offset) {
-        File f = LittleFS.open(v2RxPath, "r");
-        bool same = f && f.seek(offset);
-        for (size_t i = 0; same && i < body.length(); ++i) same = f.read() == (uint8_t)body[i];
-        if (f) f.close();
-        if (!same) { v2BundleError("chunk_conflict"); return; }
-    } else {
-        if (!v2Rx.append(offset, body.length(), v2NowMs())) { v2BundleError("offset_or_size"); return; }
-        File f = LittleFS.open(v2RxPath, "a");
-        bool ok = f && f.write((const uint8_t *)body.c_str(), body.length()) == body.length();
-        if (f) f.close();
-        if (!ok) { v2Rx.deadline = 0; v2BundleError("write"); return; }
-        v2Rx.offset += body.length();
+    if (raw.status == RAW_WRITE && v2ChunkOk) {
+        uint64_t end = (uint64_t)v2ChunkOffset + v2ChunkBytes + raw.currentSize;
+        if (end > (v2ChunkReplay ? v2Rx.offset : v2Rx.length)) {
+            v2ChunkFailure = "offset_or_size";
+            v2ChunkOk = false;
+            return;
+        }
+        if (v2ChunkReplay) {
+            for (size_t i = 0; i < raw.currentSize; ++i) {
+                if (v2ChunkFile.read() != raw.buf[i]) {
+                    v2ChunkFailure = "chunk_conflict";
+                    v2ChunkOk = false;
+                    break;
+                }
+            }
+        } else if (v2ChunkFile.write(raw.buf, raw.currentSize) != raw.currentSize) {
+            v2ChunkFailure = "write";
+            v2ChunkOk = false;
+        }
+        if (v2ChunkOk) v2ChunkBytes += raw.currentSize;
+        return;
+    }
+    if (raw.status == RAW_ABORTED) {
+        v2ChunkFailure = "aborted";
+        v2ChunkOk = false;
+    }
+    if (raw.status == RAW_END || raw.status == RAW_ABORTED) {
+        if (v2ChunkFile) v2ChunkFile.close();
+        if (v2ChunkOk && !v2ChunkBytes) {
+            v2ChunkFailure = "offset_or_size";
+            v2ChunkOk = false;
+        }
+        if (v2ChunkOk && !v2ChunkReplay &&
+            !v2Rx.append(v2ChunkOffset, v2ChunkBytes, v2NowMs())) {
+            v2ChunkFailure = "offset_or_size";
+            v2ChunkOk = false;
+        }
+        if (v2ChunkOk && !v2ChunkReplay) v2Rx.offset += v2ChunkBytes;
+        if (!v2ChunkOk && v2ChunkWriting) v2Rx.deadline = 0;
+    }
+}
+
+static void handleV2BundleChunk() {
+    if (!v2ChunkOk) {
+        if (!strcmp(v2ChunkFailure, "unauthorized")) {
+            server.send(401, "application/json", "{\"result\":\"unauthorized\"}");
+        } else {
+            v2BundleError(v2ChunkFailure);
+        }
+        return;
     }
     server.send(200, "application/json", String("{\"result\":\"applied\",\"next_offset\":") +
                 String(v2Rx.offset) + "}");
@@ -3804,11 +3896,34 @@ static void handleV2BundleCommit() {
     File f = LittleFS.open(v2RxPath, "r");
     if (!f || f.size() != v2Rx.length) { if (f) f.close(); v2BundleError("length"); return; }
     String body;
-    body.reserve(v2Rx.length);
+    if (!body.reserve(v2Rx.length)) {
+        f.close();
+        v2BundleError("oom");
+        return;
+    }
     while (f.available()) body += (char)f.read();
     f.close();
     if (body.length() != v2Rx.length || v2CrcOf(body) != crc) { v2BundleError("crc"); return; }
     if (v2BodyBridgeId(body) != owner) { v2BundleError("owner"); return; }
+    JsonDocument idFilter, idDoc;
+    idFilter["job_id"] = true;
+    if (deserializeJson(idDoc, body, DeserializationOption::Filter(idFilter))) {
+        v2BundleError("json"); return;
+    }
+    const char *jobId = idDoc["job_id"] | "";
+    uint32_t activeCrc = 0;
+    if (bsActiveJobPayload(jobId, activeCrc)) {
+        if (activeCrc != crc) { v2BundleError("request_conflict"); return; }
+        bsProfile(v2Profile);
+        v2CommittedOwner = owner; v2CommittedRequest = request;
+        v2CommittedCrc = crc; v2CommittedLength = v2Rx.length;
+        v2CommittedContext = v2Profile.contextId;
+        v2Rx.deadline = 0;
+        LittleFS.remove(v2RxPath);
+        v2Ack("bundle", "applied", "unchanged", "flash", nullptr, -1, 0,
+              v2Profile.contextId, UINT32_MAX);
+        return;
+    }
     char ctx[BS_CTX_LEN];
     snprintf(ctx, sizeof(ctx), "%08x%08x", v2CtxGen.next(), (unsigned)esp_random());
     String err;
@@ -3996,6 +4111,8 @@ static void v2RendezvousRender(bool light) {
 }
 
 static void registerHttpRoutes() {
+    const char *bundleHeaders[] = {"X-Request-Id", "X-Session-Nonce", "X-Offset"};
+    server.collectHeaders(bundleHeaders, 3);
     server.on("/", HTTP_GET, handleStatus);
     server.on("/status.json", HTTP_GET, handleStatusJson);
     server.on("/log", HTTP_GET, handleLog);
@@ -4014,7 +4131,7 @@ static void registerHttpRoutes() {
     server.on("/v2/activate", HTTP_POST, handleV2Activate);
 
     server.on("/v2/bundle/begin", HTTP_POST, handleV2BundleBegin);
-    server.on("/v2/bundle/chunk", HTTP_POST, handleV2BundleChunk);
+    server.on("/v2/bundle/chunk", HTTP_POST, handleV2BundleChunk, handleV2BundleChunkRaw);
     server.on("/v2/bundle/commit", HTTP_POST, handleV2BundleCommit);
     server.on("/update", HTTP_GET, handleUpdatePage);
     server.on("/doUpdate", HTTP_POST,
@@ -4523,6 +4640,8 @@ static int deepNetworkCycle() {
 // Light -> deep transition: capture the clock window, notify the bridge, mark
 // the mode and sleep. Never returns (called from loop()/setup()).
 static void enterDeep(const char *reason) {
+    // Every deep-sleep path must honor the PC USB keep-awake policy.
+    if (plugged && !rtcDeepOnUsb) return;
     setStage(19);
     if (clkR.valid && lastDisplayedFrame) clkCaptureFromFramebuffer();
     if (v2BundleReady && rv2Enabled) rtcNextContactS = V2_RENDEZVOUS_S;
@@ -5033,6 +5152,24 @@ static void handleSerialCli() {
             DevLog.printf("[cli] fw=%s state=%s ip=%s rssi=%d heap=%u\n",
                           FW_VERSION, deviceStateText(), ipText().c_str(),
                           WiFi.RSSI(), ESP.getFreeHeap());
+#if defined(CODEX_TARGET_NOTE4)
+            const esp_partition_t *running = esp_ota_get_running_partition();
+            DevLog.printf("[cli] slot=%s epd_writes=%u busy_fails=%u trusted=%d\n",
+                          running ? running->label : "?", (unsigned)epdWriteCount,
+                          (unsigned)rtcEpdBusyFails, epdBaselineTrusted ? 1 : 0);
+            uint32_t black = 0;
+            if (frame) for (int i = 0; i < EPD_FB_BYTES; ++i)
+                black += __builtin_popcount((unsigned char)~frame[i]);
+            const esp_partition_t *storage = esp_partition_find_first(
+                ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "storage");
+            DevLog.printf("[cli] frame_black=%u flash=%u storage=%s\n",
+                          (unsigned)black, (unsigned)ESP.getFlashChipSize(),
+                          storage ? "found" : "missing");
+#endif
+#if defined(CODEX_TARGET_NOTE4)
+        } else if (line == "log") {
+            Serial.print(DevLog.dump());
+#endif
         } else if (line == "batt") {
             DevLog.printf("[cli] battery=%d%% (%u mV)\n", batteryPercent(),
                           (unsigned)batteryMilliVolts());
@@ -5236,7 +5373,7 @@ void loop() {
     // v2: only a new formal PowerPlan moves the light deadline; reads, data,
     // claims and status polls never do. The BOOT provisional 300 s closes the
     // radio when the Bridge stays unreachable (v2 §7/§12).
-    if (v2BundleReady && rtcMode == MODE_LIGHT) {
+    if (v2BundleReady && rtcMode == MODE_LIGHT && (!plugged || rtcDeepOnUsb)) {
         if (v2Plan.accepted()) {
             if (!v2Plan.lightActive(v2NowMs())) {
                 DevLog.printf("[v2] formal light window ended (%s)\n", v2PlanReason.c_str());

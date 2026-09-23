@@ -46,19 +46,33 @@
 /**
  * GPIO config
 **/
+#if defined(CODEX_TARGET_NOTE4)
+#include "platform_target.h"
+#define EPD_SCK_PIN  NOTE4_EPD_SCK
+#define EPD_MOSI_PIN NOTE4_EPD_MOSI
+#define EPD_CS_PIN   NOTE4_EPD_CS
+#define EPD_DC_PIN   NOTE4_EPD_DC
+#define EPD_RST_PIN  NOTE4_EPD_RST
+#define EPD_BUSY_PIN NOTE4_EPD_BUSY
+#else
 #define EPD_SCK_PIN  12
 #define EPD_MOSI_PIN 13
 #define EPD_CS_PIN   11
 #define EPD_DC_PIN   10
 #define EPD_RST_PIN  9
 #define EPD_BUSY_PIN 8
+#endif
 
 /**
  * Enable it or not according to the actual hardware used, and the corresponding pin
  */
 #define D_9PIN  1
 #if D_9PIN
+#if defined(CODEX_TARGET_NOTE4)
+    #define EPD_PWR_PIN NOTE4_EPD_PWR
+#else
     #define EPD_PWR_PIN 6
+#endif
 #endif
 
 

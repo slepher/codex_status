@@ -11,11 +11,8 @@
 //                             (blocked_by_hardware_arrival).
 //   zectrix-note4-400x300   : ZecTrix Note4 V1.0 board (ESP32-S3) with a 4.2"
 //                             400x300 B/W panel and an SSD2683 controller.
-//                             Panel model/resolution/controller are confirmed;
-//                             the ESP32<->EPD and KEY_* GPIO map and the panel
-//                             waveform LUTs are NOT in the supplied schematic
-//                             sheets, so the build fails with an explicit list
-//                             instead of guessing (blocked_by_hardware_arrival).
+//                             Official V1.0 pin map and OTP full-refresh path
+//                             are used. Partial refresh awaits hardware tests.
 #pragma once
 
 #if defined(CODEX_TARGET_NOTE4)
@@ -24,7 +21,7 @@
 #define TARGET_PIXEL_FORMAT "1bpp"
 #define TARGET_COLORS      "bw"
 #define TARGET_PARTIAL     0   // enable only after waveform/BUSY verification
-#define TARGET_VERIFIED    0
+#define TARGET_VERIFIED    1   // Note4 V1.0 pin map and OTP full-refresh path
 #define TARGET_WIDTH  400
 #define TARGET_HEIGHT 300
 #elif defined(CODEX_TARGET_GRAY4)
@@ -55,8 +52,8 @@
 //   - EPD nets: EPD_SCK/EPD_CS/EPD_DC/EPD_RST/EPD_BUSY/EPD_SDA + EPD3V3_EN
 //   - KEY nets: KEY_PGUP (side), KEY_PGDN (side), KEY_ENTER (front)
 //   - I2C: PCF8563 RTC (0x51), ES8311 codec (0x18), NFC (0x55)
-// Missing (do not guess): the GPIO numbers behind those nets and the panel
-// waveform LUTs. Define them in the build flags to enable this target.
+// The V1.0 GPIO numbers are explicit in the Note4 PlatformIO env. Full
+// refresh uses the panel OTP waveform; no external waveform table is needed.
 // ---------------------------------------------------------------------------
 #if defined(CODEX_TARGET_NOTE4)
 #if !defined(NOTE4_EPD_SCK) || !defined(NOTE4_EPD_MOSI) || !defined(NOTE4_EPD_CS) || \
@@ -66,8 +63,5 @@
 #endif
 #if !defined(NOTE4_KEY_PGUP) || !defined(NOTE4_KEY_PGDN) || !defined(NOTE4_KEY_ENTER)
 #error "target zectrix-note4-400x300: missing KEY GPIO map. Provide NOTE4_KEY_PGUP/PGDN/ENTER in build_flags."
-#endif
-#if !defined(CODEX_SSD2683_LUTS)
-#error "target zectrix-note4-400x300: missing verified panel waveform LUTs. Provide CODEX_SSD2683_LUTS (vendor LUT header for this panel/temperature) before enabling refresh."
 #endif
 #endif

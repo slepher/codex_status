@@ -273,6 +273,13 @@ bool bsProfile(BsProfile &out) {
 }
 
 uint32_t bsCommitSeq() { return g_seq; }
+bool bsActiveJobPayload(const char *jobId, uint32_t &payloadCrc) {
+    if (!g_configured || !jobId || !*jobId) return false;
+    SlotHeader h;
+    if (!readSlotHeader(g_slot, h) || strcmp(h.jobId, jobId)) return false;
+    payloadCrc = h.payloadCrc;
+    return true;
+}
 const char *bsLastError() { return g_lastError.c_str(); }
 size_t bsFreeBytes() {
     if (!g_mounted) return 0;

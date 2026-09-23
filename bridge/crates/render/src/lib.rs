@@ -14,6 +14,7 @@ use std::sync::OnceLock;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Op {
     RenderJson,
+    Validate,
     Compile,
     RenderCompiled,
     Serialize,
@@ -34,6 +35,8 @@ struct Job {
     offline_mins: i32,
     mode: String,
     blob: Vec<u8>,
+    width: u32,
+    height: u32,
     reply: Sender<(i32, Vec<u8>, String)>,
 }
 
@@ -56,8 +59,9 @@ fn engine_loop(rx: Receiver<Job>) {
         let mut out = vec![0u8; 64 * 1024];
         let mut message = String::new();
         let rc = run_job(&job, &mut out, &mut message);
+        unsafe { codex_set_canvas(WIDTH as c_int, HEIGHT as c_int) };
         if matches!(job.op, Op::RenderJson | Op::RenderCompiled) {
-            out.truncate(BUF_LEN);
+            out.truncate(((job.width + 7) / 8 * job.height) as usize);
         } else if rc > 0 && (rc as usize) <= out.len() {
             out.truncate(rc as usize);
         }
@@ -66,7 +70,18 @@ fn engine_loop(rx: Receiver<Job>) {
 }
 
 fn run_job(job: &Job, out: &mut [u8], message: &mut String) -> i32 {
+    unsafe { codex_set_canvas(job.width as c_int, job.height as c_int) };
     match job.op {
+        Op::Validate => {
+            let tmpl = match CString::new(job.template.as_str()) {
+                Ok(value) => value,
+                Err(_) => return -3,
+            };
+            let mut err = vec![0i8; 128];
+            let ok = unsafe { codex_validate(tmpl.as_ptr(), err.as_mut_ptr(), err.len() as c_int) };
+            if ok != 1 { *message = cstr(&err); }
+            return ok;
+        }
         Op::Artifact => {
             let source = match CString::new(job.template.as_str()) {
                 Ok(value) => value,
@@ -176,7 +191,7 @@ fn run_job(job: &Job, out: &mut [u8], message: &mut String) -> i32 {
                 job.offline_mins,
                 mode.as_ptr(),
                 out.as_mut_ptr(),
-                BUF_LEN as c_int,
+                (((job.width + 7) / 8) * job.height) as c_int,
             )
         };
     }
@@ -196,7 +211,7 @@ fn run_job(job: &Job, out: &mut [u8], message: &mut String) -> i32 {
             job.offline_mins,
             mode.as_ptr(),
             out.as_mut_ptr(),
-            BUF_LEN as c_int,
+            (((job.width + 7) / 8) * job.height) as c_int,
         )
     }
 }
@@ -225,6 +240,7 @@ fn run_engine(op: Op, template: &str, job: Job) -> anyhow::Result<(i32, Vec<u8>,
 }
 
 fn base_job(template: &str, env: &Env<'_>) -> Job {
+    let (width, height) = canvas_size(template).unwrap_or((WIDTH, HEIGHT));
     Job {
         op: Op::RenderJson,
         template: template.to_string(),
@@ -237,7 +253,21 @@ fn base_job(template: &str, env: &Env<'_>) -> Job {
         offline_mins: env.offline_mins,
         mode: env.mode.to_string(),
         blob: Vec::new(),
+        width,
+        height,
         reply: std::sync::mpsc::channel().0,
+    }
+}
+
+pub fn canvas_size(template: &str) -> Option<(u32, u32)> {
+    let source: serde_json::Value = serde_json::from_str(template).ok()?;
+    let size = (
+        source.get("canvas")?.get("w")?.as_u64()?,
+        source.get("canvas")?.get("h")?.as_u64()?,
+    );
+    match size {
+        (200, 200) | (400, 300) => Some((size.0 as u32, size.1 as u32)),
+        _ => None,
     }
 }
 
@@ -255,11 +285,24 @@ pub fn compile(template: &str) -> Result<(), String> {
 /// Shared C++ wire compiler/validator. Returns binary CTP1 bytes and metadata
 /// obtained from that same record in one serialized engine operation.
 pub fn compiled_artifact(source: Option<&str>, blob: &[u8]) -> anyhow::Result<(Vec<u8>, String)> {
+    compiled_artifact_with_canvas(source, blob, WIDTH, HEIGHT)
+}
+
+pub fn compiled_artifact_with_canvas(
+    source: Option<&str>,
+    blob: &[u8],
+    width: u32,
+    height: u32,
+) -> anyhow::Result<(Vec<u8>, String)> {
     let source = source.unwrap_or("");
     let mut job = base_job(source, &Env::default());
+    job.width = width;
+    job.height = height;
     job.blob = blob.to_vec();
     let (rc, out, metadata) = run_engine(Op::Artifact, source, job)?;
-    if rc <= 0 { anyhow::bail!("compiled artifact: {metadata}"); }
+    if rc <= 0 {
+        anyhow::bail!("compiled artifact: {metadata}");
+    }
     Ok((out, metadata))
 }
 
@@ -280,7 +323,21 @@ pub fn compiled_source_crc() -> u32 {
 
 /// Render using the compiled template (no template JSON parsing).
 pub fn render_compiled_bits(usage: &str, env: &Env<'_>) -> anyhow::Result<Vec<u8>> {
+    render_compiled_bits_size(usage, env, WIDTH, HEIGHT)
+}
+
+/// Canvas-aware compiled render. The engine keeps one global compiled record,
+/// so the caller must pass the canvas that record was compiled for; otherwise
+/// ops fall outside the 200x200 default frame buffer.
+pub fn render_compiled_bits_size(
+    usage: &str,
+    env: &Env<'_>,
+    width: u32,
+    height: u32,
+) -> anyhow::Result<Vec<u8>> {
     let mut job = base_job("", env);
+    job.width = width;
+    job.height = height;
     job.usage = usage.to_string();
     let (rc, out, message) = run_engine(Op::RenderCompiled, "", job)?;
     match rc {
@@ -321,6 +378,7 @@ pub const ROW_BYTES: usize = (WIDTH as usize + 7) / 8;
 pub const BUF_LEN: usize = ROW_BYTES * HEIGHT as usize;
 
 extern "C" {
+    fn codex_set_canvas(w: c_int, h: c_int);
     fn codex_ct_artifact(source: *const c_char, blob: *const u8, len: c_int,
         out: *mut u8, cap: c_int, metadata: *mut c_char, meta_cap: c_int) -> c_int;
     fn codex_render(
@@ -355,6 +413,20 @@ extern "C" {
     fn codex_ct_source_crc() -> c_int;
     fn codex_ct_serialize(out: *mut u8, cap: c_int) -> c_int;
     fn codex_ct_deserialize(blob: *const u8, len: c_int, err: *mut c_char, err_len: c_int) -> c_int;
+    fn codex_set_panel(w: c_int, h: c_int);
+    fn codex_font_asset_check(bytes: *const u8, len: c_int, out: *mut c_char,
+        cap: c_int) -> c_int;
+    fn codex_font_store_reset();
+    fn codex_font_store_budget(budget: i64);
+    fn codex_font_store_begin(profile: *const c_char) -> c_int;
+    fn codex_font_store_write(bytes: *const u8, len: c_int, out: *mut c_char,
+        cap: c_int) -> c_int;
+    fn codex_font_store_inventory(out: *mut c_char, cap: c_int) -> c_int;
+    fn codex_font_store_load(id: *const c_char, out: *mut c_char, cap: c_int) -> c_int;
+    fn codex_font_store_prune(ids: *const c_char, out: *mut c_char, cap: c_int) -> c_int;
+    fn codex_font_store_clear() -> c_int;
+    fn codex_font_store_usage(out: *mut c_char, cap: c_int) -> c_int;
+    fn codex_font_store_put_raw(id: *const c_char, bytes: *const u8, len: c_int) -> c_int;
     fn codex_rgn_build(tmpl: *const c_char) -> c_int;
     fn codex_rgn_build_ct(blob: *const u8, len: c_int, err: *mut c_char, errcap: c_int) -> c_int;
     fn codex_rgn_decide(
@@ -371,10 +443,148 @@ extern "C" {
     fn codex_rgn_dump(out: *mut c_char, out_len: c_int) -> c_int;
 }
 
+/// Result of pushing one font container into the device font store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FontStoreWrite {
+    /// The container was validated and written (or replaced).
+    Stored { id: String, name: String },
+    /// The id was already installed: a no-op that transfers nothing.
+    AlreadyPresent { id: String, name: String },
+}
+
+/// Reset the in-memory device filesystem and unbind the font store.
+pub fn font_store_reset() {
+    unsafe { codex_font_store_reset() };
+}
+
+/// Inject a torn write after exactly `budget` bytes (`-1` disables).
+pub fn font_store_set_write_budget(budget: i64) {
+    unsafe { codex_font_store_budget(budget) };
+}
+
+/// Bind the font store to a Profile directory (the device's `/fonts/<id>/`).
+pub fn font_store_begin(profile: &str) -> bool {
+    let c = match CString::new(profile) { Ok(v) => v, Err(_) => return false };
+    unsafe { codex_font_store_begin(c.as_ptr()) == 1 }
+}
+
+pub fn font_store_write(bytes: &[u8]) -> Result<FontStoreWrite, String> {
+    let mut out = vec![0i8; 192];
+    let rc = unsafe {
+        codex_font_store_write(bytes.as_ptr(), bytes.len() as c_int, out.as_mut_ptr(),
+                               out.len() as c_int)
+    };
+    let message = cstr(&out);
+    if rc < 0 {
+        return Err(message);
+    }
+    let id = field(&message, "id=").unwrap_or_default();
+    let name = field(&message, "name=").unwrap_or_default();
+    Ok(if rc == 1 {
+        FontStoreWrite::Stored { id, name }
+    } else {
+        FontStoreWrite::AlreadyPresent { id, name }
+    })
+}
+
+/// `(count, corrupt_count, "id:name:bytes …")` for the bound Profile.
+pub fn font_store_inventory() -> (usize, usize, String) {
+    let mut out = vec![0i8; 512];
+    let n = unsafe { codex_font_store_inventory(out.as_mut_ptr(), out.len() as c_int) };
+    let message = cstr(&out);
+    let bad = field(&message, "bad=")
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    (n.max(0) as usize, bad, message)
+}
+
+/// Load one installed font: `(id, name, bytes, crc32)` of the stored container.
+pub fn font_store_load(id: &str) -> Result<(String, String, u32, u32), String> {
+    let c = CString::new(id).map_err(|e| e.to_string())?;
+    let mut out = vec![0i8; 192];
+    let rc = unsafe { codex_font_store_load(c.as_ptr(), out.as_mut_ptr(), out.len() as c_int) };
+    let message = cstr(&out);
+    if rc != 1 {
+        return Err(message);
+    }
+    let get = |key: &str| field(&message, key).unwrap_or_default();
+    Ok((
+        get("id="),
+        get("name="),
+        get("bytes=").trim().parse().unwrap_or(0),
+        u32::from_str_radix(get("crc=").trim(), 16).unwrap_or(0),
+    ))
+}
+
+/// Keep only the listed font ids in the bound Profile: `(removed, left, bytes)`.
+pub fn font_store_prune(keep_ids: &[&str]) -> (i32, usize, u32) {
+    let c = CString::new(keep_ids.join(",")).unwrap_or_default();
+    let mut out = vec![0i8; 128];
+    let removed = unsafe { codex_font_store_prune(c.as_ptr(), out.as_mut_ptr(), out.len() as c_int) };
+    let message = cstr(&out);
+    (
+        removed,
+        field(&message, "left=").and_then(|v| v.trim().parse().ok()).unwrap_or(0),
+        field(&message, "bytes=").and_then(|v| v.trim().parse().ok()).unwrap_or(0),
+    )
+}
+
+pub fn font_store_clear() -> bool {
+    unsafe { codex_font_store_clear() == 1 }
+}
+
+pub fn font_store_usage() -> (u32, usize, String) {
+    let mut out = vec![0i8; 128];
+    let count = unsafe { codex_font_store_usage(out.as_mut_ptr(), out.len() as c_int) };
+    let message = cstr(&out);
+    let bytes = field(&message, "bytes=").and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+    let profile = field(&message, "profile=").unwrap_or_default();
+    (bytes, count.max(0) as usize, profile)
+}
+
+/// Write raw bytes at the store path for `id`, bypassing validation (models a
+/// file that was damaged or mis-named outside the write path).
+pub fn font_store_put_raw(id: &str, bytes: &[u8]) -> bool {
+    let c = match CString::new(id) { Ok(v) => v, Err(_) => return false };
+    unsafe { codex_font_store_put_raw(c.as_ptr(), bytes.as_ptr(), bytes.len() as c_int) == 1 }
+}
+
+fn field(haystack: &str, key: &str) -> Option<String> {
+    let start = haystack.find(key)? + key.len();
+    let rest = &haystack[start..];
+    let end = rest.find(|c: char| c == ' ' || c == '\n').unwrap_or(rest.len());
+    Some(rest[..end].to_string())
+}
+
+/// Validate a CSFN v1 font asset container with the device's own parser.
+/// On success returns the descriptor line the device would report; on rejection
+/// returns the device's rejection reason.
+pub fn font_asset_check(bytes: &[u8]) -> Result<String, String> {
+    let mut out = vec![0i8; 256];
+    let rc = unsafe {
+        codex_font_asset_check(bytes.as_ptr(), bytes.len() as c_int,
+                               out.as_mut_ptr(), out.len() as c_int)
+    };
+    let message = cstr(&out);
+    match rc {
+        1 => Ok(message),
+        0 => Err(message),
+        _ => Err("font asset check failed".to_string()),
+    }
+}
+
 /// Derive the semantic refresh regions for a template (display-safety layer).
 /// Callers must serialize all `rgn_*` calls (the policy state is global, like
-/// the firmware's).
+/// the firmware's). The panel geometry is taken from the template's own canvas,
+/// so a 400x300 template is not derived against the 200x200 default.
 pub fn rgn_build(template: &str) -> Result<usize, String> {
+    let (width, height) = canvas_size(template).unwrap_or((WIDTH, HEIGHT));
+    rgn_build_size(template, width, height)
+}
+
+/// Canvas-explicit region derivation (callers that already resolved the canvas).
+pub fn rgn_build_size(template: &str, width: u32, height: u32) -> Result<usize, String> {
+    set_panel(width, height);
     let tmpl = CString::new(template).map_err(|e| e.to_string())?;
     let n = unsafe { codex_rgn_build(tmpl.as_ptr()) };
     if n < 1 {
@@ -423,8 +633,16 @@ pub fn rgn_on_full() {
     unsafe { codex_rgn_on_full() };
 }
 
+/// Declare the panel geometry the region policy should use. The policy keeps
+/// one global panel size, so it must be set for the template's canvas before
+/// deriving regions (200x200 and 400x300 share this code).
+pub fn set_panel(width: u32, height: u32) {
+    unsafe { codex_set_panel(width as c_int, height as c_int) };
+}
+
 /// Derive refresh regions from the compiled record (activation path).
-pub fn rgn_build_compiled(blob: &[u8]) -> Result<usize, String> {
+pub fn rgn_build_compiled(blob: &[u8], width: u32, height: u32) -> Result<usize, String> {
+    set_panel(width, height);
     let mut err = vec![0i8; 128];
     let n = unsafe {
         codex_rgn_build_ct(
@@ -491,34 +709,38 @@ pub fn render_bits(template: &str, usage: &str, env: &Env<'_>) -> anyhow::Result
 }
 
 pub fn validate(template: &str) -> Result<(), String> {
-    let tmpl = CString::new(template).map_err(|e| e.to_string())?;
-    let mut err = vec![0i8; 128];
-    let ok = unsafe { codex_validate(tmpl.as_ptr(), err.as_mut_ptr(), err.len() as c_int) };
-    if ok == 1 {
-        return Ok(());
+    let job = base_job(template, &Env::default());
+    let (rc, _, message) = run_engine(Op::Validate, template, job).map_err(|e| e.to_string())?;
+    if rc == 1 {
+        Ok(())
+    } else {
+        Err(message)
     }
-    let bytes: Vec<u8> = err
-        .iter()
-        .take_while(|&&c| c != 0)
-        .map(|&c| c as u8)
-        .collect();
-    Err(String::from_utf8_lossy(&bytes).to_string())
 }
 
 /// 8-bit grayscale PNG of the raster (white = 255, ink = 0).
 pub fn bits_to_png(bits: &[u8]) -> anyhow::Result<Vec<u8>> {
+    bits_to_png_size(bits, WIDTH, HEIGHT)
+}
+
+pub fn bits_to_png_size(bits: &[u8], width: u32, height: u32) -> anyhow::Result<Vec<u8>> {
+    let row_bytes = ((width + 7) / 8) as usize;
+    anyhow::ensure!(
+        bits.len() == row_bytes * height as usize,
+        "framebuffer size"
+    );
     let mut out = Vec::new();
     {
-        let mut encoder = png::Encoder::new(&mut out, WIDTH, HEIGHT);
+        let mut encoder = png::Encoder::new(&mut out, width, height);
         encoder.set_color(png::ColorType::Grayscale);
         encoder.set_depth(png::BitDepth::Eight);
         let mut writer = encoder.write_header()?;
-        let mut data = vec![0u8; (WIDTH * HEIGHT) as usize];
-        for y in 0..HEIGHT as usize {
-            for x in 0..WIDTH as usize {
-                let byte = bits[y * ROW_BYTES + x / 8];
+        let mut data = vec![0u8; (width * height) as usize];
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let byte = bits[y * row_bytes + x / 8];
                 let white = byte & (0x80 >> (x % 8)) != 0;
-                data[y * WIDTH as usize + x] = if white { 255 } else { 0 };
+                data[y * width as usize + x] = if white { 255 } else { 0 };
             }
         }
         writer.write_image_data(&data)?;
@@ -528,10 +750,23 @@ pub fn bits_to_png(bits: &[u8]) -> anyhow::Result<Vec<u8>> {
 
 /// Decode a reference PNG (grayscale or RGB, 8-bit) to the same bit layout.
 pub fn png_to_bits(png_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+    png_to_bits_size(png_bytes, WIDTH, HEIGHT)
+}
+
+/// Canvas-aware reference decode: the PNG must match the requested canvas.
+pub fn png_to_bits_size(png_bytes: &[u8], width: u32, height: u32) -> anyhow::Result<Vec<u8>> {
     let decoder = png::Decoder::new(std::io::Cursor::new(png_bytes));
     let mut reader = decoder.read_info()?;
     let mut buf = vec![0u8; reader.output_buffer_size()];
     let info = reader.next_frame(&mut buf)?;
+    anyhow::ensure!(
+        (info.width, info.height) == (width, height),
+        "reference png is {}x{}, template canvas is {}x{}",
+        info.width,
+        info.height,
+        width,
+        height
+    );
     let channels = match info.color_type {
         png::ColorType::Grayscale => 1usize,
         png::ColorType::GrayscaleAlpha => 2,
@@ -539,13 +774,14 @@ pub fn png_to_bits(png_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
         png::ColorType::Rgba => 4,
         other => anyhow::bail!("unsupported reference png color type: {other:?}"),
     };
-    let mut bits = vec![0u8; BUF_LEN];
-    for y in 0..HEIGHT as usize {
-        for x in 0..WIDTH as usize {
-            let idx = (y * WIDTH as usize + x) * channels;
+    let row_bytes = ((width + 7) / 8) as usize;
+    let mut bits = vec![0u8; row_bytes * height as usize];
+    for y in 0..height as usize {
+        for x in 0..width as usize {
+            let idx = (y * width as usize + x) * channels;
             let luma = buf[idx];
             if luma >= 128 {
-                bits[y * ROW_BYTES + x / 8] |= 0x80 >> (x % 8);
+                bits[y * row_bytes + x / 8] |= 0x80 >> (x % 8);
             }
         }
     }

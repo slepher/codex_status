@@ -3,7 +3,7 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use crate::template::{parse_bind, BindSpec, CANVAS};
+use crate::template::{parse_bind, BindSpec, CANVAS, NOTE4_WIDTH, NOTE4_HEIGHT};
 use crate::platform::model::{FieldRequirement, MissingPolicy};
 
 pub const COMPILER_ABI: u32 = 1;
@@ -67,11 +67,14 @@ fn resources(meta: &ArtifactMeta) -> Vec<CompiledResource> {
 }
 
 pub fn validate(t: &CompiledTemplate) -> Result<()> {
+    let expected = if t.render_target == crate::platform::model::RENDER_TARGET_NOTE4 {
+        (NOTE4_WIDTH as u32, NOTE4_HEIGHT as u32)
+    } else { (CANVAS as u32, CANVAS as u32) };
     if t.compiler_abi != COMPILER_ABI || t.render_target.is_empty() ||
-        t.canvas_w != CANVAS as u32 || t.canvas_h != CANVAS as u32 {
+        (t.canvas_w, t.canvas_h) != expected {
         bail!("compiled template: unsupported target/ABI/canvas");
     }
-    let (_, meta) = bridge_render::compiled_artifact(None, &binary_bytes(t)?)?;
+    let (_, meta) = bridge_render::compiled_artifact_with_canvas(None, &binary_bytes(t)?, expected.0, expected.1)?;
     let meta: ArtifactMeta = serde_json::from_str(&meta)?;
     let reqs = requirements(&meta)?;
     let local: Vec<String> = reqs.iter().filter(|r| r.local).map(|r| r.field.clone()).collect();
@@ -100,7 +103,7 @@ fn field_kind(spec: &BindSpec) -> crate::platform::model::FieldKind {
     use crate::platform::model::FieldKind;
     match spec {
         BindSpec::Plan | BindSpec::Label | BindSpec::HostId | BindSpec::DeviceIp |
-        BindSpec::DeviceSync | BindSpec::DeviceState | BindSpec::DeviceNow |
+        BindSpec::DeviceSync | BindSpec::DeviceState | BindSpec::DeviceNow | BindSpec::DeviceDate |
         BindSpec::DeviceMode | BindSpec::DeviceChannel => FieldKind::Text,
         _ => FieldKind::Number,
     }
@@ -108,15 +111,22 @@ fn field_kind(spec: &BindSpec) -> crate::platform::model::FieldKind {
 
 pub fn compile(source: &Value, render_target: &str) -> Result<CompiledTemplate> {
     crate::template::validate_template(source).map_err(|e| anyhow::anyhow!("template: {e}"))?;
+    let (width, height) = if render_target == crate::platform::model::RENDER_TARGET_NOTE4 {
+        (NOTE4_WIDTH as u32, NOTE4_HEIGHT as u32)
+    } else { (CANVAS as u32, CANVAS as u32) };
+    if source["canvas"]["w"].as_u64() != Some(width as u64)
+        || source["canvas"]["h"].as_u64() != Some(height as u64) {
+        bail!("template canvas does not match render target {render_target}");
+    }
     let text = String::from_utf8(crate::template::canonical_bytes(source))?;
-    let (blob, meta) = bridge_render::compiled_artifact(Some(&text), &[])?;
+    let (blob, meta) = bridge_render::compiled_artifact_with_canvas(Some(&text), &[], width, height)?;
     let meta: ArtifactMeta = serde_json::from_str(&meta)?;
     let reqs = requirements(&meta)?;
     let compiled = CompiledTemplate {
         template_id: meta.template_id.clone(), render_target: render_target.into(),
         compiler_abi: meta.compiler_abi, version: source["version"].as_u64().unwrap_or(0),
         min_fw: source["min_fw"].as_str().map(str::to_owned),
-        source_crc: format!("{:08x}", meta.source_crc), canvas_w: CANVAS as u32, canvas_h: CANVAS as u32,
+        source_crc: format!("{:08x}", meta.source_crc), canvas_w: width, canvas_h: height,
         local_dependencies: reqs.iter().filter(|r| r.local).map(|r| r.field.clone()).collect(),
         requirements: reqs, resources: resources(&meta), op_count: meta.op_count,
         binary: blob.iter().map(|b| format!("{b:02x}")).collect(),
@@ -202,5 +212,23 @@ mod tests {
         let n = bytes.len();
         bytes[n / 2] ^= 0x01;
         assert!(decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn note4_template_compiles_and_renders_at_native_size() {
+        let source: Value = serde_json::from_str(include_str!(
+            "../../../../project-workflow/generic-display-platform-implementation/concepts-400x300/codex-status-a-400x300.json"
+        )).unwrap();
+        let compiled = compile(&source, crate::platform::model::RENDER_TARGET_NOTE4).unwrap();
+        assert_eq!((compiled.canvas_w, compiled.canvas_h), (400, 300));
+        assert_eq!(decode(&encode(&compiled)).unwrap(), compiled);
+        let usage = serde_json::json!({"account":{"plan":"Pro"},"bridge":{"label":"ACCOUNT"},
+            "buckets":[{"id":"codex","windows":[{"windowMins":300,"usedPercent":6,"resetsAt":1800000000},
+                {"windowMins":10080,"usedPercent":75,"resetsAt":1800500000}]}],
+            "resetCredits":{"availableCount":2}}).to_string();
+        let bits = bridge_render::render_bits(&source.to_string(), &usage, &bridge_render::Env::default()).unwrap();
+        assert_eq!(bits.len(), 15_000);
+        let png = bridge_render::bits_to_png_size(&bits, 400, 300).unwrap();
+        assert!(png.len() > 1000);
     }
 }

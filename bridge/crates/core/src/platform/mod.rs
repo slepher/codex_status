@@ -1,6 +1,8 @@
 //! v2 platform module tree.
 
+pub mod fonts;
 pub mod model;
+pub mod publish;
 pub mod service;
 pub mod store;
 

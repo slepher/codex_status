@@ -119,6 +119,19 @@ pub struct PlanState {
     pub last_accepted_id: u64,
     pub last_accepted_remaining_s: u32,
     pub last_accepted_at: u64,
+    #[serde(default)]
+    pub pending_explicit_light: Option<PowerPlan>,
+    #[serde(default)]
+    pub last_explicit_light_ack: Option<ExplicitLightAck>,
+    #[serde(default)]
+    pub light_hold_until: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExplicitLightAck {
+    pub plan_id: u64,
+    pub accepted_remaining_s: u32,
+    pub accepted_at: u64,
 }
 
 /// Bridge-side view of the device session (mirrors authenticated Status).
@@ -181,11 +194,6 @@ pub struct Coordinator {
     /// Observed plan-id high water mark accepted by the device.
     pub device_plan_high: u64,
     pub last_sequence_reason: Option<String>,
-    /// Bridge-controlled minimum light window (epoch seconds). While
-    /// `now < light_hold_until` rendezvous plans keep granting light; the
-    /// device still follows the formal PowerPlan deadline, which extended
-    /// holds refresh. Used for the post-OTA control window.
-    pub light_hold_until: u64,
 }
 
 pub const DEFAULT_FULL_SYNC_S: u64 = 3600;
@@ -212,13 +220,35 @@ impl Coordinator {
             session: DeviceSession::default(),
             device_plan_high: 0,
             last_sequence_reason: None,
-            light_hold_until: 0,
         }
     }
 
     /// Raise the bridge-side light hold (never shortens an existing hold).
     pub fn hold_light(&mut self, until: u64) {
-        self.light_hold_until = self.light_hold_until.max(until);
+        self.plan.light_hold_until = self.plan.light_hold_until.max(until);
+    }
+
+    /// Queue one explicit light action. Repeated requests before ACK reuse the
+    /// exact plan so HTTP and BLE delivery cannot create competing IDs.
+    pub fn queue_explicit_light(&mut self, now: u64, light_s: u32) -> PowerPlan {
+        if let Some(plan) = &self.plan.pending_explicit_light {
+            return plan.clone();
+        }
+        let duration = light_s.clamp(30, MAX_LIGHT_S.min(self.caps.max_light_s));
+        let id = self.plan.next_plan_id.max(self.device_plan_high)
+            .max(self.plan.last_sent.as_ref().map(|p| p.plan_id).unwrap_or(0)) + 1;
+        let plan = PowerPlan::light(id, duration, RENDEZVOUS_S, "explicit");
+        self.plan.next_plan_id = id;
+        self.plan.last_sent = Some(plan.clone());
+        self.plan.last_sent_at = now;
+        self.plan.pending_explicit_light = Some(plan.clone());
+        self.plan.last_explicit_light_ack = None;
+        plan
+    }
+
+    pub fn cancel_explicit_light(&mut self) {
+        self.plan.pending_explicit_light = None;
+        self.plan.light_hold_until = 0;
     }
 
     /// Rebuild the active requirement/trigger contract (context switch, profile
@@ -694,6 +724,13 @@ impl Coordinator {
         self.plan.last_accepted_id = plan_id;
         self.plan.last_accepted_remaining_s = accepted_remaining_s;
         self.plan.last_accepted_at = crate::now_secs();
+        if self.plan.pending_explicit_light.as_ref().is_some_and(|p| p.plan_id == plan_id) {
+            self.plan.pending_explicit_light = None;
+            self.plan.last_explicit_light_ack = Some(ExplicitLightAck {
+                plan_id, accepted_remaining_s, accepted_at: self.plan.last_accepted_at,
+            });
+            self.hold_light(self.plan.last_accepted_at + accepted_remaining_s as u64);
+        }
         if provisional {
             self.session.power.provisional = true;
         }
@@ -1226,6 +1263,7 @@ mod tests {
         let bundle = Bundle {
             job_id: "job-1".into(),
             device_mac: "AA:BB:CC:DD:EE:FF".into(),
+            bridge_id: String::new(),
             firmware_target: caps.firmware_target.clone(),
             render_target: caps.render_target.clone(),
             compiler_abi: crate::compile::COMPILER_ABI,
@@ -1387,6 +1425,7 @@ mod tests {
         let bundle = Bundle {
             job_id: "job-chunk".into(),
             device_mac: "AA:BB:CC:DD:EE:FF".into(),
+            bridge_id: String::new(),
             firmware_target: caps.firmware_target.clone(),
             render_target: caps.render_target.clone(),
             compiler_abi: crate::compile::COMPILER_ABI,
@@ -1438,6 +1477,7 @@ mod tests {
         let bundle = Bundle {
             job_id: "job-x".into(),
             device_mac: c.mac.clone(),
+            bridge_id: String::new(),
             firmware_target: caps.firmware_target.clone(),
             render_target: "other-target".into(),
             compiler_abi: crate::compile::COMPILER_ABI,

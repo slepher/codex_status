@@ -19,8 +19,10 @@ pub const MAX_BUNDLE_BYTES: usize = 512 * 1024;
 pub const MAX_SNAPSHOT_BYTES: usize = 8192;
 
 pub const RENDER_TARGET_154G: &str = "epd-ssd1681-200x200-1bpp";
+pub const RENDER_TARGET_NOTE4: &str = "epd-ssd2683-400x300-1bpp";
 pub const RENDER_TARGET_GRAY4: &str = "epd-200x200-2bpp-gray4";
 pub const FIRMWARE_TARGET_154G: &str = "codex-status-154g";
+pub const FIRMWARE_TARGET_NOTE4: &str = "zectrix-note4-400x300";
 pub const FIRMWARE_TARGET_GRAY4: &str = "codex-status-154g-gray4";
 
 /// Device capability contract (v2 §5). Both sides validate the target; the
@@ -36,6 +38,18 @@ pub struct DeviceCapabilities {
     pub compiler_abi: u32,
     pub max_templates: u32,
     pub max_bundle_bytes: u64,
+    #[serde(default)]
+    pub asset_publish_protocol: u32,
+    #[serde(default)]
+    pub max_object_bytes: u64,
+    #[serde(default)]
+    pub max_manifest_bytes: u64,
+    #[serde(default)]
+    pub install_peak_bytes: u64,
+    #[serde(default)]
+    pub free_bytes: u64,
+    #[serde(default)]
+    pub filesystem_overhead_bytes: u64,
     pub max_fields: u32,
     pub max_snapshot_bytes: u32,
     /// `ram`, `rtc`, `flash`.
@@ -66,6 +80,12 @@ impl DeviceCapabilities {
             compiler_abi: COMPILER_ABI,
             max_templates: MAX_PROFILE_TEMPLATES as u32,
             max_bundle_bytes: 262_144,
+            asset_publish_protocol: 0,
+            max_object_bytes: 0,
+            max_manifest_bytes: 0,
+            install_peak_bytes: 0,
+            free_bytes: 0,
+            filesystem_overhead_bytes: 0,
             max_fields: 64,
             max_snapshot_bytes: MAX_SNAPSHOT_BYTES as u32,
             retention: vec!["ram".into(), "rtc".into(), "flash".into()],
@@ -90,6 +110,12 @@ impl DeviceCapabilities {
             compiler_abi: COMPILER_ABI,
             max_templates: MAX_PROFILE_TEMPLATES as u32,
             max_bundle_bytes: 262_144,
+            asset_publish_protocol: 0,
+            max_object_bytes: 0,
+            max_manifest_bytes: 0,
+            install_peak_bytes: 0,
+            free_bytes: 0,
+            filesystem_overhead_bytes: 0,
             max_fields: 64,
             max_snapshot_bytes: MAX_SNAPSHOT_BYTES as u32,
             retention: vec!["ram".into()],
@@ -107,6 +133,21 @@ impl DeviceCapabilities {
         }
         if self.width == 0 || self.height == 0 {
             bail!("capabilities: zero canvas");
+        }
+        let expected = match self.render_target.as_str() {
+            RENDER_TARGET_154G => (200, 200, "1bpp", "bw"),
+            RENDER_TARGET_NOTE4 => (400, 300, "1bpp", "bw"),
+            RENDER_TARGET_GRAY4 => (200, 200, "2bpp", "gray4"),
+            other => bail!("capabilities: unsupported render_target {other}"),
+        };
+        if (self.width, self.height, self.pixel_format.as_str(), self.colors.as_str()) != expected {
+            bail!("capabilities: target {} disagrees with canvas/pixel format", self.render_target);
+        }
+        if self.render_target == RENDER_TARGET_NOTE4 && self.firmware_target != FIRMWARE_TARGET_NOTE4 {
+            bail!("capabilities: Note4 firmware target mismatch");
+        }
+        if self.asset_publish_protocol > 0 && (self.max_object_bytes == 0 || self.max_manifest_bytes == 0 || self.install_peak_bytes == 0 || self.free_bytes == 0) {
+            bail!("capabilities: incremental publish limits missing");
         }
         if self.compiler_abi != COMPILER_ABI {
             bail!(
@@ -165,6 +206,12 @@ pub struct Binding {
 pub struct Profile {
     pub device_mac: String,
     pub template_ids: Vec<String>,
+    /// Exact display target. Older drafts are migrated only with known device capabilities.
+    #[serde(default)]
+    pub render_target: Option<String>,
+    /// Explicit asset version for each template-visible font name.
+    #[serde(default)]
+    pub font_ids: BTreeMap<String, String>,
     #[serde(default)]
     pub initial_active_id: Option<String>,
     #[serde(default)]
@@ -187,6 +234,8 @@ impl Profile {
         Self {
             device_mac: device_mac.into(),
             template_ids: Vec::new(),
+            render_target: None,
+            font_ids: BTreeMap::new(),
             initial_active_id: None,
             bindings: Vec::new(),
             sync_enabled: false,
@@ -224,6 +273,9 @@ impl Profile {
     /// Publish requires a non-empty, fully bound profile.
     pub fn validate_publishable(&self, caps: &DeviceCapabilities) -> Result<()> {
         self.validate()?;
+        if self.render_target.as_deref() != Some(caps.render_target.as_str()) {
+            bail!("profile render_target {:?} does not match device {}; reselect the target explicitly", self.render_target, caps.render_target);
+        }
         if self.template_ids.is_empty() {
             bail!("profile is empty; nothing to publish");
         }
@@ -313,6 +365,8 @@ pub struct BundleProfile {
 pub struct Bundle {
     pub job_id: String,
     pub device_mac: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub bridge_id: String,
     pub firmware_target: String,
     pub render_target: String,
     pub compiler_abi: u32,

@@ -8,6 +8,7 @@
 #include <mbedtls/base64.h>
 #include "GUI_Paint.h"
 #include "fonts.h"
+#include "font_noto.h"
 
 // Canvas size is a target property (v2 §5): set once at boot (or by the host
 // harness) instead of being compiled in, so one engine serves 200x200 and
@@ -31,7 +32,7 @@ enum BindKind {
     B_RESET_COUNT, B_RESET_EXPIRES,
     B_BUCKET_USED, B_BUCKET_REMAIN, B_BUCKET_RESET, B_BUCKET_WINMINS,
     B_DEV_CHANNEL, B_DEV_IP, B_DEV_SYNC, B_DEV_BATTERY,
-    B_DEV_STATE, B_DEV_OFFLINE, B_DEV_NOW, B_DEV_MODE
+    B_DEV_STATE, B_DEV_OFFLINE, B_DEV_NOW, B_DEV_MODE, B_DEV_DATE
 };
 
 // The optional JSON "time_format" accepts exactly "date" (the compact local
@@ -55,16 +56,6 @@ struct DrawCondition {
     bool useEquals = false;
     String equals;
 };
-
-static sFONT *fontByName(const char *name) {
-    if (!name) return nullptr;
-    if (!strcmp(name, "f8"))  return &Font8;
-    if (!strcmp(name, "f12")) return &Font12;
-    if (!strcmp(name, "f16")) return &Font16;
-    if (!strcmp(name, "f20")) return &Font20;
-    if (!strcmp(name, "f24")) return &Font24;
-    return nullptr;
-}
 
 // Font glyph tables are ASCII-only; keep multi-byte/UTF-8 text from walking
 // out of bounds in Paint_DrawChar.
@@ -112,6 +103,7 @@ static bool parseBind(const String &path, BindSpec &s) {
     if (path == "device.state")                { s.kind = B_DEV_STATE; return true; }
     if (path == "device.offline_mins")         { s.kind = B_DEV_OFFLINE; return true; }
     if (path == "device.now")                  { s.kind = B_DEV_NOW; return true; }
+    if (path == "device.date")                 { s.kind = B_DEV_DATE; return true; }
     if (path == "device.mode")                 { s.kind = B_DEV_MODE; return true; }
     if (path.startsWith("buckets[")) {
         int close = path.indexOf(']', 8);
@@ -235,6 +227,16 @@ static bool evalBind(const BindSpec &s, TextTimeFormat format, JsonDocument &usa
         out = b;
         return true;
     }
+    case B_DEV_DATE: {
+        time_t n = time(nullptr);
+        if (n < 1600000000) return false;
+        struct tm *lt = localtime(&n);
+        if (!lt) return false;
+        char b[6];
+        strftime(b, sizeof(b), "%m/%d", lt);
+        out = b;
+        return true;
+    }
     case B_DEV_MODE:
         if (env.mode.length() == 0) return false;
         out = env.mode;
@@ -273,7 +275,13 @@ static bool evalBind(const BindSpec &s, TextTimeFormat format, JsonDocument &usa
     }
 }
 
-static bool evalBindNum(const BindSpec &s, JsonDocument &usage, double &v) {
+static bool evalBindNum(const BindSpec &s, JsonDocument &usage,
+                        const TplEnv &env, double &v) {
+    if (s.kind == B_DEV_BATTERY) {
+        if (env.battery < 0) return false;
+        v = env.battery;
+        return true;
+    }
     if (s.kind != B_BUCKET_USED && s.kind != B_BUCKET_REMAIN &&
         s.kind != B_BUCKET_RESET && s.kind != B_BUCKET_WINMINS) {
         return false;
@@ -310,13 +318,14 @@ static bool bindExists(const BindSpec &s, JsonDocument &usage, const TplEnv &env
     case B_DEV_BATTERY: return env.battery >= 0;
     case B_DEV_STATE:   return env.state.length() > 0;
     case B_DEV_OFFLINE: return env.offlineMins >= 0;
-    case B_DEV_NOW:     return time(nullptr) > 1600000000;
+    case B_DEV_NOW:
+    case B_DEV_DATE:    return time(nullptr) > 1600000000;
     case B_DEV_MODE:    return env.mode.length() > 0;
     case B_PLAN:        return haveUsage && !usage["account"]["plan"].isNull();
     case B_LABEL:       return haveUsage && !usage["bridge"]["label"].isNull();
     case B_HOSTID:      return haveUsage && !usage["bridge"]["hostId"].isNull();
     case B_SERVER_TIME: return haveUsage && !usage["server_time"].isNull();
-    case B_RESET_COUNT: return haveUsage && !usage["resetCredits"]["availableCount"].isNull();
+    case B_RESET_COUNT: return haveUsage && (usage["resetCredits"]["availableCount"] | 0) > 0;
     case B_RESET_EXPIRES: return haveUsage && !usage["resetCredits"]["nextExpiresAt"].isNull();
     default: break;
     }
@@ -446,6 +455,55 @@ static void drawScaledText(const String &value, sFONT *font, int x, int y,
     }
 }
 
+// --- Proportional family (cropped Noto Sans) --------------------------------
+// The pen advances by each glyph's own 1/16 px advance and every glyph is
+// placed from its box offset, so spacing matches the upstream font instead of
+// a fixed cell. Same pixel writes as the fixed path, so host and device agree.
+
+static int propTextWidth(const Note4PropFont &f, const String &value, int scale) {
+    long adv = 0;
+    for (size_t i = 0; i < value.length(); i++) {
+        char c = value[i];
+        if (c < ' ' || c > '~') c = '?';
+        adv += f.glyphs[c - ' '].adv;
+    }
+    return (int)((adv * scale + 8) / 16);
+}
+
+static void drawPropText(const Note4PropFont &f, const String &value, int x, int y,
+                         int scale, int fg, int bg, bool clipped,
+                         int clipX, int clipY, int clipW, int clipH) {
+    if (scale < 1) scale = 1;
+    int baseline = y + (int)f.lineHeight - (int)f.baseLine;
+    long pen = (long)x << 4;   // 1/16 px fixed point
+    for (size_t i = 0; i < value.length(); i++) {
+        char c = value[i];
+        if (c < ' ' || c > '~') c = '?';
+        const Note4Glyph &g = f.glyphs[c - ' '];
+        int gx = (int)(pen >> 4) + g.ox;
+        int gy = baseline - g.oy - g.h;
+        int stride = (g.w + 7) / 8;
+        for (int row = 0; row < g.h; row++) {
+            for (int col = 0; col < g.w; col++) {
+                bool ink = (f.blob[g.off + row * stride + col / 8] &
+                            (0x80 >> (col % 8))) != 0;
+                if (!ink && bg == COLOR_NONE) continue;
+                for (int sy = 0; sy < scale; sy++) {
+                    for (int sx = 0; sx < scale; sx++) {
+                        int px = gx + col * scale + sx;
+                        int py = gy + row * scale + sy;
+                        if (px < 0 || py < 0 || px >= TPL_W || py >= TPL_H) continue;
+                        if (clipped && (px < clipX || py < clipY ||
+                                        px >= clipX + clipW || py >= clipY + clipH)) continue;
+                        Paint_SetPixel((UWORD)px, (UWORD)py, (UWORD)(ink ? fg : bg));
+                    }
+                }
+            }
+        }
+        pen += (long)g.adv * scale;
+    }
+}
+
 static bool drawIcon(const uint8_t *bits, int x, int y, int w, int h, int fg) {
     int stride = (w + 7) / 8;
     for (int row = 0; row < h; row++) {
@@ -475,20 +533,178 @@ static bool clampRect(JsonArray r, int &x, int &y, int &w, int &h) {
 // Compiled template: parse once, draw from ops forever.
 // ===========================================================================
 
-static const char *CT_FONTS[] = {"f8", "f12", "f16", "f20", "f24"};
+// ---------------------------------------------------------------------------
+// Font registry (single source of truth, see template_engine.h).
+//
+// Two families share one index space because `CtOp.font` is a uint8 index:
+// the bitmap family compiled into the firmware and the proportional
+// large-display family cropped from Noto Sans. Adding a font means adding one
+// row here; template validation, the region derivation, the clock fast path and
+// the font-slot resolver all follow automatically.
+// ---------------------------------------------------------------------------
+enum FontKind { FONT_KIND_BITMAP = 0, FONT_KIND_PROP = 1 };
 
-static int fontIndex(sFONT *font) {
-    if (font == &Font8) return 0;
-    if (font == &Font12) return 1;
-    if (font == &Font16) return 2;
-    if (font == &Font20) return 3;
-    if (font == &Font24) return 4;
+struct TplFontEntry {
+    const char          *name;
+    uint8_t              kind;
+    const sFONT         *bitmap;   // FONT_KIND_BITMAP
+    const Note4PropFont *prop;     // FONT_KIND_PROP
+};
+
+static const TplFontEntry TPL_FONTS[] = {
+    {"f8",   FONT_KIND_BITMAP, &Font8,  nullptr},
+    {"f12",  FONT_KIND_BITMAP, &Font12, nullptr},
+    {"f16",  FONT_KIND_BITMAP, &Font16, nullptr},
+    {"f20",  FONT_KIND_BITMAP, &Font20, nullptr},
+    {"f24",  FONT_KIND_BITMAP, &Font24, nullptr},
+    {"nt16", FONT_KIND_PROP,   nullptr, &note4_nt16},
+    {"nt30", FONT_KIND_PROP,   nullptr, &note4_nt30},
+    // Appended, never reordered: `CtOp.font` is a persisted index, so existing
+    // compiled templates must keep resolving to the same glyph tables.
+    {"ntthin18", FONT_KIND_PROP, nullptr, &note4_ntthin18},  // normal text, Thin 100 @18
+    {"ntreg64",  FONT_KIND_PROP, nullptr, &note4_ntreg64},   // large text, Regular 400 @64
+};
+
+int tplFontCount() {
+    return (int)(sizeof(TPL_FONTS) / sizeof(TPL_FONTS[0]));
+}
+
+int tplFontFixedCount() {
+    int n = 0;
+    for (int i = 0; i < tplFontCount(); i++) {
+        if (TPL_FONTS[i].kind == FONT_KIND_BITMAP) n++;
+    }
+    return n;
+}
+
+static const TplFontEntry *fontEntry(int idx) {
+    if (idx < 0 || idx >= tplFontCount()) return nullptr;
+    return &TPL_FONTS[idx];
+}
+
+int tplFontIndexByName(const char *name) {
+    if (!name) return -1;
+    for (int i = 0; i < tplFontCount(); i++) {
+        if (!strcmp(name, TPL_FONTS[i].name)) return i;
+    }
     return -1;
 }
 
+const char *tplFontNameByIndex(int idx) {
+    const TplFontEntry *e = fontEntry(idx);
+    return e ? e->name : nullptr;
+}
+
 static sFONT *fontByIndex(int idx) {
-    if (idx < 0 || idx > 4) return nullptr;
-    return fontByName(CT_FONTS[idx]);
+    const TplFontEntry *e = fontEntry(idx);
+    return (e && e->kind == FONT_KIND_BITMAP) ? (sFONT *)e->bitmap : nullptr;
+}
+
+// The proportional large-display family; index >= tplFontFixedCount().
+static const Note4PropFont *propFontByIndex(int idx) {
+    const TplFontEntry *e = fontEntry(idx);
+    return (e && e->kind == FONT_KIND_PROP) ? e->prop : nullptr;
+}
+
+bool tplFontCellByName(const char *name, int &cellW, int &cellH) {
+    int idx = tplFontIndexByName(name);
+    if (idx < 0) return false;
+    return tplFontCellByIndex(idx, cellW, cellH);
+}
+
+bool tplFontCellByIndex(int idx, int &cellW, int &cellH) {
+    sFONT *f = fontByIndex(idx);
+    if (f) {
+        cellW = f->Width;
+        cellH = f->Height;
+        return true;
+    }
+    const Note4PropFont *p = propFontByIndex(idx);
+    if (!p) return false;
+    cellW = (int)((p->maxAdv + 15) / 16);   // widest glyph, rounded up
+    cellH = p->lineHeight;
+    return true;
+}
+
+bool tplFontClockBox(int idx, int scale, int &w, int &h) {
+    if (scale < 1) scale = 1;
+    sFONT *f = fontByIndex(idx);
+    if (f) {
+        w = 5 * (int)f->Width * scale;
+        h = (int)f->Height * scale;
+        return true;
+    }
+    const Note4PropFont *p = propFontByIndex(idx);
+    if (!p) return false;
+    // Widest possible "HH:MM": both digits use the widest digit advance, so the
+    // reserved window fits whatever the clock shows. The +2 px covers glyph
+    // boxes that overhang their advance; the window is byte-aligned anyway.
+    int digitAdv = 0;
+    for (char c = '0'; c <= '9'; c++) {
+        int a = p->glyphs[c - ' '].adv;
+        if (a > digitAdv) digitAdv = a;
+    }
+    long adv = 2L * digitAdv + p->glyphs[':' - ' '].adv;
+    w = (int)((adv * scale + 8) / 16) + 2;
+    h = (int)p->lineHeight * scale;
+    return true;
+}
+
+bool tplFontDrawClock(uint8_t *win, int bw, int rows, int xOff, int idx,
+                      const char *text, int scale) {
+    if (!win || !text || bw <= 0 || rows <= 0 || xOff < 0 || scale < 1) return false;
+    const int bufW = bw * 8;
+    // Ink only: the window buffer already holds the background (the caller
+    // restores it from the captured window before the write).
+    auto put = [&](int px, int py) {
+        if (px < 0 || py < 0 || px >= bufW || py >= rows) return;
+        win[py * bw + (px >> 3)] &= (uint8_t)~(0x80 >> (px & 7));
+    };
+    sFONT *f = fontByIndex(idx);
+    if (f) {
+        const int stride = (f->Width + 7) / 8;
+        for (int i = 0; text[i]; i++) {
+            char c = text[i];
+            if (c < ' ' || c > '~') c = '?';
+            const uint8_t *p = &f->table[((int)c - ' ') * f->Height * stride];
+            for (int row = 0; row < (int)f->Height; row++) {
+                for (int col = 0; col < (int)f->Width; col++) {
+                    if (!(p[row * stride + col / 8] & (0x80 >> (col % 8)))) continue;
+                    for (int dy = 0; dy < scale; dy++) {
+                        for (int dx = 0; dx < scale; dx++) {
+                            put(xOff + (i * (int)f->Width + col) * scale + dx,
+                                row * scale + dy);
+                        }
+                    }
+                }
+            }
+        }
+        return true;
+    }
+    const Note4PropFont *p = propFontByIndex(idx);
+    if (!p) return false;
+    const int baseline = (int)p->lineHeight - (int)p->baseLine;
+    long pen = (long)xOff << 4;   // 1/16 px fixed point, same as drawPropText
+    for (int i = 0; text[i]; i++) {
+        char c = text[i];
+        if (c < ' ' || c > '~') c = '?';
+        const Note4Glyph &g = p->glyphs[c - ' '];
+        const int gx = (int)(pen >> 4) + g.ox;
+        const int gy = baseline - g.oy - g.h;
+        const int stride = (g.w + 7) / 8;
+        for (int row = 0; row < g.h; row++) {
+            for (int col = 0; col < g.w; col++) {
+                if (!(p->blob[g.off + row * stride + col / 8] & (0x80 >> (col % 8)))) continue;
+                for (int sy = 0; sy < scale; sy++) {
+                    for (int sx = 0; sx < scale; sx++) {
+                        put(gx + col * scale + sx, gy + row * scale + sy);
+                    }
+                }
+            }
+        }
+        pen += (long)g.adv * scale;
+    }
+    return true;
 }
 
 static void ctCopy(char *dst, size_t cap, const char *src) {
@@ -598,9 +814,7 @@ static bool parseElementCompiled(JsonObject e, CtTemplate &ct, CtOp &op) {
 
     const char *type = e["type"] | "";
     if (!strcmp(type, "text")) {
-        sFONT *font = fontByName(e["font"] | "");
-        if (!font) return false;
-        int fi = fontIndex(font);
+        int fi = tplFontIndexByName(e["font"] | "");
         if (fi < 0) return false;
         const char *bind = e["bind"] | "";
         const char *text = e["text"] | "";
@@ -714,8 +928,9 @@ static bool drawCtOp(const CtTemplate &ct, const CtOp &op, JsonDocument &usage,
     switch (op.type) {
     case CT_TEXT: {
         if (dry) return true;
-        font = fontByIndex(op.font);
-        if (!font) return false;
+        const Note4PropFont *prop = propFontByIndex(op.font);
+        font = prop ? nullptr : fontByIndex(op.font);
+        if (!prop && !font) return false;
         String val;
         if (op.bindIdx != CT_NONE_IDX) {
             TextTimeFormat fmt = op.flags & 0x08 ? (op.timeFormat ? TTF_HHMM : TTF_DATE) : TTF_DATE;
@@ -729,24 +944,33 @@ static bool drawCtOp(const CtTemplate &ct, const CtOp &op, JsonDocument &usage,
         int scale = op.scale ? op.scale : 1;
         int fg = op.color, bg = op.bg == 0xFF ? 1 : op.bg;
         int x = op.x, y = op.y;
+        int cellH = prop ? prop->lineHeight : font->Height;
         if (!hasRegion && scale == 1) {
-            Paint_DrawString_EN(x, y, val.c_str(), font, (UWORD)bg, (UWORD)fg);
+            if (prop) drawPropText(*prop, val, x, y, 1, fg, bg, false, 0, 0, 0, 0);
+            else Paint_DrawString_EN(x, y, val.c_str(), font, (UWORD)bg, (UWORD)fg);
         } else {
             int useScale = scale;
-            int textW = (int)val.length() * font->Width * useScale;
+            int textW = prop ? propTextWidth(*prop, val, useScale)
+                             : (int)val.length() * font->Width * useScale;
             while (hasRegion && useScale > 1 &&
-                   (textW > op.w || font->Height * useScale > op.h)) {
+                   (textW > op.w || cellH * useScale > op.h)) {
                 useScale--;
-                textW = (int)val.length() * font->Width * useScale;
+                textW = prop ? propTextWidth(*prop, val, useScale)
+                             : (int)val.length() * font->Width * useScale;
             }
             if (hasRegion) {
                 x = op.x;
                 if (op.align == 1) x = op.x + (op.w - textW) / 2;
                 else if (op.align == 2) x = op.x + op.w - textW;
-                y = op.y + (op.h - font->Height * useScale) / 2;
+                y = op.y + (op.h - cellH * useScale) / 2;
             }
-            drawScaledText(val, font, x, y, useScale, fg, bg, hasRegion,
-                           op.x, op.y, op.w, op.h);
+            if (prop) {
+                drawPropText(*prop, val, x, y, useScale, fg, bg, hasRegion,
+                             op.x, op.y, op.w, op.h);
+            } else {
+                drawScaledText(val, font, x, y, useScale, fg, bg, hasRegion,
+                               op.x, op.y, op.w, op.h);
+            }
         }
         return true;
     }
@@ -756,10 +980,10 @@ static bool drawCtOp(const CtTemplate &ct, const CtOp &op, JsonDocument &usage,
         int fg = op.fg, bg = op.bg;
         double maxV = op.maxVal > 0 ? op.maxVal : 100;
         double v = 0;
-        if (haveUsage && op.bindIdx != CT_NONE_IDX) {
+        if (op.bindIdx != CT_NONE_IDX) {
             BindSpec spec;
             ctBind(ct.reqs[op.bindIdx], spec);
-            evalBindNum(spec, usage, v);
+            evalBindNum(spec, usage, env, v);
         }
         if (bg != COLOR_NONE) {
             Paint_DrawRectangle(x, y, x + w - 1, y + h - 1, (UWORD)bg,
@@ -817,7 +1041,7 @@ bool tplValidateCt(const CtTemplate &ct, String &err) {
         if (op.bindIdx != CT_NONE_IDX && op.bindIdx >= ct.reqCount) { err = "ct_bind"; return false; }
         if (op.whenIdx != CT_NONE_IDX && op.whenIdx >= ct.reqCount) { err = "ct_when"; return false; }
         if (op.resourceIdx != CT_NONE_IDX && op.resourceIdx >= ct.resCount) { err = "ct_res"; return false; }
-        if (op.type == CT_TEXT && op.font > 4) { err = "ct_font"; return false; }
+        if (op.type == CT_TEXT && op.font >= tplFontCount()) { err = "ct_font"; return false; }
         if (op.type == CT_TEXT && op.bindIdx == CT_NONE_IDX && op.text[0] == 0) {
             err = "ct_text"; return false;
         }

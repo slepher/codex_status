@@ -1,5 +1,241 @@
 # Codex Status 项目进度（交接文档）
 
+## Bridge 显式 light 计划实机验证：2026-09-23 — 深睡后 BLE 会合唤醒通过
+
+Bridge 的 MCP/UI 显式 light 现先持久化正式 PowerPlan，离线时排队，在下一次
+BLE v2 会合发送同一计划并以 ACK 确认；重启可恢复，读取状态不延长时限。
+Note4 `0.18.19-note4-b` 电池供电（USB 已拔、94%）实测：sleep 计划 53
+获 ACK 后 HTTP 离线，light 计划 54 排队并经 BLE 获 ACK；设备回读
+`reset=deep-sleep`、`wake=timer`、Wi-Fi 在线、`power.plan_id=54`、
+`mode=light`，原模板仍在。用户随后插回 USB，设备回报 `plugged=true`。
+隔离 Rust 测试 126 项通过；当前 Bridge 已更新并运行，未提交 Git。
+详见 [Bridge 状态](project-workflow/note4-bridge-publish/status.md)。
+字体 manifest/CSFN 增量发布合同仍见待双方确认的
+[protocol.md](project-workflow/note4-bridge-publish/protocol.md)，不能据本次
+电源验证推断字体发布端点已可用。
+
+## Note4 实机里程碑：2026-09-23 — USB 防深睡修复与 A/B OTA 再验证
+
+精确 MAC 核验后，USB 刷入 `0.18.19-note4-a` 到 `ota_0` 并仅擦除 otadata；
+A 经串口/HTTP 启动，已安装的 400×300 模板保留。随后经绑定加密 BLE 获取
+token，只发送一次受鉴权 OTA，收到 HTTP 200 `UPDATE OK`；
+`0.18.19-note4-b` 经 HTTP 与串口确认从 `ota_1` 启动，模板/PSRAM 保留。
+USB 接入且 Bridge 的 sleep 计划到期后，A 仍保持 light 并提供 HTTP。
+B 也在计划与 OTA 保活均到期后持续在线 610 秒，HTTP/串口与模板正常。
+ROM SHA256、双槽证据、客户端初始误判原因和恢复
+操作详见 [Note4 状态](project-workflow/note4-ota-bringup/status.md)。未提交 Git。
+
+## Note4 实机里程碑：2026-09-23 — 掉线证实为深睡会合，USB 修复 ROM 已构建
+
+Note4 旧版 `0.18.18-note4-b` 在 PC USB 连着时仍因 v2 计划到期进入深睡；
+重插 USB 后 COM5 短暂重现又掉线。72 秒 BLE 扫描发现精确设备广播，Bridge
+在最近两个约 60 秒窗口成功下发 `sleep` 计划，证明设备仍在定期会合。
+固件现已统一在深睡入口检查 USB，并对 USB SOF 消失增加 10 秒消抖；
+`0.18.19-note4-a/b` 修复 ROM 均构建成功，待稳定 USB 下载模式刷入 A，
+然后受鉴权 OTA 验证 B。ROM SHA256、现场证据和恢复步骤见
+[Note4 状态](project-workflow/note4-ota-bringup/status.md)。未改 Bridge 源码或工作流，未提交 Git。
+
+## Note4 首次 Bridge Profile 实机发布：2026-09-23 — 模板已安装并显示
+
+设备 `0.18.18-note4-b` 启用 OPI PSRAM 后，Bridge 用原持久化作业 `b462a509` 发布 ABI1 完整 Bundle。修正冻结 Bundle 顶层缺失的 `bridge_id` 后，设备返回 `applied/displayed` ACK；鉴权状态回读为 `configured=true`、`committed_job_id=b462a509`、活动模板 `codex-status-a`。设备任务的 [实物照片](artifacts/note4-first-bundle-display-20260923.jpg)可见非空白 400×300 模板与数值。Bridge 当前正常运行，活动发布队列为空，本地历史为 `succeeded`；未提交 Git。具体过程和测试见 [Bridge 状态](project-workflow/note4-bridge-publish/status.md)。设备侧正补同作业重放的持久幂等保护（本次 `commit_seq=2`）；**字体 manifest/CSFN 增量发布仍未实机就绪**，合同在待双方确认的 [protocol.md](project-workflow/note4-bridge-publish/protocol.md)。
+
+发布后的设备后续又进入深睡，USB 仍接着但局域网/串口暂不可达；固件任务正修正 USB 接入信号与深睡入口。这不撤销已取得的提交 ACK 和屏幕照片，但后续实机状态回读须待设备重新唤醒。
+
+## Note4 实机里程碑：2026-09-23 — PSRAM 与流式 Bundle 已跑通
+
+用户按键唤醒后，Note4 B 槽通过 USB 刷入 `0.18.18-note4-b`，串口与
+HTTP 确认启动；`psram_free` 从 0 升至 8,351,272 B。Bridge 原冻结作业
+的 27,086 B Bundle 已按 4096 B 分片全部写入，设备完成正文读取和 CRC；
+因冻结 Bundle 缺顶层 `bridge_id`，设备按 owner 校验拒绝提交，仍未显示模板。
+该字段由同期 Bridge 工作修复，本任务不改其源码。证据和下一步见
+`project-workflow/note4-ota-bringup/status.md`。
+
+## Note4 实机里程碑：2026-09-23 — 定位 Bundle 断连与未启用 PSRAM
+
+空白 Note4 接收 4096 B Bundle 分片时，设备实际可在 LittleFS 写完全部
+27,086 B（每片 10–30 ms），但 Bridge 收到连接复位且无提交 ACK。独立
+32 KiB 文件写入跨越 16 KiB 边界成功；HTTP 不存在 1024 B 上限。
+诊断状态显示最大连续内部堆约 15 KiB、`psram_free=0`，尽管芯片板载
+8 MiB PSRAM。Note4 独立构建环境已启用 OPI PSRAM，并把 Bundle CHUNK
+改为受鉴权的流式接收；对应 Bridge 请求头由同期 Bridge 工作负责。
+启用 PSRAM 的 B ROM 已构建但因设备进入休眠尚未刷入；原发布任务保留、
+Bridge 已暂停。现场与 ROM SHA256 见
+`project-workflow/note4-ota-bringup/status.md`。
+
+## Note4 Bridge 实机发布排障：2026-09-23 — 冻结作业保留，设备暂离线
+
+Bridge 已用真实 400×300/ABI1 能力与绑定令牌对 Note4 显式 claim，并尝试发布内建字体 `codex-status-a` 完整 Bundle。首次作业 `5c6d63fc` 的第 4 个 4096B 分片在 offset 12288 遇到设备断连；旧完整 Bundle 队列仅存内存的问题随后已修复。当前持久化作业 `b462a509`、Bundle 27086B；Bridge 重启后验证同一冻结作业恢复，降为 1024B 分片再试，于 offset 14336 超时，随后 Note4 HTTP 整体不可达。设备未返回提交 ACK，先前 `commit_seq=0`，**不能认定已发布或显示成功**。已只停止当前 Bridge 主进程及 watchdog，保留原运行数据与冻结作业，等待固件任务排查设备后再恢复。详情及测试见 [Bridge 状态](project-workflow/note4-bridge-publish/status.md)；新字体 manifest 协议仍见待双方确认的 [草案](project-workflow/note4-bridge-publish/protocol.md)。
+
+后续诊断版 `0.18.18-note4-b` 显示 LittleFS 连续写 32 KiB 正常，而固件未启用板载 8 MB OPI PSRAM（`psram_free=0`、最大连续堆约 15 KiB）。设备任务正编译 PSRAM 与流式分片接收固件；Bridge 已为旧 Bundle 分片增加三项校验头，并改为按完整 `Content-Length` 读取 ACK，宿主隔离测试 122 项通过。**Bridge 仍暂停，原作业 `b462a509` 未提交；待 PSRAM 实测可用后重试同一作业。**
+
+最新现场：设备端修复 ROM 已构建，但 Note4 等待期间休眠，LAN 与 USB 下载握手暂不可用。固件任务需用户短按屏幕下方任意唤醒键，随后刷入并确认 `psram_free`；Bridge 再部署已构建客户端，恢复同一冻结作业。当前没有实机提交 ACK 或显示验收。
+
+## Note4 实机里程碑：2026-09-23 — 发布失败定位为待发任务与协议阻塞
+
+截图中的“a publish is already in progress”来自首次发布留下的 Note4
+待发任务 `6640f3be`；再次点击触发冲突。设备先前报告 `BLE ON`，但设备端
+仍为 0 个已安装模板、`commit_seq=0`。**更正：**先前的 HTTP 失败来自
+受限命令环境的 `Bad access`；局域网直连已证实 HTTP 200、Wi-Fi 在线。
+真正阻碍是 Bridge 端点尚未存入设备（鉴权 401）和旧 Bridge 把 Note4
+误登记成 200×200。现已用绑定加密 BLE 配置随机端点令牌，固件新增真实
+400×300 能力字段，受鉴权 v2 状态读取成功。模板使用内建字体，现有
+完整 Bundle 通道可发布；首次设备提交仍在实测。详细证据见
+`project-workflow/note4-ota-bringup/status.md`。
+
+## Note4 Bridge 界面核对：2026-09-23 — 独立运行数据中 v2 Profile 可见
+
+用户截图中的顶部 `配置 ▾ / note4` 是旧版配置（空模板列表、200×200
+旧模板库），并非 Note4 的 v2 Profile。为避免界面固定选多设备列表首项，
+Bridge 改用 `artifacts/note4-bridge-data/` 独立运行数据，平台中只登记
+Note4；原 `bridge/target/debug/data/` 和 1.54 英寸设备备份保留。
+实看“设备”页已显示 Note4 在线、`0.18.13-note4-b`/`ota_1`，
+`Profile（1–8 项）` 显示 `1. codex-status-a`、初始 active；
+设备端仍为 0 个已安装模板，未发布。顶部旧配置菜单边缘裁切属于 Bridge UI
+布局问题，本任务遵守同期边界未修改 Bridge 源码。细节与恢复路径见
+`project-workflow/note4-ota-bringup/status.md`。
+
+## Note4 Bridge 运行现场：2026-09-23 — 已切换绑定并建本地 400×300 Profile
+
+按用户要求，先备份原 1.54 英寸设备的 Bridge 配置和设备记录到
+`artifacts/bridge-before-note4-bind-20260923/`，再将当前 Bridge 实例绑定
+Note4（`7C4FADB93408` / `192.168.3.177`）。可见面板与 MCP 均显示
+Note4 在线，固件 `0.18.13-note4-b` 从 `ota_1` 运行；原设备及
+`quad/full/mini` Profile 仍保存在平台数据中。新建 Note4 本地 Profile，
+只含 `codex-status-a`（400×300），初始模板为它、自动同步关闭。
+**尚未发布模板**：当前运行的 Bridge 二进制把 Note4 错登记为 200×200；
+固件状态也缺少新 Bridge 源码要求的显式能力字段，需对齐后再发布。
+备份 SHA256、恢复旧绑定方法和现场细节见
+`project-workflow/note4-ota-bringup/status.md`。未改 Bridge 源码或其工作流文档，未提交 Git。
+
+## Note4 实机里程碑：2026-09-23 — 受鉴权 OTA 完成，B 从 ota_1 启动
+
+最终 ROM A/B 为 `0.18.13-note4-a/b`，SHA256、USB/HTTP 双槽启动证据和恢复步骤见
+`project-workflow/note4-ota-bringup/status.md`。A 经 USB 从 `ota_0` 启动；
+使用精确 Note4 身份及已绑定加密 BLE 获取的 token，仅发送一次受鉴权
+`/doUpdate`，B 随后从 `ota_1` 启动（HTTP 与 USB 串口均确认）。
+当前设备 Wi-Fi 为 `wd21-la`，验证时 IP `192.168.3.177`；
+B 启动日志确认 LittleFS、Wi-Fi、NVS token 可读。屏幕整黑/半黑诊断成功；
+调整后的高清照片可见状态页，设备相对摄像头倒置（用户确认按钮应在屏幕下方），
+不属于固件旋转错误；小字像素级验收、按键/唤醒仍未完成。
+本任务未改 Bridge 源码或其工作流，未提交 Git。
+
+## Note4 实机里程碑：2026-09-23 — 40 MHz bootloader 修复 NVS/LittleFS
+
+Note4 使用 80 MHz bootloader 时 NVS/LittleFS 写入失败；只将应用改为 40 MHz
+仍失败，单独擦 NVS 也未修复。将 bootloader 和应用均设为 40 MHz 后，
+文件系统初始化成功，Wi-Fi 配置与鉴权 token 可跨重启从 NVS 读取。
+诊断擦除前已备份原始 16 KiB NVS；当前 NVS 是重新配置后的内容，
+原厂元数据可从备份恢复。备份哈希、刷机日志与详细因果证据见
+`project-workflow/note4-ota-bringup/status.md`。
+
+## Note4 实机里程碑：2026-09-23 — A 从 ota_0 启动，整屏诊断通过，OTA 待联网
+
+Note4 COM5 / MAC `7C:4F:AD:B9:34:08` 已用独立 16 MB / DIO / 80 MHz
+环境写入 `0.18.6-note4-a`（bootloader、分区表、ota_0；NVS/otadata 保留），
+esptool 哈希校验通过。USB 串口确认 `fw=0.18.6-note4-a`、`slot=ota_0`、
+EPD BUSY 失败 0 次；实机全黑和半黑画面均刷新成功，已恢复配网页，
+但广角照片中文字不清晰。LittleFS 尚未挂载成功。ROM B 已构建并哈希，
+设备因无保存的 Wi-Fi 处于 AP `192.168.4.1`，OTA 尚未进行；
+待读取/输入网络凭据的授权路径确定后再做受鉴权升级与 `ota_1` 启动验证。
+详情、ROM A/B SHA256、刷写重试、照片和恢复步骤见
+`project-workflow/note4-ota-bringup/status.md`。本任务不改 Bridge 源码，
+不写回通用平台实现工作流。
+
+## Note4 Bridge 增量发布准备：2026-09-23（未提交，协议待双方确认）
+
+Bridge 已加入精确 Note4 能力校验、Profile `render_target`/显式 `font_ids`、CSFN 导入、冻结的完整 manifest/对象、差量与安装峰值规划、持久化待发任务，以及 UI/MCP 的预检和字体版本选择；现有整包和 legacy 路径保留。宿主 Rust 测试与 400×300/200×200 编译渲染对比通过。`project-workflow/note4-bridge-publish/protocol.md` 是**待设备/Bridge 双方确认的草案**：当前设备仍为 ABI 1、48 KiB/8 字体实现，也没有增量端点，因此 Bridge 新任务明确等待协议，未进行 Note4 实机资产发布。A/B ROM OTA 另见 `project-workflow/note4-ota-bringup/status.md`，不能替代本协议验收。完整测试矩阵、限制和下一步见 `project-workflow/note4-bridge-publish/status.md`。
+
+## 引擎化字体资产：2026-09-23 — 单一字体注册表 + CSFN 容器 + 设备字体库（未提交、未发布）
+
+用户改任务：**只调整设备端与 bridge 端引擎**，字体与排版待引擎就绪后再细调；正文采用
+Noto Sans Thin 18px、大文字采用 Regular 64px（字号为暂定值，由实现方选择）。同时
+**停止抗锯齿（2bpp/gray4）方向**。本节即是该项工作的交接，详情与证据见
+`project-workflow/generic-display-platform-implementation/task-7-font-assets.md`，容器合同见
+`docs/font-asset-format.md`。
+
+- **单一字体注册表**：`src/template_engine.cpp` 的 `TPL_FONTS`（9 项，只允许追加，因为
+  `CtOp.font` 是持久化索引）。`main.cpp` 时钟快路径不再自带字体表，改走
+  `tplFontClockBox`/`tplFontDrawClock`；`refresh_policy` 早已使用共享 cell helper；
+  Rust 侧 `template.rs::FONTS` 同步为同一份名单。
+- **新字体**（`tools/note4-fonts/rasterize_ttf.py`，FreeType 单色 `FT_LOAD_TARGET_MONO`，
+  源为静态 hinted Noto TTF）：`ntthin18`（Thin 100 @18，ASCII，blob 1412 B）、
+  `ntreg64`（Regular 400 @64，等宽数字，blob 2457 B）；0–9 advance 相同（不跳字）。
+  TTF 置于 `tools/note4-fonts/vendor/`（已 gitignore）。
+- **CSFN v1 容器**：同一工具同时产出引擎头文件与 `.bin` 资产（`bridge/assets/fonts/`，
+  `18c2e4ed`/`4dc3b226`）；设备解析器 `src/font_asset.{h,cpp}`、按 Profile 的设备字体库
+  `src/font_store.{h,cpp}`（tmp→校验→rename 原子写、CRC 复检、name==id、上限、prune）、
+  bridge 字体库 `bridge/crates/core/src/platform/fonts.rs`（内容寻址、去重、Profile 依赖、
+  inventory 差集、上限）。
+- **修复了工作树里真实存在的破损**：宿主 FFI 无法链接 `rgnSetPanel`（被放进匿名
+  namespace）、`compiled.rs` 调用旧 1 参 `rgn_build_compiled`、`rgn_build` 用 200×200
+  几何推导 400×300 区域、`RGN_MAX=32` 小于模板的 38 个元素、`Rgn::area` 在 120000 像素
+  面板上 `uint16_t` 溢出、`build.rs` 未跟踪字体头文件（预览可能用旧字形）、宿主 LittleFS
+  shim 没有目录语义。
+- **验证**：`cargo test -p bridge-core -p bridge-render -p bridge-mcp`（隔离 target 目录）
+  **110 passed / 0 failed**（含设备解析器 3 项、设备字体库 5 项、bridge 字体库 18 项）；
+  `bridge-render --compare-compiled --regions` 在重生成的 400×300 模板上
+  `diff pixels: 0`、往返 `0`、两条路径均 18 个区域。测试发现真 bug：设备 inventory 会把
+  名字与内容 id 不符的文件按内容 id 报出，已改为 name==id 才算已安装。
+- **未做（下一步）**：模板→资产解析（`CtOp.fontRef` + `CT_ABI` 升级）、
+  `font_inventory` 与 BEGIN/CHUNK/COMMIT/ACK 传输、bridge 发布预览/MCP/UI、
+  最终排版与字重定稿、`assets` 分区落地。**交接 prompt：
+  `project-workflow/generic-display-platform-implementation/prompt-font-assets-transport.md`。**
+- **待验证的阻塞项**：`pio run -e esp32-s3-epaper-154g` 曾因 `font_store.cpp` 三处编译错误失败
+  （设备 `fs::File::name()` 返回 `const char*`，宿主 shim 返回 `std::string`，代码却调用
+  `String(f.name().c_str())`）。两侧已修（shim 的 `name()` 改回 `const char*`，源码改用
+  `String(f.name())`），宿主 5 项测试复通过，但**固件自修复后未再编译**，下一轮第一件事就是
+  重跑 `pio run`。
+
+## Note4 模板宿主交付：2026-09-23 — A 方案已通过 MCP 保存与渲染（rev 2）
+
+Bridge 已重建并运行，本地 MCP `127.0.0.1:8766/mcp` 可用。A 方案 400×300 模板 `codex-status-a` 通过 `template_save_v2` 保存（`epd-ssd2683-400x300-1bpp`，`source_crc=2b523381`，`compiled_crc=41c31abd`，`published=false`）；MCP 实际渲染正常数据、Pro 仅 weekly/RC=0、电量 0/25/50/75/100%、剩余量 0/100 边界、无数据离线、超长套餐/账号名六类场景，PNG 均 400×300/纯黑白。状态栏右侧图标组已收紧并靠右；主机采用用户选定的 Icons8 TV Off 轮廓，项目命名 Bridge Off，并制成配套 Bridge On。电池基于用户选定的 Icons8 图形，`device.battery` 同时驱动外框内填充和百分比；宿主 C++ 引擎已补本地电量的数值绑定。说明文字统一为 `f16`、主数字采用同系列 `f24` 两倍放大。
+
+rev 2 修正（用户反馈“电量填充/文字未居中”，并要求主区 `%` 与数字垂直居中）：用 `concepts-400x300/measure-preview.py` 逐像素实测后，把状态栏日期/时间/电量百分比与电池填充对齐到图标中心线（日期 ink 中心 14.0→18.0、时间 13.5→17.5、百分比 15.5→17.5），电池填充改为外壳内腔对称 6 行并加宽到 14 px（100% 顶到内腔右缘），主区三个 `%` 的 `y` 由 149 改为 127（ink 中心与数字同为 132.5）。成因是供应商 `GUI_Paint.cpp` 的 1×1 `Paint_DrawPoint` 偏移 1 px 与矩形填充少一行，二者同时作用于固件与宿主；为保留 200×200 原有行为未改引擎，只在 400×300 模板内补偿。另按既有 `device.offline_mins` 合同补了页脚 `OFF <n>M` 行，离线/过期不再复用旧数字。宿主侧同时补上两个 400×300 缺口：compiled 渲染入口按画布分配帧缓冲（`render_compiled_bits_size`）、参考 PNG 解码支持任意画布，`bridge-render` 新增 `--compare-compiled` 与画布感知 `--diff`，400×300 的 JSON/compiled 像素一致性与 CTP1 往返均为 `diff pixels: 0`。
+
+源码、输入与预览见 `project-workflow/generic-display-platform-implementation/concepts-400x300/`。宿主 400×300 校验、CTP1、PNG 链路及 `device.date` 已接通；`cargo test -p bridge-core -p bridge-render -p bridge-mcp`（隔离 `CARGO_TARGET_DIR`，83 passed/0 failed）、quad 的 `--compare-compiled` 回归通过。配额缺失的表现按用户澄清确认为模板属性：`AGENTS.md` 的显示规则条目已改为按变体描述（quad 静态 100 / A 版隐藏 5h 并把 weekly 提到主位），不再是全局统一规则。蓝牙/Wi-Fi/Bridge 连接图标目前是固定图形，独立连接状态绑定未定义；Note4 实机、发布、局刷仍未做。
+
+## 设计候选：2026-09-23 — Note4 400×300 状态页
+
+已先完成三张纯黑白、原生 400×300 的布局候选图，均采用顶部状态栏：
+`project-workflow/generic-display-platform-implementation/concepts-400x300/`。
+分别为双主数值、信息列表和进度仪表；图片与可重绘脚本、方案说明同目录。
+另补三张 Pro 仅 weekly 桶的对应状态稿。它们将缺失的 5h 区块收起，与当前“缺失 5h 显示静态 100”规则不同；正式实现前需先确定产品规则并同步合同。
+用户选定 A 双主数值方案；状态栏规格定为内容区 28 px、上下各 4 px（总高 36 px），左日期/时间，右蓝牙/Wi-Fi/主机/电池/电量百分比，图标盒 20×20 px。详见同目录 `README.md`。
+本轮仅做视觉设计，未新增 JSON 模板、修改渲染协议、构建或发布到设备。
+选定方向后再做缺失/离线状态稿与实际模板验证。
+
+## 排期更新：2026-09-23 — Note4 已到货
+
+用户确认第二硬件 Note4 已到货。到货解除实机可用性阻塞；GPIO 映射、SSD2683 面板时序及
+waveform LUT、Flash/PSRAM 规格尚未在仓库资料中确认，Note4 目标头文件仍保留显式 `#error`，
+设备尚未 bring-up、刷机或验收。下一阶段顺序与验收关口见
+`project-workflow/next-execution-plan-2026-09-23.md`：现有 1.54 英寸设备先固定功耗基线，
+Note4 同时开展硬件事实盘点；其后分别完成 DFS/btpm 对照、Note4 全刷与 v2 路径、
+会合节奏核查、`bridge_first` 生产实现和双策略 A/B。
+核对当前工作树时发现：虽然目标头文件含 Note4 的显式缺失项检查，`platformio.ini`
+尚无 Note4 env；下方 09-22 记录的“环境已准备”与当前工作树不符，须在 bring-up 时补齐。
+
+## 实机盘点：2026-09-23 — Note4 USB 只读评估
+
+COM5 枚举为 Espressif USB-Serial/JTAG（VID:PID `303A:1001`，USB serial/MAC
+`7C:4F:AD:B9:34:08`）；esptool 识别 ESP32-S3 rev 0.2、16 MB Flash、8 MB PSRAM。
+只读分区表已保存到 `artifacts/note4-partition-table-0x8000.bin`（4096 B，SHA256
+`A82133FA4CD77C180D65FA75CA3B5C27BCEBFB8CC4D419362838852E995BA9E5`）；Note4 设备表
+为两个 0x5F0000 OTA 槽和 4 MB assets，不能复用当前 1.54 英寸 `partitions.csv`。
+完整 16 MB 当前 Flash 刷写前只读备份已完成：
+`artifacts/note4-preflash-full-flash-16m.bin`（16,777,216 B，SHA256
+`366dea39643855fd5250d15bb8f23da3b363eca1705a0068b9ab5a598e01d110`）。部分 stub
+读取区间断流后改用 ROM-only 小块读取恢复；最终长度与哈希已核验。本轮未擦写、OTA 或改分区。
+
+已查到 ZECTRIX NOTE4 DevKit V1.0 官方 pin map 与公开 SSD2683 驱动/waveform source；
+需目视核对本机 PCB 版本/面板排线后才能按该参考接线。无串口启动日志、屏幕/按键/睡眠
+实测或照片。本轮 esptool 触发过瞬时 reset/download mode，成功分区读取后请求 hard reset；
+COM5 仍枚举。详细证据和下一步见
+`project-workflow/generic-display-platform-implementation/status.md` 的 USB evaluation 节。
+字体检查发现 assets 分区几乎全空、无法按 LittleFS/SPIFFS 挂载；当前固件中的
+`LvglBuiltInFont` 表明字形编译进了应用。已下载对应的 XiaoZhi 字体组件 v2.0.0；
+30_4 common CBIN 为 2,609,092 B，占 4 MiB assets 分区 62.2%，源码/体积见评估记录。
+
 ## 实机推进：2026-09-23 — 桥提速定稿 + bridge_first spike + 0.17.9 固件（已提交 99ef3c0）
 
 已提交 **`99ef3c0`**（上一基线 `e1e93fc`）。权威细节与证据见
@@ -156,4 +392,3 @@ epd-ssd2683-400x300-1bpp`）与 OTA 双端防错已在协议/桥侧就绪 → �
 
 2026-09-22 及更早的进度（通用平台 v2 实现、0.13–0.16 各轮实机修复、早期里程碑）已移至
 `docs/history/progress-archive-2026-09-23.md`；追溯时按标题检索，不必整读。
-

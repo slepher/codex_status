@@ -44,6 +44,8 @@ fn main() {
         .file(firmware.join("v2_runtime.cpp"))
         .file(firmware.join("bundle_store.cpp"))
         .file(firmware.join("refresh_policy.cpp"))
+        .file(firmware.join("font_asset.cpp"))
+        .file(firmware.join("font_store.cpp"))
         .file(firmware.join("GUI_Paint.cpp"))
         .file(&ffi);
     for name in ["font8", "font12", "font16", "font20", "font24"] {
@@ -51,10 +53,18 @@ fn main() {
     }
     build.compile("bridge_render");
 
+    // Every header the engine pulls in has to be tracked: the generated font
+    // tables are headers, so without this a re-crop would leave the host preview
+    // rendering the previous glyphs while the firmware builds the new ones.
     for tracked in ["template_engine.cpp", "template_engine.h", "GUI_Paint.cpp",
                     "GUI_Paint.h", "refresh_policy.cpp", "refresh_policy.h",
                     "v2_state.h", "v2_runtime.h", "v2_runtime.cpp",
-                    "bundle_store.h", "bundle_store.cpp"] {
+                    "bundle_store.h", "bundle_store.cpp", "fonts.h",
+                    "font_noto.h", "font_noto_nt16.h", "font_noto_nt30.h",
+                    "font_noto_ntthin18.h", "font_noto_ntreg64.h",
+                    "font_asset.h", "font_asset.cpp",
+                    "font_store.h", "font_store.cpp",
+                    "platform_target.h"] {
         println!("cargo:rerun-if-changed={}", firmware.join(tracked).display());
     }
     println!("cargo:rerun-if-changed={}", ffi.display());

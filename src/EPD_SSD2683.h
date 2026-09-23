@@ -2,11 +2,8 @@
 * | File      	:   EPD_SSD2683.h
 * | Function    :   4.2" 400x300 B/W e-Paper - SSD2683 controller (ZecTrix
 * |                 Note4 V1.0 target). Driver structure and BUSY/window/plane
-* |                 handling follow the verified SSD1681 adaptation; the panel
-* |                 waveform LUTs and the board GPIO map are NOT yet verified
-* |                 and must be supplied explicitly (see platform_target.h).
-* | Status      :   blocked_by_hardware_arrival - compiles and is host-tested
-* |                 for geometry; must not be flashed as a verified panel.
+* |                 full-refresh sequence uses the Note4 reference OTP waveform.
+* |                 Partial refresh remains disabled until waveform/BUSY tests.
 ******************************************************************************/
 #ifndef __EPD_SSD2683_H_
 #define __EPD_SSD2683_H_

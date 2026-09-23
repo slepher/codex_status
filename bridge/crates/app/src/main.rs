@@ -602,9 +602,13 @@ async fn mcp_handler(
                 | "template_list"
                 | "template_get_v2"
                 | "template_save_v2"
+                | "template_validate_v2"
                 | "profile_get_v2"
                 | "profile_save_v2"
                 | "platform_publish"
+                | "platform_publish_preview"
+                | "platform_font_list"
+                | "platform_font_import"
                 | "platform_publish_cancel"
                 | "template_activate"
                 | "data_sources_v2"
@@ -832,6 +836,7 @@ async fn post_claim_once(
         url.push_str("&release=1");
     }
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(5))
         .build()
         .map_err(|e| ClaimError::Other(e.to_string()))?;
@@ -1297,6 +1302,7 @@ async fn platform_profile_save(
 async fn platform_publish(
     state: State<'_, Arc<AppCtx>>,
     mac: Option<String>,
+    expected_target_id: Option<String>,
 ) -> Result<Value, String> {
     let mac = match mac {
         Some(m) if !m.is_empty() => m,
@@ -1307,7 +1313,23 @@ async fn platform_publish(
             .clone()
             .ok_or_else(|| "device MAC not learned yet".to_string())?,
     };
-    platform::publish(&state, &mac).await
+    platform::publish(&state, &mac, expected_target_id.as_deref()).await
+}
+
+#[tauri::command]
+async fn platform_publish_preview(state: State<'_, Arc<AppCtx>>) -> Result<Value, String> {
+    let mac = state.device_mac.lock().unwrap().clone().ok_or("device MAC not learned yet")?;
+    platform::publish_preview(&state, &mac)
+}
+
+#[tauri::command]
+async fn platform_font_list(state: State<'_, Arc<AppCtx>>) -> Result<Value, String> {
+    platform::font_list(&state)
+}
+
+#[tauri::command]
+async fn platform_font_import(state: State<'_, Arc<AppCtx>>, path: String) -> Result<Value, String> {
+    platform::font_import(&state, &path)
 }
 
 #[tauri::command]
@@ -1368,7 +1390,7 @@ async fn platform_plan(
         .clone()
         .ok_or_else(|| "device MAC not learned yet".to_string())?;
     match mode.as_str() {
-        "light" => Ok(platform::send_plan(&state, &mac, "manual", 0).await),
+        "light" => Ok(platform::request_light(&state, &mac).await),
         "sleep" => {
             let text = platform::tool(&state, "power_plan", &json!({"mode": "sleep"})).await?;
             Ok(serde_json::from_str(&text).unwrap_or_else(|_| json!({"result": text})))
@@ -1548,7 +1570,8 @@ async fn preview_template(
             .get(&target)
             .ok_or_else(|| format!("template not found: {target}"))?;
         let text = String::from_utf8(entry.bytes.clone()).map_err(|e| e.to_string())?;
-        (text, bridge_render::WIDTH, bridge_render::HEIGHT)
+        let (width, height) = bridge_render::canvas_size(&text).ok_or("unsupported canvas")?;
+        (text, width, height)
     };
     let usage = state
         .envelope
@@ -1870,9 +1893,13 @@ async fn device_cache_loop(ctx: Arc<AppCtx>) {
         }
         if online {
             if let Some(raw) = raw.as_ref() {
-                let (caps, legacy) = platform::caps_from_status(raw);
-                platform::ensure_device(&ctx, caps, legacy);
-                platform::note_status_json(&ctx, raw);
+                match platform::caps_from_status(raw) {
+                    Ok((caps, legacy)) => {
+                        platform::ensure_device(&ctx, caps, legacy);
+                        platform::note_status_json(&ctx, raw);
+                    }
+                    Err(e) => tracing::warn!("device capability contract rejected: {e}"),
+                }
             }
         }
         if online {
@@ -2049,6 +2076,7 @@ async fn run_services(ctx: Arc<AppCtx>) {
         let ctx = ctx.clone();
         tokio::spawn(async move {
             let client = match reqwest::Client::builder()
+                .no_proxy()
                 .timeout(Duration::from_secs(3))
                 .build()
             {
@@ -2596,6 +2624,9 @@ fn main() {
             platform_profile_get,
             platform_profile_save,
             platform_publish,
+            platform_publish_preview,
+            platform_font_list,
+            platform_font_import,
             platform_publish_cancel,
             platform_activate,
             platform_data_sources,

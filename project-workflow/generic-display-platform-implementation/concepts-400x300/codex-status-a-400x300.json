@@ -1,0 +1,480 @@
+{
+  "schema": 1,
+  "id": "codex-status-a",
+  "version": 1,
+  "render_target": "epd-ssd2683-400x300-1bpp",
+  "canvas": {
+    "w": 400,
+    "h": 300
+  },
+  "elements": [
+    {
+      "type": "text",
+      "x": 12,
+      "y": 5,
+      "font": "ntthin18",
+      "color": "black",
+      "bind": "device.date"
+    },
+    {
+      "type": "text",
+      "x": 75,
+      "y": 5,
+      "font": "ntthin18",
+      "color": "black",
+      "bind": "device.now"
+    },
+    {
+      "type": "icon",
+      "x": 248,
+      "y": 8,
+      "w": 10,
+      "h": 20,
+      "bits": "AAAAAABAAEAAQABADEAGQAHAAMAAwAHABkAMQABAAEAAQABAAAAAAA==",
+      "color": "black"
+    },
+    {
+      "type": "icon",
+      "x": 258,
+      "y": 8,
+      "w": 10,
+      "h": 20,
+      "bits": "AAAAAIAAwACwAJgAnACYAOAAwADAAOAAmACcAJgAsADAAIAAAAAAAA==",
+      "color": "black"
+    },
+    {
+      "type": "icon",
+      "x": 272,
+      "y": 8,
+      "w": 10,
+      "h": 20,
+      "bits": "AAAAAAAAA8AfwDwA8ADAwIfADwAcABAAAcADwAMAAAAAQABAAAAAAA==",
+      "color": "black"
+    },
+    {
+      "type": "icon",
+      "x": 282,
+      "y": 8,
+      "w": 10,
+      "h": 20,
+      "bits": "AAAAAAAA8AD+AA8AA8DAwPhAPAAOAAIA4ADwADAAAACAAIAAAAAAAA==",
+      "color": "black"
+    },
+    {
+      "type": "icon",
+      "x": 296,
+      "y": 8,
+      "w": 10,
+      "h": 20,
+      "bits": "AAAAAAAAP8B/wGAAYABgAGAAYQBhgGDAYEBgAHAAP8ABwAHAAAAAAA==",
+      "color": "black"
+    },
+    {
+      "type": "icon",
+      "x": 306,
+      "y": 8,
+      "w": 10,
+      "h": 20,
+      "bits": "AAAAAAAA/4D/wADAAMAQwDDAYMDAwIDAAMAAwAHA/4DwAPAAAAAAAA==",
+      "color": "black"
+    },
+    {
+      "type": "icon",
+      "x": 320,
+      "y": 8,
+      "w": 10,
+      "h": 20,
+      "bits": "AAAAAAAAAAA/wGAAQABAAEAAQABAAEAAQABAAGAAP8AAAAAAAAAAAA==",
+      "color": "black"
+    },
+    {
+      "type": "icon",
+      "x": 330,
+      "y": 8,
+      "w": 10,
+      "h": 20,
+      "bits": "AAAAAAAAAAD/AAMAAYABgAHAAcABwAHAAYABgAEA/wAAAAAAAAAAAA==",
+      "color": "black"
+    },
+    {
+      "type": "bar",
+      "bind": "device.battery",
+      "rect": [
+        324,
+        16,
+        14,
+        7
+      ],
+      "max": 100,
+      "fg": "black",
+      "bg": "none",
+      "border": false
+    },
+    {
+      "type": "text",
+      "x": 344,
+      "y": 5,
+      "font": "ntthin18",
+      "color": "black",
+      "bind": "device.battery",
+      "suffix": "%",
+      "region": [
+        344,
+        5,
+        44,
+        20
+      ]
+    },
+    {
+      "type": "line",
+      "x1": 12,
+      "y1": 36,
+      "x2": 388,
+      "y2": 36,
+      "color": "black"
+    },
+    {
+      "type": "text",
+      "x": 16,
+      "y": 44,
+      "font": "ntthin18",
+      "color": "black",
+      "text": "Remaining"
+    },
+    {
+      "type": "line",
+      "x1": 199,
+      "y1": 56,
+      "x2": 199,
+      "y2": 211,
+      "color": "black",
+      "when": {
+        "bind": "buckets[codex].5h.remaining",
+        "exists": true
+      }
+    },
+    {
+      "type": "text",
+      "x": 16,
+      "y": 66,
+      "font": "ntthin18",
+      "color": "black",
+      "text": "5H",
+      "when": {
+        "bind": "buckets[codex].5h.remaining",
+        "exists": true
+      }
+    },
+    {
+      "type": "text",
+      "x": 16,
+      "y": 88,
+      "font": "ntreg64",
+      "color": "black",
+      "bind": "buckets[codex].5h.remaining",
+      "region": [
+        16,
+        88,
+        132,
+        88
+      ],
+      "align": "center",
+      "when": {
+        "bind": "buckets[codex].5h.remaining",
+        "exists": true
+      }
+    },
+    {
+      "type": "text",
+      "x": 132,
+      "y": 120,
+      "font": "ntthin18",
+      "color": "black",
+      "text": "%",
+      "when": {
+        "bind": "buckets[codex].5h.remaining",
+        "exists": true
+      }
+    },
+    {
+      "type": "text",
+      "x": 18,
+      "y": 177,
+      "font": "ntthin18",
+      "color": "black",
+      "text": "RESET",
+      "when": {
+        "bind": "buckets[codex].5h.remaining",
+        "exists": true
+      }
+    },
+    {
+      "type": "text",
+      "x": 18,
+      "y": 200,
+      "font": "ntthin18",
+      "color": "black",
+      "bind": "buckets[codex].5h.resetsAt",
+      "region": [
+        18,
+        201,
+        170,
+        18
+      ],
+      "when": {
+        "bind": "buckets[codex].5h.remaining",
+        "exists": true
+      },
+      "time_format": "hhmm"
+    },
+    {
+      "type": "text",
+      "x": 219,
+      "y": 66,
+      "font": "ntthin18",
+      "color": "black",
+      "text": "WEEK",
+      "when": {
+        "bind": "buckets[codex].5h.remaining",
+        "exists": true
+      }
+    },
+    {
+      "type": "text",
+      "x": 217,
+      "y": 88,
+      "font": "ntreg64",
+      "color": "black",
+      "bind": "buckets[codex].weekly.remaining",
+      "region": [
+        217,
+        88,
+        132,
+        88
+      ],
+      "align": "center",
+      "when": {
+        "bind": "buckets[codex].5h.remaining",
+        "exists": true
+      }
+    },
+    {
+      "type": "text",
+      "x": 333,
+      "y": 120,
+      "font": "ntthin18",
+      "color": "black",
+      "text": "%",
+      "when": {
+        "bind": "buckets[codex].5h.remaining",
+        "exists": true
+      }
+    },
+    {
+      "type": "text",
+      "x": 219,
+      "y": 177,
+      "font": "ntthin18",
+      "color": "black",
+      "text": "RESET",
+      "when": {
+        "bind": "buckets[codex].5h.remaining",
+        "exists": true
+      }
+    },
+    {
+      "type": "text",
+      "x": 219,
+      "y": 200,
+      "font": "ntthin18",
+      "color": "black",
+      "bind": "buckets[codex].weekly.resetsAt",
+      "region": [
+        219,
+        201,
+        168,
+        18
+      ],
+      "when": {
+        "bind": "buckets[codex].5h.remaining",
+        "exists": true
+      }
+    },
+    {
+      "type": "text",
+      "x": 105,
+      "y": 66,
+      "font": "ntthin18",
+      "color": "black",
+      "text": "WEEK",
+      "when": {
+        "bind": "buckets[codex].5h.remaining",
+        "exists": false
+      }
+    },
+    {
+      "type": "text",
+      "x": 105,
+      "y": 88,
+      "font": "ntreg64",
+      "color": "black",
+      "bind": "buckets[codex].weekly.remaining",
+      "region": [
+        105,
+        88,
+        132,
+        88
+      ],
+      "align": "center",
+      "when": {
+        "bind": "buckets[codex].5h.remaining",
+        "exists": false
+      }
+    },
+    {
+      "type": "text",
+      "x": 221,
+      "y": 120,
+      "font": "ntthin18",
+      "color": "black",
+      "text": "%",
+      "when": {
+        "bind": "buckets[codex].5h.remaining",
+        "exists": false
+      }
+    },
+    {
+      "type": "text",
+      "x": 105,
+      "y": 177,
+      "font": "ntthin18",
+      "color": "black",
+      "text": "RESET",
+      "when": {
+        "bind": "buckets[codex].5h.remaining",
+        "exists": false
+      }
+    },
+    {
+      "type": "text",
+      "x": 105,
+      "y": 200,
+      "font": "ntthin18",
+      "color": "black",
+      "bind": "buckets[codex].weekly.resetsAt",
+      "region": [
+        105,
+        201,
+        168,
+        18
+      ],
+      "when": {
+        "bind": "buckets[codex].5h.remaining",
+        "exists": false
+      }
+    },
+    {
+      "type": "line",
+      "x1": 12,
+      "y1": 221,
+      "x2": 388,
+      "y2": 221,
+      "color": "black"
+    },
+    {
+      "type": "text",
+      "x": 16,
+      "y": 233,
+      "font": "ntthin18",
+      "color": "black",
+      "bind": "account.plan",
+      "region": [
+        16,
+        232,
+        83,
+        20
+      ]
+    },
+    {
+      "type": "text",
+      "x": 104,
+      "y": 233,
+      "font": "ntthin18",
+      "color": "black",
+      "bind": "bridge.label",
+      "region": [
+        104,
+        232,
+        193,
+        20
+      ],
+      "when": {
+        "bind": "bridge.label",
+        "exists": true
+      }
+    },
+    {
+      "type": "text",
+      "x": 326,
+      "y": 233,
+      "font": "ntthin18",
+      "color": "black",
+      "bind": "resetCredits.availableCount",
+      "prefix": "RC ",
+      "region": [
+        314,
+        232,
+        73,
+        20
+      ],
+      "align": "right",
+      "when": {
+        "bind": "resetCredits.availableCount",
+        "exists": true
+      }
+    },
+    {
+      "type": "line",
+      "x1": 12,
+      "y1": 269,
+      "x2": 388,
+      "y2": 269,
+      "color": "black"
+    },
+    {
+      "type": "text",
+      "x": 16,
+      "y": 270,
+      "font": "ntthin18",
+      "color": "black",
+      "bind": "device.sync_hhmm",
+      "prefix": "SYNC ",
+      "when": {
+        "bind": "device.offline_mins",
+        "exists": false
+      }
+    },
+    {
+      "type": "text",
+      "x": 16,
+      "y": 270,
+      "font": "ntthin18",
+      "color": "black",
+      "bind": "device.offline_mins",
+      "prefix": "OFF ",
+      "suffix": "M",
+      "when": {
+        "bind": "device.offline_mins",
+        "exists": true
+      }
+    },
+    {
+      "type": "text",
+      "x": 333,
+      "y": 270,
+      "font": "ntthin18",
+      "color": "black",
+      "text": "CODEX"
+    }
+  ]
+}

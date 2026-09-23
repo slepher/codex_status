@@ -72,7 +72,7 @@ git diff --check                   # 提交前必查
 - v2 数据语义：字段仅在 Bridge 绑定合同中分 push/pull；push 可见值/缺失/质量变化发送完整最新快照，pull-only 变化只更新缓存、不推送、不改 PowerPlan；只有成功 ACK 才更新确认指纹与 full_sync_deadline。设备不接收 push/pull 分类。
 - v2 电源：只有 Bridge 的正式 PowerPlan 改变 light deadline；读取/传输/claim/owner renew 都不隐式续租；BOOT provisional 300s 从物理唤醒起算，timer wake 不获得。
 - 版本号 `FW_VERSION` 在 `src/main.cpp`；固件发布后在 `PROGRESS.md` 记录 ROM 路径与 SHA256。
-- 显示规则（权威）：5h 桶不存在时显示静态 100 并隐藏其重置时间；`resetCredits.availableCount<=0` 时隐藏 RC 行；label 取不到用户名时整行隐藏。
+- 显示规则：配额/账号缺失的表现是**模板属性**，由各变体自己的 `when` 分支决定，不用全局规则统一。已实现的两种：200×200 `quad` 在 5h 桶不存在时显示静态 `100` 并隐藏其重置时间；400×300 `codex-status-a` 在 5h 桶不存在时隐藏 5h 块并把 weekly 提升到主位。共享的数据侧约定：桥在 `resetCredits.availableCount<=0` 时不下发该字段，模板按 `exists` 隐藏 RC 行；`bridge.label` 取不到用户名时模板不绘制该行。新增变体按该 target 的产品意图选择分支，并同步更新本行。
 
 ## 工作流约定
 

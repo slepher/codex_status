@@ -2,9 +2,15 @@
 .pio
 bridge/target
 bridge/crates/app/gen
+bridge/target-note4-deploy/
 
 # Local working artifacts (camera captures, previews, logs)
 artifacts/
+
+# Third-party font sources and the vendored freetype-py wheel for
+# tools/note4-fonts (downloaded, not needed for a build: the generated headers
+# and the .bin assets are what ships)
+tools/note4-fonts/vendor/
 
 # Runtime logs
 tools/test-bridge/bridge.log

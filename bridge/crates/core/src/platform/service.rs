@@ -10,15 +10,36 @@ use std::sync::Mutex;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::Digest;
 
 use crate::coordinator::{AckOutcome, Coordinator, Delivery, DeliveryKind, DEFAULT_FULL_SYNC_S};
 use crate::datasource::{DataSource, DataSourceKind};
 use crate::platform::model::{
     Binding, Bundle, BundleProfile, BundleResource, DeviceCapabilities, DeviceIdentity,
     DeviceRecord, FieldRequirement, PlanMode, PowerPlan, Profile, PublishState, SourceSnapshot,
-    Template, TemplateKey, MAX_BUNDLE_BYTES, MAX_PROFILE_TEMPLATES,
+    Template, TemplateKey, PublishJob, MAX_PROFILE_TEMPLATES,
 };
 use crate::platform::store;
+use crate::platform::fonts::{FontLibrary, FontPlan};
+use crate::platform::publish::{FrozenPublish, Capacity, CommittedRefs};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssetJob {
+    pub frozen: FrozenPublish,
+    pub state: PublishState,
+    pub created_at: u64,
+    pub last_error: Option<String>,
+}
+
+impl AssetJob {
+    fn summary(&self) -> Value {
+        json!({"job_id": self.frozen.manifest.job_id, "state": self.state,
+            "manifest_id": self.frozen.manifest_id, "objects": self.frozen.objects.len(),
+            "bytes": self.frozen.objects.iter().map(|o| o.length).sum::<u64>(),
+            "transferred_bytes": 0, "ack": null,
+            "last_error": self.last_error, "transport": "waiting_for_device_protocol"})
+    }
+}
 
 /// In-memory plus persisted platform state.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -32,6 +53,10 @@ pub struct PersistedState {
     /// Bounded terminal job summaries (no browsable content versions).
     #[serde(default)]
     pub jobs: Vec<Value>,
+    #[serde(default)]
+    pub asset_jobs: BTreeMap<String, AssetJob>,
+    #[serde(default)]
+    pub bundle_jobs: BTreeMap<String, PublishJob>,
     /// Per-device next data_seq high water mark (never blindly restarted at 0).
     #[serde(default)]
     pub next_seq: BTreeMap<String, u64>,
@@ -55,6 +80,7 @@ struct Inner {
     coordinators: BTreeMap<String, Coordinator>,
     codex_envelope: Option<Value>,
     jobs: Vec<Value>,
+    asset_jobs: BTreeMap<String, AssetJob>,
     /// Bounded checkpoint throttle: the 10 s status poll must not write flash.
     status_persist_at: BTreeMap<String, u64>,
 }
@@ -72,11 +98,32 @@ impl PlatformService {
             sources: persisted_sources,
             templates: persisted_templates,
             devices: persisted_devices,
-            jobs: persisted_jobs,
+            jobs: mut persisted_jobs,
+            asset_jobs: mut persisted_asset_jobs,
+            bundle_jobs: persisted_bundle_jobs,
             next_seq,
             contexts,
             plans,
         } = persisted;
+        for job in persisted_asset_jobs.values_mut() {
+            if let Err(error) = job.frozen.verify() {
+                job.state = PublishState::Failed;
+                job.last_error = Some(format!("persisted frozen job corrupt: {error}"));
+            }
+        }
+        let mut history_recovered = false;
+        for record in &persisted_devices {
+            let committed = record.observed.committed_job_id.as_deref().filter(|id| !id.is_empty());
+            let has_context = record.observed.active_context_id.as_deref().is_some_and(|id| !id.is_empty());
+            if has_context {
+                if let Some(entry) = persisted_jobs.iter_mut().rev().find(|entry| {
+                    committed.is_some_and(|id| entry["job_id"] == id) && entry["state"] != "succeeded"
+                }) {
+                    entry["state"] = json!("succeeded");
+                    history_recovered = true;
+                }
+            }
+        }
         let mut templates = BTreeMap::new();
         for mut t in persisted_templates {
             // Old Rust render-plan records migrate from their retained source.
@@ -97,9 +144,26 @@ impl PlatformService {
         }
         let mut devices = BTreeMap::new();
         let mut coordinators = BTreeMap::new();
-        for record in persisted_devices {
+        for mut record in persisted_devices {
+            if let Some(profile) = record.profile.as_mut() {
+                if profile.render_target.is_none() && !record.capabilities.render_target.is_empty() {
+                    profile.render_target = Some(record.capabilities.render_target.clone());
+                }
+            }
             let mac = record.identity.device_mac.clone();
             let mut c = Coordinator::new(&mac, record.capabilities.clone());
+            if let Some(mut job) = persisted_bundle_jobs.get(&mac).cloned() {
+                if job.device_mac == mac
+                    && job.frozen_bundle.verify().is_ok()
+                    && job.frozen_bundle.render_target == record.capabilities.render_target
+                    && job.frozen_bundle.firmware_target == record.capabilities.firmware_target
+                {
+                    if job.state == PublishState::Sending {
+                        job.state = PublishState::Waiting;
+                    }
+                    c.job = Some(job);
+                }
+            }
             if let Some(seq) = next_seq.get(&mac) {
                 // Lost local record: the authenticated device read precedes any
                 // send; keep the per-device counter monotonic, never 0.
@@ -129,10 +193,15 @@ impl PlatformService {
                 coordinators,
                 codex_envelope: None,
                 jobs: persisted_jobs,
+                asset_jobs: persisted_asset_jobs,
                 status_persist_at: BTreeMap::new(),
             }),
         };
         service.refresh_all_contracts()?;
+        if history_recovered {
+            let inner = service.inner.lock().unwrap();
+            Self::persist(&inner, &service.state_path())?;
+        }
         Ok(service)
     }
 
@@ -140,16 +209,68 @@ impl PlatformService {
         self.dir.join("state.json")
     }
 
+    fn font_library(&self) -> Result<FontLibrary> {
+        FontLibrary::open(&self.dir.parent().context("platform data root missing")?.join("fonts"))
+    }
+
+    pub fn font_list(&self) -> Result<Value> {
+        Ok(json!({"fonts": self.font_library()?.list()?, "source_conversion": "unavailable", "note": "Import a CSFN .bin; TTF/OTF conversion is not packaged in this Bridge"}))
+    }
+
+    pub fn font_import(&self, path: &Path) -> Result<Value> {
+        if path.extension().and_then(|x| x.to_str()) != Some("bin") {
+            bail!("only CSFN .bin import is available; TTF/OTF conversion is not packaged");
+        }
+        let descriptor = self.font_library()?.add(&std::fs::read(path)?)?;
+        Ok(json!({"imported": descriptor, "published": false}))
+    }
+
+    fn profile_fonts(&self, inner: &Inner, profile: &Profile) -> Result<FontPlan> {
+        let target = profile.render_target.as_deref().context("profile target unbound")?;
+        let mut names = Vec::new();
+        for id in &profile.template_ids {
+            let template = inner.templates.get(&TemplateKey::new(id, target))
+                .with_context(|| format!("template {id} has no {target} variant"))?;
+            collect_font_names(&template.source, &mut names);
+        }
+        let plan = FontPlan::for_selected(&self.font_library()?, &names, &profile.font_ids)?;
+        if plan.required.len() != profile.font_ids.len() {
+            bail!("profile contains a font_id selection unused by its templates");
+        }
+        let format = &inner.devices[&profile.device_mac].capabilities.pixel_format;
+        for font in &plan.required { font.check_target(format)?; }
+        Ok(plan)
+    }
+
+    fn freeze_assets(&self, caps: &DeviceCapabilities, profile: &Profile,
+        templates: &[Template], fonts: &FontPlan, job_id: &str) -> Result<FrozenPublish> {
+        if !fonts.required.is_empty() && caps.compiler_abi < 2 {
+            bail!("asset fonts require a device/compiler ABI with explicit font references; ABI {} cannot publish them", caps.compiler_abi);
+        }
+        let library = self.font_library()?;
+        let mut bytes = BTreeMap::new();
+        for font in &fonts.required {
+            bytes.insert(font.name.clone(), library.read(&font.id)?
+                .with_context(|| format!("selected font {} disappeared", font.id))?);
+        }
+        FrozenPublish::build(job_id, caps, profile, templates, &bytes)
+    }
+
     fn persist(inner: &Inner, path: &Path) -> Result<()> {
         let mut jobs = inner.jobs.clone();
         store::prune(&mut jobs, MAX_JOB_SUMMARIES);
-        // Job summaries are already bounded plain JSON; the full frozen bundles
-        // stay in memory only until the job reaches a terminal state.
+        // Keep frozen in-flight Bundles across Bridge restarts. The device's
+        // authenticated status and idempotent BEGIN decide whether to resume.
         let state = PersistedState {
             sources: inner.sources.values().cloned().collect(),
             templates: inner.templates.values().cloned().collect(),
             devices: inner.devices.values().cloned().collect(),
             jobs,
+            asset_jobs: inner.asset_jobs.clone(),
+            bundle_jobs: inner.coordinators.iter().filter_map(|(mac, c)| {
+                c.job.as_ref().filter(|j| !j.state.is_terminal())
+                    .map(|j| (mac.clone(), j.clone()))
+            }).collect(),
             next_seq: inner
                 .coordinators
                 .iter()
@@ -181,6 +302,16 @@ impl PlatformService {
                 .collect(),
         };
         store::write_json(path, &state)
+    }
+
+    fn refresh_bundle_history(inner: &mut Inner, mac: &str) {
+        let Some(summary) = inner.coordinators.get(mac).and_then(|c| c.job_snapshot()) else {
+            return;
+        };
+        let job_id = summary["job_id"].as_str();
+        if let Some(entry) = inner.jobs.iter_mut().rev().find(|entry| entry["job_id"].as_str() == job_id) {
+            *entry = summary;
+        }
     }
 
     pub fn templates(&self) -> Vec<Value> {
@@ -329,9 +460,18 @@ impl PlatformService {
                 .devices
                 .get(&profile.device_mac)
                 .context("unknown device")?;
+            if profile.render_target.is_none() {
+                if record.capabilities.render_target.is_empty() {
+                    bail!("device target is unknown; select a render_target after authenticated discovery");
+                }
+                profile.render_target = Some(record.capabilities.render_target.clone());
+            }
+            if profile.render_target.as_deref() != Some(record.capabilities.render_target.as_str()) {
+                bail!("profile target {:?} differs from device {}; migrate the profile explicitly", profile.render_target, record.capabilities.render_target);
+            }
             for id in &profile.template_ids {
                 if !inner.templates.keys().any(|k| {
-                    &k.template_id == id && k.render_target == record.capabilities.render_target
+                    &k.template_id == id && Some(k.render_target.as_str()) == profile.render_target.as_deref()
                 }) {
                     bail!(
                         "template {id} has no variant for render target {}",
@@ -382,6 +522,7 @@ impl PlatformService {
                 source_field: canonical,
             });
         }
+        let _ = self.profile_fonts(&inner, &profile)?;
         profile.updated_at = now;
         let mac = profile.device_mac.clone();
         if let Some(record) = inner.devices.get_mut(&mac) {
@@ -396,11 +537,49 @@ impl PlatformService {
 
     // ---- Explicit publish ------------------------------------------------
 
+    /// Read-only preflight. Reuse is unknown until an authenticated versioned
+    /// status digest exists, so this uses an all-missing conservative estimate.
+    pub fn publish_preview(&self, mac: &str) -> Result<Value> {
+        let inner = self.inner.lock().unwrap();
+        let record = inner.devices.get(&mac.to_uppercase()).context("unknown device")?;
+        let profile = record.profile.as_ref().context("device has no profile")?;
+        profile.validate_publishable(&record.capabilities)?;
+        let fonts = self.profile_fonts(&inner, profile)?;
+        if record.capabilities.asset_publish_protocol != 1 {
+            return Ok(json!({"route": "full_bundle", "render_target": profile.render_target,
+                "profile_order": profile.template_ids, "font_dependencies": fonts,
+                "max_bundle_bytes": record.capabilities.max_bundle_bytes.min(256 * 1024),
+                "can_publish_fonts": false,
+                "source_conversion": "unavailable", "note": "CSFN import is available; TTF/OTF conversion and incremental device protocol are not available"}));
+        }
+        let templates = profile.template_ids.iter().map(|id| {
+            inner.templates.get(&TemplateKey::new(id, &record.capabilities.render_target)).cloned()
+                .with_context(|| format!("missing template {id}"))
+        }).collect::<Result<Vec<_>>>()?;
+        let frozen = self.freeze_assets(&record.capabilities, profile, &templates, &fonts, "preview")?;
+        let plan = crate::platform::publish::plan(&frozen, &CommittedRefs::default(), &capacity_from_caps(&record.capabilities))?;
+        Ok(json!({"route": "asset_manifest", "manifest_id": frozen.manifest_id,
+            "target_id": frozen.target_id,
+            "render_target": profile.render_target, "firmware_target": record.capabilities.firmware_target,
+            "compiler_abi": record.capabilities.compiler_abi, "profile_order": profile.template_ids,
+            "initial_active_id": frozen.manifest.initial_active_id,
+            "templates": frozen.manifest.templates, "fonts": frozen.manifest.fonts,
+            "objects": frozen.manifest.objects, "plan_all_missing": plan,
+            "reuse": "unknown_until_authenticated_asset_status", "source_conversion": "unavailable"}))
+    }
+
     /// Freeze the current profile into a complete Bundle and queue exactly one
     /// PublishJob. Later template/profile edits cannot change the frozen content.
     pub fn publish(&self, mac: &str, now: u64) -> Result<Value> {
+        self.publish_checked(mac, now, None, None)
+    }
+
+    pub fn publish_checked(&self, mac: &str, now: u64, expected_target_id: Option<&str>, bridge_id: Option<&str>) -> Result<Value> {
         let mac = mac.to_uppercase();
         let mut inner = self.inner.lock().unwrap();
+        if inner.asset_jobs.get(&mac).is_some_and(|j| !j.state.is_terminal()) {
+            bail!("device has an unfinished asset publish job; cancel or recover it before starting another");
+        }
         let caps = inner
             .devices
             .get(&mac)
@@ -417,6 +596,7 @@ impl PlatformService {
             }
         }
         profile.validate_publishable(&caps)?;
+        let font_plan = self.profile_fonts(&inner, &profile)?;
         if !profile.sync_enabled {
             // Publishing itself is explicit; data sync is a separate switch, so a
             // publish is allowed with sync off. Kept visible in the job summary.
@@ -456,6 +636,24 @@ impl PlatformService {
                 bail!("profile has no binding for required field {}", r.field);
             }
         }
+        if caps.asset_publish_protocol == 1 {
+            let frozen = self.freeze_assets(&caps, &profile, &templates, &font_plan, &job_id_for(&mac, now, &profile))?;
+            if expected_target_id.is_some_and(|id| id != frozen.target_id) {
+                bail!("publish target changed since preview; review the new snapshot before publishing");
+            }
+            let capacity = capacity_from_caps(&caps);
+            let _ = crate::platform::publish::plan(&frozen, &CommittedRefs::default(), &capacity)?;
+            let job = AssetJob { frozen, state: PublishState::Waiting, created_at: now, last_error: None };
+            let summary = job.summary();
+            inner.asset_jobs.insert(mac.clone(), job);
+            inner.jobs.push(summary.clone());
+            store::prune(&mut inner.jobs, MAX_JOB_SUMMARIES);
+            Self::persist(&inner, &self.state_path())?;
+            return Ok(summary);
+        }
+        if !font_plan.required.is_empty() {
+            bail!("device does not advertise the versioned asset protocol; selected fonts cannot be published through the old bundle path");
+        }
         let initial = profile
             .initial_active_id
             .clone()
@@ -467,6 +665,7 @@ impl PlatformService {
         let bundle = Bundle {
             job_id: job_id.clone(),
             device_mac: mac.clone(),
+            bridge_id: bridge_id.unwrap_or_default().to_string(),
             firmware_target: caps.firmware_target.clone(),
             render_target: caps.render_target.clone(),
             compiler_abi: crate::compile::COMPILER_ABI,
@@ -482,9 +681,10 @@ impl PlatformService {
             crc: String::new(),
         }
         .seal()?;
-        if bundle.total_len as usize > MAX_BUNDLE_BYTES {
-            bail!("bundle exceeds bridge limit");
+        if u64::from(bundle.total_len) > caps.max_bundle_bytes.min(256 * 1024) {
+            bail!("bundle is {} bytes, device full-bundle limit is {}", bundle.total_len, caps.max_bundle_bytes.min(256 * 1024));
         }
+        inner.asset_jobs.remove(&mac);
         let coordinator = inner
             .coordinators
             .entry(mac.clone())
@@ -511,6 +711,37 @@ impl PlatformService {
         job.frozen_bundle.canonical_bytes()
     }
 
+    /// Bind pre-existing uncommitted Bundles that were frozen before the
+    /// ownership field existed. Re-seal the same job ID before any retry.
+    pub fn bind_pending_bundle_owner(&self, mac: &str, bridge_id: &str) -> Result<()> {
+        if bridge_id.is_empty() {
+            bail!("bridge id is required for bundle ownership");
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let mac = mac.to_uppercase();
+        let limit = inner.devices.get(&mac).context("unknown device")?
+            .capabilities.max_bundle_bytes.min(256 * 1024);
+        let job = inner.coordinators.get_mut(&mac)
+            .and_then(|c| c.job.as_mut()).context("no publish job for device")?;
+        if job.frozen_bundle.bridge_id == bridge_id {
+            return Ok(());
+        }
+        if !job.frozen_bundle.bridge_id.is_empty() || job.state.is_terminal() {
+            bail!("frozen bundle belongs to another bridge or is already terminal");
+        }
+        let mut bundle = job.frozen_bundle.clone();
+        bundle.bridge_id = bridge_id.to_string();
+        bundle = bundle.seal()?;
+        if u64::from(bundle.total_len) > limit {
+            bail!("bundle is {} bytes, device full-bundle limit is {limit}", bundle.total_len);
+        }
+        job.frozen_bundle = bundle;
+        job.updated_at = crate::now_secs();
+        Self::refresh_bundle_history(&mut inner, &mac);
+        Self::persist(&inner, &self.state_path())?;
+        Ok(())
+    }
+
     /// Canonical Data message body for the in-flight snapshot.
     pub fn data_message_body(&self, mac: &str) -> Option<Value> {
         let inner = self.inner.lock().unwrap();
@@ -526,6 +757,7 @@ impl PlatformService {
 
     pub fn job(&self, mac: &str) -> Option<Value> {
         let inner = self.inner.lock().unwrap();
+        if let Some(job) = inner.asset_jobs.get(&mac.to_uppercase()) { return Some(job.summary()); }
         inner
             .coordinators
             .get(&mac.to_uppercase())
@@ -534,19 +766,36 @@ impl PlatformService {
 
     pub fn cancel_job(&self, mac: &str) {
         let mut inner = self.inner.lock().unwrap();
+        if let Some(job) = inner.asset_jobs.get_mut(&mac.to_uppercase()) {
+            if !job.state.is_terminal() { job.state = PublishState::Cancelled; }
+            let _ = Self::persist(&inner, &self.state_path());
+            return;
+        }
         if let Some(c) = inner.coordinators.get_mut(&mac.to_uppercase()) {
             c.cancel_job();
+            Self::refresh_bundle_history(&mut inner, &mac.to_uppercase());
+            let _ = Self::persist(&inner, &self.state_path());
         }
+    }
+
+    pub fn asset_job_pending(&self, mac: &str) -> bool {
+        self.inner.lock().unwrap().asset_jobs.get(&mac.to_uppercase())
+            .is_some_and(|j| !j.state.is_terminal())
     }
 
     /// Idempotent retry result: the same committed job returns its prior result.
     pub fn retry_job(&self, mac: &str, job_id: &str, committed: bool, now: u64) -> bool {
         let mut inner = self.inner.lock().unwrap();
-        inner
+        let matched = inner
             .coordinators
             .get_mut(&mac.to_uppercase())
             .map(|c| c.retry_bundle_ack(job_id, committed, now))
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if matched && committed {
+            Self::refresh_bundle_history(&mut inner, &mac.to_uppercase());
+            let _ = Self::persist(&inner, &self.state_path());
+        }
+        matched
     }
 
     /// Explicit remote activate (new context on success).
@@ -764,7 +1013,8 @@ impl PlatformService {
                     "profile_count": d.profile.as_ref().map(|p| p.template_ids.len()).unwrap_or(0),
                     "sync_enabled": d.profile.as_ref().map(|p| p.sync_enabled).unwrap_or(false),
                     "active_template_id": coordinator.and_then(|c| c.active_template_id.clone()),
-                    "job": coordinator.and_then(|c| c.job_snapshot()),
+                    "job": inner.asset_jobs.get(mac).map(AssetJob::summary)
+                        .or_else(|| coordinator.and_then(|c| c.job_snapshot())),
                     "data": coordinator.map(|c| json!({
                         "push_dirty": c.data.push_dirty,
                         "pull_only_change": c.pull_only_change(),
@@ -868,6 +1118,36 @@ impl PlatformService {
         if let Some(c) = inner.coordinators.get_mut(&mac) {
             c.note_status(status, now);
         }
+        let mut power_reconciled = false;
+        if let Some(c) = inner.coordinators.get_mut(&mac) {
+            if let Some(pending) = c.plan.pending_explicit_light.clone() {
+                let power = &status["power"];
+                if power["plan_id"] == pending.plan_id && power["mode"] == "light" {
+                    if let Some(remaining) = power["remaining_s"].as_u64().filter(|n| *n > 0) {
+                        power_reconciled = c.note_plan_ack(pending.plan_id, remaining as u32, false)
+                            == crate::coordinator::PlanAck::Accepted;
+                    }
+                }
+            }
+        }
+        let mut job_reconciled = false;
+        if status["configured"] == true {
+            if let Some(job_id) = status["committed_job_id"].as_str().filter(|s| !s.is_empty()) {
+                let local_pending = inner.coordinators.get(&mac)
+                    .and_then(|c| c.job.as_ref())
+                    .is_some_and(|j| j.job_id == job_id && j.state != PublishState::Succeeded);
+                if local_pending {
+                    inner.coordinators.get_mut(&mac).expect("coordinator")
+                        .retry_bundle_ack(job_id, true, now);
+                    Self::refresh_bundle_history(&mut inner, &mac);
+                    job_reconciled = true;
+                } else if let Some(entry) = inner.jobs.iter_mut().rev()
+                    .find(|entry| entry["job_id"] == job_id && entry["state"] != "succeeded") {
+                    entry["state"] = json!("succeeded");
+                    job_reconciled = true;
+                }
+            }
+        }
         // Reconcile a device context we do not know (cold start / recovery):
         // adopt it but keep the per-device seq counter monotonic.
         let reconcile = inner.coordinators.get(&mac).and_then(|c| {
@@ -912,7 +1192,7 @@ impl PlatformService {
                 c.set_contract(&template_id, requirements, triggers);
             }
         }
-        if reconcile_needed {
+        if reconcile_needed || job_reconciled || power_reconciled {
             let _ = Self::persist(&inner, &self.state_path());
             inner
                 .status_persist_at
@@ -1030,13 +1310,17 @@ impl PlatformService {
     ) -> Result<PowerPlan> {
         let mac = mac.to_uppercase();
         let mut inner = self.inner.lock().unwrap();
+        if let Some(pending) = inner.coordinators.get(&mac)
+            .and_then(|c| c.plan.pending_explicit_light.as_ref()) {
+            return Ok(pending.clone());
+        }
         // Light is only granted for real pending work: sync alone does not keep
         // the radio on (v2 §7). Pending data/jobs/activation do.
         let want_light = inner
             .coordinators
             .get(&mac)
             .map(|c| {
-                now < c.light_hold_until
+                now < c.plan.light_hold_until
                     || (c.sync_enabled && c.data.push_dirty)
                     || c.data.in_flight.is_some()
                     || c.pending_activate.is_some()
@@ -1078,7 +1362,20 @@ impl PlatformService {
             .get_mut(&mac.to_uppercase())
             .context("unknown device")?;
         c.hold_light(until);
-        Ok(())
+        Self::persist(&inner, &self.state_path())
+    }
+
+    /// Durable explicit light request, shared by UI and MCP. The plan is
+    /// frozen until an authenticated HTTP/BLE ACK or status reconciliation.
+    pub fn queue_explicit_light(&self, mac: &str, now: u64) -> Result<(PowerPlan, bool)> {
+        let mut inner = self.inner.lock().unwrap();
+        let c = inner.coordinators.get_mut(&mac.to_uppercase()).context("unknown device")?;
+        let already_pending = c.plan.pending_explicit_light.is_some();
+        let plan = c.queue_explicit_light(now, crate::coordinator::MAX_LIGHT_S);
+        if !already_pending {
+            Self::persist(&inner, &self.state_path())?;
+        }
+        Ok((plan, already_pending))
     }
 
     /// Explicit user/debug power action with a freshly allocated plan id.
@@ -1095,7 +1392,15 @@ impl PlatformService {
             .get_mut(&mac.to_uppercase())
             .context("unknown device")?;
         let now = crate::now_secs();
-        Ok(c.plan_for(
+        if mode == crate::platform::model::PlanMode::Light {
+            if let Some(pending) = &c.plan.pending_explicit_light {
+                return Ok(pending.clone());
+            }
+        }
+        if mode == crate::platform::model::PlanMode::Sleep {
+            c.cancel_explicit_light();
+        }
+        let plan = c.plan_for(
             now,
             mode == crate::platform::model::PlanMode::Light,
             if light_s == 0 {
@@ -1104,7 +1409,9 @@ impl PlatformService {
                 light_s
             },
             reason,
-        ))
+        );
+        Self::persist(&inner, &self.state_path())?;
+        Ok(plan)
     }
 
     pub fn note_plan_ack(
@@ -1118,8 +1425,12 @@ impl PlatformService {
         let Some(c) = inner.coordinators.get_mut(&mac.to_uppercase()) else {
             return json!({"outcome": "unknown_device"});
         };
+        let outcome = c.note_plan_ack(plan_id, remaining_s, provisional);
+        if outcome == crate::coordinator::PlanAck::Accepted {
+            let _ = Self::persist(&inner, &self.state_path());
+        }
         json!({
-            "outcome": match c.note_plan_ack(plan_id, remaining_s, provisional) {
+            "outcome": match outcome {
                 crate::coordinator::PlanAck::Accepted => "accepted",
                 crate::coordinator::PlanAck::Stale => "stale",
                 crate::coordinator::PlanAck::Conflict => "conflict",
@@ -1161,6 +1472,8 @@ impl PlatformService {
         let mut profile = Profile {
             device_mac: mac.clone(),
             template_ids: ids,
+            render_target: None,
+            font_ids: BTreeMap::new(),
             initial_active_id: active,
             bindings: Vec::new(),
             sync_enabled: false,
@@ -1280,6 +1593,33 @@ impl PlatformService {
         }
         Ok(())
     }
+}
+
+fn collect_font_names(value: &Value, names: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(name) = map.get("font").and_then(Value::as_str) {
+                if !names.iter().any(|n| n == name) { names.push(name.to_string()); }
+            }
+            for child in map.values() { collect_font_names(child, names); }
+        }
+        Value::Array(items) => for child in items { collect_font_names(child, names); },
+        _ => {}
+    }
+}
+
+fn job_id_for(mac: &str, now: u64, profile: &Profile) -> String {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default().as_nanos();
+    let fingerprint = format!("{:x}", sha2::Sha256::digest(format!("{mac}:{now}:{nanos}:{}", profile.template_ids.join(",")).as_bytes()));
+    fingerprint[..24].to_string()
+}
+
+fn capacity_from_caps(caps: &DeviceCapabilities) -> Capacity {
+    Capacity { max_object_bytes: caps.max_object_bytes,
+        max_manifest_bytes: caps.max_manifest_bytes, free_bytes: caps.free_bytes,
+        install_peak_bytes: caps.install_peak_bytes,
+        filesystem_overhead_bytes: caps.filesystem_overhead_bytes }
 }
 
 fn context_from_json(value: &Value, next_seq: u64) -> Option<crate::coordinator::ContextState> {
@@ -1590,6 +1930,207 @@ mod tests {
             .clone();
         assert_eq!(frozen_before, frozen_after);
         assert_ne!(frozen_after, edited);
+    }
+
+    #[test]
+    fn full_bundle_job_survives_restart_with_frozen_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = service_with_device(dir.path());
+        svc.template_save("quad", "epd-ssd1681-200x200-1bpp", &quad_source(), 1000)
+            .unwrap();
+        let mut profile = Profile::draft("AA:BB:CC:DD:EE:FF");
+        profile.template_ids = vec!["quad".into()];
+        profile.initial_active_id = Some("quad".into());
+        svc.profile_save(profile, 1000).unwrap();
+        let job = svc.publish("AA:BB:CC:DD:EE:FF", 1000).unwrap();
+        let old_bytes = svc.bundle_payload("AA:BB:CC:DD:EE:FF").unwrap();
+        drop(svc);
+        let svc = PlatformService::open(dir.path()).unwrap();
+        svc.bind_pending_bundle_owner("AA:BB:CC:DD:EE:FF", "bridge-1").unwrap();
+        let frozen = svc.bundle_payload("AA:BB:CC:DD:EE:FF").unwrap();
+        assert_ne!(frozen, old_bytes);
+        assert_eq!(serde_json::from_slice::<Value>(&frozen).unwrap()["bridge_id"], "bridge-1");
+        let mut edited = quad_source();
+        edited["elements"][0]["rect"] = json!([0, 0, 10, 10]);
+        svc.template_save("quad", "epd-ssd1681-200x200-1bpp", &edited, 2000)
+            .unwrap();
+        drop(svc);
+
+        let resumed = PlatformService::open(dir.path()).unwrap();
+        assert_eq!(resumed.job("AA:BB:CC:DD:EE:FF").unwrap()["job_id"], job["job_id"]);
+        assert_eq!(resumed.bundle_payload("AA:BB:CC:DD:EE:FF").unwrap(), frozen);
+        assert_eq!(resumed.next_http_delivery("AA:BB:CC:DD:EE:FF", true, 3000)["decision"], "bundle");
+        resumed.template_save("quad", "epd-ssd1681-200x200-1bpp", &quad_source(), 3001)
+            .unwrap(); // checkpoints the in-flight Sending state
+        drop(resumed);
+        let recovered = PlatformService::open(dir.path()).unwrap();
+        assert_eq!(recovered.job("AA:BB:CC:DD:EE:FF").unwrap()["state"], "waiting");
+        assert_eq!(recovered.bundle_payload("AA:BB:CC:DD:EE:FF").unwrap(), frozen);
+        assert!(recovered.retry_job("AA:BB:CC:DD:EE:FF", job["job_id"].as_str().unwrap(), true, 4000));
+        let expected_crc = recovered.job("AA:BB:CC:DD:EE:FF").unwrap()["crc"].clone();
+        drop(recovered);
+        let after_ack = PlatformService::open(dir.path()).unwrap();
+        assert_eq!(after_ack.next_http_delivery("AA:BB:CC:DD:EE:FF", true, 4001)["decision"], "idle");
+        let persisted: PersistedState = store::read_json(&dir.path().join("platform/state.json"))
+            .unwrap().unwrap();
+        let summary = persisted.jobs.iter().find(|entry| entry["job_id"] == job["job_id"]).unwrap();
+        assert_eq!(summary["state"], "succeeded");
+        assert_eq!(summary["crc"], expected_crc);
+    }
+
+    #[test]
+    fn device_status_reconciles_lost_bundle_ack() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = service_with_device(dir.path());
+        svc.template_save("quad", "epd-ssd1681-200x200-1bpp", &quad_source(), 1000).unwrap();
+        let mut profile = Profile::draft("AA:BB:CC:DD:EE:FF");
+        profile.template_ids = vec!["quad".into()];
+        svc.profile_save(profile, 1000).unwrap();
+        let job = svc.publish("AA:BB:CC:DD:EE:FF", 1000).unwrap();
+        drop(svc);
+
+        let resumed = PlatformService::open(dir.path()).unwrap();
+        resumed.note_device_status("AA:BB:CC:DD:EE:FF", &json!({
+            "configured": true, "committed_job_id": job["job_id"],
+            "active_context_id": "ctx-1", "active_template_id": "quad",
+        })).unwrap();
+        assert_eq!(resumed.job("AA:BB:CC:DD:EE:FF").unwrap()["state"], "succeeded");
+        drop(resumed);
+        let state_path = dir.path().join("platform/state.json");
+        let mut state: PersistedState = store::read_json(&state_path).unwrap().unwrap();
+        state.jobs.iter_mut().find(|entry| entry["job_id"] == job["job_id"]).unwrap()["state"] = json!("waiting");
+        store::write_json(&state_path, &state).unwrap(); // Simulates an older stale history checkpoint.
+        let restarted = PlatformService::open(dir.path()).unwrap();
+        assert_eq!(restarted.next_http_delivery("AA:BB:CC:DD:EE:FF", true, 2000)["decision"], "idle");
+        let state: PersistedState = store::read_json(&state_path).unwrap().unwrap();
+        assert_eq!(state.jobs.iter().find(|entry| entry["job_id"] == job["job_id"]).unwrap()["state"], "succeeded");
+    }
+
+    #[test]
+    fn explicit_light_queues_one_plan_across_restart_and_ack() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = service_with_device(dir.path());
+        let mac = "AA:BB:CC:DD:EE:FF";
+        let now = crate::now_secs();
+        let ordinary = svc.plan_for_rendezvous(mac, now, "rendezvous", 0).unwrap();
+        assert_eq!(ordinary.mode, PlanMode::Sleep);
+        let (light, already) = svc.queue_explicit_light(mac, now + 1).unwrap();
+        assert!(!already);
+        assert_eq!(light.mode, PlanMode::Light);
+        assert!(light.plan_id > ordinary.plan_id);
+        assert_eq!(svc.queue_explicit_light(mac, now + 2).unwrap(), (light.clone(), true));
+        drop(svc);
+
+        let resumed = PlatformService::open(dir.path()).unwrap();
+        assert_eq!(resumed.plan_for_rendezvous(mac, now + 3, "rendezvous", 0).unwrap(), light);
+        assert_eq!(resumed.note_plan_ack(mac, light.plan_id, 500, false)["outcome"], "accepted");
+        let summary = resumed.coordinator_summary(mac).unwrap();
+        assert!(summary["plan"]["pending_explicit_light"].is_null());
+        assert_eq!(summary["plan"]["last_explicit_light_ack"]["plan_id"], light.plan_id);
+        let hold_until = summary["plan"]["light_hold_until"].as_u64().unwrap();
+        assert_eq!(resumed.plan_for_rendezvous(mac, hold_until - 1, "rendezvous", 0).unwrap().mode, PlanMode::Light);
+        assert_eq!(resumed.plan_for_rendezvous(mac, hold_until + 1, "rendezvous", 0).unwrap().mode, PlanMode::Sleep);
+    }
+
+    #[test]
+    fn authenticated_status_recovers_lost_explicit_light_ack() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = service_with_device(dir.path());
+        let mac = "AA:BB:CC:DD:EE:FF";
+        let (plan, _) = svc.queue_explicit_light(mac, crate::now_secs()).unwrap();
+        svc.note_device_status(mac, &json!({
+            "power": {"mode": "light", "plan_id": plan.plan_id, "remaining_s": 540},
+        })).unwrap();
+        drop(svc);
+        let resumed = PlatformService::open(dir.path()).unwrap();
+        let state = resumed.coordinator_summary(mac).unwrap();
+        assert!(state["plan"]["pending_explicit_light"].is_null());
+        assert_eq!(state["plan"]["last_explicit_light_ack"]["plan_id"], plan.plan_id);
+    }
+
+    #[test]
+    fn explicit_sleep_cancels_queued_light_without_changing_normal_rendezvous() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = service_with_device(dir.path());
+        let mac = "AA:BB:CC:DD:EE:FF";
+        let now = crate::now_secs();
+        svc.queue_explicit_light(mac, now).unwrap();
+        let sleep = svc.explicit_plan(mac, PlanMode::Sleep, 0, "explicit").unwrap();
+        assert_eq!(sleep.mode, PlanMode::Sleep);
+        assert!(svc.coordinator_summary(mac).unwrap()["plan"]["pending_explicit_light"].is_null());
+        assert_eq!(svc.plan_for_rendezvous(mac, now + 1, "rendezvous", 0).unwrap().mode, PlanMode::Sleep);
+    }
+
+    #[test]
+    fn incremental_job_persists_frozen_bytes_across_restart_and_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = PlatformService::open(dir.path()).unwrap();
+        let mut caps = DeviceCapabilities::ssd1681_154g();
+        caps.asset_publish_protocol = 1;
+        caps.max_object_bytes = 100_000;
+        caps.max_manifest_bytes = 100_000;
+        caps.free_bytes = 1_000_000;
+        caps.install_peak_bytes = 1_000_000;
+        svc.device_upsert(DeviceIdentity::new("AA:BB:CC:DD:EE:FF", "Test").unwrap(), caps, false).unwrap();
+        svc.template_save("quad", crate::platform::model::RENDER_TARGET_154G, &quad_source(), 1000).unwrap();
+        let mut profile = Profile::draft("AA:BB:CC:DD:EE:FF");
+        profile.template_ids = vec!["quad".into()];
+        let saved = svc.profile_save(profile, 1000).unwrap();
+        assert_eq!(saved.render_target.as_deref(), Some(crate::platform::model::RENDER_TARGET_154G));
+        let preview = svc.publish_preview("AA:BB:CC:DD:EE:FF").unwrap();
+        let expected = preview["target_id"].as_str().unwrap();
+        let before = svc.publish_checked("AA:BB:CC:DD:EE:FF", 1001, Some(expected), None).unwrap();
+        assert_eq!(before["state"], "waiting");
+        let mut edited = quad_source();
+        edited["elements"][0]["rect"] = json!([0, 0, 10, 10]);
+        svc.template_save("quad", crate::platform::model::RENDER_TARGET_154G, &edited, 1002).unwrap();
+        drop(svc);
+        let restored = PlatformService::open(dir.path()).unwrap();
+        let after = restored.job("AA:BB:CC:DD:EE:FF").unwrap();
+        assert_eq!(before["manifest_id"], after["manifest_id"]);
+        assert!(restored.asset_job_pending("AA:BB:CC:DD:EE:FF"));
+        restored.cancel_job("AA:BB:CC:DD:EE:FF");
+        assert_eq!(restored.job("AA:BB:CC:DD:EE:FF").unwrap()["state"], "cancelled");
+    }
+
+    #[test]
+    fn profile_target_change_requires_explicit_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = service_with_device(dir.path());
+        svc.template_save("quad", crate::platform::model::RENDER_TARGET_154G, &quad_source(), 1000).unwrap();
+        let mut profile = Profile::draft("AA:BB:CC:DD:EE:FF");
+        profile.template_ids = vec!["quad".into()];
+        profile.render_target = Some(crate::platform::model::RENDER_TARGET_NOTE4.into());
+        assert!(svc.profile_save(profile, 1001).unwrap_err().to_string().contains("differs from device"));
+    }
+
+    #[test]
+    fn note4_builtin_font_profile_uses_existing_full_bundle_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = PlatformService::open(dir.path()).unwrap();
+        let mut caps = DeviceCapabilities::ssd1681_154g();
+        caps.firmware_target = crate::platform::model::FIRMWARE_TARGET_NOTE4.into();
+        caps.render_target = crate::platform::model::RENDER_TARGET_NOTE4.into();
+        caps.width = 400;
+        caps.height = 300;
+        caps.partial = false;
+        caps.hardware_verified = false;
+        svc.device_upsert(DeviceIdentity::new("7C4FADB93408", "Note4").unwrap(), caps, false).unwrap();
+        let source: Value = serde_json::from_str(include_str!("../../../../../project-workflow/generic-display-platform-implementation/concepts-400x300/codex-status-a-400x300.json")).unwrap();
+        svc.template_save("codex-status-a", crate::platform::model::RENDER_TARGET_NOTE4, &source, 1000).unwrap();
+        let mut profile = Profile::draft("7C4FADB93408");
+        profile.template_ids = vec!["codex-status-a".into()];
+        profile.initial_active_id = Some("codex-status-a".into());
+        svc.profile_save(profile, 1000).unwrap();
+        let job = svc.publish("7C4FADB93408", 1001).unwrap();
+        assert_eq!(job["state"], "waiting");
+        let inner = svc.inner.lock().unwrap();
+        let bundle = &inner.coordinators["7C4FADB93408"].job.as_ref().unwrap().frozen_bundle;
+        assert_eq!(bundle.render_target, crate::platform::model::RENDER_TARGET_NOTE4);
+        assert_eq!(bundle.compiler_abi, 1);
+        assert!(bundle.total_len <= 262_144);
+        assert_eq!(bundle.profile.template_ids, ["codex-status-a"]);
+        bundle.verify().unwrap();
     }
 
     #[test]

@@ -21,6 +21,42 @@ bool tplDraw(const String &tmplJson, const String &usageJson, const TplEnv &env)
 // Structural validation only (no usage needed): used at BLE receive time.
 bool tplValidate(const String &tmplJson, String &err);
 
+// ---------------------------------------------------------------------------
+// Font registry: the single source of truth for every font the engine renders.
+//
+// `CtOp.font` is an index into this one table, which holds both families:
+//   [0, tplFontFixedCount())  bitmap family compiled into the firmware (f8..f24)
+//   [tplFontFixedCount(), …)  proportional large-display family (nt16/nt30)
+// Template validation, the refresh policy's region derivation, the clock fast
+// path and the font-slot resolver all read this table; no other file keeps its
+// own copy of the font list or its index mapping.
+// ---------------------------------------------------------------------------
+int tplFontCount();
+int tplFontFixedCount();
+int tplFontIndexByName(const char *name);
+const char *tplFontNameByIndex(int idx);
+
+// Conservative text cell for one font: the bitmap family reports its uniform
+// cell, the proportional family the line height and the widest advance.
+// Used by the refresh policy (region derivation) so every font family gets a
+// bounded box instead of falling back to a whole-frame refresh. False = unknown
+// font.
+bool tplFontCellByName(const char *name, int &cellW, int &cellH);
+bool tplFontCellByIndex(int idx, int &cellW, int &cellH);
+
+// Clock fast path (main.cpp): box of the clock string "HH:MM" for a registry
+// font. `w` is the widest possible box (widest digit advance) so the reserved
+// window always fits whatever the clock shows, `h` the scaled line height.
+// False = unknown font.
+bool tplFontClockBox(int idx, int scale, int &w, int &h);
+
+// Blit the clock string into a byte-aligned 1bpp window buffer (ink only, the
+// window already holds the background) at `xOff` inside the window, using the
+// same pixel writes as the full render path for both font families.
+// False = unknown font / bad arguments.
+bool tplFontDrawClock(uint8_t *win, int winBytesPerRow, int winRows, int xOff,
+                      int idx, const char *text, int scale);
+
 // Render-target canvas (v2 §5): the engine is target-parameterized so one
 // binary family serves 200x200 and 400x300 panels. Called at boot and by the
 // host harness; defaults to TARGET_WIDTH x TARGET_HEIGHT.
@@ -62,7 +98,7 @@ struct CtReq {
 struct CtOp {
     uint8_t  type;
     uint8_t  flags;        // bit0 fill, bit1 has_region, bit2 has_align, bit3 has_timefmt
-    uint8_t  font;         // 0..4 (f8,f12,f16,f20,f24)
+    uint8_t  font;         // index into CT_FONTS (f8,f12,f16,f20,f24,nt16,nt30)
     uint8_t  scale;
     int16_t  x, y, w, h;   // primary rect / text origin
     int16_t  x2, y2;       // line end

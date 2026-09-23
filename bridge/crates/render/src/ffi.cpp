@@ -4,6 +4,8 @@
 #include "v2_state.h"
 #include "v2_runtime.h"
 #include "bundle_store.h"
+#include "font_asset.h"
+#include "font_store.h"
 #include "dev_log.h"
 #include <LittleFS.h>
 
@@ -11,19 +13,35 @@
 
 #include <cstring>
 #include <cstdio>
+#include <vector>
 
 SerialClass Serial;
 DevLogger DevLog;
+// The host engine does not need the device log; the no-op definitions below keep
+// every firmware source that logs (font store, bundle store, engine) linkable.
 void DevLogger::printf(const char *, ...) {}
+void DevLogger::println(const char *) {}
+void DevLogger::println() {}
+void DevLogger::print(const char *) {}
+String DevLogger::dump() { return String(); }
+void DevLogger::append(const char *, size_t) {}
 
 namespace {
 RgnSet g_rgn;
 // Single active compiled template (the firmware keeps exactly one per device).
 CtTemplate g_ct;
 bool g_ct_valid = false;
+int g_canvas_w = 200;
+int g_canvas_h = 200;
 }
 
 extern "C" {
+
+void codex_set_canvas(int w, int h) {
+    g_canvas_w = w;
+    g_canvas_h = h;
+    tplSetCanvas(w, h);
+}
 
 int codex_bundle_store_check(const char *json) {
     LittleFS.files.clear(); LittleFS.capacity = 1024 * 1024; LittleFS.writeBudget = -1;
@@ -77,8 +95,8 @@ int codex_bundle_store_check(const char *json) {
 int codex_render(const char *tmpl, const char *usage, const char *channel, const char *ip,
                  const char *sync_hhmm, int battery, const char *state, int offline_mins,
                  const char *mode, uint8_t *out, int out_len) {
-    if (!tmpl || !out || out_len < 200 * 200 / 8) return -2;
-    Paint_NewImage(out, 200, 200, ROTATE_0, WHITE);
+    if (!tmpl || !out || out_len < ((g_canvas_w + 7) / 8) * g_canvas_h) return -2;
+    Paint_NewImage(out, g_canvas_w, g_canvas_h, ROTATE_0, WHITE);
     Paint_Clear(WHITE);
     TplEnv env;
     env.channel = channel ? channel : "";
@@ -121,9 +139,9 @@ int codex_compile(const char *tmpl, char *err, int err_len) {
 int codex_render_compiled(const char *usage, const char *channel, const char *ip,
                           const char *sync_hhmm, int battery, const char *state,
                           int offline_mins, const char *mode, uint8_t *out, int out_len) {
-    if (!out || out_len < 200 * 200 / 8) return -2;
+    if (!out || out_len < ((g_canvas_w + 7) / 8) * g_canvas_h) return -2;
     if (!g_ct_valid) return -4;
-    Paint_NewImage(out, 200, 200, ROTATE_0, WHITE);
+    Paint_NewImage(out, g_canvas_w, g_canvas_h, ROTATE_0, WHITE);
     Paint_Clear(WHITE);
     TplEnv env;
     env.channel = channel ? channel : "";
@@ -206,6 +224,10 @@ int codex_ct_artifact(const char *source, const uint8_t *blob, int len,
 
 // Display-safety policy host bridge (refresh_policy.cpp): derive the semantic
 // regions once, then run decisions against caller-provided 1bpp framebuffers.
+void codex_set_panel(int w, int h) {
+    rgnSetPanel(w, h);
+}
+
 int codex_rgn_build(const char *tmpl) {
     if (!tmpl) return -1;
     bool ok = rgnBuild(String(tmpl), g_rgn);
@@ -360,8 +382,145 @@ int codex_dirty_window(const uint8_t *oldFrame, const uint8_t *newFrame,
     return 1;
 }
 
-int codex_rgn_dump(char *out, int out_len) {
-    if (!out || out_len <= 0) return -1;
+int codex_font_asset_check(const uint8_t *bytes, int len, char *out, int cap) {
+    if (!bytes || len <= 0 || !out || cap <= 0) return -1;
+    FontAssetInfo info;
+    String err;
+    if (!fontAssetValidate(bytes, (size_t)len, info, err)) {
+        std::snprintf(out, (size_t)cap, "err=%s", err.c_str());
+        return 0;
+    }
+    if (!fontAssetMatchesTarget(info, err)) {
+        std::snprintf(out, (size_t)cap, "err=%s", err.c_str());
+        return 0;
+    }
+    Note4PropFont view;
+    bool viewOk = fontAssetView(bytes, (size_t)len, info, view);
+    std::snprintf(out, (size_t)cap,
+                  "id=%s name=%s family=%s coverage=%s size=%u weight=%u bpp=%u pf=%s "
+                  "line=%u base=%u maxadv=%u blob=%u glyphs=%u filled=%u hint=%u bytes=%u view=%d",
+                  info.id, info.name, info.family, info.coverage, (unsigned)info.sizePx,
+                  (unsigned)info.weight, (unsigned)info.bpp,
+                  fontAssetPixelFormatName(info.pixelFormat), (unsigned)info.lineHeight,
+                  (unsigned)info.baseLine, (unsigned)info.maxAdv, (unsigned)info.blobBytes,
+                  (unsigned)info.glyphCount, (unsigned)info.filledGlyphs,
+                  (unsigned)info.hint, (unsigned)info.bytes, viewOk ? 1 : 0);
+    return 1;
+}
+
+// Font store (font_store.cpp): host tests drive the real device store, including
+// its atomic write path, its inventory and its Profile pruning.
+void codex_font_store_reset() {
+    LittleFS.files.clear();
+    LittleFS.dirs.clear();
+    LittleFS.capacity = 1024 * 1024;
+    LittleFS.writeBudget = -1;
+    fontStoreBegin("");
+}
+
+void codex_font_store_budget(long long budget) {
+    LittleFS.writeBudget = budget;
+}
+
+int codex_font_store_begin(const char *profile) {
+    return fontStoreBegin(profile) ? 1 : 0;
+}
+
+// 1 = stored, 0 = already present (no-op), -1 = rejected (`out` carries the reason).
+int codex_font_store_write(const uint8_t *bytes, int len, char *out, int cap) {
+    if (!bytes || len <= 0 || !out || cap <= 0) return -1;
+    FontAssetInfo info;
+    bool stored = false;
+    String err;
+    if (!fontStoreWrite(bytes, (size_t)len, info, stored, err)) {
+        std::snprintf(out, (size_t)cap, "err=%s", err.c_str());
+        return -1;
+    }
+    std::snprintf(out, (size_t)cap, "id=%s name=%s stored=%d", info.id, info.name,
+                  stored ? 1 : 0);
+    return stored ? 1 : 0;
+}
+
+int codex_font_store_inventory(char *out, int cap) {
+    if (!out || cap <= 0) return -1;
+    FontAssetInfo items[FONT_STORE_MAX_PER_PROFILE];
+    int bad = 0;
+    const int n = fontStoreInventory(items, FONT_STORE_MAX_PER_PROFILE, &bad);
+    int used = std::snprintf(out, (size_t)cap, "n=%d bad=%d", n, bad);
+    for (int i = 0; i < n && used < cap - 48; i++) {
+        used += std::snprintf(out + used, (size_t)(cap - used), " %s:%s:%u",
+                              items[i].id, items[i].name, (unsigned)items[i].bytes);
+    }
+    return n;
+}
+
+int codex_font_store_load(const char *id, char *out, int cap) {
+    if (!id || !out || cap <= 0) return -1;
+    std::vector<uint8_t> buf(FONT_ASSET_MAX_BYTES);
+    size_t len = 0;
+    FontAssetInfo info;
+    String err;
+    if (!fontStoreLoad(id, buf.data(), buf.size(), len, info, err)) {
+        std::snprintf(out, (size_t)cap, "err=%s", err.c_str());
+        return 0;
+    }
+    // Report a content digest as well: the test compares it against the file it
+    // pushed, which proves the round trip is byte-exact.
+    std::snprintf(out, (size_t)cap, "id=%s name=%s bytes=%u crc=%08x", info.id,
+                  info.name, (unsigned)len, v2Crc32(buf.data(), len));
+    return 1;
+}
+
+// `ids` is a comma-separated keep list (empty = keep nothing).
+int codex_font_store_prune(const char *ids, char *out, int cap) {
+    std::vector<String> keep;
+    if (ids && *ids) {
+        String list(ids);
+        int start = 0;
+        while (start <= (int)list.length()) {
+            int comma = list.indexOf(',', start);
+            if (comma < 0) comma = list.length();
+            keep.push_back(list.substring(start, comma));
+            start = comma + 1;
+        }
+    }
+    std::vector<const char *> pointers;
+    for (const String &k : keep) pointers.push_back(k.c_str());
+    const int removed = fontStorePrune(pointers.data(), (int)pointers.size());
+    int left = 0;
+    uint32_t bytes = 0;
+    fontStoreUsage(bytes, left);
+    std::snprintf(out, (size_t)cap, "removed=%d left=%d bytes=%u", removed, left,
+                  (unsigned)bytes);
+    return removed;
+}
+
+int codex_font_store_clear() {
+    return fontStoreClearProfile() ? 1 : 0;
+}
+
+int codex_font_store_usage(char *out, int cap) {
+    uint32_t bytes = 0;
+    int count = 0;
+    fontStoreUsage(bytes, count);
+    std::snprintf(out, (size_t)cap, "bytes=%u count=%d profile=%s", (unsigned)bytes,
+                  count, fontStoreProfile());
+    return count;
+}
+
+// Place raw bytes at the store path the device would use, bypassing validation.
+// Used to model a file that was damaged or mis-named outside the write path.
+int codex_font_store_put_raw(const char *id, const uint8_t *bytes, int len) {
+    if (!id || !bytes || len <= 0) return 0;
+    String path = String("/fonts/") + fontStoreProfile() + "/" + id + ".bin";
+    File f = LittleFS.open(path.c_str(), FILE_WRITE);
+    if (!f) return 0;
+    const size_t wrote = f.write(bytes, (size_t)len);
+    f.close();
+    return wrote == (size_t)len ? 1 : 0;
+}
+
+int codex_rgn_dump(char *out, int out_len) {    if (!out || out_len <= 0) return -1;
     int used = 0;
     used += std::snprintf(out + used, (size_t)(out_len - used), "[");
     for (uint8_t i = 0; i < g_rgn.n && used < out_len - 80; i++) {
