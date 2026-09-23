@@ -1,5 +1,43 @@
 # Codex Status 项目进度（交接文档）
 
+## Note4 同步、时钟与 96px 模板：2026-09-24
+
+- Bridge 的 Codex 数据源保持 `good`；此前 Note4 Profile 的四项配额绑定仍指向 `static1` 且 `sync_enabled=false`。已只对 Note4 改为 `codex` 并启用同步；实机在本轮模板发布后确认 `data_seq=16`、`applied_seq=16`、`display_state=displayed`。1.54 的旧 ABI1 能力仍被 Bridge 接受用于数据通道，当前该设备有待投递状态，未将 Note4 的 ACK 误算给它。
+- Bridge 投递按目标 MAC 解析设备链路，不再借用界面当前选择的设备 IP。MCP `template_save_v2` 现通知界面刷新模板缩略图；界面预览在未显式传入测试用量时使用 Bridge 当前缓存的用量信封。Note4 模板已通过 MCP 保存，`source_crc=11455c65`、`compiled_crc=442007ea`，并已显式发布完整 Bundle，作业 `4905c76c` 获 `applied/displayed` ACK。
+- Note4 B 经鉴权 BLE 令牌和单次 HTTP OTA 从 `0.18.19-note4-b`/`ota_1` 升至 `0.18.20-note4-b`/`ota_0`，原模板与作业在升级后保留；随后安装新 Bundle，设备报告 `compiler_abi=2`、`partial=true`、`commit_seq=257`。ROM 为 `artifacts/codex-status-0.18.20-note4-b-abi2.bin`，1,739,488 B，SHA256 `DDA7F214127814FC93B03B06D4C50818D77847CCCDF18938701E12C69C3F094B`；OTA 证据见 `artifacts/note4-ota-01820-b-abi2.json`。
+- 模板全部用量数字使用 `ntreg96`；weekly 独占居中，移除可见 `RESET` 但保留重置时间；蓝牙、Wi-Fi、连接图标和深睡 `zzz` 按状态显示。ABI2 的上限为 64 操作、16 位图资源；本模板用 57/16。六种 400×300 宿主预览的 JSON/编译/序列化像素差均为 0，Note4 B 构建成功。
+- **已知问题，按用户要求仅记录、不在本轮修正：Note4 时钟更新目前表现为全刷。** Note4 深睡会切断屏幕电源，深睡唤醒后可能失去局刷基线并走本地全刷回退；实机刷新质量、残影与后续局刷行为另行验收。时钟本地更新不依赖数据同步开关。
+- 其他现场与设计见 `project-workflow/note4-live-sync/`、`project-workflow/note4-template-96/`。
+
+## Bridge 后台运行：2026-09-23
+
+当前工作树的 `bridge-app` 经 `cargo build --offline -p bridge-app` 构建后，使用
+`tools/start-bridge.ps1` 在 Codex Desktop 进程外分离启动。界面范围修正后已重启：
+主进程 PID 46796，watchdog PID 15716；本地 `127.0.0.1:8766/mcp` 对 GET 返回
+405，表明端点已监听；
+启动后两进程持续存活。日志为 `artifacts/bridge-app-run.out` 和 `.err`，PID 文件在
+`artifacts/bridge-app-run.pid`。未发布模板、未改设备、未提交 Git。
+
+族下拉只有「1.54 黑白」「Note4」两个短名；模板页两族统一使用族 Profile：
+旧行界面、最多 8 项、启用开关、无初始项设置；单独模板库卡片已移除。启动时
+无损迁入旧 1.54 配置和唯一 Note4 设备配置，原文件/设备 Profile 保留，见
+`project-workflow/bridge-multi-device-ui/status.md`。按 MAC 的多设备路由与族发布菜单
+仍是待办，两个族的统一推送项暂禁用。
+
+## 新增待办：2026-09-23 — Bridge 多设备与模板页迁移
+
+用户要求 Bridge 同时支持多设备；把设备 Tab 的 v2 模板/Profile 操作迁至模板 Tab；
+「推送到设备」使用兼容设备子菜单选择明确目标。当前 Profile 对应类型只有一台兼容设备
+时，在按钮下方以小字 note 显示该设备。实现顺序、现有全局 `device_mac` 与 UI 首项选择
+问题、0/1/多设备验收见
+`project-workflow/bridge-multi-device-ui/plan.md`。本节是待办记录，尚未改 Bridge/UI、
+未部署、未实机验证。
+
+补充界面要求：在截图中「默认 ▾」Profile 下拉框左侧加入「族 ▾」；族明确以
+`render_target` 为键。选择族后只显示该族 Profile，并联动模板变体、预览和推送目标。
+同名 Profile 可分属不同族；切族不改设备。
+族内草稿与设备当前 Profile/PublishJob 的分离及旧配置迁移要求已补入上述计划。
+
 ## Bridge 显式 light 计划实机验证：2026-09-23 — 深睡后 BLE 会合唤醒通过
 
 Bridge 的 MCP/UI 显式 light 现先持久化正式 PowerPlan，离线时排队，在下一次

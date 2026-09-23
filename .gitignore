@@ -3,6 +3,7 @@
 bridge/target
 bridge/crates/app/gen
 bridge/target-note4-deploy/
+bridge/target-note4-sync/
 
 # Local working artifacts (camera captures, previews, logs)
 artifacts/
