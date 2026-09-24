@@ -15,6 +15,9 @@ use std::time::Duration;
 
 use crate::AppCtx;
 
+#[path = "wake_history.rs"]
+mod wake_history;
+
 /// Resolved per-device transport facts (token from the cached device token).
 pub struct DeviceLink {
     pub mac: String,
@@ -1366,6 +1369,17 @@ mod capability_tests {
         )
         .is_none());
     }
+
+    #[test]
+    fn explicit_target_mac_is_normalized_and_invalid_values_are_rejected() {
+        assert_eq!(
+            requested_mac(&json!({"mac": "70:04:1d:aa:bb:cc"})).unwrap(),
+            Some("70041DAABBCC".to_string())
+        );
+        assert!(requested_mac(&json!({"mac": "not-a-mac"})).is_err());
+        assert!(requested_mac(&json!({"mac": 42})).is_err());
+        assert_eq!(requested_mac(&json!({})).unwrap(), None);
+    }
 }
 
 /// Feed the device's own status digest (MAC-verified HTTP read) into the
@@ -1415,6 +1429,145 @@ pub enum BleOpportunity {
     Connected { mac: String, result: Result<(), String> },
 }
 
+/// Pull completed wake records only after the normal rendezvous work has been
+/// acknowledged. The short budget keeps diagnostics from extending the wake
+/// window or changing the result of a healthy plan/data exchange.
+async fn sync_wake_history(
+    link: &mut bridge_ble::V2Connection,
+    mac: &str,
+    status: &Value,
+) {
+    let Some(generation) = status.get("wake_generation").and_then(Value::as_u64) else {
+        // Older ROMs have no generation and therefore cannot be safely joined
+        // to a durable Bridge stream.
+        return;
+    };
+    let mut store = match wake_history::Store::open(mac, generation) {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::debug!(device_mac = %mac, wake_generation = generation, error = %error,
+                "wake history store unavailable");
+            return;
+        }
+    };
+    let now = now_secs() as i64;
+    if !store.due(now) {
+        return;
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut pages = 0;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() || pages >= 16 {
+            tracing::debug!(device_mac = %mac, wake_generation = generation,
+                cursor = store.cursor(), pages, "wake history sync budget exhausted");
+            return;
+        }
+        pages += 1;
+        let before = store.cursor();
+        let reply = match tokio::time::timeout(
+            remaining,
+            link.command(
+                "history",
+                json!({
+                    "since": before.min(u32::MAX as u64),
+                    "limit": wake_history::PAGE_LIMIT,
+                }),
+            ),
+        )
+        .await
+        {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(error)) => {
+                if is_history_unsupported(&error.to_string()) {
+                    let _ = store.mark_unsupported();
+                }
+                tracing::debug!(device_mac = %mac, wake_generation = generation, error = %error,
+                    "wake history sync skipped");
+                return;
+            }
+            Err(_) => {
+                tracing::debug!(device_mac = %mac, wake_generation = generation,
+                    cursor = before, "wake history sync timed out");
+                return;
+            }
+        };
+        if is_history_unsupported(
+            reply
+                .get("result")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        ) || is_history_unsupported(
+            reply
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        ) {
+            let _ = store.mark_unsupported();
+            return;
+        }
+        if reply.get("wake_generation").and_then(Value::as_u64) != Some(generation) {
+            tracing::debug!(device_mac = %mac, wake_generation = generation,
+                "wake history generation mismatch");
+            return;
+        }
+        let progress = match store.append_page(&reply, now_secs() as i64) {
+            Ok(progress) => progress,
+            Err(error) => {
+                tracing::debug!(device_mac = %mac, wake_generation = generation, error = %error,
+                    "wake history page rejected");
+                return;
+            }
+        };
+        if progress.more && progress.received == 0 && progress.cursor <= before {
+            tracing::debug!(device_mac = %mac, wake_generation = generation,
+                cursor = before, "wake history page made no progress");
+            return;
+        }
+        if !progress.more {
+            tracing::info!(event = "wake_history_sync", device_mac = %mac,
+                wake_generation = generation, records = progress.received,
+                cursor = progress.cursor, pages, "wake history synchronized");
+            return;
+        }
+    }
+}
+
+fn wake_history_sync_due(mac: &str, status: &Value) -> bool {
+    let Some(generation) = status.get("wake_generation").and_then(Value::as_u64) else {
+        return false;
+    };
+    wake_history::Store::open(mac, generation)
+        .map(|store| store.due(now_secs() as i64))
+        .unwrap_or(false)
+}
+
+fn is_history_unsupported(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains("unsupported")
+        || text.contains("unknown op")
+        || text.contains("unknown command")
+        || text.contains("not found")
+}
+
+async fn cache_device_token_if_missing(link: &bridge_ble::V2Connection, mac: &str) {
+    if bridge_mcp::load_runtime_device_token(mac).is_some() {
+        return;
+    }
+    match tokio::time::timeout(Duration::from_secs(1), link.request_device_token()).await {
+        Ok(Ok(token)) => match bridge_mcp::save_runtime_device_token(mac, &token) {
+            Ok(()) => tracing::info!(device_mac = %mac, "device token cached after BLE rendezvous"),
+            Err(error) => tracing::warn!(device_mac = %mac, error = %error,
+                "device token cache write failed; continuing rendezvous"),
+        },
+        Ok(Err(error)) => tracing::warn!(device_mac = %mac, error = %error,
+            "device token request failed; continuing rendezvous"),
+        Err(_) => tracing::warn!(device_mac = %mac, reason = "timeout",
+            "device token request timed out; continuing rendezvous"),
+    }
+}
+
 /// One real GATT rendezvous. Small snapshots stay on BLE; larger work receives
 /// a formal light plan and is then delivered by the HTTP cycle.
 pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportunity, String> {
@@ -1433,15 +1586,24 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
         Some((mac, link)) => (mac, link),
         None => return Ok(BleOpportunity::NoDevice),
     };
+    let still_registered = service(ctx).devices().into_iter().any(|device| {
+        device["legacy"].as_bool() == Some(false)
+            && device["device_mac"].as_str().and_then(DeviceIdentity::normalized_mac)
+                == Some(mac.clone())
+    });
+    // The firmware closes BLE 200 ms after the Plan ACK. Fetch before the
+    // ordinary timeout starts so a failed optional request cannot consume the
+    // Data/Plan exchange budget.
+    if still_registered {
+        cache_device_token_if_missing(&link, &mac).await;
+    }
     let work = async {
-        let still_registered = service(ctx).devices().into_iter().any(|device| {
-            device["legacy"].as_bool() == Some(false)
-                && device["device_mac"].as_str().and_then(DeviceIdentity::normalized_mac)
-                    == Some(mac.clone())
-        });
         if !still_registered {
             return Err(format!("connected BLE device {mac} is no longer registered as v2"));
         }
+        link.write_endpoint(&bridge_ble::lan_ip(), ctx.config.port, &ctx.config.token)
+            .await
+            .map_err(err_text)?;
         let state = link.command("status", json!({})).await.map_err(err_text)?;
         if state["result"] != "applied" {
             return Err("BLE status rejected".to_owned());
@@ -1500,8 +1662,12 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
                 remaining,
             )
             .map_err(err_text)?;
+        let mut plan_body = serde_json::to_value(&plan).map_err(err_text)?;
+        if wake_history_sync_due(&mac, &state) {
+            plan_body["history_sync_ms"] = json!(2500);
+        }
         let ack = link
-            .command("plan", serde_json::to_value(&plan).map_err(err_text)?)
+            .command("plan", plan_body)
             .await
             .map_err(err_text)?;
         let accepted = ack["result"] == "applied";
@@ -1539,12 +1705,19 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             transport = "ble",
             "v2 PowerPlan acknowledgement"
         );
-        Ok(())
+        Ok(state)
     };
-    let result = tokio::time::timeout(Duration::from_secs(10), work)
+    let normal_result = tokio::time::timeout(Duration::from_secs(10), work)
         .await
         .map_err(|_| "BLE rendezvous timed out".to_owned())
         .and_then(|r| r);
+    if let Ok(state) = &normal_result {
+        // Keep diagnostics outside the normal rendezvous deadline: a history
+        // timeout can never turn a successful status/data/plan exchange into
+        // a failed contact.
+        sync_wake_history(&mut link, &mac, state).await;
+    }
+    let result = normal_result.map(|_| ());
     link.close().await;
     Ok(BleOpportunity::Connected { mac, result })
 }
@@ -1672,7 +1845,7 @@ pub async fn tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, Stri
             family_profile_copy_from_device(ctx, mac, id, name)?
         }
         "platform_publish" => {
-            let mac = device_mac(ctx)?;
+            let mac = target_mac(ctx, args)?;
             publish(
                 ctx,
                 &mac,
@@ -1681,7 +1854,7 @@ pub async fn tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, Stri
             .await?
         }
         "platform_publish_preview" => {
-            let mac = device_mac(ctx)?;
+            let mac = target_mac(ctx, args)?;
             publish_preview(ctx, &mac)?
         }
         "platform_font_list" => font_list(ctx)?,
@@ -1693,11 +1866,11 @@ pub async fn tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, Stri
             font_import(ctx, path)?
         }
         "platform_publish_cancel" => {
-            let mac = device_mac(ctx)?;
+            let mac = target_mac(ctx, args)?;
             job_cancel(ctx, &mac)
         }
         "template_activate" => {
-            let mac = device_mac(ctx)?;
+            let mac = target_mac(ctx, args)?;
             let id = args
                 .get("id")
                 .and_then(|v| v.as_str())
@@ -1718,7 +1891,7 @@ pub async fn tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, Stri
         }
         "power_view_v2" => power_view(ctx),
         "power_plan" => {
-            let mac = device_mac(ctx)?;
+            let mac = target_mac(ctx, args)?;
             let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("auto");
             match mode {
                 "light" => request_light(ctx, &mac).await,
@@ -1750,13 +1923,13 @@ pub async fn tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, Stri
             }
         }
         "platform_status_refresh" => {
-            let mac = device_mac(ctx)?;
+            let mac = target_mac(ctx, args)?;
             refresh_status(ctx, &mac).await
         }
         // Explicit user/agent action: deliver pending data now instead of
         // waiting for the automatic cadence.
         "platform_push_now" => {
-            let mac = device_mac(ctx)?;
+            let mac = target_mac(ctx, args)?;
             deliver(ctx, &mac).await
         }
         "platform_recovery" => {
@@ -1766,6 +1939,29 @@ pub async fn tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, Stri
         other => return Err(format!("unknown platform tool: {other}")),
     };
     serde_json::to_string_pretty(&value).map_err(err_text)
+}
+
+fn requested_mac(args: &Value) -> Result<Option<String>, String> {
+    let Some(value) = args.get("mac") else {
+        return Ok(None);
+    };
+    let raw = value.as_str().ok_or("mac must be a string")?;
+    DeviceIdentity::normalized_mac(raw)
+        .map(Some)
+        .ok_or_else(|| "invalid device MAC".to_string())
+}
+
+fn target_mac(ctx: &AppCtx, args: &Value) -> Result<String, String> {
+    let Some(mac) = requested_mac(args)? else {
+        return device_mac(ctx);
+    };
+    let device = service(ctx)
+        .device_get(&mac)
+        .ok_or_else(|| format!("device {mac} is not registered"))?;
+    if device["legacy"].as_bool().unwrap_or(true) {
+        return Err(format!("device {mac} is registered as legacy"));
+    }
+    Ok(mac)
 }
 
 fn device_mac(ctx: &AppCtx) -> Result<String, String> {

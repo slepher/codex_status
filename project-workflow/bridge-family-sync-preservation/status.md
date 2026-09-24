@@ -1,0 +1,7 @@
+# Family publish preserves device sync policy — 2026-09-24
+
+Read-only state inspection found the 1.54 family draft migrated at 2026-09-23 22:50:11 +08 with `sync_enabled:false`. Template-tab publish at 2026-09-24 14:42:49 +08 copied that hidden family value into the 1.54 device Profile. The persisted records do not prove whether the user had deliberately chosen the device's previous sync setting; the flow can silently overwrite it.
+
+`confirmFamilyPublish()` now copies `sync_enabled` and `full_sync_s` from the selected target device Profile, defaulting to `false` and `3600` only when no device Profile exists. It still saves template IDs/bindings then explicitly publishes the Bundle. Inline browser script parsing, focused target-sync-on/off/no-profile simulations, and `git diff --check` passed. This source fix has not been built into or loaded by the running main Bridge.
+
+Subsequently, the user explicitly requested `sync_enabled=true` for the 1.54 device. The running Bridge MCP `profile_save_v2` saved only that device Profile and returned `published:false`; persisted readback confirms true with `mini,quad`, bindings, and `full_sync_s=3600` preserved. The family draft remains false. Until the UI source fix is deployed, publishing again from the running template tab may copy false back to the device. No device ACK followed: HTTP remained unreachable, BLE rendezvous failed, and the older Bundle job is still active.

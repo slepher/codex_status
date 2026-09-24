@@ -530,14 +530,15 @@
     if (!familyProfile || !mac || !ids.length) return;
     try {
       const { devices = [] } = await invoke('platform_devices');
-      if (!devices.some(d => d.device_mac === mac && !d.legacy && d.capabilities?.render_target === selectedRenderTarget)) {
+      const device = devices.find(d => d.device_mac === mac && !d.legacy && d.capabilities?.render_target === selectedRenderTarget);
+      if (!device) {
         throw new Error('目标设备已变化，请重新选择');
       }
       const profile = {
         device_mac: mac, template_ids: ids, render_target: selectedRenderTarget,
         font_ids: familyProfile.font_ids || {}, initial_active_id: ids[0],
         bindings: (familyProfile.bindings || []).filter(b => !b.template_id || ids.includes(b.template_id)),
-        sync_enabled: !!familyProfile.sync_enabled, full_sync_s: familyProfile.full_sync_s || 3600,
+        sync_enabled: device.profile?.sync_enabled ?? false, full_sync_s: device.profile?.full_sync_s ?? 3600,
       };
       await invoke('platform_profile_save', { profile });
       const result = await invoke('platform_publish', { mac });

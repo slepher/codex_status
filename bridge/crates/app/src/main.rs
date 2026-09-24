@@ -1011,7 +1011,16 @@ async fn post_claim_once(
     let host = lan_ip();
     let port = ctx.config.port;
     post_claim_to_endpoint(
-        endpoint, target_mac, token, &bridge_id, &name, &host, port, force, release,
+        endpoint,
+        target_mac,
+        token,
+        &ctx.config.token,
+        &bridge_id,
+        &name,
+        &host,
+        port,
+        force,
+        release,
     )
     .await
 }
@@ -1019,7 +1028,8 @@ async fn post_claim_once(
 async fn post_claim_to_endpoint(
     endpoint: &str,
     target_mac: &str,
-    token: &str,
+    claim_token: &str,
+    v2_token: &str,
     bridge_id: &str,
     name: &str,
     host: &str,
@@ -1038,27 +1048,46 @@ async fn post_claim_to_endpoint(
         bridge_core::device::fetch(&status_endpoint, Duration::from_secs(2))
     })
     .await
-    .map_err(|e| {
-        tracing::warn!(event = "preflight_result", device_mac = %expected_mac,
-            elapsed_ms = started.elapsed().as_millis() as u64, error_category = "connection",
-            "claim identity preflight failed");
-        ClaimError::Other(format!("device identity check failed: {e}"))
-    })?
-    .map_err(|e| {
-        tracing::warn!(event = "preflight_result", device_mac = %expected_mac,
-            elapsed_ms = started.elapsed().as_millis() as u64, error_category = "http_or_status",
-            "claim identity preflight failed");
-        ClaimError::Other(format!("device identity check failed: {e}"))
-    })?;
-    let actual_mac = status
-        .get("MAC")
-        .and_then(bridge_core::platform::model::DeviceIdentity::normalized_mac)
-        .ok_or_else(|| {
-            tracing::warn!(event = "preflight_result", device_mac = %expected_mac,
-                elapsed_ms = started.elapsed().as_millis() as u64, error_category = "identity_mismatch",
-                "claim identity preflight rejected");
-            ClaimError::Other("device status has no valid MAC; refusing claim".into())
-        })?;
+    .map_err(|e| ClaimError::Other(format!("device identity check failed: {e}")))?;
+    let actual_mac = status.ok().and_then(|status| {
+        status
+            .get("MAC")
+            .and_then(bridge_core::platform::model::DeviceIdentity::normalized_mac)
+    });
+    let actual_mac = match actual_mac {
+        Some(mac) => mac,
+        None => {
+            tracing::info!(event = "preflight_fallback", device_mac = %expected_mac,
+                operation = "/v2/status", "using authenticated v2 status for claim identity");
+            let v2_endpoint = endpoint.clone();
+            let v2_token = v2_token.to_owned();
+            let v2_status = tokio::task::spawn_blocking(move || {
+                bridge_core::v2_client::status(
+                    &v2_endpoint,
+                    &v2_token,
+                    Duration::from_secs(2),
+                )
+            })
+            .await
+            .map_err(|e| ClaimError::Other(format!("device identity check failed: {e}")))?
+            .map_err(|e| {
+                tracing::warn!(event = "preflight_result", device_mac = %expected_mac,
+                    elapsed_ms = started.elapsed().as_millis() as u64, error_category = "http_or_status",
+                    "claim identity preflight failed");
+                ClaimError::Other(format!("device identity check failed: {e}"))
+            })?;
+            v2_status
+                .get("device_mac")
+                .and_then(Value::as_str)
+                .and_then(bridge_core::platform::model::DeviceIdentity::normalized_mac)
+                .ok_or_else(|| {
+                    tracing::warn!(event = "preflight_result", device_mac = %expected_mac,
+                        elapsed_ms = started.elapsed().as_millis() as u64, error_category = "identity_mismatch",
+                        "claim identity preflight rejected");
+                    ClaimError::Other("authenticated device status has no valid MAC; refusing claim".into())
+                })?
+        }
+    };
     if actual_mac != expected_mac {
         tracing::warn!(event = "preflight_result", device_mac = %expected_mac,
             reported_mac = %actual_mac, elapsed_ms = started.elapsed().as_millis() as u64,
@@ -1089,7 +1118,7 @@ async fn post_claim_to_endpoint(
     tracing::info!(event = "send", device_mac = %expected_mac, operation = "/claim",
         "claim request");
     let claim_started = std::time::Instant::now();
-    let resp = match client.post(&url).bearer_auth(token).send().await {
+    let resp = match client.post(&url).bearer_auth(claim_token).send().await {
         Ok(resp) => resp,
         Err(error) => {
             tracing::warn!(event = "result", device_mac = %expected_mac, operation = "/claim",
@@ -1463,31 +1492,55 @@ async fn device_tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, S
             Ok(result.to_string())
         }
         "device_claim" => {
-            ctx.yielded.store(false, Ordering::SeqCst);
             let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
-            // Explicit user action: let the device decide (no stale cache).
-            let owner = post_claim_explicit(ctx, force, false)
+            let requested_mac = match args.get("mac") {
+                None => None,
+                Some(value) => Some(
+                    bridge_core::platform::model::DeviceIdentity::normalized_mac(
+                        value
+                            .as_str()
+                            .ok_or_else(|| "mac must be a string".to_string())?,
+                    )
+                    .ok_or_else(|| "invalid device MAC".to_string())?,
+                ),
+            };
+            let Some(mac) = requested_mac else {
+                ctx.yielded.store(false, Ordering::SeqCst);
+                // Explicit user action: let the device decide (no stale cache).
+                let owner = post_claim_explicit(ctx, force, false)
+                    .await
+                    .map_err(claim_error_text)?;
+                record_legacy_claim_success(ctx, owner.clone());
+                if let Some(mac) = ctx
+                    .device_mac
+                    .lock()
+                    .unwrap()
+                    .as_deref()
+                    .and_then(bridge_core::platform::model::DeviceIdentity::normalized_mac)
+                {
+                    update_v2_claim_cache(
+                        &mut ctx.v2_status_cache.lock().unwrap(),
+                        &mac,
+                        owner.clone(),
+                        now_secs(),
+                        false,
+                    );
+                }
+                ctx.device_ip_dirty.store(true, Ordering::SeqCst);
+                ctx.force_push.notify_one();
+                return Ok(json!({"owner": owner, "yielded": false}).to_string());
+            };
+            let owner = post_claim_for_mac(ctx, force, false, &mac)
                 .await
                 .map_err(claim_error_text)?;
-            record_legacy_claim_success(ctx, owner.clone());
-            if let Some(mac) = ctx
-                .device_mac
-                .lock()
-                .unwrap()
-                .as_deref()
-                .and_then(bridge_core::platform::model::DeviceIdentity::normalized_mac)
-            {
-                update_v2_claim_cache(
-                    &mut ctx.v2_status_cache.lock().unwrap(),
-                    &mac,
-                    owner.clone(),
-                    now_secs(),
-                    false,
-                );
-            }
-            ctx.device_ip_dirty.store(true, Ordering::SeqCst);
-            ctx.force_push.notify_one();
-            Ok(json!({"owner": owner, "yielded": false}).to_string())
+            update_v2_claim_cache(
+                &mut ctx.v2_status_cache.lock().unwrap(),
+                &mac,
+                owner.clone(),
+                now_secs(),
+                false,
+            );
+            Ok(json!({"owner": owner, "mac": mac, "yielded": false}).to_string())
         }
         "device_release" => {
             let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -3885,6 +3938,60 @@ mod claim_target_tests {
         (endpoint, worker)
     }
 
+    fn v2_fallback_server(
+        mac: &'static str,
+        expect_claim: bool,
+    ) -> (String, thread::JoinHandle<bool>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let worker = thread::spawn(move || {
+            for path in ["/status.json", "/"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                assert!(read_request(&mut stream).starts_with(&format!("GET {path} ")));
+                let body = "unavailable";
+                write!(
+                    stream,
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_request(&mut stream);
+            assert!(request.starts_with("GET /v2/status "));
+            assert!(request.contains("Authorization: Bearer endpoint-token\r\n"));
+            let body = format!(
+                r#"{{"device_mac":"{mac}","session_nonce":"0123456789abcdef0123456789abcdef"}}"#
+            );
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            drop(stream);
+
+            if expect_claim {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_request(&mut stream);
+                let claimed = request.starts_with("POST /claim?");
+                let body = "{}";
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{body}"
+                )
+                .unwrap();
+                claimed
+            } else {
+                listener.set_nonblocking(true).unwrap();
+                thread::sleep(Duration::from_millis(100));
+                matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+            }
+        });
+        (endpoint, worker)
+    }
+
     #[tokio::test]
     async fn claim_refuses_wrong_target_mac_without_posting() {
         let (endpoint, server) = status_server("AA:BB:CC:DD:EE:02", false);
@@ -3892,6 +3999,7 @@ mod claim_target_tests {
             &endpoint,
             "AA:BB:CC:DD:EE:01",
             "token",
+            "endpoint-token",
             "bridge",
             "name",
             "127.0.0.1",
@@ -3912,6 +4020,7 @@ mod claim_target_tests {
             &endpoint,
             "aa-bb-cc-dd-ee-01",
             "token",
+            "endpoint-token",
             "bridge",
             "name",
             "127.0.0.1",
@@ -3922,6 +4031,48 @@ mod claim_target_tests {
         .await;
 
         assert!(matches!(result, Ok((code, _)) if code == reqwest::StatusCode::OK));
+        assert!(server.join().unwrap());
+    }
+
+    #[tokio::test]
+    async fn claim_falls_back_to_authenticated_v2_status_before_posting() {
+        let (endpoint, server) = v2_fallback_server("AA:BB:CC:DD:EE:01", true);
+        let result = post_claim_to_endpoint(
+            &endpoint,
+            "aa-bb-cc-dd-ee-01",
+            "token",
+            "endpoint-token",
+            "bridge",
+            "name",
+            "127.0.0.1",
+            8765,
+            false,
+            false,
+        )
+        .await;
+
+        assert!(matches!(result, Ok((code, _)) if code == reqwest::StatusCode::OK));
+        assert!(server.join().unwrap());
+    }
+
+    #[tokio::test]
+    async fn claim_refuses_wrong_v2_target_mac_without_posting() {
+        let (endpoint, server) = v2_fallback_server("AA:BB:CC:DD:EE:02", false);
+        let result = post_claim_to_endpoint(
+            &endpoint,
+            "AA:BB:CC:DD:EE:01",
+            "token",
+            "endpoint-token",
+            "bridge",
+            "name",
+            "127.0.0.1",
+            8765,
+            true,
+            false,
+        )
+        .await;
+
+        assert!(result.is_err());
         assert!(server.join().unwrap());
     }
 }

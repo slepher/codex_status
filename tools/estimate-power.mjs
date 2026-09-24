@@ -27,6 +27,7 @@ const I = {
   cpu_mA: { low: 20, base: 30, high: 40 },
   ble_mA: { low: 93, base: 120, high: 176 },
 };
+const WAKE_NAMES = { 0: 'light', 1: 'thin', 2: 'rendezvous-sleep', 3: 'rendezvous-light', 4: 'net' };
 
 const url = `http://${ip}/status.json`;
 let status;
@@ -37,6 +38,61 @@ try {
   process.exit(1);
 }
 
+function numberAt(value, ...paths) {
+  for (const path of paths) {
+    let current = value;
+    for (const part of path.split('.')) current = current?.[part];
+    if (Number.isFinite(current)) return Number(current);
+  }
+  return 0;
+}
+
+function recordsFromHistory(value) {
+  if (Array.isArray(value)) return value;
+  if (Array.isArray(value?.records)) return value.records;
+  if (Array.isArray(value?.history)) return value.history;
+  return [];
+}
+
+function summarizeHistory(records) {
+  const groups = new Map();
+  let v2Count = 0;
+  let v2AwakeMs = 0;
+  let v2BleMs = 0;
+  let v2RenderMs = 0;
+  for (const rec of records) {
+    const isV2 = rec?.format === 2 && typeof rec.wake_type === 'string';
+    const isLegacyWake = rec?.ev === 7;
+    if (!isV2 && !isLegacyWake) continue;
+    const name = isV2 ? rec.wake_type : (WAKE_NAMES[rec.aux] || `aux${rec.aux}`);
+    const ms = isV2 ? numberAt(rec, 'awake_ms', 'timing.awake_ms', 'timings.awake_ms') : Number(rec.dur_ms || 0);
+    const g = groups.get(name) || { n: 0, ms: 0, renders: 0, src: new Map(), results: new Map() };
+    g.n++;
+    g.ms += ms;
+    g.renders += isV2 ? numberAt(rec, 'render_ms', 'timing.render_ms', 'timings.render_ms') > 0 ? 1 : 0 : rec.aux === 1 ? 1 : 0;
+    const source = isV2 ? (rec.transport || 'history-v2') : (rec.src ?? 'unknown');
+    g.src.set(source, (g.src.get(source) || 0) + 1);
+    if (isV2 && typeof rec.result === 'string') g.results.set(rec.result, (g.results.get(rec.result) || 0) + 1);
+    groups.set(name, g);
+    if (isV2) {
+      v2Count++;
+      v2AwakeMs += ms;
+      v2BleMs += numberAt(rec, 'ble_ms', 'timing.ble_ms', 'timings.ble_ms');
+      v2RenderMs += numberAt(rec, 'render_ms', 'timing.render_ms', 'timings.render_ms');
+    }
+  }
+  return { groups, v2Count, v2AwakeMs, v2BleMs, v2RenderMs };
+}
+
+let historyRecords = [];
+try {
+  const history = await (await fetch(`http://${ip}/history`, { signal: AbortSignal.timeout(10000) })).json();
+  historyRecords = recordsFromHistory(history);
+} catch {
+  // History is optional; the cumulative status totals remain authoritative.
+}
+const historySummary = summarizeHistory(historyRecords);
+
 const deep = status.deep || {};
 const acc = {
   cycles: deep.acc_cycles || 0,
@@ -44,6 +100,15 @@ const acc = {
   bleMs: deep.acc_ble_ms || 0,
   renderMs: deep.acc_render_ms || 0,
 };
+
+// New format-2 history can still provide a useful estimate while an older
+// ROM has not populated cumulative deep-cycle counters yet.
+if (!acc.cycles && historySummary.v2Count) {
+  acc.cycles = historySummary.v2Count;
+  acc.awakeMs = historySummary.v2AwakeMs;
+  acc.bleMs = historySummary.v2BleMs;
+  acc.renderMs = historySummary.v2RenderMs;
+}
 
 if (!acc.cycles) {
   console.error('deep.acc_cycles = 0: no completed deep cycle since the last RTC reset.');
@@ -87,30 +152,14 @@ if (status.light_sleep_ms !== undefined) {
   console.log(`current boot light-sleep share: ${f(duty, 1)}% (${status.light_sleep_ms} of ${status.awake_ms} ms awake)`);
 }
 
-// Per-wake-type durations from the device history ring (ev=7 HIST_WAKE):
-// the acc_* totals mix thin clock wakes with rendezvous/net cycles, so the
+// Per-wake-type durations from either format-2 records or legacy ev=7 wakes.
+// The acc_* totals mix thin clock wakes with rendezvous/net cycles, so the
 // rendezvous-only average is the number to use for the Plan C budget.
-const WAKE_NAMES = { 0: 'light', 1: 'thin', 2: 'rendezvous-sleep', 3: 'rendezvous-light', 4: 'net' };
-try {
-  const hist = await (await fetch(`http://${ip}/history`, { signal: AbortSignal.timeout(10000) })).json();
-  const groups = new Map();
-  for (const rec of hist) {
-    if (rec.ev !== 7) continue;
-    const name = WAKE_NAMES[rec.aux] || `aux${rec.aux}`;
-    const g = groups.get(name) || { n: 0, ms: 0, renders: 0, src: new Map() };
-    g.n++;
-    g.ms += rec.dur_ms;
-    g.renders += rec.aux === 1 ? 1 : 0; // thin wakes are single-render
-    g.src.set(rec.src, (g.src.get(rec.src) || 0) + 1);
-    groups.set(name, g);
-  }
-  console.log('per wake result (ev=7):');
-  for (const [name, g] of groups) {
-    const src = [...g.src.entries()].map(([s, n]) => `${['none', 'ble', 'rtc'][s] || s}:${n}`).join(' ');
-    console.log(`  ${name.padEnd(17)} n=${g.n}  avg ${f(g.ms / g.n / 1000, 2)}s  (src ${src})`);
-  }
-} catch {
-  // history is optional; the acc_* estimate above still stands
+console.log('per wake result (format-2 or legacy ev=7):');
+for (const [name, g] of historySummary.groups) {
+  const src = [...g.src.entries()].map(([s, n]) => `${['none', 'ble', 'rtc'][s] || s}:${n}`).join(' ');
+  const results = g.results.size ? ` results=${[...g.results.entries()].map(([result, n]) => `${result}:${n}`).join(',')}` : '';
+  console.log(`  ${name.padEnd(17)} n=${g.n}  avg ${f(g.ms / g.n / 1000, 2)}s  (src ${src})${results}`);
 }
 
 console.log('note: time x datasheet current, not a measurement; cross-check with a USB power meter or PPK2.');

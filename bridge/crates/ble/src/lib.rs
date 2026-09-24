@@ -412,6 +412,8 @@ impl Pusher {
             ble_address = %address,
             rssi = ?properties.rssi,
             decision = if is_match { "target_candidate" } else { "ignored_non_target" },
+            wake_association = "uncertain",
+            association_basis = "advertisement",
             "BLE CodexStatus advertisement"
         );
         is_match.then(|| peripheral.clone())
@@ -487,6 +489,14 @@ impl Pusher {
 
     fn peer_bonded(info: &serde_json::Value) -> bool {
         info.get("peerBonded").and_then(|v| v.as_bool()) == Some(true)
+    }
+
+    fn peer_encrypted_bonded(info: &serde_json::Value) -> bool {
+        Self::peer_bonded(info) && info.get("peerEncrypted").and_then(|v| v.as_bool()) == Some(true)
+    }
+
+    fn valid_device_token(token: &str) -> bool {
+        token.len() == 32 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
     }
 
     fn info_matches_mac(info: &serde_json::Value, expected_mac: &str) -> bool {
@@ -593,6 +603,47 @@ impl Pusher {
         Ok(())
     }
 
+    async fn request_token_on_peripheral(peripheral: &Peripheral) -> Result<String> {
+        let status = peripheral
+            .characteristics()
+            .into_iter()
+            .find(|c| c.uuid == Self::uuid(CHR_STATUS))
+            .ok_or_else(|| anyhow!("status characteristic missing"))?;
+        peripheral
+            .subscribe(&status)
+            .await
+            .context("subscribe status")?;
+        let mut stream = peripheral.notifications().await?;
+        Self::write_json(peripheral, CHR_AUTH, br#"{"cmd":"token"}"#).await?;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout_at(deadline, stream.next()).await {
+                Ok(Some(ValueNotification { uuid, value, .. })) => {
+                    if uuid != Self::uuid(CHR_STATUS) {
+                        continue;
+                    }
+                    let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&value) else {
+                        continue;
+                    };
+                    if doc.get("ack").and_then(|v| v.as_str()) != Some("auth")
+                        || doc.get("ok").and_then(|v| v.as_bool()) != Some(true)
+                    {
+                        continue;
+                    }
+                    let token = doc
+                        .get("token")
+                        .and_then(|v| v.as_str())
+                        .filter(|token| Self::valid_device_token(token))
+                        .ok_or_else(|| anyhow!("device token response was invalid"))?;
+                    return Ok(token.to_string());
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        Err(anyhow!("device token response timed out"))
+    }
+
     async fn log_notifications(peripheral: &Peripheral) -> Result<tokio::task::JoinHandle<()>> {
         let status = peripheral
             .characteristics()
@@ -615,13 +666,23 @@ impl Pusher {
     }
 
     async fn push_endpoint(&self, peripheral: &Peripheral) -> Result<()> {
-        let payload = json!({
+        Self::write_json(
+            peripheral,
+            CHR_ENDPOINT,
+            &Self::endpoint_payload(&self.cfg.host, self.cfg.port, &self.cfg.token),
+        )
+        .await
+    }
+
+    fn endpoint_payload(host: &str, port: u16, token: &str) -> Vec<u8> {
+        json!({
             "schema": 1,
-            "host": self.cfg.host,
-            "port": self.cfg.port,
-            "token": self.cfg.token,
-        });
-        Self::write_json(peripheral, CHR_ENDPOINT, payload.to_string().as_bytes()).await
+            "host": host,
+            "port": port,
+            "token": token,
+        })
+        .to_string()
+        .into_bytes()
     }
 
     async fn push_usage(&self, peripheral: &Peripheral) -> Result<()> {
@@ -812,47 +873,18 @@ impl Pusher {
             let _ = peripheral.disconnect().await;
             bail!("BLE device Wi-Fi MAC does not match target");
         }
+        if !Self::peer_encrypted_bonded(&info) {
+            let _ = peripheral.disconnect().await;
+            bail!("BLE device link is not encrypted and bonded");
+        }
         tracing::info!(
             scan_id,
             verified_mac = expected_mac,
             "BLE device identity verified"
         );
-        let status = peripheral
-            .characteristics()
-            .into_iter()
-            .find(|c| c.uuid == Self::uuid(CHR_STATUS))
-            .ok_or_else(|| anyhow!("status characteristic missing"))?;
-        peripheral
-            .subscribe(&status)
-            .await
-            .context("subscribe status")?;
-        let mut stream = peripheral.notifications().await?;
-        Self::write_json(&peripheral, CHR_AUTH, br#"{"cmd":"token"}"#).await?;
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        let mut token: Option<String> = None;
-        while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout_at(deadline, stream.next()).await {
-                Ok(Some(ValueNotification { uuid, value, .. })) => {
-                    if uuid != Self::uuid(CHR_STATUS) {
-                        continue;
-                    }
-                    let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&value) else {
-                        continue;
-                    };
-                    if doc.get("ack").and_then(|v| v.as_str()) != Some("auth") {
-                        continue;
-                    }
-                    if let Some(value) = doc.get("token").and_then(|v| v.as_str()) {
-                        token = Some(value.to_string());
-                    }
-                    break;
-                }
-                Ok(None) | Err(_) => break,
-            }
-        }
+        let token = Self::request_token_on_peripheral(&peripheral).await;
         let _ = peripheral.disconnect().await;
-        token.ok_or_else(|| anyhow!("device token response timed out"))
+        token
     }
 
     /// One connect → push → disconnect cycle. Returns the device info JSON so
@@ -937,9 +969,39 @@ pub struct V2Connection {
     bridge_id: String,
     nonce: String,
     device_mac: String,
+    auth_ready: bool,
+    wake_identity: Option<WakeIdentity>,
+    wake_cause: String,
+    device_last_stage: String,
     /// Stage timings (`find`, `connect`, `discover`, `info`, one entry per
     /// command) for the Plan C wake-budget evidence.
     timings: Vec<(String, u128)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WakeIdentity {
+    generation: u64,
+    seq: u64,
+}
+
+fn wake_identity(value: &serde_json::Value) -> Option<WakeIdentity> {
+    Some(WakeIdentity {
+        generation: value.get("wake_generation")?.as_u64()?,
+        seq: value.get("wake_seq")?.as_u64()?,
+    })
+}
+
+fn text_field(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+}
+
+fn identity_text(identity: Option<WakeIdentity>) -> (String, String) {
+    identity.map_or_else(
+        || ("unknown".to_owned(), "unknown".to_owned()),
+        |identity| (identity.generation.to_string(), identity.seq.to_string()),
+    )
 }
 
 impl V2Connection {
@@ -1049,7 +1111,17 @@ impl V2Connection {
             );
             bail!("BLE device identity mismatch");
         };
-        tracing::info!(scan_id, verified_mac = %authorized_mac, "BLE device identity verified");
+        let initial_wake_identity = wake_identity(&info);
+        let (wake_generation, wake_seq) = identity_text(initial_wake_identity);
+        tracing::info!(
+            scan_id,
+            verified_mac = %authorized_mac,
+            wake_generation = %wake_generation,
+            wake_seq = %wake_seq,
+            wake_association = if initial_wake_identity.is_some() { "confirmed" } else { "incomplete" },
+            association_basis = "authenticated_info",
+            "BLE device identity verified and wake contact associated"
+        );
         if info["rendezvous_v"].as_u64().unwrap_or(0) < 2 {
             let _ = peripheral.disconnect().await;
             bail!("device BLE rendezvous is disabled");
@@ -1069,9 +1141,35 @@ impl V2Connection {
                 bridge_id: bridge_id.to_owned(),
                 nonce: String::new(),
                 device_mac,
+                auth_ready: Pusher::peer_encrypted_bonded(&info),
+                wake_identity: initial_wake_identity,
+                wake_cause: text_field(&info, &["wake_cause", "wake_type"])
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                device_last_stage: text_field(&info, &["wake_stage", "last_stage", "stage"])
+                    .unwrap_or_else(|| "unknown".to_owned()),
                 timings,
             },
         )))
+    }
+
+    /// Refresh the endpoint credentials on this already MAC-verified link.
+    /// The caller must verify the registered target before invoking this.
+    pub async fn write_endpoint(&self, host: &str, port: u16, token: &str) -> Result<()> {
+        Pusher::write_json(
+            &self.peripheral,
+            CHR_ENDPOINT,
+            &Pusher::endpoint_payload(host, port, token),
+        )
+        .await
+    }
+
+    /// Request the device operation token on this already MAC-verified link.
+    /// The link must have reported both a persistent bond and encryption.
+    pub async fn request_device_token(&self) -> Result<String> {
+        if !self.auth_ready {
+            bail!("BLE device link is not encrypted and bonded");
+        }
+        Pusher::request_token_on_peripheral(&self.peripheral).await
     }
 
     pub async fn command(
@@ -1108,6 +1206,7 @@ impl V2Connection {
         let status = match status {
             Ok(status) => status,
             Err(error) => {
+                self.log_failure(&id, op, "status_characteristic", "characteristic_missing");
                 tracing::warn!(device_mac = %self.device_mac, op, stage = "status_characteristic", category = "characteristic_missing", duration_ms = lookup_start.elapsed().as_millis(), "BLE ACK characteristic lookup failed");
                 return Err(error);
             }
@@ -1115,26 +1214,68 @@ impl V2Connection {
         tracing::info!(device_mac = %self.device_mac, op, characteristic = "status", duration_ms = lookup_start.elapsed().as_millis(), "BLE ACK characteristic found");
         let write_start = Instant::now();
         if let Err(error) = Pusher::write_json(&self.peripheral, CHR_TPL_CTRL, &bytes).await {
+            self.log_failure(&id, op, "write", "write_failed");
             tracing::warn!(device_mac = %self.device_mac, op, request_id = %id, stage = "write", category = error_category("write"), duration_ms = write_start.elapsed().as_millis(), "BLE command write failed");
             return Err(error);
         }
-        tracing::info!(device_mac = %self.device_mac, op, request_id = %id, duration_ms = write_start.elapsed().as_millis(), "BLE command written");
+        let (write_wake_generation, write_wake_seq) = identity_text(self.wake_identity);
+        tracing::info!(
+            device_mac = %self.device_mac,
+            op,
+            request_id = %id,
+            wake_generation = %write_wake_generation,
+            wake_seq = %write_wake_seq,
+            wake_association = if self.wake_identity.is_some() { "confirmed" } else { "incomplete" },
+            duration_ms = write_start.elapsed().as_millis(),
+            "BLE command written"
+        );
         let started = Instant::now();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             let raw = match tokio::time::timeout_at(deadline, self.peripheral.read(&status)).await {
                 Ok(Ok(raw)) => raw,
                 Ok(Err(_)) => {
+                    self.log_failure(&id, op, "ack", "read_failed");
                     tracing::warn!(device_mac = %self.device_mac, op, request_id = %id, stage = "ack", category = "read_failed", duration_ms = started.elapsed().as_millis(), "BLE command ACK read failed");
                     return Err(anyhow!("v2 BLE ACK read failed"));
                 }
                 Err(_) => {
+                    self.log_failure(&id, op, "ack", "timeout");
                     tracing::warn!(device_mac = %self.device_mac, op, request_id = %id, stage = "ack", category = error_category("ack"), duration_ms = started.elapsed().as_millis(), "BLE command ACK failed");
                     return Err(anyhow!("v2 BLE ACK timed out"));
                 }
             };
             if let Ok(reply) = serde_json::from_slice::<serde_json::Value>(&raw) {
                 if reply["ack"] == "v2" && reply["request_id"] == id {
+                    let ack_identity = wake_identity(&reply);
+                    if let (Some(expected), Some(actual)) = (self.wake_identity, ack_identity) {
+                        if expected != actual {
+                            let (expected_generation, expected_seq) = identity_text(Some(expected));
+                            let (actual_generation, actual_seq) = identity_text(Some(actual));
+                            tracing::warn!(
+                                device_mac = %self.device_mac,
+                                op,
+                                request_id = %id,
+                                expected_wake_generation = %expected_generation,
+                                expected_wake_seq = %expected_seq,
+                                ack_wake_generation = %actual_generation,
+                                ack_wake_seq = %actual_seq,
+                                stage = "wake_identity",
+                                category = "mismatch",
+                                "BLE ACK wake identity differs from authenticated INFO"
+                            );
+                        }
+                    }
+                    if self.wake_identity.is_none() {
+                        self.wake_identity = ack_identity;
+                    }
+                    if let Some(cause) = text_field(&reply, &["wake_cause", "wake_type"]) {
+                        self.wake_cause = cause;
+                    }
+                    if let Some(stage) = text_field(&reply, &["wake_stage", "last_stage", "stage"])
+                    {
+                        self.device_last_stage = stage;
+                    }
                     if op == "status" && reply["result"] == "applied" {
                         self.nonce = reply["session_nonce"]
                             .as_str()
@@ -1143,16 +1284,47 @@ impl V2Connection {
                     }
                     let ms = started.elapsed().as_millis();
                     self.timings.push((op.to_string(), ms));
-                    tracing::info!(device_mac = %self.device_mac, op, request_id = %id, result = reply["result"].as_str().unwrap_or("acknowledged"), duration_ms = ms, "BLE command acknowledged");
+                    let (wake_generation, wake_seq) = identity_text(self.wake_identity);
+                    tracing::info!(
+                        device_mac = %self.device_mac,
+                        op,
+                        request_id = %id,
+                        result = reply["result"].as_str().unwrap_or("acknowledged"),
+                        wake_generation = %wake_generation,
+                        wake_seq = %wake_seq,
+                        wake_association = if self.wake_identity.is_some() { "confirmed" } else { "incomplete" },
+                        duration_ms = ms,
+                        "BLE command acknowledged"
+                    );
                     return Ok(reply);
                 }
             }
             if tokio::time::Instant::now() >= deadline {
+                self.log_failure(&id, op, "ack", "timeout");
                 tracing::warn!(device_mac = %self.device_mac, op, request_id = %id, stage = "ack", category = error_category("ack"), duration_ms = started.elapsed().as_millis(), "BLE command ACK failed");
                 bail!("v2 BLE ACK timed out");
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    fn log_failure(&self, request_id: &str, op: &str, bridge_stage: &str, result: &str) {
+        let (wake_generation, wake_seq) = identity_text(self.wake_identity);
+        tracing::warn!(
+            event = "wake_contact_summary",
+            device_mac = %self.device_mac,
+            wake_generation = %wake_generation,
+            wake_seq = %wake_seq,
+            wake_association = if self.wake_identity.is_some() { "confirmed" } else { "incomplete" },
+            wake_cause = %self.wake_cause,
+            device_last_stage = %self.device_last_stage,
+            bridge_last_stage = %bridge_stage,
+            stage_durations = ?self.timings,
+            op,
+            request_id = %request_id,
+            result,
+            "wake contact failure summary"
+        );
     }
 
     /// Close the link explicitly. Measured 2026-09-22: leaving the Windows
@@ -1202,7 +1374,7 @@ mod tests {
     use super::{
         advertisement_matches_any_target, classify_advertisement, empty_scan_suppressed_windows,
         info_authorized_target, normalize_target_macs, should_log_empty_window,
-        should_log_scan_start, AdvertisementDecision, Pusher,
+        should_log_scan_start, wake_identity, AdvertisementDecision, Pusher,
     };
     use serde_json::json;
     use std::collections::HashSet;
@@ -1296,12 +1468,39 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_payload_contains_current_bridge_credentials() {
+        let payload: serde_json::Value = serde_json::from_slice(&Pusher::endpoint_payload(
+            "192.168.1.2",
+            8765,
+            "bridge-token",
+        ))
+        .unwrap();
+        assert_eq!(payload["schema"], 1);
+        assert_eq!(payload["host"], "192.168.1.2");
+        assert_eq!(payload["port"], 8765);
+        assert_eq!(payload["token"], "bridge-token");
+    }
+
+    #[test]
     fn info_gate_requires_persistent_bond() {
         assert!(Pusher::peer_bonded(&json!({"peerBonded": true})));
         assert!(!Pusher::peer_bonded(
             &json!({"peerBonded": false, "peerEncrypted": true})
         ));
         assert!(!Pusher::peer_bonded(&json!({"peerEncrypted": true})));
+    }
+
+    #[test]
+    fn token_request_requires_encrypted_bond_and_hex_token() {
+        assert!(Pusher::peer_encrypted_bonded(
+            &json!({"peerBonded": true, "peerEncrypted": true})
+        ));
+        assert!(!Pusher::peer_encrypted_bonded(
+            &json!({"peerBonded": true, "peerEncrypted": false})
+        ));
+        assert!(Pusher::valid_device_token(&"a1".repeat(16)));
+        assert!(!Pusher::valid_device_token(&"z".repeat(32)));
+        assert!(!Pusher::valid_device_token(&"a".repeat(31)));
     }
 
     #[test]
@@ -1378,6 +1577,23 @@ mod tests {
         );
         assert_eq!(
             info_authorized_target(&json!({"mac": "00:00:00:AA:BB:CC"}), &targets),
+            None
+        );
+    }
+
+    #[test]
+    fn wake_association_requires_both_rtc_identity_parts() {
+        assert_eq!(
+            wake_identity(&json!({"wake_generation": 4, "wake_seq": 19})),
+            Some(super::WakeIdentity {
+                generation: 4,
+                seq: 19,
+            })
+        );
+        assert_eq!(wake_identity(&json!({"wake_generation": 4})), None);
+        assert_eq!(wake_identity(&json!({"wake_seq": 19})), None);
+        assert_eq!(
+            wake_identity(&json!({"wake_generation": "4", "wake_seq": 19})),
             None
         );
     }

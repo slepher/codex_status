@@ -56,8 +56,9 @@ BATTERY = """
 """
 BLUETOOTH = "AGAAAHAAAHgAAGwAAGYADGcABmYAA/wAAfgAAPAAAPAAAfgAA/wABmYADGcAAGYAAGwAAHgAAHAAAGAA"
 WIFI = "AAAAAAAAAAAAA/wAH/+APAPA8ADwwPAwh/4QDw8AHAOAEACAAfgAA/wAAwwAAAAAAGAAAGAAAAAAAAAA"
-# Original sleep-20 artwork, retained for the shared BLE / sleep cell.
-SLEEP_20 = "AAAAAAAAf8AAAIAAAQAAAh+ABAEACAEAf8EAAAgAAB+AAAAAHgAABAAACAAAHgAAAAAAAAAAAAAAAAAA"
+WIFI_OFF = "AAAAAAAAAGAAA2wAH2+APGPA8GDwwGAwh24QD28AHGOAEGCAAQgAAwwAAwwAAAAAAGAAAGAAAAAAAAAA"
+# User-approved 20x20 sleep artwork with one-pixel horizontal bars.
+SLEEP_20 = "AAAAAAAAf8AAAEAAAIAAAR+AAgCABAEAf8IAAAQAAAgAAB+AHwAAAQAAAgAABAAAHwAAAAAAAAAAAAAA"
 
 
 def rows(art):
@@ -146,7 +147,7 @@ def icon_set():
         "bluetooth": bluetooth,
         "bluetooth-off": crossed(bluetooth),
         "wifi": from_bits(WIFI),
-        "wifi-off": crossed(from_bits(WIFI)),
+        "wifi-off": from_bits(WIFI_OFF),
         "bridge-off": off,
         "bridge-on": on,
         "zzz": from_bits(SLEEP_20),

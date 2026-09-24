@@ -7,7 +7,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -210,13 +210,17 @@ fn load_library(cfg: &McpConfig) -> Result<Library> {
 //
 // The device token gates /claim and /doUpdate. It is disclosed only over the
 // bonded BLE link, so cache it by the Wi-Fi MAC read from authenticated info.
-fn device_token_path(cfg: &McpConfig, mac: &str) -> Option<PathBuf> {
+fn device_token_path_at(data_root: &Path, mac: &str) -> Option<PathBuf> {
     let mac = bridge_core::platform::model::DeviceIdentity::normalized_mac(mac)?;
-    Some(cfg.data_root.join(format!("device-token-{mac}.json")))
+    Some(data_root.join(format!("device-token-{mac}.json")))
 }
 
-pub fn load_device_token(cfg: &McpConfig, expected_mac: &str) -> Option<String> {
-    let path = device_token_path(cfg, expected_mac)?;
+fn valid_device_token(token: &str) -> bool {
+    token.len() == 32 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+pub fn load_device_token_at(data_root: &Path, expected_mac: &str) -> Option<String> {
+    let path = device_token_path_at(data_root, expected_mac)?;
     let text = std::fs::read_to_string(&path).ok()?;
     let doc: Value = serde_json::from_str(&text).ok()?;
     let expected_mac = bridge_core::platform::model::DeviceIdentity::normalized_mac(expected_mac)?;
@@ -227,19 +231,42 @@ pub fn load_device_token(cfg: &McpConfig, expected_mac: &str) -> Option<String> 
         return None;
     }
     let token = doc.get("token").and_then(|v| v.as_str())?;
-    (token.len() == 32).then(|| token.to_string())
+    valid_device_token(token).then(|| token.to_string())
 }
 
-fn save_device_token(cfg: &McpConfig, expected_mac: &str, token: &str) -> Result<()> {
+pub fn save_device_token_at(data_root: &Path, expected_mac: &str, token: &str) -> Result<()> {
     let mac = bridge_core::platform::model::DeviceIdentity::normalized_mac(expected_mac)
         .context("invalid target device MAC")?;
-    let _ = std::fs::create_dir_all(&cfg.data_root);
-    let path = device_token_path(cfg, &mac).context("invalid target device MAC")?;
+    if !valid_device_token(token) {
+        return Err(anyhow::anyhow!("invalid device token"));
+    }
+    let _ = std::fs::create_dir_all(data_root);
+    let path = device_token_path_at(data_root, &mac).context("invalid target device MAC")?;
     let doc = json!({"device_mac": mac, "token": token, "updated_at": now_secs()});
     std::fs::write(&path, serde_json::to_string_pretty(&doc)?)
         .with_context(|| format!("write {}", path.display()))?;
     tracing::info!("device token cached ({})", path.display());
     Ok(())
+}
+
+pub fn load_device_token(cfg: &McpConfig, expected_mac: &str) -> Option<String> {
+    load_device_token_at(&cfg.data_root, expected_mac)
+}
+
+pub fn save_device_token(cfg: &McpConfig, expected_mac: &str, token: &str) -> Result<()> {
+    save_device_token_at(&cfg.data_root, expected_mac, token)
+}
+
+/// Runtime cache helpers used by the app's BLE rendezvous. The app sets
+/// `CODEX_STATUS_DATA` before constructing either this config or its platform
+/// service, so this resolves to the same default or named-instance directory
+/// that OTA reads through `McpConfig.data_root`.
+pub fn load_runtime_device_token(expected_mac: &str) -> Option<String> {
+    load_device_token_at(&bridge_core::paths::data_root(), expected_mac)
+}
+
+pub fn save_runtime_device_token(expected_mac: &str, token: &str) -> Result<()> {
+    save_device_token_at(&bridge_core::paths::data_root(), expected_mac, token)
 }
 
 /// Fetch the token over BLE; requires an active device BLE session (BOOT click).
@@ -323,6 +350,7 @@ async fn post_firmware(
     filename: &str,
 ) -> reqwest::Result<reqwest::Response> {
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(120))
         .build()?;
     let part = reqwest::multipart::Part::bytes(bytes)
@@ -414,6 +442,7 @@ async fn firmware_ota_inner(cfg: &McpConfig, args: &Value) -> Result<Vec<Value>,
     // UpdateClass "already running" after an aborted transfer, which made every
     // following Update.begin() fail. Unknown params are ignored by old ROMs.
     if let Ok(client) = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(10))
         .build()
     {
@@ -861,11 +890,14 @@ fn tool_definitions() -> Value {
         {
             "name": "device_claim",
             "title": "占用设备",
-            "description": "用户显式动作：占用设备（空闲/过期时自动成功；他人占用时需 force=true 强制接管）。无 force 时相当于恢复自动占用（清除本地让步状态）",
+            "description": "用户显式动作：占用设备（空闲/过期时自动成功；他人占用时需 force=true 强制接管）。可用 mac 指定已登记目标；省略 mac 时使用当前默认设备。无 force 时相当于恢复自动占用（清除本地让步状态）",
             "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true},
             "inputSchema": {
                 "type": "object",
-                "properties": {"force": {"type": "boolean", "description": "强制接管他人占用"}},
+                "properties": {
+                    "force": {"type": "boolean", "description": "强制接管他人占用"},
+                    "mac": {"type": "string", "description": "可选目标设备 Wi-Fi MAC；省略时使用当前默认设备"}
+                },
                 "additionalProperties": false
             }
         },
@@ -1055,7 +1087,7 @@ fn tool_definitions() -> Value {
             "name": "platform_publish_preview",
             "description": "Read-only full target and conservative byte/space preview. Reuse remains unknown until authenticated asset status is available.",
             "annotations": {"readOnlyHint": true},
-            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+            "inputSchema": {"type": "object", "properties": {"mac": {"type": "string", "description": "Optional target device Wi-Fi MAC"}}, "additionalProperties": false}
         },
         {
             "name": "platform_font_list",
@@ -1073,7 +1105,7 @@ fn tool_definitions() -> Value {
             "name": "platform_publish_cancel",
             "description": "Cancel the queued (unstarted) publish job for the device.",
             "annotations": {"readOnlyHint": false},
-            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+            "inputSchema": {"type": "object", "properties": {"mac": {"type": "string", "description": "Optional target device Wi-Fi MAC"}}, "additionalProperties": false}
         },
         {
             "name": "template_activate",
@@ -1081,7 +1113,7 @@ fn tool_definitions() -> Value {
             "annotations": {"readOnlyHint": false},
             "inputSchema": {
                 "type": "object",
-                "properties": {"id": {"type": "string"}},
+                "properties": {"id": {"type": "string"}, "mac": {"type": "string", "description": "Optional target device Wi-Fi MAC"}},
                 "required": ["id"],
                 "additionalProperties": false
             }
@@ -1126,7 +1158,7 @@ fn tool_definitions() -> Value {
             "annotations": {"readOnlyHint": false},
             "inputSchema": {
                 "type": "object",
-                "properties": {"mode": {"type": "string"}},
+                "properties": {"mode": {"type": "string"}, "mac": {"type": "string", "description": "Optional target device Wi-Fi MAC"}},
                 "required": ["mode"],
                 "additionalProperties": false
             }
@@ -1135,13 +1167,13 @@ fn tool_definitions() -> Value {
             "name": "platform_status_refresh",
             "description": "Read the authenticated device status and reconcile the bridge view.",
             "annotations": {"readOnlyHint": true},
-            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+            "inputSchema": {"type": "object", "properties": {"mac": {"type": "string", "description": "Optional target device Wi-Fi MAC"}}, "additionalProperties": false}
         },
                 {
             "name": "platform_push_now",
             "description": "Deliver pending coordinator data to the device immediately (explicit action; never renews the light lease by itself).",
             "annotations": {"readOnlyHint": false},
-            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+            "inputSchema": {"type": "object", "properties": {"mac": {"type": "string", "description": "Optional target device Wi-Fi MAC"}}, "additionalProperties": false}
         },
         {
             "name": "platform_recovery",
@@ -1545,6 +1577,7 @@ mod device_token_tests {
         )
         .unwrap();
         assert_eq!(load_device_token(&cfg, mac_a), None);
+        assert!(save_device_token(&cfg, mac_a, &"z".repeat(32)).is_err());
         let _ = std::fs::remove_dir_all(cfg.data_root);
     }
 }

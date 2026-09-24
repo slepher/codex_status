@@ -30,7 +30,7 @@
       "y": 8,
       "w": 10,
       "h": 20,
-      "bits": "AAAAAH/AAIABAAIABAAIAH/AAAAAAAAAHgAEAAgAHgAAAAAAAAAAAA==",
+      "bits": "AAAAAH/AAEAAgAEAAgAEAH/AAAAAAAAAHwABAAIABAAfAAAAAAAAAA==",
       "color": "black",
       "when": {
         "bind": "device.mode",
@@ -43,7 +43,7 @@
       "y": 8,
       "w": 10,
       "h": 20,
-      "bits": "AAAAAAAAAAAAAH4ABAAEAAQAIAB+AAAAAAAAAAAAAAAAAAAAAAAAAA==",
+      "bits": "AAAAAAAAAAAAAH4AAgAEAAgAEAAgAH4AAAAAAAAAAAAAAAAAAAAAAA==",
       "color": "black",
       "when": {
         "bind": "device.mode",
@@ -134,33 +134,7 @@
       "y": 8,
       "w": 10,
       "h": 20,
-      "bits": "AAAAAAAAA8AfwDwA8ADAwIfAD0AcwBGAA8AHwA8AGAAwQCBAAAAAAA==",
-      "color": "black",
-      "when": {
-        "bind": "device.state",
-        "equals": "WIFI OFF"
-      }
-    },
-    {
-      "type": "icon",
-      "x": 282,
-      "y": 8,
-      "w": 10,
-      "h": 20,
-      "bits": "AAABAAMA9gD+AB8AM8DgwPhAvAAOAAIA4ADwADAAAACAAIAAAAAAAA==",
-      "color": "black",
-      "when": {
-        "bind": "device.state",
-        "equals": "WIFI OFF"
-      }
-    },
-    {
-      "type": "icon",
-      "x": 272,
-      "y": 8,
-      "w": 10,
-      "h": 20,
-      "bits": "AAAAAAAAA8AfwDwA8ADAwIfAD0AcwBGAA8AHwA8AGAAwQCBAAAAAAA==",
+      "bits": "AAAAAAAAA8AfwDwA8ADAwIfADwAcABAAAcADwAMAAAAAQABAAAAAAA==",
       "color": "black",
       "when": {
         "bind": "device.state",
@@ -173,7 +147,7 @@
       "y": 8,
       "w": 10,
       "h": 20,
-      "bits": "AAABAAMA9gD+AB8AM8DgwPhAvAAOAAIA4ADwADAAAACAAIAAAAAAAA==",
+      "bits": "AAAAAAAA8AD+AA8AA8DAwPhAPAAOAAIA4ADwADAAAACAAIAAAAAAAA==",
       "color": "black",
       "when": {
         "bind": "device.state",
@@ -186,11 +160,11 @@
       "y": 8,
       "w": 10,
       "h": 20,
-      "bits": "AAAAAAAAA8AfwDwA8ADAwIfAD0AcwBGAA8AHwA8AGAAwQCBAAAAAAA==",
+      "bits": "AAAAAABAA0AfQDxA8EDAQIdAD0AcQBBAAQADAAMAAAAAQABAAAAAAA==",
       "color": "black",
       "when": {
         "bind": "device.state",
-        "equals": "AP"
+        "equals": "WIFI OFF"
       }
     },
     {
@@ -199,37 +173,11 @@
       "y": 8,
       "w": 10,
       "h": 20,
-      "bits": "AAABAAMA9gD+AB8AM8DgwPhAvAAOAAIA4ADwADAAAACAAIAAAAAAAA==",
+      "bits": "AAAAAIAAsAC+AI8Ag8CAwLhAvACOAIIAIAAwADAAAACAAIAAAAAAAA==",
       "color": "black",
       "when": {
         "bind": "device.state",
-        "equals": "AP"
-      }
-    },
-    {
-      "type": "icon",
-      "x": 272,
-      "y": 8,
-      "w": 10,
-      "h": 20,
-      "bits": "AAAAAAAAA8AfwDwA8ADAwIfAD0AcwBGAA8AHwA8AGAAwQCBAAAAAAA==",
-      "color": "black",
-      "when": {
-        "bind": "device.state",
-        "equals": "DEEP"
-      }
-    },
-    {
-      "type": "icon",
-      "x": 282,
-      "y": 8,
-      "w": 10,
-      "h": 20,
-      "bits": "AAABAAMA9gD+AB8AM8DgwPhAvAAOAAIA4ADwADAAAACAAIAAAAAAAA==",
-      "color": "black",
-      "when": {
-        "bind": "device.state",
-        "equals": "DEEP"
+        "equals": "WIFI OFF"
       }
     },
     {
@@ -282,6 +230,84 @@
       "when": {
         "bind": "device.offline_mins",
         "exists": true
+      }
+    },
+    {
+      "type": "icon",
+      "x": 296,
+      "y": 8,
+      "w": 10,
+      "h": 20,
+      "bits": "AAAAAAAAP8B/wGAAYABhAGCAYEBggGEAYABgAHAAP8ABwAHAAAAAAA==",
+      "color": "black",
+      "when": {
+        "bind": "device.state",
+        "equals": "WIFI OFF"
+      }
+    },
+    {
+      "type": "icon",
+      "x": 306,
+      "y": 8,
+      "w": 10,
+      "h": 20,
+      "bits": "AAAAAAAA/4D/wADAAMAgwEDAgMBAwCDAAMAAwAHA/4DwAPAAAAAAAA==",
+      "color": "black",
+      "when": {
+        "bind": "device.state",
+        "equals": "WIFI OFF"
+      }
+    },
+    {
+      "type": "icon",
+      "x": 296,
+      "y": 8,
+      "w": 10,
+      "h": 20,
+      "bits": "AAAAAAAAP8B/wGAAYABhAGCAYEBggGEAYABgAHAAP8ABwAHAAAAAAA==",
+      "color": "black",
+      "when": {
+        "bind": "device.state",
+        "equals": "WIFI CONN"
+      }
+    },
+    {
+      "type": "icon",
+      "x": 296,
+      "y": 8,
+      "w": 10,
+      "h": 20,
+      "bits": "AAAAAAAAP8B/wGAAYABhAGCAYEBggGEAYABgAHAAP8ABwAHAAAAAAA==",
+      "color": "black",
+      "when": {
+        "bind": "device.state",
+        "equals": "WIFI BLINK OFF"
+      }
+    },
+    {
+      "type": "icon",
+      "x": 306,
+      "y": 8,
+      "w": 10,
+      "h": 20,
+      "bits": "AAAAAAAA/4D/wADAAMAgwEDAgMBAwCDAAMAAwAHA/4DwAPAAAAAAAA==",
+      "color": "black",
+      "when": {
+        "bind": "device.state",
+        "equals": "WIFI BLINK OFF"
+      }
+    },
+    {
+      "type": "icon",
+      "x": 306,
+      "y": 8,
+      "w": 10,
+      "h": 20,
+      "bits": "AAAAAAAA/4D/wADAAMAgwEDAgMBAwCDAAMAAwAHA/4DwAPAAAAAAAA==",
+      "color": "black",
+      "when": {
+        "bind": "device.state",
+        "equals": "WIFI CONN"
       }
     },
     {
