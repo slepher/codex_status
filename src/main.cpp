@@ -57,6 +57,7 @@
 #include "v2_activate_command.h"
 #include "v2_claim_command.h"
 #include "v2_command_envelope.h"
+#include "v2_status_snapshot.h"
 #include "bundle_store.h"
 
 // v2 platform targets (src/platform_target.h): the render/firmware target
@@ -3614,38 +3615,23 @@ static void handleV2Status() {
         return;
     }
     markSynced();   // authenticated bridge contact (v2 HTTP channel)
-    JsonDocument doc;
-    doc["result"] = "applied";
-    doc["protocol"] = 2;
-    doc["device_mac"] = macText();
-    doc["session_nonce"] = v2Nonce();
-    doc["active_context_id"] = v2Profile.contextId;
-    doc["active_template_id"] =
-        (v2BundleReady && v2Profile.count) ? v2Profile.ids[v2Profile.initial] : activeTplId;
-    doc["committed_job_id"] = v2Profile.jobId;
-    doc["data_seq"] = v2DataSeq.appliedSeq();
-    doc["applied_seq"] = v2DataSeq.appliedSeq();
-    doc["display_state"] = v2DisplayState == 1 ? "displayed"
-                          : v2DisplayState == 2 ? "pending"
-                          : v2DisplayState == 3 ? "failed"
-                                                : "unchanged";
-    doc["commit_seq"] = (unsigned)bsCommitSeq();
-    doc["configured"] = v2BundleReady;
-    doc["template_ids"] = JsonArray();
-    for (uint8_t i = 0; i < v2Profile.count; i++) doc["template_ids"].add(v2Profile.ids[i]);
-    JsonObject power = doc["power"].to<JsonObject>();
-    power["mode"] = (rtcMode == MODE_DEEP) ? "sleep" : "light";
-    power["plan_id"] = v2Plan.acceptedId();
-    power["remaining_s"] = v2Plan.remainingS(v2NowMs());
-    power["granted_s"] = v2Plan.grantedS();
-    power["provisional"] = v2Provisional && !v2Plan.accepted();
-    power["provisional_remaining_s"] =
-        v2Provisional ? V2PlanState::bootProvisionalRemaining(v2BootMs, v2NowMs()) : 0;
-    power["rendezvous_period_s"] = V2_RENDEZVOUS_S;
-    power["battery"] = batteryPercent();
-    String out;
-    serializeJson(doc, out);
-    server.send(200, "application/json", out);
+    V2StatusSnapshot snapshot;
+    snapshot.mac = macText();
+    snapshot.sessionNonce = v2Nonce();
+    snapshot.profile = &v2Profile;
+    snapshot.configured = v2BundleReady;
+    snapshot.activeTemplateId = (v2BundleReady && v2Profile.count)
+        ? v2Profile.ids[v2Profile.initial] : activeTplId;
+    snapshot.dataSeq = &v2DataSeq;
+    snapshot.displayState = v2DisplayState;
+    snapshot.commitSeq = bsCommitSeq();
+    snapshot.deepSleep = rtcMode == MODE_DEEP;
+    snapshot.plan = &v2Plan;
+    snapshot.provisional = v2Provisional;
+    snapshot.bootMs = v2BootMs;
+    snapshot.nowMs = v2NowMs();
+    snapshot.battery = batteryPercent();
+    server.send(200, "application/json", v2BuildStatusSnapshot(snapshot));
 }
 
 // POST /v2/data: atomic complete snapshot inside the current context.

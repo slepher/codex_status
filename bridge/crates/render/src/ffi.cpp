@@ -9,6 +9,7 @@
 #include "v2_activate_command.h"
 #include "v2_claim_command.h"
 #include "v2_command_envelope.h"
+#include "v2_status_snapshot.h"
 #include "bundle_store.h"
 #include "font_asset.h"
 #include "font_store.h"
@@ -671,6 +672,61 @@ int codex_v2_build_ack(const char *op, const char *result, const char *display,
     if (body.length() >= (size_t)cap) return -3;
     memcpy(out, body.c_str(), body.length() + 1);
     return (int)body.length();
+}
+int codex_v2_status_snapshot(const char *input, char *out, int cap) {
+    if (!input || !out || cap <= 0) return -99;
+    JsonDocument doc;
+    if (deserializeJson(doc, input)) return -2;
+    V2StatusSnapshot snapshot;
+    snapshot.mac = doc["mac"] | "";
+    snapshot.sessionNonce = doc["session_nonce"] | "";
+    BsProfile profile{};
+    const char *context = doc["context"] | "";
+    const char *job = doc["job_id"] | "";
+    strncpy(profile.contextId, context, sizeof(profile.contextId) - 1);
+    strncpy(profile.jobId, job, sizeof(profile.jobId) - 1);
+    JsonArrayConst ids = doc["template_ids"].as<JsonArrayConst>();
+    if (ids.size() > BS_MAX_TEMPLATES) return -3;
+    for (JsonVariantConst id : ids) {
+        const char *value = id | "";
+        strncpy(profile.ids[profile.count], value, BS_ID_LEN - 1);
+        ++profile.count;
+    }
+    snapshot.profile = &profile;
+    snapshot.configured = doc["configured"] | false;
+    snapshot.activeTemplateId = doc["active_template_id"] | "";
+    V2DataSeq dataSeq;
+    uint64_t appliedSeq = doc["applied_seq"] | 0ULL;
+    if (appliedSeq) dataSeq.noteApplied(appliedSeq, doc["data_crc"] | 0u);
+    snapshot.dataSeq = &dataSeq;
+    snapshot.displayState = doc["display_state_code"] | 0;
+    snapshot.commitSeq = doc["commit_seq"] | 0u;
+    snapshot.deepSleep = doc["deep_sleep"] | false;
+    V2PlanState plan;
+    if (doc["plan_accepted"] | false) {
+        V2PowerPlan active{};
+        active.planId = doc["plan_id"] | 0ULL;
+        active.mode = !strcmp(doc["plan_mode"] | "sleep", "light")
+            ? V2_PLAN_LIGHT : V2_PLAN_SLEEP;
+        active.lightDurationS = doc["granted_s"] | 0u;
+        active.rendezvousPeriodS = V2_RENDEZVOUS_S;
+        plan.accept(active, doc["plan_accepted_at_ms"] | 0ULL,
+                    false, V2_MAX_LIGHT_S);
+    }
+    snapshot.plan = &plan;
+    snapshot.provisional = doc["provisional"] | false;
+    snapshot.bootMs = doc["boot_ms"] | 0ULL;
+    snapshot.nowMs = doc["now_ms"] | 0ULL;
+    snapshot.battery = doc["battery"] | 0;
+    String status = v2BuildStatusSnapshot(snapshot);
+    JsonDocument statusDoc, result;
+    if (deserializeJson(statusDoc, status)) return -4;
+    result["status"] = statusDoc.as<JsonVariantConst>();
+    result["state_after"]["applied_seq"] = dataSeq.appliedSeq();
+    result["state_after"]["next_seq"] = dataSeq.nextSeq();
+    result["state_after"]["plan_id"] = plan.acceptedId();
+    result["state_after"]["plan_granted_s"] = plan.grantedS();
+    return (int)serializeJson(result, out, (size_t)cap);
 }
 uint64_t codex_v2_plan_high(void *p) { return ((V2PlanState *)p)->highId(); }
 int codex_v2_plan_light_active(void *p, uint64_t now_ms) {

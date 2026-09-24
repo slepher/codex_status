@@ -1,5 +1,9 @@
 # Codex Status 项目进度（交接文档）
 
+## Fake ROM Stage C 状态快照：2026-09-24 — 宿主验证通过
+
+命令信封已提交 `c154945`；`/v2/status` 的完整 JSON 现由固件与宿主共用 `src/v2_status_snapshot.{h,cpp}`，PowerPlan/provisional 剩余使用显式同一 `nowMs`。设备端继续承担 endpoint token 401、`markSynced`、nonce 生成与现场字段采集。宿主 render 测试 19/19、`git diff --check` 通过。未接主 Bridge/实机，未构建/烧录 ROM。Stage C 已具备共享命令决策、信封和状态快照，但尚无可运行 Fake ROM；Stage D 需接宿主鉴权、owner/Bundle 存储、HTTP/BLE、显示与时钟，见 `project-workflow/fake-rom-simulator/status.md`。
+
 ## Fake ROM Stage C 命令信封：2026-09-24 — 宿主验证通过
 
 claim 已提交 `f030dac`。设备端与宿主现共用 `src/v2_command_envelope.{h,cpp}` 的命令 JSON/session/MAC/request 校验和 ACK JSON 构造；固件 `v2Command` 保持 owner 检查、request_id 更新与按需 nonce 生成顺序，endpoint token 和 BLE 包装仍在设备入口。宿主 render 测试 18/18、`git diff --check` 通过。未接主 Bridge/实机，未构建/烧录 ROM。还需共享 `/v2/status` 并完成宿主端点/存储/时钟/显示接线；见 `project-workflow/fake-rom-simulator/status.md`。

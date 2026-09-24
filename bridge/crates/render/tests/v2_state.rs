@@ -165,6 +165,11 @@ extern "C" {
         out: *mut std::os::raw::c_char,
         cap: c_int,
     ) -> c_int;
+    fn codex_v2_status_snapshot(
+        input: *const std::os::raw::c_char,
+        out: *mut std::os::raw::c_char,
+        cap: c_int,
+    ) -> c_int;
     fn codex_v2_plan_high(p: *mut c_void) -> u64;
     fn codex_v2_plan_light_active(p: *mut c_void, now_ms: u64) -> c_int;
     fn codex_v2_boot_remaining(t_boot_ms: u64, now_ms: u64) -> u32;
@@ -601,6 +606,111 @@ fn shared_command_envelope_checks_session_and_builds_ack_shape() {
     assert_eq!(full["accepted_remaining_s"], 0);
     assert!(full.get("ack").is_none());
     assert!(full.get("request_id").is_none());
+}
+
+#[test]
+fn shared_status_snapshot_preserves_fields_time_and_read_only_state() {
+    let input = |display_state: u8, configured: bool| {
+        serde_json::json!({
+            "mac": "70:04:1D:AA:BB:CC",
+            "session_nonce": "boot-session",
+            "context": "ctx-current",
+            "job_id": "job-current",
+            "active_template_id": if configured { "t7" } else { "fallback-template" },
+            "template_ids": ["t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7"],
+            "configured": configured,
+            "applied_seq": 12,
+            "data_crc": 0x12345678u32,
+            "display_state_code": display_state,
+            "commit_seq": 23,
+            "deep_sleep": false,
+            "plan_accepted": true,
+            "plan_mode": "light",
+            "plan_id": 9,
+            "granted_s": 120,
+            "plan_accepted_at_ms": 10_000,
+            "provisional": true,
+            "boot_ms": 10_000,
+            "now_ms": 40_000,
+            "battery": 73
+        })
+    };
+    let snapshot = |value: serde_json::Value| {
+        let message = std::ffi::CString::new(value.to_string()).unwrap();
+        let mut out = vec![0i8; 4096];
+        let rc = unsafe {
+            codex_v2_status_snapshot(message.as_ptr(), out.as_mut_ptr(), out.len() as c_int)
+        };
+        assert!(rc > 0);
+        unsafe {
+            serde_json::from_str::<serde_json::Value>(
+                std::ffi::CStr::from_ptr(out.as_ptr()).to_str().unwrap(),
+            )
+            .unwrap()
+        }
+    };
+
+    let light = snapshot(input(1, true));
+    assert_eq!(light, snapshot(input(1, true)), "same nowMs gives same snapshot");
+    let status = &light["status"];
+    assert_eq!(status["result"], "applied");
+    assert_eq!(status["protocol"], 2);
+    assert_eq!(status["device_mac"], "70:04:1D:AA:BB:CC");
+    assert_eq!(status["session_nonce"], "boot-session");
+    assert_eq!(status["active_context_id"], "ctx-current");
+    assert_eq!(status["active_template_id"], "t7");
+    assert_eq!(status["committed_job_id"], "job-current");
+    assert_eq!(status["data_seq"], 12);
+    assert_eq!(status["applied_seq"], 12);
+    assert_eq!(status["display_state"], "displayed");
+    assert_eq!(status["commit_seq"], 23);
+    assert_eq!(status["configured"], true);
+    assert_eq!(status["template_ids"].as_array().unwrap().len(), 8);
+    assert_eq!(status["template_ids"][7], "t7");
+    assert_eq!(status["power"]["mode"], "light");
+    assert_eq!(status["power"]["plan_id"], 9);
+    assert_eq!(status["power"]["remaining_s"], 90);
+    assert_eq!(status["power"]["granted_s"], 120);
+    assert_eq!(status["power"]["provisional"], false);
+    assert_eq!(status["power"]["provisional_remaining_s"], 270);
+    assert_eq!(status["power"]["rendezvous_period_s"], 60);
+    assert_eq!(status["power"]["battery"], 73);
+    assert_eq!(light["state_after"]["applied_seq"], 12);
+    assert_eq!(light["state_after"]["next_seq"], 13);
+    assert_eq!(light["state_after"]["plan_id"], 9);
+    assert_eq!(light["state_after"]["plan_granted_s"], 120);
+
+    for (state, display) in [(0, "unchanged"), (1, "displayed"), (2, "pending"), (3, "failed")] {
+        assert_eq!(snapshot(input(state, true))["status"]["display_state"], display);
+    }
+    let mut unconfigured_input = input(0, false);
+    unconfigured_input["applied_seq"] = 0.into();
+    unconfigured_input["plan_accepted"] = false.into();
+    let unconfigured = snapshot(unconfigured_input);
+    assert_eq!(unconfigured["status"]["configured"], false);
+    assert_eq!(unconfigured["status"]["active_template_id"], "fallback-template");
+    assert_eq!(unconfigured["status"]["data_seq"], 0);
+    assert_eq!(unconfigured["status"]["template_ids"].as_array().unwrap().len(), 8);
+
+    let mut sleep_input = input(0, true);
+    sleep_input["deep_sleep"] = true.into();
+    sleep_input["plan_mode"] = "sleep".into();
+    sleep_input["plan_id"] = 10.into();
+    sleep_input["granted_s"] = 0.into();
+    let sleep = snapshot(sleep_input);
+    assert_eq!(sleep["status"]["power"]["mode"], "sleep");
+    assert_eq!(sleep["status"]["power"]["plan_id"], 10);
+    assert_eq!(sleep["status"]["power"]["remaining_s"], 0);
+    assert_eq!(sleep["status"]["power"]["granted_s"], 0);
+
+    let mut provisional_input = input(0, false);
+    provisional_input["plan_accepted"] = false.into();
+    provisional_input["provisional"] = true.into();
+    let provisional = snapshot(provisional_input);
+    assert_eq!(provisional["status"]["power"]["provisional"], true);
+    assert_eq!(provisional["status"]["power"]["provisional_remaining_s"], 270);
+    assert_eq!(provisional["state_after"]["plan_id"], 0);
+    assert_eq!(provisional["state_after"]["applied_seq"], 12);
 }
 
 #[test]

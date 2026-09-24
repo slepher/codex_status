@@ -1,5 +1,9 @@
 # Fake ROM 与多设备实验时钟状态
 
+## 2026-09-24：Stage C / Task 12i `/v2/status` 快照通过宿主验证
+
+在信封 `c154945` 后，`src/v2_status_snapshot.{h,cpp}` 共享权威 `/v2/status` 的全部 JSON 字段，显式传入 MAC/nonce、Profile/DataSeq/Plan、显示态、电量及一次取得的单调 `nowMs`。设备 handler 保留 endpoint token 401、`markSynced` 与 nonce 懒生成；重复状态读取不碰 owner 或计划。宿主测试覆盖未配置 v2 的模板回退、8 项 Profile、显示四态、light/sleep、provisional 剩余和只读性；`cargo test -p bridge-render --test v2_state` 19/19、`git diff --check` 通过。未构建/烧录 ROM、接主 Bridge/实机。Stage C 的命令决策、信封和状态快照已有同源宿主调用；真实认证、持久 owner/Bundle、HTTP/BLE、显示/RTC 副作用与完整端点仍待 Stage D，故目前不能称为可运行 Fake ROM。
+
 ## 2026-09-24：Stage C / Task 12h 命令信封与 ACK 通过宿主验证
 
 在 claim `f030dac` 后，`src/v2_command_envelope.{h,cpp}` 共享 v2 命令 JSON 解析、protocol/MAC/request/nonce 校验和 ACK JSON 字段构造。设备端仍按 parse→owner→request_id→按需生成 nonce→session 的原顺序执行；endpoint token、owner touch/409、HTTP/BLE 回复包装保持 main。宿主测试覆盖非法 JSON、错误协议/MAC/request/nonce、64 字符边界和 ACK 字段省略/包含；`cargo test -p bridge-render --test v2_state` 18/18、`git diff --check` 通过。未构建/烧录 ROM、接主 Bridge 或实机。下一步共享 `/v2/status` 快照，再审查 Stage C 完成条件。
