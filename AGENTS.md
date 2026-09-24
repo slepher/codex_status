@@ -85,6 +85,7 @@ git diff --check                   # 提交前必查
 
 ## 工作流约定
 
+- 在仓库内创建新目录必须对创建步骤使用 `require_escalated` 提权执行，避免目录属主变成 `CodexSandboxOffline`、继承到不完整的 ACL。包括 `mkdir`/`New-Item`、补丁工具隐式建目录，以及构建或脚本首次生成目录；对自动生成的目录，先提权预建，无法预建时提权运行创建它的命令。不要先在沙箱中创建再修属主；若提权被拒绝，停止该创建步骤并说明原因。已存在的目录无需重复创建。
 - 每个里程碑后更新 `PROGRESS.md`（现场、证据、待办）；多步工作用 `project-workflow/<initiative>/` 写 plan/task/status/review，先计划再动代码。
 - 提交信息用英文祈使句，沿用现有风格（如 `Firmware 0.8.0: status JSON, log ring, battery; bridge prefers JSON status`）。未经用户要求不要提交。
 - 后台进程启动必须立即返回、不挂住会话：桥用 `pwsh tools/start-bridge.ps1`（`UseShellExecute=true` 完全分离子进程 + 隐藏窗口 + cmd 重定向日志，避免子进程继承 stdio 句柄导致调用方阻塞）；其他服务照此模式（分离启动 + 日志重定向到 `artifacts/`），不用会继承管道句柄的前台/直连方式。不在前台跑长轮询；不是当前 debug/release 构建输出目录（如 `bridge/target/debug`）下运行的桥/设备服务不要擅自停止。停止当前构建目录的桥时先结束 watchdog 子进程（`--watchdog <pid>`）再停父进程，避免 watchdog 拉起重启。
