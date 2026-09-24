@@ -1,5 +1,9 @@
 # Codex Status 项目进度（交接文档）
 
+## Fake ROM Stage C 全量宿主回归：2026-09-24 — 35 项通过
+
+`codex/fake` HEAD `e4fb250`，`cargo test -p bridge-render` 完整包 35/35、`git diff --check` 通过，工作树干净。Data/Plan/Bundle/Activate/claim 的共享 C++ 决策、命令信封与 `/v2/status` 快照已在固件调用路径与宿主渲染库中。仍没有可运行 Fake ROM：宿主设备状态、鉴权、持久存储、HTTP/BLE、显示与逻辑时钟须在 Stage D/E 接线。下一步先做单设备 localhost 模拟进程的最小端点，未覆盖行为显式 unsupported；见 `project-workflow/fake-rom-simulator/status.md`。
+
 ## Fake ROM Stage C 状态快照：2026-09-24 — 宿主验证通过
 
 命令信封已提交 `c154945`；`/v2/status` 的完整 JSON 现由固件与宿主共用 `src/v2_status_snapshot.{h,cpp}`，PowerPlan/provisional 剩余使用显式同一 `nowMs`。设备端继续承担 endpoint token 401、`markSynced`、nonce 生成与现场字段采集。宿主 render 测试 19/19、`git diff --check` 通过。未接主 Bridge/实机，未构建/烧录 ROM。Stage C 已具备共享命令决策、信封和状态快照，但尚无可运行 Fake ROM；Stage D 需接宿主鉴权、owner/Bundle 存储、HTTP/BLE、显示与时钟，见 `project-workflow/fake-rom-simulator/status.md`。

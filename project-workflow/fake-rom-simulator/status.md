@@ -1,5 +1,9 @@
 # Fake ROM 与多设备实验时钟状态
 
+## 2026-09-24：Stage C 全量宿主回归通过
+
+`bridge-render` 完整包测试 35/35 通过，`git diff --check` 通过，`codex/fake` 工作树干净，HEAD `e4fb250`。Stage C 已共享命令决策、信封与权威状态快照；固件 `main.cpp` 继续调用同一 C++，但宿主尚没有统一设备状态/认证/存储/HTTP/BLE/显示编排，也没有可运行的 Fake ROM。按计划转入 Stage D 单设备模拟进程，先交付受限 localhost 进程与真实状态快照，再逐条接通业务端点；未覆盖端点必须明确 unsupported。
+
 ## 2026-09-24：Stage C / Task 12i `/v2/status` 快照通过宿主验证
 
 在信封 `c154945` 后，`src/v2_status_snapshot.{h,cpp}` 共享权威 `/v2/status` 的全部 JSON 字段，显式传入 MAC/nonce、Profile/DataSeq/Plan、显示态、电量及一次取得的单调 `nowMs`。设备 handler 保留 endpoint token 401、`markSynced` 与 nonce 懒生成；重复状态读取不碰 owner 或计划。宿主测试覆盖未配置 v2 的模板回退、8 项 Profile、显示四态、light/sleep、provisional 剩余和只读性；`cargo test -p bridge-render --test v2_state` 19/19、`git diff --check` 通过。未构建/烧录 ROM、接主 Bridge/实机。Stage C 的命令决策、信封和状态快照已有同源宿主调用；真实认证、持久 owner/Bundle、HTTP/BLE、显示/RTC 副作用与完整端点仍待 Stage D，故目前不能称为可运行 Fake ROM。
