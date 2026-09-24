@@ -3,6 +3,13 @@
 #include "refresh_policy.h"
 #include "v2_state.h"
 #include "v2_runtime.h"
+#include "v2_data_command.h"
+#include "v2_plan_command.h"
+#include "v2_bundle_command.h"
+#include "v2_activate_command.h"
+#include "v2_claim_command.h"
+#include "v2_command_envelope.h"
+#include "v2_status_snapshot.h"
 #include "bundle_store.h"
 #include "font_asset.h"
 #include "font_store.h"
@@ -33,6 +40,30 @@ CtTemplate g_ct;
 bool g_ct_valid = false;
 int g_canvas_w = 200;
 int g_canvas_h = 200;
+
+struct BundleBeginHarness {
+    V2BundleRx current;
+    V2BundleRx candidate;
+    bool hasCandidate = false;
+    String committedOwner, committedRequest, committedContext;
+    uint32_t committedCrc = 0, committedLength = 0;
+};
+
+struct ActivateHarness {
+    bool configured = false;
+    BsProfile profile{};
+    String request, owner, templateId, expected, context;
+};
+
+void writeBundleRx(JsonObject out, const V2BundleRx &rx) {
+    out["owner"] = rx.owner;
+    out["request"] = rx.request;
+    out["nonce"] = rx.nonce;
+    out["length"] = rx.length;
+    out["crc"] = rx.crc;
+    out["offset"] = rx.offset;
+    out["deadline"] = rx.deadline;
+}
 }
 
 extern "C" {
@@ -300,6 +331,416 @@ int codex_v2_plan_accept(void *p, uint64_t id, int mode, uint32_t duration, uint
 uint32_t codex_v2_plan_remaining(void *p, uint64_t now_ms) {
     return ((V2PlanState *)p)->remainingS(now_ms);
 }
+int codex_v2_plan_decide(void *p, const char *message, uint64_t now_ms,
+                         int provisional, char *out, int cap) {
+    if (!p || !message || !out || cap <= 0) return -99;
+    JsonDocument doc;
+    V2PlanDecision decision;
+    if (deserializeJson(doc, message)) {
+        decision.error = "plan_shape";
+    } else {
+        decision = v2DecidePlan(doc, *(V2PlanState *)p, now_ms, provisional != 0);
+    }
+    V2PlanState &state = *(V2PlanState *)p;
+    JsonDocument result;
+    result["accepted"] = decision.accepted;
+    result["result"] = decision.result;
+    result["display"] = decision.display;
+    if (decision.error) result["error"] = decision.error;
+    result["plan_id"] = decision.planId;
+    result["granted_s"] = decision.grantedS;
+    result["include_context"] = decision.includeContext;
+    result["high_id"] = state.highId();
+    result["accepted_id"] = state.acceptedId();
+    result["state_accepted"] = state.accepted();
+    result["state_granted_s"] = state.grantedS();
+    result["deadline_ms"] = state.deadlineMs();
+    result["remaining_s"] = state.remainingS(now_ms);
+    result["light_active"] = state.lightActive(now_ms);
+    result["from_boot"] = state.fromBoot();
+    return (int)serializeJson(result, out, (size_t)cap);
+}
+void *codex_v2_bundle_begin_new(void) { return new BundleBeginHarness(); }
+void codex_v2_bundle_begin_free(void *p) { delete (BundleBeginHarness *)p; }
+void codex_v2_bundle_begin_committed(void *p, const char *owner,
+                                     const char *request, uint32_t crc,
+                                     uint32_t length, const char *context) {
+    if (!p) return;
+    BundleBeginHarness &h = *(BundleBeginHarness *)p;
+    h.committedOwner = owner ? owner : "";
+    h.committedRequest = request ? request : "";
+    h.committedCrc = crc;
+    h.committedLength = length;
+    h.committedContext = context ? context : "";
+}
+int codex_v2_bundle_begin_seed_rx(void *p, const char *owner,
+                                  const char *request, const char *nonce,
+                                  uint32_t length, uint32_t crc,
+                                  uint32_t offset, uint64_t deadline) {
+    if (!p || offset > length) return 0;
+    V2BundleRx rx;
+    if (!rx.begin(owner, request, nonce, length, crc, 0)) return 0;
+    rx.offset = offset;
+    rx.deadline = deadline;
+    ((BundleBeginHarness *)p)->current = rx;
+    return 1;
+}
+int codex_v2_bundle_begin_decide(void *p, const char *message,
+                                 const char *nonce, uint64_t now_ms,
+                                 char *out, int cap) {
+    if (!p || !message || !nonce || !out || cap <= 0) return -99;
+    BundleBeginHarness &h = *(BundleBeginHarness *)p;
+    JsonDocument doc;
+    if (deserializeJson(doc, message)) return -2;
+    const V2BundleFingerprint committed{
+        h.committedOwner.c_str(), h.committedRequest.c_str(), h.committedCrc,
+        h.committedLength, h.committedContext.c_str()
+    };
+    V2BundleBeginDecision decision = v2DecideBundleBegin(
+        doc, h.current, committed, nonce, now_ms);
+    h.hasCandidate = decision.action == V2_BUNDLE_BEGIN_START;
+    if (h.hasCandidate) h.candidate = decision.candidate;
+
+    JsonDocument result;
+    const char *action = decision.action == V2_BUNDLE_BEGIN_REPLAY ? "replay"
+                       : decision.action == V2_BUNDLE_BEGIN_RESUME ? "resume"
+                       : decision.action == V2_BUNDLE_BEGIN_START ? "start" : "reject";
+    result["action"] = action;
+    if (decision.error) result["error"] = decision.error;
+    if (decision.replayContext) result["replay_context"] = decision.replayContext;
+    result["next_offset"] = decision.nextOffset;
+    writeBundleRx(result["current"].to<JsonObject>(), h.current);
+    if (h.hasCandidate) writeBundleRx(result["candidate"].to<JsonObject>(), h.candidate);
+    return (int)serializeJson(result, out, (size_t)cap);
+}
+int codex_v2_bundle_begin_commit_candidate(void *p) {
+    if (!p) return 0;
+    BundleBeginHarness &h = *(BundleBeginHarness *)p;
+    if (!h.hasCandidate) return 0;
+    h.current = h.candidate;
+    h.hasCandidate = false;
+    return 1;
+}
+int codex_v2_bundle_chunk_start(void *p, const char *request, const char *nonce,
+                                const char *offset, uint64_t now_ms,
+                                char *out, int cap) {
+    if (!p || !out || cap <= 0) return -99;
+    BundleBeginHarness &h = *(BundleBeginHarness *)p;
+    V2BundleChunkStartDecision decision = v2DecideBundleChunkStart(
+        h.current, request, nonce, offset, now_ms);
+    JsonDocument result;
+    result["allowed"] = decision.allowed;
+    result["replay"] = decision.replay;
+    result["offset"] = decision.offset;
+    if (decision.error) result["error"] = decision.error;
+    writeBundleRx(result["current"].to<JsonObject>(), h.current);
+    return (int)serializeJson(result, out, (size_t)cap);
+}
+int codex_v2_bundle_chunk_write(void *p, uint32_t offset, int replay,
+                                uint32_t processed, uint32_t size,
+                                char *out, int cap) {
+    if (!p || !out || cap <= 0) return -99;
+    BundleBeginHarness &h = *(BundleBeginHarness *)p;
+    V2BundleChunkWriteDecision decision = v2DecideBundleChunkWrite(
+        h.current, offset, replay != 0, processed, size);
+    JsonDocument result;
+    result["allowed"] = decision.allowed;
+    if (decision.error) result["error"] = decision.error;
+    writeBundleRx(result["current"].to<JsonObject>(), h.current);
+    return (int)serializeJson(result, out, (size_t)cap);
+}
+int codex_v2_bundle_chunk_end(void *p, uint32_t offset, int replay,
+                              uint32_t processed, uint64_t now_ms,
+                              char *out, int cap) {
+    if (!p || !out || cap <= 0) return -99;
+    BundleBeginHarness &h = *(BundleBeginHarness *)p;
+    V2BundleChunkEndDecision decision = v2DecideBundleChunkEnd(
+        h.current, offset, replay != 0, processed, now_ms);
+    JsonDocument result;
+    result["allowed"] = decision.allowed;
+    if (decision.error) result["error"] = decision.error;
+    result["next_offset"] = decision.nextOffset;
+    writeBundleRx(result["current"].to<JsonObject>(), h.current);
+    return (int)serializeJson(result, out, (size_t)cap);
+}
+int codex_v2_bundle_commit_reset_store() {
+    LittleFS.files.clear();
+    LittleFS.dirs.clear();
+    LittleFS.capacity = 1024 * 1024;
+    LittleFS.writeBudget = -1;
+    bsBegin();
+    return 1;
+}
+int codex_v2_bundle_commit_install_active(const char *bundle, const char *context) {
+    if (!bundle || !context || !codex_v2_bundle_commit_reset_store()) return 0;
+    String error;
+    return bsInstall(String(bundle), "codex-status-154g",
+                     "epd-ssd1681-200x200-1bpp", context, error) ? 1 : 0;
+}
+int codex_v2_bundle_commit_seed_rx(void *p, const char *owner,
+                                   const char *request, const char *nonce,
+                                   uint32_t length, uint32_t crc, uint32_t offset,
+                                   uint64_t deadline) {
+    if (!p) return 0;
+    V2BundleRx rx;
+    if (!rx.begin(owner, request, nonce, length, crc, 0)) return 0;
+    if (offset > length) return 0;
+    rx.offset = offset;
+    rx.deadline = deadline;
+    ((BundleBeginHarness *)p)->current = rx;
+    return 1;
+}
+int codex_v2_bundle_commit_write_file(const char *path,
+                                      const uint8_t *body, int length) {
+    if (!path || !body || length <= 0) return 0;
+    File file = LittleFS.open(path, "w");
+    if (!file) return 0;
+    size_t written = file.write(body, (size_t)length);
+    file.close();
+    return written == (size_t)length ? 1 : 0;
+}
+int codex_v2_bundle_commit_decide(void *p, const char *message,
+                                  const char *nonce, uint64_t now_ms,
+                                  const char *path, const char *fallback,
+                                  char *out, int cap,
+                                  char *body_out, int body_cap) {
+    if (!p || !message || !nonce || !path || !out || cap <= 0 ||
+        !body_out || body_cap <= 0) return -99;
+    BundleBeginHarness &h = *(BundleBeginHarness *)p;
+    JsonDocument doc;
+    if (deserializeJson(doc, message)) return -2;
+    const V2BundleFingerprint committed{
+        h.committedOwner.c_str(), h.committedRequest.c_str(), h.committedCrc,
+        h.committedLength, h.committedContext.c_str()
+    };
+    V2BundleCommitDecision decision = v2DecideBundleCommit(
+        doc, h.current, committed, nonce, now_ms, path, fallback);
+    JsonDocument result;
+    const char *action = decision.action == V2_BUNDLE_COMMIT_REPLAY ? "replay"
+                       : decision.action == V2_BUNDLE_COMMIT_ALREADY_ACTIVE ? "already_active"
+                       : decision.action == V2_BUNDLE_COMMIT_INSTALL ? "install" : "reject";
+    result["action"] = action;
+    if (decision.error) result["error"] = decision.error;
+    if (decision.replayContext) result["replay_context"] = decision.replayContext;
+    result["owner"] = decision.owner;
+    result["request"] = decision.request;
+    result["crc"] = decision.crc;
+    result["length"] = decision.length;
+    writeBundleRx(result["current"].to<JsonObject>(), h.current);
+    size_t written = serializeJson(result, out, (size_t)cap);
+    if (!written) return -3;
+    // The shared decision streams the payload from flash instead of returning it
+    // in RAM, so the harness reads back the very file the device would install
+    // from -- this keeps the payload assertion byte-exact without re-adding the
+    // allocation the streaming path exists to avoid.
+    String body;
+    if (decision.action == V2_BUNDLE_COMMIT_INSTALL ||
+        decision.action == V2_BUNDLE_COMMIT_ALREADY_ACTIVE) {
+        File file = LittleFS.open(path, "r");
+        if (file) {
+            body.reserve(file.size());
+            while (file.available()) body += (char)file.read();
+            file.close();
+        }
+    }
+    if (body.length() >= (size_t)body_cap) return -4;
+    memcpy(body_out, body.c_str(), body.length() + 1);
+    return (int)written;
+}
+void *codex_v2_activate_new(int configured, const char *profile_json) {
+    if (!profile_json) return nullptr;
+    auto *h = new ActivateHarness();
+    JsonDocument profile;
+    if (deserializeJson(profile, profile_json)) { delete h; return nullptr; }
+    h->configured = configured != 0;
+    const char *context = profile["context"] | "";
+    strncpy(h->profile.contextId, context, sizeof(h->profile.contextId) - 1);
+    JsonArrayConst ids = profile["ids"].as<JsonArrayConst>();
+    if (ids.size() > BS_MAX_TEMPLATES) { delete h; return nullptr; }
+    for (JsonVariantConst id : ids) {
+        const char *value = id | "";
+        strncpy(h->profile.ids[h->profile.count], value, BS_ID_LEN - 1);
+        ++h->profile.count;
+    }
+    return h;
+}
+void codex_v2_activate_free(void *p) { delete (ActivateHarness *)p; }
+void codex_v2_activate_seed_fingerprint(void *p, const char *request,
+                                        const char *owner, const char *template_id,
+                                        const char *expected, const char *context) {
+    if (!p) return;
+    ActivateHarness &h = *(ActivateHarness *)p;
+    h.request = request ? request : "";
+    h.owner = owner ? owner : "";
+    h.templateId = template_id ? template_id : "";
+    h.expected = expected ? expected : "";
+    h.context = context ? context : "";
+}
+int codex_v2_activate_decide(void *p, const char *message, char *out, int cap) {
+    if (!p || !message || !out || cap <= 0) return -99;
+    ActivateHarness &h = *(ActivateHarness *)p;
+    JsonDocument doc;
+    if (deserializeJson(doc, message)) return -2;
+    V2ActivateDecision decision = v2DecideActivate(
+        doc, h.configured, h.profile, h.request.c_str(), h.owner.c_str(),
+        h.templateId.c_str(), h.expected.c_str(), h.context.c_str());
+    JsonDocument result;
+    result["action"] = decision.action == V2_ACTIVATE_SWITCH ? "switch"
+                      : decision.action == V2_ACTIVATE_REPLAY ? "replay" : "reject";
+    result["result"] = decision.result;
+    result["display"] = decision.display;
+    if (decision.error) result["error"] = decision.error;
+    if (decision.context) result["context"] = decision.context;
+    result["index"] = decision.index;
+    result["request"] = decision.request;
+    result["owner"] = decision.owner;
+    result["template_id"] = decision.templateId;
+    result["expected"] = decision.expected;
+    result["saved_request"] = h.request;
+    result["saved_owner"] = h.owner;
+    result["saved_template"] = h.templateId;
+    result["saved_expected"] = h.expected;
+    result["saved_context"] = h.context;
+    return (int)serializeJson(result, out, (size_t)cap);
+}
+int codex_v2_claim_decide(const char *message, int have_owner,
+                          const char *current_json, char *out, int cap) {
+    if (!message || !current_json || !out || cap <= 0) return -99;
+    JsonDocument doc, currentDoc;
+    if (deserializeJson(doc, message) || deserializeJson(currentDoc, current_json)) return -2;
+    V2ClaimArgs args = v2PrepareClaim(
+        String(doc["id"] | ""), String(doc["name"] | ""),
+        String(doc["host"] | ""), String(doc["port"] | ""),
+        String(doc["lease"] | ""), doc["has_lease"] | false,
+        doc["force"] | false, doc["release"] | false);
+    OwnerRec current;
+    current.id = currentDoc["id"] | "";
+    current.name = currentDoc["name"] | "";
+    current.host = currentDoc["host"] | "";
+    current.port = currentDoc["port"] | 0;
+    current.since = currentDoc["since"] | 0;
+    current.lastSeen = currentDoc["last_seen"] | 0;
+    current.lease = currentDoc["lease"] | 300;
+    JsonDocument result;
+    result["valid_id"] = args.validId;
+    result["request_id"] = args.request.id;
+    result["request_name"] = args.request.name;
+    result["request_host"] = args.request.host;
+    result["request_port"] = args.request.port;
+    result["request_lease"] = args.request.lease;
+    if (!args.validId) {
+        result["action"] = "args";
+    } else {
+        V2ClaimDecision decision = v2DecideClaim(args, have_owner != 0, current);
+        const char *action = decision.action == V2_CLAIM_RELEASE_EMPTY ? "release_empty"
+                           : decision.action == V2_CLAIM_OCCUPIED ? "occupied"
+                           : decision.action == V2_CLAIM_RELEASE ? "release" : "claim";
+        result["action"] = action;
+        result["keep_since"] = decision.keepSince;
+        result["new_claim"] = decision.newClaim;
+    }
+    JsonObject unchanged = result["current"].to<JsonObject>();
+    unchanged["id"] = current.id;
+    unchanged["name"] = current.name;
+    unchanged["host"] = current.host;
+    unchanged["port"] = current.port;
+    unchanged["since"] = current.since;
+    unchanged["last_seen"] = current.lastSeen;
+    unchanged["lease"] = current.lease;
+    return (int)serializeJson(result, out, (size_t)cap);
+}
+int codex_v2_command_parse(const char *message, char *out, int cap) {
+    if (!message || !out || cap <= 0) return -99;
+    JsonDocument doc;
+    const char *error = v2ParseCommand(String(message), doc);
+    JsonDocument result;
+    result["parsed"] = !error;
+    if (error) result["error"] = error;
+    else result["bridge_id"] = doc["bridge_id"] | "";
+    return (int)serializeJson(result, out, (size_t)cap);
+}
+int codex_v2_command_check(const char *message, const char *current_mac,
+                           const char *nonce, char *out, int cap) {
+    if (!message || !current_mac || !nonce || !out || cap <= 0) return -99;
+    JsonDocument doc;
+    if (v2ParseCommand(String(message), doc)) return -2;
+    String sessionNonce(nonce);
+    V2CommandSessionDecision decision = v2CheckCommandSession(
+        doc, String(current_mac), &sessionNonce);
+    JsonDocument result;
+    result["accepted"] = decision.accepted;
+    if (decision.error) result["error"] = decision.error;
+    result["bridge_id"] = doc["bridge_id"] | "";
+    result["request_id"] = doc["request_id"] | "";
+    return (int)serializeJson(result, out, (size_t)cap);
+}
+int codex_v2_build_ack(const char *op, const char *result, const char *display,
+                       const char *retention, const char *error, int64_t seq,
+                       uint64_t plan_id, const char *context,
+                       uint32_t accepted_remaining_s, const char *fw_target,
+                       char *out, int cap) {
+    if (!out || cap <= 0) return -99;
+    String body = v2BuildAck(op, result, display, retention, error, seq,
+                             plan_id, context, accepted_remaining_s, fw_target);
+    if (body.length() >= (size_t)cap) return -3;
+    memcpy(out, body.c_str(), body.length() + 1);
+    return (int)body.length();
+}
+int codex_v2_status_snapshot(const char *input, char *out, int cap) {
+    if (!input || !out || cap <= 0) return -99;
+    JsonDocument doc;
+    if (deserializeJson(doc, input)) return -2;
+    V2StatusSnapshot snapshot;
+    snapshot.mac = doc["mac"] | "";
+    snapshot.sessionNonce = doc["session_nonce"] | "";
+    BsProfile profile{};
+    const char *context = doc["context"] | "";
+    const char *job = doc["job_id"] | "";
+    strncpy(profile.contextId, context, sizeof(profile.contextId) - 1);
+    strncpy(profile.jobId, job, sizeof(profile.jobId) - 1);
+    JsonArrayConst ids = doc["template_ids"].as<JsonArrayConst>();
+    if (ids.size() > BS_MAX_TEMPLATES) return -3;
+    for (JsonVariantConst id : ids) {
+        const char *value = id | "";
+        strncpy(profile.ids[profile.count], value, BS_ID_LEN - 1);
+        ++profile.count;
+    }
+    snapshot.profile = &profile;
+    snapshot.configured = doc["configured"] | false;
+    snapshot.activeTemplateId = doc["active_template_id"] | "";
+    V2DataSeq dataSeq;
+    uint64_t appliedSeq = doc["applied_seq"] | 0ULL;
+    if (appliedSeq) dataSeq.noteApplied(appliedSeq, doc["data_crc"] | 0u);
+    snapshot.dataSeq = &dataSeq;
+    snapshot.displayState = doc["display_state_code"] | 0;
+    snapshot.commitSeq = doc["commit_seq"] | 0u;
+    snapshot.deepSleep = doc["deep_sleep"] | false;
+    V2PlanState plan;
+    if (doc["plan_accepted"] | false) {
+        V2PowerPlan active{};
+        active.planId = doc["plan_id"] | 0ULL;
+        active.mode = !strcmp(doc["plan_mode"] | "sleep", "light")
+            ? V2_PLAN_LIGHT : V2_PLAN_SLEEP;
+        active.lightDurationS = doc["granted_s"] | 0u;
+        active.rendezvousPeriodS = V2_RENDEZVOUS_S;
+        plan.accept(active, doc["plan_accepted_at_ms"] | 0ULL,
+                    false, V2_MAX_LIGHT_S);
+    }
+    snapshot.plan = &plan;
+    snapshot.provisional = doc["provisional"] | false;
+    snapshot.bootMs = doc["boot_ms"] | 0ULL;
+    snapshot.nowMs = doc["now_ms"] | 0ULL;
+    snapshot.battery = doc["battery"] | 0;
+    String status = v2BuildStatusSnapshot(snapshot);
+    JsonDocument statusDoc, result;
+    if (deserializeJson(statusDoc, status)) return -4;
+    result["status"] = statusDoc.as<JsonVariantConst>();
+    result["state_after"]["applied_seq"] = dataSeq.appliedSeq();
+    result["state_after"]["next_seq"] = dataSeq.nextSeq();
+    result["state_after"]["plan_id"] = plan.acceptedId();
+    result["state_after"]["plan_granted_s"] = plan.grantedS();
+    return (int)serializeJson(result, out, (size_t)cap);
+}
 uint64_t codex_v2_plan_high(void *p) { return ((V2PlanState *)p)->highId(); }
 int codex_v2_plan_light_active(void *p, uint64_t now_ms) {
     return ((V2PlanState *)p)->lightActive(now_ms) ? 1 : 0;
@@ -328,6 +769,36 @@ int codex_v2_accept_data_template(const char *source, const char *message) {
     V2DataSeq seq;
     String usage;
     return v2AcceptData(ct, String(message), "ctx", seq, usage, error);
+}
+int codex_v2_data_decide(void *p, int configured, const char *source,
+                        const char *message, const char *context,
+                        char *out, int cap) {
+    if (!p || !message || !out || cap <= 0) return -99;
+    CtTemplate ct{};
+    String compileError;
+    const bool validTemplate = source && tplCompile(String(source), ct, compileError);
+    V2DataDecision decision;
+    if (configured && !validTemplate) {
+        decision.result = "rejected";
+        decision.display = "failed";
+        decision.error = compileError.length() ? compileError : String("template");
+    } else {
+        JsonDocument input;
+        uint64_t seq = 0;
+        if (!deserializeJson(input, message)) seq = input["seq"] | 0ULL;
+        decision = v2DecideData(configured != 0, validTemplate ? &ct : nullptr,
+                                String(message), seq, context, *(V2DataSeq *)p);
+    }
+    JsonDocument result;
+    result["first_applied"] = decision.firstApplied;
+    result["seq"] = decision.seq;
+    result["result"] = decision.result;
+    if (decision.display) result["display"] = decision.display;
+    if (decision.error.length()) result["error"] = decision.error;
+    result["usage"] = decision.usage;
+    result["include_context"] = decision.includeContext;
+    size_t written = serializeJson(result, out, (size_t)cap);
+    return written ? (int)written : -1;
 }
 void codex_v2_seq_free(void *p) { delete (V2DataSeq *)p; }
 void codex_v2_seq_begin(void *p, uint64_t now_ms, uint32_t keep_next) {

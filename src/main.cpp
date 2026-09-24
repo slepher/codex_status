@@ -51,6 +51,13 @@
 #include "refresh_policy.h"
 #include "v2_state.h"
 #include "v2_runtime.h"
+#include "v2_data_command.h"
+#include "v2_plan_command.h"
+#include "v2_bundle_command.h"
+#include "v2_activate_command.h"
+#include "v2_claim_command.h"
+#include "v2_command_envelope.h"
+#include "v2_status_snapshot.h"
 #include "bundle_store.h"
 
 // v2 platform targets (src/platform_target.h): the render/firmware target
@@ -3575,95 +3582,57 @@ static bool requestAuthorized() {
     return false;
 }
 
-// Occupancy claim/renew/release (task-4). Token-gated; `since` is kept across
-// renewals of the same id, lease expiry only clears (never transfers).
-// UTF-8 sequences pass through (names/ids may be non-ASCII); control
-// characters are replaced. `maxChars` counts characters, never splitting a
-// multi-byte sequence (invalid UTF-8 would break the JSON readers).
-static String claimText(const String &in, size_t maxChars) {
-    String out;
-    size_t chars = 0;
-    for (size_t i = 0; i < in.length() && chars < maxChars;) {
-        unsigned char c = (unsigned char)in[i];
-        size_t seq = 1;
-        if (c >= 0xF0) seq = 4;
-        else if (c >= 0xE0) seq = 3;
-        else if (c >= 0xC0) seq = 2;
-        if (i + seq > in.length()) break;
-        if (c < 0x20 || c == 0x7F) {
-            out += '?';
-            i += 1;
-        } else {
-            for (size_t k = 0; k < seq; k++) out += in[i + k];
-            i += seq;
-        }
-        chars++;
-    }
-    return out;
-}
-
 static void handleClaim() {
     if (!requestAuthorized()) {
         server.send(401, "application/json",
                     String("{\"error\":\"unauthorized\",\"owner\":") + ownerJson() + "}");
         return;
     }
-    String id = claimText(server.arg("id"), 32);
-    id.trim();
-    if (!id.length()) {
+    V2ClaimArgs args = v2PrepareClaim(
+        server.arg("id"), server.arg("name"), server.arg("host"),
+        server.arg("port"), server.arg("lease"), server.hasArg("lease"),
+        server.hasArg("force") && server.arg("force") != "0",
+        server.hasArg("release") && server.arg("release") != "0");
+    if (!args.validId) {
         server.send(400, "application/json", "{\"error\":\"args\"}");
         return;
     }
-    bool force = server.hasArg("force") && server.arg("force") != "0";
-    bool release = server.hasArg("release") && server.arg("release") != "0";
     OwnerRec cur;
     bool have = ownerGet(cur);
+    V2ClaimDecision decision = v2DecideClaim(args, have, cur);
 
-    if (release) {
-        if (!have) {
-            server.send(200, "application/json", "{\"owner\":null,\"released\":false}");
-            return;
-        }
-        if (cur.id != id && !force) {
-            server.send(409, "application/json",
-                        String("{\"error\":\"occupied\",\"owner\":") + ownerJson() + "}");
-            return;
-        }
-        DevLog.printf("[owner] released by id=%s force=%d\n", id.c_str(), force ? 1 : 0);
+    if (decision.action == V2_CLAIM_RELEASE_EMPTY) {
+        server.send(200, "application/json", "{\"owner\":null,\"released\":false}");
+        return;
+    }
+    if (decision.action == V2_CLAIM_OCCUPIED) {
+        if (!args.release)
+            DevLog.printf("[owner] claim denied: held by %s\n", cur.id.c_str());
+        server.send(409, "application/json",
+                    String("{\"error\":\"occupied\",\"owner\":") + ownerJson() + "}");
+        return;
+    }
+    if (decision.action == V2_CLAIM_RELEASE) {
+        DevLog.printf("[owner] released by id=%s force=%d\n",
+                      args.request.id.c_str(), args.force ? 1 : 0);
         ownerClear(true);
         server.send(200, "application/json", "{\"owner\":null,\"released\":true}");
         return;
     }
 
-    if (have && cur.id != id && !force) {
-        DevLog.printf("[owner] claim denied: held by %s\n", cur.id.c_str());
-        server.send(409, "application/json",
-                    String("{\"error\":\"occupied\",\"owner\":") + ownerJson() + "}");
-        return;
-    }
-
-    OwnerRec req;
-    req.id = id;
-    req.name = claimText(server.arg("name"), 16);
-    req.host = claimText(server.arg("host"), 32);
-    long port = server.arg("port").toInt();
-    req.port = (port > 0 && port <= 65535) ? (uint16_t)port : 0;
-    long lease = server.hasArg("lease") ? server.arg("lease").toInt() : 300;
-    if (lease < 60) lease = 60;
-    if (lease > 3600) lease = 3600;
-    req.lease = (uint32_t)lease;
-    bool keepSince = have && cur.id == id;
-    ownerClaim(req, keepSince);
+    ownerClaim(decision.request, decision.keepSince);
     // Design §6: a lease renewal is a protocol keep-alive, not user activity;
     // it must not extend the light phase (idleDeepDue would never fire while
     // the bridge renews every 60 s). Only a new claim resets the idle timer.
-    if (!keepSince) noteActivity("claim");
+    if (decision.newClaim) noteActivity("claim");
     DevLog.printf("[owner] %s id=%s name=%s host=%s:%u lease=%us force=%d\n",
-                  keepSince ? "renew" : "claim", req.id.c_str(), req.name.c_str(),
-                  req.host.c_str(), req.port, (unsigned)req.lease, force ? 1 : 0);
+                  decision.keepSince ? "renew" : "claim", decision.request.id.c_str(),
+                  decision.request.name.c_str(), decision.request.host.c_str(),
+                  decision.request.port, (unsigned)decision.request.lease,
+                  args.force ? 1 : 0);
     server.send(200, "application/json",
                 String("{\"owner\":") + ownerJson() + ",\"renew\":" +
-                    (keepSince ? "true" : "false") + "}");
+                    (decision.keepSince ? "true" : "false") + "}");
 }
 
 static void handleBleAuth(const String &json) {
@@ -4019,40 +3988,6 @@ static void v2Response(int status, const String &body) {
     bleNotifyStatusQuiet(reply);
 }
 
-static String v2BodyBridgeId(File &file) {
-    JsonDocument doc;
-    JsonDocument filter;
-    filter["bridge_id"] = true;
-    if (!file.seek(0) || deserializeJson(doc, file, DeserializationOption::Filter(filter))) {
-        return server.arg("bridge_id");
-    }
-    const char *id = doc["bridge_id"] | "";
-    return strlen(id) ? String(id) : server.arg("bridge_id");
-}
-
-static bool v2FileCrc(File &file, uint32_t length, uint32_t &crc) {
-    if (file.size() != length || !file.seek(0)) return false;
-    uint8_t buf[256];
-    uint32_t state = 0xFFFFFFFFu;
-    uint32_t readTotal = 0;
-    while (readTotal < length) {
-        size_t want = length - readTotal;
-        if (want > sizeof(buf)) want = sizeof(buf);
-        size_t got = file.read(buf, want);
-        if (!got) return false;
-        for (size_t i = 0; i < got; i++) {
-            state ^= buf[i];
-            for (int b = 0; b < 8; b++) {
-                state = (state >> 1) ^ (0xEDB88320u &
-                    (uint32_t)(-(int32_t)(state & 1)));
-            }
-        }
-        readTotal += got;
-    }
-    crc = ~state;
-    return readTotal == length;
-}
-
 static bool v2OwnerOk(const char *bridgeId) {
     if (!ownerAllows(bridgeId)) {
         v2Response(409,
@@ -4067,20 +4002,8 @@ static bool v2OwnerOk(const char *bridgeId) {
 static void v2Ack(const char *op, const char *result, const char *display,
                   const char *retention, const char *error, int64_t seq, uint64_t planId,
                   const char *context, uint32_t acceptedRemainingS) {
-    JsonDocument doc;
-    doc["op"] = op;
-    doc["result"] = result;
-    doc["display_state"] = display;
-    doc["retention"] = retention;
-    if (error && *error) doc["error"] = error;
-    if (seq >= 0) doc["data_seq"] = seq;
-    if (planId) doc["plan_id"] = planId;
-    if (context && *context) doc["active_context_id"] = context;
-    if (acceptedRemainingS != UINT32_MAX) doc["accepted_remaining_s"] = acceptedRemainingS;
-    doc["fw_target"] = FW_TARGET_ID;
-    String out;
-    serializeJson(doc, out);
-    v2Response(200, out);
+    v2Response(200, v2BuildAck(op, result, display, retention, error, seq,
+                               planId, context, acceptedRemainingS, FW_TARGET_ID));
 }
 
 // Only authenticated status exposes this boot session nonce.
@@ -4095,16 +4018,20 @@ static const String &v2Nonce() {
 }
 
 static bool v2Command(const String &body, JsonDocument &doc) {
-    if (deserializeJson(doc, body)) {
+    if (v2ParseCommand(body, doc)) {
         v2Ack("command", "rejected", "unchanged", "ram", "json", -1, 0, nullptr, UINT32_MAX);
         return false;
     }
     if (!v2OwnerOk(doc["bridge_id"] | "")) return false;
     const char *request = doc["request_id"] | "";
     v2RequestId = request;
-    if ((doc["protocol"] | 0) != 2 || String(doc["device_mac"] | "") != macText() ||
-        !*request || strlen(request) > 64 ||
-        v2Nonce() != (doc["session_nonce"] | "")) {
+    String currentMac = macText();
+    V2CommandSessionDecision session = v2CheckCommandSession(doc, currentMac, nullptr);
+    if (session.needsNonce) {
+        const String &nonce = v2Nonce();
+        session = v2CheckCommandSession(doc, currentMac, &nonce);
+    }
+    if (!session.accepted) {
         v2Ack("command", "rejected", "unchanged", "ram", "session", -1, 0, nullptr, UINT32_MAX);
         return false;
     }
@@ -4128,77 +4055,48 @@ static void handleV2Status() {
     }
     traceMarkHttp(true, 200);
     markSynced();   // authenticated bridge contact (v2 HTTP channel)
-    JsonDocument doc;
-    doc["result"] = "applied";
-    doc["protocol"] = 2;
-    doc["device_mac"] = macText();
-    doc["wake_generation"] = rtcWakeGeneration;
-    doc["wake_seq"] = rtcTraceCurrentSeq;
-    doc["wake_stage"] = traceCurrent() ? traceStageName(traceCurrent()->furthest) : "none";
-    doc["wake_cause"] = wakeCauseName(bootWakeCause);
-    doc["session_nonce"] = v2Nonce();
-    doc["active_context_id"] = v2Profile.contextId;
-    doc["active_template_id"] =
-        (v2BundleReady && v2Profile.count) ? v2Profile.ids[v2Profile.initial] : activeTplId;
-    doc["committed_job_id"] = v2Profile.jobId;
-    doc["data_seq"] = v2DataSeq.appliedSeq();
-    doc["applied_seq"] = v2DataSeq.appliedSeq();
-    doc["display_state"] = v2DisplayState == 1 ? "displayed"
-                          : v2DisplayState == 2 ? "pending"
-                          : v2DisplayState == 3 ? "failed"
-                                                : "unchanged";
-    doc["commit_seq"] = (unsigned)bsCommitSeq();
-    doc["configured"] = v2BundleReady;
-    doc["template_ids"] = JsonArray();
-    for (uint8_t i = 0; i < v2Profile.count; i++) doc["template_ids"].add(v2Profile.ids[i]);
-    JsonObject power = doc["power"].to<JsonObject>();
-    power["mode"] = (rtcMode == MODE_DEEP) ? "sleep" : "light";
-    power["plan_id"] = v2Plan.acceptedId();
-    power["remaining_s"] = v2Plan.remainingS(v2NowMs());
-    power["granted_s"] = v2Plan.grantedS();
-    power["provisional"] = v2Provisional && !v2Plan.accepted();
-    power["provisional_remaining_s"] =
-        v2Provisional ? V2PlanState::bootProvisionalRemaining(v2BootMs, v2NowMs()) : 0;
-    power["rendezvous_period_s"] = V2_RENDEZVOUS_S;
-    power["battery"] = batteryPercent();
-    String out;
-    serializeJson(doc, out);
-    server.send(200, "application/json", out);
+    V2StatusSnapshot snapshot;
+    snapshot.mac = macText();
+    snapshot.sessionNonce = v2Nonce();
+    snapshot.profile = &v2Profile;
+    snapshot.configured = v2BundleReady;
+    snapshot.activeTemplateId = (v2BundleReady && v2Profile.count)
+        ? v2Profile.ids[v2Profile.initial] : activeTplId;
+    snapshot.dataSeq = &v2DataSeq;
+    snapshot.displayState = v2DisplayState;
+    snapshot.commitSeq = bsCommitSeq();
+    snapshot.deepSleep = rtcMode == MODE_DEEP;
+    snapshot.plan = &v2Plan;
+    snapshot.provisional = v2Provisional;
+    snapshot.bootMs = v2BootMs;
+    snapshot.nowMs = v2NowMs();
+    snapshot.battery = batteryPercent();
+    // The shared builder stays authoritative; the local wake diagnostics ride
+    // along as an optional block so the host/simulator document is unchanged.
+    V2WakeSnapshot wake;
+    wake.generation = rtcWakeGeneration;
+    wake.seq = rtcTraceCurrentSeq;
+    wake.stage = traceCurrent() ? traceStageName(traceCurrent()->furthest) : "none";
+    wake.cause = wakeCauseName(bootWakeCause);
+    snapshot.wake = &wake;
+    server.send(200, "application/json", v2BuildStatusSnapshot(snapshot));
 }
 
 // POST /v2/data: atomic complete snapshot inside the current context.
 static void applyV2Data(const String &body) {
     JsonDocument peek;
     if (!v2Command(body, peek)) return;
-    if (!v2BundleReady || !v2CtValid) {
-        v2Ack("data", "rejected", "failed", "ram", "unconfigured", -1, 0, nullptr,
-              UINT32_MAX);
-        return;
-    }
     uint64_t seq = peek["seq"] | 0ULL;
-    String usage, err;
-    V2DataAck rc = v2AcceptData(v2Ct, body, v2Profile.contextId, v2DataSeq, usage, err);
-    if (rc == V2_DATA_CONTEXT_MISMATCH) {
-        v2Ack("data", "rejected", "pending", "ram", "context", (int64_t)seq, 0,
-              v2Profile.contextId, UINT32_MAX);
+    V2DataDecision decision = v2DecideData(v2BundleReady && v2CtValid,
+                                            v2CtValid ? &v2Ct : nullptr, body, seq,
+                                            v2Profile.contextId, v2DataSeq);
+    if (!decision.firstApplied) {
+        v2Ack("data", decision.result, decision.display, "ram",
+              decision.error.length() ? decision.error.c_str() : nullptr, decision.seq, 0,
+              decision.includeContext ? v2Profile.contextId : nullptr, UINT32_MAX);
         return;
     }
-    if (rc == V2_DATA_REJECTED) {
-        v2Ack("data", "rejected", "failed", "ram", err.c_str(), (int64_t)seq, 0,
-              v2Profile.contextId, UINT32_MAX);
-        return;
-    }
-    if (rc == V2_DATA_UNCHANGED) {
-        v2Ack("data", "applied", "unchanged", "ram", nullptr, (int64_t)seq, 0,
-              v2Profile.contextId, UINT32_MAX);
-        return;
-    }
-    if (rc == V2_DATA_CONFLICT || rc == V2_DATA_STALE) {
-        v2Ack("data", "rejected", "unchanged", "ram",
-              rc == V2_DATA_CONFLICT ? "seq_conflict" : "stale_seq", (int64_t)seq, 0,
-              v2Profile.contextId, UINT32_MAX);
-        return;
-    }
+    const String &usage = decision.usage;
     v2AppliedFields = "";
     serializeJson(peek["fields"], v2AppliedFields);
     v2LastAckSeq = seq;
@@ -4250,28 +4148,22 @@ static void handleV2Data() {
 static void applyV2Plan(const String &body) {
     JsonDocument doc;
     if (!v2Command(body, doc)) return;
-    V2PowerPlan plan;
-    plan.planId = doc["plan_id"] | 0ULL;
-    const char *mode = doc["mode"] | "sleep";
-    if (!doc["plan_id"].is<uint64_t>() || (!strcmp(mode, "light") && !doc["light_duration_s"].is<uint32_t>()) ||
-        (strcmp(mode, "light") && strcmp(mode, "sleep"))) {
-        v2Ack("plan", "rejected", "unchanged", "ram", "plan_shape", -1, 0, nullptr, UINT32_MAX);
+    V2PlanDecision decision = v2DecidePlan(doc, v2Plan, v2NowMs(), v2Provisional);
+    // Local: the requested history window is recorded as soon as the plan shape is
+    // valid -- before the accept result is known -- mirroring the pre-refactor
+    // path, which set it right after its own shape check and before v2Plan.accept().
+    if (!decision.error || strcmp(decision.error, "plan_shape")) {
+        uint32_t historyMs = doc["history_sync_ms"] | 0u;
+        if (historyMs > 2500) historyMs = 2500;
+        v2HistorySyncMs = historyMs;
+    }
+    if (!decision.accepted) {
+        v2Ack("plan", decision.result, decision.display, "ram", decision.error,
+              -1, decision.planId, decision.includeContext ? v2Profile.contextId : nullptr,
+              UINT32_MAX);
         return;
     }
-    plan.mode = strcmp(mode, "light") == 0 ? V2_PLAN_LIGHT : V2_PLAN_SLEEP;
-    plan.lightDurationS = doc["light_duration_s"] | 0u;
-    plan.rendezvousPeriodS = doc["rendezvous_period_s"] | V2_RENDEZVOUS_S;
-    uint32_t historyMs = doc["history_sync_ms"] | 0u;
-    if (historyMs > 2500) historyMs = 2500;
-    v2HistorySyncMs = historyMs;
-    V2PlanAck rc = v2Plan.accept(plan, v2NowMs(), false,
-                                 v2Provisional ? V2_BOOT_PROVISIONAL_S : V2_MAX_LIGHT_S);
-    if (rc == V2_PLAN_STALE_ID || rc == V2_PLAN_CONFLICT) {
-        v2Ack("plan", "rejected", "unchanged", "ram",
-              rc == V2_PLAN_STALE_ID ? "stale_plan" : "plan_conflict", -1, plan.planId,
-              v2Profile.contextId, UINT32_MAX);
-        return;
-    }
+    const V2PowerPlan &plan = decision.plan;
     v2PlanReason = "bridge";
     if (plan.mode == V2_PLAN_LIGHT) {
         v2LightDeadlineMs = v2Plan.deadlineMs();
@@ -4290,8 +4182,9 @@ static void applyV2Plan(const String &body) {
     if (v2ReplyOverBle && v2HistorySyncMs) {
         v2HistorySyncUntilMs = v2NowMs() + v2HistorySyncMs;
     }
-    v2Ack("plan", "applied", rtcMode == MODE_LIGHT ? "unchanged" : "unchanged", "ram",
-          nullptr, -1, plan.planId, v2Profile.contextId, v2Plan.grantedS());
+    v2Ack("plan", decision.result, decision.display, "ram", decision.error,
+          -1, decision.planId, decision.includeContext ? v2Profile.contextId : nullptr,
+          decision.grantedS);
 }
 
 static void handleV2Plan() {
@@ -4317,34 +4210,24 @@ static void handleV2Activate() {
     }
     JsonDocument doc;
     if (!v2Command(server.arg("plain"), doc)) return;
-    String id = doc["template_id"] | "";
-    String owner = doc["bridge_id"] | "";
-    String request = doc["request_id"] | "";
-    String expected = doc["expected_active_context_id"] | "";
-    if (request == v2ActivateRequest && owner == v2ActivateOwner) {
-        bool same = id == v2ActivateTemplate && expected == v2ActivateExpected;
-        v2Ack("activate", same ? "applied" : "rejected", "unchanged", "flash",
-              same ? nullptr : "request_conflict", -1, 0,
-              v2ActivateContext.c_str(), UINT32_MAX);
+    V2ActivateDecision decision = v2DecideActivate(
+        doc, v2BundleReady, v2Profile, v2ActivateRequest.c_str(),
+        v2ActivateOwner.c_str(), v2ActivateTemplate.c_str(),
+        v2ActivateExpected.c_str(), v2ActivateContext.c_str());
+    if (decision.action != V2_ACTIVATE_SWITCH) {
+        v2Ack("activate", decision.result, decision.display, "flash",
+              decision.error, -1, 0, decision.context, UINT32_MAX);
         return;
     }
-    if (!v2BundleReady || expected != v2Profile.contextId) {
-        v2Ack("activate", "rejected", "unchanged", "flash", "context", -1, 0,
-              v2Profile.contextId, UINT32_MAX);
-        return;
-    }
-    int index = -1;
-    for (uint8_t i = 0; i < v2Profile.count; i++) {
-        if (id == v2Profile.ids[i]) { index = i; break; }
-    }
-    if (index < 0 || !v2SwitchActive((uint8_t)index)) {
+    if (!v2SwitchActive((uint8_t)decision.index)) {
         v2Ack("activate", "rejected", "unchanged", "flash",
-              index < 0 ? "unknown_template" : "activation_failed", -1, 0,
+              "activation_failed", -1, 0,
               v2Profile.contextId, UINT32_MAX);
         return;
     }
-    v2ActivateRequest = request; v2ActivateOwner = owner; v2ActivateExpected = expected;
-    v2ActivateTemplate = id; v2ActivateContext = v2Profile.contextId;
+    v2ActivateRequest = decision.request; v2ActivateOwner = decision.owner;
+    v2ActivateExpected = decision.expected; v2ActivateTemplate = decision.templateId;
+    v2ActivateContext = v2Profile.contextId;
     renderCurrent();
     v2Ack("activate", "applied", "displayed", "flash", nullptr, -1, 0,
           v2Profile.contextId, UINT32_MAX);
@@ -4359,47 +4242,39 @@ static void v2BundleError(const char *error) {
           v2Profile.contextId, UINT32_MAX);
 }
 
-static bool v2BundleReplay(JsonDocument &doc) {
-    if (v2CommittedRequest != (doc["request_id"] | "") ||
-        v2CommittedOwner != (doc["bridge_id"] | "")) return false;
-    uint32_t crc = 0;
-    if (!v2ParseCrc(doc["content_crc"] | "", crc) || crc != v2CommittedCrc ||
-        (doc["length"] | 0u) != v2CommittedLength) {
-        v2BundleError("request_conflict");
-    } else {
-        v2Ack("bundle", "applied", "unchanged", "flash", nullptr, -1, 0,
-              v2CommittedContext.c_str(), UINT32_MAX);
-    }
-    return true;
-}
-
 static void handleV2BundleBegin() {
     String mac;
     if (!endpointTokenAuthorized(mac)) {
         server.send(401, "application/json", "{\"result\":\"unauthorized\"}"); return;
     }
     JsonDocument doc;
-    if (!v2Command(server.arg("plain"), doc) || v2BundleReplay(doc)) return;
-    const char *owner = doc["bridge_id"] | "";
-    const char *request = doc["request_id"] | "";
-    uint32_t len = doc["length"] | 0u, crc = 0;
-    if (!v2ParseCrc(doc["content_crc"] | "", crc)) { v2BundleError("crc"); return; }
-    if (v2Rx.live(v2NowMs())) {
-        if (!v2Rx.matches(owner, request, v2Nonce().c_str())) { v2BundleError("busy"); return; }
-        if (v2Rx.length != len || v2Rx.crc != crc) { v2BundleError("request_conflict"); return; }
-    } else {
-        V2BundleRx next;
-        if (!next.begin(owner, request, v2Nonce().c_str(), len, crc, v2NowMs())) {
-            v2BundleError("size"); return;
-        }
+    if (!v2Command(server.arg("plain"), doc)) return;
+    const String nonce = v2Nonce();
+    const uint64_t nowMs = v2NowMs();
+    const V2BundleFingerprint committed{
+        v2CommittedOwner.c_str(), v2CommittedRequest.c_str(), v2CommittedCrc,
+        v2CommittedLength, v2CommittedContext.c_str()
+    };
+    V2BundleBeginDecision decision = v2DecideBundleBegin(
+        doc, v2Rx, committed, nonce.c_str(), nowMs);
+    if (decision.action == V2_BUNDLE_BEGIN_REPLAY) {
+        v2Ack("bundle", "applied", "unchanged", "flash", nullptr, -1, 0,
+              decision.replayContext, UINT32_MAX);
+        return;
+    }
+    if (decision.action == V2_BUNDLE_BEGIN_REJECT) {
+        v2BundleError(decision.error);
+        return;
+    }
+    if (decision.action == V2_BUNDLE_BEGIN_START) {
         if (!LittleFS.exists("/bundle")) LittleFS.mkdir("/bundle");
         File f = LittleFS.open(v2RxPath, "w");
         if (!f) { v2BundleError("open"); return; }
         f.close();
-        v2Rx = next;
+        v2Rx = decision.candidate;
     }
     server.send(200, "application/json", String("{\"result\":\"applied\",\"next_offset\":") +
-                String(v2Rx.offset) + "}");
+                String(decision.nextOffset) + "}");
 }
 
 // WebServer's ordinary POST parser duplicates the complete body several times
@@ -4425,16 +4300,14 @@ static void handleV2BundleChunkRaw() {
         String mac;
         if (!endpointTokenAuthorized(mac)) { v2ChunkFailure = "unauthorized"; return; }
         if (!ownerAllows(v2Rx.owner)) { v2ChunkFailure = "occupied"; return; }
-        if (server.header("X-Request-Id") != v2Rx.request ||
-            server.header("X-Session-Nonce") != v2Rx.nonce ||
-            !v2Rx.live(v2NowMs())) return;
+        String request = server.header("X-Request-Id");
+        String nonce = server.header("X-Session-Nonce");
         String offsetText = server.header("X-Offset");
-        if (!offsetText.length()) return;
-        for (char c : offsetText) if (c < '0' || c > '9') return;
-        uint64_t parsedOffset = strtoull(offsetText.c_str(), nullptr, 10);
-        if (parsedOffset > v2Rx.offset) { v2ChunkFailure = "offset_or_size"; return; }
-        v2ChunkOffset = (uint32_t)parsedOffset;
-        v2ChunkReplay = v2ChunkOffset < v2Rx.offset;
+        V2BundleChunkStartDecision decision = v2DecideBundleChunkStart(
+            v2Rx, request.c_str(), nonce.c_str(), offsetText.c_str(), v2NowMs());
+        if (!decision.allowed) { v2ChunkFailure = decision.error; return; }
+        v2ChunkOffset = decision.offset;
+        v2ChunkReplay = decision.replay;
         v2ChunkWriting = !v2ChunkReplay;
         v2ChunkFile = LittleFS.open(v2RxPath, v2ChunkReplay ? "r" : "a");
         if (!v2ChunkFile || (v2ChunkReplay && !v2ChunkFile.seek(v2ChunkOffset))) {
@@ -4444,9 +4317,11 @@ static void handleV2BundleChunkRaw() {
         return;
     }
     if (raw.status == RAW_WRITE && v2ChunkOk) {
-        uint64_t end = (uint64_t)v2ChunkOffset + v2ChunkBytes + raw.currentSize;
-        if (end > (v2ChunkReplay ? v2Rx.offset : v2Rx.length)) {
-            v2ChunkFailure = "offset_or_size";
+        V2BundleChunkWriteDecision decision = v2DecideBundleChunkWrite(
+            v2Rx, v2ChunkOffset, v2ChunkReplay, v2ChunkBytes,
+            (uint32_t)raw.currentSize);
+        if (!decision.allowed) {
+            v2ChunkFailure = decision.error;
             v2ChunkOk = false;
             return;
         }
@@ -4471,16 +4346,16 @@ static void handleV2BundleChunkRaw() {
     }
     if (raw.status == RAW_END || raw.status == RAW_ABORTED) {
         if (v2ChunkFile) v2ChunkFile.close();
-        if (v2ChunkOk && !v2ChunkBytes) {
-            v2ChunkFailure = "offset_or_size";
-            v2ChunkOk = false;
+        if (v2ChunkOk) {
+            V2BundleChunkEndDecision decision = v2DecideBundleChunkEnd(
+                v2Rx, v2ChunkOffset, v2ChunkReplay, v2ChunkBytes, v2NowMs());
+            if (!decision.allowed) {
+                v2ChunkFailure = decision.error;
+                v2ChunkOk = false;
+            } else {
+                v2Rx.offset = decision.nextOffset;
+            }
         }
-        if (v2ChunkOk && !v2ChunkReplay &&
-            !v2Rx.append(v2ChunkOffset, v2ChunkBytes, v2NowMs())) {
-            v2ChunkFailure = "offset_or_size";
-            v2ChunkOk = false;
-        }
-        if (v2ChunkOk && !v2ChunkReplay) v2Rx.offset += v2ChunkBytes;
         if (!v2ChunkOk && v2ChunkWriting) v2Rx.deadline = 0;
     }
 }
@@ -4504,36 +4379,30 @@ static void handleV2BundleCommit() {
         server.send(401, "application/json", "{\"result\":\"unauthorized\"}"); return;
     }
     JsonDocument doc;
-    if (!v2Command(server.arg("plain"), doc) || v2BundleReplay(doc)) return;
-    const char *owner = doc["bridge_id"] | "";
-    const char *request = doc["request_id"] | "";
-    uint32_t crc = 0;
-    if (!v2ParseCrc(doc["content_crc"] | "", crc)) { v2BundleError("crc"); return; }
-    if (!v2Rx.matches(owner, request, v2Nonce().c_str()) ||
-        !v2Rx.complete(doc["length"] | 0u, crc, v2NowMs())) { v2BundleError("session_or_length"); return; }
-    File f = LittleFS.open(v2RxPath, "r");
-    if (!f || f.size() != v2Rx.length) { if (f) f.close(); v2BundleError("length"); return; }
-    uint32_t fileCrc = 0;
-    if (!v2FileCrc(f, v2Rx.length, fileCrc) || fileCrc != crc) {
-        f.close();
-        v2BundleError("crc");
+    if (!v2Command(server.arg("plain"), doc)) return;
+    const String nonce = v2Nonce();
+    const uint64_t nowMs = v2NowMs();
+    const String bridgeIdFallback = server.arg("bridge_id");
+    const V2BundleFingerprint committed{
+        v2CommittedOwner.c_str(), v2CommittedRequest.c_str(), v2CommittedCrc,
+        v2CommittedLength, v2CommittedContext.c_str()
+    };
+    V2BundleCommitDecision decision = v2DecideBundleCommit(
+        doc, v2Rx, committed, nonce.c_str(), nowMs, v2RxPath.c_str(),
+        bridgeIdFallback.c_str());
+    if (decision.action == V2_BUNDLE_COMMIT_REJECT) {
+        v2BundleError(decision.error);
         return;
     }
-    if (v2BodyBridgeId(f) != owner) { f.close(); v2BundleError("owner"); return; }
-    JsonDocument idFilter, idDoc;
-    idFilter["job_id"] = true;
-    if (!f.seek(0) || deserializeJson(idDoc, f, DeserializationOption::Filter(idFilter))) {
-        f.close();
-        v2BundleError("json"); return;
+    if (decision.action == V2_BUNDLE_COMMIT_REPLAY) {
+        v2Ack("bundle", "applied", "unchanged", "flash", nullptr, -1, 0,
+              decision.replayContext, UINT32_MAX);
+        return;
     }
-    const char *jobId = idDoc["job_id"] | "";
-    uint32_t activeCrc = 0;
-    if (bsActiveJobPayload(jobId, activeCrc)) {
-        f.close();
-        if (activeCrc != crc) { v2BundleError("request_conflict"); return; }
+    if (decision.action == V2_BUNDLE_COMMIT_ALREADY_ACTIVE) {
         bsProfile(v2Profile);
-        v2CommittedOwner = owner; v2CommittedRequest = request;
-        v2CommittedCrc = crc; v2CommittedLength = v2Rx.length;
+        v2CommittedOwner = decision.owner; v2CommittedRequest = decision.request;
+        v2CommittedCrc = decision.crc; v2CommittedLength = decision.length;
         v2CommittedContext = v2Profile.contextId;
         v2Rx.deadline = 0;
         LittleFS.remove(v2RxPath);
@@ -4544,13 +4413,23 @@ static void handleV2BundleCommit() {
     char ctx[BS_CTX_LEN];
     snprintf(ctx, sizeof(ctx), "%08x%08x", v2CtxGen.next(), (unsigned)esp_random());
     String err;
-    if (!bsInstall(f, v2Rx.length, crc, FW_TARGET_ID, RENDER_TARGET_ID, ctx, err)) {
+    // Local: install by streaming the already-validated payload straight from
+    // flash. v2DecideBundleCommit settled length/CRC/owner/job without holding the
+    // bundle in RAM, so this re-opens the same file instead of rebuilding it.
+    File f = LittleFS.open(v2RxPath, "r");
+    if (!f || f.size() != decision.length) {
+        if (f) f.close();
+        v2BundleError("length");
+        return;
+    }
+    if (!bsInstall(f, decision.length, decision.crc, FW_TARGET_ID, RENDER_TARGET_ID, ctx, err)) {
         f.close();
         v2BundleError(err.c_str()); return;
     }
     f.close();
-    v2CommittedOwner = owner; v2CommittedRequest = request;
-    v2CommittedCrc = crc; v2CommittedLength = v2Rx.length; v2CommittedContext = ctx;
+    v2CommittedOwner = decision.owner; v2CommittedRequest = decision.request;
+    v2CommittedCrc = decision.crc; v2CommittedLength = decision.length;
+    v2CommittedContext = ctx;
     v2Rx.deadline = 0;
     LittleFS.remove(v2RxPath);
     bsProfile(v2Profile);

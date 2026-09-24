@@ -1,5 +1,36 @@
 # Codex Status 项目进度（交接文档）
 
+## 合并 codex/fake（共享 v2 决策 + 设备模拟器）：2026-09-25 — 合并完成，待重编 ROM
+
+把 `codex/fake`（`afaf5ab`，14 个提交，40 文件 +5436/−273）合入 `master`（`ca4022c`，合并基 `6d131ac`）。两边各有独有提交，故为真正的三方合并：38 个文件自动合并，仅 `PROGRESS.md` 与 `src/main.cpp` 冲突，与合并前 `git merge-tree` 干跑预测完全一致。`platformio.ini` 未被分支改动。
+
+`src/main.cpp` 共 6 处冲突。按 next.md §5.4「以分支版为骨架，只把本地新增贴回去」执行，并按用户决策 D4/D2 处理两处语义分歧：
+
+- **C1 局部流式辅助函数**：删除本地 `v2BodyBridgeId(File&)`、`v2FileCrc`——已被共享模块内的流式校验取代。
+- **C2 `/v2/status`**：采用分支的共享 `v2BuildStatusSnapshot`，同时把本地 4 个唤醒字段（`wake_generation`/`wake_seq`/`wake_stage`/`wake_cause`）作为**可选块**接回：`V2StatusSnapshot` 新增 `const V2WakeSnapshot *wake = nullptr`，宿主/模拟器不绑定该指针，故其 status JSON 逐字节不变；字段插入位置与本地版一致（紧跟 `device_mac`）。
+- **C3/C4 `/v2/plan`**：采用分支 `v2DecidePlan`，同时保留本地 `history_sync_ms` 语义——仍在「形状校验通过之后、接受结果已知之前」记录窗口，与原 `v2Plan.accept` 前的赋值点一致。
+- **C5/C6 `POST /v2/bundle/commit`**：采用分支的 `v2DecideBundleCommit` 决策流，并把安装改回**流式**（`bsInstall(File&, length, crc, ...)`）。
+
+**D4（用户选 B）：共享模块改为流式校验。** 分支的 `v2DecideBundleCommit` 原先把整份 bundle 读进 RAM `String bodyOut` 再调 `bsInstall(body, ...)`，正好抵消 `ca4022c` 的流式安装。现按用户选择把 `src/v2_bundle_command.cpp` 改为流式：按 256 B 分块从 flash 计算 CRC、用 ArduinoJson 过滤解析只读 `bridge_id`/`job_id`，**移除 `bodyOut` 出参**。校验顺序与错误码（`length`/`crc`/`owner`/`json`/`request_conflict`）逐项保留；`crc` 语义经核对完全相同（同为 CRC32/IEEE，poly `0xEDB88320`、初值 `0xFFFFFFFF`、末尾取反）。配套改动：`v2_state.h` 把 `v2Crc32` 拆为 `v2Crc32Start/Update/Finish`（`v2Crc32` 结果不变，全构建仍是单一实现）；宿主 shim `LittleFS.h` 补 `File::readBytes`（ArduinoJson 的非 `Stream` 通用 reader 需要，设备侧由 `Stream` 提供）；`ffi.cpp` 的 `codex_v2_bundle_commit_decide` 改为读回该文件填充 `body_out`，故 `v2_state.rs` 的载荷断言仍逐字节有效、未被放宽。
+
+> ⚠️ **副作用**：整份载荷不再进 RAM，原先 `reserveString` 失败返回的 `oom` 分支随之消失（该路径本就不被宿主 shim 覆盖，无测试依赖）。已删除 `reserveString` 与 `<type_traits>`。
+
+**复核点实测：**
+
+- 复核点 1（防静默回退）：`main.cpp` 对 `v2Decide*`/`v2ParseCommand`/`v2CheckCommandSession`/`v2BuildAck`/`v2PrepareClaim`/`v2DecideClaim`/`v2BuildStatusSnapshot` 的引用共 **14 处**（分支版 13 处，+1 为本轮新增注释）；`v2BundleReplay`/`v2FileCrc`/`v2BodyBridgeId` 均为 **0 处**，旧内联决策未被带回。
+- 复核点 2：`bsInstall` 两个重载仍在——`bundle_store.h` **2 处声明**、`bundle_store.cpp` **2 处定义**；`main.cpp` 调用流式重载。
+- 复核点 3 / D4：校验顺序与 CRC 语义**一致**（见上）；唯一差异是分支多一次整份 `String` 读取，已按 D4 消除。
+
+`git diff --check` 通过。**尚未重编/烧录 ROM，未接实机、未启动或停止 Bridge。** 下一步：154g 先单目标编译，再 note4-b（串行），并按 next.md §8 验证产物。
+
+### 现场事故：next.md §5.2 的 stash 流程在本机不成立
+
+按 §5.2 执行选择性 `git stash push -u` 时**部分失败**：`tools/` 与 `artifacts/` 带有 `CodexSandboxUsers` ACL，**拒绝 shell 写入**（`artifacts/` 的该问题 next.md §6 已记录，`tools/` 同样如此）。git stash 先 unlink 再写回，于是 16 个文件被删除却无法重建，而索引已暂存全部改动。
+
+**已无损恢复**：stash 对象 `stash@{0}`（`ae42586`）完整保存了 13 个已修改 + 8 个未跟踪文件；索引中也保有同一份 WIP 快照，故用 `git checkout --` 从索引恢复了 16 个被删文件，再 `git reset` 取消暂存。**逐文件哈希核对 21/21 全部一致**（对照 `stash@{0}` 与 `stash@{0}^3` 的 blob）。另在 `%TEMP%\codex-wip-backup` 存有独立补丁与 tar 备份。
+
+**结论（供后续修订 next.md）**：本机不要用 `git stash` 保护现场；`tools/`、`artifacts/` 只能由 `write`/`edit` 工具写入。已核实分支 40 个文件与现场 21 项 WIP **零交集**，故本次直接在脏工作树上合并，stash 仅作备份、不再 pop。
+
 ## 固件双目标切换：2026-09-24 — 按用户要求停止构建
 
 用户要求停止本轮 `0.18.23` 双目标构建；当前无活动 `pio` 进程，未执行后续构建、框架包安装/修复或设备操作。`.pio/build/zectrix-note4-b` 与 `.pio/build/esp32-s3-epaper-154g` 已有构建文件，但没有复制到 `artifacts/`，因此不作为发布 ROM 记录。
@@ -33,6 +64,62 @@ Note4 `0.18.20-note4-b` 的设备 `/log`（4KB 无时间戳环形）能证明多
 发布与同步边界：`sync_enabled` 只控制 Bridge 的 Data 快照投递及其产生的 light 计划，不阻止显式 Bundle 发布。Bundle 有按 MAC 的冻结待办，认证会合后由 Bridge 计划 light 并经 HTTP 投递；ROM OTA 当前仍用旧的内存 `pending_ota_rom` 排队与联系窗口重试，并非按 MAC 持久化的 v2 OTA 作业，不能承诺重启后或多设备下可靠续投。设备不会自行下载模板/ROM。此协议缺口已记录，未主动更改运行状态。
 
 Note4 帧缓存源码另发现条件性自愈缺陷：恢复失败后 RTC 哈希仍在，下一次相同帧可能跳过重写。Luna 已作最小源码修正，隔离 worktree 的 Note4 B 与 1.54 顺序构建均退出 0，`git diff --check` 通过；未制作发布 ROM、未刷机、未提交。现机 0.18.20 不能归因于这项尚未安装的修正。
+
+## Fake ROM Stage D PowerPlan 状态：2026-09-24 — 未配置设备协议路径通过
+
+owner/claim 已提交 `e591951`。Task 13d 在 `codex/fake` 独立 worktree 让 `/v2/plan` 依次调用同源命令解析、owner/session 校验、C++ Plan 状态机和 ACK 构造。16 项模拟进程集成测试覆盖首次接受、重放不续期、旧 ID/冲突/坏形状、401/409、逻辑 step 与 wall 偏移、双进程独立状态；`bridge-render` 全套、格式检查及 `git diff --check` 通过。审查中校正了 ACK：重放回原授予秒数，递减剩余只在 status，JSON/session 错误为 command ACK，冲突包含 owner。当前无 Bundle，故仍未模拟 sleep/无线会合；Data/Bundle/Activate 继续 501，不能登记为完整 Fake ROM。
+
+## Fake ROM Stage D owner/claim：2026-09-24 — 逻辑租期与正常重启恢复通过
+
+在独立 `codex/fake` worktree，设备时钟 Task 13b 已提交 `7aa6d38`。Task 13c 将设备操作 token 鉴权的 `/claim` 接到 Stage C 共享 C++ 决策，新增每虚构 MAC 显式独立数据目录和 owner 文件；claim/续约/409/force/release、暂停 step 的精确 lease 边界、wall 校时不影响租期、正常重启后钳制 uptime 并续约、目录身份隔离与损坏拒绝均通过 13 项 loopback 集成测试。`cargo test -p bridge-render` 全套和 `git diff --check` 通过。仍未提供 `/status.json`，Data/Plan/Bundle/Activate 仍 501；存储断电撕裂、BLE、显示与 Bridge 逐目标时钟待后续阶段，见 `project-workflow/fake-rom-simulator/status.md`。
+
+## Fake ROM Stage D 设备时钟：2026-09-24 — 可独立暂停、步进与倍速
+
+`codex/fake` 独立 worktree 的 Task 13a 启动层已提交 `a8578a6`。Task 13b 为每个 `device-sim` 进程增加单独的整数倍率逻辑时钟：1x、暂停、暂停时精确 step、倍率切换连续结算与独立 wall 偏移；`/v2/status` 和控制状态使用同一取样，控制面用独立 token。两个进程不同速率、非法命令原子拒绝等 9 项集成测试通过；`cargo test -p bridge-render` 与 `git diff --check` 也通过。当前进程冷启动从零开始，跨重启持久时钟、事件队列 `max`、owner/PowerPlan 截止及 Bridge 按 MAC 目标时钟均尚未接线；见 `project-workflow/fake-rom-simulator/task-13b-device-clock.md`。
+
+## Fake ROM Stage D 启动层：2026-09-24 — 单设备 localhost 进程通过宿主验证
+
+在独立 `codex/fake` worktree，从多 Bridge tag 之后的 Stage C 继续推进。新增 `device-sim`：每进程显式虚构 MAC、动态 loopback 端口、三种互不相同的 token；鉴权 `/v2/status` 调用固件同源 C++ 快照，控制面只读，其余业务写入明确 501。两个进程的身份/端口隔离、认证和拒绝路径由 6 项集成测试覆盖；`cargo test -p device-sim`、`cargo test -p bridge-render`、`git diff --check` 通过。此切片尚无 owner/Bundle 持久状态、可写命令、BLE、显示或倍速时钟，不可作为完整 Fake ROM 登记到生产 Bridge。下一步串行接设备状态与协议写入，见 `project-workflow/fake-rom-simulator/status.md`。
+
+## Fake ROM Stage C 全量宿主回归：2026-09-24 — 35 项通过
+
+`codex/fake` HEAD `e4fb250`，`cargo test -p bridge-render` 完整包 35/35、`git diff --check` 通过，工作树干净。Data/Plan/Bundle/Activate/claim 的共享 C++ 决策、命令信封与 `/v2/status` 快照已在固件调用路径与宿主渲染库中。仍没有可运行 Fake ROM：宿主设备状态、鉴权、持久存储、HTTP/BLE、显示与逻辑时钟须在 Stage D/E 接线。下一步先做单设备 localhost 模拟进程的最小端点，未覆盖行为显式 unsupported；见 `project-workflow/fake-rom-simulator/status.md`。
+
+## Fake ROM Stage C 状态快照：2026-09-24 — 宿主验证通过
+
+命令信封已提交 `c154945`；`/v2/status` 的完整 JSON 现由固件与宿主共用 `src/v2_status_snapshot.{h,cpp}`，PowerPlan/provisional 剩余使用显式同一 `nowMs`。设备端继续承担 endpoint token 401、`markSynced`、nonce 生成与现场字段采集。宿主 render 测试 19/19、`git diff --check` 通过。未接主 Bridge/实机，未构建/烧录 ROM。Stage C 已具备共享命令决策、信封和状态快照，但尚无可运行 Fake ROM；Stage D 需接宿主鉴权、owner/Bundle 存储、HTTP/BLE、显示与时钟，见 `project-workflow/fake-rom-simulator/status.md`。
+
+## Fake ROM Stage C 命令信封：2026-09-24 — 宿主验证通过
+
+claim 已提交 `f030dac`。设备端与宿主现共用 `src/v2_command_envelope.{h,cpp}` 的命令 JSON/session/MAC/request 校验和 ACK JSON 构造；固件 `v2Command` 保持 owner 检查、request_id 更新与按需 nonce 生成顺序，endpoint token 和 BLE 包装仍在设备入口。宿主 render 测试 18/18、`git diff --check` 通过。未接主 Bridge/实机，未构建/烧录 ROM。还需共享 `/v2/status` 并完成宿主端点/存储/时钟/显示接线；见 `project-workflow/fake-rom-simulator/status.md`。
+
+## Fake ROM Stage C claim 切片：2026-09-24 — 宿主验证通过
+
+Activate 已提交 `dc445ff`；`POST /claim` 的 UTF-8 参数净化、lease/port 归一化与 release/occupied/claim/renew 判定也已抽为固件与宿主共用的 `src/v2_claim_command.{h,cpp}`。设备端设备操作 token、owner NVS、活动计时与 HTTP 回复顺序保留；空 id 仍在 owner 查询前 400，续约不延长 light 活动。宿主 render 测试 17/17、`git diff --check` 通过。未接主 Bridge/实机，未构建/烧录 ROM。Stage C 共享命令决策已覆盖 Data/Plan/Bundle/Activate/claim，宿主端点及存储/时钟/显示适配仍待 Stage D，详见 `project-workflow/fake-rom-simulator/status.md`。
+
+## Fake ROM Stage C Activate 切片：2026-09-24 — 宿主验证通过
+
+Bundle COMMIT 已提交 `b702aa3`；Activate 的请求重放、expected context 和 Profile 1–8 模板索引现在由固件与宿主共用 `src/v2_activate_command.{h,cpp}`。设备端只在新请求有效时调用原 `v2SwitchActive`，成功后才更新指纹、渲染和 ACK。宿主 render 测试 16/16、`git diff --check` 通过；未接主 Bridge/实机，未构建/烧录 ROM。下一步 claim 与完整宿主端点；见 `project-workflow/fake-rom-simulator/status.md`。
+
+## Fake ROM Stage C Bundle COMMIT 切片：2026-09-24 — 宿主验证通过
+
+独立 `codex/fake` worktree 上，CHUNK 已提交 `fa50902`；COMMIT 的重放、会话完整性、接收文件读回 CRC、owner/JSON 和已有 job 判定现由固件与宿主共用 `v2DecideBundleCommit`。设备端仍负责 context 随机生成、实际安装和安装成功后的状态/显示副作用。内存 LittleFS 宿主测试 15/15、`git diff --check` 通过；OOM 分支保留固件原 bool 检查，宿主 shim 不模拟 reserve 失败。未接主 Bridge/实机、未构建/烧录 ROM。Activate/claim 与可运行 Fake ROM 仍待实现，见 `project-workflow/fake-rom-simulator/status.md`。
+
+## Fake ROM Stage C Bundle CHUNK 切片：2026-09-24 — 宿主验证通过
+
+独立 `codex/fake` worktree 上，Bundle BEGIN 已提交 `bd916c7`；CHUNK 的 START 会话/offset、WRITE 边界、END append 决策也已抽入固件与宿主共享的 `src/v2_bundle_command.{h,cpp}`。设备端保留原始流与 LittleFS I/O、endpoint token/owner、重放比对和失败时会话失效顺序。宿主 render 测试 14/14 与 `git diff --check` 通过；未接主 Bridge/实机，未构建/烧录 ROM。COMMIT、Activate/claim、宿主端点仍待实现，详见 `project-workflow/fake-rom-simulator/status.md`。
+
+## Fake ROM Stage C Bundle BEGIN 切片：2026-09-24 — 宿主验证通过
+
+Data `02dd043`、Plan `e997a72` 已提交；接着在独立 `codex/fake` worktree 将 Bundle BEGIN 的重放、会话匹配、CRC/长度与恢复偏移决策抽为固件和宿主共用的 `src/v2_bundle_command.{h,cpp}`。设备端仍先鉴权，且仅在接收文件创建成功后写入新接收状态；重复 BEGIN 不续期。宿主 render 测试 13/13 与 `git diff --check` 通过。未碰主 Bridge、生产数据或实机，未构建/烧录 ROM。Bundle CHUNK/COMMIT、Activate/claim、宿主端点与完整 Fake ROM 尚待实现，见 `project-workflow/fake-rom-simulator/status.md`。
+
+## Fake ROM Stage C Plan 决策切片：2026-09-24 — 宿主验证通过
+
+Data 切片已提交 `02dd043`，随后在同一独立 `codex/fake` worktree 串行完成 PowerPlan 的共享 C++ 命令决策：形状校验、计划授予限制、ACK 分类由固件和宿主 render FFI 调用同一 `src/v2_plan_command.{h,cpp}`。原有认证、deadline、模式持久化和日志副作用留在设备端。宿主测试证明同 ID 重放不续期，冲突/旧 ID/非法形状不改变计划；provisional 300s、常规 600s、最低 30s 与 sleep 均通过。`cargo test -p bridge-render --test v2_state` 12/12、`git diff --check` 通过。未碰主 Bridge、生产数据或实机，未构建/烧录 ROM。后续仍需 Bundle/Activate/claim、宿主端点和完整 Fake ROM；详见 `project-workflow/fake-rom-simulator/status.md`。
+
+## Fake ROM Stage C Data 决策切片：2026-09-24 — 独立 worktree 宿主验证通过
+
+在 `codex/fake` 独立 worktree 从 `bridge-multi-instance-2026-09-24` tag 基线开始，ROM 文件已交接。`src/main.cpp::applyV2Data` 预检后的 Data 决策/ACK 分类由固件和宿主共用 `src/v2_data_command.{h,cpp}`；设备端认证、首次接受后的 checkpoint/缓存/显示原顺序保留。宿主 render FFI 覆盖首次接受、重放、冲突、旧 seq、错 context、CRC/字段顺序错误和未配置，拒绝不推进序列。`cargo test -p bridge-render --test v2_state` 11/11 通过（ArduinoJson 用已安装的只读头文件路径），`git diff --check` 通过。未改主工作树、未启动/停止 Bridge、未接设备、未构建/烧录实机 ROM、未提交。此切片仍不是可运行 Fake ROM；Stage C 后续 Plan/Bundle/Activate/claim 与宿主端点尚待实现，见 `project-workflow/fake-rom-simulator/status.md`。
 
 ## Bridge 两设备界面与推送：2026-09-24 — 主工作树已部署
 

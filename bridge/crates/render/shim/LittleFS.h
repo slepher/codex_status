@@ -114,6 +114,10 @@ public:
         memcpy(out, LittleFS.files[path].data() + pos, len); pos += len; return len;
     }
     int read() { uint8_t b; return read(&b, 1) == 1 ? b : -1; }
+    /// The device's `fs::File` inherits `Stream::readBytes`; ArduinoJson's
+    /// generic (non-`Stream`) reader requires the same name here, which is what
+    /// the streamed Bundle validation uses on both sides.
+    size_t readBytes(char *out, size_t len) { return read((uint8_t *)out, len); }
     size_t write(const uint8_t *data, size_t len) {
         if (!opened || isDir) return 0;
         if (LittleFS.writeBudget >= 0) len = std::min(len, (size_t)LittleFS.writeBudget);

@@ -184,15 +184,25 @@ class V2DataSeq {
 };
 
 // CRC32/IEEE (poly 0xEDB88320) matching the bridge/Python/device template hash.
-inline uint32_t v2Crc32(const uint8_t *data, size_t len) {
-    uint32_t crc = 0xFFFFFFFFu;
+// Split into start/update/finish so one implementation serves both the
+// one-shot callers and the streaming ones (bundle commit hashes the received
+// payload in bounded chunks instead of materializing it in RAM).
+inline uint32_t v2Crc32Start() { return 0xFFFFFFFFu; }
+
+inline uint32_t v2Crc32Update(uint32_t crc, const uint8_t *data, size_t len) {
     for (size_t i = 0; i < len; i++) {
         crc ^= data[i];
         for (int b = 0; b < 8; b++) {
             crc = (crc >> 1) ^ (0xEDB88320u & (uint32_t)(-(int32_t)(crc & 1)));
         }
     }
-    return ~crc;
+    return crc;
+}
+
+inline uint32_t v2Crc32Finish(uint32_t crc) { return ~crc; }
+
+inline uint32_t v2Crc32(const uint8_t *data, size_t len) {
+    return v2Crc32Finish(v2Crc32Update(v2Crc32Start(), data, len));
 }
 
 // RTC checkpoint is bound to the committed activation context. It contains no

@@ -1,5 +1,63 @@
 # Fake ROM 与多设备实验时钟状态
 
+## 2026-09-24：Stage D / Task 13d 未配置设备 Plan 状态通过宿主验证
+
+模拟进程的 `/v2/plan` 现调用 ROM 同源 C++ 命令解析、session、Plan 判定与 ACK 构造；owner 占用按设备顺序检查，Plan ID/截止按进程隔离。重放 ACK 保留原授予秒数，status 的剩余秒随设备逻辑时间递减；wall 校时不改变截止。16 项集成测试、`bridge-render` 全套、Rust 格式与 `git diff --check` 通过。因为 Bundle 仍未配置，模拟器未执行实际 sleep/无线会合；Data、Bundle、Activate、显示和 Bridge 每 MAC 时钟仍待完成。
+
+## 2026-09-24：Stage D / Task 13c owner 与 claim 通过宿主验证
+
+模拟设备现在要求显式实例数据目录，目录 marker 绑定虚构 MAC；`/claim` 经设备 token 鉴权和共享 C++ 参数/动作判定，owner 写入文件并按 32 位 uptime 秒租期恢复。13 项集成测试覆盖 claim/续约/冲突/force/release、lease 精确边界、wall 跳变、正常重启、目录与 MAC 隔离及异常文件拒绝；`bridge-render` 全套与 `git diff --check` 通过。存储故障/断电恢复、其他业务命令、BLE、显示和 Bridge 目标时钟仍未完成。下一步先让 Data/Plan 在模拟进程中走共享命令路径，未完成端点继续 501。
+
+## 2026-09-24：Stage D / Task 13b 设备时钟通过宿主验证
+
+每个 `device-sim` 进程现在有独立的逻辑 monotonic/uptime 与 wall 视图；控制 token 可读写 `/sim/time`，支持 1x、暂停、step、0..1000x 倍率及 wall 偏移。倍率切换先结算旧时间；校时不回退 monotonic。`/v2/status` 与 `/sim/state` 改用时钟快照；`max` 与跨进程持久时钟明确未实现。9 项模拟进程集成测试、`bridge-render` 全套和 `git diff --check` 通过。Bridge 逐目标时钟、owner/PowerPlan 期限与业务状态尚未接线；下一步先接持久设备 owner/claim，再推进其余命令。
+
+## 2026-09-24：Stage D / Task 13a 启动层通过宿主验证
+
+`device-sim` 在 loopback 以一进程一虚构 MAC 运行，三 token 域互不相同；鉴权 `/v2/status` 通过 Stage C 同源 C++ 生成未配置状态，`/sim/state` 只读，其余业务写入 501 unsupported。未提供 `/status.json`，避免 Bridge 误登记。两个模拟进程身份/端口隔离与错误路径通过 6 项集成测试；`cargo test -p device-sim`、`cargo test -p bridge-render` 和 `git diff --check` 通过，提交 `a8578a6`。尚无状态持久化、可写协议、BLE、显示和实验时钟，不能视为完整 Fake ROM；下一步 Task 13b 在设备端接可控逻辑时钟。
+
+## 2026-09-24：Stage C 全量宿主回归通过
+
+`bridge-render` 完整包测试 35/35 通过，`git diff --check` 通过，`codex/fake` 工作树干净，HEAD `e4fb250`。Stage C 已共享命令决策、信封与权威状态快照；固件 `main.cpp` 继续调用同一 C++，但宿主尚没有统一设备状态/认证/存储/HTTP/BLE/显示编排，也没有可运行的 Fake ROM。按计划转入 Stage D 单设备模拟进程，先交付受限 localhost 进程与真实状态快照，再逐条接通业务端点；未覆盖端点必须明确 unsupported。
+
+## 2026-09-24：Stage C / Task 12i `/v2/status` 快照通过宿主验证
+
+在信封 `c154945` 后，`src/v2_status_snapshot.{h,cpp}` 共享权威 `/v2/status` 的全部 JSON 字段，显式传入 MAC/nonce、Profile/DataSeq/Plan、显示态、电量及一次取得的单调 `nowMs`。设备 handler 保留 endpoint token 401、`markSynced` 与 nonce 懒生成；重复状态读取不碰 owner 或计划。宿主测试覆盖未配置 v2 的模板回退、8 项 Profile、显示四态、light/sleep、provisional 剩余和只读性；`cargo test -p bridge-render --test v2_state` 19/19、`git diff --check` 通过。未构建/烧录 ROM、接主 Bridge/实机。Stage C 的命令决策、信封和状态快照已有同源宿主调用；真实认证、持久 owner/Bundle、HTTP/BLE、显示/RTC 副作用与完整端点仍待 Stage D，故目前不能称为可运行 Fake ROM。
+
+## 2026-09-24：Stage C / Task 12h 命令信封与 ACK 通过宿主验证
+
+在 claim `f030dac` 后，`src/v2_command_envelope.{h,cpp}` 共享 v2 命令 JSON 解析、protocol/MAC/request/nonce 校验和 ACK JSON 字段构造。设备端仍按 parse→owner→request_id→按需生成 nonce→session 的原顺序执行；endpoint token、owner touch/409、HTTP/BLE 回复包装保持 main。宿主测试覆盖非法 JSON、错误协议/MAC/request/nonce、64 字符边界和 ACK 字段省略/包含；`cargo test -p bridge-render --test v2_state` 18/18、`git diff --check` 通过。未构建/烧录 ROM、接主 Bridge 或实机。下一步共享 `/v2/status` 快照，再审查 Stage C 完成条件。
+
+## 2026-09-24：Stage C / Task 12g claim 决策切片通过宿主验证
+
+在 Activate `dc445ff` 后，`POST /claim` 的参数净化与 release/occupied/claim/renew 动作判定抽为 `src/v2_claim_command.{h,cpp}`。设备端依旧先校验设备操作 token；空 id 在 `ownerGet` 前返回 400；owner NVS 持久化和 `noteActivity` 留在 main，续约不触发活动计时。宿主测试覆盖 UTF-8/控制字符和长度、port/lease 边界、release/冲突/force、同 id 续约及决策不修改当前 owner；`cargo test -p bridge-render --test v2_state` 17/17、`git diff --check` 通过。未构建/烧录 ROM、接主 Bridge 或实机。Stage C 已有 Data/Plan/Bundle/Activate/claim 共享决策，但宿主鉴权、owner 存储/显式时钟、HTTP/BLE、显示副作用仍未接线；不能称为可运行 Fake ROM。下一步先审查 Stage C 完整性，再设计 Stage D。
+
+## 2026-09-24：Stage C / Task 12f Activate 决策切片通过宿主验证
+
+在 Bundle COMMIT `b702aa3` 后，串行抽取 Activate 的同请求重放/冲突、expected context 和 Profile 1–8 模板索引决策为 `src/v2_activate_command.{h,cpp}`。设备端仍在 token/owner/session 预检后调用共享决策；只有有效 switch 才进入原 `v2SwitchActive`，成功后才记录请求指纹并渲染。宿主测试覆盖上次 context 的成功重放、冲突、未配置、旧 context、未知模板、8 项索引和拒绝时指纹不变；`cargo test -p bridge-render --test v2_state` 16/16、`git diff --check` 通过。未构建/烧录 ROM、未接主 Bridge/实机。下一步 claim，再处理宿主端点及存储/显示适配；仍非可运行 Fake ROM。
+
+## 2026-09-24：Stage C / Task 12e Bundle COMMIT 校验切片通过宿主验证
+
+在 CHUNK `fa50902` 后，共享 `v2DecideBundleCommit` 按原顺序处理已提交请求重放、CRC/会话/长度、LittleFS 接收文件读回、body owner/JSON、已有 job 同 CRC 或冲突判定。固件 `main.cpp` 仍在校验成功后生成 context、安装 Bundle，再按原顺序更新 committed 指纹、清理 RX、重置 DataSeq 与显示。宿主内存 LittleFS 测试覆盖重放/冲突、错会话/不完整/缺文件/错长度/CRC/owner/JSON、待安装和已有 job 分支；`cargo test -p bridge-render --test v2_state` 15/15、`git diff --check` 通过。Arduino 固件 `String::reserve` 返回 bool，共享代码保留原 OOM 拒绝；宿主 shim 的 reserve 不报告失败，故 OOM 未由宿主触发验证。未构建/烧录 ROM、接主 Bridge 或实机。下一步 Activate、claim 以及宿主完整端点。
+
+## 2026-09-24：Stage C / Task 12d Bundle CHUNK 决策切片通过宿主验证
+
+在 BEGIN `bd916c7` 后，串行共享 CHUNK 的 START 身份/offset、WRITE 边界和 END append 接纳决策；固件 `main.cpp` 保持 endpoint token、owner、LittleFS 原始流、重放字节比较、文件关闭和新写入失败时使会话失效的原顺序。共享决策只读当前 RX，成功 END 后设备适配层才应用新 offset。宿主测试覆盖错身份/过期/非十进制或过大 offset、重放与新写、0 字节、16KB 上限及拒绝不改状态；`cargo test -p bridge-render --test v2_state` 14/14、`git diff --check` 通过。未修改 COMMIT，未接主 Bridge/实机、未构建/烧录 ROM。下一步 COMMIT；仍非可运行 Fake ROM。
+
+## 2026-09-24：Stage C / Task 12c Bundle BEGIN 决策切片通过宿主验证
+
+在 Data `02dd043`、Plan `e997a72` 后，串行抽取 Bundle BEGIN 的已提交请求重放、CRC/长度、live 会话忙碌/恢复、新会话候选状态为 `src/v2_bundle_command.{h,cpp}`，固件与宿主 render FFI 使用同一函数。设备端仍先做 token/owner/session 预检，只有空接收文件成功创建并关闭后才写入新 `v2Rx`；重复 BEGIN 返回现有 offset，绝不延长 deadline。宿主测试覆盖重放/冲突、busy、过期、CRC/大小错误和拒绝时状态不变；`cargo test -p bridge-render --test v2_state` 13/13、`git diff --check` 通过。未接主 Bridge/实机，未构建或烧录 ROM。下一步 CHUNK/COMMIT，仍无可运行 Fake ROM。
+
+## 2026-09-24：Stage C / Task 12b Plan 决策切片通过宿主验证
+
+在已提交的 Data 切片 `02dd043` 后，串行抽取 `src/main.cpp::applyV2Plan` 预检后的 PowerPlan 形状校验、授予上限选择和 ACK 分类为 `src/v2_plan_command.{h,cpp}`；宿主 render FFI 编译同一 C++ 实现。设备端认证和正式计划接受后的 deadline、模式持久化、日志副作用保留原顺序。同 ID 完全重放保留原截止；冲突、旧 ID 和非法形状不改计划。宿主测试覆盖 provisional 300s、常规 600s、最低 30s、重放、冲突、旧 ID 和 sleep；`cargo test -p bridge-render --test v2_state` 12/12 通过，`git diff --check` 通过。未接实机或主 Bridge，未构建/烧录 ROM。下一步继续 Bundle、Activate、claim 命令路径；仍无可运行 Fake ROM。
+
+## 2026-09-24：Stage C / Task 12a Data 决策切片通过宿主验证
+
+在独立 `codex/fake` worktree（HEAD 与 `bridge-multi-instance-2026-09-24` tag 均为 `6d131ac`）开始 Stage C。ROM 文件已交接；只有一名 6-luna high 代理顺序编码。`src/main.cpp::applyV2Data` 的预检后决策和 ACK 分类已抽入 `src/v2_data_command.{h,cpp}`，与宿主 render FFI 编译同一 C++ 实现；设备端原 token/owner/session 预检、首次接受后的 fields/checkpoint/cache/显示顺序保留。拒绝与重放不触发副作用，未配置仍返回原 ACK。初审发现 ACK 的 result/error 混用后已修正。
+
+宿主 `cargo test -p bridge-render --test v2_state` 11/11 通过，`git diff --check` 通过。测试通过临时 `CODEX_STATUS_ARDUINOJSON` 指向主工作树已有的只读 ArduinoJson 头文件；没有修改主工作树、运行中的 Bridge 或设备。本切片未构建/烧录 ROM、未提交。它仍不是可运行 Fake ROM：认证、owner、存储、显示副作用、Plan/Bundle/Activate/claim 和 HTTP/BLE 入口尚未在宿主共享。下一步由主代理设计 Stage C 后续命令路径，继续串行实现。
+
 ## 2026-09-24：Task 9/10a/10b 已提交，Task 11a/10c/11b 完成宿主验证
 
 显式 v2 端点登记与多目标 BLE 一次扫描/逐 MAC 会合已提交 `c82487c`。随后按串行顺序完成 BLE 扫描/GATT 时间线、UDP 已登记目标的认证改址、UDP/HTTP/PowerPlan/Data/ACK 结构化日志。真实 ROM 会发 UDP；v2 广播仅为地址线索，不再改全局选择/IP/推送/BLE 标志，也不构成 BLE 会合前提。无 legacy 设备参与本轮验收。
