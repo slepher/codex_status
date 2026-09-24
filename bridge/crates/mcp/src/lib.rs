@@ -915,6 +915,21 @@ fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "platform_device_register_v2",
+            "description": "Explicitly register or update one v2 device endpoint by MAC after verifying its structured status and authenticated v2 status. Does not claim or publish. Available only in bridge-app.",
+            "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true},
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "mac": {"type": "string", "description": "Device Wi-Fi MAC address"},
+                    "endpoint": {"type": "string", "description": "Bare IPv4 or IPv4:port"},
+                    "name": {"type": "string", "description": "Optional display name"}
+                },
+                "required": ["mac", "endpoint"],
+                "additionalProperties": false
+            }
+        },
+        {
             "name": "platform_overview",
             "description": "v2 platform overview: templates (latest per id+render_target), devices (MAC/profile/count), data sources, pending states. Same application service as the UI.",
             "annotations": {"readOnlyHint": true},
@@ -1404,7 +1419,7 @@ async fn call_tool(cfg: &McpConfig, name: &str, args: &Value) -> Result<Vec<Valu
         }
         // v2 platform tools share the app's application service; without a
         // running app there is no live state to read or change.
-        "platform_overview" | "template_list" | "template_get_v2" | "template_save_v2"
+        "platform_device_register_v2" | "platform_overview" | "template_list" | "template_get_v2" | "template_save_v2"
         | "template_validate_v2" | "profile_get_v2" | "profile_save_v2"
         | "family_profiles_v2" | "family_profile_save_v2"
         | "family_profile_delete_v2" | "family_profile_copy_v2"

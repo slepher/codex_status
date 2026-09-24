@@ -90,6 +90,228 @@ fn timeout() -> Duration {
     Duration::from_secs(6)
 }
 
+fn parse_device_endpoint(value: &str) -> Result<String, String> {
+    if value.is_empty() || value.trim() != value {
+        return Err("endpoint must be a bare IPv4 address or IPv4:port".into());
+    }
+    let (ip, port) = match value.split_once(':') {
+        Some((ip, port)) => {
+            let port = port
+                .parse::<u16>()
+                .ok()
+                .filter(|port| *port != 0)
+                .ok_or("endpoint port must be 1–65535")?;
+            (
+                ip.parse::<std::net::Ipv4Addr>()
+                    .map_err(|_| "endpoint must be IPv4")?,
+                Some(port),
+            )
+        }
+        None => (
+            value
+                .parse::<std::net::Ipv4Addr>()
+                .map_err(|_| "endpoint must be IPv4")?,
+            None,
+        ),
+    };
+    if ip.is_unspecified() {
+        return Err("endpoint cannot be 0.0.0.0".into());
+    }
+    Ok(port
+        .map(|port| format!("{ip}:{port}"))
+        .unwrap_or_else(|| ip.to_string()))
+}
+
+fn registered_device_facts(
+    requested_mac: &str,
+    status: &Value,
+    v2_status: &Value,
+) -> Result<(DeviceCapabilities, String), String> {
+    let requested_mac = DeviceIdentity::normalized_mac(requested_mac)
+        .ok_or_else(|| "invalid device MAC".to_string())?;
+    let status_mac = status
+        .get("mac")
+        .and_then(Value::as_str)
+        .and_then(DeviceIdentity::normalized_mac)
+        .ok_or_else(|| "status.json missing valid mac".to_string())?;
+    if status_mac != requested_mac {
+        return Err(format!(
+            "status.json reports MAC {status_mac}, not requested {requested_mac}"
+        ));
+    }
+    let (capabilities, legacy) = caps_from_status(status)?;
+    if legacy {
+        return Err("v2 capabilities missing: device reports a legacy protocol".into());
+    }
+    let authenticated_mac = v2_status
+        .get("device_mac")
+        .and_then(Value::as_str)
+        .and_then(DeviceIdentity::normalized_mac)
+        .ok_or_else(|| "authenticated /v2/status missing valid device_mac".to_string())?;
+    if authenticated_mac != requested_mac || authenticated_mac != status_mac {
+        return Err(format!(
+            "authenticated /v2/status reports MAC {authenticated_mac}, expected {requested_mac}"
+        ));
+    }
+    Ok((capabilities, requested_mac))
+}
+
+fn registration_identity(mac: &str, endpoint: &str, name: &str) -> Result<DeviceIdentity, String> {
+    let mut identity = DeviceIdentity::new(mac, name).map_err(err_text)?;
+    identity.ip = Some(endpoint.to_string());
+    identity.discovered_via = "manual".into();
+    identity.last_seen_at = now_secs();
+    Ok(identity)
+}
+
+async fn register_device_v2(ctx: &AppCtx, args: &Value) -> Result<Value, String> {
+    let mac = args
+        .get("mac")
+        .and_then(Value::as_str)
+        .ok_or("missing mac")?;
+    let mac = DeviceIdentity::normalized_mac(mac).ok_or("invalid device MAC")?;
+    let endpoint = parse_device_endpoint(
+        args.get("endpoint")
+            .and_then(Value::as_str)
+            .ok_or("missing endpoint")?,
+    )?;
+    let (endpoint_status, endpoint_v2_status, token) =
+        (endpoint.clone(), endpoint.clone(), ctx.config.token.clone());
+    let (status, v2_status) = blocking(move || {
+        let status = bridge_core::device::fetch(&endpoint_status, timeout())
+            .map_err(err_text)?
+            .raw
+            .ok_or_else(|| "endpoint did not return structured /status.json".to_string())?;
+        let v2_status =
+            v2_client::status(&endpoint_v2_status, &token, timeout()).map_err(err_text)?;
+        Ok((status, v2_status))
+    })
+    .await?;
+    let (capabilities, mac) = registered_device_facts(&mac, &status, &v2_status)?;
+    let name = args
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            service(ctx)
+                .device_get(&mac)
+                .and_then(|d| d["name"].as_str().map(str::to_string))
+        })
+        .unwrap_or_else(|| format!("CodexStatus-{}", &mac[6..]));
+    let identity = registration_identity(&mac, &endpoint, &name)?;
+    service(ctx)
+        .device_upsert(identity, capabilities, false)
+        .map_err(err_text)?;
+    service(ctx)
+        .device_get(&mac)
+        .ok_or_else(|| "registered device record unavailable".into())
+}
+
+#[cfg(test)]
+mod registration_tests {
+    use super::*;
+
+    fn status() -> Value {
+        json!({
+            "mac": "AA:BB:CC:DD:EE:FF",
+            "fw_target": "codex-status-154g",
+            "render_target": "epd-ssd1681-200x200-1bpp",
+            "max_templates": 8
+        })
+    }
+
+    fn v2_status(mac: &str) -> Value {
+        json!({"device_mac": mac})
+    }
+
+    #[test]
+    fn endpoint_accepts_only_ipv4_and_valid_optional_port() {
+        assert_eq!(
+            parse_device_endpoint("192.168.1.50").unwrap(),
+            "192.168.1.50"
+        );
+        assert_eq!(
+            parse_device_endpoint("192.168.1.50:8765").unwrap(),
+            "192.168.1.50:8765"
+        );
+        for invalid in [
+            "",
+            " http://192.168.1.50",
+            "device.local",
+            "[::1]",
+            "0.0.0.0",
+            "192.168.1.50:0",
+            "192.168.1.50:abc",
+        ] {
+            assert!(
+                parse_device_endpoint(invalid).is_err(),
+                "accepted {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn registration_requires_both_status_documents_to_match_requested_mac() {
+        let (caps, mac) =
+            registered_device_facts("aa-bb-cc-dd-ee-ff", &status(), &v2_status("AABBCCDDEEFF"))
+                .unwrap();
+        assert_eq!(mac, "AABBCCDDEEFF");
+        assert_eq!(caps.max_templates, 8);
+
+        assert!(registered_device_facts(
+            "00:00:00:00:00:01",
+            &status(),
+            &v2_status("AABBCCDDEEFF")
+        )
+        .is_err());
+        assert!(registered_device_facts(
+            "AABBCCDDEEFF",
+            &json!({"fw_target":"codex-status-154g"}),
+            &v2_status("AABBCCDDEEFF")
+        )
+        .is_err());
+        assert!(registered_device_facts(
+            "AABBCCDDEEFF",
+            &json!({
+                "mac": "00:00:00:00:00:01",
+                "fw_target": "codex-status-154g",
+                "render_target": "epd-ssd1681-200x200-1bpp"
+            }),
+            &v2_status("AABBCCDDEEFF")
+        )
+        .is_err());
+        assert!(registered_device_facts(
+            "AABBCCDDEEFF",
+            &status(),
+            &v2_status("00:00:00:00:00:01")
+        )
+        .is_err());
+        assert!(registered_device_facts(
+            "AABBCCDDEEFF",
+            &json!({"mac":"AABBCCDDEEFF"}),
+            &v2_status("AABBCCDDEEFF")
+        )
+        .unwrap_err()
+        .contains("v2 capabilities missing"));
+        assert!(registered_device_facts(
+            "AABBCCDDEEFF",
+            &json!({"mac":"AABBCCDDEEFF", "fw_target":"zectrix-note4-400x300", "render_target":"epd-ssd2683-400x300-1bpp"}),
+            &v2_status("AABBCCDDEEFF")
+        )
+        .unwrap_err()
+        .contains("missing width"));
+    }
+
+    #[test]
+    fn manual_registration_identity_uses_endpoint_and_name() {
+        let identity = registration_identity("AABBCCDDEEFF", "127.0.0.1:8123", "test").unwrap();
+        assert_eq!(identity.device_mac, "AABBCCDDEEFF");
+        assert_eq!(identity.ip.as_deref(), Some("127.0.0.1:8123"));
+        assert_eq!(identity.discovered_via, "manual");
+        assert!(identity.last_seen_at > 0);
+    }
+}
+
 fn endpoint(ctx: &AppCtx) -> String {
     ctx.device_ip.lock().unwrap().clone()
 }
@@ -1038,33 +1260,42 @@ pub fn is_v2_device(ctx: &AppCtx) -> bool {
         .unwrap_or(false)
 }
 
-/// Outcome of one v2 BLE opportunity (Plan C window accounting).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Outcome of one v2 BLE scan and, when connected, its rendezvous.
+#[derive(Debug)]
 pub enum BleOpportunity {
-    /// The device was not advertising; no connection was attempted.
+    /// None of the registered candidates was advertising.
     NoDevice,
-    /// One connection/handshake was attempted for this rendezvous window.
-    Attempted,
+    /// A verified MAC connected; the rendezvous may still have failed.
+    Connected { mac: String, result: Result<(), String> },
 }
 
 /// One real GATT rendezvous. Small snapshots stay on BLE; larger work receives
 /// a formal light plan and is then delivered by the HTTP cycle.
-pub async fn ble_cycle(ctx: &AppCtx) -> Result<BleOpportunity, String> {
+pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportunity, String> {
+    if candidates.is_empty() {
+        return Ok(BleOpportunity::NoDevice);
+    }
     let _delivery = ctx.v2_delivery.lock().await;
-    let mac = ctx
-        .device_mac
-        .lock()
-        .unwrap()
-        .clone()
-        .ok_or("unknown device")?;
-    let mut link = match bridge_ble::V2Connection::connect(&mac, &ctx.config.token, &ctx.bridge_id)
-        .await
-        .map_err(err_text)?
+    let (mac, mut link) = match bridge_ble::V2Connection::connect_any(
+        candidates,
+        &ctx.config.token,
+        &ctx.bridge_id,
+    )
+    .await
+    .map_err(err_text)?
     {
-        Some(link) => link,
+        Some((mac, link)) => (mac, link),
         None => return Ok(BleOpportunity::NoDevice),
     };
     let work = async {
+        let still_registered = service(ctx).devices().into_iter().any(|device| {
+            device["legacy"].as_bool() == Some(false)
+                && device["device_mac"].as_str().and_then(DeviceIdentity::normalized_mac)
+                    == Some(mac.clone())
+        });
+        if !still_registered {
+            return Err(format!("connected BLE device {mac} is no longer registered as v2"));
+        }
         let state = link.command("status", json!({})).await.map_err(err_text)?;
         if state["result"] != "applied" {
             return Err("BLE status rejected".to_owned());
@@ -1129,15 +1360,7 @@ pub async fn ble_cycle(ctx: &AppCtx) -> Result<BleOpportunity, String> {
         .map_err(|_| "BLE rendezvous timed out".to_owned())
         .and_then(|r| r);
     link.close().await;
-    // Plan C acceptance evidence: one line per attempted rendezvous (a found
-    // device), so the bridge log shows at most one per 60 s window.
-    match &result {
-        Ok(()) => tracing::info!(device = mac, transport = "ble", "v2 rendezvous complete"),
-        Err(error) => {
-            tracing::warn!(device = mac, transport = "ble", %error, "v2 rendezvous failed")
-        }
-    }
-    result.map(|_| BleOpportunity::Attempted)
+    Ok(BleOpportunity::Connected { mac, result })
 }
 
 /// Run one coordinator cycle for a registered v2 device.
@@ -1202,6 +1425,7 @@ fn json_arg(args: &Value) -> Result<Value, String> {
 /// MCP-tool adapter: same service calls as the UI commands.
 pub async fn tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, String> {
     let value = match name {
+        "platform_device_register_v2" => register_device_v2(ctx, args).await?,
         "platform_overview" => overview(ctx),
         "template_list" => templates(ctx),
         "template_get_v2" => {

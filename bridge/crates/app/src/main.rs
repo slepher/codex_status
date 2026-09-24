@@ -759,6 +759,7 @@ async fn mcp_handler(
         if matches!(
             name,
             "platform_overview"
+                | "platform_device_register_v2"
                 | "template_list"
                 | "template_get_v2"
                 | "template_save_v2"
@@ -2805,12 +2806,9 @@ async fn run_services(ctx: Arc<AppCtx>) {
     // handshake in its UDP announce (`ble=1`), which refreshes the endpoint
     // record (host/port/token) over the bonded link. Templates go over HTTP.
     //
-    // Plan C: the v2 rendezvous window is a hard 3 s, so this loop retries the
-    // opportunity every 250 ms (effectively continuous scan coverage on a
-    // mains-powered PC) and remembers a successful connect so one 60 s
-    // rendezvous period never gets a second connection. Scan misses while the
-    // device is not advertising are expected and stay at debug level.
-    let mut last_v2_ok: Option<i64> = None;
+    // Plan C: keep the 250 ms wake cadence and throttle actual GATT attempts
+    // independently for each registered v2 device.
+    let mut last_v2_attempt = HashMap::<String, i64>::new();
     loop {
         if ctx.status.lock().unwrap().paused {
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -2821,17 +2819,23 @@ async fn run_services(ctx: Arc<AppCtx>) {
             _ = tokio::time::sleep(Duration::from_millis(250)) => {}
         }
         let udp_request = ctx.udp_ble.swap(false, Ordering::SeqCst);
-        if !udp_request {
-            if platform::is_v2_device(&ctx) {
-                let now = now_secs();
-                let already_connected = last_v2_ok.is_some_and(|at| now.saturating_sub(at) < 55);
-                if !already_connected {
-                    match platform::ble_cycle(&ctx).await {
-                        Ok(platform::BleOpportunity::Attempted) => last_v2_ok = Some(now_secs()),
-                        Ok(platform::BleOpportunity::NoDevice) => {}
-                        Err(error) => {
-                            tracing::debug!(%error, "v2 BLE opportunity unavailable");
+        let current_is_v2 = platform::is_v2_device(&ctx);
+        let devices = ctx.platform.devices();
+        let registered_v2 = v2_ble_candidates(&devices, &HashMap::new(), now_secs());
+        if !udp_request || current_is_v2 || !registered_v2.is_empty() {
+            let candidates = v2_ble_candidates(&devices, &last_v2_attempt, now_secs());
+            if !candidates.is_empty() {
+                match platform::ble_cycle(&ctx, &candidates).await {
+                    Ok(platform::BleOpportunity::NoDevice) => {}
+                    Ok(platform::BleOpportunity::Connected { mac, result }) => {
+                        last_v2_attempt.insert(mac.clone(), now_secs());
+                        match result {
+                            Ok(()) => tracing::info!(device = %mac, transport = "ble", "v2 rendezvous complete"),
+                            Err(error) => tracing::warn!(device = %mac, transport = "ble", %error, "v2 rendezvous failed"),
                         }
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, "v2 BLE opportunity unavailable");
                     }
                 }
             }
@@ -2889,6 +2893,55 @@ async fn run_services(ctx: Arc<AppCtx>) {
                 tokio::time::sleep(Duration::from_secs(20)).await;
             }
         }
+    }
+}
+
+fn v2_ble_candidates(devices: &[Value], last_attempt: &HashMap<String, i64>, now: i64) -> Vec<String> {
+    devices
+        .iter()
+        .filter(|device| device["legacy"].as_bool() == Some(false))
+        .filter_map(|device| {
+            device["device_mac"]
+                .as_str()
+                .and_then(bridge_core::platform::model::DeviceIdentity::normalized_mac)
+        })
+        .filter(|mac| {
+            last_attempt
+                .get(mac)
+                .map_or(true, |at| now.saturating_sub(*at) >= 55)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod v2_ble_candidate_tests {
+    use super::*;
+
+    fn device(mac: &str, legacy: bool) -> Value {
+        json!({"device_mac": mac, "legacy": legacy})
+    }
+
+    #[test]
+    fn throttles_each_registered_v2_mac_independently() {
+        let devices = [device("AA:BB:CC:DD:EE:01", false), device("aabbccddee02", false)];
+        let attempts = HashMap::from([("AABBCCDDEE01".to_string(), 100)]);
+
+        let due = v2_ble_candidates(&devices, &attempts, 120);
+        assert_eq!(due, ["AABBCCDDEE02"]);
+
+        let due = v2_ble_candidates(&devices, &attempts, 155);
+        assert!(due.contains(&"AABBCCDDEE01".to_string()));
+        assert!(due.contains(&"AABBCCDDEE02".to_string()));
+    }
+
+    #[test]
+    fn excludes_invalid_and_unregistered_macs() {
+        let devices = [
+            device("not-a-mac", false),
+        ];
+        let attempts = HashMap::from([("AABBCCDDEE03".to_string(), 100)]);
+        let due = v2_ble_candidates(&devices, &attempts, 120);
+        assert!(due.is_empty());
     }
 }
 

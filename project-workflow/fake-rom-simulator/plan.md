@@ -36,4 +36,4 @@ A 的公共时间入口是 B 和 E 的前置。**开发严格串行**：先完�
 
 ## 首轮任务与约束
 
-`task-1-coordinator-time.md` 已完成并提交为 `cc6a6c1`。多设备运行层的 `task-2-target-mac-guard.md` 至 `task-8-v2-cycle.md` 已通过宿主测试。其后完成阶段 B 的 BLE/发现/验收，再串行开始 Fake ROM 与独立时钟；不让编码代理自行补设计。除用户明确要求提交的里程碑外，不自动提交；不启动、停止或改动正在运行的 Bridge，不访问实机，不写生产数据目录。每次里程碑在 `PROGRESS.md` 更新证据与待办。
+`task-1-coordinator-time.md` 已完成并提交为 `cc6a6c1`。多设备运行层的 `task-2-target-mac-guard.md` 至 `task-8-v2-cycle.md` 已通过宿主测试并提交为 `d3ba464`；`task-9-register-endpoint.md` 与 `task-10a-ble-any-target.md` 已通过宿主测试。`task-10b-ble-cycle.md` 把一次扫描入口接入 app 的逐 MAC 会合；之后完成阶段 B 的发现/验收，再串行开始 Fake ROM 与独立时钟；不让编码代理自行补设计。除用户明确要求提交的里程碑外，不自动提交；不启动、停止或改动正在运行的 Bridge，不访问实机，不写生产数据目录。每次里程碑在 `PROGRESS.md` 更新证据与待办。

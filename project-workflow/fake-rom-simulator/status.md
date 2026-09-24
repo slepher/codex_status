@@ -37,3 +37,15 @@ Task 1 与计划已提交为 `cc6a6c1`。Task 2 `task-2-target-mac-guard.md` 由
 ## 2026-09-24：Task 8 逐 MAC HTTP 调度通过
 
 `task-8-v2-cycle.md` 已完成。用户纠正当前没有 legacy 设备，任务和测试已去除相关虚构现场；历史 `legacy` 标记仅作为防止误入 v2 协议的兼容字段。Bridge HTTP 周期循环现在按已登记 MAC 选择认证在线目标，逐台经占用 gate 做计划与投递；目标刷新失败不写该台。隔离 `bridge-app` check、3 项状态/目标测试和 `git diff --check` 通过。BLE 机会仍只针对当前设备，Fake ROM/时钟未开始；本轮未提交或接实机。
+
+## 2026-09-24：Task 9 显式端点登记通过
+
+前一批 Task 2–8 已提交 `d3ba464`，未包含并行 ROM 改动。`task-9-register-endpoint.md` 新增 `platform_device_register_v2`：显式输入 MAC/IPv4(:port)，状态页与认证状态均匹配目标且具 v2 能力后才登记，不自动 claim 或推送。隔离 app check、app 3 项登记测试、MCP 1 项测试及 `git diff --check` 通过。未部署、未访问设备；本 Task 尚未提交。下一项是 BLE 多设备机会，需一次扫描从登记集合选目标，不能对每个 MAC 串行扫描 3 秒而漏掉短会合窗口。
+
+## 2026-09-24：Task 10a 一次 BLE 扫描入口通过
+
+`task-10a-ble-any-target.md` 完成宿主验证：BLE `connect_any` 一次扫描所有目标广播候选，连接后用完整 info MAC 授权；单目标 `connect` 复用新实现。主代理评审消除了重复扫描循环。隔离 `bridge-ble` 7 项测试、`bridge-app` check 和 `git diff --check` 通过。尚未接 app 多设备机会、未接硬件或提交。
+
+## 2026-09-24：Task 10b 逐 MAC BLE 会合通过
+
+`task-10b-ble-cycle.md` 已接入 app：从登记记录生成 v2 BLE 候选，单次扫描可匹配任一目标；连接后再次核对登记与完整 MAC，按 MAC 记录 55 秒尝试节流。评审去除了不存在的 legacy 实机测试，并确保有已登记 v2 目标时 UDP 通知不转入旧长扫描。隔离 app check、2 项定向测试及 `git diff --check` 通过。未连接设备、未部署或提交。下一步核对多设备发现和 Bridge 阶段 B 的剩余入口。

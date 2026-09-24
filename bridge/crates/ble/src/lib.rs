@@ -2,6 +2,7 @@
 //! on connect it writes the LAN endpoint+token, pushes the current usage
 //! envelope and pushes the template library (begin / chunks / end / activate).
 
+use std::collections::HashSet;
 use std::net::UdpSocket;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -109,6 +110,17 @@ impl Pusher {
         prefix: &str,
         timeout: Duration,
     ) -> Result<Option<Peripheral>> {
+        Self::find_device_matching(adapter, timeout, |name| name.starts_with(prefix)).await
+    }
+
+    async fn find_device_matching<F>(
+        adapter: &Adapter,
+        timeout: Duration,
+        matches: F,
+    ) -> Result<Option<Peripheral>>
+    where
+        F: Fn(&str) -> bool,
+    {
         adapter
             .start_scan(ScanFilter::default())
             .await
@@ -129,7 +141,7 @@ impl Pusher {
                         .flatten()
                         .and_then(|p| p.local_name)
                         .unwrap_or_default();
-                    if name.starts_with(prefix) {
+                    if matches(&name) {
                         let _ = adapter.stop_scan().await;
                         return Ok(Some(peripheral));
                     }
@@ -518,15 +530,27 @@ impl V2Connection {
     /// closed or stale scan entry): no connection was attempted and the caller
     /// may scan again immediately.
     pub async fn connect(mac: &str, token: &str, bridge_id: &str) -> Result<Option<Self>> {
-        let compact = bridge_core::platform::model::DeviceIdentity::normalized_mac(mac)
-            .context("invalid device MAC")?;
+        Ok(Self::connect_any(&[mac.to_owned()], token, bridge_id)
+            .await?
+            .map(|(_, connection)| connection))
+    }
+
+    /// Scan once for any registered target. The advertisement name is only a
+    /// candidate filter; the full Wi-Fi MAC in GATT info authorizes the link.
+    pub async fn connect_any(
+        target_macs: &[String],
+        token: &str,
+        bridge_id: &str,
+    ) -> Result<Option<(String, Self)>> {
+        let targets = normalize_target_macs(target_macs)?;
+        if targets.is_empty() {
+            return Ok(None);
+        }
         let adapter = Pusher::adapter().await?;
         let find_start = Instant::now();
-        let found = Pusher::find_device(
-            &adapter,
-            &format!("CodexStatus-{}", &compact[6..]),
-            Duration::from_secs(3),
-        )
+        let found = Pusher::find_device_matching(&adapter, Duration::from_secs(3), |name| {
+            advertisement_matches_any_target(name, &targets)
+        })
         .await;
         let Some(peripheral) = found? else {
             return Ok(None);
@@ -585,32 +609,32 @@ impl V2Connection {
             }
         };
         timings.extend(stages);
-        if bridge_core::platform::model::DeviceIdentity::normalized_mac(
-            info["mac"].as_str().unwrap_or(""),
-        ) != Some(compact.clone())
-        {
+        let Some(authorized_mac) = info_authorized_target(&info, &targets) else {
             let _ = peripheral.disconnect().await;
             bail!("BLE device identity mismatch");
-        }
+        };
         if info["rendezvous_v"].as_u64().unwrap_or(0) < 2 {
             let _ = peripheral.disconnect().await;
             bail!("device BLE rendezvous is disabled");
         }
         tracing::debug!(?timings, "v2 link ready");
-        let device_mac = compact
+        let device_mac = authorized_mac
             .as_bytes()
             .chunks(2)
             .map(|p| std::str::from_utf8(p).unwrap())
             .collect::<Vec<_>>()
             .join(":");
-        Ok(Some(Self {
-            peripheral,
-            token: token.to_owned(),
-            bridge_id: bridge_id.to_owned(),
-            nonce: String::new(),
-            device_mac,
-            timings,
-        }))
+        Ok(Some((
+            authorized_mac,
+            Self {
+                peripheral,
+                token: token.to_owned(),
+                bridge_id: bridge_id.to_owned(),
+                nonce: String::new(),
+                device_mac,
+                timings,
+            },
+        )))
     }
 
     pub async fn command(&mut self, op: &str, mut body: serde_json::Value) -> Result<serde_json::Value> {
@@ -665,9 +689,37 @@ impl V2Connection {
     }
 }
 
+fn normalize_target_macs(target_macs: &[String]) -> Result<Vec<String>> {
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::with_capacity(target_macs.len());
+    for mac in target_macs {
+        let mac = bridge_core::platform::model::DeviceIdentity::normalized_mac(mac)
+            .context("invalid device MAC")?;
+        if seen.insert(mac.clone()) {
+            normalized.push(mac);
+        }
+    }
+    Ok(normalized)
+}
+
+fn advertisement_matches_any_target(name: &str, target_macs: &[String]) -> bool {
+    target_macs
+        .iter()
+        .any(|mac| name.starts_with(&format!("CodexStatus-{}", &mac[6..])))
+}
+
+fn info_authorized_target(info: &serde_json::Value, target_macs: &[String]) -> Option<String> {
+    let mac = bridge_core::platform::model::DeviceIdentity::normalized_mac(
+        info.get("mac").and_then(serde_json::Value::as_str).unwrap_or(""),
+    )?;
+    target_macs.iter().any(|target| target == &mac).then_some(mac)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Pusher;
+    use super::{
+        advertisement_matches_any_target, info_authorized_target, normalize_target_macs, Pusher,
+    };
     use serde_json::json;
 
     #[test]
@@ -710,6 +762,49 @@ mod tests {
         assert!(
             (-840..=840).contains(&tz),
             "tz_offset_min out of range: {tz}"
+        );
+    }
+
+    #[test]
+    fn any_target_candidates_cover_all_registered_macs() {
+        let targets = normalize_target_macs(&[
+            "70:04:1D:AA:BB:CC".to_owned(),
+            "70:04:1D:AA:BB:DD".to_owned(),
+        ])
+        .unwrap();
+        assert!(advertisement_matches_any_target("CodexStatus-AABBCC", &targets));
+        assert!(advertisement_matches_any_target("CodexStatus-AABBDD", &targets));
+        assert!(!advertisement_matches_any_target("CodexStatus-AABBEE", &targets));
+    }
+
+    #[test]
+    fn target_macs_reject_invalid_values_and_deduplicate_normalized_values() {
+        assert!(normalize_target_macs(&["not-a-mac".to_owned()]).is_err());
+        assert_eq!(
+            normalize_target_macs(&[
+                "70:04:1D:AA:BB:CC".to_owned(),
+                "70041daabbcc".to_owned(),
+            ])
+            .unwrap(),
+            vec!["70041DAABBCC"]
+        );
+    }
+
+    #[test]
+    fn full_info_mac_authorizes_candidate_even_when_advertisement_suffix_collides() {
+        let targets = normalize_target_macs(&[
+            "10:20:30:AA:BB:CC".to_owned(),
+            "40:50:60:AA:BB:CC".to_owned(),
+        ])
+        .unwrap();
+        assert!(advertisement_matches_any_target("CodexStatus-AABBCC", &targets));
+        assert_eq!(
+            info_authorized_target(&json!({"mac": "40:50:60:AA:BB:CC"}), &targets),
+            Some("405060AABBCC".to_owned())
+        );
+        assert_eq!(
+            info_authorized_target(&json!({"mac": "00:00:00:AA:BB:CC"}), &targets),
+            None
         );
     }
 }
