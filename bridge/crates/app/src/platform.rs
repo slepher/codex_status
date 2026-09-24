@@ -420,6 +420,7 @@ fn device_summary(ctx: &AppCtx) -> Value {
 
 pub fn device_rows(ctx: &AppCtx) -> Value {
     json!({
+        "selected_device_mac": ctx.device_mac.lock().unwrap().clone(),
         "devices": service(ctx).devices(),
         "templates": service(ctx).templates(),
     })

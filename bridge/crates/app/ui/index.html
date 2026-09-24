@@ -166,6 +166,10 @@
         </div>
       </div>
       <div class="card">
+        <h2>已登记设备</h2>
+        <div id="registered-devices" class="plist muted">加载中…</div>
+      </div>
+      <div class="card">
         <h2>设备</h2>
         <div class="row"><span>ROM 版本</span><span id="dev-fw">--</span></div>
         <div class="row"><span>运行槽位</span><span id="dev-slot">--</span></div>
@@ -499,9 +503,50 @@
     $('menu-actions').innerHTML =
       `<div class="item" ${hasProfile ? '' : 'style="opacity:.45"'} onclick="closeMenus(); ${hasProfile ? 'modalAddFamilyTemplates()' : ''}">＋ 添加模板</div>` +
       `<div class="sep"></div>` +
-      `<div class="item" style="opacity:.45" title="待按 MAC 选择设备">⇪ 推送到设备（待按 MAC 选择）</div>` +
+      `<div class="item" ${hasProfile ? '' : 'style="opacity:.45"'} onclick="closeMenus(); ${hasProfile ? 'modalFamilyPublish()' : ''}">⇪ 推送到设备</div>` +
       `<div class="item" ${hasProfile ? '' : 'style="opacity:.45"'} onclick="closeMenus(); ${hasProfile ? 'modalRenameFamilyProfile()' : ''}">✎ 重命名</div>` +
       `<div class="item" ${hasProfile ? '' : 'style="opacity:.45"'} onclick="closeMenus(); ${hasProfile ? 'modalDeleteFamilyProfile()' : ''}">🗑 删除</div>`;
+  }
+
+  async function modalFamilyPublish() {
+    if (!familyProfile) return;
+    try {
+      const { devices = [] } = await invoke('platform_devices');
+      const matches = devices.filter(d => !d.legacy && d.capabilities?.render_target === selectedRenderTarget);
+      const options = matches.map(d => `<option value="${escapeAttr(d.device_mac)}">${escapeHtml(d.name || d.device_mac)} · ${escapeHtml(d.device_mac)}${d.ip ? ' · ' + escapeHtml(d.ip) : ''}</option>`).join('');
+      openModal(`<h3>推送配置到设备</h3>
+        <div class="sub">${escapeHtml(familyProfile.name)} · ${familyLabel(selectedRenderTarget)}</div>
+        <div class="row"><span>目标设备</span><select id="family-publish-target">${options}</select></div>
+        <div class="sub">启用模板：${escapeHtml(enabledFamilyTemplateIds().join(' → ') || '无')}</div>
+        <div class="sub">确认后将此配置保存为目标设备的 Profile，并显式发布完整 Bundle。</div>
+        <div class="foot"><button onclick="closeModal()">取消</button><button class="primary" ${matches.length && enabledFamilyTemplateIds().length ? '' : 'disabled'} onclick="confirmFamilyPublish()">确认推送</button></div>
+        ${matches.length ? '' : '<div class="sub">此屏幕族暂无已登记设备。</div>'}`);
+    } catch (e) { familyProfileError('读取设备', e); }
+  }
+
+  async function confirmFamilyPublish() {
+    const mac = $('family-publish-target').value;
+    const ids = enabledFamilyTemplateIds();
+    if (!familyProfile || !mac || !ids.length) return;
+    try {
+      const { devices = [] } = await invoke('platform_devices');
+      if (!devices.some(d => d.device_mac === mac && !d.legacy && d.capabilities?.render_target === selectedRenderTarget)) {
+        throw new Error('目标设备已变化，请重新选择');
+      }
+      const profile = {
+        device_mac: mac, template_ids: ids, render_target: selectedRenderTarget,
+        font_ids: familyProfile.font_ids || {}, initial_active_id: ids[0],
+        bindings: (familyProfile.bindings || []).filter(b => !b.template_id || ids.includes(b.template_id)),
+        sync_enabled: !!familyProfile.sync_enabled, full_sync_s: familyProfile.full_sync_s || 3600,
+      };
+      await invoke('platform_profile_save', { profile });
+      const result = await invoke('platform_publish', { mac });
+      openModal(`<h3>发布结果</h3><pre style="white-space:pre-wrap;font-size:12px">${escapeHtml(JSON.stringify(result, null, 2))}</pre>
+        <div class="sub">离线设备将在下次会合时继续投递。</div><div class="foot"><button onclick="closeModal()">关闭</button></div>`);
+      await refreshPlatformDevice();
+    } catch (e) {
+      openModal(`<h3>推送失败</h3><div>${escapeHtml(String(e))}</div><div class="foot"><button onclick="closeModal()">关闭</button></div>`);
+    }
   }
 
   /* ---------- profiles ---------- */
@@ -1124,7 +1169,11 @@
   async function refreshPlatformDevice() {
     try {
       const data = await invoke('platform_devices');
-      const device = (data.devices || [])[0];
+      $('registered-devices').innerHTML = (data.devices || []).map(d =>
+        `<div class="row"><span>${d.device_mac === data.selected_device_mac ? '当前 · ' : ''}${escapeHtml(d.name || '未命名')} · ${escapeHtml(d.device_mac)}</span>` +
+        `<span class="muted">${escapeHtml(d.ip || 'IP 未知')} · ${escapeHtml(d.job?.state || '无发布任务')}</span></div>`
+      ).join('') || '尚无已登记设备';
+      const device = (data.devices || []).find(d => d.device_mac === data.selected_device_mac) || (data.devices || [])[0];
       platformDevice = device || null;
       if (!device) {
         $('pt-device-state').textContent = 'v2 平台状态：尚未学习到设备 MAC';

@@ -1,5 +1,9 @@
 # Codex Status 项目进度（交接文档）
 
+## Bridge 两设备界面与推送：2026-09-24 — 主工作树已部署
+
+模板页“推送到设备”已接入按 MAC 选择：只列当前屏幕族的已登记 v2 设备；确认时把族配置中启用的模板保存为目标设备 Profile，再调用该 MAC 的显式发布。设备页列出全部已登记设备，标出当前 MAC，平台状态卡也跟随当前设备。主工作树默认 Bridge 已重建并重启（PID 11644，HTTP/MCP 8765/8766），本地 `platform_overview` 保留 1.54 `70041DD7A340` 与 Note4 `7C4FADB93408` 两台登记；两个临时具名设备实例已停止。前端脚本语法、按 MAC 发布流程模拟、隔离 `cargo build --offline -p bridge-app` 与 `git diff --check` 通过。此轮**未实际发布模板、未 OTA**；两台设备上次 HTTP 状态读取超时。多实例代码提交 `3cfc8b8` 已打本地 tag `bridge-multi-instance-2026-09-24`，仓库未配置远端。
+
 ## Bridge 多实例启动：2026-09-24 — 主工作树实现，探针验证通过
 
 Bridge 增加按实例名隔离的 Windows 进程锁、运行数据、owner ID 与托盘背景形状；`tools/start-bridge.ps1` 可传独立 HTTP/MCP 端口、形状与精确设备 MAC/IP。默认实例仍用 8765/8766 和原数据/owner；命名实例不争用固定 UDP 8767，使用按 MAC 的 HTTP/BLE 路径。命名 owner ID 保证与默认不同且不超过设备 claim 的 32 字符上限。两组假 MAC/loopback 探针在 8875/8876、8877/8878 与旧默认 8765/8766 同时运行，重复启动受脚本和进程锁拦截；探针已停止。Bridge app check、23 项测试和隔离构建通过。详见 `project-workflow/bridge-multi-instance/`。待替换并重启主工作树 Bridge；未 OTA、未改 ROM。
