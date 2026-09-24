@@ -21,7 +21,29 @@
 - 复核点 2：`bsInstall` 两个重载仍在——`bundle_store.h` **2 处声明**、`bundle_store.cpp` **2 处定义**；`main.cpp` 调用流式重载。
 - 复核点 3 / D4：校验顺序与 CRC 语义**一致**（见上）；唯一差异是分支多一次整份 `String` 读取，已按 D4 消除。
 
-`git diff --check` 通过。**尚未重编/烧录 ROM，未接实机、未启动或停止 Bridge。** 下一步：154g 先单目标编译，再 note4-b（串行），并按 next.md §8 验证产物。
+`git diff --check` 通过。宿主 `cargo test -p bridge-render` 全套 **35/35 通过**。**未烧录、未接实机、未启动或停止 Bridge。**
+
+### ROM 产物（2026-09-25，合并后重编）
+
+两个目标合并后均编译成功并按 next.md §8 逐项验证。构建已由 154g 切至 note4-b；按新约定 **`zectrix-note4-b` 为唯一固件目标**（见 `AGENTS.md` §固件目标），此后不再构建 154g。
+
+| 目标 | 产物 | 大小 | SHA256 |
+|---|---|---|---|
+| `esp32-s3-epaper-154g` | `.pio/build/esp32-s3-epaper-154g/firmware.bin` | 1744496 | `E9046F6BD1A510DBA224179D6F62D62FFB059C20D8F2844B5F184860F9B5B91E` |
+| `esp32-s3-epaper-154g` | `.pio/build/esp32-s3-epaper-154g/bootloader.bin` | 19968 | `ABF25ECE9CAF8B736A3EE4DDFDA32627AEB0A5196E1057C2F5767687276F19FE` |
+| `zectrix-note4-b` | `.pio/build/zectrix-note4-b/firmware.bin` | 1758384 | `7997C3235C53755CCED60487A81AD01BB0B896AEF2693B950904D90586EC28F7` |
+| `zectrix-note4-b` | `.pio/build/zectrix-note4-b/bootloader.bin` | 18720 | `80F92A58A2C05EC25DF91BD838D977081FAA4438FFB27384BA6DF91CB937F0FB` |
+
+验证判据与结果：
+
+- 镜像头 `firmware.bin[3]`：154g `0x30`（8 MB / 40 MHz）✓、note4-b `0x40`（16 MB / 40 MHz）✓。
+- `sdkconfig.defaults` 首行与当时目标一致：154g `# TASMOTA__22ab75315012ed65` ✓、note4-b `# TASMOTA__9244f2068d3cf08d` ✓。
+- `FW_VERSION` 与 ROM 内 `esp_app_desc` 一致：154g `0.18.23-bw` ✓、note4-b `0.18.23-note4-b` ✓（各自不含另一目标的版本串）。
+- `bootloader.bin` 两目标均与 2026-09-24 参考哈希**完全相同** ✓；`partitions.bin` 两目标不同（154g `B50BE24A3242395979A4C48762E4E5E1447EE5323BF085B39DD8A6895ABA79A4` vs note4-b `3309265E5627F2B83D2152A1DB8BC851972B0F54983FE3E60A12C090D8B86F28`）且各自 3072 B ✓。
+- 相对 2026-09-24 参考尺寸增长：154g 1736352 → 1744496、note4-b 1750128 → 1758384（合并新增 8 组共享 `v2_*.cpp` 后的预期增长）。
+- 内存占用：154g RAM 35.4% / Flash 54.2%（1704940 B）；note4-b RAM 40.0% / Flash 27.6%（1718251 B）。
+
+⚠️ **交替目标的代价已实测确认**：154g 单目标构建 188 s；随后切到 note4-b 触发 framework 重装，总计 **926 s**（框架重编完成后仅第二次链接 76 s）。故按新约定只构建 note4-b。
 
 ### 现场事故：next.md §5.2 的 stash 流程在本机不成立
 
