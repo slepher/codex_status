@@ -208,35 +208,47 @@ fn load_library(cfg: &McpConfig) -> Result<Library> {
 
 // ---------------- firmware OTA (docs/power-state §9) ----------------
 //
-// The device token gates /doUpdate (401 without it). It is disclosed only over
-// the bonded BLE link, so the bridge caches it in `data/device-token.json` and
-// re-fetches over BLE when missing or rejected. OTA itself is plain HTTP.
-
-fn device_token_path(cfg: &McpConfig) -> PathBuf {
-    cfg.data_root.join("device-token.json")
+// The device token gates /claim and /doUpdate. It is disclosed only over the
+// bonded BLE link, so cache it by the Wi-Fi MAC read from authenticated info.
+fn device_token_path(cfg: &McpConfig, mac: &str) -> Option<PathBuf> {
+    let mac = bridge_core::platform::model::DeviceIdentity::normalized_mac(mac)?;
+    Some(cfg.data_root.join(format!("device-token-{mac}.json")))
 }
 
-pub fn load_device_token(cfg: &McpConfig) -> Option<String> {
-    let text = std::fs::read_to_string(device_token_path(cfg)).ok()?;
+pub fn load_device_token(cfg: &McpConfig, expected_mac: &str) -> Option<String> {
+    let path = device_token_path(cfg, expected_mac)?;
+    let text = std::fs::read_to_string(&path).ok()?;
     let doc: Value = serde_json::from_str(&text).ok()?;
+    let expected_mac = bridge_core::platform::model::DeviceIdentity::normalized_mac(expected_mac)?;
+    let stored_mac = doc.get("device_mac").and_then(Value::as_str)?;
+    if bridge_core::platform::model::DeviceIdentity::normalized_mac(stored_mac).as_deref()
+        != Some(expected_mac.as_str())
+    {
+        return None;
+    }
     let token = doc.get("token").and_then(|v| v.as_str())?;
     (token.len() == 32).then(|| token.to_string())
 }
 
-fn save_device_token(cfg: &McpConfig, token: &str) -> Result<()> {
+fn save_device_token(cfg: &McpConfig, expected_mac: &str, token: &str) -> Result<()> {
+    let mac = bridge_core::platform::model::DeviceIdentity::normalized_mac(expected_mac)
+        .context("invalid target device MAC")?;
     let _ = std::fs::create_dir_all(&cfg.data_root);
-    let doc = json!({"token": token, "updated_at": now_secs()});
-    std::fs::write(device_token_path(cfg), serde_json::to_string_pretty(&doc)?)
-        .context("write device-token.json")?;
-    tracing::info!("device token cached ({})", device_token_path(cfg).display());
+    let path = device_token_path(cfg, &mac).context("invalid target device MAC")?;
+    let doc = json!({"device_mac": mac, "token": token, "updated_at": now_secs()});
+    std::fs::write(&path, serde_json::to_string_pretty(&doc)?)
+        .with_context(|| format!("write {}", path.display()))?;
+    tracing::info!("device token cached ({})", path.display());
     Ok(())
 }
 
 /// Fetch the token over BLE; requires an active device BLE session (BOOT click).
-pub async fn fetch_device_token(cfg: &McpConfig) -> Result<String> {
+pub async fn fetch_device_token(cfg: &McpConfig, expected_mac: &str) -> Result<String> {
+    let mac = bridge_core::platform::model::DeviceIdentity::normalized_mac(expected_mac)
+        .context("invalid target device MAC")?;
     let adapter = Pusher::adapter().await?;
-    let token = Pusher::request_device_token(&adapter, "CodexStatus-", 20000).await?;
-    save_device_token(cfg, &token)?;
+    let token = Pusher::request_device_token(&adapter, "CodexStatus-", &mac, 20000).await?;
+    save_device_token(cfg, &mac, &token)?;
     Ok(token)
 }
 
@@ -251,6 +263,28 @@ async fn device_firmware(ip: &str) -> Option<String> {
         for attempt in 0..2 {
             if let Ok(status) = bridge_core::device::fetch(&ip, Duration::from_secs(10)) {
                 return status.get("Version").map(str::to_string);
+            }
+            if attempt == 0 {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+async fn device_identity_and_firmware(ip: &str) -> Option<(String, Option<String>)> {
+    let ip = ip.to_string();
+    tokio::task::spawn_blocking(move || {
+        for attempt in 0..2 {
+            if let Ok(status) = bridge_core::device::fetch(&ip, Duration::from_secs(10)) {
+                let firmware = status.get("Version")?.to_string();
+                let mac = status
+                    .get("MAC")
+                    .and_then(bridge_core::platform::model::DeviceIdentity::normalized_mac);
+                return Some((firmware, mac));
             }
             if attempt == 0 {
                 std::thread::sleep(Duration::from_millis(500));
@@ -330,18 +364,44 @@ async fn firmware_ota_inner(cfg: &McpConfig, args: &Value) -> Result<Vec<Value>,
             bytes.len()
         ));
     }
-    let ip = args
-        .get("device_ip")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .unwrap_or_else(|| cfg.device_ip.clone());
-    let Some(before) = device_firmware(&ip).await else {
+    let explicit_ip = args.get("device_ip").is_some();
+    let ip = match args.get("device_ip") {
+        Some(value) => value
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| "invalid device_ip".to_string())?,
+        None => cfg.device_ip.clone(),
+    };
+    let Some((before, reported_mac)) = device_identity_and_firmware(&ip).await else {
         return Err(format!("device {ip} is not reachable over HTTP"));
     };
+    let Some(target_mac) = reported_mac else {
+        return Err(format!("device at {ip} reported no valid Wi-Fi MAC; refusing OTA"));
+    };
 
-    let mut token = load_device_token(cfg);
+    if let Some(value) = args.get("device_mac") {
+        let requested_mac = value
+            .as_str()
+            .ok_or_else(|| "invalid device_mac".to_string())?;
+        let requested_mac = bridge_core::platform::model::DeviceIdentity::normalized_mac(requested_mac)
+            .ok_or_else(|| "invalid device_mac".to_string())?;
+        if requested_mac != target_mac {
+            return Err(format!("device at {ip} reports MAC {target_mac}, not requested {requested_mac}"));
+        }
+    }
+    if !explicit_ip {
+        if let Some(configured_mac) = cfg.device_mac.as_deref() {
+            let configured_mac = bridge_core::platform::model::DeviceIdentity::normalized_mac(configured_mac)
+                .ok_or_else(|| "configured device MAC is invalid".to_string())?;
+            if configured_mac != target_mac {
+                return Err(format!("device at {ip} reports MAC {target_mac}, not configured {configured_mac}"));
+            }
+        }
+    }
+
+    let mut token = load_device_token(cfg, &target_mac);
     if token.is_none() {
-        token = Some(fetch_device_token(cfg).await.map_err(|e| {
+        token = Some(fetch_device_token(cfg, &target_mac).await.map_err(|e| {
             format!("device token unavailable ({e}); click BOOT on the device to open its BLE session, then retry")
         })?);
     }
@@ -367,7 +427,7 @@ async fn firmware_ota_inner(cfg: &McpConfig, args: &Value) -> Result<Vec<Value>,
     let mut upload = post_firmware(&ip, token.as_deref().unwrap(), bytes.clone(), filename).await;
     if matches!(&upload, Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED) {
         tracing::warn!("device token rejected; re-requesting over BLE");
-        let fresh = fetch_device_token(cfg).await.map_err(|e| {
+        let fresh = fetch_device_token(cfg, &target_mac).await.map_err(|e| {
             format!("device token rejected and re-fetch failed ({e}); click BOOT on the device, then retry")
         })?;
         token = Some(fresh);
@@ -742,13 +802,14 @@ fn tool_definitions() -> Value {
         {
             "name": "firmware_ota",
             "title": "OTA 升级固件",
-            "description": "把本地 ROM 上传到设备 /doUpdate 并等待重启后版本变化（约 20–90s）。设备 token 优先读缓存 data/device-token.json，缺失/失效时经已绑定 BLE 链路获取（需设备处于 BLE 会话：单击 BOOT）",
+            "description": "把本地 ROM 上传到设备 /doUpdate 并等待重启后版本变化（约 20–90s）。设备 token 按状态页报告的 Wi-Fi MAC 读取对应缓存，缺失/失效时经已绑定 BLE 链路获取（需设备处于 BLE 会话：单击 BOOT）",
             "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false},
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "rom": {"type": "string", "description": "ROM 路径（绝对或相对仓库根）"},
-                    "device_ip": {"type": "string", "description": "覆盖默认设备地址"}
+                    "device_ip": {"type": "string", "description": "覆盖默认设备地址"},
+                    "device_mac": {"type": "string", "description": "可选目标 Wi-Fi MAC；必须与目标设备状态页报告的 MAC 一致"}
                 },
                 "required": ["rom"],
                 "additionalProperties": false
@@ -1410,5 +1471,65 @@ pub async fn handle_request(cfg: &McpConfig, request: &Value) -> Option<Value> {
             Some(respond(&id, result))
         }
         other => Some(respond_error(&id, -32601, &format!("method not found: {other}"))),
+    }
+}
+
+#[cfg(test)]
+mod device_token_tests {
+    use super::{load_device_token, save_device_token, McpConfig};
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn config() -> McpConfig {
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("codex-device-token-{id}"));
+        std::fs::create_dir_all(&root).unwrap();
+        McpConfig {
+            port: 8765,
+            token: String::new(),
+            templates: PathBuf::new(),
+            profiles: PathBuf::new(),
+            data_root: root.clone(),
+            seeds: PathBuf::new(),
+            profile_seed: PathBuf::new(),
+            device_ip: String::new(),
+            device_name: String::new(),
+            device_mac: None,
+            bridge_name: String::new(),
+            bridge_id: String::new(),
+            root,
+        }
+    }
+
+    #[test]
+    fn cache_is_mac_scoped_and_rejects_unbound_or_mismatched_documents() {
+        let cfg = config();
+        let mac_a = "70:04:1d:aa:bb:cc";
+        let mac_b = "70:04:1d:aa:bb:cd";
+        let token_a = "a".repeat(32);
+        let token_b = "b".repeat(32);
+        save_device_token(&cfg, mac_a, &token_a).unwrap();
+        save_device_token(&cfg, mac_b, &token_b).unwrap();
+        assert_eq!(load_device_token(&cfg, mac_a).as_deref(), Some(token_a.as_str()));
+        assert_eq!(load_device_token(&cfg, mac_b).as_deref(), Some(token_b.as_str()));
+
+        let path_a = cfg.data_root.join("device-token-70041DAABBCC.json");
+        std::fs::write(
+            &path_a,
+            serde_json::json!({"device_mac": mac_b, "token": token_a}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(load_device_token(&cfg, mac_a), None);
+
+        std::fs::write(
+            cfg.data_root.join("device-token.json"),
+            serde_json::json!({"token": token_a}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(load_device_token(&cfg, mac_a), None);
+        let _ = std::fs::remove_dir_all(cfg.data_root);
     }
 }

@@ -153,6 +153,16 @@ impl Pusher {
         info.get("peerBonded").and_then(|v| v.as_bool()) == Some(true)
     }
 
+    fn info_matches_mac(info: &serde_json::Value, expected_mac: &str) -> bool {
+        let Some(expected) = bridge_core::platform::model::DeviceIdentity::normalized_mac(expected_mac)
+        else {
+            return false;
+        };
+        bridge_core::platform::model::DeviceIdentity::normalized_mac(
+            info.get("mac").and_then(serde_json::Value::as_str).unwrap_or(""),
+        ) == Some(expected)
+    }
+
     async fn read_info(peripheral: &Peripheral) -> Result<serde_json::Value> {
         let target = peripheral
             .characteristics()
@@ -367,16 +377,27 @@ impl Pusher {
     pub async fn request_device_token(
         adapter: &Adapter,
         name_prefix: &str,
+        expected_mac: &str,
         scan_timeout_ms: u64,
     ) -> Result<String> {
+        if bridge_core::platform::model::DeviceIdentity::normalized_mac(expected_mac).is_none() {
+            bail!("invalid target device MAC");
+        }
         let scan = Duration::from_millis(scan_timeout_ms.max(1000));
         let peripheral = Self::wait_for_device(adapter, name_prefix, scan).await?;
         tracing::info!("connecting {} for device token", peripheral.address());
         peripheral.connect().await.context("connect")?;
         peripheral.discover_services().await.context("discover")?;
-        if let Err(e) = Self::read_info(&peripheral).await {
+        let info = match Self::read_info(&peripheral).await {
+            Ok(info) => info,
+            Err(e) => {
+                let _ = peripheral.disconnect().await;
+                return Err(e);
+            }
+        };
+        if !Self::info_matches_mac(&info, expected_mac) {
             let _ = peripheral.disconnect().await;
-            return Err(e);
+            bail!("BLE device Wi-Fi MAC does not match target");
         }
         let status = peripheral
             .characteristics()
@@ -664,6 +685,19 @@ mod tests {
         assert!(Pusher::peer_bonded(&json!({"peerBonded": true})));
         assert!(!Pusher::peer_bonded(&json!({"peerBonded": false, "peerEncrypted": true})));
         assert!(!Pusher::peer_bonded(&json!({"peerEncrypted": true})));
+    }
+
+    #[test]
+    fn token_info_must_match_expected_wifi_mac() {
+        assert!(Pusher::info_matches_mac(
+            &json!({"mac": "70:04:1d:aa:bb:cc"}),
+            "70041DAABBCC"
+        ));
+        assert!(!Pusher::info_matches_mac(
+            &json!({"mac": "70:04:1d:aa:bb:cd"}),
+            "70041DAABBCC"
+        ));
+        assert!(!Pusher::info_matches_mac(&json!({}), "70041DAABBCC"));
     }
 
     #[test]

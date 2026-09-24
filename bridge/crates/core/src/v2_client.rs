@@ -10,6 +10,7 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use crate::platform::model::DeviceIdentity;
 use serde_json::{json, Value};
 
 pub const BUNDLE_CHUNK_BYTES: usize = 4096;
@@ -138,18 +139,18 @@ pub fn status(ip: &str, token: &str, timeout: Duration) -> Result<Value> {
 }
 
 /// Complete bounded Data snapshot (atomic apply + simple ACK).
-pub fn data(ip: &str, token: &str, message: &Value, timeout: Duration) -> Result<Value> {
-    session_post(ip, "/v2/data", token, message, timeout)
+pub fn data(ip: &str, token: &str, expected_mac: &str, message: &Value, timeout: Duration) -> Result<Value> {
+    session_post(ip, "/v2/data", token, expected_mac, message, timeout)
 }
 
 /// Formal PowerPlan (the only thing that changes the light deadline).
-pub fn plan(ip: &str, token: &str, plan: &Value, timeout: Duration) -> Result<Value> {
-    session_post(ip, "/v2/plan", token, plan, timeout)
+pub fn plan(ip: &str, token: &str, expected_mac: &str, plan: &Value, timeout: Duration) -> Result<Value> {
+    session_post(ip, "/v2/plan", token, expected_mac, plan, timeout)
 }
 
-fn session_post(ip: &str, path: &str, token: &str, message: &Value, timeout: Duration) -> Result<Value> {
+fn session_post(ip: &str, path: &str, token: &str, expected_mac: &str, message: &Value, timeout: Duration) -> Result<Value> {
     let mut command = message.clone();
-    let (nonce, device_mac) = session_nonce(ip, token, timeout)?;
+    let (nonce, device_mac) = session_nonce(ip, token, expected_mac, timeout)?;
     command["protocol"] = json!(2);
     command["session_nonce"] = json!(nonce);
     command["device_mac"] = json!(device_mac);
@@ -162,12 +163,13 @@ fn session_post(ip: &str, path: &str, token: &str, message: &Value, timeout: Dur
 pub fn activate(
     ip: &str,
     token: &str,
+    expected_mac: &str,
     bridge_id: &str,
     template_id: &str,
     expected_context: &str,
     timeout: Duration,
 ) -> Result<Value> {
-    let (nonce, device_mac) = session_nonce(ip, token, timeout)?;
+    let (nonce, device_mac) = session_nonce(ip, token, expected_mac, timeout)?;
     let request_id = format!("activate-{expected_context}-{template_id}");
     post_json(ip, "/v2/activate", token, &json!({
         "protocol": 2, "device_mac": device_mac, "bridge_id": bridge_id, "session_nonce": nonce,
@@ -176,13 +178,21 @@ pub fn activate(
     }), timeout)
 }
 
-fn session_nonce(ip: &str, token: &str, timeout: Duration) -> Result<(String, String)> {
+fn session_nonce(ip: &str, token: &str, expected_mac: &str, timeout: Duration) -> Result<(String, String)> {
     let state = status(ip, token, timeout)?;
+    let mac = state["device_mac"].as_str()
+        .with_context(|| format!("authenticated status is missing device MAC for target {expected_mac}"))?;
+    let expected = DeviceIdentity::normalized_mac(expected_mac)
+        .with_context(|| format!("invalid expected target MAC {expected_mac}"))?;
+    let actual = DeviceIdentity::normalized_mac(mac)
+        .with_context(|| format!("invalid device MAC {mac} in authenticated status for target {expected_mac}"))?;
+    if actual != expected {
+        bail!("authenticated status MAC {mac} does not match target MAC {expected_mac}");
+    }
     let nonce = state["session_nonce"].as_str().unwrap_or("");
     if nonce.len() != 32 || !nonce.bytes().all(|c| c.is_ascii_hexdigit()) {
         bail!("device lacks v2 session protection; update firmware before publishing or activating");
     }
-    let mac = state["device_mac"].as_str().context("device MAC in authenticated status")?;
     Ok((nonce.to_owned(), mac.to_owned()))
 }
 
@@ -190,6 +200,7 @@ fn session_nonce(ip: &str, token: &str, timeout: Duration) -> Result<(String, St
 pub fn install_bundle(
     ip: &str,
     token: &str,
+    expected_mac: &str,
     bridge_id: &str,
     payload: &[u8],
     chunk_bytes: usize,
@@ -199,7 +210,7 @@ pub fn install_bundle(
         bail!("bundle payload size {} out of range", payload.len());
     }
     let chunk_bytes = chunk_bytes.clamp(256, 16 * 1024);
-    let (nonce, device_mac) = session_nonce(ip, token, timeout)?;
+    let (nonce, device_mac) = session_nonce(ip, token, expected_mac, timeout)?;
     let content_crc = format!("{:08x}", crc32fast::hash(payload));
     let bundle: Value = serde_json::from_slice(payload).context("bundle JSON")?;
     let job_id = bundle["job_id"].as_str().filter(|s| !s.is_empty())

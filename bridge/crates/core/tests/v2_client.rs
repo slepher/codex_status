@@ -106,8 +106,9 @@ fn spawn_fake() -> (String, FakeDevice) {
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { break };
-            let (_line, path, head, body) = read_request(&mut stream);
-            calls.lock().unwrap().push(path.clone());
+            let (line, path, head, body) = read_request(&mut stream);
+            let method = line.split_whitespace().next().unwrap_or("");
+            calls.lock().unwrap().push(format!("{method} {path}"));
             if path == "/v2/status" {
                 respond(
                     &mut stream,
@@ -221,6 +222,7 @@ fn status_data_plan_activate_round_trip() {
     let ack = v2_client::data(
         &addr,
         token,
+        "70:04:1D:D7:A3:40",
         &json!({"context_id": "ctx-1", "seq": 5, "fields": []}),
         timeout,
     )
@@ -230,18 +232,19 @@ fn status_data_plan_activate_round_trip() {
     let ack = v2_client::plan(
         &addr,
         token,
+        "70:04:1D:D7:A3:40",
         &json!({"plan_id": 8, "mode": "light", "light_duration_s": 300, "rendezvous_period_s": 60}),
         timeout,
     )
     .unwrap();
     assert_eq!(ack["accepted_remaining_s"], 300);
 
-    let ack = v2_client::activate(&addr, token, "bridge-1", "mini", "ctx-1", timeout).unwrap();
+    let ack = v2_client::activate(&addr, token, "70:04:1D:D7:A3:40", "bridge-1", "mini", "ctx-1", timeout).unwrap();
     assert_eq!(ack["active_context_id"], "ctx-2");
     let calls = fake.calls.lock().unwrap().clone();
-    assert!(calls[0].starts_with("/v2/status"));
-    let writes: Vec<_> = calls.iter().filter(|p| *p != "/v2/status").cloned().collect();
-    assert_eq!(writes, vec!["/v2/data", "/v2/plan", "/v2/activate"]);
+    assert_eq!(calls[0], "GET /v2/status");
+    let writes: Vec<_> = calls.iter().filter(|p| *p != "GET /v2/status").cloned().collect();
+    assert_eq!(writes, vec!["POST /v2/data", "POST /v2/plan", "POST /v2/activate"]);
 }
 
 #[test]
@@ -267,6 +270,7 @@ fn bundle_install_is_ordered_and_complete() {
     let ack = v2_client::install_bundle(
         &addr,
         "tok",
+        "70:04:1D:D7:A3:40",
         "bridge-1",
         &padded,
         v2_client::BUNDLE_CHUNK_BYTES,
@@ -276,17 +280,38 @@ fn bundle_install_is_ordered_and_complete() {
     assert_eq!(ack["result"], "applied");
     assert_eq!(fake.payload.lock().unwrap().len(), padded.len());
     let calls = fake.calls.lock().unwrap().clone();
-    assert!(calls[0].starts_with("/v2/status"));
-    assert!(calls[1].starts_with("/v2/bundle/begin"));
+    assert_eq!(calls[0], "GET /v2/status");
+    assert_eq!(calls[1], "POST /v2/bundle/begin");
     assert_eq!(
         calls
             .iter()
-            .filter(|c| c.starts_with("/v2/bundle/chunk"))
+            .filter(|c| c.starts_with("POST /v2/bundle/chunk"))
             .count(),
         3,
         "10000 bytes at 4096 -> 3 chunks, ordered by offset"
     );
-    assert!(calls.last().unwrap().starts_with("/v2/bundle/commit"));
+    assert_eq!(calls.last().unwrap(), "POST /v2/bundle/commit");
+}
+
+#[test]
+fn wrong_target_mac_stops_all_writes_after_status_get() {
+    let (addr, fake) = spawn_fake();
+    let timeout = Duration::from_secs(2);
+    let wrong_mac = "AA:BB:CC:DD:EE:FF";
+
+    assert!(v2_client::data(&addr, "tok", wrong_mac, &json!({"seq": 1}), timeout).is_err());
+    assert!(v2_client::plan(&addr, "tok", wrong_mac, &json!({"plan_id": 1}), timeout).is_err());
+    assert!(v2_client::activate(&addr, "tok", wrong_mac, "bridge-1", "mini", "ctx-1", timeout).is_err());
+    let bundle = serde_json::to_vec(&json!({"job_id": "job-guard"})).unwrap();
+    assert!(v2_client::install_bundle(
+        &addr, "tok", wrong_mac, "bridge-1", &bundle, v2_client::BUNDLE_CHUNK_BYTES, timeout
+    ).is_err());
+
+    assert_eq!(
+        fake.calls.lock().unwrap().as_slice(),
+        ["GET /v2/status", "GET /v2/status", "GET /v2/status", "GET /v2/status"],
+        "MAC mismatch must perform only authenticated GET /v2/status, with no write POST"
+    );
 }
 
 #[test]
@@ -308,6 +333,7 @@ fn owner_conflict_stops_the_write_without_retrying() {
     let ack = v2_client::data(
         &addr,
         "tok",
+        "70:04:1D:D7:A3:40",
         &json!({"context_id": "ctx", "seq": 1}),
         Duration::from_secs(2),
     )

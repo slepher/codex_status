@@ -1,7 +1,7 @@
 //! Fetch and parse the device's LAN status page (`<li>Key: value</li>` list).
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -24,9 +24,7 @@ impl DeviceStatus {
 
 /// GET `http://<ip><path>` and return the body.
 fn http_get(ip: &str, path: &str, timeout: Duration) -> Result<String> {
-    let addr = format!("{ip}:80")
-        .parse()
-        .map_err(|e| anyhow!("bad device ip {ip}: {e}"))?;
+    let addr = parse_device_addr(ip)?;
     let mut stream = TcpStream::connect_timeout(&addr, timeout)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
@@ -38,6 +36,13 @@ fn http_get(ip: &str, path: &str, timeout: Duration) -> Result<String> {
     stream.read_to_string(&mut raw)?;
     let body = raw.split("\r\n\r\n").nth(1).unwrap_or(&raw);
     Ok(body.to_string())
+}
+
+fn parse_device_addr(address: &str) -> Result<SocketAddr> {
+    address
+        .parse()
+        .or_else(|_| address.parse::<IpAddr>().map(|ip| SocketAddr::new(ip, 80)))
+        .map_err(|e| anyhow!("bad device address {address}: {e}"))
 }
 
 /// Prefer the structured `/status.json` (fw >= 0.8.0), fall back to parsing
@@ -179,4 +184,40 @@ fn fields_from_json(value: &serde_json::Value) -> Option<Vec<(String, String)>> 
         ),
         ("Free heap".to_string(), heap.to_string()),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::thread;
+
+    #[test]
+    fn bare_ipv4_defaults_to_port_80() {
+        assert_eq!(parse_device_addr("192.0.2.10").unwrap(), "192.0.2.10:80".parse().unwrap());
+    }
+
+    #[test]
+    fn fetch_uses_explicit_port_and_parses_status_mac() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            let body = r#"{"fw":"test","mac":"AA:BB:CC:DD:EE:FF"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let status = fetch(&address.to_string(), Duration::from_secs(2)).unwrap();
+        assert_eq!(status.get("MAC"), Some("AA:BB:CC:DD:EE:FF"));
+        assert_eq!(status.raw.unwrap()["fw"], "test");
+        server.join().unwrap();
+    }
 }
