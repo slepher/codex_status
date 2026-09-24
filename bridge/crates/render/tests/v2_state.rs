@@ -132,6 +132,13 @@ extern "C" {
         out: *mut std::os::raw::c_char,
         cap: c_int,
     ) -> c_int;
+    fn codex_v2_claim_decide(
+        message: *const std::os::raw::c_char,
+        have_owner: c_int,
+        current: *const std::os::raw::c_char,
+        out: *mut std::os::raw::c_char,
+        cap: c_int,
+    ) -> c_int;
     fn codex_v2_plan_high(p: *mut c_void) -> u64;
     fn codex_v2_plan_light_active(p: *mut c_void, now_ms: u64) -> c_int;
     fn codex_v2_boot_remaining(t_boot_ms: u64, now_ms: u64) -> u32;
@@ -460,6 +467,97 @@ fn shared_activate_decision_classifies_replay_and_profile_switches() {
     assert_eq!(decision["error"], "context");
     assert_eq!(decision["saved_request"], "");
     unsafe { codex_v2_activate_free(unconfigured) };
+}
+
+#[test]
+fn shared_claim_decisions_prepare_text_and_classify_owner_actions() {
+    let current = serde_json::json!({
+        "id": "held", "name": "Held", "host": "old-host", "port": 7,
+        "since": 11, "last_seen": 22, "lease": 300
+    });
+    let call = |input: serde_json::Value, have_owner: bool| unsafe {
+        let message = std::ffi::CString::new(input.to_string()).unwrap();
+        let owner = std::ffi::CString::new(current.to_string()).unwrap();
+        let mut out = vec![0i8; 2048];
+        let rc = codex_v2_claim_decide(
+            message.as_ptr(), have_owner as c_int, owner.as_ptr(),
+            out.as_mut_ptr(), out.len() as c_int,
+        );
+        assert!(rc > 0);
+        serde_json::from_str::<serde_json::Value>(
+            std::ffi::CStr::from_ptr(out.as_ptr()).to_str().unwrap(),
+        )
+        .unwrap()
+    };
+    let args = |id: &str, force: bool, release: bool, port: &str,
+                lease: &str, has_lease: bool| {
+        serde_json::json!({
+            "id": id, "name": "é".repeat(16) + "z", "host": "host\nname",
+            "port": port, "lease": lease, "has_lease": has_lease,
+            "force": force, "release": release
+        })
+    };
+    let check_current = |decision: &serde_json::Value| {
+        assert_eq!(decision["current"]["id"], "held");
+        assert_eq!(decision["current"]["name"], "Held");
+        assert_eq!(decision["current"]["host"], "old-host");
+        assert_eq!(decision["current"]["since"], 11);
+        assert_eq!(decision["current"]["last_seen"], 22);
+        assert_eq!(decision["current"]["lease"], 300);
+    };
+
+    let oversized_id = format!("{}zQ", "é".repeat(31));
+    let prepared = call(args(&oversized_id, false, false, "65535", "9999", true), false);
+    assert_eq!(prepared["valid_id"], true);
+    assert_eq!(prepared["action"], "claim");
+    assert_eq!(prepared["request_id"], format!("{}z", "é".repeat(31)));
+    assert_eq!(prepared["request_name"], "é".repeat(16));
+    assert_eq!(prepared["request_host"], "host?name");
+    assert_eq!(prepared["request_port"], 65535);
+    assert_eq!(prepared["request_lease"], 3600);
+    assert_eq!(prepared["keep_since"], false);
+    assert_eq!(prepared["new_claim"], true);
+    check_current(&prepared);
+
+    let sanitized = call(args("  é🙂x \n ", false, false, "0", "1", true), false);
+    assert_eq!(sanitized["request_id"], "é🙂x ?");
+    assert_eq!(sanitized["request_port"], 0);
+    assert_eq!(sanitized["request_lease"], 60);
+    let default_lease = call(args("new", false, false, "65536", "ignored", false), false);
+    assert_eq!(default_lease["request_port"], 0);
+    assert_eq!(default_lease["request_lease"], 300);
+
+    let empty = call(args("   ", false, false, "80", "300", true), true);
+    assert_eq!(empty["valid_id"], false);
+    assert_eq!(empty["action"], "args");
+    check_current(&empty);
+
+    let renew = call(args("held", false, false, "80", "120", true), true);
+    assert_eq!(renew["action"], "claim");
+    assert_eq!(renew["keep_since"], true);
+    assert_eq!(renew["new_claim"], false);
+    check_current(&renew);
+
+    let occupied = call(args("other", false, false, "80", "300", true), true);
+    assert_eq!(occupied["action"], "occupied");
+    assert_eq!(occupied["keep_since"], false);
+    check_current(&occupied);
+    let force_claim = call(args("other", true, false, "80", "300", true), true);
+    assert_eq!(force_claim["action"], "claim");
+    assert_eq!(force_claim["new_claim"], true);
+    check_current(&force_claim);
+
+    let release_empty = call(args("other", false, true, "80", "300", true), false);
+    assert_eq!(release_empty["action"], "release_empty");
+    let release_occupied = call(args("other", false, true, "80", "300", true), true);
+    assert_eq!(release_occupied["action"], "occupied");
+    check_current(&release_occupied);
+    let release_same = call(args("held", false, true, "80", "300", true), true);
+    assert_eq!(release_same["action"], "release");
+    check_current(&release_same);
+    let release_force = call(args("other", true, true, "80", "300", true), true);
+    assert_eq!(release_force["action"], "release");
+    check_current(&release_force);
 }
 
 #[test]

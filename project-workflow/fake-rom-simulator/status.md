@@ -1,5 +1,9 @@
 # Fake ROM 与多设备实验时钟状态
 
+## 2026-09-24：Stage C / Task 12g claim 决策切片通过宿主验证
+
+在 Activate `dc445ff` 后，`POST /claim` 的参数净化与 release/occupied/claim/renew 动作判定抽为 `src/v2_claim_command.{h,cpp}`。设备端依旧先校验设备操作 token；空 id 在 `ownerGet` 前返回 400；owner NVS 持久化和 `noteActivity` 留在 main，续约不触发活动计时。宿主测试覆盖 UTF-8/控制字符和长度、port/lease 边界、release/冲突/force、同 id 续约及决策不修改当前 owner；`cargo test -p bridge-render --test v2_state` 17/17、`git diff --check` 通过。未构建/烧录 ROM、接主 Bridge 或实机。Stage C 已有 Data/Plan/Bundle/Activate/claim 共享决策，但宿主鉴权、owner 存储/显式时钟、HTTP/BLE、显示副作用仍未接线；不能称为可运行 Fake ROM。下一步先审查 Stage C 完整性，再设计 Stage D。
+
 ## 2026-09-24：Stage C / Task 12f Activate 决策切片通过宿主验证
 
 在 Bundle COMMIT `b702aa3` 后，串行抽取 Activate 的同请求重放/冲突、expected context 和 Profile 1–8 模板索引决策为 `src/v2_activate_command.{h,cpp}`。设备端仍在 token/owner/session 预检后调用共享决策；只有有效 switch 才进入原 `v2SwitchActive`，成功后才记录请求指纹并渲染。宿主测试覆盖上次 context 的成功重放、冲突、未配置、旧 context、未知模板、8 项索引和拒绝时指纹不变；`cargo test -p bridge-render --test v2_state` 16/16、`git diff --check` 通过。未构建/烧录 ROM、未接主 Bridge/实机。下一步 claim，再处理宿主端点及存储/显示适配；仍非可运行 Fake ROM。

@@ -1,5 +1,9 @@
 # Codex Status 项目进度（交接文档）
 
+## Fake ROM Stage C claim 切片：2026-09-24 — 宿主验证通过
+
+Activate 已提交 `dc445ff`；`POST /claim` 的 UTF-8 参数净化、lease/port 归一化与 release/occupied/claim/renew 判定也已抽为固件与宿主共用的 `src/v2_claim_command.{h,cpp}`。设备端设备操作 token、owner NVS、活动计时与 HTTP 回复顺序保留；空 id 仍在 owner 查询前 400，续约不延长 light 活动。宿主 render 测试 17/17、`git diff --check` 通过。未接主 Bridge/实机，未构建/烧录 ROM。Stage C 共享命令决策已覆盖 Data/Plan/Bundle/Activate/claim，宿主端点及存储/时钟/显示适配仍待 Stage D，详见 `project-workflow/fake-rom-simulator/status.md`。
+
 ## Fake ROM Stage C Activate 切片：2026-09-24 — 宿主验证通过
 
 Bundle COMMIT 已提交 `b702aa3`；Activate 的请求重放、expected context 和 Profile 1–8 模板索引现在由固件与宿主共用 `src/v2_activate_command.{h,cpp}`。设备端只在新请求有效时调用原 `v2SwitchActive`，成功后才更新指纹、渲染和 ACK。宿主 render 测试 16/16、`git diff --check` 通过；未接主 Bridge/实机，未构建/烧录 ROM。下一步 claim 与完整宿主端点；见 `project-workflow/fake-rom-simulator/status.md`。

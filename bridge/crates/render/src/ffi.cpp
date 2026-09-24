@@ -7,6 +7,7 @@
 #include "v2_plan_command.h"
 #include "v2_bundle_command.h"
 #include "v2_activate_command.h"
+#include "v2_claim_command.h"
 #include "bundle_store.h"
 #include "font_asset.h"
 #include "font_store.h"
@@ -585,6 +586,52 @@ int codex_v2_activate_decide(void *p, const char *message, char *out, int cap) {
     result["saved_template"] = h.templateId;
     result["saved_expected"] = h.expected;
     result["saved_context"] = h.context;
+    return (int)serializeJson(result, out, (size_t)cap);
+}
+int codex_v2_claim_decide(const char *message, int have_owner,
+                          const char *current_json, char *out, int cap) {
+    if (!message || !current_json || !out || cap <= 0) return -99;
+    JsonDocument doc, currentDoc;
+    if (deserializeJson(doc, message) || deserializeJson(currentDoc, current_json)) return -2;
+    V2ClaimArgs args = v2PrepareClaim(
+        String(doc["id"] | ""), String(doc["name"] | ""),
+        String(doc["host"] | ""), String(doc["port"] | ""),
+        String(doc["lease"] | ""), doc["has_lease"] | false,
+        doc["force"] | false, doc["release"] | false);
+    OwnerRec current;
+    current.id = currentDoc["id"] | "";
+    current.name = currentDoc["name"] | "";
+    current.host = currentDoc["host"] | "";
+    current.port = currentDoc["port"] | 0;
+    current.since = currentDoc["since"] | 0;
+    current.lastSeen = currentDoc["last_seen"] | 0;
+    current.lease = currentDoc["lease"] | 300;
+    JsonDocument result;
+    result["valid_id"] = args.validId;
+    result["request_id"] = args.request.id;
+    result["request_name"] = args.request.name;
+    result["request_host"] = args.request.host;
+    result["request_port"] = args.request.port;
+    result["request_lease"] = args.request.lease;
+    if (!args.validId) {
+        result["action"] = "args";
+    } else {
+        V2ClaimDecision decision = v2DecideClaim(args, have_owner != 0, current);
+        const char *action = decision.action == V2_CLAIM_RELEASE_EMPTY ? "release_empty"
+                           : decision.action == V2_CLAIM_OCCUPIED ? "occupied"
+                           : decision.action == V2_CLAIM_RELEASE ? "release" : "claim";
+        result["action"] = action;
+        result["keep_since"] = decision.keepSince;
+        result["new_claim"] = decision.newClaim;
+    }
+    JsonObject unchanged = result["current"].to<JsonObject>();
+    unchanged["id"] = current.id;
+    unchanged["name"] = current.name;
+    unchanged["host"] = current.host;
+    unchanged["port"] = current.port;
+    unchanged["since"] = current.since;
+    unchanged["last_seen"] = current.lastSeen;
+    unchanged["lease"] = current.lease;
     return (int)serializeJson(result, out, (size_t)cap);
 }
 uint64_t codex_v2_plan_high(void *p) { return ((V2PlanState *)p)->highId(); }

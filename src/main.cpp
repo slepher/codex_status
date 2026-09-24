@@ -55,6 +55,7 @@
 #include "v2_plan_command.h"
 #include "v2_bundle_command.h"
 #include "v2_activate_command.h"
+#include "v2_claim_command.h"
 #include "bundle_store.h"
 
 // v2 platform targets (src/platform_target.h): the render/firmware target
@@ -3180,95 +3181,57 @@ static bool requestAuthorized() {
     return false;
 }
 
-// Occupancy claim/renew/release (task-4). Token-gated; `since` is kept across
-// renewals of the same id, lease expiry only clears (never transfers).
-// UTF-8 sequences pass through (names/ids may be non-ASCII); control
-// characters are replaced. `maxChars` counts characters, never splitting a
-// multi-byte sequence (invalid UTF-8 would break the JSON readers).
-static String claimText(const String &in, size_t maxChars) {
-    String out;
-    size_t chars = 0;
-    for (size_t i = 0; i < in.length() && chars < maxChars;) {
-        unsigned char c = (unsigned char)in[i];
-        size_t seq = 1;
-        if (c >= 0xF0) seq = 4;
-        else if (c >= 0xE0) seq = 3;
-        else if (c >= 0xC0) seq = 2;
-        if (i + seq > in.length()) break;
-        if (c < 0x20 || c == 0x7F) {
-            out += '?';
-            i += 1;
-        } else {
-            for (size_t k = 0; k < seq; k++) out += in[i + k];
-            i += seq;
-        }
-        chars++;
-    }
-    return out;
-}
-
 static void handleClaim() {
     if (!requestAuthorized()) {
         server.send(401, "application/json",
                     String("{\"error\":\"unauthorized\",\"owner\":") + ownerJson() + "}");
         return;
     }
-    String id = claimText(server.arg("id"), 32);
-    id.trim();
-    if (!id.length()) {
+    V2ClaimArgs args = v2PrepareClaim(
+        server.arg("id"), server.arg("name"), server.arg("host"),
+        server.arg("port"), server.arg("lease"), server.hasArg("lease"),
+        server.hasArg("force") && server.arg("force") != "0",
+        server.hasArg("release") && server.arg("release") != "0");
+    if (!args.validId) {
         server.send(400, "application/json", "{\"error\":\"args\"}");
         return;
     }
-    bool force = server.hasArg("force") && server.arg("force") != "0";
-    bool release = server.hasArg("release") && server.arg("release") != "0";
     OwnerRec cur;
     bool have = ownerGet(cur);
+    V2ClaimDecision decision = v2DecideClaim(args, have, cur);
 
-    if (release) {
-        if (!have) {
-            server.send(200, "application/json", "{\"owner\":null,\"released\":false}");
-            return;
-        }
-        if (cur.id != id && !force) {
-            server.send(409, "application/json",
-                        String("{\"error\":\"occupied\",\"owner\":") + ownerJson() + "}");
-            return;
-        }
-        DevLog.printf("[owner] released by id=%s force=%d\n", id.c_str(), force ? 1 : 0);
+    if (decision.action == V2_CLAIM_RELEASE_EMPTY) {
+        server.send(200, "application/json", "{\"owner\":null,\"released\":false}");
+        return;
+    }
+    if (decision.action == V2_CLAIM_OCCUPIED) {
+        if (!args.release)
+            DevLog.printf("[owner] claim denied: held by %s\n", cur.id.c_str());
+        server.send(409, "application/json",
+                    String("{\"error\":\"occupied\",\"owner\":") + ownerJson() + "}");
+        return;
+    }
+    if (decision.action == V2_CLAIM_RELEASE) {
+        DevLog.printf("[owner] released by id=%s force=%d\n",
+                      args.request.id.c_str(), args.force ? 1 : 0);
         ownerClear(true);
         server.send(200, "application/json", "{\"owner\":null,\"released\":true}");
         return;
     }
 
-    if (have && cur.id != id && !force) {
-        DevLog.printf("[owner] claim denied: held by %s\n", cur.id.c_str());
-        server.send(409, "application/json",
-                    String("{\"error\":\"occupied\",\"owner\":") + ownerJson() + "}");
-        return;
-    }
-
-    OwnerRec req;
-    req.id = id;
-    req.name = claimText(server.arg("name"), 16);
-    req.host = claimText(server.arg("host"), 32);
-    long port = server.arg("port").toInt();
-    req.port = (port > 0 && port <= 65535) ? (uint16_t)port : 0;
-    long lease = server.hasArg("lease") ? server.arg("lease").toInt() : 300;
-    if (lease < 60) lease = 60;
-    if (lease > 3600) lease = 3600;
-    req.lease = (uint32_t)lease;
-    bool keepSince = have && cur.id == id;
-    ownerClaim(req, keepSince);
+    ownerClaim(decision.request, decision.keepSince);
     // Design §6: a lease renewal is a protocol keep-alive, not user activity;
     // it must not extend the light phase (idleDeepDue would never fire while
     // the bridge renews every 60 s). Only a new claim resets the idle timer.
-    if (!keepSince) noteActivity("claim");
+    if (decision.newClaim) noteActivity("claim");
     DevLog.printf("[owner] %s id=%s name=%s host=%s:%u lease=%us force=%d\n",
-                  keepSince ? "renew" : "claim", req.id.c_str(), req.name.c_str(),
-                  req.host.c_str(), req.port, (unsigned)req.lease, force ? 1 : 0);
+                  decision.keepSince ? "renew" : "claim", decision.request.id.c_str(),
+                  decision.request.name.c_str(), decision.request.host.c_str(),
+                  decision.request.port, (unsigned)decision.request.lease,
+                  args.force ? 1 : 0);
     server.send(200, "application/json",
                 String("{\"owner\":") + ownerJson() + ",\"renew\":" +
-                    (keepSince ? "true" : "false") + "}");
+                    (decision.keepSince ? "true" : "false") + "}");
 }
 
 static void handleBleAuth(const String &json) {
