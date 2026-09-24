@@ -1,5 +1,11 @@
 # Fake ROM 与多设备实验时钟状态
 
+## 2026-09-24：Task 9/10a/10b 已提交，Task 11a/10c/11b 完成宿主验证
+
+显式 v2 端点登记与多目标 BLE 一次扫描/逐 MAC 会合已提交 `c82487c`。随后按串行顺序完成 BLE 扫描/GATT 时间线、UDP 已登记目标的认证改址、UDP/HTTP/PowerPlan/Data/ACK 结构化日志。真实 ROM 会发 UDP；v2 广播仅为地址线索，不再改全局选择/IP/推送/BLE 标志，也不构成 BLE 会合前提。无 legacy 设备参与本轮验收。
+
+Task 11a 隔离 `bridge-ble` 11 项测试及 app check 通过；Task 10c app UDP 2 项、身份 1 项测试及 app check 通过；Task 11b 隔离 `bridge-core` 全套与 app UDP 4 项定向测试通过，`git diff --check` 通过。最终审查发现并修复 HTTP 非成功错误误把请求 JSON 拼入错误文本的问题，POST/status/Bundle chunk 现只保留状态码和必要 offset。未启动生产 Bridge、操作实机或触碰 ROM；多设备和日志的现场验证、Fake ROM/实验时钟仍待完成。
+
 ## 2026-09-24：计划落地，Task 1 完成
 
 主代理定下一个模拟器进程一台设备、Bridge 按 MAC 维护独立目标时钟、设备侧和 Bridge 侧可分别配置倍率/偏移/漂移的合同；同步与失步都列入验收。阶段、路由、实机隔离与时间迁移约束见 `plan.md`，原提案 `docs/fake-rom-simulator-design.md` 已同步修正。当前仍没有可运行的 Fake ROM。

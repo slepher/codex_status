@@ -7,7 +7,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use crate::platform::model::DeviceIdentity;
@@ -110,10 +110,65 @@ fn request(
 }
 
 fn post_json(ip: &str, path: &str, token: &str, body: &Value, timeout: Duration) -> Result<Value> {
+    let started = Instant::now();
     let text = serde_json::to_vec(body)?;
-    let (status, body) = request(ip, "POST", path, token, Some(&text), &[], timeout)
-        .with_context(|| format!("POST {path}"))?;
-    let parsed: Value = serde_json::from_str(&body).unwrap_or(json!({"raw": body}));
+    let request_id = event_id(body, "request_id");
+    let device_mac = event_id(body, "device_mac");
+    let seq = body["seq"].as_u64();
+    let plan_id = body["plan_id"].as_u64();
+    let job_id = event_id(body, "job_id");
+    tracing::info!(
+        event = "send",
+        operation = path,
+        request_id = request_id.as_deref().unwrap_or(""),
+        device_mac = device_mac.as_deref().unwrap_or(""),
+        seq = seq.unwrap_or(0),
+        plan_id = plan_id.unwrap_or(0),
+        job_id = job_id.as_deref().unwrap_or(""),
+        "v2 HTTP request"
+    );
+    let response = request(ip, "POST", path, token, Some(&text), &[], timeout);
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let (status, response_body) = match response {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(
+                event = "result",
+                operation = path,
+                request_id = request_id.as_deref().unwrap_or(""),
+                device_mac = device_mac.as_deref().unwrap_or(""),
+                seq = seq.unwrap_or(0),
+                plan_id = plan_id.unwrap_or(0),
+                job_id = job_id.as_deref().unwrap_or(""),
+                elapsed_ms,
+                error_category = safe_error_category(&error),
+                "v2 HTTP result"
+            );
+            return Err(error).with_context(|| format!("POST {path}"));
+        }
+    };
+    let error_category = if (200..300).contains(&status) {
+        "none"
+    } else if status == 401 || status == 409 {
+        "identity_or_claim_rejected"
+    } else {
+        "http_non_success"
+    };
+    tracing::info!(
+        event = "result",
+        operation = path,
+        request_id = request_id.as_deref().unwrap_or(""),
+        device_mac = device_mac.as_deref().unwrap_or(""),
+        seq = seq.unwrap_or(0),
+        plan_id = plan_id.unwrap_or(0),
+        job_id = job_id.as_deref().unwrap_or(""),
+        status,
+        elapsed_ms,
+        error_category,
+        "v2 HTTP result"
+    );
+    let parsed: Value =
+        serde_json::from_str(&response_body).unwrap_or(json!({"raw": response_body}));
     if status == 409 {
         return Ok(json!({"result": "rejected", "error": "occupied", "detail": parsed}));
     }
@@ -121,19 +176,81 @@ fn post_json(ip: &str, path: &str, token: &str, body: &Value, timeout: Duration)
         bail!("device rejected the endpoint token (401)");
     }
     if !(200..300).contains(&status) {
-        bail!("device returned HTTP {status}: {body}");
+        bail!("device returned HTTP {status}");
     }
     Ok(parsed)
 }
 
+fn event_id(body: &Value, key: &str) -> Option<String> {
+    if !matches!(key, "request_id" | "device_mac" | "job_id") {
+        return None;
+    }
+    body[key]
+        .as_str()
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 80
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:".contains(&byte))
+        })
+        .map(str::to_owned)
+}
+
+fn safe_error_category(error: &anyhow::Error) -> &'static str {
+    if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
+    }) {
+        "timeout"
+    } else if error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            io.kind() == std::io::ErrorKind::ConnectionRefused
+                || io.kind() == std::io::ErrorKind::ConnectionReset
+                || io.kind() == std::io::ErrorKind::NotConnected
+        })
+    }) {
+        "connection"
+    } else {
+        "transport_or_protocol"
+    }
+}
+
 /// Authenticated Status read: the only authoritative device state.
 pub fn status(ip: &str, token: &str, timeout: Duration) -> Result<Value> {
-    let (status, body) = request(ip, "GET", "/v2/status", token, None, &[], timeout)?;
+    let started = Instant::now();
+    tracing::info!(event = "send", operation = "/v2/status", "v2 HTTP request");
+    let response = request(ip, "GET", "/v2/status", token, None, &[], timeout);
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let (status, body) = match response {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(
+                event = "result",
+                operation = "/v2/status",
+                elapsed_ms,
+                error_category = safe_error_category(&error),
+                "v2 HTTP result"
+            );
+            return Err(error);
+        }
+    };
+    tracing::info!(
+        event = "result",
+        operation = "/v2/status",
+        status,
+        elapsed_ms,
+        error_category = if status == 200 { "none" }
+            else if status == 401 { "identity_rejected" }
+            else { "http_non_success" },
+        "v2 HTTP result"
+    );
     if status == 401 {
         bail!("device rejected the endpoint token (401)");
     }
     if status != 200 {
-        bail!("device /v2/status HTTP {status}: {body}");
+        bail!("device /v2/status HTTP {status}");
     }
     Ok(serde_json::from_str(&body).context("v2 status json")?)
 }
@@ -187,8 +304,14 @@ fn session_nonce(ip: &str, token: &str, expected_mac: &str, timeout: Duration) -
     let actual = DeviceIdentity::normalized_mac(mac)
         .with_context(|| format!("invalid device MAC {mac} in authenticated status for target {expected_mac}"))?;
     if actual != expected {
+        tracing::warn!(event = "preflight_reject", operation = "/v2/status",
+            device_mac = %expected, reported_mac = %actual, error_category = "identity_mismatch",
+            "v2 HTTP identity preflight rejected");
         bail!("authenticated status MAC {mac} does not match target MAC {expected_mac}");
     }
+    tracing::info!(event = "preflight_accept", operation = "/v2/status",
+        device_mac = %expected, reported_mac = %actual, error_category = "none",
+        "v2 HTTP identity preflight accepted");
     let nonce = state["session_nonce"].as_str().unwrap_or("");
     if nonce.len() != 32 || !nonce.bytes().all(|c| c.is_ascii_hexdigit()) {
         bail!("device lacks v2 session protection; update firmware before publishing or activating");
@@ -236,7 +359,13 @@ pub fn install_bundle(
         let end = (offset + chunk_bytes).min(payload.len());
         let path = format!("/v2/bundle/chunk?request_id={request_id}&session_nonce={nonce}&offset={offset}");
         let offset_text = offset.to_string();
-        let (status, body) = request(
+        let trace_device_mac = event_id(&command, "device_mac").unwrap_or_default();
+        let trace_job_id = event_id(&bundle, "job_id").unwrap_or_default();
+        let started = Instant::now();
+        tracing::info!(event = "send", operation = "/v2/bundle/chunk",
+            request_id = %request_id, device_mac = %trace_device_mac, job_id = %trace_job_id,
+            offset, "v2 HTTP request");
+        let response = request(
             ip,
             "POST",
             &path,
@@ -244,12 +373,31 @@ pub fn install_bundle(
             Some(&payload[offset..end]),
             &[("X-Request-Id", &request_id), ("X-Session-Nonce", &nonce), ("X-Offset", &offset_text)],
             timeout,
-        ).with_context(|| format!("bundle chunk at offset {offset}"))?;
+        );
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let (status, body) = match response {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(event = "result", operation = "/v2/bundle/chunk",
+                    request_id = %request_id, device_mac = %trace_device_mac, job_id = %trace_job_id,
+                    offset, elapsed_ms, error_category = safe_error_category(&error), "v2 HTTP result");
+                return Err(error).with_context(|| format!("bundle chunk at offset {offset}"));
+            }
+        };
+        tracing::info!(event = "result", operation = "/v2/bundle/chunk",
+            request_id = %request_id, device_mac = %trace_device_mac, job_id = %trace_job_id,
+            offset, status, elapsed_ms,
+            error_category = if (200..300).contains(&status) { "none" } else { "http_non_success" },
+            "v2 HTTP result");
         if !(200..300).contains(&status) {
-            bail!("bundle chunk at {offset} failed: HTTP {status} {body}");
+            bail!("bundle chunk at offset {offset} failed: HTTP {status}");
         }
         let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
         if parsed["result"] != "applied" {
+            tracing::warn!(event = "ack", operation = "/v2/bundle/chunk",
+                request_id = %request_id, device_mac = %trace_device_mac, job_id = %trace_job_id,
+                offset, result = parsed["result"].as_str().unwrap_or("unknown"),
+                error_category = "ack_rejected", "v2 Bundle chunk acknowledgement");
             return Ok(parsed);
         }
         let next = parsed["next_offset"].as_u64().unwrap_or(u64::MAX);
@@ -283,11 +431,92 @@ pub fn chunk_plan(payload_len: usize, chunk_bytes: usize) -> Vec<(usize, usize)>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::thread;
 
     #[test]
     fn chunk_plan_is_bounded_and_contiguous() {
         let plan = chunk_plan(10_000, 4096);
         assert_eq!(plan, vec![(0, 4096), (4096, 4096), (8192, 1808)]);
         assert_eq!(plan.iter().map(|(_, n)| n).sum::<usize>(), 10_000);
+    }
+
+    #[test]
+    fn event_metadata_keeps_correlators_and_rejects_unbounded_values() {
+        let body = json!({"request_id": "data-0012", "device_mac": "AABBCCDDEEFF",
+            "seq": 12, "plan_id": 7, "job_id": "job-1", "token": "must-not-log"});
+        assert_eq!(event_id(&body, "request_id").as_deref(), Some("data-0012"));
+        assert_eq!(
+            event_id(&body, "device_mac").as_deref(),
+            Some("AABBCCDDEEFF")
+        );
+        assert_eq!(body["seq"].as_u64(), Some(12));
+        assert_eq!(body["plan_id"].as_u64(), Some(7));
+        assert_eq!(event_id(&body, "token"), None);
+        assert_eq!(
+            event_id(&json!({"request_id": "x".repeat(81)}), "request_id"),
+            None
+        );
+    }
+
+    #[test]
+    fn post_json_reports_http_status_without_exposing_request_or_response_bodies() {
+        fn serve_once(status: u16, payload: &'static str) -> String {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap().to_string();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0; 1024];
+                loop {
+                    let count = stream.read(&mut chunk).unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..count]);
+                    if let Some(head_end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                        let header = String::from_utf8_lossy(&request[..head_end]);
+                        let content_len = header.lines().find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("Content-Length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        }).unwrap_or(0);
+                        if request.len() >= head_end + 4 + content_len {
+                            break;
+                        }
+                    }
+                }
+                let response = format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}", payload.len());
+                stream.write_all(response.as_bytes()).unwrap();
+            });
+            let result = post_json(
+                &address,
+                "/v2/data",
+                "secret-token",
+                &json!({"device_mac": "AABBCCDDEEFF", "request_id": "data-1", "seq": 1,
+                    "session_nonce": "request-secret", "snapshot": {"account": "request-secret"}}),
+                Duration::from_secs(2),
+            );
+            server.join().unwrap();
+            match result {
+                Ok(value) => value.to_string(),
+                Err(error) => error.to_string(),
+            }
+        }
+
+        assert_eq!(
+            serve_once(200, r#"{"result":"applied","data_seq":1}"#),
+            r#"{"data_seq":1,"result":"applied"}"#
+        );
+        let failed = serve_once(503, r#"{"secret":"response-secret"}"#);
+        assert!(failed.contains("HTTP 503"));
+        assert!(!failed.contains("request-secret"));
+        assert!(!failed.contains("response-secret"));
+        assert_eq!(
+            safe_error_category(&anyhow!(failed)),
+            "transport_or_protocol"
+        );
     }
 }

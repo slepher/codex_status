@@ -207,6 +207,61 @@ async fn register_device_v2(ctx: &AppCtx, args: &Value) -> Result<Value, String>
         .ok_or_else(|| "registered device record unavailable".into())
 }
 
+/// Verify and update one already-registered v2 device's endpoint from UDP.
+/// The service upsert keeps its Profile, sync setting, and observations.
+pub(super) async fn revalidate_registered_v2_endpoint(
+    ctx: &AppCtx,
+    requested_mac: &str,
+    endpoint: &str,
+) -> Result<bool, String> {
+    let mac = DeviceIdentity::normalized_mac(requested_mac).ok_or("invalid device MAC")?;
+    let endpoint = parse_device_endpoint(endpoint)?;
+    let Some(existing) = service(ctx).device_get(&mac) else {
+        return Ok(false);
+    };
+    if existing["legacy"] != false {
+        return Ok(false);
+    }
+    let Some(previous_endpoint) = existing["ip"].as_str().map(str::to_string) else {
+        return Ok(false);
+    };
+    if previous_endpoint == endpoint {
+        return Ok(false);
+    }
+
+    let (status_endpoint, v2_endpoint, token) =
+        (endpoint.clone(), endpoint.clone(), ctx.config.token.clone());
+    let (status, v2_status) = blocking(move || {
+        let status = bridge_core::device::fetch(&status_endpoint, timeout())
+            .map_err(err_text)?
+            .raw
+            .ok_or_else(|| "endpoint did not return structured /status.json".to_string())?;
+        let v2_status = v2_client::status(&v2_endpoint, &token, timeout()).map_err(err_text)?;
+        Ok((status, v2_status))
+    })
+    .await?;
+    let (capabilities, mac) = registered_device_facts(&mac, &status, &v2_status)?;
+
+    // Another address update or rename may have landed while HTTP was in flight.
+    let Some(current) = service(ctx).device_get(&mac) else {
+        return Ok(false);
+    };
+    if current["legacy"] != false || current["ip"].as_str() != Some(&previous_endpoint) {
+        return Ok(false);
+    }
+    let name = current["name"]
+        .as_str()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("CodexStatus")
+        .to_string();
+    let mut identity = registration_identity(&mac, &endpoint, &name)?;
+    identity.discovered_via = "udp".into();
+    service(ctx)
+        .device_upsert(identity, capabilities, false)
+        .map_err(err_text)?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod registration_tests {
     use super::*;
@@ -712,6 +767,8 @@ pub async fn deliver(ctx: &AppCtx, mac: &str) -> Value {
             }
             let (ip, token, expected_mac) = (link.ip.clone(), link.token.clone(), link.mac.clone());
             let sent = payload.clone();
+            tracing::info!(event = "send", device_mac = %mac, operation = "/v2/data",
+                seq = body["seq"].as_u64().unwrap_or(0), "v2 data send");
             match blocking(move || {
                 v2_client::data(&ip, &token, &expected_mac, &sent, timeout()).map_err(err_text)
             })
@@ -719,6 +776,15 @@ pub async fn deliver(ctx: &AppCtx, mac: &str) -> Value {
             {
                 Ok(ack) => {
                     let applied = ack["result"] == "applied";
+                    let ack_category = if !applied {
+                        "ack_rejected"
+                    } else if ack["data_seq"] != body["seq"]
+                        || ack["active_context_id"] != body["active_context_id"]
+                    {
+                        "ack_mismatch"
+                    } else {
+                        "none"
+                    };
                     let seq = body["seq"].as_u64().unwrap_or(0);
                     let crc = body["crc"].as_str().unwrap_or("").to_string();
                     let kind = DeliveryKind::LightData;
@@ -730,11 +796,26 @@ pub async fn deliver(ctx: &AppCtx, mac: &str) -> Value {
                         applied,
                         ack["display_state"].as_str().unwrap_or("unchanged"),
                     );
-                    tracing::info!(device = mac, seq, outcome = %outcome["outcome"],
-                        transport = "http", ack = %ack, "v2 data acknowledgement");
+                    tracing::info!(
+                        event = "ack",
+                        device = mac,
+                        seq,
+                        data_seq = ack["data_seq"].as_u64().unwrap_or(0),
+                        result = ack["result"].as_str().unwrap_or("unknown"),
+                        display_state = ack["display_state"].as_str().unwrap_or("unknown"),
+                        error_category = ack_category,
+                        outcome = outcome["outcome"].as_str().unwrap_or("unknown"),
+                        transport = "http",
+                        "v2 data acknowledgement"
+                    );
                     json!({"result": "data", "transport": "http", "ack": ack, "confirmation": outcome})
                 }
-                Err(e) => json!({"result": "deferred", "error": e}),
+                Err(e) => {
+                    tracing::warn!(event = "result", device_mac = %mac, operation = "/v2/data",
+                        seq = body["seq"].as_u64().unwrap_or(0), error_category = safe_protocol_error_category(&e),
+                        "v2 data send failed");
+                    json!({"result": "deferred", "error": e})
+                }
             }
         }
         "waiting_for_rendezvous" => json!(decision),
@@ -768,6 +849,8 @@ pub async fn send_plan(
     }
     let (ip, token, expected_mac) = (link.ip.clone(), link.token.clone(), link.mac.clone());
     let sent = body.clone();
+    tracing::info!(event = "send", device_mac = %mac, operation = "/v2/plan",
+        plan_id = plan.plan_id, "v2 PowerPlan send");
     match blocking(move || {
         v2_client::plan(&ip, &token, &expected_mac, &sent, timeout()).map_err(err_text)
     })
@@ -785,9 +868,27 @@ pub async fn send_plan(
                     now_secs(),
                 );
             }
+            let ack_category = if !accepted {
+                "ack_rejected"
+            } else if ack["plan_id"].as_u64().is_some_and(|id| id != plan.plan_id) {
+                "ack_mismatch"
+            } else {
+                "none"
+            };
+            tracing::info!(event = "ack", device_mac = %mac, plan_id = plan.plan_id,
+                result = ack["result"].as_str().unwrap_or("unknown"),
+                ack_plan_id = ack["plan_id"].as_u64().unwrap_or(0),
+                accepted_remaining_s = ack["accepted_remaining_s"].as_u64().unwrap_or(0),
+                error_category = ack_category,
+                transport = "http", "v2 PowerPlan acknowledgement");
             json!({"result": "plan", "plan": plan, "ack": ack, "accepted": accepted})
         }
-        Err(e) => json!({"result": "deferred", "error": e}),
+        Err(e) => {
+            tracing::warn!(event = "result", device_mac = %mac, operation = "/v2/plan",
+                plan_id = plan.plan_id, error_category = safe_protocol_error_category(&e),
+                "v2 PowerPlan send failed");
+            json!({"result": "deferred", "error": e})
+        }
     }
 }
 
@@ -826,6 +927,8 @@ pub async fn request_light(ctx: &AppCtx, mac: &str) -> Value {
     let mut body = serde_json::to_value(&plan).unwrap_or(Value::Null);
     body["bridge_id"] = json!(link.bridge_id);
     let (ip, token, expected_mac) = (link.ip, link.token, link.mac);
+    tracing::info!(event = "send", device_mac = %mac, operation = "/v2/plan",
+        plan_id = plan.plan_id, "v2 PowerPlan send");
     match blocking(move || {
         v2_client::plan(&ip, &token, &expected_mac, &body, timeout()).map_err(err_text)
     })
@@ -835,13 +938,46 @@ pub async fn request_light(ctx: &AppCtx, mac: &str) -> Value {
             let remaining = ack["accepted_remaining_s"].as_u64().unwrap_or(0) as u32;
             let confirmation =
                 service(ctx).note_plan_ack(mac, plan.plan_id, remaining, false, now_secs());
+            tracing::info!(event = "ack", device_mac = %mac, plan_id = plan.plan_id,
+                result = ack["result"].as_str().unwrap_or("unknown"),
+                ack_plan_id = ack["plan_id"].as_u64().unwrap_or(0),
+                accepted_remaining_s = remaining,
+                error_category = if ack["plan_id"].as_u64().is_some_and(|id| id != plan.plan_id) { "ack_mismatch" } else { "none" },
+                transport = "http",
+                "v2 PowerPlan acknowledgement");
             json!({"result": "applied", "transport": "http", "plan": plan,
                 "already_pending": already_pending, "ack": ack, "confirmation": confirmation})
         }
-        Ok(ack) => json!({"result": "queued", "transport": "ble_rendezvous",
-            "plan": plan, "already_pending": already_pending, "ack": ack}),
-        Err(error) => json!({"result": "queued", "transport": "ble_rendezvous",
-            "plan": plan, "already_pending": already_pending, "ack": null, "http_error": error}),
+        Ok(ack) => {
+            tracing::warn!(event = "ack", device_mac = %mac, plan_id = plan.plan_id,
+                result = ack["result"].as_str().unwrap_or("unknown"),
+                ack_plan_id = ack["plan_id"].as_u64().unwrap_or(0),
+                accepted_remaining_s = ack["accepted_remaining_s"].as_u64().unwrap_or(0),
+                error_category = if ack["result"] == "applied" { "none" } else { "ack_rejected" },
+                error_category = "ack_rejected", transport = "http", "v2 PowerPlan rejected");
+            json!({"result": "queued", "transport": "ble_rendezvous",
+                "plan": plan, "already_pending": already_pending, "ack": ack})
+        }
+        Err(error) => {
+            tracing::warn!(event = "result", device_mac = %mac, operation = "/v2/plan",
+                plan_id = plan.plan_id, error_category = safe_protocol_error_category(&error),
+                "v2 PowerPlan send failed");
+            json!({"result": "queued", "transport": "ble_rendezvous",
+                "plan": plan, "already_pending": already_pending, "ack": null, "http_error": error})
+        }
+    }
+}
+
+fn safe_protocol_error_category(error: &str) -> &'static str {
+    let text = error.to_ascii_lowercase();
+    if text.contains("does not match") || text.contains("identity") || text.contains("expected") {
+        "identity_mismatch"
+    } else if text.contains("timeout") || text.contains("timed out") {
+        "timeout"
+    } else if text.contains("http") {
+        "http_non_success"
+    } else {
+        "transport_or_protocol"
     }
 }
 
@@ -956,9 +1092,18 @@ pub async fn post_ota_window(ctx: &AppCtx, secs: u32) {
                     now_secs(),
                 );
             }
-            tracing::info!(device = mac, %ack, "post-OTA light plan");
+            tracing::info!(
+                event = "ack",
+                device_mac = mac,
+                plan_id = plan.plan_id,
+                result = ack["result"].as_str().unwrap_or("unknown"),
+                ack_plan_id = ack["plan_id"].as_u64().unwrap_or(0),
+                accepted_remaining_s = ack["accepted_remaining_s"].as_u64().unwrap_or(0),
+                "post-OTA light plan acknowledgement"
+            );
         }
-        Err(e) => tracing::warn!("post-OTA light plan failed: {e}"),
+        Err(e) => tracing::warn!(event = "result", device_mac = mac, plan_id = plan.plan_id,
+            error_category = safe_protocol_error_category(&e), "post-OTA light plan failed"),
     }
 }
 
@@ -1310,6 +1455,13 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
                 let applied = ack["result"] == "applied"
                     && ack["data_seq"] == body["seq"]
                     && ack["active_context_id"] == body["active_context_id"];
+                let ack_category = if ack["result"] != "applied" {
+                    "ack_rejected"
+                } else if !applied {
+                    "ack_mismatch"
+                } else {
+                    "none"
+                };
                 let outcome = service(ctx).note_ack(
                     &mac,
                     DeliveryKind::BleData,
@@ -1318,8 +1470,18 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
                     applied,
                     ack["display_state"].as_str().unwrap_or("unchanged"),
                 );
-                tracing::info!(device = mac, outcome = %outcome["outcome"], transport = "ble",
-                    ack = %ack, "v2 data acknowledgement");
+                tracing::info!(
+                    event = "ack",
+                    device_mac = mac,
+                    seq = body["seq"].as_u64().unwrap_or(0),
+                    data_seq = ack["data_seq"].as_u64().unwrap_or(0),
+                    result = ack["result"].as_str().unwrap_or("unknown"),
+                    display_state = ack["display_state"].as_str().unwrap_or("unknown"),
+                    error_category = ack_category,
+                    outcome = outcome["outcome"].as_str().unwrap_or("unknown"),
+                    transport = "ble",
+                    "v2 data acknowledgement"
+                );
             }
         }
         let remaining = state["power"]["provisional_remaining_s"]
@@ -1341,8 +1503,21 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             .command("plan", serde_json::to_value(&plan).map_err(err_text)?)
             .await
             .map_err(err_text)?;
-        if ack["result"] != "applied" {
-            return Err(format!("BLE PowerPlan rejected: {ack}"));
+        let accepted = ack["result"] == "applied";
+        let ack_category = if !accepted {
+            "ack_rejected"
+        } else if ack["plan_id"].as_u64().is_some_and(|id| id != plan.plan_id) {
+            "ack_mismatch"
+        } else {
+            "none"
+        };
+        if !accepted {
+            tracing::warn!(event = "ack", device_mac = %mac, plan_id = plan.plan_id,
+                result = ack["result"].as_str().unwrap_or("unknown"),
+                ack_plan_id = ack["plan_id"].as_u64().unwrap_or(0),
+                accepted_remaining_s = ack["accepted_remaining_s"].as_u64().unwrap_or(0),
+                error_category = ack_category, transport = "ble", "v2 PowerPlan rejected");
+            return Err("BLE PowerPlan rejected (ack_rejected)".to_owned());
         }
         let confirmation = service(ctx).note_plan_ack(
             &mac,
@@ -1351,8 +1526,18 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             remaining > 0,
             now_secs(),
         );
-        tracing::info!(device = mac, plan_id = plan.plan_id, ack = %ack,
-            confirmation = %confirmation, "v2 PowerPlan acknowledgement");
+        tracing::info!(
+            event = "ack",
+            device_mac = mac,
+            plan_id = plan.plan_id,
+            result = ack["result"].as_str().unwrap_or("unknown"),
+            ack_plan_id = ack["plan_id"].as_u64().unwrap_or(0),
+            accepted_remaining_s = ack["accepted_remaining_s"].as_u64().unwrap_or(0),
+            error_category = ack_category,
+            confirmation = confirmation["outcome"].as_str().unwrap_or("unknown"),
+            transport = "ble",
+            "v2 PowerPlan acknowledgement"
+        );
         Ok(())
     };
     let result = tokio::time::timeout(Duration::from_secs(10), work)

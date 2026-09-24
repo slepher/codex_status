@@ -1022,23 +1022,42 @@ async fn post_claim_to_endpoint(
     force: bool,
     release: bool,
 ) -> Result<(reqwest::StatusCode, String), ClaimError> {
+    let started = std::time::Instant::now();
     let expected_mac = bridge_core::platform::model::DeviceIdentity::normalized_mac(target_mac)
         .ok_or_else(|| ClaimError::Other("invalid target MAC; refusing claim".into()))?;
+    tracing::info!(event = "preflight", device_mac = %expected_mac, operation = "/status.json",
+        "claim identity preflight");
     let endpoint = endpoint.to_string();
     let status_endpoint = endpoint.clone();
     let status = tokio::task::spawn_blocking(move || {
         bridge_core::device::fetch(&status_endpoint, Duration::from_secs(2))
     })
     .await
-    .map_err(|e| ClaimError::Other(format!("device identity check failed: {e}")))?
-    .map_err(|e| ClaimError::Other(format!("device identity check failed: {e}")))?;
+    .map_err(|e| {
+        tracing::warn!(event = "preflight_result", device_mac = %expected_mac,
+            elapsed_ms = started.elapsed().as_millis() as u64, error_category = "connection",
+            "claim identity preflight failed");
+        ClaimError::Other(format!("device identity check failed: {e}"))
+    })?
+    .map_err(|e| {
+        tracing::warn!(event = "preflight_result", device_mac = %expected_mac,
+            elapsed_ms = started.elapsed().as_millis() as u64, error_category = "http_or_status",
+            "claim identity preflight failed");
+        ClaimError::Other(format!("device identity check failed: {e}"))
+    })?;
     let actual_mac = status
         .get("MAC")
         .and_then(bridge_core::platform::model::DeviceIdentity::normalized_mac)
         .ok_or_else(|| {
+            tracing::warn!(event = "preflight_result", device_mac = %expected_mac,
+                elapsed_ms = started.elapsed().as_millis() as u64, error_category = "identity_mismatch",
+                "claim identity preflight rejected");
             ClaimError::Other("device status has no valid MAC; refusing claim".into())
         })?;
     if actual_mac != expected_mac {
+        tracing::warn!(event = "preflight_result", device_mac = %expected_mac,
+            reported_mac = %actual_mac, elapsed_ms = started.elapsed().as_millis() as u64,
+            error_category = "identity_mismatch", "claim identity preflight rejected");
         return Err(ClaimError::Other(format!(
             "device at {endpoint} reports MAC {actual_mac}, expected {expected_mac}; refusing claim"
         )));
@@ -1062,14 +1081,26 @@ async fn post_claim_to_endpoint(
         .timeout(Duration::from_secs(5))
         .build()
         .map_err(|e| ClaimError::Other(e.to_string()))?;
-    let resp = client
-        .post(&url)
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|e| ClaimError::Other(format!("device unreachable: {e}")))?;
+    tracing::info!(event = "send", device_mac = %expected_mac, operation = "/claim",
+        "claim request");
+    let claim_started = std::time::Instant::now();
+    let resp = match client.post(&url).bearer_auth(token).send().await {
+        Ok(resp) => resp,
+        Err(error) => {
+            tracing::warn!(event = "result", device_mac = %expected_mac, operation = "/claim",
+                elapsed_ms = claim_started.elapsed().as_millis() as u64,
+                error_category = if error.is_timeout() { "timeout" } else if error.is_connect() { "connection" } else { "transport" },
+                "claim request failed");
+            return Err(ClaimError::Other(format!("device unreachable: {error}")));
+        }
+    };
     let code = resp.status();
     let body = resp.text().await.unwrap_or_default();
+    tracing::info!(event = "result", device_mac = %expected_mac, operation = "/claim",
+        status = code.as_u16(), elapsed_ms = claim_started.elapsed().as_millis() as u64,
+        error_category = if code.is_success() { "none" } else if code == reqwest::StatusCode::UNAUTHORIZED { "identity_rejected" }
+            else if code == reqwest::StatusCode::CONFLICT { "claim_rejected" } else { "http_non_success" },
+        "claim request result");
     Ok((code, body))
 }
 
@@ -2148,11 +2179,10 @@ async fn reload_templates(state: State<'_, Arc<AppCtx>>) -> Result<usize, String
     Ok(count)
 }
 
-/// UDP announce listener (docs/power-state.md §9): the device broadcasts
-/// `{magic, mac, ip, port, proto, ble, fw}` to 255.255.255.255:8767 on IP
-/// change, BLE session start and every ~5 min. Only a known MAC may move the
-/// endpoint; before the first /status.json fetch only the configured address
-/// is accepted (and its MAC learned).
+/// UDP announce listener (docs/power-state.md §9). For registered v2 devices,
+/// announcements are per-MAC address hints that are verified over HTTP.
+/// The selected-device discovery below remains only for historical legacy
+/// compatibility and is never used for a registered v2 device.
 async fn udp_listen(ctx: Arc<AppCtx>) {
     let socket = match tokio::net::UdpSocket::bind(("0.0.0.0", 8767)).await {
         Ok(socket) => socket,
@@ -2167,46 +2197,471 @@ async fn udp_listen(ctx: Arc<AppCtx>) {
     let _ = socket.set_broadcast(true);
     tracing::info!("udp announce listener on :8767");
     let mut buf = [0u8; 1024];
+    let mut last_revalidation = HashMap::<String, i64>::new();
+    let mut v2_udp_sampler = V2UdpTraceSampler::default();
     loop {
         let Ok((n, from)) = socket.recv_from(&mut buf).await else {
             continue;
         };
         let Ok(doc) = serde_json::from_slice::<Value>(&buf[..n]) else {
+            if let Some(suppressed) = v2_udp_sampler.record(None, "malformed_json", now_secs()) {
+                tracing::debug!(event = "udp_discard", category = "malformed_json", suppressed,
+                    "unrelated UDP traffic sampled");
+            }
             continue;
         };
         if doc.get("magic").and_then(|v| v.as_str()) != Some("codex-status") {
+            if let Some(suppressed) = v2_udp_sampler.record(None, "unrelated_magic", now_secs()) {
+                tracing::debug!(event = "udp_discard", category = "unrelated_magic", suppressed,
+                    "unrelated UDP traffic sampled");
+            }
             continue;
         }
-        let mac = doc.get("mac").and_then(|v| v.as_str()).unwrap_or("");
+        let raw_mac = doc.get("mac").and_then(Value::as_str).unwrap_or("");
+        let devices = ctx.platform.devices();
+        let Some(mac) = bridge_core::platform::model::DeviceIdentity::normalized_mac(raw_mac)
+        else {
+            if let Some(suppressed) = v2_udp_sampler.record(None, "format_invalid", now_secs()) {
+                tracing::debug!(event = "udp_discard", category = "format_invalid", suppressed,
+                    "UDP announce with invalid identity sampled");
+            }
+            continue;
+        };
+        let hint = classify_v2_udp_hint(&doc, from.ip(), &devices);
+        let registered_v2 = hint.is_registered();
+        if registered_v2 {
+            let (mac, endpoint) = match hint {
+                V2UdpHint::Changed { mac, endpoint } => {
+                    if let Some(suppressed) =
+                        v2_udp_sampler.record(Some(&mac), "endpoint_changed", now_secs())
+                    {
+                        tracing::info!(event = "udp_accept", device_mac = %mac, source = %from,
+                            endpoint = %endpoint, category = "endpoint_changed", suppressed,
+                            "registered v2 UDP announce accepted");
+                    }
+                    (mac, endpoint)
+                }
+                V2UdpHint::Unchanged { mac } => {
+                    if let Some(suppressed) =
+                        v2_udp_sampler.record(Some(&mac), "unchanged", now_secs())
+                    {
+                        tracing::trace!(event = "udp_duplicate", device_mac = %mac, source = %from,
+                            suppressed, "registered v2 UDP announce unchanged");
+                    }
+                    continue;
+                }
+                V2UdpHint::Rejected {
+                    mac,
+                    category,
+                    registered,
+                } => {
+                    let mac_for_log = if registered { mac.as_deref() } else { None };
+                    if let Some(suppressed) =
+                        v2_udp_sampler.record(mac_for_log, category, now_secs())
+                    {
+                        if registered {
+                            tracing::warn!(event = "udp_reject", device_mac = mac.as_deref().unwrap_or(""),
+                                source = %from, category, suppressed,
+                                "registered v2 UDP announce rejected");
+                        } else {
+                            tracing::debug!(event = "udp_reject", source = %from, category, suppressed,
+                                "unregistered UDP announce ignored");
+                        }
+                    }
+                    continue;
+                }
+            };
+            if last_revalidation
+                .get(&mac)
+                .is_none_or(|last| now_secs().saturating_sub(*last) >= 10)
+            {
+                last_revalidation.insert(mac.clone(), now_secs());
+                let ctx = ctx.clone();
+                let mac_for_task = mac.clone();
+                let endpoint_for_task = endpoint.clone();
+                tokio::spawn(async move {
+                    match platform::revalidate_registered_v2_endpoint(
+                        &ctx,
+                        &mac_for_task,
+                        &endpoint_for_task,
+                    )
+                    .await
+                    {
+                        Ok(true) => {
+                            tracing::info!(event = "udp_verified", device_mac = %mac_for_task,
+                                endpoint = %endpoint_for_task, "UDP endpoint verified and updated");
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            tracing::warn!(event = "udp_reject", device_mac = %mac_for_task,
+                                source = %endpoint_for_task, category = safe_v2_error_category(&error),
+                                "registered v2 UDP endpoint verification failed")
+                        }
+                    }
+                });
+            }
+            // The per-MAC BLE scheduler remains independent of UDP announces.
+            continue;
+        }
+
+        // Historical single-device UDP hint for an already-known legacy MAC.
+        // TODO remove when legacy firmware support retires. First identification
+        // is disabled; unknown MACs are never registered.
         let ip = doc.get("ip").and_then(|v| v.as_str()).unwrap_or("");
-        if mac.is_empty() || ip.is_empty() || from.ip().to_string() != ip {
+        if ip.parse::<std::net::Ipv4Addr>().is_err() || from.ip().to_string() != ip {
             continue;
         }
         let known = ctx.device_mac.lock().unwrap().clone();
         if known
             .as_deref()
-            .map(|existing| !existing.eq_ignore_ascii_case(mac))
-            .unwrap_or(false)
+            .map(|existing| !existing.eq_ignore_ascii_case(&mac))
+            .unwrap_or(true)
         {
-            tracing::debug!("udp announce ignored (mac mismatch)");
             continue;
         }
-        if known.is_none() && ctx.device_ip.lock().unwrap().as_str() != ip {
-            // First identification must match the configured address (the MAC
-            // then becomes the identity key for all later announcements).
-            tracing::debug!("udp announce ignored (unknown mac from {ip})");
+        if !ctx
+            .platform
+            .device_get(&mac)
+            .is_some_and(|device| device["legacy"] == true)
+        {
             continue;
         }
-        if !learn_mac(&ctx, mac, "udp") {
+        if !learn_mac(&ctx, &mac, "udp") {
             continue;
         }
         set_device_ip(&ctx, ip, "udp");
         ctx.activity.note_contact("udp");
         if doc.get("ble").and_then(|v| v.as_i64()).unwrap_or(0) == 1 {
-            tracing::info!("device requested a BLE handshake via UDP");
             ctx.udp_ble.store(true, Ordering::SeqCst);
             ctx.force_ble.notify_one();
         }
+    }
+}
+
+enum V2UdpHint {
+    Changed {
+        mac: String,
+        endpoint: String,
+    },
+    Unchanged {
+        mac: String,
+    },
+    Rejected {
+        mac: Option<String>,
+        category: &'static str,
+        registered: bool,
+    },
+}
+
+impl V2UdpHint {
+    fn is_registered(&self) -> bool {
+        match self {
+            Self::Changed { .. } | Self::Unchanged { .. } => true,
+            Self::Rejected { registered, .. } => *registered,
+        }
+    }
+}
+
+fn classify_v2_udp_hint(doc: &Value, source: std::net::IpAddr, devices: &[Value]) -> V2UdpHint {
+    use bridge_core::platform::model::DeviceIdentity;
+
+    if doc.get("magic").and_then(Value::as_str) != Some("codex-status") {
+        return V2UdpHint::Rejected {
+            mac: None,
+            category: "format_invalid",
+            registered: false,
+        };
+    }
+    let Some(mac) = doc
+        .get("mac")
+        .and_then(Value::as_str)
+        .and_then(DeviceIdentity::normalized_mac)
+    else {
+        return V2UdpHint::Rejected {
+            mac: None,
+            category: "format_invalid",
+            registered: false,
+        };
+    };
+    let Some(ip) = doc
+        .get("ip")
+        .and_then(Value::as_str)
+        .and_then(|ip| ip.parse::<std::net::Ipv4Addr>().ok())
+    else {
+        let registered = is_registered_v2_mac(&mac, devices);
+        return V2UdpHint::Rejected {
+            mac: Some(mac),
+            category: "format_invalid",
+            registered,
+        };
+    };
+    if source != std::net::IpAddr::V4(ip) {
+        let registered = is_registered_v2_mac(&mac, devices);
+        return V2UdpHint::Rejected {
+            mac: Some(mac),
+            category: "source_mismatch",
+            registered,
+        };
+    }
+    let port = if let Some(value) = doc.get("port") {
+        let Some(port) = value
+            .as_u64()
+            .and_then(|port| u16::try_from(port).ok())
+            .filter(|port| *port != 0)
+        else {
+            let registered = is_registered_v2_mac(&mac, devices);
+            return V2UdpHint::Rejected {
+                mac: Some(mac),
+                category: "format_invalid",
+                registered,
+            };
+        };
+        Some(port)
+    } else {
+        None
+    };
+    let registered_device = devices.iter().find(|device| {
+        device["legacy"] == false
+            && device["device_mac"]
+                .as_str()
+                .and_then(DeviceIdentity::normalized_mac)
+                .as_deref()
+                == Some(mac.as_str())
+    });
+    let Some(device) = registered_device else {
+        return V2UdpHint::Rejected {
+            mac: None,
+            category: "identity_unregistered",
+            registered: false,
+        };
+    };
+    let Some(previous_endpoint) = device["ip"].as_str() else {
+        return V2UdpHint::Rejected {
+            mac: Some(mac),
+            category: "identity_mismatch",
+            registered: true,
+        };
+    };
+    let endpoint = port
+        .filter(|port| *port != 80)
+        .map(|port| format!("{ip}:{port}"))
+        .unwrap_or_else(|| ip.to_string());
+    if previous_endpoint == endpoint {
+        V2UdpHint::Unchanged { mac }
+    } else {
+        V2UdpHint::Changed { mac, endpoint }
+    }
+}
+
+fn is_registered_v2_mac(mac: &str, devices: &[Value]) -> bool {
+    use bridge_core::platform::model::DeviceIdentity;
+    devices.iter().any(|device| {
+        device["legacy"] == false
+            && device["device_mac"]
+                .as_str()
+                .and_then(DeviceIdentity::normalized_mac)
+                .as_deref()
+                == Some(mac)
+    })
+}
+
+#[derive(Default)]
+struct V2UdpTraceSampler {
+    last_logged: HashMap<(String, &'static str), i64>,
+    suppressed: HashMap<(String, &'static str), u64>,
+}
+
+impl V2UdpTraceSampler {
+    fn record(&mut self, mac: Option<&str>, category: &'static str, now: i64) -> Option<u64> {
+        let key = (mac.unwrap_or_default().to_owned(), category);
+        if !self.last_logged.contains_key(&key) && self.last_logged.len() >= 256 {
+            if let Some(oldest) = self
+                .last_logged
+                .iter()
+                .min_by_key(|(_, last)| **last)
+                .map(|(key, _)| key.clone())
+            {
+                self.last_logged.remove(&oldest);
+                self.suppressed.remove(&oldest);
+            }
+        }
+        if let Some(last) = self.last_logged.get(&key) {
+            if now.saturating_sub(*last) < 10 {
+                *self.suppressed.entry(key).or_default() += 1;
+                return None;
+            }
+        }
+        self.last_logged.insert(key.clone(), now);
+        Some(self.suppressed.remove(&key).unwrap_or(0))
+    }
+}
+
+fn safe_v2_error_category(error: &str) -> &'static str {
+    let text = error.to_ascii_lowercase();
+    if text.contains("does not match") || text.contains("expected") || text.contains("identity") {
+        "identity_mismatch"
+    } else if text.contains("timeout") || text.contains("timed out") {
+        "timeout"
+    } else {
+        "http_or_transport"
+    }
+}
+
+#[cfg(test)]
+mod v2_udp_hint_tests {
+    use super::{classify_v2_udp_hint, V2UdpHint, V2UdpTraceSampler};
+    use serde_json::json;
+    use std::net::IpAddr;
+
+    fn device(mac: &str, ip: &str) -> serde_json::Value {
+        json!({"device_mac": mac, "ip": ip, "legacy": false})
+    }
+
+    #[test]
+    fn endpoint_hint_is_registered_per_mac_and_source_bound() {
+        let mac_a = "AA:BB:CC:DD:EE:01";
+        let mac_b = "AA:BB:CC:DD:EE:02";
+        let devices = [device(mac_a, "192.168.1.10"), device(mac_b, "192.168.1.20")];
+        let announce = json!({
+            "magic": "codex-status",
+            "mac": "aa-bb-cc-dd-ee-01",
+            "ip": "192.168.1.11"
+        });
+
+        assert!(matches!(classify_v2_udp_hint(&announce,
+            "192.168.1.11".parse::<IpAddr>().unwrap(), &devices),
+            V2UdpHint::Changed { mac, endpoint } if mac == "AABBCCDDEE01" && endpoint == "192.168.1.11"));
+        assert_eq!(devices[1]["ip"], "192.168.1.20");
+        assert!(matches!(
+            classify_v2_udp_hint(
+                &announce,
+                "192.168.1.12".parse::<IpAddr>().unwrap(),
+                &devices
+            ),
+            V2UdpHint::Rejected {
+                category: "source_mismatch",
+                registered: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn unknown_mac_unchanged_endpoint_and_invalid_port_are_ignored() {
+        let known = [device("AA:BB:CC:DD:EE:01", "192.168.1.10")];
+        let unknown = json!({
+            "magic": "codex-status",
+            "mac": "AA:BB:CC:DD:EE:02",
+            "ip": "192.168.1.11"
+        });
+        assert!(matches!(
+            classify_v2_udp_hint(&unknown, "192.168.1.11".parse::<IpAddr>().unwrap(), &known),
+            V2UdpHint::Rejected {
+                category: "identity_unregistered",
+                registered: false,
+                mac: None
+            }
+        ));
+
+        let same = json!({
+            "magic": "codex-status",
+            "mac": "AA:BB:CC:DD:EE:01",
+            "ip": "192.168.1.10"
+        });
+        assert!(
+            matches!(classify_v2_udp_hint(&same, "192.168.1.10".parse::<IpAddr>().unwrap(), &known),
+            V2UdpHint::Unchanged { mac } if mac == "AABBCCDDEE01")
+        );
+
+        let same_with_port_80 = json!({
+            "magic": "codex-status",
+            "mac": "AA:BB:CC:DD:EE:01",
+            "ip": "192.168.1.10",
+            "port": 80
+        });
+        assert!(matches!(
+            classify_v2_udp_hint(
+                &same_with_port_80,
+                "192.168.1.10".parse::<IpAddr>().unwrap(),
+                &known
+            ),
+            V2UdpHint::Unchanged { .. }
+        ));
+
+        for port in [json!(0), json!(65536), json!("80")] {
+            let announce = json!({
+                "magic": "codex-status",
+                "mac": "AA:BB:CC:DD:EE:01",
+                "ip": "192.168.1.11",
+                "port": port
+            });
+            assert!(matches!(
+                classify_v2_udp_hint(&announce, "192.168.1.11".parse::<IpAddr>().unwrap(), &known),
+                V2UdpHint::Rejected {
+                    category: "format_invalid",
+                    registered: true,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn udp_trace_classifies_identity_source_and_duplicate_without_side_effects() {
+        let known = [device("AA:BB:CC:DD:EE:01", "192.168.1.10")];
+        let source = "192.168.1.10".parse::<IpAddr>().unwrap();
+        let base = json!({"magic":"codex-status", "mac":"AA:BB:CC:DD:EE:01", "ip":"192.168.1.10"});
+        assert!(matches!(
+            classify_v2_udp_hint(&base, source, &known),
+            V2UdpHint::Unchanged { .. }
+        ));
+        assert!(matches!(
+            classify_v2_udp_hint(&base, "192.168.1.11".parse().unwrap(), &known),
+            V2UdpHint::Rejected {
+                category: "source_mismatch",
+                registered: true,
+                ..
+            }
+        ));
+        let unknown =
+            json!({"magic":"codex-status", "mac":"AA:BB:CC:DD:EE:02", "ip":"192.168.1.10"});
+        assert!(matches!(
+            classify_v2_udp_hint(&unknown, source, &known),
+            V2UdpHint::Rejected {
+                category: "identity_unregistered",
+                registered: false,
+                mac: None
+            }
+        ));
+        let moved = json!({"magic":"codex-status", "mac":"AA:BB:CC:DD:EE:01", "ip":"192.168.1.12"});
+        assert!(matches!(
+            classify_v2_udp_hint(&moved, "192.168.1.12".parse().unwrap(), &known),
+            V2UdpHint::Changed { .. }
+        ));
+    }
+
+    #[test]
+    fn udp_trace_sampling_is_bounded_and_counts_suppressed_events() {
+        let mut sampler = V2UdpTraceSampler::default();
+        assert_eq!(
+            sampler.record(Some("AABBCCDDEE01"), "source_mismatch", 100),
+            Some(0)
+        );
+        assert_eq!(
+            sampler.record(Some("AABBCCDDEE01"), "source_mismatch", 109),
+            None
+        );
+        assert_eq!(
+            sampler.record(Some("AABBCCDDEE01"), "source_mismatch", 110),
+            Some(1)
+        );
+        assert_eq!(sampler.record(None, "identity_unregistered", 110), Some(0));
+        assert_eq!(sampler.last_logged.len(), 2);
+        for n in 0..300 {
+            let mac = format!("AA:BB:CC:DD:{:02X}:{:02X}", n / 256, n % 256);
+            let _ = sampler.record(Some(&mac), "endpoint_changed", 200 + n);
+        }
+        assert!(sampler.last_logged.len() <= 256);
     }
 }
 
@@ -2830,12 +3285,19 @@ async fn run_services(ctx: Arc<AppCtx>) {
                     Ok(platform::BleOpportunity::Connected { mac, result }) => {
                         last_v2_attempt.insert(mac.clone(), now_secs());
                         match result {
-                            Ok(()) => tracing::info!(device = %mac, transport = "ble", "v2 rendezvous complete"),
-                            Err(error) => tracing::warn!(device = %mac, transport = "ble", %error, "v2 rendezvous failed"),
+                            Ok(()) => tracing::info!(event = "result", device_mac = %mac,
+                                transport = "ble", "v2 rendezvous complete"),
+                            Err(error) => tracing::warn!(event = "result", device_mac = %mac,
+                                transport = "ble", error_category = safe_v2_error_category(&error),
+                                "v2 rendezvous failed"),
                         }
                     }
                     Err(error) => {
-                        tracing::debug!(%error, "v2 BLE opportunity unavailable");
+                        tracing::debug!(
+                            event = "result",
+                            error_category = safe_v2_error_category(&error),
+                            "v2 BLE opportunity unavailable"
+                        );
                     }
                 }
             }

@@ -3,8 +3,10 @@
 //! envelope and pushes the template library (begin / chunks / end / activate).
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::net::UdpSocket;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -16,6 +18,111 @@ use futures::StreamExt;
 use serde_json::json;
 use tokio::sync::RwLock;
 use uuid::Uuid;
+
+static NEXT_SCAN_ID: AtomicU64 = AtomicU64::new(1);
+static EMPTY_SCAN_SUMMARY: OnceLock<Mutex<EmptyScanSummary>> = OnceLock::new();
+
+#[derive(Default)]
+struct EmptyScanSummary {
+    last_emitted: Option<Instant>,
+    suppressed_windows: u64,
+}
+
+#[derive(Default)]
+struct ScanCounts {
+    discovered: u64,
+    updated: u64,
+    candidate_count: u64,
+    target_candidate_count: u64,
+    ignored_non_candidate: u64,
+    ignored_non_target: u64,
+    ignored_properties: u64,
+}
+
+fn should_log_empty_window(elapsed: Option<Duration>, interval: Duration) -> bool {
+    elapsed.map_or(true, |elapsed| elapsed >= interval)
+}
+
+fn should_log_scan_start(result: &str, candidate_count: u64) -> bool {
+    result != "timeout" || candidate_count > 0
+}
+
+fn empty_scan_suppressed_windows(now: Instant, interval: Duration) -> Option<u64> {
+    let summary = EMPTY_SCAN_SUMMARY.get_or_init(Default::default);
+    let Ok(mut summary) = summary.lock() else {
+        return Some(0);
+    };
+    let elapsed = summary
+        .last_emitted
+        .map(|last| now.saturating_duration_since(last));
+    if should_log_empty_window(elapsed, interval) {
+        let suppressed = std::mem::take(&mut summary.suppressed_windows);
+        summary.last_emitted = Some(now);
+        Some(suppressed)
+    } else {
+        summary.suppressed_windows += 1;
+        None
+    }
+}
+
+fn error_category(stage: &'static str) -> &'static str {
+    match stage {
+        "adapter" => "unavailable",
+        "start_scan" => "start_failed",
+        "connect" => "connect_failed",
+        "discover_services" => "gatt_discovery_failed",
+        "read_info" => "info_read_failed",
+        "verify_mac" => "identity_mismatch",
+        "write" => "write_failed",
+        "ack" => "ack_failed",
+        _ => "failed",
+    }
+}
+
+async fn trace_stage<T>(
+    scan_id: u64,
+    stage: &'static str,
+    action: impl Future<Output = Result<T>>,
+) -> Result<(T, u128)> {
+    let started = Instant::now();
+    match action.await {
+        Ok(value) => {
+            let duration_ms = started.elapsed().as_millis();
+            tracing::info!(
+                scan_id,
+                stage,
+                result = "ok",
+                duration_ms,
+                "BLE stage completed"
+            );
+            Ok((value, duration_ms))
+        }
+        Err(error) => {
+            tracing::warn!(
+                scan_id,
+                stage,
+                category = error_category(stage),
+                duration_ms = started.elapsed().as_millis(),
+                "BLE stage failed"
+            );
+            Err(error)
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AdvertisementDecision {
+    IgnoreNonCandidate,
+    Candidate { matches_target: bool },
+}
+
+fn classify_advertisement(name: &str, matches_target: bool) -> AdvertisementDecision {
+    if name.starts_with("CodexStatus-") || matches_target {
+        AdvertisementDecision::Candidate { matches_target }
+    } else {
+        AdvertisementDecision::IgnoreNonCandidate
+    }
+}
 
 use bridge_core::template::{encode_chunks, template_hash, Library};
 
@@ -81,6 +188,30 @@ impl Pusher {
         Uuid::parse_str(s).expect("static uuid")
     }
 
+    fn log_service_lookup(peripheral: &Peripheral, scan_id: u64) {
+        let started = Instant::now();
+        let found = peripheral
+            .services()
+            .iter()
+            .any(|service| service.uuid == Self::uuid(SVC_UUID));
+        if found {
+            tracing::info!(
+                scan_id,
+                service = "codex_status",
+                duration_ms = started.elapsed().as_millis(),
+                "BLE GATT service found"
+            );
+        } else {
+            tracing::warn!(
+                scan_id,
+                stage = "service_lookup",
+                category = "service_missing",
+                duration_ms = started.elapsed().as_millis(),
+                "BLE GATT service lookup failed"
+            );
+        }
+    }
+
     /// A fresh Windows GATT central. Each rendezvous attempt gets its own
     /// adapter (and therefore its own advertisement watcher): reusing one
     /// adapter and restarting its scan re-registers the WinRT advertisement
@@ -88,14 +219,27 @@ impl Pusher {
     /// Manager itself is a zero-sized wrapper, so recreating is the cheap,
     /// leak-free option here.
     pub async fn adapter() -> Result<Adapter> {
-        let manager = Manager::new().await.context("bluetooth manager")?;
-        manager
-            .adapters()
-            .await
-            .context("bluetooth adapters")?
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("no bluetooth adapter"))
+        let result = async {
+            let manager = Manager::new().await.context("bluetooth manager")?;
+            let adapter = manager
+                .adapters()
+                .await
+                .context("bluetooth adapters")?
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow!("no bluetooth adapter"))?;
+            Ok::<_, anyhow::Error>(adapter)
+        }
+        .await;
+        match &result {
+            Ok(_) => tracing::debug!(result = "selected", "BLE adapter available"),
+            Err(_) => tracing::warn!(
+                stage = "adapter",
+                category = error_category("adapter"),
+                "BLE adapter unavailable"
+            ),
+        }
+        result
     }
 
     /// One scan pass for the device prefix, driven by advertisement events
@@ -109,7 +253,7 @@ impl Pusher {
         adapter: &Adapter,
         prefix: &str,
         timeout: Duration,
-    ) -> Result<Option<Peripheral>> {
+    ) -> Result<Option<(u64, Peripheral)>> {
         Self::find_device_matching(adapter, timeout, |name| name.starts_with(prefix)).await
     }
 
@@ -117,45 +261,225 @@ impl Pusher {
         adapter: &Adapter,
         timeout: Duration,
         matches: F,
-    ) -> Result<Option<Peripheral>>
+    ) -> Result<Option<(u64, Peripheral)>>
     where
         F: Fn(&str) -> bool,
     {
-        adapter
-            .start_scan(ScanFilter::default())
-            .await
-            .context("start scan")?;
-        let mut events = adapter.events().await.context("scan events")?;
+        let scan_id = NEXT_SCAN_ID.fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
+        tracing::debug!(
+            scan_id,
+            timeout_ms = timeout.as_millis(),
+            "BLE scan started"
+        );
+        if let Err(error) = adapter.start_scan(ScanFilter::default()).await {
+            Self::log_scan_start(scan_id, started);
+            tracing::warn!(
+                scan_id,
+                stage = "start_scan",
+                category = error_category("start_scan"),
+                "BLE scan failed"
+            );
+            tracing::info!(
+                scan_id,
+                result = "error",
+                duration_ms = started.elapsed().as_millis(),
+                "BLE scan ended"
+            );
+            return Err(error).context("start scan");
+        }
+        let mut events = match adapter.events().await {
+            Ok(events) => events,
+            Err(error) => {
+                let _ = adapter.stop_scan().await;
+                Self::log_scan_start(scan_id, started);
+                tracing::warn!(
+                    scan_id,
+                    stage = "scan_events",
+                    category = "event_stream_failed",
+                    "BLE scan failed"
+                );
+                tracing::info!(
+                    scan_id,
+                    result = "error",
+                    duration_ms = started.elapsed().as_millis(),
+                    "BLE scan ended"
+                );
+                return Err(error).context("scan events");
+            }
+        };
         let deadline = tokio::time::Instant::now() + timeout;
+        let mut counts = ScanCounts::default();
+        let mut seen_candidates = HashSet::new();
         loop {
-            match tokio::time::timeout_at(deadline, events.next()).await {
-                Ok(Some(CentralEvent::DeviceDiscovered(id)))
-                | Ok(Some(CentralEvent::DeviceUpdated(id))) => {
-                    let Ok(peripheral) = adapter.peripheral(&id).await else {
-                        continue;
-                    };
-                    let name = peripheral
-                        .properties()
-                        .await
-                        .ok()
-                        .flatten()
-                        .and_then(|p| p.local_name)
-                        .unwrap_or_default();
-                    if matches(&name) {
-                        let _ = adapter.stop_scan().await;
-                        return Ok(Some(peripheral));
-                    }
-                }
-                Ok(Some(_)) => continue,
-                Ok(None) | Err(_) => {
+            let event = match tokio::time::timeout_at(deadline, events.next()).await {
+                Ok(Some(event)) => event,
+                Ok(None) => {
                     let _ = adapter.stop_scan().await;
+                    tracing::warn!(
+                        scan_id,
+                        stage = "scan_events",
+                        category = "event_stream_closed",
+                        "BLE scan event stream closed"
+                    );
+                    Self::log_scan_end(scan_id, started, "error", &counts);
+                    return Err(anyhow!("scan event stream closed"));
+                }
+                Err(_) => {
+                    let _ = adapter.stop_scan().await;
+                    Self::log_scan_end(scan_id, started, "timeout", &counts);
                     return Ok(None);
                 }
+            };
+            let (id, discovered) = match event {
+                CentralEvent::DeviceDiscovered(id) => (id, true),
+                CentralEvent::DeviceUpdated(id) => (id, false),
+                _ => continue,
+            };
+            if discovered {
+                counts.discovered += 1;
+            } else {
+                counts.updated += 1;
+            }
+            let Ok(peripheral) = adapter.peripheral(&id).await else {
+                counts.ignored_properties += 1;
+                tracing::warn!(
+                    scan_id,
+                    stage = "peripheral_lookup",
+                    category = "lookup_failed",
+                    "BLE advertisement lookup failed"
+                );
+                continue;
+            };
+            if let Some(found) = Self::consider_advertisement(
+                scan_id,
+                started,
+                &peripheral,
+                discovered,
+                &matches,
+                &mut counts,
+                &mut seen_candidates,
+            )
+            .await
+            {
+                let _ = adapter.stop_scan().await;
+                Self::log_scan_end(scan_id, started, "matched", &counts);
+                return Ok(Some((scan_id, found)));
             }
         }
     }
 
-    async fn wait_for_device(adapter: &Adapter, prefix: &str, timeout: Duration) -> Result<Peripheral> {
+    async fn consider_advertisement<F>(
+        scan_id: u64,
+        started: Instant,
+        peripheral: &Peripheral,
+        discovered: bool,
+        matches: &F,
+        counts: &mut ScanCounts,
+        seen: &mut HashSet<String>,
+    ) -> Option<Peripheral>
+    where
+        F: Fn(&str) -> bool,
+    {
+        let address = peripheral.address().to_string();
+        let properties = match peripheral.properties().await {
+            Ok(Some(properties)) => properties,
+            _ => {
+                counts.ignored_properties += 1;
+                return None;
+            }
+        };
+        let name = properties.local_name.unwrap_or_default();
+        let is_match = matches(&name);
+        if classify_advertisement(&name, is_match) == AdvertisementDecision::IgnoreNonCandidate {
+            counts.ignored_non_candidate += 1;
+            return None;
+        }
+        if !seen.insert(address.clone()) {
+            return None;
+        }
+        counts.candidate_count += 1;
+        if is_match {
+            counts.target_candidate_count += 1;
+        } else {
+            counts.ignored_non_target += 1;
+        }
+        tracing::info!(
+            scan_id,
+            first_seen_ms = started.elapsed().as_millis(),
+            advertisement = if discovered { "discovered" } else { "updated" },
+            name = %name,
+            ble_address = %address,
+            rssi = ?properties.rssi,
+            decision = if is_match { "target_candidate" } else { "ignored_non_target" },
+            "BLE CodexStatus advertisement"
+        );
+        is_match.then(|| peripheral.clone())
+    }
+
+    fn log_scan_start(scan_id: u64, started: Instant) {
+        tracing::info!(
+            scan_id,
+            window_started_ms_ago = started.elapsed().as_millis(),
+            "BLE scan started"
+        );
+    }
+
+    fn log_scan_end(scan_id: u64, started: Instant, result: &'static str, counts: &ScanCounts) {
+        let duration_ms = started.elapsed().as_millis();
+        if should_log_scan_start(result, counts.candidate_count) {
+            Self::log_scan_start(scan_id, started);
+        }
+        if result == "timeout" && counts.candidate_count == 0 {
+            let interval = Duration::from_secs(30);
+            match empty_scan_suppressed_windows(Instant::now(), interval) {
+                Some(suppressed_windows) => tracing::info!(
+                    scan_id,
+                    result,
+                    duration_ms,
+                    discovered = counts.discovered,
+                    updated = counts.updated,
+                    candidate_count = counts.candidate_count,
+                    target_candidate_count = counts.target_candidate_count,
+                    ignored_non_candidate = counts.ignored_non_candidate,
+                    ignored_properties = counts.ignored_properties,
+                    suppressed_windows,
+                    "BLE scan summary"
+                ),
+                None if tracing::enabled!(tracing::Level::DEBUG) => tracing::debug!(
+                    scan_id,
+                    result,
+                    duration_ms,
+                    discovered = counts.discovered,
+                    updated = counts.updated,
+                    candidate_count = counts.candidate_count,
+                    ignored_non_candidate = counts.ignored_non_candidate,
+                    "BLE empty scan sampled"
+                ),
+                None => {}
+            }
+        } else {
+            tracing::info!(
+                scan_id,
+                result,
+                duration_ms,
+                discovered = counts.discovered,
+                updated = counts.updated,
+                candidate_count = counts.candidate_count,
+                target_candidate_count = counts.target_candidate_count,
+                ignored_non_candidate = counts.ignored_non_candidate,
+                ignored_non_target = counts.ignored_non_target,
+                ignored_properties = counts.ignored_properties,
+                "BLE scan ended"
+            );
+        }
+    }
+
+    async fn wait_for_device(
+        adapter: &Adapter,
+        prefix: &str,
+        timeout: Duration,
+    ) -> Result<(u64, Peripheral)> {
         Self::find_device(adapter, prefix, timeout)
             .await?
             .with_context(|| format!("device {prefix}* not found"))
@@ -166,22 +490,63 @@ impl Pusher {
     }
 
     fn info_matches_mac(info: &serde_json::Value, expected_mac: &str) -> bool {
-        let Some(expected) = bridge_core::platform::model::DeviceIdentity::normalized_mac(expected_mac)
+        let Some(expected) =
+            bridge_core::platform::model::DeviceIdentity::normalized_mac(expected_mac)
         else {
             return false;
         };
         bridge_core::platform::model::DeviceIdentity::normalized_mac(
-            info.get("mac").and_then(serde_json::Value::as_str).unwrap_or(""),
+            info.get("mac")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(""),
         ) == Some(expected)
     }
 
-    async fn read_info(peripheral: &Peripheral) -> Result<serde_json::Value> {
+    async fn read_info(peripheral: &Peripheral, scan_id: u64) -> Result<serde_json::Value> {
+        let lookup_start = Instant::now();
         let target = peripheral
             .characteristics()
             .into_iter()
             .find(|c| c.uuid == Self::uuid(CHR_INFO))
-            .ok_or_else(|| anyhow!("info characteristic missing"))?;
-        let raw = peripheral.read(&target).await.context("read device info")?;
+            .ok_or_else(|| anyhow!("info characteristic missing"));
+        let target = match target {
+            Ok(target) => target,
+            Err(error) => {
+                tracing::warn!(
+                    scan_id,
+                    stage = "info_characteristic",
+                    category = "characteristic_missing",
+                    duration_ms = lookup_start.elapsed().as_millis(),
+                    "BLE GATT characteristic lookup failed"
+                );
+                return Err(error);
+            }
+        };
+        tracing::info!(
+            scan_id,
+            characteristic = "info",
+            duration_ms = lookup_start.elapsed().as_millis(),
+            "BLE GATT characteristic found"
+        );
+        let read_start = Instant::now();
+        let raw = match peripheral.read(&target).await {
+            Ok(raw) => raw,
+            Err(error) => {
+                tracing::warn!(
+                    scan_id,
+                    stage = "read_info",
+                    category = error_category("read_info"),
+                    duration_ms = read_start.elapsed().as_millis(),
+                    "BLE info characteristic read failed"
+                );
+                return Err(error).context("read device info");
+            }
+        };
+        tracing::info!(
+            scan_id,
+            duration_ms = read_start.elapsed().as_millis(),
+            "BLE info characteristic read"
+        );
         let info: serde_json::Value = serde_json::from_slice(&raw).context("parse device info")?;
         if !Self::peer_bonded(&info) {
             bail!("device is not bonded; pair manually in Windows Bluetooth settings: hold BOOT for 2 seconds to open the 120 second pairing window, connect CodexStatus, then retry")
@@ -204,11 +569,7 @@ impl Pusher {
         Ok(resp.json().await?)
     }
 
-    async fn write_char(
-        peripheral: &Peripheral,
-        uuid: &str,
-        data: &[u8],
-    ) -> Result<()> {
+    async fn write_char(peripheral: &Peripheral, uuid: &str, data: &[u8]) -> Result<()> {
         let target = peripheral
             .characteristics()
             .into_iter()
@@ -246,10 +607,7 @@ impl Pusher {
         let handle = tokio::spawn(async move {
             while let Some(ValueNotification { uuid, value, .. }) = stream.next().await {
                 if uuid == Uuid::parse_str(CHR_STATUS).unwrap() {
-                    tracing::info!(
-                        "[status] {}",
-                        String::from_utf8_lossy(&value)
-                    );
+                    tracing::debug!(bytes = value.len(), "BLE status notification received");
                 }
             }
         });
@@ -280,7 +638,14 @@ impl Pusher {
         }
     }
 
-    async fn push_template(&self, peripheral: &Peripheral, id: &str, bytes: &[u8], version: u64, activate: bool) -> Result<()> {
+    async fn push_template(
+        &self,
+        peripheral: &Peripheral,
+        id: &str,
+        bytes: &[u8],
+        version: u64,
+        activate: bool,
+    ) -> Result<()> {
         let crc = crc32fast::hash(bytes);
         let hash = template_hash(bytes);
         let begin = json!({
@@ -304,12 +669,19 @@ impl Pusher {
             Self::write_json(peripheral, CHR_TPL_CTRL, activate.to_string().as_bytes()).await?;
             tracing::info!("template {id} pushed and activated ({} bytes)", bytes.len());
         } else {
-            tracing::info!("template {id} pushed, not activated ({} bytes)", bytes.len());
+            tracing::info!(
+                "template {id} pushed, not activated ({} bytes)",
+                bytes.len()
+            );
         }
         Ok(())
     }
 
-    async fn push_templates(&self, peripheral: &Peripheral, info: &serde_json::Value) -> Result<()> {
+    async fn push_templates(
+        &self,
+        peripheral: &Peripheral,
+        info: &serde_json::Value,
+    ) -> Result<()> {
         if matches!(&self.cfg.template_ids, Some(list) if list.is_empty()) {
             tracing::info!("no template push requested; templates left untouched");
             return Ok(());
@@ -344,7 +716,10 @@ impl Pusher {
                 tracing::info!("template {id} up to date ({hash}); skip");
                 continue;
             }
-            if let Err(e) = self.push_template(peripheral, &id, &bytes, version, false).await {
+            if let Err(e) = self
+                .push_template(peripheral, &id, &bytes, version, false)
+                .await
+            {
                 tracing::warn!("push template {id}: {e}");
                 continue;
             }
@@ -371,14 +746,23 @@ impl Pusher {
         scan_timeout_ms: u64,
     ) -> Result<serde_json::Value> {
         let scan = Duration::from_millis(scan_timeout_ms.max(1000));
-        let peripheral = Self::wait_for_device(adapter, name_prefix, scan).await?;
-        tracing::info!("connecting {} for device info", peripheral.address());
-        peripheral.connect().await.context("connect")?;
-        peripheral.discover_services().await.context("discover")?;
-        let info = Self::read_info(&peripheral).await;
-        if let Ok(info) = &info {
-            tracing::info!("device info: {info}");
+        let (scan_id, peripheral) = Self::wait_for_device(adapter, name_prefix, scan).await?;
+        trace_stage(scan_id, "connect", async {
+            peripheral.connect().await.context("connect")
+        })
+        .await?;
+        if let Err(error) = trace_stage(scan_id, "discover_services", async {
+            peripheral.discover_services().await.context("discover")
+        })
+        .await
+        {
+            let _ = peripheral.disconnect().await;
+            return Err(error);
         }
+        Self::log_service_lookup(&peripheral, scan_id);
+        let info = trace_stage(scan_id, "read_info", Self::read_info(&peripheral, scan_id))
+            .await
+            .map(|(info, _)| info);
         let _ = peripheral.disconnect().await;
         info
     }
@@ -396,21 +780,43 @@ impl Pusher {
             bail!("invalid target device MAC");
         }
         let scan = Duration::from_millis(scan_timeout_ms.max(1000));
-        let peripheral = Self::wait_for_device(adapter, name_prefix, scan).await?;
-        tracing::info!("connecting {} for device token", peripheral.address());
-        peripheral.connect().await.context("connect")?;
-        peripheral.discover_services().await.context("discover")?;
-        let info = match Self::read_info(&peripheral).await {
-            Ok(info) => info,
-            Err(e) => {
-                let _ = peripheral.disconnect().await;
-                return Err(e);
-            }
-        };
+        let (scan_id, peripheral) = Self::wait_for_device(adapter, name_prefix, scan).await?;
+        trace_stage(scan_id, "connect", async {
+            peripheral.connect().await.context("connect")
+        })
+        .await?;
+        if let Err(error) = trace_stage(scan_id, "discover_services", async {
+            peripheral.discover_services().await.context("discover")
+        })
+        .await
+        {
+            let _ = peripheral.disconnect().await;
+            return Err(error);
+        }
+        Self::log_service_lookup(&peripheral, scan_id);
+        let info =
+            match trace_stage(scan_id, "read_info", Self::read_info(&peripheral, scan_id)).await {
+                Ok((info, _)) => info,
+                Err(e) => {
+                    let _ = peripheral.disconnect().await;
+                    return Err(e);
+                }
+            };
         if !Self::info_matches_mac(&info, expected_mac) {
+            tracing::warn!(
+                scan_id,
+                stage = "verify_mac",
+                category = error_category("verify_mac"),
+                "BLE device identity mismatch"
+            );
             let _ = peripheral.disconnect().await;
             bail!("BLE device Wi-Fi MAC does not match target");
         }
+        tracing::info!(
+            scan_id,
+            verified_mac = expected_mac,
+            "BLE device identity verified"
+        );
         let status = peripheral
             .characteristics()
             .into_iter()
@@ -453,31 +859,42 @@ impl Pusher {
     /// the caller can adopt its identity (mac/ip) when needed.
     pub async fn cycle_once(&self, adapter: &Adapter) -> Result<serde_json::Value> {
         let scan = Duration::from_millis(self.cfg.scan_timeout_ms.max(1000));
-        let peripheral = Self::wait_for_device(adapter, &self.cfg.name_prefix, scan).await?;
-        let props = peripheral.properties().await?;
-        let name = props
-            .and_then(|p| p.local_name)
-            .unwrap_or_else(|| self.cfg.name_prefix.clone());
-        tracing::info!("connecting {name} ({})", peripheral.address());
-        peripheral.connect().await.context("connect")?;
-        peripheral.discover_services().await.context("discover")?;
-        let info = match Self::read_info(&peripheral).await {
-            Ok(info) => info,
-            Err(e) => {
-                let _ = peripheral.disconnect().await;
-                return Err(e);
-            }
-        };
-        tracing::info!("device info: {}", info);
+        let (scan_id, peripheral) =
+            Self::wait_for_device(adapter, &self.cfg.name_prefix, scan).await?;
+        trace_stage(scan_id, "connect", async {
+            peripheral.connect().await.context("connect")
+        })
+        .await?;
+        if let Err(error) = trace_stage(scan_id, "discover_services", async {
+            peripheral.discover_services().await.context("discover")
+        })
+        .await
+        {
+            let _ = peripheral.disconnect().await;
+            return Err(error);
+        }
+        Self::log_service_lookup(&peripheral, scan_id);
+        let info =
+            match trace_stage(scan_id, "read_info", Self::read_info(&peripheral, scan_id)).await {
+                Ok((info, _)) => info,
+                Err(e) => {
+                    let _ = peripheral.disconnect().await;
+                    return Err(e);
+                }
+            };
 
         let notify_handle = Self::log_notifications(&peripheral).await.ok();
 
         let result = async {
             self.push_endpoint(&peripheral).await?;
             tokio::time::sleep(Duration::from_millis(500)).await;
-            if info["v2_bundle"] != true { self.push_usage(&peripheral).await?; }
+            if info["v2_bundle"] != true {
+                self.push_usage(&peripheral).await?;
+            }
             tokio::time::sleep(Duration::from_millis(500)).await;
-            if info["v2_bundle"] != true { self.push_templates(&peripheral, &info).await?; }
+            if info["v2_bundle"] != true {
+                self.push_templates(&peripheral, &info).await?;
+            }
             Ok::<_, anyhow::Error>(())
         }
         .await;
@@ -552,27 +969,32 @@ impl V2Connection {
             advertisement_matches_any_target(name, &targets)
         })
         .await;
-        let Some(peripheral) = found? else {
+        let Some((scan_id, peripheral)) = found? else {
             return Ok(None);
         };
         let mut timings: Vec<(String, u128)> =
             vec![("find".to_string(), find_start.elapsed().as_millis())];
-        tracing::debug!("v2 BLE device found at {}", peripheral.address());
         let connect_start = Instant::now();
-        let mut connected = tokio::time::timeout(Duration::from_secs(4), peripheral.connect())
-            .await
-            .map_err(anyhow::Error::from)
-            .and_then(|r| r.map_err(anyhow::Error::from));
+        let mut connected = trace_stage(scan_id, "connect", async {
+            tokio::time::timeout(Duration::from_secs(4), peripheral.connect())
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|r| r.map_err(anyhow::Error::from))
+        })
+        .await;
         if connected.is_err() {
             // Windows refuses the first connect to a just-seen advertisement
             // often enough to lose the whole rendezvous; retry inside the
             // window instead of waiting for the next scan tick.
-            tracing::debug!("v2 BLE connect retry");
+            tracing::debug!(scan_id, stage = "connect", "BLE connect retry");
             tokio::time::sleep(Duration::from_millis(120)).await;
-            connected = tokio::time::timeout(Duration::from_secs(4), peripheral.connect())
-                .await
-                .map_err(anyhow::Error::from)
-                .and_then(|r| r.map_err(anyhow::Error::from));
+            connected = trace_stage(scan_id, "connect", async {
+                tokio::time::timeout(Duration::from_secs(4), peripheral.connect())
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|r| r.map_err(anyhow::Error::from))
+            })
+            .await;
         }
         if let Err(error) = connected {
             let _ = peripheral.disconnect().await;
@@ -581,23 +1003,31 @@ impl V2Connection {
         timings.push(("connect".to_string(), connect_start.elapsed().as_millis()));
         let setup = async {
             let mut stages: Vec<(String, u128)> = Vec::new();
-            let discover_start = Instant::now();
             // Re-discovery is not optional here: `close` must call
             // `disconnect` (see below), which clears btleplug's GATT object
             // cache, and skipping both on a kept-open link made every second
             // rendezvous lose its connect. Measured on the Windows backend:
             // discover ~300 ms, INFO ~30 ms.
-            tokio::time::timeout(Duration::from_secs(3), peripheral.discover_services())
+            let (_, discover_ms) = trace_stage(scan_id, "discover_services", async {
+                tokio::time::timeout(Duration::from_secs(3), peripheral.discover_services())
+                    .await
+                    .context("discover timeout")
+                    .and_then(|result| result.context("discover"))
+            })
+            .await?;
+            stages.push(("discover".to_string(), discover_ms));
+            Pusher::log_service_lookup(&peripheral, scan_id);
+            let (info, info_ms) = trace_stage(scan_id, "read_info", async {
+                tokio::time::timeout(
+                    Duration::from_secs(3),
+                    Pusher::read_info(&peripheral, scan_id),
+                )
                 .await
-                .context("discover timeout")?
-                .context("discover")?;
-            stages.push(("discover".to_string(), discover_start.elapsed().as_millis()));
-            let info_start = Instant::now();
-            let info = tokio::time::timeout(Duration::from_secs(3), Pusher::read_info(&peripheral))
-                .await
-                .map_err(|_| anyhow!("info timeout"))?
-                .map_err(|e| e.context("info"))?;
-            stages.push(("info".to_string(), info_start.elapsed().as_millis()));
+                .map_err(|_| anyhow!("info timeout"))
+                .and_then(|result| result.map_err(|e| e.context("info")))
+            })
+            .await?;
+            stages.push(("info".to_string(), info_ms));
             Ok::<_, anyhow::Error>((info, stages))
         }
         .await;
@@ -611,8 +1041,15 @@ impl V2Connection {
         timings.extend(stages);
         let Some(authorized_mac) = info_authorized_target(&info, &targets) else {
             let _ = peripheral.disconnect().await;
+            tracing::warn!(
+                scan_id,
+                stage = "verify_mac",
+                category = error_category("verify_mac"),
+                "BLE device identity mismatch"
+            );
             bail!("BLE device identity mismatch");
         };
+        tracing::info!(scan_id, verified_mac = %authorized_mac, "BLE device identity verified");
         if info["rendezvous_v"].as_u64().unwrap_or(0) < 2 {
             let _ = peripheral.disconnect().await;
             bail!("device BLE rendezvous is disabled");
@@ -637,8 +1074,17 @@ impl V2Connection {
         )))
     }
 
-    pub async fn command(&mut self, op: &str, mut body: serde_json::Value) -> Result<serde_json::Value> {
-        let id = format!("r{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos());
+    pub async fn command(
+        &mut self,
+        op: &str,
+        mut body: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let id = format!(
+            "r{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        );
         body["rv"] = json!(2);
         body["protocol"] = json!(2);
         body["op"] = json!(op);
@@ -649,14 +1095,44 @@ impl V2Connection {
         body["token"] = json!(self.token);
         stamp_clock(&mut body);
         let bytes = serde_json::to_vec(&body)?;
-        if bytes.len() > 8192 { bail!("v2 BLE command exceeds 8192 bytes"); }
-        let status = self.peripheral.characteristics().into_iter()
-            .find(|c| c.uuid == Pusher::uuid(CHR_STATUS)).context("status characteristic")?;
-        Pusher::write_json(&self.peripheral, CHR_TPL_CTRL, &bytes).await?;
+        if bytes.len() > 8192 {
+            bail!("v2 BLE command exceeds 8192 bytes");
+        }
+        let lookup_start = Instant::now();
+        let status = self
+            .peripheral
+            .characteristics()
+            .into_iter()
+            .find(|c| c.uuid == Pusher::uuid(CHR_STATUS))
+            .context("status characteristic");
+        let status = match status {
+            Ok(status) => status,
+            Err(error) => {
+                tracing::warn!(device_mac = %self.device_mac, op, stage = "status_characteristic", category = "characteristic_missing", duration_ms = lookup_start.elapsed().as_millis(), "BLE ACK characteristic lookup failed");
+                return Err(error);
+            }
+        };
+        tracing::info!(device_mac = %self.device_mac, op, characteristic = "status", duration_ms = lookup_start.elapsed().as_millis(), "BLE ACK characteristic found");
+        let write_start = Instant::now();
+        if let Err(error) = Pusher::write_json(&self.peripheral, CHR_TPL_CTRL, &bytes).await {
+            tracing::warn!(device_mac = %self.device_mac, op, request_id = %id, stage = "write", category = error_category("write"), duration_ms = write_start.elapsed().as_millis(), "BLE command write failed");
+            return Err(error);
+        }
+        tracing::info!(device_mac = %self.device_mac, op, request_id = %id, duration_ms = write_start.elapsed().as_millis(), "BLE command written");
         let started = Instant::now();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            let raw = tokio::time::timeout_at(deadline, self.peripheral.read(&status)).await??;
+            let raw = match tokio::time::timeout_at(deadline, self.peripheral.read(&status)).await {
+                Ok(Ok(raw)) => raw,
+                Ok(Err(_)) => {
+                    tracing::warn!(device_mac = %self.device_mac, op, request_id = %id, stage = "ack", category = "read_failed", duration_ms = started.elapsed().as_millis(), "BLE command ACK read failed");
+                    return Err(anyhow!("v2 BLE ACK read failed"));
+                }
+                Err(_) => {
+                    tracing::warn!(device_mac = %self.device_mac, op, request_id = %id, stage = "ack", category = error_category("ack"), duration_ms = started.elapsed().as_millis(), "BLE command ACK failed");
+                    return Err(anyhow!("v2 BLE ACK timed out"));
+                }
+            };
             if let Ok(reply) = serde_json::from_slice::<serde_json::Value>(&raw) {
                 if reply["ack"] == "v2" && reply["request_id"] == id {
                     if op == "status" && reply["result"] == "applied" {
@@ -667,11 +1143,12 @@ impl V2Connection {
                     }
                     let ms = started.elapsed().as_millis();
                     self.timings.push((op.to_string(), ms));
-                    tracing::debug!(op, ms, "v2 command acknowledged");
+                    tracing::info!(device_mac = %self.device_mac, op, request_id = %id, result = reply["result"].as_str().unwrap_or("acknowledged"), duration_ms = ms, "BLE command acknowledged");
                     return Ok(reply);
                 }
             }
             if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(device_mac = %self.device_mac, op, request_id = %id, stage = "ack", category = error_category("ack"), duration_ms = started.elapsed().as_millis(), "BLE command ACK failed");
                 bail!("v2 BLE ACK timed out");
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -710,17 +1187,101 @@ fn advertisement_matches_any_target(name: &str, target_macs: &[String]) -> bool 
 
 fn info_authorized_target(info: &serde_json::Value, target_macs: &[String]) -> Option<String> {
     let mac = bridge_core::platform::model::DeviceIdentity::normalized_mac(
-        info.get("mac").and_then(serde_json::Value::as_str).unwrap_or(""),
+        info.get("mac")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(""),
     )?;
-    target_macs.iter().any(|target| target == &mac).then_some(mac)
+    target_macs
+        .iter()
+        .any(|target| target == &mac)
+        .then_some(mac)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        advertisement_matches_any_target, info_authorized_target, normalize_target_macs, Pusher,
+        advertisement_matches_any_target, classify_advertisement, empty_scan_suppressed_windows,
+        info_authorized_target, normalize_target_macs, should_log_empty_window,
+        should_log_scan_start, AdvertisementDecision, Pusher,
     };
     use serde_json::json;
+    use std::collections::HashSet;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn scan_sampling_logs_at_the_thirty_second_boundary() {
+        let interval = Duration::from_secs(30);
+        assert!(should_log_empty_window(None, interval));
+        assert!(!should_log_empty_window(
+            Some(interval - Duration::from_millis(1)),
+            interval
+        ));
+        assert!(should_log_empty_window(Some(interval), interval));
+        assert!(should_log_empty_window(
+            Some(interval + Duration::from_millis(1)),
+            interval
+        ));
+    }
+
+    #[test]
+    fn scan_start_info_is_deferred_only_for_candidate_or_error_windows() {
+        assert!(should_log_scan_start("matched", 1));
+        assert!(should_log_scan_start("error", 0));
+        assert!(should_log_scan_start("timeout", 1));
+        assert!(!should_log_scan_start("timeout", 0));
+    }
+
+    #[test]
+    fn advertisement_classification_keeps_unrelated_names_private_and_deduplicates_updates() {
+        assert_eq!(
+            classify_advertisement("Headphones", false),
+            AdvertisementDecision::IgnoreNonCandidate
+        );
+        assert_eq!(
+            classify_advertisement("CodexStatus-AABBEE", false),
+            AdvertisementDecision::Candidate {
+                matches_target: false
+            }
+        );
+        assert_eq!(
+            classify_advertisement("CodexStatus-AABBCC", true),
+            AdvertisementDecision::Candidate {
+                matches_target: true
+            }
+        );
+
+        let mut seen = HashSet::new();
+        let mut counts = super::ScanCounts::default();
+        for address in ["70:04:1D:AA:BB:CC", "70:04:1D:AA:BB:CC"] {
+            if seen.insert(address.to_owned()) {
+                counts.candidate_count += 1;
+                counts.target_candidate_count += 1;
+            }
+        }
+        assert_eq!(counts.candidate_count, 1);
+        assert_eq!(counts.target_candidate_count, 1);
+    }
+
+    #[test]
+    fn empty_scan_sampling_reports_suppressed_window_count() {
+        let first = Instant::now();
+        assert_eq!(
+            empty_scan_suppressed_windows(first, Duration::from_secs(30)),
+            Some(0)
+        );
+        assert_eq!(
+            empty_scan_suppressed_windows(first + Duration::from_secs(1), Duration::from_secs(30)),
+            None
+        );
+        assert_eq!(
+            empty_scan_suppressed_windows(first + Duration::from_secs(29), Duration::from_secs(30)),
+            None
+        );
+        assert_eq!(
+            empty_scan_suppressed_windows(first + Duration::from_secs(30), Duration::from_secs(30)),
+            Some(2)
+        );
+    }
 
     #[test]
     fn json_fragments_reassemble_at_boundary_and_preserve_utf8_bytes() {
@@ -728,14 +1289,18 @@ mod tests {
         input.extend_from_slice("界尾".as_bytes());
         let parts = Pusher::fragment_payload(&input, super::JSON_WRITE_LIMIT);
         assert_eq!(parts.iter().map(Vec::len).max(), Some(180));
-        assert!(parts.iter().all(|part| part.len() <= super::JSON_WRITE_LIMIT));
+        assert!(parts
+            .iter()
+            .all(|part| part.len() <= super::JSON_WRITE_LIMIT));
         assert_eq!(parts.concat(), input);
     }
 
     #[test]
     fn info_gate_requires_persistent_bond() {
         assert!(Pusher::peer_bonded(&json!({"peerBonded": true})));
-        assert!(!Pusher::peer_bonded(&json!({"peerBonded": false, "peerEncrypted": true})));
+        assert!(!Pusher::peer_bonded(
+            &json!({"peerBonded": false, "peerEncrypted": true})
+        ));
         assert!(!Pusher::peer_bonded(&json!({"peerEncrypted": true})));
     }
 
@@ -772,20 +1337,26 @@ mod tests {
             "70:04:1D:AA:BB:DD".to_owned(),
         ])
         .unwrap();
-        assert!(advertisement_matches_any_target("CodexStatus-AABBCC", &targets));
-        assert!(advertisement_matches_any_target("CodexStatus-AABBDD", &targets));
-        assert!(!advertisement_matches_any_target("CodexStatus-AABBEE", &targets));
+        assert!(advertisement_matches_any_target(
+            "CodexStatus-AABBCC",
+            &targets
+        ));
+        assert!(advertisement_matches_any_target(
+            "CodexStatus-AABBDD",
+            &targets
+        ));
+        assert!(!advertisement_matches_any_target(
+            "CodexStatus-AABBEE",
+            &targets
+        ));
     }
 
     #[test]
     fn target_macs_reject_invalid_values_and_deduplicate_normalized_values() {
         assert!(normalize_target_macs(&["not-a-mac".to_owned()]).is_err());
         assert_eq!(
-            normalize_target_macs(&[
-                "70:04:1D:AA:BB:CC".to_owned(),
-                "70041daabbcc".to_owned(),
-            ])
-            .unwrap(),
+            normalize_target_macs(&["70:04:1D:AA:BB:CC".to_owned(), "70041daabbcc".to_owned(),])
+                .unwrap(),
             vec!["70041DAABBCC"]
         );
     }
@@ -797,7 +1368,10 @@ mod tests {
             "40:50:60:AA:BB:CC".to_owned(),
         ])
         .unwrap();
-        assert!(advertisement_matches_any_target("CodexStatus-AABBCC", &targets));
+        assert!(advertisement_matches_any_target(
+            "CodexStatus-AABBCC",
+            &targets
+        ));
         assert_eq!(
             info_authorized_target(&json!({"mac": "40:50:60:AA:BB:CC"}), &targets),
             Some("405060AABBCC".to_owned())
