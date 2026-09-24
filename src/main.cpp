@@ -53,6 +53,7 @@
 #include "v2_runtime.h"
 #include "v2_data_command.h"
 #include "v2_plan_command.h"
+#include "v2_bundle_command.h"
 #include "bundle_store.h"
 
 // v2 platform targets (src/platform_target.h): the render/firmware target
@@ -3876,27 +3877,33 @@ static void handleV2BundleBegin() {
         server.send(401, "application/json", "{\"result\":\"unauthorized\"}"); return;
     }
     JsonDocument doc;
-    if (!v2Command(server.arg("plain"), doc) || v2BundleReplay(doc)) return;
-    const char *owner = doc["bridge_id"] | "";
-    const char *request = doc["request_id"] | "";
-    uint32_t len = doc["length"] | 0u, crc = 0;
-    if (!v2ParseCrc(doc["content_crc"] | "", crc)) { v2BundleError("crc"); return; }
-    if (v2Rx.live(v2NowMs())) {
-        if (!v2Rx.matches(owner, request, v2Nonce().c_str())) { v2BundleError("busy"); return; }
-        if (v2Rx.length != len || v2Rx.crc != crc) { v2BundleError("request_conflict"); return; }
-    } else {
-        V2BundleRx next;
-        if (!next.begin(owner, request, v2Nonce().c_str(), len, crc, v2NowMs())) {
-            v2BundleError("size"); return;
-        }
+    if (!v2Command(server.arg("plain"), doc)) return;
+    const String nonce = v2Nonce();
+    const uint64_t nowMs = v2NowMs();
+    const V2BundleFingerprint committed{
+        v2CommittedOwner.c_str(), v2CommittedRequest.c_str(), v2CommittedCrc,
+        v2CommittedLength, v2CommittedContext.c_str()
+    };
+    V2BundleBeginDecision decision = v2DecideBundleBegin(
+        doc, v2Rx, committed, nonce.c_str(), nowMs);
+    if (decision.action == V2_BUNDLE_BEGIN_REPLAY) {
+        v2Ack("bundle", "applied", "unchanged", "flash", nullptr, -1, 0,
+              decision.replayContext, UINT32_MAX);
+        return;
+    }
+    if (decision.action == V2_BUNDLE_BEGIN_REJECT) {
+        v2BundleError(decision.error);
+        return;
+    }
+    if (decision.action == V2_BUNDLE_BEGIN_START) {
         if (!LittleFS.exists("/bundle")) LittleFS.mkdir("/bundle");
         File f = LittleFS.open(v2RxPath, "w");
         if (!f) { v2BundleError("open"); return; }
         f.close();
-        v2Rx = next;
+        v2Rx = decision.candidate;
     }
     server.send(200, "application/json", String("{\"result\":\"applied\",\"next_offset\":") +
-                String(v2Rx.offset) + "}");
+                String(decision.nextOffset) + "}");
 }
 
 // WebServer's ordinary POST parser duplicates the complete body several times

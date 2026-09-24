@@ -45,6 +45,7 @@ fn main() {
         .file(firmware.join("v2_runtime.cpp"))
         .file(firmware.join("v2_data_command.cpp"))
         .file(firmware.join("v2_plan_command.cpp"))
+        .file(firmware.join("v2_bundle_command.cpp"))
         .file(firmware.join("bundle_store.cpp"))
         .file(firmware.join("refresh_policy.cpp"))
         .file(firmware.join("font_asset.cpp"))
@@ -64,6 +65,7 @@ fn main() {
                     "v2_state.h", "v2_runtime.h", "v2_runtime.cpp",
                     "v2_data_command.h", "v2_data_command.cpp",
                     "v2_plan_command.h", "v2_plan_command.cpp",
+                    "v2_bundle_command.h", "v2_bundle_command.cpp",
                     "bundle_store.h", "bundle_store.cpp", "fonts.h",
                     "font_noto.h", "font_noto_nt16.h", "font_noto_nt30.h",
                     "font_noto_ntthin18.h", "font_noto_ntreg64.h",

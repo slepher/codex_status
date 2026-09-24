@@ -5,6 +5,7 @@
 #include "v2_runtime.h"
 #include "v2_data_command.h"
 #include "v2_plan_command.h"
+#include "v2_bundle_command.h"
 #include "bundle_store.h"
 #include "font_asset.h"
 #include "font_store.h"
@@ -35,6 +36,24 @@ CtTemplate g_ct;
 bool g_ct_valid = false;
 int g_canvas_w = 200;
 int g_canvas_h = 200;
+
+struct BundleBeginHarness {
+    V2BundleRx current;
+    V2BundleRx candidate;
+    bool hasCandidate = false;
+    String committedOwner, committedRequest, committedContext;
+    uint32_t committedCrc = 0, committedLength = 0;
+};
+
+void writeBundleRx(JsonObject out, const V2BundleRx &rx) {
+    out["owner"] = rx.owner;
+    out["request"] = rx.request;
+    out["nonce"] = rx.nonce;
+    out["length"] = rx.length;
+    out["crc"] = rx.crc;
+    out["offset"] = rx.offset;
+    out["deadline"] = rx.deadline;
+}
 }
 
 extern "C" {
@@ -330,6 +349,67 @@ int codex_v2_plan_decide(void *p, const char *message, uint64_t now_ms,
     result["light_active"] = state.lightActive(now_ms);
     result["from_boot"] = state.fromBoot();
     return (int)serializeJson(result, out, (size_t)cap);
+}
+void *codex_v2_bundle_begin_new(void) { return new BundleBeginHarness(); }
+void codex_v2_bundle_begin_free(void *p) { delete (BundleBeginHarness *)p; }
+void codex_v2_bundle_begin_committed(void *p, const char *owner,
+                                     const char *request, uint32_t crc,
+                                     uint32_t length, const char *context) {
+    if (!p) return;
+    BundleBeginHarness &h = *(BundleBeginHarness *)p;
+    h.committedOwner = owner ? owner : "";
+    h.committedRequest = request ? request : "";
+    h.committedCrc = crc;
+    h.committedLength = length;
+    h.committedContext = context ? context : "";
+}
+int codex_v2_bundle_begin_seed_rx(void *p, const char *owner,
+                                  const char *request, const char *nonce,
+                                  uint32_t length, uint32_t crc,
+                                  uint32_t offset, uint64_t deadline) {
+    if (!p || offset > length) return 0;
+    V2BundleRx rx;
+    if (!rx.begin(owner, request, nonce, length, crc, 0)) return 0;
+    rx.offset = offset;
+    rx.deadline = deadline;
+    ((BundleBeginHarness *)p)->current = rx;
+    return 1;
+}
+int codex_v2_bundle_begin_decide(void *p, const char *message,
+                                 const char *nonce, uint64_t now_ms,
+                                 char *out, int cap) {
+    if (!p || !message || !nonce || !out || cap <= 0) return -99;
+    BundleBeginHarness &h = *(BundleBeginHarness *)p;
+    JsonDocument doc;
+    if (deserializeJson(doc, message)) return -2;
+    const V2BundleFingerprint committed{
+        h.committedOwner.c_str(), h.committedRequest.c_str(), h.committedCrc,
+        h.committedLength, h.committedContext.c_str()
+    };
+    V2BundleBeginDecision decision = v2DecideBundleBegin(
+        doc, h.current, committed, nonce, now_ms);
+    h.hasCandidate = decision.action == V2_BUNDLE_BEGIN_START;
+    if (h.hasCandidate) h.candidate = decision.candidate;
+
+    JsonDocument result;
+    const char *action = decision.action == V2_BUNDLE_BEGIN_REPLAY ? "replay"
+                       : decision.action == V2_BUNDLE_BEGIN_RESUME ? "resume"
+                       : decision.action == V2_BUNDLE_BEGIN_START ? "start" : "reject";
+    result["action"] = action;
+    if (decision.error) result["error"] = decision.error;
+    if (decision.replayContext) result["replay_context"] = decision.replayContext;
+    result["next_offset"] = decision.nextOffset;
+    writeBundleRx(result["current"].to<JsonObject>(), h.current);
+    if (h.hasCandidate) writeBundleRx(result["candidate"].to<JsonObject>(), h.candidate);
+    return (int)serializeJson(result, out, (size_t)cap);
+}
+int codex_v2_bundle_begin_commit_candidate(void *p) {
+    if (!p) return 0;
+    BundleBeginHarness &h = *(BundleBeginHarness *)p;
+    if (!h.hasCandidate) return 0;
+    h.current = h.candidate;
+    h.hasCandidate = false;
+    return 1;
 }
 uint64_t codex_v2_plan_high(void *p) { return ((V2PlanState *)p)->highId(); }
 int codex_v2_plan_light_active(void *p, uint64_t now_ms) {

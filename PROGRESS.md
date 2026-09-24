@@ -1,5 +1,9 @@
 # Codex Status 项目进度（交接文档）
 
+## Fake ROM Stage C Bundle BEGIN 切片：2026-09-24 — 宿主验证通过
+
+Data `02dd043`、Plan `e997a72` 已提交；接着在独立 `codex/fake` worktree 将 Bundle BEGIN 的重放、会话匹配、CRC/长度与恢复偏移决策抽为固件和宿主共用的 `src/v2_bundle_command.{h,cpp}`。设备端仍先鉴权，且仅在接收文件创建成功后写入新接收状态；重复 BEGIN 不续期。宿主 render 测试 13/13 与 `git diff --check` 通过。未碰主 Bridge、生产数据或实机，未构建/烧录 ROM。Bundle CHUNK/COMMIT、Activate/claim、宿主端点与完整 Fake ROM 尚待实现，见 `project-workflow/fake-rom-simulator/status.md`。
+
 ## Fake ROM Stage C Plan 决策切片：2026-09-24 — 宿主验证通过
 
 Data 切片已提交 `02dd043`，随后在同一独立 `codex/fake` worktree 串行完成 PowerPlan 的共享 C++ 命令决策：形状校验、计划授予限制、ACK 分类由固件和宿主 render FFI 调用同一 `src/v2_plan_command.{h,cpp}`。原有认证、deadline、模式持久化和日志副作用留在设备端。宿主测试证明同 ID 重放不续期，冲突/旧 ID/非法形状不改变计划；provisional 300s、常规 600s、最低 30s 与 sleep 均通过。`cargo test -p bridge-render --test v2_state` 12/12、`git diff --check` 通过。未碰主 Bridge、生产数据或实机，未构建/烧录 ROM。后续仍需 Bundle/Activate/claim、宿主端点和完整 Fake ROM；详见 `project-workflow/fake-rom-simulator/status.md`。

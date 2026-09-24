@@ -1,5 +1,9 @@
 # Fake ROM 与多设备实验时钟状态
 
+## 2026-09-24：Stage C / Task 12c Bundle BEGIN 决策切片通过宿主验证
+
+在 Data `02dd043`、Plan `e997a72` 后，串行抽取 Bundle BEGIN 的已提交请求重放、CRC/长度、live 会话忙碌/恢复、新会话候选状态为 `src/v2_bundle_command.{h,cpp}`，固件与宿主 render FFI 使用同一函数。设备端仍先做 token/owner/session 预检，只有空接收文件成功创建并关闭后才写入新 `v2Rx`；重复 BEGIN 返回现有 offset，绝不延长 deadline。宿主测试覆盖重放/冲突、busy、过期、CRC/大小错误和拒绝时状态不变；`cargo test -p bridge-render --test v2_state` 13/13、`git diff --check` 通过。未接主 Bridge/实机，未构建或烧录 ROM。下一步 CHUNK/COMMIT，仍无可运行 Fake ROM。
+
 ## 2026-09-24：Stage C / Task 12b Plan 决策切片通过宿主验证
 
 在已提交的 Data 切片 `02dd043` 后，串行抽取 `src/main.cpp::applyV2Plan` 预检后的 PowerPlan 形状校验、授予上限选择和 ACK 分类为 `src/v2_plan_command.{h,cpp}`；宿主 render FFI 编译同一 C++ 实现。设备端认证和正式计划接受后的 deadline、模式持久化、日志副作用保留原顺序。同 ID 完全重放保留原截止；冲突、旧 ID 和非法形状不改计划。宿主测试覆盖 provisional 300s、常规 600s、最低 30s、重放、冲突、旧 ID 和 sleep；`cargo test -p bridge-render --test v2_state` 12/12 通过，`git diff --check` 通过。未接实机或主 Bridge，未构建/烧录 ROM。下一步继续 Bundle、Activate、claim 命令路径；仍无可运行 Fake ROM。

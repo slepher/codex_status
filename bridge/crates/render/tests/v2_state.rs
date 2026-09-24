@@ -28,6 +28,35 @@ extern "C" {
         out: *mut std::os::raw::c_char,
         cap: c_int,
     ) -> c_int;
+    fn codex_v2_bundle_begin_new() -> *mut c_void;
+    fn codex_v2_bundle_begin_free(p: *mut c_void);
+    fn codex_v2_bundle_begin_committed(
+        p: *mut c_void,
+        owner: *const std::os::raw::c_char,
+        request: *const std::os::raw::c_char,
+        crc: u32,
+        length: u32,
+        context: *const std::os::raw::c_char,
+    );
+    fn codex_v2_bundle_begin_seed_rx(
+        p: *mut c_void,
+        owner: *const std::os::raw::c_char,
+        request: *const std::os::raw::c_char,
+        nonce: *const std::os::raw::c_char,
+        length: u32,
+        crc: u32,
+        offset: u32,
+        deadline: u64,
+    ) -> c_int;
+    fn codex_v2_bundle_begin_decide(
+        p: *mut c_void,
+        message: *const std::os::raw::c_char,
+        nonce: *const std::os::raw::c_char,
+        now_ms: u64,
+        out: *mut std::os::raw::c_char,
+        cap: c_int,
+    ) -> c_int;
+    fn codex_v2_bundle_begin_commit_candidate(p: *mut c_void) -> c_int;
     fn codex_v2_plan_high(p: *mut c_void) -> u64;
     fn codex_v2_plan_light_active(p: *mut c_void, now_ms: u64) -> c_int;
     fn codex_v2_boot_remaining(t_boot_ms: u64, now_ms: u64) -> u32;
@@ -261,6 +290,110 @@ fn shared_plan_decision_classifies_ack_and_preserves_plan_state() {
         assert_eq!(normal_cap["accepted"], true);
         assert_eq!(normal_cap["granted_s"], 600);
         codex_v2_plan_free(normal);
+    }
+}
+
+#[test]
+fn shared_bundle_begin_decision_preserves_rx_for_replay_and_rejection() {
+    let nonce = std::ffi::CString::new("session").unwrap();
+    let message = |owner: &str, request: &str, length: u32, crc: &str| {
+        serde_json::json!({
+            "bridge_id": owner,
+            "request_id": request,
+            "length": length,
+            "content_crc": crc,
+        })
+    };
+    let decide = |p: *mut c_void, body: serde_json::Value, now_ms| unsafe {
+        let text = std::ffi::CString::new(body.to_string()).unwrap();
+        let mut out = vec![0i8; 2048];
+        let rc = codex_v2_bundle_begin_decide(
+            p,
+            text.as_ptr(),
+            nonce.as_ptr(),
+            now_ms,
+            out.as_mut_ptr(),
+            out.len() as c_int,
+        );
+        assert!(rc > 0);
+        serde_json::from_str::<serde_json::Value>(
+            std::ffi::CStr::from_ptr(out.as_ptr()).to_str().unwrap(),
+        )
+        .unwrap()
+    };
+    unsafe {
+        let p = codex_v2_bundle_begin_new();
+        let original = message("owner", "request-a", 100, "12345678");
+        let start = decide(p, original.clone(), 1_000);
+        assert_eq!(start["action"], "start");
+        assert_eq!(start["next_offset"], 0);
+        assert_eq!(start["current"]["deadline"], 0);
+        assert_eq!(start["candidate"]["owner"], "owner");
+        assert_eq!(start["candidate"]["length"], 100);
+        assert_eq!(start["candidate"]["crc"], 0x12345678u32);
+        assert_eq!(start["candidate"]["deadline"], 121_000);
+        assert_eq!(codex_v2_bundle_begin_commit_candidate(p), 1);
+
+        assert_eq!(codex_v2_bundle_begin_seed_rx(
+            p,
+            std::ffi::CString::new("owner").unwrap().as_ptr(),
+            std::ffi::CString::new("request-a").unwrap().as_ptr(),
+            nonce.as_ptr(), 100, 0x12345678, 40, 121_000
+        ), 1);
+        let resume = decide(p, original.clone(), 2_000);
+        assert_eq!(resume["action"], "resume");
+        assert_eq!(resume["next_offset"], 40);
+        assert_eq!(resume["current"]["offset"], 40);
+        assert_eq!(resume["current"]["deadline"], 121_000, "resume must not renew");
+
+        let before = resume["current"].clone();
+        let busy = decide(p, message("owner", "request-b", 100, "87654321"), 2_000);
+        assert_eq!(busy["action"], "reject");
+        assert_eq!(busy["error"], "busy");
+        assert_eq!(busy["current"], before);
+        let conflict = decide(p, message("owner", "request-a", 100, "87654321"), 2_000);
+        assert_eq!(conflict["action"], "reject");
+        assert_eq!(conflict["error"], "request_conflict");
+        assert_eq!(conflict["current"], before);
+        let bad_crc = decide(p, message("owner", "request-b", 100, "bad"), 2_000);
+        assert_eq!(bad_crc["action"], "reject");
+        assert_eq!(bad_crc["error"], "crc");
+        assert_eq!(bad_crc["current"], before);
+        let bad_size = decide(p, message("owner", "request-b", 262_145, "12345678"), 121_000);
+        assert_eq!(bad_size["action"], "reject");
+        assert_eq!(bad_size["error"], "size");
+        assert_eq!(bad_size["current"], before);
+
+        let expired = decide(p, message("owner", "request-c", 50, "aaaaaaaa"), 121_000);
+        assert_eq!(expired["action"], "start");
+        assert_eq!(expired["candidate"]["request"], "request-c");
+        assert_eq!(expired["current"], before);
+
+        let committed_owner = std::ffi::CString::new("done-owner").unwrap();
+        let committed_request = std::ffi::CString::new("done-request").unwrap();
+        let committed_context = std::ffi::CString::new("committed-context").unwrap();
+        codex_v2_bundle_begin_committed(
+            p,
+            committed_owner.as_ptr(),
+            committed_request.as_ptr(),
+            0xabcdef01,
+            80,
+            committed_context.as_ptr(),
+        );
+        let before_replay = expired["current"].clone();
+        let replay = decide(p, message("done-owner", "done-request", 80, "abcdef01"), 121_000);
+        assert_eq!(replay["action"], "replay");
+        assert_eq!(replay["replay_context"], "committed-context");
+        assert_eq!(replay["current"], before_replay);
+        let replay_conflict = decide(
+            p,
+            message("done-owner", "done-request", 81, "abcdef01"),
+            121_000,
+        );
+        assert_eq!(replay_conflict["action"], "reject");
+        assert_eq!(replay_conflict["error"], "request_conflict");
+        assert_eq!(replay_conflict["current"], before_replay);
+        codex_v2_bundle_begin_free(p);
     }
 }
 
