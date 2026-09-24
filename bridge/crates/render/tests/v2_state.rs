@@ -29,6 +29,15 @@ extern "C" {
         source: *const std::os::raw::c_char,
         message: *const std::os::raw::c_char,
     ) -> c_int;
+    fn codex_v2_data_decide(
+        p: *mut c_void,
+        configured: c_int,
+        source: *const std::os::raw::c_char,
+        message: *const std::os::raw::c_char,
+        context: *const std::os::raw::c_char,
+        out: *mut std::os::raw::c_char,
+        cap: c_int,
+    ) -> c_int;
     fn codex_v2_seq_free(p: *mut c_void);
     fn codex_v2_seq_begin(p: *mut c_void, now_ms: u64, keep_next: u32);
     fn codex_v2_seq_observe(p: *mut c_void, seq: u64, crc: u32) -> c_int;
@@ -156,6 +165,127 @@ fn transport_runtime_validates_crc_before_advancing_sequence() {
         assert_eq!(codex_v2_seq_applied(p), 1, "rejection must not advance seq");
         message["active_context_id"] = "ctx".into();
         assert_eq!(accept(p, &message), DATA_APPLIED);
+        codex_v2_seq_free(p);
+    }
+}
+
+#[test]
+fn shared_data_decision_classifies_acks_and_preserves_rejected_state() {
+    let template = r#"{"schema":1,"id":"t","canvas":{"w":200,"h":200},"elements":[
+        {"type":"text","bind":"bridge.label","x":8,"y":8,"font":"f12"},
+        {"type":"text","bind":"bridge.hostId","x":8,"y":24,"font":"f12"}]}"#;
+    let source = std::ffi::CString::new(template).unwrap();
+    let context = std::ffi::CString::new("ctx").unwrap();
+    fn make_message(seq: u64, ctx: &str, value: &str, bad_crc: bool, swap: bool) -> serde_json::Value {
+        let mut fields = vec![
+            serde_json::json!({"i": 0, "k": "bridge.label", "v": value, "q": "good"}),
+            serde_json::json!({"i": 1, "k": "bridge.hostId", "v": "host", "q": "good"}),
+        ];
+        if swap {
+            fields.reverse();
+        }
+        let crc = format!("{:08x}", bridge_core::coordinator::data_fields_crc(&fields));
+        serde_json::json!({
+            "active_context_id": ctx,
+            "seq": seq,
+            "fields": fields,
+            "crc": if bad_crc { "00000000".to_owned() } else { crc }
+        })
+    }
+    let p = unsafe { codex_v2_seq_new() };
+    let decide = |p, configured: bool, m: &serde_json::Value| {
+        let text = std::ffi::CString::new(m.to_string()).unwrap();
+        let mut out = vec![0i8; 2048];
+        let rc = unsafe {
+            codex_v2_data_decide(
+                p,
+                configured as c_int,
+                source.as_ptr(),
+                text.as_ptr(),
+                context.as_ptr(),
+                out.as_mut_ptr(),
+                out.len() as c_int,
+            )
+        };
+        assert!(rc > 0);
+        let output = unsafe { std::ffi::CStr::from_ptr(out.as_ptr()) };
+        serde_json::from_str::<serde_json::Value>(output.to_str().unwrap()).unwrap()
+    };
+    unsafe {
+        let unconfigured = decide(p, false, &make_message(1, "ctx", "first", false, false));
+        assert_eq!(unconfigured["result"], "rejected");
+        assert_eq!(unconfigured["display"], "failed");
+        assert_eq!(unconfigured["error"], "unconfigured");
+        assert_eq!(unconfigured["seq"], -1);
+        assert_eq!(unconfigured["include_context"], false);
+        assert_eq!(codex_v2_seq_next(p), 1);
+        assert_eq!(codex_v2_seq_applied(p), 0);
+
+        let bad_source = std::ffi::CString::new("{}").unwrap();
+        let bad_message = std::ffi::CString::new(
+            make_message(1, "ctx", "first", false, false).to_string()
+        ).unwrap();
+        let mut bad_out = vec![0i8; 2048];
+        assert!(codex_v2_data_decide(
+            p, 1, bad_source.as_ptr(), bad_message.as_ptr(), context.as_ptr(),
+            bad_out.as_mut_ptr(), bad_out.len() as c_int
+        ) > 0);
+        let bad_template_decision = serde_json::from_str::<serde_json::Value>(
+            std::ffi::CStr::from_ptr(bad_out.as_ptr()).to_str().unwrap()
+        ).unwrap();
+        assert_eq!(bad_template_decision["result"], "rejected");
+        assert_eq!(bad_template_decision["display"], "failed");
+        assert_ne!(bad_template_decision["error"], "unconfigured");
+        assert_eq!(codex_v2_seq_next(p), 1);
+
+        let first = make_message(1, "ctx", "first", false, false);
+        let applied = decide(p, true, &first);
+        assert_eq!(applied["result"], "applied");
+        assert_eq!(applied["first_applied"], true);
+        assert_eq!(applied["seq"], 1);
+        assert_eq!(applied["include_context"], true);
+        assert!(applied.get("display").is_none());
+        assert!(applied.get("error").is_none());
+        assert_eq!(codex_v2_seq_applied(p), 1);
+
+        let replay = decide(p, true, &first);
+        assert_eq!(replay["result"], "applied");
+        assert_eq!(replay["display"], "unchanged");
+        assert!(replay.get("error").is_none());
+        assert_eq!(replay["first_applied"], false);
+        assert_eq!(codex_v2_seq_applied(p), 1);
+
+        let conflict = decide(p, true, &make_message(1, "ctx", "different", false, false));
+        assert_eq!(conflict["result"], "rejected");
+        assert_eq!(conflict["display"], "unchanged");
+        assert_eq!(conflict["error"], "seq_conflict");
+        assert_eq!(codex_v2_seq_applied(p), 1);
+
+        let later = decide(p, true, &make_message(3, "ctx", "different", false, false));
+        assert_eq!(later["result"], "applied");
+        assert_eq!(codex_v2_seq_applied(p), 3);
+        let stale = decide(p, true, &make_message(2, "ctx", "different", false, false));
+        assert_eq!(stale["result"], "rejected");
+        assert_eq!(stale["display"], "unchanged");
+        assert_eq!(stale["error"], "stale_seq");
+        assert_eq!(codex_v2_seq_applied(p), 3);
+
+        let wrong_context = decide(p, true, &make_message(4, "wrong", "different", false, false));
+        assert_eq!(wrong_context["result"], "rejected");
+        assert_eq!(wrong_context["display"], "pending");
+        assert_eq!(wrong_context["error"], "context");
+        assert_eq!(codex_v2_seq_applied(p), 3);
+
+        let bad_crc = decide(p, true, &make_message(4, "ctx", "different", true, false));
+        assert_eq!(bad_crc["result"], "rejected");
+        assert_eq!(bad_crc["display"], "failed");
+        assert_eq!(bad_crc["error"], "crc");
+        assert_eq!(codex_v2_seq_applied(p), 3);
+        let bad_order = decide(p, true, &make_message(4, "ctx", "different", false, true));
+        assert_eq!(bad_order["result"], "rejected");
+        assert_eq!(bad_order["display"], "failed");
+        assert_eq!(bad_order["error"], "order");
+        assert_eq!(codex_v2_seq_applied(p), 3);
         codex_v2_seq_free(p);
     }
 }

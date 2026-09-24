@@ -1,5 +1,11 @@
 # Fake ROM 与多设备实验时钟状态
 
+## 2026-09-24：Stage C / Task 12a Data 决策切片通过宿主验证
+
+在独立 `codex/fake` worktree（HEAD 与 `bridge-multi-instance-2026-09-24` tag 均为 `6d131ac`）开始 Stage C。ROM 文件已交接；只有一名 6-luna high 代理顺序编码。`src/main.cpp::applyV2Data` 的预检后决策和 ACK 分类已抽入 `src/v2_data_command.{h,cpp}`，与宿主 render FFI 编译同一 C++ 实现；设备端原 token/owner/session 预检、首次接受后的 fields/checkpoint/cache/显示顺序保留。拒绝与重放不触发副作用，未配置仍返回原 ACK。初审发现 ACK 的 result/error 混用后已修正。
+
+宿主 `cargo test -p bridge-render --test v2_state` 11/11 通过，`git diff --check` 通过。测试通过临时 `CODEX_STATUS_ARDUINOJSON` 指向主工作树已有的只读 ArduinoJson 头文件；没有修改主工作树、运行中的 Bridge 或设备。本切片未构建/烧录 ROM、未提交。它仍不是可运行 Fake ROM：认证、owner、存储、显示副作用、Plan/Bundle/Activate/claim 和 HTTP/BLE 入口尚未在宿主共享。下一步由主代理设计 Stage C 后续命令路径，继续串行实现。
+
 ## 2026-09-24：Task 9/10a/10b 已提交，Task 11a/10c/11b 完成宿主验证
 
 显式 v2 端点登记与多目标 BLE 一次扫描/逐 MAC 会合已提交 `c82487c`。随后按串行顺序完成 BLE 扫描/GATT 时间线、UDP 已登记目标的认证改址、UDP/HTTP/PowerPlan/Data/ACK 结构化日志。真实 ROM 会发 UDP；v2 广播仅为地址线索，不再改全局选择/IP/推送/BLE 标志，也不构成 BLE 会合前提。无 legacy 设备参与本轮验收。

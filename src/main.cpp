@@ -51,6 +51,7 @@
 #include "refresh_policy.h"
 #include "v2_state.h"
 #include "v2_runtime.h"
+#include "v2_data_command.h"
 #include "bundle_store.h"
 
 // v2 platform targets (src/platform_target.h): the render/firmware target
@@ -3699,35 +3700,17 @@ static void handleV2Status() {
 static void applyV2Data(const String &body) {
     JsonDocument peek;
     if (!v2Command(body, peek)) return;
-    if (!v2BundleReady || !v2CtValid) {
-        v2Ack("data", "rejected", "failed", "ram", "unconfigured", -1, 0, nullptr,
-              UINT32_MAX);
-        return;
-    }
     uint64_t seq = peek["seq"] | 0ULL;
-    String usage, err;
-    V2DataAck rc = v2AcceptData(v2Ct, body, v2Profile.contextId, v2DataSeq, usage, err);
-    if (rc == V2_DATA_CONTEXT_MISMATCH) {
-        v2Ack("data", "rejected", "pending", "ram", "context", (int64_t)seq, 0,
-              v2Profile.contextId, UINT32_MAX);
+    V2DataDecision decision = v2DecideData(v2BundleReady && v2CtValid,
+                                            v2CtValid ? &v2Ct : nullptr, body, seq,
+                                            v2Profile.contextId, v2DataSeq);
+    if (!decision.firstApplied) {
+        v2Ack("data", decision.result, decision.display, "ram",
+              decision.error.length() ? decision.error.c_str() : nullptr, decision.seq, 0,
+              decision.includeContext ? v2Profile.contextId : nullptr, UINT32_MAX);
         return;
     }
-    if (rc == V2_DATA_REJECTED) {
-        v2Ack("data", "rejected", "failed", "ram", err.c_str(), (int64_t)seq, 0,
-              v2Profile.contextId, UINT32_MAX);
-        return;
-    }
-    if (rc == V2_DATA_UNCHANGED) {
-        v2Ack("data", "applied", "unchanged", "ram", nullptr, (int64_t)seq, 0,
-              v2Profile.contextId, UINT32_MAX);
-        return;
-    }
-    if (rc == V2_DATA_CONFLICT || rc == V2_DATA_STALE) {
-        v2Ack("data", "rejected", "unchanged", "ram",
-              rc == V2_DATA_CONFLICT ? "seq_conflict" : "stale_seq", (int64_t)seq, 0,
-              v2Profile.contextId, UINT32_MAX);
-        return;
-    }
+    const String &usage = decision.usage;
     v2AppliedFields = "";
     serializeJson(peek["fields"], v2AppliedFields);
     v2LastAckSeq = seq;

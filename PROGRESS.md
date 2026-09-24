@@ -1,5 +1,9 @@
 # Codex Status 项目进度（交接文档）
 
+## Fake ROM Stage C Data 决策切片：2026-09-24 — 独立 worktree 宿主验证通过
+
+在 `codex/fake` 独立 worktree 从 `bridge-multi-instance-2026-09-24` tag 基线开始，ROM 文件已交接。`src/main.cpp::applyV2Data` 预检后的 Data 决策/ACK 分类由固件和宿主共用 `src/v2_data_command.{h,cpp}`；设备端认证、首次接受后的 checkpoint/缓存/显示原顺序保留。宿主 render FFI 覆盖首次接受、重放、冲突、旧 seq、错 context、CRC/字段顺序错误和未配置，拒绝不推进序列。`cargo test -p bridge-render --test v2_state` 11/11 通过（ArduinoJson 用已安装的只读头文件路径），`git diff --check` 通过。未改主工作树、未启动/停止 Bridge、未接设备、未构建/烧录实机 ROM、未提交。此切片仍不是可运行 Fake ROM；Stage C 后续 Plan/Bundle/Activate/claim 与宿主端点尚待实现，见 `project-workflow/fake-rom-simulator/status.md`。
+
 ## Bridge 两设备界面与推送：2026-09-24 — 主工作树已部署
 
 模板页“推送到设备”已接入按 MAC 选择：只列当前屏幕族的已登记 v2 设备；确认时把族配置中启用的模板保存为目标设备 Profile，再调用该 MAC 的显式发布。设备页列出全部已登记设备，标出当前 MAC，平台状态卡也跟随当前设备。主工作树默认 Bridge 已重建并重启（PID 11644，HTTP/MCP 8765/8766），本地 `platform_overview` 保留 1.54 `70041DD7A340` 与 Note4 `7C4FADB93408` 两台登记；两个临时具名设备实例已停止。前端脚本语法、按 MAC 发布流程模拟、隔离 `cargo build --offline -p bridge-app` 与 `git diff --check` 通过。此轮**未实际发布模板、未 OTA**；两台设备上次 HTTP 状态读取超时。多实例代码提交 `3cfc8b8` 已打本地 tag `bridge-multi-instance-2026-09-24`，仓库未配置远端。

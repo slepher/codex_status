@@ -3,6 +3,7 @@
 #include "refresh_policy.h"
 #include "v2_state.h"
 #include "v2_runtime.h"
+#include "v2_data_command.h"
 #include "bundle_store.h"
 #include "font_asset.h"
 #include "font_store.h"
@@ -328,6 +329,36 @@ int codex_v2_accept_data_template(const char *source, const char *message) {
     V2DataSeq seq;
     String usage;
     return v2AcceptData(ct, String(message), "ctx", seq, usage, error);
+}
+int codex_v2_data_decide(void *p, int configured, const char *source,
+                        const char *message, const char *context,
+                        char *out, int cap) {
+    if (!p || !message || !out || cap <= 0) return -99;
+    CtTemplate ct{};
+    String compileError;
+    const bool validTemplate = source && tplCompile(String(source), ct, compileError);
+    V2DataDecision decision;
+    if (configured && !validTemplate) {
+        decision.result = "rejected";
+        decision.display = "failed";
+        decision.error = compileError.length() ? compileError : String("template");
+    } else {
+        JsonDocument input;
+        uint64_t seq = 0;
+        if (!deserializeJson(input, message)) seq = input["seq"] | 0ULL;
+        decision = v2DecideData(configured != 0, validTemplate ? &ct : nullptr,
+                                String(message), seq, context, *(V2DataSeq *)p);
+    }
+    JsonDocument result;
+    result["first_applied"] = decision.firstApplied;
+    result["seq"] = decision.seq;
+    result["result"] = decision.result;
+    if (decision.display) result["display"] = decision.display;
+    if (decision.error.length()) result["error"] = decision.error;
+    result["usage"] = decision.usage;
+    result["include_context"] = decision.includeContext;
+    size_t written = serializeJson(result, out, (size_t)cap);
+    return written ? (int)written : -1;
 }
 void codex_v2_seq_free(void *p) { delete (V2DataSeq *)p; }
 void codex_v2_seq_begin(void *p, uint64_t now_ms, uint32_t keep_next) {
