@@ -544,7 +544,7 @@ impl Coordinator {
 
     /// Queue one explicit publish. A frozen bundle replaces an unstarted job;
     /// a job already sending must finish (or be cancelled) first.
-    pub fn enqueue_bundle(&mut self, bundle: Bundle) -> Result<(), String> {
+    pub fn enqueue_bundle(&mut self, bundle: Bundle, now: u64) -> Result<(), String> {
         bundle.verify().map_err(|e| e.to_string())?;
         if bundle.device_mac != self.mac {
             return Err(format!(
@@ -573,7 +573,6 @@ impl Coordinator {
                 _ => {}
             }
         }
-        let now = crate::now_secs();
         self.job = Some(PublishJob {
             job_id: bundle.job_id.clone(),
             device_mac: self.mac.clone(),
@@ -602,11 +601,11 @@ impl Coordinator {
         })
     }
 
-    pub fn cancel_job(&mut self) {
+    pub fn cancel_job(&mut self, now: u64) {
         if let Some(job) = self.job.as_mut() {
             if !job.state.is_terminal() {
                 job.state = PublishState::Cancelled;
-                job.updated_at = crate::now_secs();
+                job.updated_at = now;
             }
         }
         self.data.in_flight = None;
@@ -709,6 +708,7 @@ impl Coordinator {
         plan_id: u64,
         accepted_remaining_s: u32,
         provisional: bool,
+        now: u64,
     ) -> PlanAck {
         if plan_id < self.device_plan_high {
             return PlanAck::Stale;
@@ -723,7 +723,7 @@ impl Coordinator {
         self.device_plan_high = plan_id;
         self.plan.last_accepted_id = plan_id;
         self.plan.last_accepted_remaining_s = accepted_remaining_s;
-        self.plan.last_accepted_at = crate::now_secs();
+        self.plan.last_accepted_at = now;
         if self.plan.pending_explicit_light.as_ref().is_some_and(|p| p.plan_id == plan_id) {
             self.plan.pending_explicit_light = None;
             self.plan.last_explicit_light_ack = Some(ExplicitLightAck {
@@ -805,7 +805,7 @@ impl Coordinator {
         }))
     }
 
-    pub fn summary(&self) -> Value {
+    pub fn summary(&self, now: u64) -> Value {
         let merged = merge_sources(&self.sources);
         serde_json::json!({
             "device_mac": self.mac,
@@ -829,7 +829,7 @@ impl Coordinator {
                 "kind": f.kind, "seq": f.seq, "crc": f.content_crc, "attempts": f.attempts,
             })),
             "pull_only_change": self.pull_only_change(),
-            "full_sync_due": self.full_sync_due(crate::now_secs()),
+            "full_sync_due": self.full_sync_due(now),
             "plan": self.plan,
             "job": self.job_snapshot(),
             "pending_activate": self.pending_activate,
@@ -1218,9 +1218,9 @@ mod tests {
         let p2 = c.plan_for(1005, true, 300, "rendezvous");
         assert_eq!(p1.plan_id, p2.plan_id, "same content reuses the plan id");
         // Repeating an accepted plan does not extend a deadline.
-        assert_eq!(c.note_plan_ack(p1.plan_id, 299, false), PlanAck::Accepted);
+        assert_eq!(c.note_plan_ack(p1.plan_id, 299, false, 1006), PlanAck::Accepted);
         let before = c.plan.last_accepted_remaining_s;
-        assert_eq!(c.note_plan_ack(p1.plan_id, 299, false), PlanAck::Accepted);
+        assert_eq!(c.note_plan_ack(p1.plan_id, 299, false, 1007), PlanAck::Accepted);
         assert_eq!(c.plan.last_accepted_remaining_s, before);
         // BOOT: keeping the original window sends remaining time, not a fresh 300.
         let mut c2 = coord();
@@ -1281,7 +1281,7 @@ mod tests {
         .seal()
         .unwrap();
         let mut c = coord();
-        c.enqueue_bundle(bundle.clone()).unwrap();
+        c.enqueue_bundle(bundle.clone(), 1000).unwrap();
         assert_eq!(c.job.as_ref().unwrap().state, PublishState::Waiting);
         // Waiting delivery pins the job as sending and delivers the frozen bundle.
         let Delivery::Bundle { job_id } = c.next_delivery(1001, true) else {
@@ -1290,12 +1290,81 @@ mod tests {
         assert_eq!(job_id, "job-1");
         assert_eq!(c.job.as_ref().unwrap().state, PublishState::Sending);
         // A second publish while sending is refused.
-        assert!(c.enqueue_bundle(bundle).is_err());
+        assert!(c.enqueue_bundle(bundle, 1001).is_err());
         // Frozen content cannot drift after queueing.
         assert_eq!(
             c.job.as_ref().unwrap().frozen_bundle.templates[0].source,
             source
         );
+    }
+
+    #[test]
+    fn coordinator_times_are_independent_per_device_and_summary_uses_supplied_time() {
+        use crate::platform::model::Template;
+        let caps = DeviceCapabilities::ssd1681_154g();
+        let source: Value = serde_json::from_str(include_str!(
+            "../../../../tools/test-bridge/templates/mini.json"
+        ))
+        .unwrap();
+        let template = Template {
+            key: crate::platform::model::TemplateKey::new("mini", &caps.render_target),
+            source: source.clone(),
+            source_crc: crate::template::template_hash(&crate::template::canonical_bytes(&source)),
+            compiled: crate::compile::compile(&source, &caps.render_target).unwrap(),
+            saved_at: 0,
+        };
+        let make_bundle = |mac: &str, id: &str| Bundle {
+            job_id: id.into(),
+            device_mac: mac.into(),
+            bridge_id: String::new(),
+            firmware_target: caps.firmware_target.clone(),
+            render_target: caps.render_target.clone(),
+            compiler_abi: crate::compile::COMPILER_ABI,
+            profile: crate::platform::model::BundleProfile {
+                template_ids: vec!["mini".into()],
+                initial_active_id: "mini".into(),
+                bindings: vec![],
+                full_sync_s: DEFAULT_FULL_SYNC_S,
+            },
+            templates: vec![template.clone()],
+            resources: vec![],
+            total_len: 0,
+            crc: String::new(),
+        }
+        .seal()
+        .unwrap();
+
+        let mut first = Coordinator::new("AA:BB:CC:DD:EE:01", caps.clone());
+        let mut second = Coordinator::new("AA:BB:CC:DD:EE:02", caps.clone());
+        let first_mac = first.mac.clone();
+        let second_mac = second.mac.clone();
+        first.enqueue_bundle(make_bundle(&first_mac, "job-1"), 1111).unwrap();
+        second.enqueue_bundle(make_bundle(&second_mac, "job-2"), 2222).unwrap();
+        assert_eq!(first.job.as_ref().unwrap().created_at, 1111);
+        assert_eq!(first.job.as_ref().unwrap().updated_at, 1111);
+        assert_eq!(second.job.as_ref().unwrap().created_at, 2222);
+        assert_eq!(second.job.as_ref().unwrap().updated_at, 2222);
+        first.cancel_job(3333);
+        second.cancel_job(4444);
+        assert_eq!(first.job.as_ref().unwrap().updated_at, 3333);
+        assert_eq!(second.job.as_ref().unwrap().updated_at, 4444);
+
+        let first_plan = first.plan_for(1000, true, 300, "test");
+        let second_plan = second.plan_for(2000, true, 300, "test");
+        first.plan.pending_explicit_light = Some(first_plan.clone());
+        second.plan.pending_explicit_light = Some(second_plan.clone());
+        assert_eq!(first.note_plan_ack(first_plan.plan_id, 300, false, 1010), PlanAck::Accepted);
+        assert_eq!(second.note_plan_ack(second_plan.plan_id, 300, false, 2020), PlanAck::Accepted);
+        assert_eq!(first.plan.last_accepted_at, 1010);
+        assert_eq!(first.plan.light_hold_until, 1310);
+        assert_eq!(second.plan.last_accepted_at, 2020);
+        assert_eq!(second.plan.light_hold_until, 2320);
+
+        first.new_context("test", 1000);
+        second.new_context("test", 1000);
+        assert_eq!(first.summary(4599)["full_sync_due"], false);
+        assert_eq!(first.summary(4601)["full_sync_due"], true);
+        assert_eq!(second.summary(4599)["full_sync_due"], false);
     }
 
     #[test]
@@ -1400,7 +1469,7 @@ mod tests {
     fn data_reads_and_status_polls_never_extend_light() {
         let mut c = coord();
         let plan = c.plan_for(1000, true, 300, "rendezvous");
-        assert_eq!(c.note_plan_ack(plan.plan_id, 300, false), PlanAck::Accepted);
+        assert_eq!(c.note_plan_ack(plan.plan_id, 300, false, 1001), PlanAck::Accepted);
         for i in 0..20 {
             c.note_status(
                 &json!({"active_context_id": c.context.as_ref().unwrap().context_id, "power": {"mode": "light", "plan_id": plan.plan_id, "remaining_s": 300}}),
@@ -1502,6 +1571,6 @@ mod tests {
         }
         .seal()
         .unwrap();
-        assert!(c.enqueue_bundle(bundle).is_err());
+        assert!(c.enqueue_bundle(bundle, 1000).is_err());
     }
 }

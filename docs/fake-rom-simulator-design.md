@@ -111,7 +111,7 @@ Display 同时记录 `candidate` 与 `displayed`；后一份只在成功完成�
 
 使用未改造的生产 Bridge EXE 时默认只开放 1x/Nx；Nx 是压力观察、不是确定性证明，必须记录 wall I/O 是否赶不上虚拟窗口。无协作 Bridge 时 max 只用于独立 ROM 场景，不能宣称完成 Bridge+ROM 加速集成。不要在开启 max 的情况下用“等待 50ms 没网络包”判断全系统空闲。
 
-Bridge 必须注入的时间包括：coordinator 的 now（含 `note_plan_ack`、job 时间戳、summary 的隐藏 now）；`core/src/platform/service.rs` 的 ACK/full_sync 计时（实施时核对实际路径）；源轮询/观测/过期时间；`app/src/platform.rs` status/plan/cycle 时间；`app/src/main.rs` 的 owner 60s 续约、扫描/机会/重试/缓存节流；`ble/src/lib.rs` 的 stamp_clock、request ID 生成、逻辑 ACK/连接预算。request ID 改用注入计数/熵，不依赖真实 SystemTime 纳秒才能唯一。真实 btleplug connect/read 和 TcpStream read/write timeout 继续有 wall-clock 上限；fake BLE 的协议等待使用逻辑 clock。首阶段让测试 runner 直接调用 coordinator/application service 的一轮工作；最终把生产循环的“等下一轮”接到同一 clock，避免复制一套 Bridge 行为。
+Bridge 必须按设备 MAC 注入目标时间，不要求所有 fake 设备或 Bridge 与模拟器共用一个全局时钟。每台 fake 设备的 Bridge 视图和设备视图可分别设倍率、wall epoch 偏移和漂移：参数相同时验证同步，参数不同时验证失步处理；真实设备继续用真实时钟。时钟接点包括 coordinator 的 now（含 `note_plan_ack`、job 时间戳、summary 的隐藏 now）；`core/src/platform/service.rs` 的 ACK/full_sync 计时；源轮询/观测/过期时间；`app/src/platform.rs` status/plan/cycle 时间；`app/src/main.rs` 的 owner 60s 续约、扫描/机会/重试/缓存节流；`ble/src/lib.rs` 的 stamp_clock、request ID 生成、逻辑 ACK/连接预算。request ID 改用注入计数/熵，不依赖真实 SystemTime 纳秒才能唯一。真实 btleplug connect/read 和 TcpStream read/write timeout 继续有 wall-clock 上限；fake BLE 的协议等待使用目标逻辑 clock。首阶段让测试 runner 直接调用 coordinator/application service 的一轮工作；最终把生产循环的“等下一轮”接到对应目标的 clock，避免复制一套 Bridge 行为。具体实施顺序见 `project-workflow/fake-rom-simulator/plan.md`。
 
 ## 7. HTTP 与 fake BLE 接入
 

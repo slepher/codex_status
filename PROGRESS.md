@@ -1,5 +1,11 @@
 # Codex Status 项目进度（交接文档）
 
+## Fake ROM、多设备与实验时钟：2026-09-24 — 计划落地、首个时间接点完成
+
+已建立 `project-workflow/fake-rom-simulator/plan.md`：一个 fake 进程一台设备；生产 Bridge 按 MAC 隔离运行目标和时间上下文；每台 fake 设备的 Bridge 视图与设备视图分别配置倍率、偏移、漂移，可测试同步和失步。原 `docs/fake-rom-simulator-design.md` 的全局共同时钟表述已修正。`release` worktree 仅用于源码隔离，不用多开生产 Bridge 替代多设备路由。
+
+Task 1 已由 6-luna high 编码并经主代理核对：Coordinator 四处隐藏 `crate::now_secs()` 改为显式 `now`，生产调用仍传真实时间；跨 MAC 作业/计划/summary 测试新增。隔离 `CARGO_TARGET_DIR=bridge/artifacts/coordinator-explicit-time-target` 的 `cargo test -p bridge-core` **104 项通过**，`cargo check -p bridge-app` 与 `git diff --check` 通过。未部署、未操作设备、未提交。**仍待** Bridge app 多设备运行路由、service/app/BLE 其余时钟接点、同源 Fake ROM 进程与联测；当前没有可运行的 Fake ROM。细节见 `project-workflow/fake-rom-simulator/status.md`。
+
 ## Note4 同步、时钟与 96px 模板：2026-09-24
 
 - Bridge 的 Codex 数据源保持 `good`；此前 Note4 Profile 的四项配额绑定仍指向 `static1` 且 `sync_enabled=false`。已只对 Note4 改为 `codex` 并启用同步；实机在本轮模板发布后确认 `data_seq=16`、`applied_seq=16`、`display_state=displayed`。1.54 的旧 ABI1 能力仍被 Bridge 接受用于数据通道，当前该设备有待投递状态，未将 Note4 的 ACK 误算给它。

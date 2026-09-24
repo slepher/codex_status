@@ -2082,7 +2082,9 @@ async fn run_services(ctx: Arc<AppCtx>) {
                 // lease; this only mirrors the legacy pending-work rule.
                 let mac = ctx.device_mac.lock().unwrap().clone().unwrap_or_default();
                 if !mac.is_empty() {
-                    if let Some(summary) = platform::service(&ctx).coordinator_summary(&mac) {
+                    if let Some(summary) = platform::service(&ctx)
+                        .coordinator_summary(&mac, now_secs().max(0) as u64)
+                    {
                         let pending = summary["push_dirty"].as_bool().unwrap_or(false)
                             || summary["in_flight"].is_object()
                             || summary["pending_activate"].is_string()

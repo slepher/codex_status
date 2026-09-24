@@ -371,7 +371,7 @@ pub fn font_import(ctx: &AppCtx, path: &str) -> Result<Value, String> {
 }
 
 pub fn job_cancel(ctx: &AppCtx, mac: &str) -> Value {
-    service(ctx).cancel_job(mac);
+    service(ctx).cancel_job(mac, now_secs());
     json!({"cancelled": true, "job": service(ctx).job(mac)})
 }
 
@@ -531,6 +531,7 @@ pub async fn send_plan(
                     remaining as u32,
                     plan.mode == bridge_core::platform::model::PlanMode::Light
                         && provisional_remaining_s > 0,
+                    now_secs(),
                 );
             }
             json!({"result": "plan", "plan": plan, "ack": ack, "accepted": accepted})
@@ -563,7 +564,7 @@ pub async fn request_light(ctx: &AppCtx, mac: &str) -> Value {
     match blocking(move || v2_client::plan(&ip, &token, &body, timeout()).map_err(err_text)).await {
         Ok(ack) if ack["result"] == "applied" => {
             let remaining = ack["accepted_remaining_s"].as_u64().unwrap_or(0) as u32;
-            let confirmation = service(ctx).note_plan_ack(mac, plan.plan_id, remaining, false);
+            let confirmation = service(ctx).note_plan_ack(mac, plan.plan_id, remaining, false, now_secs());
             json!({"result": "applied", "transport": "http", "plan": plan,
                 "already_pending": already_pending, "ack": ack, "confirmation": confirmation})
         }
@@ -638,6 +639,7 @@ pub async fn post_ota_window(ctx: &AppCtx, secs: u32) {
                     plan.plan_id,
                     ack["accepted_remaining_s"].as_u64().unwrap_or(0) as u32,
                     false,
+                    now_secs(),
                 );
             }
             tracing::info!(device = mac, %ack, "post-OTA light plan");
@@ -689,7 +691,7 @@ pub fn note_envelope(ctx: &AppCtx, envelope: &Value) {
 
 pub fn power_view(ctx: &AppCtx) -> Value {
     let mac = ctx.device_mac.lock().unwrap().clone().unwrap_or_default();
-    let summary = service(ctx).coordinator_summary(&mac);
+    let summary = service(ctx).coordinator_summary(&mac, now_secs());
     let explicit = summary.as_ref().map(|s| &s["plan"]);
     let pending = explicit.map(|p| &p["pending_explicit_light"]);
     let ack = explicit.map(|p| &p["last_explicit_light_ack"]);
@@ -941,7 +943,7 @@ pub async fn ble_cycle(ctx: &AppCtx) -> Result<BleOpportunity, String> {
             return Err(format!("BLE PowerPlan rejected: {ack}"));
         }
         let confirmation = service(ctx).note_plan_ack(&mac, plan.plan_id,
-            ack["accepted_remaining_s"].as_u64().unwrap_or(0) as u32, remaining > 0);
+            ack["accepted_remaining_s"].as_u64().unwrap_or(0) as u32, remaining > 0, now_secs());
         tracing::info!(device = mac, plan_id = plan.plan_id, ack = %ack,
             confirmation = %confirmation, "v2 PowerPlan acknowledgement");
         Ok(())
@@ -982,7 +984,7 @@ pub async fn cycle(ctx: &AppCtx, refresh: bool, deliver_now: bool) {
         // idempotent on the device; a new id is only generated when the decision
         // really changes or the window has expired.
         let status = service(ctx)
-            .coordinator_summary(&mac)
+            .coordinator_summary(&mac, now_secs())
             .unwrap_or(Value::Null);
         let provisional = status["session"]["power"]["provisional"]
             .as_bool()

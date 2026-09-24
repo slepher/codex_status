@@ -818,7 +818,7 @@ impl PlatformService {
             .entry(mac.clone())
             .or_insert_with(|| Coordinator::new(&mac, caps.clone()));
         coordinator
-            .enqueue_bundle(bundle)
+            .enqueue_bundle(bundle, now)
             .map_err(|e| anyhow::anyhow!(e))?;
         coordinator.full_sync_s = profile.full_sync_s.max(60);
         let summary = coordinator.job_snapshot().unwrap_or(Value::Null);
@@ -892,7 +892,7 @@ impl PlatformService {
             .and_then(|c| c.job_snapshot())
     }
 
-    pub fn cancel_job(&self, mac: &str) {
+    pub fn cancel_job(&self, mac: &str, now: u64) {
         let mut inner = self.inner.lock().unwrap();
         if let Some(job) = inner.asset_jobs.get_mut(&mac.to_uppercase()) {
             if !job.state.is_terminal() { job.state = PublishState::Cancelled; }
@@ -900,7 +900,7 @@ impl PlatformService {
             return;
         }
         if let Some(c) = inner.coordinators.get_mut(&mac.to_uppercase()) {
-            c.cancel_job();
+            c.cancel_job(now);
             Self::refresh_bundle_history(&mut inner, &mac.to_uppercase());
             let _ = Self::persist(&inner, &self.state_path());
         }
@@ -1252,7 +1252,7 @@ impl PlatformService {
                 let power = &status["power"];
                 if power["plan_id"] == pending.plan_id && power["mode"] == "light" {
                     if let Some(remaining) = power["remaining_s"].as_u64().filter(|n| *n > 0) {
-                        power_reconciled = c.note_plan_ack(pending.plan_id, remaining as u32, false)
+                        power_reconciled = c.note_plan_ack(pending.plan_id, remaining as u32, false, now)
                             == crate::coordinator::PlanAck::Accepted;
                     }
                 }
@@ -1548,12 +1548,13 @@ impl PlatformService {
         plan_id: u64,
         remaining_s: u32,
         provisional: bool,
+        now: u64,
     ) -> Value {
         let mut inner = self.inner.lock().unwrap();
         let Some(c) = inner.coordinators.get_mut(&mac.to_uppercase()) else {
             return json!({"outcome": "unknown_device"});
         };
-        let outcome = c.note_plan_ack(plan_id, remaining_s, provisional);
+        let outcome = c.note_plan_ack(plan_id, remaining_s, provisional, now);
         if outcome == crate::coordinator::PlanAck::Accepted {
             let _ = Self::persist(&inner, &self.state_path());
         }
@@ -1566,12 +1567,12 @@ impl PlatformService {
         })
     }
 
-    pub fn coordinator_summary(&self, mac: &str) -> Option<Value> {
+    pub fn coordinator_summary(&self, mac: &str, now: u64) -> Option<Value> {
         let inner = self.inner.lock().unwrap();
         inner
             .coordinators
             .get(&mac.to_uppercase())
-            .map(|c| c.summary())
+            .map(|c| c.summary(now))
     }
 
     // ---- Recovery / migration -------------------------------------------
@@ -2205,8 +2206,8 @@ mod tests {
 
         let resumed = PlatformService::open(dir.path()).unwrap();
         assert_eq!(resumed.plan_for_rendezvous(mac, now + 3, "rendezvous", 0).unwrap(), light);
-        assert_eq!(resumed.note_plan_ack(mac, light.plan_id, 500, false)["outcome"], "accepted");
-        let summary = resumed.coordinator_summary(mac).unwrap();
+        assert_eq!(resumed.note_plan_ack(mac, light.plan_id, 500, false, now + 4)["outcome"], "accepted");
+        let summary = resumed.coordinator_summary(mac, now + 4).unwrap();
         assert!(summary["plan"]["pending_explicit_light"].is_null());
         assert_eq!(summary["plan"]["last_explicit_light_ack"]["plan_id"], light.plan_id);
         let hold_until = summary["plan"]["light_hold_until"].as_u64().unwrap();
@@ -2225,7 +2226,7 @@ mod tests {
         })).unwrap();
         drop(svc);
         let resumed = PlatformService::open(dir.path()).unwrap();
-        let state = resumed.coordinator_summary(mac).unwrap();
+        let state = resumed.coordinator_summary(mac, crate::now_secs()).unwrap();
         assert!(state["plan"]["pending_explicit_light"].is_null());
         assert_eq!(state["plan"]["last_explicit_light_ack"]["plan_id"], plan.plan_id);
     }
@@ -2239,7 +2240,7 @@ mod tests {
         svc.queue_explicit_light(mac, now).unwrap();
         let sleep = svc.explicit_plan(mac, PlanMode::Sleep, 0, "explicit").unwrap();
         assert_eq!(sleep.mode, PlanMode::Sleep);
-        assert!(svc.coordinator_summary(mac).unwrap()["plan"]["pending_explicit_light"].is_null());
+        assert!(svc.coordinator_summary(mac, now + 1).unwrap()["plan"]["pending_explicit_light"].is_null());
         assert_eq!(svc.plan_for_rendezvous(mac, now + 1, "rendezvous", 0).unwrap().mode, PlanMode::Sleep);
     }
 
@@ -2271,7 +2272,7 @@ mod tests {
         let after = restored.job("AA:BB:CC:DD:EE:FF").unwrap();
         assert_eq!(before["manifest_id"], after["manifest_id"]);
         assert!(restored.asset_job_pending("AA:BB:CC:DD:EE:FF"));
-        restored.cancel_job("AA:BB:CC:DD:EE:FF");
+        restored.cancel_job("AA:BB:CC:DD:EE:FF", 1001);
         assert_eq!(restored.job("AA:BB:CC:DD:EE:FF").unwrap()["state"], "cancelled");
     }
 
@@ -2337,8 +2338,8 @@ mod tests {
         svc.note_codex_envelope(&env).unwrap();
         let mac = "AA:BB:CC:DD:EE:FF";
         // The device commits the bundle and reports its new context.
-        svc.cancel_job(mac);
         let t = crate::now_secs();
+        svc.cancel_job(mac, t);
         svc.adopt_activation_context(mac, "ctx-ack-test", t)
             .unwrap();
         let decision = svc.next_delivery(mac, true, t);
@@ -2352,8 +2353,8 @@ mod tests {
         // ACK confirms and starts the deadline clock.
         let ack = svc.note_ack(mac, DeliveryKind::BleData, seq, &crc, true, "displayed");
         assert_eq!(ack["outcome"], "applied");
-        assert!(svc.coordinator_summary(mac).unwrap()["in_flight"].is_null());
-        let deadline_before = svc.coordinator_summary(mac).unwrap()["context"]
+        assert!(svc.coordinator_summary(mac, t).unwrap()["in_flight"].is_null());
+        let deadline_before = svc.coordinator_summary(mac, t).unwrap()["context"]
             ["full_sync_deadline"]
             .as_u64()
             .unwrap();
@@ -2363,7 +2364,7 @@ mod tests {
         svc.note_codex_envelope(&env).unwrap();
         assert_eq!(svc.next_delivery(mac, true, t + 1)["decision"], "idle");
         assert_eq!(
-            svc.coordinator_summary(mac).unwrap()["context"]["full_sync_deadline"].as_u64(),
+            svc.coordinator_summary(mac, t + 1).unwrap()["context"]["full_sync_deadline"].as_u64(),
             Some(deadline_before)
         );
 
@@ -2407,7 +2408,7 @@ mod tests {
         p.sync_enabled = true;
         svc.profile_save(p, 1000).unwrap();
         svc.publish("AA:BB:CC:DD:EE:FF", 1000).unwrap();
-        svc.cancel_job("AA:BB:CC:DD:EE:FF");
+        svc.cancel_job("AA:BB:CC:DD:EE:FF", 1001);
         let mac = "AA:BB:CC:DD:EE:FF";
         let a = svc.adopt_activation_context(mac, "ctx-1", 1000).unwrap();
         let _ = a;
@@ -2420,13 +2421,13 @@ mod tests {
         let seq = d["data_seq"].as_u64().unwrap();
         let crc = d["content_crc"].as_str().unwrap().to_string();
         svc.note_ack(mac, DeliveryKind::BleData, seq, &crc, true, "displayed");
-        let next_seq = svc.coordinator_summary(mac).unwrap()["context"]["next_seq"]
+        let next_seq = svc.coordinator_summary(mac, 1000).unwrap()["context"]["next_seq"]
             .as_u64()
             .unwrap();
         drop(svc);
         // Reopen the service: seq continues, never restarts at 0.
         let svc2 = PlatformService::open(dir.path()).unwrap();
-        let summary = svc2.coordinator_summary(mac).unwrap();
+        let summary = svc2.coordinator_summary(mac, 1000).unwrap();
         assert!(summary["context"]["next_seq"].as_u64().unwrap() >= next_seq);
         assert_eq!(summary["context"]["context_id"], "ctx-1");
     }
