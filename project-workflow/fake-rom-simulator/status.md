@@ -1,5 +1,9 @@
 # Fake ROM 与多设备实验时钟状态
 
+## 2026-09-24：Stage D / Task 13a 启动层通过宿主验证
+
+`device-sim` 在 loopback 以一进程一虚构 MAC 运行，三 token 域互不相同；鉴权 `/v2/status` 通过 Stage C 同源 C++ 生成未配置状态，`/sim/state` 只读，其余业务写入 501 unsupported。未提供 `/status.json`，避免 Bridge 误登记。两个模拟进程身份/端口隔离与错误路径通过 6 项集成测试；`cargo test -p device-sim`、`cargo test -p bridge-render` 和 `git diff --check` 通过。尚无状态持久化、可写协议、BLE、显示和实验时钟，不能视为完整 Fake ROM；下一步由主代理设计 Task 13b，再串行委托 Luna 编码。
+
 ## 2026-09-24：Stage C 全量宿主回归通过
 
 `bridge-render` 完整包测试 35/35 通过，`git diff --check` 通过，`codex/fake` 工作树干净，HEAD `e4fb250`。Stage C 已共享命令决策、信封与权威状态快照；固件 `main.cpp` 继续调用同一 C++，但宿主尚没有统一设备状态/认证/存储/HTTP/BLE/显示编排，也没有可运行的 Fake ROM。按计划转入 Stage D 单设备模拟进程，先交付受限 localhost 进程与真实状态快照，再逐条接通业务端点；未覆盖端点必须明确 unsupported。

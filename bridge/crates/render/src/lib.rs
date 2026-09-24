@@ -441,6 +441,28 @@ extern "C" {
     fn codex_rgn_on_partial() -> c_int;
     fn codex_rgn_on_full() -> c_int;
     fn codex_rgn_dump(out: *mut c_char, out_len: c_int) -> c_int;
+    fn codex_v2_status_snapshot(input: *const c_char, out: *mut c_char, cap: c_int) -> c_int;
+}
+
+/// Build the simulator's `/v2/status` payload with the firmware's C++ builder.
+/// This only creates a status snapshot; it does not simulate command side effects.
+pub fn simulator_status_snapshot(input: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    let input = serde_json::to_string(input)?;
+    anyhow::ensure!(input.len() <= 64 * 1024, "simulator status input too large");
+    let input =
+        CString::new(input).map_err(|_| anyhow::anyhow!("simulator status input contains NUL"))?;
+    let mut out = vec![0i8; 8192];
+    let rc =
+        unsafe { codex_v2_status_snapshot(input.as_ptr(), out.as_mut_ptr(), out.len() as c_int) };
+    anyhow::ensure!(
+        rc > 0 && (rc as usize) < out.len(),
+        "simulator status builder failed ({rc})"
+    );
+    let result: serde_json::Value = serde_json::from_str(&cstr(&out))?;
+    result
+        .get("status")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("simulator status result missing"))
 }
 
 /// Result of pushing one font container into the device font store.

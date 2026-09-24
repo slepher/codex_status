@@ -1,5 +1,9 @@
 # Codex Status 项目进度（交接文档）
 
+## Fake ROM Stage D 启动层：2026-09-24 — 单设备 localhost 进程通过宿主验证
+
+在独立 `codex/fake` worktree，从多 Bridge tag 之后的 Stage C 继续推进。新增 `device-sim`：每进程显式虚构 MAC、动态 loopback 端口、三种互不相同的 token；鉴权 `/v2/status` 调用固件同源 C++ 快照，控制面只读，其余业务写入明确 501。两个进程的身份/端口隔离、认证和拒绝路径由 6 项集成测试覆盖；`cargo test -p device-sim`、`cargo test -p bridge-render`、`git diff --check` 通过。此切片尚无 owner/Bundle 持久状态、可写命令、BLE、显示或倍速时钟，不可作为完整 Fake ROM 登记到生产 Bridge。下一步串行接设备状态与协议写入，见 `project-workflow/fake-rom-simulator/status.md`。
+
 ## Fake ROM Stage C 全量宿主回归：2026-09-24 — 35 项通过
 
 `codex/fake` HEAD `e4fb250`，`cargo test -p bridge-render` 完整包 35/35、`git diff --check` 通过，工作树干净。Data/Plan/Bundle/Activate/claim 的共享 C++ 决策、命令信封与 `/v2/status` 快照已在固件调用路径与宿主渲染库中。仍没有可运行 Fake ROM：宿主设备状态、鉴权、持久存储、HTTP/BLE、显示与逻辑时钟须在 Stage D/E 接线。下一步先做单设备 localhost 模拟进程的最小端点，未覆盖行为显式 unsupported；见 `project-workflow/fake-rom-simulator/status.md`。
