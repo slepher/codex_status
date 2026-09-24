@@ -16,6 +16,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include <LittleFS.h>
 #include "template_engine.h"
 
 #define BS_MAX_TEMPLATES 8
@@ -42,6 +43,9 @@ bool bsBegin();
 // `expectedFirmware`/`expectedRender` guard against wrong-target images.
 bool bsInstall(const String &bundleJson, const char *expectedFirmware,
                const char *expectedRender, const char *newContextId, String &err);
+bool bsInstall(File &bundleFile, uint32_t bundleLength, uint32_t bundleCrc,
+               const char *expectedFirmware, const char *expectedRender,
+               const char *newContextId, String &err);
 
 // Load one compiled template from the active slot (bounded, validated).
 bool bsLoadCompiled(uint8_t index, CtTemplate &out, String &err);

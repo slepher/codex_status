@@ -1,5 +1,39 @@
 # Codex Status 项目进度（交接文档）
 
+## 固件双目标切换：2026-09-24 — 按用户要求停止构建
+
+用户要求停止本轮 `0.18.23` 双目标构建；当前无活动 `pio` 进程，未执行后续构建、框架包安装/修复或设备操作。`.pio/build/zectrix-note4-b` 与 `.pio/build/esp32-s3-epaper-154g` 已有构建文件，但没有复制到 `artifacts/`，因此不作为发布 ROM 记录。
+
+根因证据：切换 Note4 时，项目根 `sdkconfig.defaults` 的 `# TASMOTA__9244f2068d3cf08d` 与 1.54 目标期望的 `# TASMOTA__22ab75315012ed65` 不同。已安装 pioarduino `C:\Users\cogic\.platformio\platforms\espressif32\builder\frameworks\arduino.py` 的 `matching_custom_sdkconfig()` 比较项目根首行与当前 `custom_sdkconfig`、MCU 和板卡指纹，`check_reinstall_frwrk()` 在不匹配时调用 `safe_remove_sdkconfig_files()` 并重装 `framework-arduinoespressif32` 与 `framework-arduinoespressif32-libs`。串行构建不能消除这项确定性重装；后续须先诊断并隔离项目根 `sdkconfig.defaults` 与已安装 package 状态，隔离方案待定。未发布 ROM、未刷机。
+
+## Bridge OTA token 自动缓存：2026-09-24 — 宿主验证完成
+
+v2 BLE 会合在已核对完整 Wi-Fi MAC 且 INFO 报告 bonded+encrypted 后，若该 MAC 没有有效的 `data/device-token-<MAC>.json`，会在同一 GATT 会话、固件 Plan ACK 前只请求一次 `CHR_AUTH {"cmd":"token"}`，请求有 1 秒上限，校验 32 位十六进制 token 后按 OTA 现有格式持久化；已有有效缓存跳过请求。请求或保存失败只记录不含 token 的安全原因，不影响后续 Data/Plan 工作；运行时缓存路径复用 OTA 的 `CODEX_STATUS_DATA`（默认及命名实例）解析，OTA 现有 401 重新取 token 路径保留。缓存 MAC 绑定和 token 格式边界测试通过。未连接设备、未重启服务、未执行 OTA。
+
+隔离 `CARGO_TARGET_DIR=C:\Users\cogic\.codex\worktrees\a695\codex_status\target-token-cache` 下 `cargo test -p bridge-ble -p bridge-mcp`（14+1 项通过）、`cargo check -p bridge-app` 通过；`git diff --check` 通过。全 workspace `cargo fmt --all -- --check` 仍受既有其他文件格式漂移影响，未对无关文件格式化。
+
+## 唤醒会合诊断记录：2026-09-24 — 计划已定，未实施
+
+计划见 `project-workflow/wake-contact-trace/plan.md`。两台设备按一次物理唤醒合并为一条 RTC 记录，在同一条内更新 BLE/Wi-Fi/命令/回复阶段，复用并替换现有 `/history` 事件环；Bridge 用认证后的 `wake_seq` 与既有 `request_id` 对照。目标 64 条、每条 ≤48 B，两种 target 的 map 容量须在实施后复核。本轮只写计划，未改固件/Bridge 代码、未刷机、未重启服务或操作设备。
+
+## 1.54 数据同步开关：2026-09-24 — 按用户要求启用，待设备可达
+
+用户明确要求将 1.54 `70041DD7A340` 的 `sync_enabled:false` 改为 true。通过主 Bridge 内建 MCP `profile_save_v2` 只保存该设备原 Profile，持久化回读 `sync_enabled=true`、`template_ids=mini,quad`、`full_sync_s=3600`，绑定保持不变；返回 `saved=true, published=false`，未重新发布模板/ROM。运行中的主 Bridge 与设备未重启/刷机。1.54 族草稿仍是 false；主 Bridge 当前 UI 尚未加载本 worktree 的“族发布保留设备同步设置”修正，再从旧模板页发布可能把设备值覆盖回 false。
+
+启用后直接无代理 HTTP `/status.json` 仍连接失败；随后 07:21:54 UTC 的该 MAC BLE 会合仍报 `http_or_transport`。设备已确认 `data_seq=applied_seq=51` 未变，Bundle 作业 `91b51cdb` 仍 `sending`，没有新的 Data ACK。Coordinator 先处理未完成 Bundle，再处理 Data，因此此刻不能以同步开关已启用推断数据已送达。等待设备可达/手动唤醒后再核对作业 ACK 与数据序号；本轮未主动触发发布或 OTA。
+
+## Note4 ENTER 唤醒与 1.54 推送只读排查：2026-09-24 — 进行中
+
+独立 worktree `a695` 未触碰 Fake ROM、主 Bridge 进程/数据或设备写入。Note4 `7C4FADB93408` 当前仍运行 `0.18.20-note4-b`，不是待刷的 `0.18.21`；USB 后可直连 HTTP，当前启动记录仅为 `power-on`，无法还原此前 ENTER 按下时是否产生 EXT1 唤醒。现机 `/log` 多次报告时钟窗口写失败，`epd_busy_fails=8`，表明确有显示更新问题，但不能据此判定按键失效。源码已配置 ENTER/GPIO0 的 active-low EXT1；用户确认 PGUP/GPIO39 只需清醒时切换模板，ENTER 是所需深睡唤醒键。详见 `project-workflow/note4-buttons/`。
+
+1.54 `70041DD7A340` 当前 HTTP 超时；Bridge 历史上曾经 GATT 完整 MAC 核验后进入该设备的 BLE v2 会合，随后报 `http_or_transport`，扫描阶段无 MAC 的 `connect_failed` 不能归给它。按 MAC 持久化状态复核后，当前确有新 Bundle 作业 `91b51cdb`（14:42:49 +08，模板 `mini,quad`）；用户提供的发布响应为 `delivery=deferred`、Windows 10060 连接超时、`job=waiting`，另一状态快照为 `sending`，没有设备提交 ACK。先前用 PowerShell 默认 JSON 对象 `.Count` 判断作业为空是调查误判。该设备与 1.54 族 Profile 都是 `sync_enabled:false`：族草稿在 09-23 迁移时默认 false，09-24 模板页发布又把它复制到设备 Profile；不能推断为用户有意关闭。数据投递被此开关抑制，模板发布不受其限制。修复计划见 `project-workflow/bridge-family-sync-preservation/`；主 Bridge 数据保持原样。
+
+Note4 `0.18.20-note4-b` 的设备 `/log`（4KB 无时间戳环形）能证明多次绑定 BLE 连接、应用 v2 plan 300–305；Bridge 在 14:32:17 +08 对 Note4 的 `plan` 命令通过连接/身份/写入阶段后，等待匹配 ACK 5 秒超时（request `r18d82e1818c43458`），会合随即超时。设备成功 ACK 静默、不记请求 ID；环形旧日志已覆盖，故不能把某个设备 plan 与该 Bridge 请求严格对应，也不能据此判断具体 ACK 丢失原因。继续只读核对代码路径，不刷机。
+
+发布与同步边界：`sync_enabled` 只控制 Bridge 的 Data 快照投递及其产生的 light 计划，不阻止显式 Bundle 发布。Bundle 有按 MAC 的冻结待办，认证会合后由 Bridge 计划 light 并经 HTTP 投递；ROM OTA 当前仍用旧的内存 `pending_ota_rom` 排队与联系窗口重试，并非按 MAC 持久化的 v2 OTA 作业，不能承诺重启后或多设备下可靠续投。设备不会自行下载模板/ROM。此协议缺口已记录，未主动更改运行状态。
+
+Note4 帧缓存源码另发现条件性自愈缺陷：恢复失败后 RTC 哈希仍在，下一次相同帧可能跳过重写。Luna 已作最小源码修正，隔离 worktree 的 Note4 B 与 1.54 顺序构建均退出 0，`git diff --check` 通过；未制作发布 ROM、未刷机、未提交。现机 0.18.20 不能归因于这项尚未安装的修正。
+
 ## Bridge 两设备界面与推送：2026-09-24 — 主工作树已部署
 
 模板页“推送到设备”已接入按 MAC 选择：只列当前屏幕族的已登记 v2 设备；确认时把族配置中启用的模板保存为目标设备 Profile，再调用该 MAC 的显式发布。设备页列出全部已登记设备，标出当前 MAC，平台状态卡也跟随当前设备。主工作树默认 Bridge 已重建并重启（PID 11644，HTTP/MCP 8765/8766），本地 `platform_overview` 保留 1.54 `70041DD7A340` 与 Note4 `7C4FADB93408` 两台登记；两个临时具名设备实例已停止。前端脚本语法、按 MAC 发布流程模拟、隔离 `cargo build --offline -p bridge-app` 与 `git diff --check` 通过。此轮**未实际发布模板、未 OTA**；两台设备上次 HTTP 状态读取超时。多实例代码提交 `3cfc8b8` 已打本地 tag `bridge-multi-instance-2026-09-24`，仓库未配置远端。

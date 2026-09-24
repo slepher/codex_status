@@ -72,12 +72,12 @@ static bool targetUnverified = false;
 #define FW_VERSION    "0.13.9-clkwin"
 #elif defined(CODEX_TARGET_NOTE4)
 #ifdef CODEX_NOTE4_ROM_B
-#define FW_VERSION    "0.18.21-note4-b"
+#define FW_VERSION    "0.18.23-note4-b"
 #else
 #define FW_VERSION    "0.18.19-note4-a"
 #endif
 #else
-#define FW_VERSION    "0.17.9-bw"
+#define FW_VERSION    "0.18.23-bw"
 #endif
 #define AP_PASSWORD   "codex1234"
 #define MAX_SLOTS     3
@@ -476,13 +476,16 @@ static uint32_t fnv1a(const String &s) {
 
 static bool timeKnown() { return time(nullptr) > 1600000000; }
 
-// v0.15 deep/light transition history: a small RTC ring (survives deep sleep;
-// cleared by a power loss, which is acceptable) so the timeline of a sleep
-// session can be read back after a manual wake. Zero flash wear, no switch.
-// Read via GET /history (oldest first; `since=<seq>` for incremental polls);
-// /status.json exposes hist_count (sequence number of the newest record) and
-// hist_head (ring slot the next write uses).
-#define HIST_CAP 120
+// Wake/contact trace: one fixed record per physical wake. RTC RAM survives
+// deep sleep, but not a power loss, so the generation disambiguates a fresh
+// RTC ring from a retained one. The old event ring is intentionally replaced;
+// histAdd below is only a compatibility shim for old call sites.
+#define HIST_CAP 64
+#define TRACE_FORMAT 2
+#define TRACE_MAGIC 0x57545232u // "WTR2"
+#define TRACE_VALID_START 0xA5
+#define TRACE_VALID_END 0x5A
+#define TRACE_STAGE_COUNT 9
 enum : uint8_t {
     HIST_BOOT = 1,        // wake/boot classified, aux = esp_sleep_wakeup_cause_t
     HIST_ENTER_DEEP = 2,  // light -> deep transition, aux = next_contact_s
@@ -507,34 +510,299 @@ enum : uint8_t {
     TIME_BLE = 1,
     TIME_RTC = 2,
 };
-struct HistRec {
-    uint32_t epoch;
-    uint8_t ev;
-    uint8_t stage;
-    uint8_t batt;      // 0xFF = unknown
-    uint8_t src;       // TIME_* of the recorded wake (HIST_WAKE)
-    uint16_t aux;
-    uint32_t dur_ms;   // awake duration of the recorded wake (0 when unknown)
+enum : uint8_t {
+    TRACE_WAKE_BOOT = 0, TRACE_WAKE_TIMER = 1, TRACE_WAKE_BUTTON = 2,
+    TRACE_WAKE_THIN = 3, TRACE_WAKE_OTHER = 4,
 };
-static_assert(sizeof(HistRec) == 16, "history record layout changed");
-RTC_DATA_ATTR static HistRec histRing[HIST_CAP];
+enum : uint8_t {
+    TRACE_STAGE_WIRELESS = 1, TRACE_STAGE_BLE_ADV = 2,
+    TRACE_STAGE_BLE_CONNECTED = 3, TRACE_STAGE_COMMAND = 4,
+    TRACE_STAGE_REPLY = 5, TRACE_STAGE_BLE_OFF = 6,
+    TRACE_STAGE_WIFI_IP = 7, TRACE_STAGE_HTTP = 8, TRACE_STAGE_SLEEP = 9,
+};
+enum : uint8_t {
+    TRACE_RESULT_ACTIVE = 0, TRACE_RESULT_THIN = 1, TRACE_RESULT_ANSWERED = 2,
+    TRACE_RESULT_NO_CONNECTION = 3, TRACE_RESULT_NO_COMMAND = 4,
+    TRACE_RESULT_WIFI_NO_IP = 5, TRACE_RESULT_HTTP_FAILED = 6,
+    TRACE_RESULT_INTERRUPTED = 7,
+};
+enum : uint8_t {
+    TRACE_ERR_NONE = 0, TRACE_ERR_WIFI = 1, TRACE_ERR_ENDPOINT = 2,
+    TRACE_ERR_HTTP = 3, TRACE_ERR_JSON = 4, TRACE_ERR_RESET = 5,
+};
+
+// Packed on purpose: this is the RTC contract shared with Bridge history
+// export. Nine uint16 timings use 100 ms units, covering about 109 minutes;
+// JSON expands them back to milliseconds. awake_ms remains uint32.
+struct __attribute__((packed)) WakeTraceRec {
+    uint32_t wake_generation;
+    uint32_t seq;
+    uint8_t wake_type;
+    uint8_t wake_cause;
+    uint8_t ext1;
+    uint8_t valid_start;
+    uint8_t valid_end;
+    uint8_t furthest;
+    uint8_t result;
+    uint8_t error;
+    uint16_t request_crc;
+    uint32_t awake_ms;
+    uint16_t timing[TRACE_STAGE_COUNT];
+    uint16_t stage_mask;
+    uint8_t transport;
+    uint8_t reserved;
+    uint32_t crc;
+};
+static_assert(sizeof(WakeTraceRec) == 48, "wake trace record must stay 48 bytes");
+RTC_DATA_ATTR static WakeTraceRec histRing[HIST_CAP];
 RTC_DATA_ATTR static uint32_t histCount = 0;   // records ever written
 RTC_DATA_ATTR static uint16_t histHead = 0;    // next write slot
+RTC_DATA_ATTR static uint32_t rtcTraceMagic = 0;
+RTC_DATA_ATTR static uint32_t rtcWakeGeneration = 0;
+RTC_DATA_ATTR static uint32_t rtcTraceCurrentSeq = 0;
+RTC_DATA_ATTR static uint16_t rtcTraceCurrentSlot = 0xFFFF;
+RTC_DATA_ATTR static WakeTraceRec rtcTraceShadow = {};
+RTC_DATA_ATTR static uint32_t rtcTraceShadowSeq = 0;
+static uint32_t traceStartMs = 0;
+static bool traceBleConnectedSeen = false;
 
-static void histAddFull(uint8_t ev, uint16_t aux, uint32_t durMs, uint8_t src) {
-    if (histHead >= HIST_CAP) histHead = 0;
-    HistRec &r = histRing[histHead];
-    r.epoch = timeKnown() ? (uint32_t)time(nullptr) : 0;
-    r.ev = ev;
-    r.stage = rtcStage;
-    r.batt = (batteryPct < 0 || batteryPct > 100) ? 0xFF : (uint8_t)batteryPct;
-    r.src = src;
-    r.aux = aux;
-    r.dur_ms = durMs;
-    histHead = (uint16_t)((histHead + 1) % HIST_CAP);
-    histCount++;
+static uint32_t traceCrc(const WakeTraceRec &r) {
+    const uint8_t *p = reinterpret_cast<const uint8_t *>(&r);
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < sizeof(WakeTraceRec) - sizeof(r.crc); ++i) {
+        h ^= p[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+static bool traceValid(const WakeTraceRec &r) {
+    return r.valid_start == TRACE_VALID_START && r.valid_end == TRACE_VALID_END &&
+           r.crc == traceCrc(r);
+}
+static WakeTraceRec *traceCurrent() {
+    return rtcTraceCurrentSlot < HIST_CAP ? &histRing[rtcTraceCurrentSlot] : nullptr;
+}
+static void traceCommit(WakeTraceRec &r) {
+    r.valid_end = TRACE_VALID_END;
+    r.crc = traceCrc(r);
+    rtcTraceShadow = r;
+    rtcTraceShadowSeq = r.seq;
+}
+static void tracePrepare(WakeTraceRec &r) {
+    rtcTraceShadow = r;
+    rtcTraceShadowSeq = r.seq;
+}
+static const char *traceStageName(uint8_t stage) {
+    switch (stage) {
+    case TRACE_STAGE_WIRELESS: return "wireless_start";
+    case TRACE_STAGE_BLE_ADV: return "ble_broadcast";
+    case TRACE_STAGE_BLE_CONNECTED: return "ble_connected";
+    case TRACE_STAGE_COMMAND: return "command_received";
+    case TRACE_STAGE_REPLY: return "reply_committed";
+    case TRACE_STAGE_BLE_OFF: return "ble_off";
+    case TRACE_STAGE_WIFI_IP: return "wifi_ip";
+    case TRACE_STAGE_HTTP: return "http_result";
+    case TRACE_STAGE_SLEEP: return "sleep";
+    default: return "none";
+    }
+}
+static const char *traceWakeTypeName(uint8_t type) {
+    switch (type) {
+    case TRACE_WAKE_TIMER: return "timer";
+    case TRACE_WAKE_BUTTON: return "button";
+    case TRACE_WAKE_THIN: return "thin";
+    case TRACE_WAKE_BOOT: return "boot";
+    default: return "other";
+    }
+}
+static const char *traceResultName(uint8_t result) {
+    switch (result) {
+    case TRACE_RESULT_THIN: return "thin";
+    case TRACE_RESULT_ANSWERED: return "answered";
+    case TRACE_RESULT_NO_CONNECTION: return "no_connection";
+    case TRACE_RESULT_NO_COMMAND: return "no_command";
+    case TRACE_RESULT_WIFI_NO_IP: return "wifi_no_ip";
+    case TRACE_RESULT_HTTP_FAILED: return "http_failed";
+    case TRACE_RESULT_INTERRUPTED: return "interrupted";
+    default: return "active";
+    }
+}
+static const char *traceTransportName(uint8_t transport) {
+    if ((transport & 3) == 3) return "ble+wifi";
+    if (transport & 1) return "ble";
+    if (transport & 2) return "wifi";
+    return "none";
+}
+static uint8_t traceWakeType(esp_sleep_wakeup_cause_t cause) {
+    if (cause == ESP_SLEEP_WAKEUP_TIMER) return TRACE_WAKE_TIMER;
+    if (cause == ESP_SLEEP_WAKEUP_EXT1) return TRACE_WAKE_BUTTON;
+    if (cause == ESP_SLEEP_WAKEUP_UNDEFINED) return TRACE_WAKE_BOOT;
+    return TRACE_WAKE_OTHER;
+}
+static uint8_t traceExt1Summary() {
+    const uint64_t bits = esp_sleep_get_ext1_wakeup_status();
+    return (bits & (1ULL << 0) ? 1 : 0) | (bits & (1ULL << 18) ? 2 : 0);
+}
+static void traceSetStage(uint8_t stage) {
+    WakeTraceRec *r = traceCurrent();
+    if (!r || stage < 1 || stage > TRACE_STAGE_COUNT) return;
+    const uint16_t bit = (uint16_t)(1u << (stage - 1));
+    tracePrepare(*r);
+    r->valid_end = 0;
+    if (!(r->stage_mask & bit)) {
+        r->stage_mask |= bit;
+        uint32_t elapsed = millis() - traceStartMs;
+        uint32_t ticks = elapsed / 100u;
+        r->timing[stage - 1] = ticks > 0xFFFFu ? 0xFFFFu : (uint16_t)ticks;
+    }
+    if (stage > r->furthest) r->furthest = stage;
+    r->awake_ms = millis() - traceStartMs;
+    traceCommit(*r);
+}
+static void traceSetTransport(uint8_t transport) {
+    WakeTraceRec *r = traceCurrent();
+    if (!r || (r->transport & transport) == transport) return;
+    tracePrepare(*r);
+    r->valid_end = 0;
+    r->transport |= transport;
+    traceCommit(*r);
+}
+static void traceSetRequest(const char *request) {
+    WakeTraceRec *r = traceCurrent();
+    if (!r || !request || !*request) return;
+    tracePrepare(*r);
+    r->valid_end = 0;
+    r->request_crc = (uint16_t)fnv1a(String(request));
+    traceCommit(*r);
+}
+static void traceSetError(uint8_t error) {
+    WakeTraceRec *r = traceCurrent();
+    if (!r || r->error) return;
+    tracePrepare(*r);
+    r->valid_end = 0;
+    r->error = error;
+    traceCommit(*r);
+}
+static void traceSetResult(uint8_t result, uint8_t error = TRACE_ERR_NONE) {
+    WakeTraceRec *r = traceCurrent();
+    if (!r) return;
+    tracePrepare(*r);
+    r->valid_end = 0;
+    r->result = result;
+    if (error) r->error = error;
+    traceCommit(*r);
+}
+static void traceMarkHttp(bool ok, int code) {
+    WakeTraceRec *r = traceCurrent();
+    if (!r) return;
+    traceSetTransport(2);
+    if (!(r->stage_mask & (1u << (TRACE_STAGE_HTTP - 1)))) {
+        traceSetStage(TRACE_STAGE_HTTP);
+        if (!ok) traceSetResult(TRACE_RESULT_HTTP_FAILED,
+                                code > 0 ? (uint8_t)code : TRACE_ERR_HTTP);
+    }
+}
+static void traceMarkThin() {
+    WakeTraceRec *r = traceCurrent();
+    if (!r) return;
+    tracePrepare(*r);
+    r->valid_end = 0;
+    r->wake_type = TRACE_WAKE_THIN;
+    r->result = TRACE_RESULT_THIN;
+    traceCommit(*r);
+}
+static void traceFinishInterrupted() {
+    WakeTraceRec *r = traceCurrent();
+    if (!r) return;
+    if (!traceValid(*r) && traceValid(rtcTraceShadow) &&
+        rtcTraceShadow.seq == rtcTraceCurrentSeq) {
+        *r = rtcTraceShadow;
+    }
+    tracePrepare(*r);
+    r->valid_end = 0;
+    r->result = TRACE_RESULT_INTERRUPTED;
+    if (!r->error) r->error = TRACE_ERR_RESET;
+    traceCommit(*r);
+    rtcTraceCurrentSlot = 0xFFFF;
+}
+static void traceBegin(esp_sleep_wakeup_cause_t cause) {
+    if (rtcTraceMagic != TRACE_MAGIC) {
+        memset(histRing, 0, sizeof(histRing));
+        histCount = 0;
+        histHead = 0;
+        rtcWakeGeneration = esp_random();
+        if (!rtcWakeGeneration) rtcWakeGeneration = 1;
+        rtcTraceMagic = TRACE_MAGIC;
+        rtcTraceCurrentSeq = 0;
+        rtcTraceCurrentSlot = 0xFFFF;
+    } else if (traceCurrent()) {
+        // A reset can interrupt the small validity-marker update itself; the
+        // slot is still the best available evidence and is finalized as such.
+        traceFinishInterrupted();
+    }
+    if (!rtcWakeGeneration) {
+        rtcWakeGeneration = esp_random();
+        if (!rtcWakeGeneration) rtcWakeGeneration = 1;
+    }
+    const uint16_t slot = histHead < HIST_CAP ? histHead : 0;
+    WakeTraceRec &r = histRing[slot];
+    memset(&r, 0, sizeof(r));
+    r.wake_generation = rtcWakeGeneration;
+    r.seq = ++histCount;
+    r.wake_type = traceWakeType(cause);
+    r.wake_cause = (uint8_t)cause;
+    r.ext1 = traceExt1Summary();
+    r.valid_start = TRACE_VALID_START;
+    r.result = TRACE_RESULT_ACTIVE;
+    traceStartMs = millis();
+    histHead = (uint16_t)((slot + 1) % HIST_CAP);
+    rtcTraceCurrentSlot = slot;
+    rtcTraceCurrentSeq = r.seq;
+    traceBleConnectedSeen = false;
+    traceCommit(r);
+}
+static uint8_t traceFinalResult() {
+    WakeTraceRec *r = traceCurrent();
+    if (!r) return TRACE_RESULT_INTERRUPTED;
+    if (r->result == TRACE_RESULT_THIN || r->result == TRACE_RESULT_HTTP_FAILED) return r->result;
+    if (r->stage_mask & (1u << (TRACE_STAGE_REPLY - 1))) return TRACE_RESULT_ANSWERED;
+    if (r->stage_mask & (1u << (TRACE_STAGE_COMMAND - 1))) return TRACE_RESULT_ANSWERED;
+    if (r->stage_mask & (1u << (TRACE_STAGE_BLE_CONNECTED - 1))) return TRACE_RESULT_NO_COMMAND;
+    if (r->stage_mask & (1u << (TRACE_STAGE_BLE_ADV - 1))) return TRACE_RESULT_NO_CONNECTION;
+    if (r->stage_mask & (1u << (TRACE_STAGE_WIFI_IP - 1))) return TRACE_RESULT_NO_COMMAND;
+    return TRACE_RESULT_WIFI_NO_IP;
+}
+static void traceFinishSleep() {
+    WakeTraceRec *r = traceCurrent();
+    if (!r) return;
+    traceSetStage(TRACE_STAGE_SLEEP);
+    traceSetResult(traceFinalResult());
+    r = traceCurrent();
+    if (r) {
+        tracePrepare(*r);
+        r->valid_end = 0;
+        r->awake_ms = millis() - traceStartMs;
+        traceCommit(*r);
+    }
+    rtcTraceCurrentSlot = 0xFFFF;
+}
+static void tracePollConnection() {
+    const bool connected = bleIsConnected();
+    if (connected && !traceBleConnectedSeen) {
+        traceBleConnectedSeen = true;
+        traceSetTransport(1);
+        traceSetStage(TRACE_STAGE_BLE_CONNECTED);
+    } else if (!connected) {
+        traceBleConnectedSeen = false;
+    }
 }
 
+// Old event calls remain source-compatible but no longer allocate records.
+static void histAddFull(uint8_t ev, uint16_t aux, uint32_t, uint8_t) {
+    if (ev == HIST_NET_OK) traceMarkHttp(true, aux);
+    else if (ev == HIST_NET_FAIL) traceMarkHttp(false, aux);
+    else if (ev == HIST_THIN) traceMarkThin();
+}
 static void histAdd(uint8_t ev, uint16_t aux) { histAddFull(ev, aux, 0, 0); }
 
 // ---- Plan C wake telemetry (task-3) ----
@@ -615,10 +883,14 @@ static const char *deviceStateText() {
 }
 
 // Template-visible state. While a boot connect attempt is running the Wi-Fi
-// icon cell blinks at ~1 Hz (task-10 B): `WIFI CONN` is the visible phase and
-// `WIFI OFF` the hidden one. The template can gate the icon on WIFI CONN and
-// keep the crossed-link overlay steady on both values.
+// icon cell blinks at ~1 Hz (task-10 B): `WIFI CONN` is the visible phase.
+// Note4 uses `WIFI BLINK OFF` for the hidden phase so its Wi-Fi cell is blank;
+// sustained offline still uses `WIFI OFF` for the existing 20x20 off glyph.
+// The 1.54 target retains the historical `WIFI OFF` hidden phase.
 static const char *templateStateText() {
+#if defined(CODEX_TARGET_NOTE4)
+    if (wifiConnActive && !wifiBlinkOn) return "WIFI BLINK OFF";
+#endif
     if (wifiConnActive) return wifiBlinkOn ? "WIFI CONN" : "WIFI OFF";
     return deviceStateText();
 }
@@ -766,6 +1038,8 @@ static bool           v2Provisional = false;     // BOOT 300 s window active
 static uint64_t       v2LightDeadlineMs = 0;     // accepted plan deadline (monotonic)
 static uint64_t       v2LastAckAtMs = 0;
 static uint64_t       v2LastAckSeq = 0;
+static uint32_t       v2HistorySyncMs = 0;
+static uint64_t       v2HistorySyncUntilMs = 0;
 static String         v2AppliedFields;           // bounded last applied Data fields
 static uint8_t        v2DisplayState = 0;        // 0 none,1 displayed,2 pending,3 failed
 static V2BundleRx     v2Rx;
@@ -773,6 +1047,7 @@ static String         v2SessionNonce;
 // Device safety cap: with a committed bundle but no formal PowerPlan (or before
 // the Bridge answers) the light session is bounded by the max light lease.
 static uint64_t       v2SafetyDeadlineMs = 0;
+static uint64_t       v2ManualBleHoldUntilMs = 0; // runtime-only manual BLE hold; reset on boot
 static String         v2RxPath = "/bundle/rx.bin";
 static String         v2PlanReason = "init";
 // Plan C: while the rendezvous window is open the screen is not touched; the
@@ -785,6 +1060,13 @@ static bool           v2WakeRenderPending = false;
 
 static uint64_t v2NowMs() { return (uint64_t)(esp_timer_get_time() / 1000ULL); }
 static uint32_t v2Millis32() { return (uint32_t)(esp_timer_get_time() / 1000ULL); }
+static uint32_t v2ManualBleHoldRemainingS() {
+    const uint64_t now = v2NowMs();
+    return v2ManualBleHoldUntilMs > now
+        ? (uint32_t)((v2ManualBleHoldUntilMs - now) / 1000ULL)
+        : 0;
+}
+static bool v2ManualBleHoldActive() { return v2ManualBleHoldUntilMs > v2NowMs(); }
 
 static String lastUsage;
 static String lastChannel = "-";
@@ -1393,7 +1675,9 @@ static void note4SaveFrameBaseline() {
 }
 
 static bool note4RestoreFrameBaseline(bool thin) {
-    if (!rtcNote4FrameHash || !LittleFS.begin(false, "/littlefs", 10, "storage"))
+    const uint32_t expectedHash = rtcNote4FrameHash;
+    rtcNote4FrameHash = 0;
+    if (!expectedHash || !LittleFS.begin(false, "/littlefs", 10, "storage"))
         return false;
     File file = LittleFS.open("/panel-base.bin", "r");
     if (!file || file.size() != EPD_FB_BYTES + 8) return false;
@@ -1404,7 +1688,7 @@ static bool note4RestoreFrameBaseline(bool thin) {
                       file.read(pixels, EPD_FB_BYTES) == EPD_FB_BYTES;
     file.close();
     bool valid = read && header[0] == 0x344E5045u &&
-                 header[1] == rtcNote4FrameHash &&
+                 header[1] == expectedHash &&
                  note4FrameHash(pixels) == header[1];
     if (valid && clkPixelsValid && clkR.valid) {
         valid = clkR.x0b <= clkR.x1b && clkR.x1b < EPD_W / 8 &&
@@ -1420,6 +1704,7 @@ static bool note4RestoreFrameBaseline(bool thin) {
                    clkPixels + row * clkR.bw, clkR.bw);
     }
     if (valid) {
+        rtcNote4FrameHash = expectedHash;
         EPD_SSD2683_RestoreShadow(pixels);
         if (!thin) {
             epdBaselineTrusted = true;
@@ -1642,10 +1927,18 @@ static void renderUsage(const String &json, const char *channel) {
                   wk.used, fh.used, channel ? channel : "");
 }
 
+static const char *wakeCauseName(esp_sleep_wakeup_cause_t cause);
+static uint32_t traceEarliestComplete();
+
 static void updateInfoExtra() {
     String items = "\"mac\":\"" + macText() + "\",\"ip\":\"" + ipText() +
                    "\",\"http_port\":80,\"rendezvous_v\":" + String((unsigned)(rv2Enabled ? RV2_SUPPORTED : 0)) +
                    ",\"rv_max\":" + String((unsigned)RV2_SUPPORTED) +
+                   ",\"wake_generation\":" + String((unsigned long)rtcWakeGeneration) +
+                   ",\"wake_seq\":" + String((unsigned long)rtcTraceCurrentSeq) +
+                   ",\"wake_stage\":\"" +
+                   (traceCurrent() ? traceStageName(traceCurrent()->furthest) : "none") +
+                   "\",\"wake_cause\":\"" + wakeCauseName(bootWakeCause) + "\"" +
                    ",\"v2_bundle\":" + String(v2BundleReady ? "true" : "false") + ",\"templates\":[";
     String active = tplStoreActive();
     for (int i = 0; i < tplStoreCount(); i++) {
@@ -2143,7 +2436,7 @@ static void deepSleepRaw(uint32_t sec) {
     rtcLastRenders = bootRenderCount;
     rtcLastTimeSource = timeSource;
     rtcLastWakeResult = wakeResult;
-    histAddFull(HIST_WAKE, wakeResult, rtcLastAwakeMs, timeSource);
+    traceFinishSleep();
     // Power estimate (no current meter): accumulate only deep cycles so the
     // per-cycle averages are not dominated by long light sessions.
     if (wakeResult != WAKE_LIGHT) {
@@ -2194,6 +2487,9 @@ static void handleBleUsage(const String &json) {
     pendingUsage = json;
     pendingChannel = "BLE";
     pendingUsageReady = true;
+    traceSetTransport(1);
+    traceSetStage(TRACE_STAGE_COMMAND);
+    traceSetStage(TRACE_STAGE_REPLY);
     bleNotifyStatus("{\"ack\":\"usage\",\"ok\":true}");
 }
 
@@ -2213,6 +2509,9 @@ static void handleBleEndpoint(const String &json) {
     String mac = blePeerAddress();
     if (!mac.length()) mac = "unknown";
     storeUpsert(mac, host, port, token);
+    traceSetTransport(1);
+    traceSetStage(TRACE_STAGE_COMMAND);
+    traceSetStage(TRACE_STAGE_REPLY);
     bleNotifyStatus("{\"ack\":\"endpoint\",\"ok\":true}");
     pendingEndpoint = true;
 }
@@ -2556,6 +2855,16 @@ static void handleStatusJson() {
     doc["tz"] = deviceTz;
     doc["hist_count"] = histCount;
     doc["hist_head"] = histHead;
+    doc["wake_generation"] = rtcWakeGeneration;
+    doc["wake_seq"] = rtcTraceCurrentSeq;
+    const uint32_t wakeEarliestSeq = traceEarliestComplete();
+    const bool wakeOverwritten = histCount > HIST_CAP;
+    doc["wake_earliest_seq"] = wakeEarliestSeq;
+    doc["wake_overwritten"] = wakeOverwritten;
+    doc["earliest_seq"] = wakeEarliestSeq;
+    doc["overwritten"] = wakeOverwritten;
+    doc["wake_stage"] = traceCurrent() ? traceStageName(traceCurrent()->furthest) : "none";
+    doc["wake_cause"] = wakeCauseName(bootWakeCause);
     // Plan C wake telemetry (task-3): live values of the current wake; the
     // previous wake's final values are in `deep.last_*` below.
     doc["awake_ms"] = millis();
@@ -2614,6 +2923,7 @@ static void handleStatusJson() {
         power["provisional"] = v2Provisional && !v2Plan.accepted();
         power["provisional_remaining_s"] =
             v2Provisional ? V2PlanState::bootProvisionalRemaining(v2BootMs, v2NowMs()) : 0;
+        power["manual_ble_hold_remaining_s"] = v2ManualBleHoldRemainingS();
         power["rendezvous_period_s"] = V2_RENDEZVOUS_S;
     }
     {
@@ -2679,33 +2989,122 @@ static void handleLog() {
     server.send(200, "text/plain; charset=utf-8", DevLog.dump());
 }
 
-// GET /history: deep/light transition history from the RTC ring, oldest first.
-// `since=<seq>` returns only records with a higher sequence number, so the
-// bridge can poll incrementally using `/status.json`'s hist_count. Read-only,
-// no token (same exposure as /log and /status.json).
+static bool traceGetComplete(uint32_t seq, WakeTraceRec &out) {
+    if (!seq || !histCount || seq > histCount) return false;
+    const uint32_t first = histCount > HIST_CAP ? histCount - HIST_CAP + 1 : 1;
+    if (seq < first) return false;
+    const WakeTraceRec &r = histRing[(seq - 1) % HIST_CAP];
+    if (r.seq != seq || !traceValid(r)) return false;
+    out = r;
+    if (seq == rtcTraceCurrentSeq && traceCurrent() && traceCurrent()->seq == seq)
+        out.awake_ms = millis() - traceStartMs;
+    return true;
+}
+
+static uint32_t traceEarliestComplete() {
+    const uint32_t first = histCount > HIST_CAP ? histCount - HIST_CAP + 1 : 1;
+    for (uint32_t seq = first; seq <= histCount; ++seq) {
+        WakeTraceRec r;
+        if (traceGetComplete(seq, r)) return seq;
+    }
+    return 0;
+}
+
+static uint32_t traceLatestComplete() {
+    for (uint32_t seq = histCount; seq; --seq) {
+        WakeTraceRec r;
+        if (traceGetComplete(seq, r)) return seq;
+        if (seq == 1) break;
+    }
+    return 0;
+}
+
+static bool traceRecordActive(uint32_t seq) {
+    return seq && seq == rtcTraceCurrentSeq && traceCurrent() &&
+           traceCurrent()->seq == seq;
+}
+
+static void traceAppendRow(JsonArray arr, const WakeTraceRec &r, bool compact = false) {
+    JsonObject item = arr.add<JsonObject>();
+    item["format"] = TRACE_FORMAT;
+    item["wake_generation"] = r.wake_generation;
+    item["seq"] = r.seq;
+    item["wake_type"] = traceWakeTypeName(r.wake_type);
+    if (!compact) {
+        item["wake_cause"] = wakeCauseName((esp_sleep_wakeup_cause_t)r.wake_cause);
+        item["ext1"] = r.ext1;
+    }
+    item["awake_ms"] = r.awake_ms;
+    item["result"] = traceResultName(r.result);
+    item["complete"] = !traceRecordActive(r.seq);
+    if (!compact) item["error"] = r.error;
+    if (compact) item["stage"] = r.furthest;
+    else item["stage"] = traceStageName(r.furthest);
+    JsonArray timing = item["timing"].to<JsonArray>();
+    for (uint8_t i = 0; i < TRACE_STAGE_COUNT; ++i)
+        timing.add((uint32_t)r.timing[i] * 100u);
+    if (!compact && r.request_crc) item["request_crc"] = r.request_crc;
+    item["transport"] = traceTransportName(r.transport);
+}
+
+static String traceHistoryJson(uint32_t since, uint8_t limit, size_t maxBytes,
+                               bool &more) {
+    if (!limit) limit = 1;
+    if (limit > HIST_CAP) limit = HIST_CAP;
+    const uint32_t latest = traceLatestComplete();
+    const uint32_t earliest = traceEarliestComplete();
+    JsonDocument doc;
+    doc["wake_generation"] = rtcWakeGeneration;
+    doc["earliest_seq"] = earliest;
+    doc["latest_seq"] = latest;
+    JsonArray records = doc["records"].to<JsonArray>();
+    more = false;
+    uint8_t added = 0;
+    if (earliest && latest) {
+        for (uint32_t seq = earliest; seq <= latest; ++seq) {
+            if (seq <= since) continue;
+            WakeTraceRec r;
+            if (!traceGetComplete(seq, r)) continue;
+            if (added >= limit) { more = true; break; }
+            traceAppendRow(records, r, true);
+            String probe;
+            serializeJson(doc, probe);
+            if (probe.length() > maxBytes && added == 0) {
+                records.remove(records.size() - 1);
+                more = true;
+                break;
+            }
+            if (probe.length() > maxBytes) {
+                records.remove(records.size() - 1);
+                more = true;
+                break;
+            }
+            added++;
+        }
+    }
+    doc["more"] = more;
+    String out;
+    serializeJson(doc, out);
+    return out;
+}
+
+// GET /history keeps its array shape and incremental `since` semantics.
 static void handleHistory() {
     uint32_t since = 0;
     if (server.hasArg("since")) {
         long long v = server.arg("since").toInt();
         if (v > 0) since = (uint32_t)v;
     }
-    uint32_t avail = histCount < HIST_CAP ? histCount : HIST_CAP;
-    uint32_t firstSeq = histCount - avail + 1;
     JsonDocument doc;
     JsonArray arr = doc.to<JsonArray>();
-    for (uint32_t i = 0; i < avail; i++) {
-        uint32_t seq = firstSeq + i;
-        if (seq <= since) continue;
-        const HistRec &r = histRing[(seq - 1) % HIST_CAP];
-        JsonObject item = arr.add<JsonObject>();
-        item["seq"] = seq;
-        item["t"] = r.epoch;
-        item["ev"] = r.ev;
-        item["stage"] = r.stage;
-        item["batt"] = r.batt;
-        item["aux"] = r.aux;
-        item["dur_ms"] = r.dur_ms;
-        item["src"] = r.src;
+    const uint32_t earliest = traceEarliestComplete();
+    const uint32_t latest = traceLatestComplete();
+    if (earliest && latest) {
+        for (uint32_t seq = earliest; seq <= latest; ++seq) {
+            if (seq <= since) continue;
+            WakeTraceRec r;
+            if (traceGetComplete(seq, r)) traceAppendRow(arr, r);
+        }
     }
     String out;
     serializeJson(doc, out);
@@ -3275,6 +3674,9 @@ static void handleBleAuth(const String &json) {
     }
     if (doc["rotate"] | false) rotateAuthToken();
     else if (!authValid()) loadOrIssueAuthToken();
+    traceSetTransport(1);
+    traceSetStage(TRACE_STAGE_COMMAND);
+    traceSetStage(TRACE_STAGE_REPLY);
     bleNotifyStatusQuiet(String("{\"ack\":\"auth\",\"ok\":true,\"token\":\"") + authToken + "\"}");
 }
 
@@ -3387,9 +3789,18 @@ static void enterBleOn(bool userInitiated) {
         DevLog.println("[ble] session on");
     }
     bleRadioMark(true);
+    traceSetTransport(1);
+    traceSetStage(TRACE_STAGE_WIRELESS);
     bleAdvertiseStart();
+    traceSetStage(TRACE_STAGE_BLE_ADV);
     if (userInitiated) {
         bleOpenPairingWindow(120000);
+        if (v2BundleReady) {
+            const uint64_t requestedUntil = v2NowMs() + BLE_GRACE_MS;
+            if (v2ManualBleHoldUntilMs < requestedUntil) {
+                v2ManualBleHoldUntilMs = requestedUntil;
+            }
+        }
     }
     bool autoCond = plugged && !rtcDeepOnUsb && batteryPct > BLE_AUTO_PCT;
     lastBleAuto = autoCond;
@@ -3401,6 +3812,8 @@ static void enterBleOn(bool userInitiated) {
 static void bleOff(const char *reason) {
     if (!bleOn) return;
     bleOn = false;
+    traceSetStage(TRACE_STAGE_BLE_OFF);
+    if (!strcmp(reason, "user click")) v2ManualBleHoldUntilMs = 0;
     lastBleAuto = false;
     bleRadioMark(false);
     bleAdvertiseStop();
@@ -3475,6 +3888,8 @@ static void pollWifi() {
     if (nowUp) {
         if (!wifiUp) {
             wifiUp = true;
+            traceSetTransport(2);
+            traceSetStage(TRACE_STAGE_WIFI_IP);
             wifiLostHandled = false;
             wifiLostSince = 0;
             rtcRetryStage = 0;
@@ -3505,6 +3920,9 @@ static void pollWifi() {
         return;
     }
     if (millis() - wifiLostSince < WIFI_LOST_MS) return;
+    if (v2BundleReady && v2ManualBleHoldActive()) {
+        return;
+    }
     wifiLostHandled = true;
     if (bleOn) bleOff("wifi lost");
     if (plugged && !rtcDeepOnUsb) {
@@ -3580,16 +3998,59 @@ static void v2Response(int status, const String &body) {
     if (deserializeJson(doc, body)) return;
     doc["ack"] = "v2";
     doc["request_id"] = v2RequestId;
+    doc["wake_generation"] = rtcWakeGeneration;
+    doc["wake_seq"] = rtcTraceCurrentSeq;
+    const bool historyReply = !doc["records"].isNull();
+    if (!historyReply) {
+        doc["wake_stage"] = traceCurrent() ? traceStageName(traceCurrent()->furthest) : "none";
+        doc["wake_cause"] = wakeCauseName(bootWakeCause);
+    }
     String reply;
     serializeJson(doc, reply);
+    JsonArray records = doc["records"].as<JsonArray>();
+    while (reply.length() > 480 && !records.isNull() && records.size()) {
+        records.remove(records.size() - 1);
+        doc["more"] = true;
+        reply = "";
+        serializeJson(doc, reply);
+    }
+    traceSetTransport(1);
+    traceSetStage(TRACE_STAGE_REPLY);
     bleNotifyStatusQuiet(reply);
 }
 
-static String v2BodyBridgeId(const String &body) {
+static String v2BodyBridgeId(File &file) {
     JsonDocument doc;
-    if (deserializeJson(doc, body)) return server.arg("bridge_id");
+    JsonDocument filter;
+    filter["bridge_id"] = true;
+    if (!file.seek(0) || deserializeJson(doc, file, DeserializationOption::Filter(filter))) {
+        return server.arg("bridge_id");
+    }
     const char *id = doc["bridge_id"] | "";
     return strlen(id) ? String(id) : server.arg("bridge_id");
+}
+
+static bool v2FileCrc(File &file, uint32_t length, uint32_t &crc) {
+    if (file.size() != length || !file.seek(0)) return false;
+    uint8_t buf[256];
+    uint32_t state = 0xFFFFFFFFu;
+    uint32_t readTotal = 0;
+    while (readTotal < length) {
+        size_t want = length - readTotal;
+        if (want > sizeof(buf)) want = sizeof(buf);
+        size_t got = file.read(buf, want);
+        if (!got) return false;
+        for (size_t i = 0; i < got; i++) {
+            state ^= buf[i];
+            for (int b = 0; b < 8; b++) {
+                state = (state >> 1) ^ (0xEDB88320u &
+                    (uint32_t)(-(int32_t)(state & 1)));
+            }
+        }
+        readTotal += got;
+    }
+    crc = ~state;
+    return readTotal == length;
 }
 
 static bool v2OwnerOk(const char *bridgeId) {
@@ -3647,6 +4108,10 @@ static bool v2Command(const String &body, JsonDocument &doc) {
         v2Ack("command", "rejected", "unchanged", "ram", "session", -1, 0, nullptr, UINT32_MAX);
         return false;
     }
+    traceSetTransport(v2ReplyOverBle ? 1 : 2);
+    traceSetRequest(request);
+    traceSetStage(TRACE_STAGE_COMMAND);
+    if (!v2ReplyOverBle) traceMarkHttp(true, 200);
     return true;
 }
 
@@ -3657,14 +4122,20 @@ static void handleV2Status() {
     DevLog.printf("[v2] req status heap=%u", (unsigned)ESP.getFreeHeap());
     String mac;
     if (!endpointTokenAuthorized(mac)) {
+        traceMarkHttp(false, 401);
         server.send(401, "application/json", "{\"result\":\"unauthorized\"}");
         return;
     }
+    traceMarkHttp(true, 200);
     markSynced();   // authenticated bridge contact (v2 HTTP channel)
     JsonDocument doc;
     doc["result"] = "applied";
     doc["protocol"] = 2;
     doc["device_mac"] = macText();
+    doc["wake_generation"] = rtcWakeGeneration;
+    doc["wake_seq"] = rtcTraceCurrentSeq;
+    doc["wake_stage"] = traceCurrent() ? traceStageName(traceCurrent()->furthest) : "none";
+    doc["wake_cause"] = wakeCauseName(bootWakeCause);
     doc["session_nonce"] = v2Nonce();
     doc["active_context_id"] = v2Profile.contextId;
     doc["active_template_id"] =
@@ -3790,6 +4261,9 @@ static void applyV2Plan(const String &body) {
     plan.mode = strcmp(mode, "light") == 0 ? V2_PLAN_LIGHT : V2_PLAN_SLEEP;
     plan.lightDurationS = doc["light_duration_s"] | 0u;
     plan.rendezvousPeriodS = doc["rendezvous_period_s"] | V2_RENDEZVOUS_S;
+    uint32_t historyMs = doc["history_sync_ms"] | 0u;
+    if (historyMs > 2500) historyMs = 2500;
+    v2HistorySyncMs = historyMs;
     V2PlanAck rc = v2Plan.accept(plan, v2NowMs(), false,
                                  v2Provisional ? V2_BOOT_PROVISIONAL_S : V2_MAX_LIGHT_S);
     if (rc == V2_PLAN_STALE_ID || rc == V2_PLAN_CONFLICT) {
@@ -3812,6 +4286,9 @@ static void applyV2Plan(const String &body) {
         v2LightDeadlineMs = 0;
         v2Provisional = false;
         DevLog.printf("[v2] plan %lu sleep\n", (unsigned long)plan.planId);
+    }
+    if (v2ReplyOverBle && v2HistorySyncMs) {
+        v2HistorySyncUntilMs = v2NowMs() + v2HistorySyncMs;
     }
     v2Ack("plan", "applied", rtcMode == MODE_LIGHT ? "unchanged" : "unchanged", "ram",
           nullptr, -1, plan.planId, v2Profile.contextId, v2Plan.grantedS());
@@ -4036,24 +4513,23 @@ static void handleV2BundleCommit() {
         !v2Rx.complete(doc["length"] | 0u, crc, v2NowMs())) { v2BundleError("session_or_length"); return; }
     File f = LittleFS.open(v2RxPath, "r");
     if (!f || f.size() != v2Rx.length) { if (f) f.close(); v2BundleError("length"); return; }
-    String body;
-    if (!body.reserve(v2Rx.length)) {
+    uint32_t fileCrc = 0;
+    if (!v2FileCrc(f, v2Rx.length, fileCrc) || fileCrc != crc) {
         f.close();
-        v2BundleError("oom");
+        v2BundleError("crc");
         return;
     }
-    while (f.available()) body += (char)f.read();
-    f.close();
-    if (body.length() != v2Rx.length || v2CrcOf(body) != crc) { v2BundleError("crc"); return; }
-    if (v2BodyBridgeId(body) != owner) { v2BundleError("owner"); return; }
+    if (v2BodyBridgeId(f) != owner) { f.close(); v2BundleError("owner"); return; }
     JsonDocument idFilter, idDoc;
     idFilter["job_id"] = true;
-    if (deserializeJson(idDoc, body, DeserializationOption::Filter(idFilter))) {
+    if (!f.seek(0) || deserializeJson(idDoc, f, DeserializationOption::Filter(idFilter))) {
+        f.close();
         v2BundleError("json"); return;
     }
     const char *jobId = idDoc["job_id"] | "";
     uint32_t activeCrc = 0;
     if (bsActiveJobPayload(jobId, activeCrc)) {
+        f.close();
         if (activeCrc != crc) { v2BundleError("request_conflict"); return; }
         bsProfile(v2Profile);
         v2CommittedOwner = owner; v2CommittedRequest = request;
@@ -4068,9 +4544,11 @@ static void handleV2BundleCommit() {
     char ctx[BS_CTX_LEN];
     snprintf(ctx, sizeof(ctx), "%08x%08x", v2CtxGen.next(), (unsigned)esp_random());
     String err;
-    if (!bsInstall(body, FW_TARGET_ID, RENDER_TARGET_ID, ctx, err)) {
+    if (!bsInstall(f, v2Rx.length, crc, FW_TARGET_ID, RENDER_TARGET_ID, ctx, err)) {
+        f.close();
         v2BundleError(err.c_str()); return;
     }
+    f.close();
     v2CommittedOwner = owner; v2CommittedRequest = request;
     v2CommittedCrc = crc; v2CommittedLength = v2Rx.length; v2CommittedContext = ctx;
     v2Rx.deadline = 0;
@@ -4109,6 +4587,9 @@ static void serviceV2Ble() {
         v2Ack("command", "rejected", "unchanged", "ram",
               authenticated ? "disabled" : "unauthorized", -1, 0, nullptr, UINT32_MAX);
     } else {
+        traceSetTransport(1);
+        traceSetRequest(doc["request_id"] | "");
+        traceSetStage(TRACE_STAGE_COMMAND);
         // Plan C: the bridge stamps server_time/tz_offset_min into every
         // rendezvous command (status/plan/data); adopt them before any handler
         // renders or replies. Missing fields keep the local RTC fallback.
@@ -4134,8 +4615,20 @@ static void serviceV2Ble() {
             state["power"]["remaining_s"] = v2Plan.remainingS(v2NowMs());
             state["power"]["provisional_remaining_s"] = v2Provisional ?
                 V2PlanState::bootProvisionalRemaining(v2BootMs, v2NowMs()) : 0;
+            state["power"]["manual_ble_hold_remaining_s"] = v2ManualBleHoldRemainingS();
             String out;
             serializeJson(state, out);
+            v2Response(200, out);
+        } else if (!strcmp(op, "history")) {
+            if (v2HistorySyncMs) v2HistorySyncUntilMs = v2NowMs() + v2HistorySyncMs;
+            const uint32_t since = doc["since"] | 0u;
+            uint8_t limit = doc["limit"] | 8u;
+            if (!limit) limit = 1;
+            if (limit > HIST_CAP) limit = HIST_CAP;
+            bool more = false;
+            // Keep room for the authenticated ACK envelope and request id;
+            // never let diagnostics consume the normal status/data path.
+            String out = traceHistoryJson(since, limit, 350, more);
             v2Response(200, out);
         } else if (!strcmp(op, "data")) {
             applyV2Data(body);
@@ -4155,6 +4648,8 @@ static void serviceV2Ble() {
 static void v2RendezvousRender(bool light);
 static bool v2Rendezvous() {
     v2InRendezvous = true;
+    v2HistorySyncMs = 0;
+    v2HistorySyncUntilMs = 0;
     enterBleOn(false);
     const uint64_t windowStart = v2NowMs();
     uint64_t deadline = windowStart + V2_RENDEZVOUS_WINDOW_MS;
@@ -4162,6 +4657,7 @@ static bool v2Rendezvous() {
     uint64_t connectedAt = 0;
     while (v2NowMs() < deadline) {
         blePoll();
+        tracePollConnection();
         serviceV2Ble();
         if (!connectedAt && bleIsConnected()) {
             // The central is in; the wait deadline is done. Give the command
@@ -4173,7 +4669,10 @@ static bool v2Rendezvous() {
         }
         if (v2Plan.accepted()) {
             if (!answeredAt) answeredAt = v2NowMs();
-            if (v2NowMs() - answeredAt >= V2_RENDEZVOUS_ACK_GRACE_MS) break;
+            const uint64_t normalUntil = answeredAt + V2_RENDEZVOUS_ACK_GRACE_MS;
+            const uint64_t historyUntil = v2HistorySyncUntilMs;
+            const uint64_t closeAt = historyUntil > normalUntil ? historyUntil : normalUntil;
+            if (v2NowMs() >= closeAt) break;
         }
         delay(10);
     }
@@ -4379,6 +4878,8 @@ static bool configureWifiPowerSave() {
 
 static void startNormalMode(bool skipConnect = false) {
     configMode = false;
+    traceSetTransport(2);
+    traceSetStage(TRACE_STAGE_WIRELESS);
     hostname = "codex-status-" + macSuffix();
     // Keep the active TZ (NVS/bridge-provided); a hard-coded "CST-8" here used
     // to clobber a bridge-synced timezone on every light start.
@@ -4420,6 +4921,7 @@ static void startNormalMode(bool skipConnect = false) {
     server.begin();
 
     if (wifiUp) {
+        traceSetStage(TRACE_STAGE_WIFI_IP);
         wifiLostHandled = false;
         wifiLostSince = 0;
         lastBattCheck = millis();
@@ -4590,6 +5092,8 @@ static bool deepFastConnect() {
         while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) delay(50);
     }
     bool up = WiFi.status() == WL_CONNECTED;
+    traceSetTransport(2);
+    if (up) traceSetStage(TRACE_STAGE_WIFI_IP);
     DevLog.printf("[deep] wifi %s fast=%d %ums ip=%s\n", up ? "up" : "fail",
                   fast ? 1 : 0, (unsigned)(millis() - t0),
                   up ? WiFi.localIP().toString().c_str() : "-");
@@ -4646,7 +5150,10 @@ static bool deepNetDue() {
 static int deepNetworkCycle() {
     const time_t before = timeKnown() ? time(nullptr) : 0;
     setStage(10);
+    traceSetTransport(2);
+    traceSetStage(TRACE_STAGE_WIRELESS);
     if (!deepFastConnect()) {
+        traceSetError(TRACE_ERR_WIFI);
         setStage(13);
         rtcNetFails++;
         histAdd(HIST_NET_FAIL, 0);
@@ -4660,6 +5167,7 @@ static int deepNetworkCycle() {
     }
     EndpointRec rec;
     if (!pickEndpoint(rec)) {
+        traceSetError(TRACE_ERR_ENDPOINT);
         setStage(13);
         rtcNetFails++;
         histAdd(HIST_NET_FAIL, 0);
@@ -4672,6 +5180,7 @@ static int deepNetworkCycle() {
     String body, err;
     const uint32_t t0 = millis();
     bool ok = usageHttpGet(rec, body, err, 4000, path);
+    traceMarkHttp(ok, ok ? 200 : 0);
     DevLog.printf("[deep] pull %s:%u %lums %s len=%u\n",
                   rec.host.c_str(), rec.port, (unsigned)(millis() - t0),
                   ok ? "ok" : err.c_str(), (unsigned)body.length());
@@ -4687,6 +5196,8 @@ static int deepNetworkCycle() {
     }
     JsonDocument doc;
     if (deserializeJson(doc, body) || doc.as<JsonObject>().isNull()) {
+        traceSetError(TRACE_ERR_JSON);
+        traceSetResult(TRACE_RESULT_HTTP_FAILED, TRACE_ERR_JSON);
         setStage(13);
         rtcNetFails++;
         histAdd(HIST_NET_FAIL, 0);
@@ -5042,6 +5553,7 @@ void setup() {
 #endif
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
     bootWakeCause = cause;
+    traceBegin(cause);
     rtcLastWake = (uint8_t)cause;
     rtcStage = 1;
     if (cause != ESP_SLEEP_WAKEUP_TIMER) {
@@ -5091,6 +5603,7 @@ void setup() {
     wakeResult = deepTimerBoot ? WAKE_NET : WAKE_LIGHT;
     if (deepClockOnlyBoot) {
         wakeResult = WAKE_THIN;
+        traceMarkThin();
         if (deepThinWake()) sleepToNextEvent();
     }
 
@@ -5441,6 +5954,7 @@ void loop() {
         return;
     }
     blePoll();
+    tracePollConnection();
     serviceV2Ble();
 
     static uint32_t pwrDownAt = 0;
@@ -5462,7 +5976,8 @@ void loop() {
     if (configMode) {
         // AP without credentials: battery sleeps after 5 idle minutes (buttons
         // only); plugged stays awake so provisioning/serial stay available.
-        if (!plugged && millis() - configStartedAt > CONFIG_IDLE_MS) {
+        if (!plugged && millis() - configStartedAt > CONFIG_IDLE_MS &&
+            !v2ManualBleHoldActive()) {
             DevLog.println("[config] AP idle timeout (battery): deep sleep");
             deepSleepFor(0);
         }
@@ -5560,19 +6075,22 @@ void loop() {
     // claims and status polls never do. The BOOT provisional 300 s closes the
     // radio when the Bridge stays unreachable (v2 §7/§12).
     if (v2BundleReady && rtcMode == MODE_LIGHT && (!plugged || rtcDeepOnUsb)) {
-        if (v2Plan.accepted()) {
-            if (!v2Plan.lightActive(v2NowMs())) {
-                DevLog.printf("[v2] formal light window ended (%s)\n", v2PlanReason.c_str());
-                enterDeep("v2 plan");
+        const uint64_t nowV2 = v2NowMs();
+        if (!v2ManualBleHoldActive()) {
+            if (v2Plan.accepted()) {
+                if (!v2Plan.lightActive(nowV2)) {
+                    DevLog.printf("[v2] formal light window ended (%s)\n", v2PlanReason.c_str());
+                    enterDeep("v2 plan");
+                }
+            } else if (v2Provisional &&
+                       V2PlanState::bootProvisionalRemaining(v2BootMs, nowV2) == 0) {
+                DevLog.println("[v2] boot provisional 300s expired without a formal plan");
+                enterDeep("v2 provisional");
+            } else if (!v2Provisional && v2SafetyDeadlineMs &&
+                       nowV2 >= v2SafetyDeadlineMs) {
+                DevLog.println("[v2] no formal plan within the max light lease; sleeping");
+                enterDeep("v2 safety");
             }
-        } else if (v2Provisional &&
-                   V2PlanState::bootProvisionalRemaining(v2BootMs, v2NowMs()) == 0) {
-            DevLog.println("[v2] boot provisional 300s expired without a formal plan");
-            enterDeep("v2 provisional");
-        } else if (!v2Provisional && v2SafetyDeadlineMs &&
-                   v2NowMs() >= v2SafetyDeadlineMs) {
-            DevLog.println("[v2] no formal plan within the max light lease; sleeping");
-            enterDeep("v2 safety");
         }
     }
 

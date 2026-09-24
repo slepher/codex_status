@@ -286,10 +286,88 @@ size_t bsFreeBytes() {
     return LittleFS.totalBytes() - LittleFS.usedBytes();
 }
 
-bool bsInstall(const String &bundleJson, const char *expectedFirmware,
-               const char *expectedRender, const char *newContextId, String &err) {
+namespace {
+
+struct StringBundleInput {
+    const String &value;
+    size_t offset = 0;
+
+    size_t size() const { return value.length(); }
+    bool rewind() { offset = 0; return true; }
+    size_t read(uint8_t *out, size_t len) {
+        size_t remaining = value.length() - offset;
+        if (len > remaining) len = remaining;
+        if (len) memcpy(out, value.c_str() + offset, len);
+        offset += len;
+        return len;
+    }
+};
+
+struct FileBundleInput {
+    File &file;
+
+    size_t size() const { return file.size(); }
+    bool rewind() { return file.seek(0); }
+    size_t read(uint8_t *out, size_t len) { return file.read(out, len); }
+};
+
+static DeserializationError parseBundle(StringBundleInput &source,
+                                        JsonDocument &doc, JsonDocument &filter) {
+    return deserializeJson(doc, source.value, DeserializationOption::Filter(filter));
+}
+
+static DeserializationError parseBundle(FileBundleInput &source,
+                                        JsonDocument &doc, JsonDocument &filter) {
+    if (!source.rewind()) return DeserializationError::EmptyInput;
+#ifdef ARDUINO
+    return deserializeJson(doc, source.file, DeserializationOption::Filter(filter));
+#else
+    String body;
+    uint8_t buf[256];
+    while (source.file.available()) {
+        size_t got = source.file.read(buf, sizeof(buf));
+        if (!got) break;
+        if (!body.concat((const char *)buf, got)) return DeserializationError::NoMemory;
+    }
+    return deserializeJson(doc, body, DeserializationOption::Filter(filter));
+#endif
+}
+
+static uint32_t crcUpdate(uint32_t crc, const uint8_t *data, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int b = 0; b < 8; b++) {
+            crc = (crc >> 1) ^ (0xEDB88320u & (uint32_t)(-(int32_t)(crc & 1)));
+        }
+    }
+    return crc;
+}
+
+template <typename Input>
+static bool appendBundle(Input &source, File &out, size_t len, uint32_t &crc) {
+    if (!source.rewind()) return false;
+    uint8_t buf[256];
+    uint32_t state = 0xFFFFFFFFu;
+    size_t copied = 0;
+    while (copied < len) {
+        size_t want = len - copied;
+        if (want > sizeof(buf)) want = sizeof(buf);
+        size_t got = source.read(buf, want);
+        if (!got || !writeAll(out, buf, got)) return false;
+        state = crcUpdate(state, buf, got);
+        copied += got;
+    }
+    crc = ~state;
+    return copied == len;
+}
+
+template <typename Input>
+static bool bsInstallSource(Input &source, uint32_t expectedPayloadCrc,
+                            const char *expectedFirmware, const char *expectedRender,
+                            const char *newContextId, String &err) {
+    const size_t bundleLength = source.size();
     if (!g_mounted) { err = "fs"; return false; }
-    if (bundleJson.length() == 0 || bundleJson.length() > BS_MAX_BUNDLE_BYTES) {
+    if (bundleLength == 0 || bundleLength > BS_MAX_BUNDLE_BYTES) {
         err = "size";
         return false;
     }
@@ -306,9 +384,8 @@ bool bsInstall(const String &bundleJson, const char *expectedFirmware,
     filter["templates"][0]["key"]["template_id"] = true;
     filter["templates"][0]["key"]["render_target"] = true;
     filter["templates"][0]["source"] = true;
-    filter["templates"][0]["compiled"]["binary"] = true;
     JsonDocument doc;
-    DeserializationError de = deserializeJson(doc, bundleJson, DeserializationOption::Filter(filter));
+    DeserializationError de = parseBundle(source, doc, filter);
     if (de) { err = "json"; return false; }
 
     const char *fw = doc["firmware_target"] | "";
@@ -336,7 +413,7 @@ bool bsInstall(const String &bundleJson, const char *expectedFirmware,
     }
 
     // Shape/target pre-check before any compile or write.
-    uint32_t total = sizeof(SlotHeader) + bundleJson.length();
+    uint32_t total = sizeof(SlotHeader) + bundleLength;
     for (size_t i = 0; i < order.size(); i++) {
         const char *id = order[i] | "";
         if (!strlen(id) || strlen(id) >= BS_ID_LEN) { err = "id"; return false; }
@@ -375,37 +452,23 @@ bool bsInstall(const String &bundleJson, const char *expectedFirmware,
     // ~9 KB compiled record: never on the 8 KB loop-task stack.
     static CtTemplate compiled;
     const size_t blobCap = tplCtSize() + 16;
-    uint8_t *blob = (uint8_t *)malloc(blobCap);
-    if (!blob) { f.close(); err = "oom"; return false; }
     for (size_t i = 0; i < order.size() && ok; i++) {
         JsonObject tpl = templates[i].as<JsonObject>();
         String source;
         serializeJson(tpl["source"], source);
         String cerr;
         size_t written = 0;
-        const char *hex = tpl["compiled"]["binary"] | "";
-        if (*hex) {
-            const size_t chars = strlen(hex);
-            if (chars % 2 || chars / 2 > blobCap) { err = "compiled_size"; ok = false; break; }
-            written = chars / 2;
-            for (size_t j = 0; j < written; ++j) {
-                char word[9] = {'0','0','0','0','0','0',hex[j*2],hex[j*2+1],0};
-                uint32_t byte = 0;
-                if (!v2ParseCrc(word, byte)) { ok = false; break; }
-                blob[j] = (uint8_t)byte;
-            }
-            if (!ok || !tplCtDeserialize(blob, written, compiled, cerr) ||
-                compiled.sourceCrc != v2Crc32((const uint8_t *)source.c_str(), source.length()) ||
-                strcmp(compiled.id, order[i] | "")) {
-                err = "compiled:" + cerr; ok = false; break;
-            }
-        } else {
-            // Compatibility for previously frozen v2 jobs: compile their source
-            // with the very same C++ compiler used by the current Bridge.
-            if (!tplCompile(source, compiled, cerr) ||
-                !tplCtSerialize(compiled, blob, blobCap, written)) {
-                err = "compile:" + cerr; ok = false; break;
-            }
+        // The compiled hex is a cache and can be larger than the free heap on
+        // BLE-enabled 1.54. Rebuild from the retained source instead.
+        if (!tplCompile(source, compiled, cerr)) {
+            err = "compile:" + cerr; ok = false; break;
+        }
+        // Keep this allocation out of the source compiler's peak heap usage.
+        uint8_t *blob = (uint8_t *)malloc(blobCap);
+        if (!blob) { err = "oom"; ok = false; break; }
+        if (!tplCtSerialize(compiled, blob, blobCap, written)) {
+            free(blob);
+            err = "compile:" + cerr; ok = false; break;
         }
         char id[BS_ID_LEN] = {};
         strncpy(id, order[i] | "", sizeof(id) - 1);
@@ -413,11 +476,13 @@ bool bsInstall(const String &bundleJson, const char *expectedFirmware,
         uint32_t len = (uint32_t)written;
         ok = ok && f.write((const uint8_t *)&len, 4) == 4;
         ok = ok && f.write(blob, written) == written;
+        free(blob);
     }
-    free(blob);
     // Retain the exact frozen contract, including source/bindings/resources and
     // the Bridge artifact. The per-template compiled table is only a cache.
-    if (ok) ok = writeAll(f, bundleJson.c_str(), bundleJson.length());
+    uint32_t payloadCrc = 0;
+    if (ok) ok = appendBundle(source, f, bundleLength, payloadCrc);
+    if (ok && payloadCrc != expectedPayloadCrc) { err = "crc"; ok = false; }
     f.close();
     if (!ok) {
         LittleFS.remove(SLOT_PATH[slot]);
@@ -435,8 +500,8 @@ bool bsInstall(const String &bundleJson, const char *expectedFirmware,
     h.count = (uint16_t)order.size();
     h.initial = (uint8_t)initial;
     h.flags = 1; // complete source Bundle appended after the compiled table
-    h.reserved = bundleJson.length();
-    h.payloadCrc = v2Crc32((const uint8_t *)bundleJson.c_str(), bundleJson.length());
+    h.reserved = bundleLength;
+    h.payloadCrc = payloadCrc;
     strncpy(h.jobId, doc["job_id"] | "", sizeof(h.jobId) - 1);
     strncpy(h.contextId, newContextId ? newContextId : "", sizeof(h.contextId) - 1);
     strncpy(h.firmwareTarget, fw, sizeof(h.firmwareTarget) - 1);
@@ -465,6 +530,24 @@ bool bsInstall(const String &bundleJson, const char *expectedFirmware,
     }
     g_profile.count = (uint8_t)order.size();
     return true;
+}
+
+}  // namespace
+
+bool bsInstall(const String &bundleJson, const char *expectedFirmware,
+               const char *expectedRender, const char *newContextId, String &err) {
+    StringBundleInput source{bundleJson};
+    return bsInstallSource(source, v2Crc32((const uint8_t *)bundleJson.c_str(), bundleJson.length()),
+                           expectedFirmware, expectedRender, newContextId, err);
+}
+
+bool bsInstall(File &bundleFile, uint32_t bundleLength, uint32_t bundleCrc,
+               const char *expectedFirmware, const char *expectedRender,
+               const char *newContextId, String &err) {
+    FileBundleInput source{bundleFile};
+    if (source.size() != bundleLength) { err = "length"; return false; }
+    return bsInstallSource(source, bundleCrc, expectedFirmware, expectedRender,
+                           newContextId, err);
 }
 
 bool bsLoadCompiled(uint8_t index, CtTemplate &out, String &err) {
