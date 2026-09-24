@@ -1,5 +1,9 @@
 # Codex Status 项目进度（交接文档）
 
+## Fake ROM Stage C 命令信封：2026-09-24 — 宿主验证通过
+
+claim 已提交 `f030dac`。设备端与宿主现共用 `src/v2_command_envelope.{h,cpp}` 的命令 JSON/session/MAC/request 校验和 ACK JSON 构造；固件 `v2Command` 保持 owner 检查、request_id 更新与按需 nonce 生成顺序，endpoint token 和 BLE 包装仍在设备入口。宿主 render 测试 18/18、`git diff --check` 通过。未接主 Bridge/实机，未构建/烧录 ROM。还需共享 `/v2/status` 并完成宿主端点/存储/时钟/显示接线；见 `project-workflow/fake-rom-simulator/status.md`。
+
 ## Fake ROM Stage C claim 切片：2026-09-24 — 宿主验证通过
 
 Activate 已提交 `dc445ff`；`POST /claim` 的 UTF-8 参数净化、lease/port 归一化与 release/occupied/claim/renew 判定也已抽为固件与宿主共用的 `src/v2_claim_command.{h,cpp}`。设备端设备操作 token、owner NVS、活动计时与 HTTP 回复顺序保留；空 id 仍在 owner 查询前 400，续约不延长 light 活动。宿主 render 测试 17/17、`git diff --check` 通过。未接主 Bridge/实机，未构建/烧录 ROM。Stage C 共享命令决策已覆盖 Data/Plan/Bundle/Activate/claim，宿主端点及存储/时钟/显示适配仍待 Stage D，详见 `project-workflow/fake-rom-simulator/status.md`。

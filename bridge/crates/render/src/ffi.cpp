@@ -8,6 +8,7 @@
 #include "v2_bundle_command.h"
 #include "v2_activate_command.h"
 #include "v2_claim_command.h"
+#include "v2_command_envelope.h"
 #include "bundle_store.h"
 #include "font_asset.h"
 #include "font_store.h"
@@ -633,6 +634,43 @@ int codex_v2_claim_decide(const char *message, int have_owner,
     unchanged["last_seen"] = current.lastSeen;
     unchanged["lease"] = current.lease;
     return (int)serializeJson(result, out, (size_t)cap);
+}
+int codex_v2_command_parse(const char *message, char *out, int cap) {
+    if (!message || !out || cap <= 0) return -99;
+    JsonDocument doc;
+    const char *error = v2ParseCommand(String(message), doc);
+    JsonDocument result;
+    result["parsed"] = !error;
+    if (error) result["error"] = error;
+    else result["bridge_id"] = doc["bridge_id"] | "";
+    return (int)serializeJson(result, out, (size_t)cap);
+}
+int codex_v2_command_check(const char *message, const char *current_mac,
+                           const char *nonce, char *out, int cap) {
+    if (!message || !current_mac || !nonce || !out || cap <= 0) return -99;
+    JsonDocument doc;
+    if (v2ParseCommand(String(message), doc)) return -2;
+    String sessionNonce(nonce);
+    V2CommandSessionDecision decision = v2CheckCommandSession(
+        doc, String(current_mac), &sessionNonce);
+    JsonDocument result;
+    result["accepted"] = decision.accepted;
+    if (decision.error) result["error"] = decision.error;
+    result["bridge_id"] = doc["bridge_id"] | "";
+    result["request_id"] = doc["request_id"] | "";
+    return (int)serializeJson(result, out, (size_t)cap);
+}
+int codex_v2_build_ack(const char *op, const char *result, const char *display,
+                       const char *retention, const char *error, int64_t seq,
+                       uint64_t plan_id, const char *context,
+                       uint32_t accepted_remaining_s, const char *fw_target,
+                       char *out, int cap) {
+    if (!out || cap <= 0) return -99;
+    String body = v2BuildAck(op, result, display, retention, error, seq,
+                             plan_id, context, accepted_remaining_s, fw_target);
+    if (body.length() >= (size_t)cap) return -3;
+    memcpy(out, body.c_str(), body.length() + 1);
+    return (int)body.length();
 }
 uint64_t codex_v2_plan_high(void *p) { return ((V2PlanState *)p)->highId(); }
 int codex_v2_plan_light_active(void *p, uint64_t now_ms) {

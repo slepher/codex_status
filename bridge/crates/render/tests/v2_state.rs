@@ -139,6 +139,32 @@ extern "C" {
         out: *mut std::os::raw::c_char,
         cap: c_int,
     ) -> c_int;
+    fn codex_v2_command_parse(
+        message: *const std::os::raw::c_char,
+        out: *mut std::os::raw::c_char,
+        cap: c_int,
+    ) -> c_int;
+    fn codex_v2_command_check(
+        message: *const std::os::raw::c_char,
+        current_mac: *const std::os::raw::c_char,
+        nonce: *const std::os::raw::c_char,
+        out: *mut std::os::raw::c_char,
+        cap: c_int,
+    ) -> c_int;
+    fn codex_v2_build_ack(
+        op: *const std::os::raw::c_char,
+        result: *const std::os::raw::c_char,
+        display: *const std::os::raw::c_char,
+        retention: *const std::os::raw::c_char,
+        error: *const std::os::raw::c_char,
+        seq: i64,
+        plan_id: u64,
+        context: *const std::os::raw::c_char,
+        accepted_remaining_s: u32,
+        fw_target: *const std::os::raw::c_char,
+        out: *mut std::os::raw::c_char,
+        cap: c_int,
+    ) -> c_int;
     fn codex_v2_plan_high(p: *mut c_void) -> u64;
     fn codex_v2_plan_light_active(p: *mut c_void, now_ms: u64) -> c_int;
     fn codex_v2_boot_remaining(t_boot_ms: u64, now_ms: u64) -> u32;
@@ -467,6 +493,114 @@ fn shared_activate_decision_classifies_replay_and_profile_switches() {
     assert_eq!(decision["error"], "context");
     assert_eq!(decision["saved_request"], "");
     unsafe { codex_v2_activate_free(unconfigured) };
+}
+
+#[test]
+fn shared_command_envelope_checks_session_and_builds_ack_shape() {
+    fn output_from_parse(message: &str) -> serde_json::Value {
+        let message = std::ffi::CString::new(message).unwrap();
+        let mut out = vec![0i8; 2048];
+        let rc = unsafe { codex_v2_command_parse(message.as_ptr(), out.as_mut_ptr(), out.len() as c_int) };
+        assert!(rc > 0);
+        unsafe {
+            serde_json::from_str::<serde_json::Value>(
+                std::ffi::CStr::from_ptr(out.as_ptr()).to_str().unwrap(),
+            )
+            .unwrap()
+        }
+    }
+    fn check(message: &serde_json::Value) -> serde_json::Value {
+        let message = std::ffi::CString::new(message.to_string()).unwrap();
+        let mac = std::ffi::CString::new("70:04:1D:AA:BB:CC").unwrap();
+        let nonce = std::ffi::CString::new("session-nonce").unwrap();
+        let mut out = vec![0i8; 2048];
+        let rc = unsafe {
+            codex_v2_command_check(
+                message.as_ptr(), mac.as_ptr(), nonce.as_ptr(),
+                out.as_mut_ptr(), out.len() as c_int,
+            )
+        };
+        assert!(rc > 0);
+        unsafe {
+            serde_json::from_str::<serde_json::Value>(
+                std::ffi::CStr::from_ptr(out.as_ptr()).to_str().unwrap(),
+            )
+            .unwrap()
+        }
+    }
+    fn ack(error: *const std::os::raw::c_char, seq: i64, plan_id: u64,
+           context: *const std::os::raw::c_char, remaining: u32) -> serde_json::Value {
+        let op = std::ffi::CString::new("plan").unwrap();
+        let result = std::ffi::CString::new("applied").unwrap();
+        let display = std::ffi::CString::new("unchanged").unwrap();
+        let retention = std::ffi::CString::new("ram").unwrap();
+        let target = std::ffi::CString::new("codex-status-test").unwrap();
+        let mut out = vec![0i8; 2048];
+        let rc = unsafe {
+            codex_v2_build_ack(
+                op.as_ptr(), result.as_ptr(), display.as_ptr(), retention.as_ptr(),
+                error, seq, plan_id, context, remaining, target.as_ptr(),
+                out.as_mut_ptr(), out.len() as c_int,
+            )
+        };
+        assert!(rc > 0);
+        unsafe {
+            serde_json::from_str::<serde_json::Value>(
+                std::ffi::CStr::from_ptr(out.as_ptr()).to_str().unwrap(),
+            )
+            .unwrap()
+        }
+    }
+
+    let malformed = output_from_parse("{");
+    assert_eq!(malformed["parsed"], false);
+    assert_eq!(malformed["error"], "json");
+
+    let mut message = serde_json::json!({
+        "bridge_id": "owner-to-check-outside",
+        "protocol": 2,
+        "device_mac": "70:04:1D:AA:BB:CC",
+        "request_id": "r",
+        "session_nonce": "session-nonce",
+    });
+    let parsed = output_from_parse(&message.to_string());
+    assert_eq!(parsed["parsed"], true);
+    assert_eq!(parsed["bridge_id"], "owner-to-check-outside");
+
+    let accepted = check(&message);
+    assert_eq!(accepted["accepted"], true);
+    assert!(accepted.get("error").is_none());
+    assert_eq!(accepted["bridge_id"], "owner-to-check-outside");
+    message["protocol"] = 1.into();
+    assert_eq!(check(&message)["error"], "session");
+    message["protocol"] = 2.into();
+    message["device_mac"] = "70:04:1D:AA:BB:CD".into();
+    assert_eq!(check(&message)["error"], "session");
+    message["device_mac"] = "70:04:1D:AA:BB:CC".into();
+    message["request_id"] = "".into();
+    assert_eq!(check(&message)["error"], "session");
+    message["request_id"] = "x".repeat(65).into();
+    assert_eq!(check(&message)["error"], "session");
+    message["request_id"] = "x".repeat(64).into();
+    assert_eq!(check(&message)["accepted"], true);
+    message["session_nonce"] = "other".into();
+    assert_eq!(check(&message)["error"], "session");
+
+    let minimal = ack(std::ptr::null(), -1, 0, std::ptr::null(), u32::MAX);
+    assert_eq!(minimal, serde_json::json!({
+        "op": "plan", "result": "applied", "display_state": "unchanged",
+        "retention": "ram", "fw_target": "codex-status-test"
+    }));
+    let error = std::ffi::CString::new("plan_limit").unwrap();
+    let context = std::ffi::CString::new("ctx-1").unwrap();
+    let full = ack(error.as_ptr(), 5, 7, context.as_ptr(), 0);
+    assert_eq!(full["error"], "plan_limit");
+    assert_eq!(full["data_seq"], 5);
+    assert_eq!(full["plan_id"], 7);
+    assert_eq!(full["active_context_id"], "ctx-1");
+    assert_eq!(full["accepted_remaining_s"], 0);
+    assert!(full.get("ack").is_none());
+    assert!(full.get("request_id").is_none());
 }
 
 #[test]

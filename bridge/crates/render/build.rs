@@ -48,6 +48,7 @@ fn main() {
         .file(firmware.join("v2_bundle_command.cpp"))
         .file(firmware.join("v2_activate_command.cpp"))
         .file(firmware.join("v2_claim_command.cpp"))
+        .file(firmware.join("v2_command_envelope.cpp"))
         .file(firmware.join("bundle_store.cpp"))
         .file(firmware.join("refresh_policy.cpp"))
         .file(firmware.join("font_asset.cpp"))
@@ -70,6 +71,7 @@ fn main() {
                     "v2_bundle_command.h", "v2_bundle_command.cpp",
                     "v2_activate_command.h", "v2_activate_command.cpp",
                     "v2_claim_command.h", "v2_claim_command.cpp",
+                    "v2_command_envelope.h", "v2_command_envelope.cpp",
                     "bundle_store.h", "bundle_store.cpp", "fonts.h",
                     "font_noto.h", "font_noto_nt16.h", "font_noto_nt30.h",
                     "font_noto_ntthin18.h", "font_noto_ntreg64.h",

@@ -1,5 +1,9 @@
 # Fake ROM 与多设备实验时钟状态
 
+## 2026-09-24：Stage C / Task 12h 命令信封与 ACK 通过宿主验证
+
+在 claim `f030dac` 后，`src/v2_command_envelope.{h,cpp}` 共享 v2 命令 JSON 解析、protocol/MAC/request/nonce 校验和 ACK JSON 字段构造。设备端仍按 parse→owner→request_id→按需生成 nonce→session 的原顺序执行；endpoint token、owner touch/409、HTTP/BLE 回复包装保持 main。宿主测试覆盖非法 JSON、错误协议/MAC/request/nonce、64 字符边界和 ACK 字段省略/包含；`cargo test -p bridge-render --test v2_state` 18/18、`git diff --check` 通过。未构建/烧录 ROM、接主 Bridge 或实机。下一步共享 `/v2/status` 快照，再审查 Stage C 完成条件。
+
 ## 2026-09-24：Stage C / Task 12g claim 决策切片通过宿主验证
 
 在 Activate `dc445ff` 后，`POST /claim` 的参数净化与 release/occupied/claim/renew 动作判定抽为 `src/v2_claim_command.{h,cpp}`。设备端依旧先校验设备操作 token；空 id 在 `ownerGet` 前返回 400；owner NVS 持久化和 `noteActivity` 留在 main，续约不触发活动计时。宿主测试覆盖 UTF-8/控制字符和长度、port/lease 边界、release/冲突/force、同 id 续约及决策不修改当前 owner；`cargo test -p bridge-render --test v2_state` 17/17、`git diff --check` 通过。未构建/烧录 ROM、接主 Bridge 或实机。Stage C 已有 Data/Plan/Bundle/Activate/claim 共享决策，但宿主鉴权、owner 存储/显式时钟、HTTP/BLE、显示副作用仍未接线；不能称为可运行 Fake ROM。下一步先审查 Stage C 完整性，再设计 Stage D。

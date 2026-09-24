@@ -56,6 +56,7 @@
 #include "v2_bundle_command.h"
 #include "v2_activate_command.h"
 #include "v2_claim_command.h"
+#include "v2_command_envelope.h"
 #include "bundle_store.h"
 
 // v2 platform targets (src/platform_target.h): the render/firmware target
@@ -3566,20 +3567,8 @@ static bool v2OwnerOk(const char *bridgeId) {
 static void v2Ack(const char *op, const char *result, const char *display,
                   const char *retention, const char *error, int64_t seq, uint64_t planId,
                   const char *context, uint32_t acceptedRemainingS) {
-    JsonDocument doc;
-    doc["op"] = op;
-    doc["result"] = result;
-    doc["display_state"] = display;
-    doc["retention"] = retention;
-    if (error && *error) doc["error"] = error;
-    if (seq >= 0) doc["data_seq"] = seq;
-    if (planId) doc["plan_id"] = planId;
-    if (context && *context) doc["active_context_id"] = context;
-    if (acceptedRemainingS != UINT32_MAX) doc["accepted_remaining_s"] = acceptedRemainingS;
-    doc["fw_target"] = FW_TARGET_ID;
-    String out;
-    serializeJson(doc, out);
-    v2Response(200, out);
+    v2Response(200, v2BuildAck(op, result, display, retention, error, seq,
+                               planId, context, acceptedRemainingS, FW_TARGET_ID));
 }
 
 // Only authenticated status exposes this boot session nonce.
@@ -3594,16 +3583,20 @@ static const String &v2Nonce() {
 }
 
 static bool v2Command(const String &body, JsonDocument &doc) {
-    if (deserializeJson(doc, body)) {
+    if (v2ParseCommand(body, doc)) {
         v2Ack("command", "rejected", "unchanged", "ram", "json", -1, 0, nullptr, UINT32_MAX);
         return false;
     }
     if (!v2OwnerOk(doc["bridge_id"] | "")) return false;
     const char *request = doc["request_id"] | "";
     v2RequestId = request;
-    if ((doc["protocol"] | 0) != 2 || String(doc["device_mac"] | "") != macText() ||
-        !*request || strlen(request) > 64 ||
-        v2Nonce() != (doc["session_nonce"] | "")) {
+    String currentMac = macText();
+    V2CommandSessionDecision session = v2CheckCommandSession(doc, currentMac, nullptr);
+    if (session.needsNonce) {
+        const String &nonce = v2Nonce();
+        session = v2CheckCommandSession(doc, currentMac, &nonce);
+    }
+    if (!session.accepted) {
         v2Ack("command", "rejected", "unchanged", "ram", "session", -1, 0, nullptr, UINT32_MAX);
         return false;
     }
