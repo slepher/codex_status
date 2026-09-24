@@ -1329,6 +1329,7 @@ static void epdPanelSleep() {
 // Refresh decision: the display-safety layer (design §8) classifies changes by
 // semantic region and budgets; high-ink changes are conservative (full) until
 // the photo gate passes. `rgnPolicyOn=false` keeps the legacy rule at runtime.
+static void clkBaselineAfterPanelWrite(bool full, const DirtyWindow *win);
 static void epdFlush(bool forceFull) {
     if (!frame) return;
     const bool blink = rfnBlink;
@@ -1402,6 +1403,10 @@ static void epdFlush(bool forceFull) {
             if (blink) blinkTicks++;
             if (rgnPolicyOn && !blink) rgnOnPartial(rgnSet);
             if (lastDisplayedFrame) memcpy(lastDisplayedFrame, frame, EPD_FB_BYTES);
+            // Keep the RTC clock baseline in step with the panel: the window path
+            // refuses to write while `clkPixels` disagrees with the driver shadow,
+            // and only this re-capture re-arms it after a frame render.
+            clkBaselineAfterPanelWrite(false, &window);
             epdPanelSleep();
             uint32_t elapsed = millis() - flushT0;
             rfnLastMs = (uint16_t)(elapsed > 0xFFFF ? 0xFFFF : elapsed);
@@ -1434,6 +1439,9 @@ static void epdFlush(bool forceFull) {
         bootRenderCount++;
         rtcClkPartials = 0;   // full waveform clears the clock-window ghosting
         if (lastDisplayedFrame) memcpy(lastDisplayedFrame, frame, EPD_FB_BYTES);
+        // The whole panel now matches `frame`, so the clock window baseline is
+        // trustworthy again (this is what re-arms the partial clock path).
+        clkBaselineAfterPanelWrite(true, nullptr);
         epdBaselineTrusted = true;
         epdPartialReady = TARGET_PARTIAL && EPD_TGT_Init_Partial();
         epdFullLut = false;
@@ -1649,6 +1657,20 @@ static void clkCaptureFromFramebuffer() {
     }
 }
 
+// Re-arm the RTC clock-window baseline after a successful panel write. A full
+// refresh makes the whole frame trustworthy; a region partial only matters when
+// it actually covered the clock window. Defined here (and forward-declared above
+// epdFlush) because the clock state lives further down this file.
+static void clkBaselineAfterPanelWrite(bool full, const DirtyWindow *win) {
+    if (!clkR.valid || !lastDisplayedFrame) return;
+    if (!full) {
+        if (!win) return;
+        if (win->y1 < clkR.y0 || win->y0 > clkR.y1) return;
+        if (win->x1 < clkR.x0b * 8 || win->x0 > clkR.x1b * 8 + 7) return;
+    }
+    clkCaptureFromFramebuffer();
+}
+
 #if defined(CODEX_TARGET_NOTE4)
 static uint32_t note4FrameHash(const uint8_t *pixels) {
     uint32_t hash = 2166136261u;
@@ -1725,10 +1747,12 @@ static bool note4RestoreFrameBaseline(bool thin) {
 }
 #endif
 
-static void clkBlitString(uint8_t *buf, const char *s) {
+static bool clkBlitString(uint8_t *buf, const char *s) {
     if (!tplFontDrawClock(buf, clkR.bw, clkR.rows, clkR.xOff, clkR.fontId, s, clkR.scale)) {
         DevLog.println("[clk] clock font unavailable at blit");
+        return false;
     }
+    return true;
 }
 
 // Clock tick: rebuild only the reserved window and push it to the panel.
@@ -1745,7 +1769,25 @@ static bool clockTickWake() {
     struct tm *lt = localtime(&nowSec);
     char s[8] = "--:--";
     if (lt) strftime(s, sizeof(s), "%H:%M", lt);
-    clkBlitString(buf, s);
+    if (!clkBlitString(buf, s)) return false;
+    // The reserved window must actually hold the string. A blit that had to drop
+    // ink (or a string wider than the window) would leave the previous frame's
+    // pixels in the clipped tail, so escalate to a full frame instead of writing
+    // a half-updated clock window.
+    const int clipped = tplFontClockClipped();
+    const int avail = clkR.bw * 8 - clkR.xOff;
+    const int need = tplFontPropWidth(clkR.fontId, clkR.scale, s);
+    if (clipped > 0 || (need > 0 && need > avail)) {
+        rtcEpdBusyFails++;
+        rtcClkPartials = CLK_GHOST_LIMIT;
+        clkPixelsValid = false;
+        epdPartialReady = false;
+        epdFullLut = false;
+        epdAsleep = false;
+        DevLog.printf("[clk] window %dx%d too narrow for \"%s\" (%d>%d clipped=%d); full refresh required\n",
+                      clkR.bw * 8, clkR.rows, s, need, avail, clipped);
+        return false;
+    }
     const int x0 = clkR.x0b * 8, x1 = clkR.x1b * 8 + 7;
     const uint64_t t1 = esp_timer_get_time();
     bool ok = EPD_TGT_WakePartialWindow(x0, clkR.y0, x1, clkR.y1,

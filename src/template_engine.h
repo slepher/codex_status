@@ -57,6 +57,16 @@ bool tplFontClockBox(int idx, int scale, int &w, int &h);
 bool tplFontDrawClock(uint8_t *win, int winBytesPerRow, int winRows, int xOff,
                       int idx, const char *text, int scale);
 
+// Advance width (px) of `text` in the proportional family; 0 for bitmap fonts or
+// unknown indexes. Used to check that a reserved clock window really fits the
+// string before a partial write clips it.
+int tplFontPropWidth(int idx, int scale, const char *text);
+
+// Ink pixels the LAST tplFontDrawClock() blit had to drop because they fell
+// outside the window. Non-zero means the reserved window is too narrow for the
+// string, so that partial write must not be trusted. Reading it clears it.
+int tplFontClockClipped();
+
 // Render-target canvas (v2 §5): the engine is target-parameterized so one
 // binary family serves 200x200 and 400x300 panels. Called at boot and by the
 // host harness; defaults to TARGET_WIDTH x TARGET_HEIGHT.

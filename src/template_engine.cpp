@@ -639,19 +639,25 @@ bool tplFontClockBox(int idx, int scale, int &w, int &h) {
     }
     const Note4PropFont *p = propFontByIndex(idx);
     if (!p) return false;
-    // Widest possible "HH:MM": both digits use the widest digit advance, so the
-    // reserved window fits whatever the clock shows. The +2 px covers glyph
-    // boxes that overhang their advance; the window is byte-aligned anyway.
+    // Widest possible "HH:MM": four digits (all share the widest digit advance)
+    // plus the colon, so the reserved window always fits whatever the clock
+    // shows. The +2 px covers glyph boxes that overhang their advance; the window
+    // is byte-aligned anyway. `2 * digitAdv` here used to under-count by two
+    // digits (26 px window for a 44 px string), which made the partial window
+    // write clip the trailing glyphs and leave the previous frame's ink there.
     int digitAdv = 0;
     for (char c = '0'; c <= '9'; c++) {
         int a = p->glyphs[c - ' '].adv;
         if (a > digitAdv) digitAdv = a;
     }
-    long adv = 2L * digitAdv + p->glyphs[':' - ' '].adv;
+    long adv = 4L * digitAdv + p->glyphs[':' - ' '].adv;
     w = (int)((adv * scale + 8) / 16) + 2;
     h = (int)p->lineHeight * scale;
     return true;
 }
+
+// Ink pixels dropped by the last tplFontDrawClock() call (see the accessor).
+static int sClockClipped = 0;
 
 bool tplFontDrawClock(uint8_t *win, int bw, int rows, int xOff, int idx,
                       const char *text, int scale) {
@@ -659,8 +665,12 @@ bool tplFontDrawClock(uint8_t *win, int bw, int rows, int xOff, int idx,
     const int bufW = bw * 8;
     // Ink only: the window buffer already holds the background (the caller
     // restores it from the captured window before the write).
+    // `clipped` counts ink pixels the window could not hold: that is never
+    // normal, and it used to hide a wrong reserved width behind a "successful"
+    // partial write (the dropped tail kept the previous frame's ink).
+    sClockClipped = 0;
     auto put = [&](int px, int py) {
-        if (px < 0 || py < 0 || px >= bufW || py >= rows) return;
+        if (px < 0 || py < 0 || px >= bufW || py >= rows) { sClockClipped++; return; }
         win[py * bw + (px >> 3)] &= (uint8_t)~(0x80 >> (px & 7));
     };
     sFONT *f = fontByIndex(idx);
@@ -708,6 +718,30 @@ bool tplFontDrawClock(uint8_t *win, int bw, int rows, int xOff, int idx,
         pen += (long)g.adv * scale;
     }
     return true;
+}
+
+// Ink pixels the last tplFontDrawClock() blit had to drop because they fell
+// outside the window. Non-zero means the reserved window is too small for the
+// string; the caller must not trust that partial write. Reading it clears it.
+int tplFontClockClipped() {
+    const int v = sClockClipped;
+    sClockClipped = 0;
+    return v;
+}
+
+// Advance width (px) of `text` in the proportional family, same metrics the
+// renderer uses, so a caller can verify a reserved window really fits before
+// writing it.
+int tplFontPropWidth(int idx, int scale, const char *text) {
+    if (!text || scale < 1) return 0;
+    const Note4PropFont *p = propFontByIndex(idx);
+    if (!p) return 0;
+    long adv = 0;
+    for (const char *c = text; *c; c++) {
+        const char ch = (*c < ' ' || *c > '~') ? '?' : *c;
+        adv += p->glyphs[ch - ' '].adv;
+    }
+    return (int)((adv * scale + 8) / 16);
 }
 
 static void ctCopy(char *dst, size_t cap, const char *src) {
