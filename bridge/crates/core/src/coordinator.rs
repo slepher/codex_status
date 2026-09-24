@@ -125,6 +125,14 @@ pub struct PlanState {
     pub last_explicit_light_ack: Option<ExplicitLightAck>,
     #[serde(default)]
     pub light_hold_until: u64,
+    /// Physical-wake (BOOT/button) window deadline. The device reports
+    /// `provisional_remaining_s` only until the first formal plan is accepted, so
+    /// the Bridge remembers `t_boot + BOOT_PROVISIONAL_S` here and keeps granting
+    /// light until it expires: a rendezvous plan may extend but never cut it
+    /// short (docs/generic-display-platform-design-v2.md §7, docs/power-state.md
+    /// §13.3). Only the explicit plan entry points may end it earlier.
+    #[serde(default)]
+    pub manual_until: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -198,6 +206,7 @@ pub struct Coordinator {
 
 pub const DEFAULT_FULL_SYNC_S: u64 = 3600;
 pub const MAX_LIGHT_S: u32 = 600;
+pub const MIN_LIGHT_S: u32 = 30;
 pub const RENDEZVOUS_S: u32 = 60;
 pub const BOOT_PROVISIONAL_S: u32 = 300;
 
@@ -642,7 +651,10 @@ impl Coordinator {
         light_s: u32,
         reason: &str,
     ) -> PowerPlan {
-        let light_s = light_s.clamp(30, MAX_LIGHT_S.min(self.caps.max_light_s));
+        let light_s = light_s.clamp(
+            MIN_LIGHT_S,
+            MAX_LIGHT_S.min(self.caps.max_light_s),
+        );
         let desired = if want_light {
             PowerPlan::light(0, light_s, RENDEZVOUS_S, reason)
         } else {
@@ -675,8 +687,33 @@ impl Coordinator {
         plan
     }
 
-    /// BOOT provisional: the formal plan may shorten/keep/extend; keeping the
-    /// original window sends the *remaining* seconds, never a fresh 300.
+    /// Remember a physical (BOOT/button) wake: the window ends at
+    /// `t_boot + BOOT_PROVISIONAL_S`. Repeated reports during the same session
+    /// never move it forward.
+    pub fn note_manual_window(&mut self, t_boot: u64) -> u64 {
+        let until = t_boot.saturating_add(BOOT_PROVISIONAL_S as u64);
+        if until > self.plan.manual_until {
+            self.plan.manual_until = until;
+        }
+        self.plan.manual_until
+    }
+
+    /// Seconds left of the physical-wake window; clears it once it has passed.
+    pub fn manual_remaining(&mut self, now: u64) -> u32 {
+        if self.plan.manual_until == 0 {
+            return 0;
+        }
+        if now >= self.plan.manual_until {
+            self.plan.manual_until = 0;
+            return 0;
+        }
+        (self.plan.manual_until - now).min(u32::MAX as u64) as u32
+    }
+
+    /// BOOT provisional: the formal plan may keep/extend the physical-wake
+    /// window but never shorten it — the effective deadline is
+    /// `max(formal plan, t_boot + BOOT_PROVISIONAL_S)`. Only the explicit entry
+    /// points (`explicit_plan` / `queue_explicit_light`) may end it earlier.
     pub fn boot_plan(
         &mut self,
         now: u64,
@@ -686,17 +723,21 @@ impl Coordinator {
     ) -> PowerPlan {
         let elapsed = now.saturating_sub(t_boot) as u32;
         let remaining = BOOT_PROVISIONAL_S.saturating_sub(elapsed).max(1);
-        if !want_light {
+        let max = MAX_LIGHT_S.min(self.caps.max_light_s);
+        // Floor: whatever is still left of the physical wake's own window. A
+        // rendezvous without pending work must not turn it into an early sleep.
+        let floor = self.manual_remaining(now).min(max);
+        if !want_light && floor == 0 {
             return self.plan_for(now, false, 0, "boot");
         }
-        let max = MAX_LIGHT_S.min(self.caps.max_light_s);
         let duration = if light_s == BOOT_PROVISIONAL_S {
             // Keep the original fallback window: send what is left of it.
             remaining.min(max)
         } else {
-            light_s.clamp(30, max)
+            light_s.clamp(MIN_LIGHT_S, max)
         };
-        if duration < 30 {
+        let duration = duration.max(floor);
+        if duration < MIN_LIGHT_S {
             // Too little time left: end the session instead of extending it.
             return self.plan_for(now, false, 0, "boot");
         }
@@ -1235,6 +1276,30 @@ mod tests {
         // Nothing left -> sleep instead of extending the fallback.
         let ended = c2.boot_plan(1400, 1000, true, 300);
         assert_eq!(ended.mode, crate::platform::model::PlanMode::Sleep);
+    }
+
+    #[test]
+    fn physical_wake_window_is_a_floor_and_never_cut_short() {
+        let mut c = coord();
+        // Device reports a button wake 15 s into its 300 s window.
+        c.note_manual_window(1000); // window ends at 1300
+        assert_eq!(c.manual_remaining(1015), 285);
+        // Keeping the fallback sends what is left of it.
+        assert_eq!(c.boot_plan(1015, 1000, true, 300).light_duration_s, 285);
+        // A rendezvous without pending work holds light instead of sleeping.
+        let held = c.boot_plan(1100, 1000, false, 300);
+        assert_eq!(held.mode, crate::platform::model::PlanMode::Light);
+        assert_eq!(held.light_duration_s, 200);
+        // A formal window may extend ...
+        assert_eq!(c.boot_plan(1100, 1000, true, 600).light_duration_s, 600);
+        // ... but never shorten below the physical-wake floor.
+        assert_eq!(c.boot_plan(1100, 1000, true, 100).light_duration_s, 200);
+        // Past the window the ordinary rule returns.
+        assert_eq!(c.manual_remaining(1300), 0);
+        assert_eq!(
+            c.boot_plan(1400, 1000, false, 300).mode,
+            crate::platform::model::PlanMode::Sleep
+        );
     }
 
     #[test]

@@ -280,7 +280,9 @@ DevLog/`/log`），用于证明 light sleep 生效。0.13.0 起同一文本也�
   宽限"判离线。
 - **手动唤醒**：deep 下 BOOT 单击 → light（不常驻，走同一 idle 规则）；再次
   单击 → BLE 会话（`enterBleOn`）；关 BLE 后仍留 light。桥从 announce/pull
-  得知设备醒来并重置 idle 计时。0.15.2 起唤醒流程：不显示 `Connecting:` 页，
+  得知设备醒来并重置 idle 计时。桥侧以 `max(plan, t_boot+300s)` 保底：一次
+  物理唤醒的 300s 窗口是下界，桥在其有效期内即使无待办也不下发 sleep（设备
+  在首个正式 plan 后不再上报 `provisional_remaining_s`，窗口由桥记住）。0.15.2 起唤醒流程：不显示 `Connecting:` 页，
   唤醒立即以正常模板替换 Zzz；Wi-Fi 图标由模板按 `device.state` 条件仅在连上
   后显示，进 deep 时 Zzz 恢复、Wi-Fi 图标消失；连接失败先恢复睡眠帧再按退避
   回 deep（quad v11）。

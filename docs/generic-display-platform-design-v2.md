@@ -152,6 +152,8 @@ WIFI_LIGHT --截止/通信失败硬限/低电--> 有界收尾 → 关无线 → 
 
 BOOT 的通知先走短 BLE 会合，Wi-Fi 连上后也上报 wake_reason；“立即”表示立即尝试通知，不保证 Bridge 已收到。provisional 从物理按键唤醒开始计时，包含 BLE、建连与事务时间；Bridge 不可达时最迟 300 秒结束在线状态，连接失败/低电可更早退出。不得以重连、重复通知或 timer wake 再获得 300 秒。Bridge 正式保持原兜底时发送剩余时长，不重置为新的 300 秒。
 
+**物理唤醒窗口是下界（取大）。** 一次按键/BOOT 唤醒建立 `t_boot + 300s` 后，后继正式 PowerPlan 只能保持或延长它：effective deadline = `max(plan, t_boot + 300s)`。设备只在首个正式 plan 被接受前上报 `provisional_remaining_s`，因此 **Bridge 必须自己记住该窗口**（`PlanState.manual_until`）并在其有效期内即使没有待办也不下发 sleep；只有显式入口（`explicit_plan` / `queue_explicit_light`）可以提前结束。没有待办时 Bridge 按剩余窗口下发 light（而不是 `MAX_LIGHT_S`），否则每 60 秒一次会合会把窗口无限延长。
+
 设备执行安全约束：最大 light lease、最大 rendezvous 周期/无线窗口、事务总截止及停滞截止、低电保护、重复计划幂等。它可以缩短或拒绝危险计划，并报告原因；不能根据数据内容或“用户大概仍活跃”续租。读取、数据传输、claim/owner renew 都不隐式改 light deadline。
 
 light deadline 使用设备单调时钟，`accepted_at + granted_duration`；Bridge 收到实际剩余期限后决定是否发送新 plan_id。新计划可延长、缩短或立即 sleep，重复计划返回原接受结果和当前剩余时长。校时不能移动期限。事务必须在接受前检查剩余期限，到点中止暂存并睡眠；若某硬件操作必须有限收尾，其最大收尾预算包含在事先接受的截止内，不再额外延长 BOOT 300 秒兜底。

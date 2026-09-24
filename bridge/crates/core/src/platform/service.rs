@@ -1427,8 +1427,10 @@ impl PlatformService {
         })
     }
 
-    /// Formal plan for a rendezvous. BOOT keeps its provisional semantics: the
-    /// bridge answers with remaining time or a deliberately different window.
+    /// Formal plan for a rendezvous. A physical (BOOT/button) wake opens a 300 s
+    /// window that later rendezvous must not cut short: the effective deadline is
+    /// `max(formal plan, t_boot + BOOT_PROVISIONAL_S)`. Pending work may extend
+    /// it; only the explicit entry points may end it earlier.
     pub fn plan_for_rendezvous(
         &self,
         mac: &str,
@@ -1442,9 +1444,24 @@ impl PlatformService {
             .and_then(|c| c.plan.pending_explicit_light.as_ref()) {
             return Ok(pending.clone());
         }
+        let manual_boot = if wake_reason == "manual" {
+            // The device reports what is left of its window, so the physical wake
+            // instant (`t_boot`) can be recovered and remembered: it stops
+            // reporting `provisional_remaining_s` as soon as a formal plan is
+            // accepted, but the window itself is still running.
+            let elapsed = crate::coordinator::BOOT_PROVISIONAL_S
+                .saturating_sub(provisional_remaining_s) as u64;
+            let t_boot = now.saturating_sub(elapsed);
+            if let Some(c) = inner.coordinators.get_mut(&mac) {
+                c.note_manual_window(t_boot);
+            }
+            Some(t_boot)
+        } else {
+            None
+        };
         // Light is only granted for real pending work: sync alone does not keep
         // the radio on (v2 §7). Pending data/jobs/activation do.
-        let want_light = inner
+        let work_want_light = inner
             .coordinators
             .get(&mac)
             .map(|c| {
@@ -1459,24 +1476,27 @@ impl PlatformService {
             })
             .unwrap_or(false);
         let c = inner.coordinators.get_mut(&mac).context("unknown device")?;
-        let plan = if wake_reason == "manual" {
-            let t_boot = now.saturating_sub(
-                (crate::coordinator::BOOT_PROVISIONAL_S as u32)
-                    .saturating_sub(provisional_remaining_s) as u64,
-            );
-            c.boot_plan(
+        let manual_remaining = c.manual_remaining(now);
+        let want_light =
+            work_want_light || manual_remaining >= crate::coordinator::MIN_LIGHT_S;
+        let plan = match manual_boot {
+            Some(t_boot) => c.boot_plan(
                 now,
                 t_boot,
                 want_light,
                 crate::coordinator::BOOT_PROVISIONAL_S,
-            )
-        } else {
-            c.plan_for(
-                now,
-                want_light,
-                crate::coordinator::MAX_LIGHT_S,
-                "rendezvous",
-            )
+            ),
+            None => {
+                // Without pending work, light lasts exactly as long as the
+                // physical wake's own window: re-sending MAX_LIGHT_S every
+                // rendezvous would extend it forever.
+                let light_s = if work_want_light {
+                    crate::coordinator::MAX_LIGHT_S
+                } else {
+                    manual_remaining
+                };
+                c.plan_for(now, want_light, light_s, "rendezvous")
+            }
         };
         Ok(plan)
     }
@@ -2213,6 +2233,31 @@ mod tests {
         let hold_until = summary["plan"]["light_hold_until"].as_u64().unwrap();
         assert_eq!(resumed.plan_for_rendezvous(mac, hold_until - 1, "rendezvous", 0).unwrap().mode, PlanMode::Light);
         assert_eq!(resumed.plan_for_rendezvous(mac, hold_until + 1, "rendezvous", 0).unwrap().mode, PlanMode::Sleep);
+    }
+
+    #[test]
+    fn physical_wake_window_survives_follow_up_rendezvous() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = service_with_device(dir.path());
+        let mac = "AA:BB:CC:DD:EE:FF";
+        let now = crate::now_secs();
+        // Button wake reported 15 s into its 300 s window, with nothing pending.
+        let boot = svc.plan_for_rendezvous(mac, now, "manual", 285).unwrap();
+        assert_eq!(boot.mode, PlanMode::Light);
+        assert_eq!(boot.light_duration_s, 285);
+        assert_eq!(
+            svc.note_plan_ack(mac, boot.plan_id, 285, true, now)["outcome"],
+            "accepted"
+        );
+        // The device stops reporting the provisional once a formal plan is
+        // accepted, but the next rendezvous must still hold light until the same
+        // physical-wake deadline instead of cutting it to an early sleep.
+        let follow = svc.plan_for_rendezvous(mac, now + 60, "rendezvous", 0).unwrap();
+        assert_eq!(follow.mode, PlanMode::Light);
+        assert_eq!(follow.light_duration_s, 225);
+        // One second past the window the ordinary sleep decision returns.
+        let after = svc.plan_for_rendezvous(mac, now + 301, "rendezvous", 0).unwrap();
+        assert_eq!(after.mode, PlanMode::Sleep);
     }
 
     #[test]
