@@ -1,0 +1,20 @@
+# Task 12a — 同源 Data 命令核心的第一条切片
+
+状态：主代理设计完成，等待 ROM 文件交接后编码。前置：Bridge 阶段 B/B2 已提交至 `d65091f`；本任务不得与正在编辑 `src/` 的其他代理同时编码。
+
+## 决策
+
+第一条同源路径选 `/v2/data`。现有 `src/v2_runtime.cpp` 的 `v2AcceptData` 已被宿主编译，包含字段、CRC、context 与 seq 校验；但 `src/main.cpp::applyV2Data` 仍独占命令分支、ACK 选择、checkpoint/缓存/显示副作用，因此现有宿主测试还不能称为 Fake ROM 端点。先抽出 **Data 决策核心**，再逐步把认证、owner、存储和显示适配到宿主。Plan、Bundle、Activate、claim 不在本切片内；任何未覆盖请求须明确 unsupported，不返回伪成功。
+
+## 精确实现边界
+
+- 新建 `src/v2_data_command.{h,cpp}`。定义显式输入（编译模板、当前 context、完整 Data JSON、`V2DataSeq`）和结果结构（Data ACK 类别、seq、拒绝原因、序列化 usage/fields、是否首次接受）。唯一实现调用既有 `v2AcceptData`，并统一 `unconfigured/context/rejected/unchanged/conflict/stale/applied` 的分支与 ACK 语义；不能复制一份 Rust 状态机。`V2DataSeq` 只在原行为允许时推进。
+- `src/main.cpp::applyV2Data` 保留已有 endpoint token、owner、protocol/MAC/nonce/request 预检顺序；预检后调用新函数。首次接受时仍按原顺序记录 fields/lastAck/checkpoint、保存 usage、按 HTTP/BLE 分支渲染或标记 pending，最后通过原 `v2Ack` 回复。拒绝与重放不得写缓存或触发显示。**本切片不宣称认证和 side effect 已在宿主共享**。
+- 复用 `bridge/crates/render/build.rs` 的现有 C++ 编译与 shim，把新文件编入同一宿主库；在 `bridge/crates/render/src/ffi.cpp` 增加最小 Data 决策入口供 Rust 测试调用。不要 `#include main.cpp`、复制 ROM 业务分支或新增独立模拟器状态机。一个进程只模拟一台设备，全局宿主 shim 仍可在本切片使用。
+- 当前工作树 `src/` 由另一代理处理；编码必须等其提交或明确交接，并基于届时最新源码重新核对 `applyV2Data` 入口和顺序。不得覆盖其 ROM 改动，也不在 release worktree 并行改这段源码。
+
+## 验收
+
+1. 同一组 Data 输入在宿主执行新 C++ 函数，覆盖合法首次接受、完全重放、同 seq 异内容、旧 seq、错 context、字段 CRC/顺序错误和未配置状态；检查 seq、usage、结果/原因及拒绝时无状态推进。
+2. 固件原 `applyV2Data` 走同一新函数；1.54 与 Note4 构建、现有 render/v2 测试通过，新增宿主测试验证该路径。ROM 并行改动交接前不运行构建或烧录。
+3. 产物说明明确：这是共享 Data 决策切片，尚未支持宿主 HTTP、claim/owner/session、真实持久恢复、显示副作用、Plan/Bundle/Activate、fake BLE/时钟；不得称为可运行 Fake ROM。下一 task 才继续抽取端点完整链路。

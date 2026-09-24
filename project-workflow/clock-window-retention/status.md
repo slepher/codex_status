@@ -1,0 +1,7 @@
+# 1.54 clock-window retention — 2026-09-24
+
+The user observed alternating minute partial and full refreshes on the 1.54-inch device; this observation is not acceptance of that behavior. The v2 rendezvous period is 60 seconds, while the clock wake aligns to minute boundaries. Existing live records already show thin and rendezvous wakes interleaving. On every rendezvous boot, `v2ActiveLoad()` recomputed the same clock region and unconditionally cleared `clkPixelsValid`, so `v2RendezvousClockRender()` chose its no-baseline full-refresh fallback. A thin clock wake runs before that template reload and can still use the retained pixels.
+
+`src/main.cpp` now keeps RTC clock pixels only for the same v2 context and identical clock region, and captures the displayed window after a successful template render. Cold boot, a new context, a changed region, or a failed display still invalidates the baseline and keeps the full-refresh fallback.
+
+Validation: `pio run --project-dir D:\Documents\PlatformIO\Projects\codex_status -e esp32-s3-epaper-154g` succeeded; `git diff --check` passed. The optional Note4 build was stopped during dependency setup; the interrupted PlatformIO shared package was reinstalled and the incomplete quarantine removed. No firmware was flashed, no device behavior was remeasured, and no release ROM was recorded. The next 1.54 hardware check should correlate each minute's `/history` wake kind, clock tick count, and visible refresh type; it must also verify full-refresh fallback after a context/template change.

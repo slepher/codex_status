@@ -91,7 +91,12 @@ pub fn render(percent: Option<i32>, state: State) -> Image<'static> {
     let plate = state.color();
     fill_rect(&mut px, 1, 1, SIZE as i32 - 2, SIZE as i32 - 2, plate);
     // soft corners
-    for (x, y) in [(1, 1), (SIZE as i32 - 2, 1), (1, SIZE as i32 - 2), (SIZE as i32 - 2, SIZE as i32 - 2)] {
+    for (x, y) in [
+        (1, 1),
+        (SIZE as i32 - 2, 1),
+        (1, SIZE as i32 - 2),
+        (SIZE as i32 - 2, SIZE as i32 - 2),
+    ] {
         set_pixel(&mut px, x, y, [0, 0, 0, 0]);
     }
     let text = match percent {

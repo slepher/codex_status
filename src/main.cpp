@@ -72,7 +72,7 @@ static bool targetUnverified = false;
 #define FW_VERSION    "0.13.9-clkwin"
 #elif defined(CODEX_TARGET_NOTE4)
 #ifdef CODEX_NOTE4_ROM_B
-#define FW_VERSION    "0.18.20-note4-b"
+#define FW_VERSION    "0.18.21-note4-b"
 #else
 #define FW_VERSION    "0.18.19-note4-a"
 #endif
@@ -129,6 +129,24 @@ static const int EPD_FB_BYTES = (EPD_W / 8) * EPD_H;
 #define V2_RENDEZVOUS_ACK_GRACE_MS 200
 
 static Preferences prefs;
+#if defined(CODEX_TARGET_NOTE4)
+// NVS `pm/panel_pwr`: 1 keeps the Note4 logic rail on in deep sleep; 0
+// powers it off. Both modes turn the controller's internal HV supply off.
+static bool note4KeepPanelPower = true;
+RTC_DATA_ATTR static uint32_t rtcNote4FrameHash = 0;
+static void note4SaveFrameBaseline();
+static bool note4RestoreFrameBaseline(bool thin);
+static bool setNote4PanelPower(bool keep) {
+    Preferences p;
+    if (!p.begin("pm", false)) return false;
+    const bool saved = p.putUChar("panel_pwr", keep ? 1 : 0) == 1;
+    p.end();
+    if (!saved) return false;
+    note4KeepPanelPower = keep;
+    EPD_SSD2683_SetKeepPower(keep);
+    return true;
+}
+#endif
 static WebServer   server(80);
 static WiFiUDP     announceUdp;
 static UBYTE      *frame = nullptr;
@@ -1166,6 +1184,7 @@ struct ClkRegion {
 RTC_DATA_ATTR static ClkRegion clkR = {};
 RTC_DATA_ATTR static uint8_t  clkPixels[CLK_MAX_BYTES] = {};
 RTC_DATA_ATTR static bool     clkPixelsValid = false;
+RTC_DATA_ATTR static char     rtcClkContextId[BS_CTX_LEN] = {};
 
 // The clock fast path reads the shared font registry (template_engine) instead
 // of keeping its own copy of the font list; both the bitmap family (f8..f24)
@@ -1249,7 +1268,10 @@ static void clkComputeRect() {
 // Compiled-template variant: identical reservation rules without parsing the
 // template JSON at activation time (v2 §8).
 static void clkComputeRectCt() {
+    const ClkRegion previous = clkR;
+    const bool previousPixelsValid = clkPixelsValid;
     clkR.valid = false;
+    clkPixelsValid = false;
     if (!TARGET_PARTIAL) return;
     if (!v2CtValid) return;
     for (uint8_t i = 0; i < v2Ct.opCount; i++) {
@@ -1301,7 +1323,18 @@ static void clkComputeRectCt() {
         clkR.scale = (uint8_t)scale;
         clkR.xOff = (uint8_t)(x - x0);
         clkR.yOff = 0;
-        clkPixelsValid = false;
+        // A rendezvous boot reloads the same compiled template. Its RTC
+        // window pixels still describe the panel unless the context or the
+        // clock region changed; only then must the first wake redraw fully.
+        clkPixelsValid = previousPixelsValid && previous.valid &&
+            v2Profile.contextId[0] != '\0' &&
+            strcmp(rtcClkContextId, v2Profile.contextId) == 0 &&
+            previous.fontId == clkR.fontId &&
+            previous.x0b == clkR.x0b && previous.x1b == clkR.x1b &&
+            previous.y0 == clkR.y0 && previous.y1 == clkR.y1 &&
+            previous.bw == clkR.bw && previous.rows == clkR.rows &&
+            previous.scale == clkR.scale &&
+            previous.xOff == clkR.xOff && previous.yOff == clkR.yOff;
         DevLog.printf("[clk] reserved x=%d..%d y=%d..%d box=%dx%d win=%dx%dB\n",
                       x, x + w - 1, y, y + h - 1, w, h, bw, bytes);
         return;
@@ -1319,7 +1352,86 @@ static void clkCaptureFromFramebuffer() {
                clkR.bw);
     }
     clkPixelsValid = true;
+    if (v2BundleReady) {
+        strncpy(rtcClkContextId, v2Profile.contextId, sizeof(rtcClkContextId) - 1);
+        rtcClkContextId[sizeof(rtcClkContextId) - 1] = '\0';
+    } else {
+        rtcClkContextId[0] = '\0';
+    }
 }
+
+#if defined(CODEX_TARGET_NOTE4)
+static uint32_t note4FrameHash(const uint8_t *pixels) {
+    uint32_t hash = 2166136261u;
+    for (int i = 0; i < EPD_FB_BYTES; ++i)
+        hash = (hash ^ pixels[i]) * 16777619u;
+    return hash ? hash : 1;
+}
+
+// Persist the actual panel image once when entering deep sleep. Thin minute
+// wakes update only the RTC clock window, avoiding a flash write every minute.
+static void note4SaveFrameBaseline() {
+    if (!lastDisplayedFrame) return;  // thin clock wake: cached base is unchanged
+    if (!epdBaselineTrusted) {
+        rtcNote4FrameHash = 0;
+        return;
+    }
+    const uint32_t hash = note4FrameHash(lastDisplayedFrame);
+    if (hash == rtcNote4FrameHash) return;
+    rtcNote4FrameHash = 0;
+    if (!LittleFS.begin(false, "/littlefs", 10, "storage")) return;
+    File file = LittleFS.open("/panel-base.tmp", "w");
+    if (!file) return;
+    const uint32_t header[2] = {0x344E5045u, hash};
+    const bool written = file.write((const uint8_t *)header, sizeof(header)) == sizeof(header) &&
+                         file.write(lastDisplayedFrame, EPD_FB_BYTES) == EPD_FB_BYTES;
+    file.close();
+    if (!written) { LittleFS.remove("/panel-base.tmp"); return; }
+    LittleFS.remove("/panel-base.bin");
+    if (LittleFS.rename("/panel-base.tmp", "/panel-base.bin"))
+        rtcNote4FrameHash = header[1];
+}
+
+static bool note4RestoreFrameBaseline(bool thin) {
+    if (!rtcNote4FrameHash || !LittleFS.begin(false, "/littlefs", 10, "storage"))
+        return false;
+    File file = LittleFS.open("/panel-base.bin", "r");
+    if (!file || file.size() != EPD_FB_BYTES + 8) return false;
+    uint32_t header[2] = {};
+    uint8_t *pixels = thin ? (uint8_t *)malloc(EPD_FB_BYTES) : lastDisplayedFrame;
+    if (!pixels) return false;
+    const bool read = file.read((uint8_t *)header, sizeof(header)) == sizeof(header) &&
+                      file.read(pixels, EPD_FB_BYTES) == EPD_FB_BYTES;
+    file.close();
+    bool valid = read && header[0] == 0x344E5045u &&
+                 header[1] == rtcNote4FrameHash &&
+                 note4FrameHash(pixels) == header[1];
+    if (valid && clkPixelsValid && clkR.valid) {
+        valid = clkR.x0b <= clkR.x1b && clkR.x1b < EPD_W / 8 &&
+                clkR.y0 <= clkR.y1 && clkR.y1 < EPD_H &&
+                clkR.bw == clkR.x1b - clkR.x0b + 1 &&
+                clkR.rows == clkR.y1 - clkR.y0 + 1 &&
+                (size_t)clkR.bw * clkR.rows <= sizeof(clkPixels);
+    }
+    if (valid && clkPixelsValid && clkR.valid) {
+        const int stride = EPD_W / 8;
+        for (int row = 0; row < clkR.rows; ++row)
+            memcpy(pixels + (clkR.y0 + row) * stride + clkR.x0b,
+                   clkPixels + row * clkR.bw, clkR.bw);
+    }
+    if (valid) {
+        EPD_SSD2683_RestoreShadow(pixels);
+        if (!thin) {
+            epdBaselineTrusted = true;
+            epdPartialReady = EPD_TGT_Init_Partial();
+            epdFullLut = false;
+        }
+    }
+    if (thin) free(pixels);
+    DevLog.printf("[epd] baseline cache %s\n", valid ? "restored" : "invalid");
+    return valid;
+}
+#endif
 
 static void clkBlitString(uint8_t *buf, const char *s) {
     if (!tplFontDrawClock(buf, clkR.bw, clkR.rows, clkR.xOff, clkR.fontId, s, clkR.scale)) {
@@ -1647,6 +1759,8 @@ static void renderActiveUsage(const String &json, const char *channel) {
                            : tplDraw(activeTplJson, json, env);
     if (drawn) {
         epdFlush(false);
+        if (epdBaselineTrusted) clkCaptureFromFramebuffer();
+        else clkPixelsValid = false;
         DevLog.printf("[tpl] rendered %s (%s)\n", activeTplId.c_str(), channel ? channel : "");
         return;
     }
@@ -1987,11 +2101,10 @@ static void armWakeSources(uint64_t timerUs) {
 // without credentials on battery (timerUs=0: buttons only). Low battery calls
 // powerOff() instead.
 //
-// v0.14: deep sleep must keep the panel powered (GPIO6 low; the SSD1681 RAM is
-// what the clock-window partial writes rely on) and the VBAT latch asserted
-// (GPIO17 high), otherwise the next thin wake starts from a random panel RAM
-// and the window refresh corrupts the screen. gpio_hold_* only persists RTC
-// capable pins (0..21); GPIO42 (amp) is left floating like before.
+// The 1.54 panel keeps GPIO6 low to retain SSD1681 RAM. Note4 holds its
+// selected GPIO6 level (high for keep, low for off_cache) and restores its
+// software baseline from LittleFS. GPIO17 keeps the VBAT latch asserted.
+// gpio_hold_* only persists RTC-capable pins (0..21).
 static void holdPinsForDeepSleep() {
     gpio_hold_en(GPIO_NUM_6);
     gpio_hold_en(GPIO_NUM_17);
@@ -2007,7 +2120,11 @@ static void releaseWakeHolds() {
     pinMode(GPIO_NUM_17, OUTPUT);
     digitalWrite(GPIO_NUM_17, HIGH);
     pinMode(GPIO_NUM_6, OUTPUT);
+#if defined(CODEX_TARGET_NOTE4)
+    digitalWrite(GPIO_NUM_6, note4KeepPanelPower ? HIGH : LOW);
+#else
     digitalWrite(GPIO_NUM_6, LOW);
+#endif
     gpio_hold_dis(GPIO_NUM_17);
     gpio_hold_dis(GPIO_NUM_6);
     gpio_deep_sleep_hold_dis();
@@ -2047,6 +2164,9 @@ static void deepSleepRaw(uint32_t sec) {
 // Full transition cleanup (light -> deep and the network-window paths): put
 // the panel to sleep, stop BLE and disconnect Wi-Fi if it was ever up.
 static void deepSleepFor(uint32_t sec) {
+#if defined(CODEX_TARGET_NOTE4)
+    note4SaveFrameBaseline();
+#endif
     epdPanelSleep();
     nvsStageMark(48);
     if (bleInitialized()) {
@@ -2402,6 +2522,9 @@ static void handleStatusJson() {
     doc["epd_streak"] = epdPartialCount;
     doc["epd_busy_fails"] = rtcEpdBusyFails;
     doc["epd_trusted"] = epdBaselineTrusted;
+#if defined(CODEX_TARGET_NOTE4)
+    doc["panel_power_mode"] = note4KeepPanelPower ? "keep" : "off_cache";
+#endif
     doc["refresh_kind"] = rfnKind;
     doc["refresh_reason"] = rfnReason;
     doc["dirty_pixels"] = rfnDirty;
@@ -2772,6 +2895,21 @@ static void handleDiag() {
         server.send(401, "text/plain", "unauthorized");
         return;
     }
+#if defined(CODEX_TARGET_NOTE4)
+    if (server.hasArg("panel_power")) {
+        const String mode = server.arg("panel_power");
+        if (mode != "keep" && mode != "off_cache") {
+            server.send(400, "text/plain", "panel_power must be keep|off_cache");
+            return;
+        }
+        if (!setNote4PanelPower(mode == "keep")) {
+            server.send(500, "text/plain", "panel_power NVS write failed");
+            return;
+        }
+        if (epdAsleep) digitalWrite(EPD_PWR_PIN, note4KeepPanelPower ? HIGH : LOW);
+        DevLog.printf("[diag] panel_power=%s\n", mode.c_str());
+    }
+#endif
     // Diagnostic BLE scan (Plan C task-6 §1.1): independent receiver for the
     // Windows publisher spike / bridge_first SCAN half. Blocking for the scan
     // duration; keep the client timeout above it.
@@ -2964,6 +3102,9 @@ static void handleDiag() {
                                           ", frame_capture=" + String((unsigned)rtcFrameCapture) +
                                           ", rv2=" + String((unsigned)rv2Enabled) +
                                           ", blink_ms=" + String((unsigned)wifiBlinkMs) +
+#if defined(CODEX_TARGET_NOTE4)
+                                          ", panel_power=" + String(note4KeepPanelPower ? "keep" : "off_cache") +
+#endif
                                           "\n\n" + sleepDiagText());
 }
 
@@ -4703,6 +4844,9 @@ static bool deepThinWake() {
     const uint64_t t0 = esp_timer_get_time();
     setStage(2);
     epdThinBegin();
+#if defined(CODEX_TARGET_NOTE4)
+    note4RestoreFrameBaseline(true);
+#endif
     setStage(30);
     bool drew = clockTickWake();
     rtcDeepCycles++;
@@ -4909,6 +5053,9 @@ void setup() {
         p.begin("pm", true);
         nvsStageAtBoot = p.getUChar("stg", 0xFF);
         rv2Enabled = p.getUChar("rv2", 1) ? 1 : 0;
+#if defined(CODEX_TARGET_NOTE4)
+        note4KeepPanelPower = p.getUChar("panel_pwr", 1) != 0;
+#endif
         bootPostOtaS = p.getUShort("post_ota_s", 0);
         String tz = p.getString("tz", "");
         if (tz.length() && tz.length() < (int)sizeof(deviceTz)) {
@@ -4917,6 +5064,9 @@ void setup() {
         }
         p.end();
     }
+#if defined(CODEX_TARGET_NOTE4)
+    EPD_SSD2683_SetKeepPower(note4KeepPanelPower);
+#endif
     applyTimezone();
     nvsStageLast = 0xFF;
     nvsStageMark(1);      // wake reached setup (diagnostic sessions only)
@@ -4945,6 +5095,9 @@ void setup() {
     }
 
     epdBegin(!woke);
+#if defined(CODEX_TARGET_NOTE4)
+    if (woke && rtcMagic == 0xC0DE0001) note4RestoreFrameBaseline(false);
+#endif
     if (!woke) screen({"CODEX STATUS", FW_VERSION, "booting..."});
     if (rtcMagic != 0xC0DE0001) {
         rtcMagic = 0xC0DE0001;
@@ -4966,6 +5119,7 @@ void setup() {
         rtcEpdBusyFails = 0;
         rtcTplActiveId[0] = 0;
         rtcTplHash[0] = 0;
+        rtcClkContextId[0] = 0;
         rtcAccCycles = 0;
         rtcAccAwakeMs = 0;
         rtcAccBleMs = 0;
@@ -5187,6 +5341,20 @@ static void handleSerialCli() {
 #if defined(CODEX_TARGET_NOTE4)
         } else if (line == "log") {
             Serial.print(DevLog.dump());
+        } else if (line == "panelpower" || line == "panelpower keep" ||
+                   line == "panelpower off_cache") {
+            if (line != "panelpower") {
+                const bool keep = line == "panelpower keep";
+                if (!setNote4PanelPower(keep)) {
+                    DevLog.println("[cli] panel power NVS write failed");
+                } else {
+                    if (epdAsleep) digitalWrite(EPD_PWR_PIN, keep ? HIGH : LOW);
+                    DevLog.printf("[cli] panel_power=%s\n", keep ? "keep" : "off_cache");
+                }
+            } else {
+                DevLog.printf("[cli] panel_power=%s\n",
+                              note4KeepPanelPower ? "keep" : "off_cache");
+            }
 #endif
         } else if (line == "batt") {
             DevLog.printf("[cli] battery=%d%% (%u mV)\n", batteryPercent(),

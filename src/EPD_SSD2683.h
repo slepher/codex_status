@@ -35,5 +35,7 @@ bool EPD_SSD2683_WakePartialWindow(int x0, int y0, int x1, int y1,
 bool EPD_SSD2683_DisplayPartWindow(int x0, int y0, int x1, int y1,
                                    const UBYTE *data);
 void EPD_SSD2683_Sleep(void);
+void EPD_SSD2683_SetKeepPower(bool keep);
+void EPD_SSD2683_RestoreShadow(const UBYTE *image);
 
 #endif

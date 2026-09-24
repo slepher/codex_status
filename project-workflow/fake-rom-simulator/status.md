@@ -6,6 +6,8 @@
 
 Task 11a 隔离 `bridge-ble` 11 项测试及 app check 通过；Task 10c app UDP 2 项、身份 1 项测试及 app check 通过；Task 11b 隔离 `bridge-core` 全套与 app UDP 4 项定向测试通过，`git diff --check` 通过。最终审查发现并修复 HTTP 非成功错误误把请求 JSON 拼入错误文本的问题，POST/status/Bundle chunk 现只保留状态码和必要 offset。未启动生产 Bridge、操作实机或触碰 ROM；多设备和日志的现场验证、Fake ROM/实验时钟仍待完成。
 
+Task 11a/10c/11b 已提交 `d65091f`。Stage C 首条同源 Data 决策切片的主代理设计见 `task-12a-data-command-slice.md`；现只读核查已提交 ROM 源码，等待另一代理的 `src/` 工作交接后才开始编码。
+
 ## 2026-09-24：计划落地，Task 1 完成
 
 主代理定下一个模拟器进程一台设备、Bridge 按 MAC 维护独立目标时钟、设备侧和 Bridge 侧可分别配置倍率/偏移/漂移的合同；同步与失步都列入验收。阶段、路由、实机隔离与时间迁移约束见 `plan.md`，原提案 `docs/fake-rom-simulator-design.md` 已同步修正。当前仍没有可运行的 Fake ROM。

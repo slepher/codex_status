@@ -1,5 +1,66 @@
 # Codex Status 项目进度（交接文档）
 
+## Fake ROM 前置协议日志：2026-09-24 — 宿主验证完成
+
+在多设备登记/BLE 改动提交 `c82487c` 后，串行完成 `project-workflow/fake-rom-simulator/` 的 Task 11a、10c、11b。Bridge BLE 现能按扫描 ID 记录候选广播、连接/GATT/完整 MAC 核验与 ACK；空窗口 info 日志每 30 秒汇总。当前已发布 1.54/Note4 ROM 确实发送 UDP，Bridge 的 v2 UDP 仅对已登记 MAC 作双状态认证改址，不写全局设备选择/IP/推送/BLE 标志，BLE 会合不依赖 UDP。HTTP/UDP/PowerPlan/Data/ACK 用安全字段和关联 ID 记录时间线；非成功 HTTP 错误不再附请求/响应正文。
+
+隔离 `bridge-ble` 11 项、`bridge-core` 全套、app UDP 4 项定向测试与 app check 通过，`git diff --check` 通过。未启动生产 Bridge、连接实机或触碰 ROM。Fake ROM 同源入口及独立时钟尚未开始；现场协议日志仍待实机/模拟器联测。
+
+## Fake ROM 多设备 BLE：2026-09-24 — app 逐 MAC 会合
+
+Task 10b `project-workflow/fake-rom-simulator/task-10b-ble-cycle.md` 完成宿主验证：Bridge 从已登记 v2 MAC 一次扫描 BLE 候选，连接后复核完整身份，每台独立 55 秒尝试节流。UDP 通知在已有 v2 登记目标时优先走该路径。隔离 `cargo check -p bridge-app`、2 项候选测试和 `git diff --check` 通过。Task 9 登记与 Task 10a/10b BLE 本轮尚未提交、部署或接实机；多设备发现、Fake ROM 与实验时钟仍待完成。其他代理 ROM 改动未触动。
+
+## Note4 400×300 图标与状态栏校正：2026-09-24 — 模板源码完成，待发布实机
+
+按用户澄清，400×300 `codex-status-a` 已恢复原 `sleep-20` 为 zzz，深睡时与 BLE 共用 x=248 格；BLE OFF 留空。Wi-Fi/Bridge 的 On/Off 改为完整位图互斥绘制，不再叠画。日期到时间的可见间隔约 12→6 px；电量文字右对齐。用户提供的 Bridge 预览截图和实机都显示电量文字偏上，根因是 `ntthin18` 行高 26 px 被放进高 20 px 的区域，渲染器整体上移 3 px；现区域改为 `[344,5,44,26]`，对照渲染中 `--%` 墨迹中心从 y=15 到 y=18，电池外框中心 y=17.5。
+
+五种状态的宿主 JSON/编译/序列化渲染逐像素差均为 0，图标格与预期原位图逐像素相同；49 操作、14 位图资源均在 ABI2 上限内，`git diff --check` 通过。仅改模板与项目文档；**未修改 ROM/Bridge 代码，未保存到桥模板库、未发布、未操作实机、未提交**。详见 `project-workflow/note4-icon-correction/`。
+
+## Fake ROM 多设备 BLE：2026-09-24 — 一次扫描入口
+
+Task 10a `project-workflow/fake-rom-simulator/task-10a-ble-any-target.md` 完成宿主验证：BLE 一次扫描覆盖登记目标的广播候选，连接后仍核对完整 Wi-Fi MAC；单目标连接复用同一实现。隔离 `bridge-ble` 7 项测试、`bridge-app` check 与 `git diff --check` 通过。尚未接 app 逐 MAC 会合调度、未访问设备或提交本 Task。Task 9 显式登记也已通过宿主测试，尚未部署。
+
+## Fake ROM 多设备路由：2026-09-24 — 显式端点登记
+
+Task 2–8 的 Bridge 多设备路由与计划已提交 `d3ba464`，没有纳入其他代理的 ROM 改动。Task 9 `project-workflow/fake-rom-simulator/task-9-register-endpoint.md` 现完成宿主验证：内建 MCP `platform_device_register_v2` 用参数 MAC 与 IPv4(:port) 显式登记目标，先核对结构化状态、认证 v2 状态及能力，成功后才保存；不自动 claim/推送。隔离 app check、登记测试 3 项、MCP 测试 1 项及 `git diff --check` 通过。尚未部署、接设备或提交本 Task；BLE 多设备机会、Fake ROM 与实验时钟仍待实现。
+
+## Fake ROM 多设备路由：2026-09-24 — 逐 MAC HTTP 周期调度
+
+Task 8 `project-workflow/fake-rom-simulator/task-8-v2-cycle.md` 已通过宿主验证：Bridge 按已登记 MAC 的认证在线缓存逐台执行占用、计划和投递；单台刷新失败不发送其本轮 Plan/Data。用户纠正当前没有 legacy 设备，本轮测试只用 v2 多设备；历史协议标记仍作防御筛选。隔离 `cargo check -p bridge-app`、3 项定向测试和 `git diff --check` 通过。BLE 多设备机会、显式登记、Fake ROM 与时钟接线仍待完成。未部署、未接实机、未提交，也未修改其他代理的 ROM 文件。
+
+## Fake ROM 实施改为串行：2026-09-24 — 逐 MAC 占用完成
+
+依用户要求取消并行开发；`project-workflow/fake-rom-simulator/plan.md` 改为 A→B→C→D→E→F→G 严格串行，每个任务由主代理设计、单名 6-luna high 编码、主代理评审后推进。Task 7 的 v2 owner/claim、yielded、续约时间已按 MAC 隔离；评审修正 409 不得记为成功续约。隔离 `cargo check -p bridge-app`、v2 测试 2 项、claim 回归 2 项与 `git diff --check` 通过。尚未接周期投递、未部署、未接实机、未提交。其他代理的 ROM 文件未触动。
+
+## Fake ROM 多设备路由：2026-09-24 — 逐 MAC 认证状态轮询
+
+Task 6 `project-workflow/fake-rom-simulator/task-6-v2-status-poll.md` 完成宿主验证：Bridge 每 10 秒只读轮询已登记的非 legacy 设备，认证状态按 MAC 独立缓存；错 MAC/离线仅改变该目标条目。隔离 `cargo check -p bridge-app`、缓存测试 1 项、claim 回归测试 2 项和 `git diff --check` 通过。此缓存尚未接逐台 claim/投递；Fake ROM 与实验时钟也未接通。未部署、未接设备、未提交。ROM 由另一代理修改，本任务未触动。
+
+## Note4 屏幕供电双模式：2026-09-24 — 固件实现，待构建与实机
+
+Note4 新增设备端 NVS `pm/panel_pwr`：默认 `keep`，可通过鉴权 `POST /diag?panel_power=keep|off_cache` 或串口 `panelpower keep|off_cache` 切换，`/status.json.panel_power_mode` 回读，供后续配置界面复用。`keep` 在深睡保持 GPIO6 屏幕逻辑电源，`off_cache` 保留断电方案；两者均关闭 SSD2683 内部高压。进入深睡保存经校验的整帧缓存，分钟薄唤醒以 RTC 时钟窗口叠加恢复驱动旧帧，无须每分钟写闪存；缓存无效时保守全刷。`0.18.21-note4-b` 终版和 1.54 回归构建均通过；1.54 首次失败系中断后遗留的单个零字节 ESP-IDF 生成对象，Luna 删除该文件后重构成功。候选 ROM `artifacts/codex-status-0.18.21-note4-b-panel-modes.bin`，1,742,144 B，SHA256 `917FAFADA6886A797FC9C2390990286A90E8DB173BF1DF1A50E3778879C9FD6A`。见 `project-workflow/note4-panel-power/`。尚未刷机，功耗与局刷需实机验证。
+
+## Fake ROM 多设备路由：2026-09-24 — claim 目标端点核验
+
+Task 5 `project-workflow/fake-rom-simulator/task-5-claim-target.md` 完成宿主验证：claim 按目标 MAC 取端点，并在发送设备 token 前用状态页 MAC 预检；本地 HTTP 测试覆盖错 MAC 零 POST 与匹配 MAC 正常 POST。隔离 `cargo check -p bridge-app`、2 项 `claim_target_tests` 和 `git diff --check` 均通过。尚未部署、接实机或提交；按 MAC owner/在线缓存、周期调度、Fake ROM 与时钟接线仍待实现。ROM 由另一代理修改，本任务未触动。
+
+## Fake ROM 多设备路由：2026-09-24 — 显式端口状态读取
+
+Task 4 `project-workflow/fake-rom-simulator/task-4-device-endpoint-port.md` 完成宿主验证：`bridge-core::device` 支持 `127.0.0.1:port`，裸 IPv4 仍默认 80；本地 TCP 测试取得结构化状态与 MAC。隔离 `cargo test -p bridge-core` 各组全通过，`git diff --check` 通过。未部署、未接实机、未提交；下一步按目标 MAC 隔离 `/claim` 端点与状态，再接多设备调度。ROM 由另一代理负责，本任务没有触动。
+
+## 1.54 时钟局刷交替问题：2026-09-24 — 源码修正，待实机验收
+
+- 用户实见 1.54 屏每分钟局刷、全刷交替；这不是对该行为的认可。既有 v2 记录显示 60 秒 BLE 会合与整分钟时钟唤醒可交错。源码确认完整会合启动会重载同一个 CompiledTemplate，却无条件清除 RTC 时钟旧像素有效标志，导致会合时按“无基线”全刷；纯时钟唤醒则可局刷。
+- 已在 `src/main.cpp` 仅当 v2 context 和时钟窗口全部参数相同才保留 RTC 旧像素；成功绘制后重取屏上窗口。新模板/上下文、窗口变化或绘制失败仍保留全刷兜底。1.54 `pio run` 构建通过、`git diff --check` 通过；**未刷设备，交替是否消失尚未实测**。详见 `project-workflow/clock-window-retention/`。
+
+## Fake ROM 多设备路由：2026-09-24 — 操作 token 按 MAC 隔离
+
+Task 3 `project-workflow/fake-rom-simulator/task-3-device-token-mac.md` 已通过宿主验证：`/claim`/OTA 的设备操作 token 使用带 MAC 的独立缓存，BLE 在发送取 token 命令前核对绑定 info 的 Wi-Fi MAC，OTA 在使用 token 前核对目标状态页 MAC。旧单份无 MAC 缓存保留但不再读取，后续首次操作可能需要重新经绑定 BLE 获取。隔离 `cargo test -p bridge-mcp` 1 项、`cargo test -p bridge-ble` 4 项、`cargo check -p bridge-app` 和 `git diff --check` 均通过。未部署、未接实机、未提交本轮改动；另一代理正在修改 ROM，当前任务不触其文件。Bridge 按 MAC 状态缓存、claim/周期调度与 Fake ROM 进程仍待实现。
+
+## Fake ROM 多设备路由：2026-09-24 — 目标 MAC 写入守卫通过
+
+前一里程碑的计划与 Coordinator 显式时间已提交 `cc6a6c1`。本轮 `project-workflow/fake-rom-simulator/task-2-target-mac-guard.md` 已完成：Bridge v2 HTTP 写入前用认证 `/v2/status` 的 MAC 核对目标，`send_plan`、`request_light`、`refresh_status` 改取指定 MAC 的设备端点；错 MAC 状态不写入缓存。测试对 Data/Plan/Activate/Bundle 各试一次错目标，只产生 4 次 GET、0 次 POST。隔离 `cargo test -p bridge-core` **105 项通过**，`cargo check -p bridge-app`、`git diff --check` 通过。未部署、未操作硬件、未提交本轮改动。多设备周期调度、按 MAC token/claim 与 fake 时钟仍待实现；另一代理正在修改 ROM，本轮不触其文件。
+
 ## Fake ROM、多设备与实验时钟：2026-09-24 — 计划落地、首个时间接点完成
 
 已建立 `project-workflow/fake-rom-simulator/plan.md`：一个 fake 进程一台设备；生产 Bridge 按 MAC 隔离运行目标和时间上下文；每台 fake 设备的 Bridge 视图与设备视图分别配置倍率、偏移、漂移，可测试同步和失步。原 `docs/fake-rom-simulator-design.md` 的全局共同时钟表述已修正。`release` worktree 仅用于源码隔离，不用多开生产 Bridge 替代多设备路由。

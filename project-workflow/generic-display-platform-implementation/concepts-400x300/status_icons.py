@@ -56,6 +56,8 @@ BATTERY = """
 """
 BLUETOOTH = "AGAAAHAAAHgAAGwAAGYADGcABmYAA/wAAfgAAPAAAPAAAfgAA/wABmYADGcAAGYAAGwAAHgAAHAAAGAA"
 WIFI = "AAAAAAAAAAAAA/wAH/+APAPA8ADwwPAwh/4QDw8AHAOAEACAAfgAA/wAAwwAAAAAAGAAAGAAAAAAAAAA"
+# Original sleep-20 artwork, retained for the shared BLE / sleep cell.
+SLEEP_20 = "AAAAAAAAf8AAAIAAAQAAAh+ABAEACAEAf8EAAAgAAB+AAAAAHgAABAAACAAAHgAAAAAAAAAAAAAAAAAA"
 
 
 def rows(art):
@@ -112,26 +114,6 @@ def crossed(pixels):
     return result
 
 
-def draw_z(pixels, x, y, width, height):
-    for dx in range(width):
-        pixels[y][x + dx] = True
-        pixels[y + 1][x + dx] = True
-        pixels[y + height - 2][x + dx] = True
-        pixels[y + height - 1][x + dx] = True
-    for dy in range(height):
-        col = x + width - 1 - round(dy * (width - 1) / (height - 1))
-        pixels[y + dy][col] = True
-        pixels[y + dy][col - 1] = True
-
-
-def zzz_icon():
-    pixels = [[False] * 20 for _ in range(20)]
-    draw_z(pixels, 1, 13, 6, 6)
-    draw_z(pixels, 7, 8, 6, 6)
-    draw_z(pixels, 13, 3, 6, 6)
-    return pixels
-
-
 def icon_set():
     off = rows(TV_OFF)
     for y in range(7, 12):
@@ -167,7 +149,7 @@ def icon_set():
         "wifi-off": crossed(from_bits(WIFI)),
         "bridge-off": off,
         "bridge-on": on,
-        "zzz": zzz_icon(),
+        "zzz": from_bits(SLEEP_20),
         "battery-outline": outline,
     }
     for level in (0, 25, 50, 75, 100):

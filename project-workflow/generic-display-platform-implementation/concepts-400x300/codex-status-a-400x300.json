@@ -18,7 +18,7 @@
     },
     {
       "type": "text",
-      "x": 75,
+      "x": 69,
       "y": 5,
       "font": "ntthin18",
       "color": "black",
@@ -26,11 +26,11 @@
     },
     {
       "type": "icon",
-      "x": 224,
+      "x": 248,
       "y": 8,
       "w": 10,
       "h": 20,
-      "bits": "AAAAAAAAAAAAAAAAAAAAAAHAAcAAQADAAcB/wH4AGAAwAH4A/gAAAA==",
+      "bits": "AAAAAH/AAIABAAIABAAIAH/AAAAAAAAAHgAEAAgAHgAAAAAAAAAAAA==",
       "color": "black",
       "when": {
         "bind": "device.mode",
@@ -39,11 +39,11 @@
     },
     {
       "type": "icon",
-      "x": 234,
+      "x": 258,
       "y": 8,
       "w": 10,
       "h": 20,
-      "bits": "AAAAAAAAH4AfgAYADAAfgP+A4ACAAAAA4ADgAAAAAAAAAAAAAAAAAA==",
+      "bits": "AAAAAAAAAAAAAH4ABAAEAAQAIAB+AAAAAAAAAAAAAAAAAAAAAAAAAA==",
       "color": "black",
       "when": {
         "bind": "device.mode",
@@ -57,28 +57,10 @@
       "w": 10,
       "h": 20,
       "bits": "AAAAAABAAEAAQABADEAGQAHAAMAAwAHABkAMQABAAEAAQABAAAAAAA==",
-      "color": "black"
-    },
-    {
-      "type": "icon",
-      "x": 258,
-      "y": 8,
-      "w": 10,
-      "h": 20,
-      "bits": "AAAAAIAAwACwAJgAnACYAOAAwADAAOAAmACcAJgAsADAAIAAAAAAAA==",
-      "color": "black"
-    },
-    {
-      "type": "icon",
-      "x": 248,
-      "y": 8,
-      "w": 10,
-      "h": 20,
-      "bits": "AAAAAABAAEAAQABADEAGQAHAAMAAwAHAB0AOQAxAGEAwQCBAAAAAAA==",
       "color": "black",
       "when": {
         "bind": "device.state",
-        "equals": "BLE OFF"
+        "equals": "BLE ON"
       }
     },
     {
@@ -87,11 +69,11 @@
       "y": 8,
       "w": 10,
       "h": 20,
-      "bits": "AAABAIMAxgC8AJgAvAD4AOAAwADAAOAAmACcAJgAsADAAIAAAAAAAA==",
+      "bits": "AAAAAIAAwACwAJgAnACYAOAAwADAAOAAmACcAJgAsADAAIAAAAAAAA==",
       "color": "black",
       "when": {
         "bind": "device.state",
-        "equals": "BLE OFF"
+        "equals": "BLE ON"
       }
     },
     {
@@ -101,7 +83,11 @@
       "w": 10,
       "h": 20,
       "bits": "AAAAAAAAA8AfwDwA8ADAwIfADwAcABAAAcADwAMAAAAAQABAAAAAAA==",
-      "color": "black"
+      "color": "black",
+      "when": {
+        "bind": "device.state",
+        "equals": "BLE ON"
+      }
     },
     {
       "type": "icon",
@@ -110,7 +96,37 @@
       "w": 10,
       "h": 20,
       "bits": "AAAAAAAA8AD+AA8AA8DAwPhAPAAOAAIA4ADwADAAAACAAIAAAAAAAA==",
-      "color": "black"
+      "color": "black",
+      "when": {
+        "bind": "device.state",
+        "equals": "BLE ON"
+      }
+    },
+    {
+      "type": "icon",
+      "x": 272,
+      "y": 8,
+      "w": 10,
+      "h": 20,
+      "bits": "AAAAAAAAA8AfwDwA8ADAwIfADwAcABAAAcADwAMAAAAAQABAAAAAAA==",
+      "color": "black",
+      "when": {
+        "bind": "device.state",
+        "equals": "BLE OFF"
+      }
+    },
+    {
+      "type": "icon",
+      "x": 282,
+      "y": 8,
+      "w": 10,
+      "h": 20,
+      "bits": "AAAAAAAA8AD+AA8AA8DAwPhAPAAOAAIA4ADwADAAAACAAIAAAAAAAA==",
+      "color": "black",
+      "when": {
+        "bind": "device.state",
+        "equals": "BLE OFF"
+      }
     },
     {
       "type": "icon",
@@ -223,7 +239,11 @@
       "w": 10,
       "h": 20,
       "bits": "AAAAAAAAP8B/wGAAYABgAGAAYQBhgGDAYEBgAHAAP8ABwAHAAAAAAA==",
-      "color": "black"
+      "color": "black",
+      "when": {
+        "bind": "device.offline_mins",
+        "exists": false
+      }
     },
     {
       "type": "icon",
@@ -232,7 +252,11 @@
       "w": 10,
       "h": 20,
       "bits": "AAAAAAAA/4D/wADAAMAQwDDAYMDAwIDAAMAAwAHA/4DwAPAAAAAAAA==",
-      "color": "black"
+      "color": "black",
+      "when": {
+        "bind": "device.offline_mins",
+        "exists": false
+      }
     },
     {
       "type": "icon",
@@ -258,110 +282,6 @@
       "when": {
         "bind": "device.offline_mins",
         "exists": true
-      }
-    },
-    {
-      "type": "icon",
-      "x": 296,
-      "y": 8,
-      "w": 10,
-      "h": 20,
-      "bits": "AAAAAAAAP8B/wGAAYABhAGCAYEBggGEAYABgAHAAP8ABwAHAAAAAAA==",
-      "color": "black",
-      "when": {
-        "bind": "device.state",
-        "equals": "WIFI OFF"
-      }
-    },
-    {
-      "type": "icon",
-      "x": 306,
-      "y": 8,
-      "w": 10,
-      "h": 20,
-      "bits": "AAAAAAAA/4D/wADAAMAgwEDAgMBAwCDAAMAAwAHA/4DwAPAAAAAAAA==",
-      "color": "black",
-      "when": {
-        "bind": "device.state",
-        "equals": "WIFI OFF"
-      }
-    },
-    {
-      "type": "icon",
-      "x": 296,
-      "y": 8,
-      "w": 10,
-      "h": 20,
-      "bits": "AAAAAAAAP8B/wGAAYABhAGCAYEBggGEAYABgAHAAP8ABwAHAAAAAAA==",
-      "color": "black",
-      "when": {
-        "bind": "device.state",
-        "equals": "WIFI CONN"
-      }
-    },
-    {
-      "type": "icon",
-      "x": 306,
-      "y": 8,
-      "w": 10,
-      "h": 20,
-      "bits": "AAAAAAAA/4D/wADAAMAgwEDAgMBAwCDAAMAAwAHA/4DwAPAAAAAAAA==",
-      "color": "black",
-      "when": {
-        "bind": "device.state",
-        "equals": "WIFI CONN"
-      }
-    },
-    {
-      "type": "icon",
-      "x": 296,
-      "y": 8,
-      "w": 10,
-      "h": 20,
-      "bits": "AAAAAAAAP8B/wGAAYABhAGCAYEBggGEAYABgAHAAP8ABwAHAAAAAAA==",
-      "color": "black",
-      "when": {
-        "bind": "device.state",
-        "equals": "AP"
-      }
-    },
-    {
-      "type": "icon",
-      "x": 306,
-      "y": 8,
-      "w": 10,
-      "h": 20,
-      "bits": "AAAAAAAA/4D/wADAAMAgwEDAgMBAwCDAAMAAwAHA/4DwAPAAAAAAAA==",
-      "color": "black",
-      "when": {
-        "bind": "device.state",
-        "equals": "AP"
-      }
-    },
-    {
-      "type": "icon",
-      "x": 296,
-      "y": 8,
-      "w": 10,
-      "h": 20,
-      "bits": "AAAAAAAAP8B/wGAAYABhAGCAYEBggGEAYABgAHAAP8ABwAHAAAAAAA==",
-      "color": "black",
-      "when": {
-        "bind": "device.state",
-        "equals": "DEEP"
-      }
-    },
-    {
-      "type": "icon",
-      "x": 306,
-      "y": 8,
-      "w": 10,
-      "h": 20,
-      "bits": "AAAAAAAA/4D/wADAAMAgwEDAgMBAwCDAAMAAwAHA/4DwAPAAAAAAAA==",
-      "color": "black",
-      "when": {
-        "bind": "device.state",
-        "equals": "DEEP"
       }
     },
     {
@@ -408,8 +328,9 @@
         344,
         5,
         44,
-        20
-      ]
+        26
+      ],
+      "align": "right"
     },
     {
       "type": "line",

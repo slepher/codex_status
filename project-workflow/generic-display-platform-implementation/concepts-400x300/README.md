@@ -16,7 +16,7 @@
 
 2026-09-23：选用 A 双主数值方案；单 weekly 场景沿用 A 的字级、线条和页脚。后续以此为基础制作实际模板，不再继续出概念图。
 
-状态栏从上到下为：上下各 4 px 留白，中间 **28 px 内容区**，合计 **36 px**；底部分隔线另占 1 px，位于 y=36。左右外边距各 12 px。左侧依次为日期 `MM/DD`、时间 `HH:MM`，两者间隔 8 px，均用 `f16`。右侧顺序固定为蓝牙、Wi-Fi、主机、电池图标、电量百分比。四个图标各占 **20×20 px** 图标盒，实际笔画可用约 18×18 px（电池轮廓约 18×12 px）；图标之间留 4 px，电池图标到百分比留 4 px，百分比也用 `f16`。整个右侧组贴近 12 px 右边距；`100%` 的宽度也已检查。图标轮廓按 1bpp 绘制，主要笔画至少 2 px。时间与右侧状态组在 28 px 内容区内垂直居中。
+状态栏从上到下为：上下各 4 px 留白，中间 **28 px 内容区**，合计 **36 px**；底部分隔线另占 1 px，位于 y=36。左右外边距各 12 px。左侧依次为日期 `MM/DD`、时间 `HH:MM`，实际笔画间隔约 6 px，均用 `ntthin18`。右侧顺序为蓝牙/深睡共用格、Wi-Fi、主机、电池图标、电量百分比。四个图标各占 **20×20 px** 图标盒，图标之间留 4 px，电池图标到百分比区域留 4 px。电量文字在区域内右对齐，保持约 12 px 的画布右边距；其区域高度与 `ntthin18` 的 26 px 行高一致，避免旧 20 px 区域将字形上移 3 px。`100%` 的宽度已检查。图标轮廓按 1bpp 绘制，主要笔画至少 2 px。时间与右侧状态组在 28 px 内容区内垂直居中。
 
 状态栏只承载设备状态，不显示 `CODEX` 标题。主内容区从分隔线下方开始；标题/额度信息按 A 方案排布。状态图标的显示语义及实际字体像素尺寸在模板实现与真机试显时校准。
 
@@ -28,7 +28,7 @@
 
 ## 首版实际模板与预览
 
-`codex-status-a-400x300.json` 为已选 A 方案的 v2 模板源；`status_icons.py` 生成 20×20 图标及放大检查图，`make-template.py` 写出 JSON。为适配当前 CTP1 的单资源长度上限，每个图标拆为左右两个 10×20 位图，最终视觉尺寸仍是 20×20。`bridge-off-icons8-20203-100.png` 来自用户选定的 [Icons8 TV Off 原图](https://img.icons8.com/?size=100&id=20203&format=png&color=000000)，在本项目命名为 **Bridge Off**；`Bridge On` 使用同一显示器轮廓加勾。`icons8-battery-59804-100.png` 来自用户选定的 [Icons8 电池原图](https://img.icons8.com/?size=100&id=59804&format=png&color=000000)，据此外框生成 0/25/50/75/100% 五档图标。模板用同一外框与 `device.battery` 进度条实时填充，右侧数字也来自 `device.battery`。蓝牙和 Wi-Fi 沿用此前准备的同尺寸黑白图形；状态联动待完成。
+`codex-status-a-400x300.json` 为已选 A 方案的 v2 模板源；`status_icons.py` 生成 20×20 图标及放大检查图。`make-template.py` 是早期布局生成脚本，尚未同步后续 96px 与状态栏修改，不能用它覆盖当前模板。为适配当前 CTP1 的单资源长度上限，每个图标拆为左右两个 10×20 位图，最终视觉尺寸仍是 20×20。`bridge-off-icons8-20203-100.png` 来自用户选定的 [Icons8 TV Off 原图](https://img.icons8.com/?size=100&id=20203&format=png&color=000000)，在本项目命名为 **Bridge Off**；`Bridge On` 使用同一显示器轮廓加勾。`icons8-battery-59804-100.png` 来自用户选定的 [Icons8 电池原图](https://img.icons8.com/?size=100&id=59804&format=png&color=000000)，据此外框生成 0/25/50/75/100% 五档图标。模板用同一外框与 `device.battery` 进度条实时填充，右侧数字也来自 `device.battery`。蓝牙和 Wi-Fi 沿用此前准备的同尺寸黑白图形。
 
 2026-09-23 二次修订：状态栏文字与电池填充按像素实测重新对齐（见下节），新增离线行，主区 `%` 改为与数字垂直居中。当前版本已通过本机 Bridge MCP 的 `template_validate_v2` / `template_save_v2`，仅保存到 v2 库（`source_crc=2b523381`，`compiled_crc=41c31abd`，`published=false`），未发布、未刷机。
 
@@ -107,10 +107,9 @@
 
 `codex-status-a-400x300.json` 已改用 `ntreg96` 显示双桶与 weekly-only 数字。双桶区域为 `[12,62,176,132]`、`[212,62,176,132]`；weekly-only 数字区域为 `[12,62,376,132]`，`WEEK` 与重置时间居中。百分号保留为小字，双桶分别位于 x=183/383，weekly-only 位于 x=285；重置时间保留，所有可见 `RESET` 字样已移除。宿主预览确认 `100` 不裁切，weekly-only 数字与时间居中。
 
-`status_icons.py` 生成带单条 2px 斜线的 `bluetooth-off`、`wifi-off` 变体和阶梯式 `zzz` 深睡图标，均有 20×20 位图及放大 PNG。模板使用正常图标底图，并在 BLE OFF、Wi-Fi OFF/CONN/AP/DEEP 等状态叠加对应的斜线图标；deep 模式在状态栏 Bluetooth 左侧绘制 `zzz`，离线 Bridge 状态叠加 Bridge Off。黑色图标像素只能增加，因此此处以正常图标为底、断开图标作条件叠加。完整状态映射需要 57 个操作和 16 个不同半片资源，现已通过 ABI 2 的 64-op/16-resource 宿主编译与往返渲染校验。
+`status_icons.py` 保留独立的 Bridge On/Off 与 Wi-Fi On/Off 完整位图；`zzz` 恢复为早期 `sleep-20` 原图。模板按状态只绘制对应图标：BLE ON 时在 x=248 绘制蓝牙，BLE OFF 时留空，deep 时在同一格绘制旧 `zzz`；Wi-Fi On/Off 在 x=272 互斥；Bridge On/Off 在 x=296 按 `device.offline_mins` 是否存在互斥。当前 49 个操作、14 个半片位图资源，已通过 ABI 2 的宿主编译与往返渲染校验。
 
 ### 仍待确认
 
 - 配额缺失的表现已按用户澄清确认为**模板属性**（不写进 `AGENTS.md` 的全局规则）：200×200 `quad` 用静态 `100` 分支，400×300 `codex-status-a` 用“隐藏 5h 块、weekly 提升到主位”分支；`AGENTS.md` 对应条目已改为按变体描述。
-- 蓝牙/Wi-Fi/主机的在线离线独立绑定仍未定义，图标目前是固定图形。
-- Note4 实机：GPIO/波形/bring-up 未做，局刷未验证，模板与预览均为宿主交付。
+- 本次图标及状态栏留白修正仅保存在模板源，尚未重新发布到 Note4 实机。

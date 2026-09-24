@@ -17,6 +17,7 @@ constexpr size_t kFrameBytes = kStride * EPD_SSD2683_HEIGHT;
 bool internalPowerOn = false;
 bool shadowValid = false;
 bool partialPrepared = false;
+bool keepPanelPower = true;
 UBYTE shadow[kFrameBytes];
 
 void command(UBYTE value) {
@@ -281,8 +282,21 @@ void EPD_SSD2683_Sleep(void) {
         command(0x02); data(0x00);
         if (waitReady("sleep")) internalPowerOn = false;
     }
-    digitalWrite(EPD_PWR_PIN, LOW);
+    digitalWrite(EPD_PWR_PIN, keepPanelPower ? HIGH : LOW);
     partialPrepared = false;
+}
+
+void EPD_SSD2683_SetKeepPower(bool keep) {
+    keepPanelPower = keep;
+}
+
+void EPD_SSD2683_RestoreShadow(const UBYTE *image) {
+    if (!image) {
+        shadowValid = false;
+        return;
+    }
+    memcpy(shadow, image, sizeof(shadow));
+    shadowValid = true;
 }
 
 #endif // CODEX_TARGET_NOTE4

@@ -15,7 +15,10 @@ const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const VALUE_NAME: &str = "CodexStatusBridge";
 
 fn wide(s: &str) -> Vec<u16> {
-    OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 fn open(access: u32) -> Option<HKEY> {
@@ -98,8 +101,7 @@ pub fn matches_current_exe() -> bool {
 }
 
 pub fn set(enable: bool) -> std::io::Result<()> {
-    let hkey = open(KEY_READ | KEY_SET_VALUE)
-        .ok_or_else(|| std::io::Error::last_os_error())?;
+    let hkey = open(KEY_READ | KEY_SET_VALUE).ok_or_else(|| std::io::Error::last_os_error())?;
     let name = wide(VALUE_NAME);
     let rc = if enable {
         let exe = std::env::current_exe()?;

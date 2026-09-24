@@ -193,11 +193,17 @@ mod tests {
     fn identity_helpers_normalize_mac_format() {
         assert_eq!(normalize_mac("70:04:1d:aa:bb:cc"), "70041DAABBCC");
         assert_eq!(normalize_mac("70-04-1D-AA-BB-CC"), "70041DAABBCC");
-        assert_eq!(default_device_name("70:04:1D:AA:BB:CC"), "CodexStatus-AABBCC");
+        assert_eq!(
+            default_device_name("70:04:1D:AA:BB:CC"),
+            "CodexStatus-AABBCC"
+        );
     }
 
     #[test]
     fn arp_scan_requires_a_full_mac() {
-        assert_eq!(arp_scan_for_mac("192.168.1.100", "AABBCC", Duration::ZERO), None);
+        assert_eq!(
+            arp_scan_for_mac("192.168.1.100", "AABBCC", Duration::ZERO),
+            None
+        );
     }
 }

@@ -42,7 +42,11 @@ fn read_recent_stamps() -> Vec<u64> {
 }
 
 fn append_log(line: &str) {
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(log_path()) {
+    if let Ok(mut f) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path())
+    {
         let _ = writeln!(f, "{line}");
     }
 }

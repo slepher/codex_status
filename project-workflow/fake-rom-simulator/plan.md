@@ -44,4 +44,4 @@ A 的公共时间入口是 B 和 E 的前置。**开发严格串行**：Task 11a
 
 ## 首轮任务与约束
 
-`task-1-coordinator-time.md` 已完成并提交为 `cc6a6c1`。多设备运行层的 Task 2–8 已提交为 `d3ba464`，Task 9、10a、10b 已提交为 `c82487c`。Task 11a BLE 日志、Task 10c UDP 多目标隔离、Task 11b 协议时间线均完成宿主验证；阶段 B/B2 的真实多设备行为仍须在 F/G 联测。下一步开始 C 同源 Fake ROM 入口的设计与实施，须等待另一代理的 ROM 文件完成交接后才改动该范围。除用户明确要求提交的里程碑外，不自动提交；不启动、停止或改动正在运行的 Bridge，不访问实机，不写生产数据目录。每次里程碑在 `PROGRESS.md` 更新证据与待办。
+`task-1-coordinator-time.md` 已完成并提交为 `cc6a6c1`。多设备运行层的 Task 2–8 已提交为 `d3ba464`，Task 9、10a、10b 已提交为 `c82487c`，Task 11a/10c/11b 已提交为 `d65091f`。阶段 B/B2 的真实多设备行为仍须在 F/G 联测。阶段 C 首条 Data 同源切片已由主代理定为 `task-12a-data-command-slice.md`；须等待另一代理的 ROM 文件完成交接后才编码，不建立并行 worktree 抢改。除用户明确要求提交的里程碑外，不自动提交；不启动、停止或改动正在运行的 Bridge，不访问实机，不写生产数据目录。每次里程碑在 `PROGRESS.md` 更新证据与待办。
