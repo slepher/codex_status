@@ -245,7 +245,7 @@ fn ready_and_status_are_safe_and_use_shared_builder() {
     assert_eq!(sim.ready["mac"], "02:AB:CD:00:00:01");
     assert_eq!(
         sim.ready["capabilities"],
-        serde_json::json!(["v2_status", "clock_control", "claim"])
+        serde_json::json!(["v2_status", "clock_control", "claim", "plan_state"])
     );
     let ready_text = sim.ready.to_string();
     assert!(!ready_text.contains(ENDPOINT));
@@ -264,6 +264,7 @@ fn ready_and_status_are_safe_and_use_shared_builder() {
     assert_eq!(status["protocol"], 2);
     assert_eq!(status["device_mac"], "02:AB:CD:00:00:01");
     assert_eq!(status["configured"], false);
+    assert_eq!(status["active_template_id"], "");
     assert_eq!(status["data_seq"], 0);
     assert_eq!(status["power"]["battery"], 75);
     assert_eq!(status["session_nonce"].as_str().unwrap().len(), 32);
@@ -282,9 +283,15 @@ fn token_domains_are_separate_and_sim_state_discloses_no_secrets() {
     assert_eq!(state["mac"], "02:00:00:00:00:02");
     assert_eq!(
         state["capabilities"],
-        serde_json::json!(["v2_status", "clock_control", "claim"])
+        serde_json::json!(["v2_status", "clock_control", "claim", "plan_state"])
     );
     assert_eq!(state["clock_persistence"], "unsupported");
+    assert_eq!(state["plan"]["accepted"], false);
+    assert!(state["unsupported"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item == "power_lifecycle"));
     assert_eq!(state["owner"], Value::Null);
     assert!(state["unsupported"]
         .as_array()
@@ -303,7 +310,6 @@ fn writes_require_their_domain_token_then_report_unsupported() {
     let sim = Simulator::start("02:00:00:00:00:03", &[]);
     for path in [
         "/v2/data",
-        "/v2/plan",
         "/v2/activate",
         "/v2/bundle/begin",
         "/v2/bundle/chunk",
@@ -377,6 +383,35 @@ fn set_time(sim: &Simulator, token: Option<&str>, command: &Value) -> (u16, Valu
     (code, result)
 }
 
+fn plan_message(
+    status: &Value,
+    bridge_id: &str,
+    request_id: &str,
+    plan_id: u64,
+    mode: &str,
+    duration: Option<u64>,
+) -> Value {
+    let mut message = serde_json::json!({
+        "protocol": 2,
+        "device_mac": status["device_mac"],
+        "session_nonce": status["session_nonce"],
+        "bridge_id": bridge_id,
+        "request_id": request_id,
+        "plan_id": plan_id,
+        "mode": mode,
+    });
+    if let Some(duration) = duration {
+        message["light_duration_s"] = duration.into();
+    }
+    message
+}
+
+fn post_plan(sim: &Simulator, token: Option<&str>, message: &Value) -> (u16, Value) {
+    let body = message.to_string();
+    let (code, response) = request(sim.address(), "POST", "/v2/plan", token, body.as_bytes());
+    (code, json_body(&response))
+}
+
 #[test]
 fn sim_clock_defaults_to_one_x_and_pause_step_and_rate_are_continuous() {
     let sim = Simulator::start("02:00:00:00:00:07", &["--epoch-ms", "5000"]);
@@ -439,6 +474,234 @@ fn sim_clock_defaults_to_one_x_and_pause_step_and_rate_are_continuous() {
     let (code, resumed) = time(&sim, Some(CONTROL));
     assert_eq!(code, 200);
     assert!(resumed["monotonic_ms"].as_u64().unwrap() >= resumed_at);
+}
+
+#[test]
+fn plan_acks_share_firmware_decisions_and_replays_keep_the_deadline() {
+    let sim = Simulator::start("02:00:00:00:00:20", &[]);
+    assert_eq!(
+        set_time(
+            &sim,
+            Some(CONTROL),
+            &serde_json::json!({"op":"rate","rate_ppm":0})
+        )
+        .0,
+        200
+    );
+    let initial_ms = time(&sim, Some(CONTROL)).1["monotonic_ms"]
+        .as_u64()
+        .unwrap();
+    let (code, body) = request(sim.address(), "GET", "/v2/status", Some(ENDPOINT), b"");
+    assert_eq!(code, 200);
+    let status = json_body(&body);
+    let first = plan_message(&status, "bridge-a", "plan-1", 1, "light", Some(120));
+    let (code, ack) = post_plan(&sim, Some(ENDPOINT), &first);
+    assert_eq!(code, 200);
+    assert_eq!(ack["result"], "applied");
+    assert_eq!(ack["display_state"], "unchanged");
+    assert_eq!(ack["retention"], "ram");
+    assert_eq!(ack["plan_id"], 1);
+    assert_eq!(ack["accepted_remaining_s"], 120);
+    assert_eq!(ack["fw_target"], "codex-status-154g");
+    assert!(ack.get("active_context_id").is_none());
+
+    let before = sim_state(&sim)["plan"].clone();
+    assert_eq!(before["accepted"], true);
+    assert_eq!(before["accepted_at_ms"], initial_ms);
+    assert_eq!(
+        set_time(
+            &sim,
+            Some(CONTROL),
+            &serde_json::json!({"op":"step","delta_ms":10000})
+        )
+        .0,
+        200
+    );
+    let (code, replay) = post_plan(&sim, Some(ENDPOINT), &first);
+    assert_eq!(code, 200);
+    assert_eq!(replay["result"], "applied");
+    assert_eq!(replay["accepted_remaining_s"], 120);
+    let (code, body) = request(sim.address(), "GET", "/v2/status", Some(ENDPOINT), b"");
+    assert_eq!(code, 200);
+    assert_eq!(json_body(&body)["power"]["plan_id"], 1);
+    assert_eq!(json_body(&body)["power"]["remaining_s"], 110);
+    assert_eq!(json_body(&body)["power"]["granted_s"], 120);
+
+    let conflict = plan_message(&status, "bridge-a", "plan-conflict", 1, "light", Some(121));
+    let (code, rejected) = post_plan(&sim, Some(ENDPOINT), &conflict);
+    assert_eq!(code, 200);
+    assert_eq!(rejected["result"], "rejected");
+    assert_eq!(rejected["display_state"], "unchanged");
+    assert_eq!(rejected["error"], "plan_conflict");
+    assert_eq!(rejected["plan_id"], 1);
+    assert_eq!(rejected["accepted_remaining_s"], 0);
+    assert_eq!(sim_state(&sim)["plan"]["accepted_at_ms"], initial_ms);
+
+    let stale = plan_message(&status, "bridge-a", "plan-stale", 0, "sleep", None);
+    let (code, rejected) = post_plan(&sim, Some(ENDPOINT), &stale);
+    assert_eq!(code, 200);
+    assert_eq!(rejected["error"], "stale_plan");
+    assert!(rejected.get("plan_id").is_none());
+    assert_eq!(rejected["accepted_remaining_s"], 0);
+    assert_eq!(sim_state(&sim)["plan"]["plan_id"], 1);
+
+    let malformed_shape = plan_message(&status, "bridge-a", "plan-shape", 2, "light", None);
+    let (code, rejected) = post_plan(&sim, Some(ENDPOINT), &malformed_shape);
+    assert_eq!(code, 200);
+    assert_eq!(rejected["error"], "plan_shape");
+    assert_eq!(rejected["accepted_remaining_s"], 0);
+    assert_eq!(sim_state(&sim)["plan"]["plan_id"], 1);
+
+    let sleep = plan_message(&status, "bridge-a", "plan-sleep", 2, "sleep", None);
+    let (code, accepted_sleep) = post_plan(&sim, Some(ENDPOINT), &sleep);
+    assert_eq!(code, 200);
+    assert_eq!(accepted_sleep["result"], "applied");
+    assert_eq!(accepted_sleep["plan_id"], 2);
+    assert_eq!(accepted_sleep["accepted_remaining_s"], 0);
+}
+
+#[test]
+fn plan_checks_json_session_owner_and_token_order_without_advancing_state() {
+    let sim = Simulator::start("02:00:00:00:00:21", &[]);
+    assert_eq!(
+        set_time(
+            &sim,
+            Some(CONTROL),
+            &serde_json::json!({"op":"rate","rate_ppm":0})
+        )
+        .0,
+        200
+    );
+    for token in [None, Some(DEVICE), Some(CONTROL)] {
+        assert_eq!(
+            request(sim.address(), "POST", "/v2/plan", token, b"{}").0,
+            401
+        );
+    }
+    let (code, malformed) = request(sim.address(), "POST", "/v2/plan", Some(ENDPOINT), b"{");
+    assert_eq!(code, 200);
+    assert_eq!(
+        json_body(&malformed),
+        serde_json::json!({
+            "op":"command", "result":"rejected", "display_state":"unchanged",
+            "retention":"ram", "error":"json", "fw_target":"codex-status-154g"
+        })
+    );
+    let (code, status_body) = request(sim.address(), "GET", "/v2/status", Some(ENDPOINT), b"");
+    assert_eq!(code, 200);
+    let status = json_body(&status_body);
+
+    let mut bad_session = plan_message(&status, "bridge-a", "bad-session", 1, "light", Some(90));
+    bad_session["session_nonce"] = "wrong".into();
+    let (code, rejected) = post_plan(&sim, Some(ENDPOINT), &bad_session);
+    assert_eq!(code, 200);
+    assert_eq!(rejected["op"], "command");
+    assert_eq!(rejected["result"], "rejected");
+    assert_eq!(rejected["display_state"], "unchanged");
+    assert_eq!(rejected["error"], "session");
+    let mut bad_mac = plan_message(&status, "bridge-a", "bad-mac", 1, "light", Some(90));
+    bad_mac["device_mac"] = "02:00:00:00:00:FF".into();
+    let (code, rejected) = post_plan(&sim, Some(ENDPOINT), &bad_mac);
+    assert_eq!(code, 200);
+    assert_eq!(rejected["error"], "session");
+    assert_eq!(sim_state(&sim)["plan"]["plan_id"], 0);
+
+    let (code, _) = claim(&sim, "id=held-owner", Some(DEVICE));
+    assert_eq!(code, 200);
+    let mut occupied = plan_message(&status, "other-owner", "occupied", 1, "light", Some(90));
+    let (code, body) = post_plan(&sim, Some(ENDPOINT), &occupied);
+    assert_eq!(code, 409);
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "result":"rejected", "error":"occupied",
+            "owner": {"id":"held-owner", "name":"", "host":"", "port":0,
+                "since_s":0, "last_seen_s":0, "lease_s":300, "expires_in_s":300}
+        })
+    );
+    assert_eq!(sim_state(&sim)["plan"]["plan_id"], 0);
+    occupied["bridge_id"] = "held-owner".into();
+    let persisted: Value =
+        serde_json::from_slice(&fs::read(sim.data_dir.join("owner.json")).unwrap()).unwrap();
+    let old_seen = persisted["owner"]["last_seen"].clone();
+    assert_eq!(
+        set_time(
+            &sim,
+            Some(CONTROL),
+            &serde_json::json!({"op":"step","delta_ms":2000})
+        )
+        .0,
+        200
+    );
+    let (code, ack) = post_plan(&sim, Some(ENDPOINT), &occupied);
+    assert_eq!(code, 200);
+    assert_eq!(ack["result"], "applied");
+    assert_eq!(sim_state(&sim)["owner"]["last_seen_s"], 2);
+    let persisted: Value =
+        serde_json::from_slice(&fs::read(sim.data_dir.join("owner.json")).unwrap()).unwrap();
+    assert_eq!(persisted["owner"]["last_seen"], old_seen);
+}
+
+#[test]
+fn plan_deadline_uses_uptime_and_each_process_has_independent_plan_state() {
+    let first = Simulator::start("02:00:00:00:00:22", &[]);
+    let second = Simulator::start("02:00:00:00:00:23", &[]);
+    for sim in [&first, &second] {
+        assert_eq!(
+            set_time(
+                sim,
+                Some(CONTROL),
+                &serde_json::json!({"op":"rate","rate_ppm":0})
+            )
+            .0,
+            200
+        );
+    }
+    let get_status = |sim: &Simulator| {
+        let (code, body) = request(sim.address(), "GET", "/v2/status", Some(ENDPOINT), b"");
+        assert_eq!(code, 200);
+        json_body(&body)
+    };
+    let first_status = get_status(&first);
+    let second_status = get_status(&second);
+    let (code, _) = post_plan(
+        &first,
+        Some(ENDPOINT),
+        &plan_message(&first_status, "bridge", "first", 7, "light", Some(120)),
+    );
+    assert_eq!(code, 200);
+    let (code, _) = post_plan(
+        &second,
+        Some(ENDPOINT),
+        &plan_message(&second_status, "bridge", "second", 1, "light", Some(120)),
+    );
+    assert_eq!(code, 200);
+    assert_eq!(get_status(&first)["power"]["plan_id"], 7);
+    assert_eq!(get_status(&second)["power"]["plan_id"], 1);
+
+    assert_eq!(
+        set_time(
+            &first,
+            Some(CONTROL),
+            &serde_json::json!({"op":"step","delta_ms":5000})
+        )
+        .0,
+        200
+    );
+    let remaining_before_wall = get_status(&first)["power"]["remaining_s"].clone();
+    assert_eq!(
+        set_time(
+            &first,
+            Some(CONTROL),
+            &serde_json::json!({"op":"wall","offset_ms":900000})
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        get_status(&first)["power"]["remaining_s"],
+        remaining_before_wall
+    );
 }
 
 #[test]
@@ -569,7 +832,6 @@ fn claim_uses_shared_decision_and_enforces_token_owner_actions() {
     assert_eq!(claim(&sim, "id=%20%20%20", Some(DEVICE)).0, 400);
     for path in [
         "/v2/data",
-        "/v2/plan",
         "/v2/activate",
         "/v2/bundle/begin",
         "/v2/bundle/chunk",
@@ -584,6 +846,11 @@ fn claim_uses_shared_decision_and_enforces_token_owner_actions() {
         assert_eq!(after_other_write["id"], first["owner"]["id"]);
         assert_eq!(after_other_write["last_seen_s"], seen);
     }
+    assert_eq!(
+        request(sim.address(), "POST", "/v2/plan", Some(ENDPOINT), b"{}").0,
+        409
+    );
+    assert_eq!(sim_state(&sim)["owner"]["last_seen_s"], seen);
 
     let (code, unauthorized) = claim(&sim, "id=ignored", Some(CONTROL));
     assert_eq!(code, 401);

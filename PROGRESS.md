@@ -1,5 +1,9 @@
 # Codex Status 项目进度（交接文档）
 
+## Fake ROM Stage D PowerPlan 状态：2026-09-24 — 未配置设备协议路径通过
+
+owner/claim 已提交 `e591951`。Task 13d 在 `codex/fake` 独立 worktree 让 `/v2/plan` 依次调用同源命令解析、owner/session 校验、C++ Plan 状态机和 ACK 构造。16 项模拟进程集成测试覆盖首次接受、重放不续期、旧 ID/冲突/坏形状、401/409、逻辑 step 与 wall 偏移、双进程独立状态；`bridge-render` 全套、格式检查及 `git diff --check` 通过。审查中校正了 ACK：重放回原授予秒数，递减剩余只在 status，JSON/session 错误为 command ACK，冲突包含 owner。当前无 Bundle，故仍未模拟 sleep/无线会合；Data/Bundle/Activate 继续 501，不能登记为完整 Fake ROM。
+
 ## Fake ROM Stage D owner/claim：2026-09-24 — 逻辑租期与正常重启恢复通过
 
 在独立 `codex/fake` worktree，设备时钟 Task 13b 已提交 `7aa6d38`。Task 13c 将设备操作 token 鉴权的 `/claim` 接到 Stage C 共享 C++ 决策，新增每虚构 MAC 显式独立数据目录和 owner 文件；claim/续约/409/force/release、暂停 step 的精确 lease 边界、wall 校时不影响租期、正常重启后钳制 uptime 并续约、目录身份隔离与损坏拒绝均通过 13 项 loopback 集成测试。`cargo test -p bridge-render` 全套和 `git diff --check` 通过。仍未提供 `/status.json`，Data/Plan/Bundle/Activate 仍 501；存储断电撕裂、BLE、显示与 Bridge 逐目标时钟待后续阶段，见 `project-workflow/fake-rom-simulator/status.md`。

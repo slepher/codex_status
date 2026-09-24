@@ -20,15 +20,15 @@ use std::{
 const BODY_LIMIT: usize = 64 * 1024;
 const MAX_RATE_PPM: u64 = 1_000_000_000;
 const MAX_STEP_MS: u64 = 86_400_000;
-const CAPABILITIES: &[&str] = &["v2_status", "clock_control", "claim"];
+const CAPABILITIES: &[&str] = &["v2_status", "clock_control", "claim", "plan_state"];
 const UNSUPPORTED: &[&str] = &[
     "data",
-    "plan",
     "bundle",
     "activate",
     "BLE",
     "persistence",
     "display",
+    "power_lifecycle",
 ];
 
 #[derive(Clone)]
@@ -40,6 +40,7 @@ struct SimState {
     nonce: String,
     clock: Arc<Mutex<SimClock>>,
     owner: Arc<Mutex<OwnerStore>>,
+    plan: Arc<Mutex<bridge_render::SimulatorPlan>>,
 }
 
 #[derive(Debug)]
@@ -522,6 +523,11 @@ async fn status(State(state): State<SimState>, request: Request<Body>) -> Respon
         )
             .into_response();
     };
+    let plan = state
+        .plan
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (plan_accepted, plan_mode, plan_id, granted_s, accepted_at_ms) = plan.status_fields();
     let input = json!({
         "mac": state.mac,
         "session_nonce": state.nonce,
@@ -535,7 +541,11 @@ async fn status(State(state): State<SimState>, request: Request<Body>) -> Respon
         "display_state_code": 0,
         "commit_seq": 0,
         "deep_sleep": false,
-        "plan_accepted": false,
+        "plan_accepted": plan_accepted,
+        "plan_mode": plan_mode,
+        "plan_id": plan_id,
+        "granted_s": granted_s,
+        "plan_accepted_at_ms": accepted_at_ms,
         "provisional": false,
         "boot_ms": 0,
         "now_ms": clock.monotonic_ms,
@@ -585,6 +595,11 @@ async fn sim_state(State(state): State<SimState>, request: Request<Body>) -> Res
                 .into_response()
         }
     };
+    let plan = state
+        .plan
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (accepted, mode, plan_id, granted_s, accepted_at_ms) = plan.status_fields();
     Json(json!({
         "mac": state.mac,
         "capabilities": CAPABILITIES,
@@ -592,7 +607,9 @@ async fn sim_state(State(state): State<SimState>, request: Request<Body>) -> Res
         "uptime_ms": clock.monotonic_ms,
         "clock": clock.json(),
         "clock_persistence": "unsupported",
-        "owner": owner_json(owner.as_ref(), now_s)
+        "owner": owner_json(owner.as_ref(), now_s),
+        "plan": {"accepted": accepted, "mode": mode, "plan_id": plan_id,
+                 "granted_s": granted_s, "accepted_at_ms": accepted_at_ms}
     }))
     .into_response()
 }
@@ -675,6 +692,162 @@ async fn unsupported(
 
 async fn endpoint_write(State(state): State<SimState>, request: Request<Body>) -> Response {
     unsupported(State(state), request, false).await
+}
+
+async fn plan(State(state): State<SimState>, request: Request<Body>) -> Response {
+    if !bearer(&request, &state.endpoint_token) {
+        return unauthorized();
+    }
+    let body = match to_bytes(request.into_body(), BODY_LIMIT).await {
+        Ok(body) => body,
+        Err(_) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(json!({"error":"body_too_large"})),
+            )
+                .into_response()
+        }
+    };
+    let Ok(message) = std::str::from_utf8(&body) else {
+        return match bridge_render::simulator_plan_ack(
+            "command",
+            "rejected",
+            "unchanged",
+            Some("json"),
+            0,
+            None,
+        ) {
+            Ok(ack) => Json(ack).into_response(),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":"plan_ack_failed"})),
+            )
+                .into_response(),
+        };
+    };
+    let parsed = match bridge_render::simulator_command_parse(message) {
+        Ok(parsed) if parsed["parsed"] == true => parsed,
+        _ => {
+            return match bridge_render::simulator_plan_ack(
+                "command",
+                "rejected",
+                "unchanged",
+                Some("json"),
+                0,
+                None,
+            ) {
+                Ok(ack) => Json(ack).into_response(),
+                Err(_) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error":"plan_ack_failed"})),
+                )
+                    .into_response(),
+            }
+        }
+    };
+    let Some(bridge_id) = parsed["bridge_id"].as_str() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":"command_parse_failed"})),
+        )
+            .into_response();
+    };
+    let Some(clock) = clock_snapshot(&state) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":"clock_unavailable"})),
+        )
+            .into_response();
+    };
+    let now_s = now_seconds(clock);
+    {
+        let mut owners = state
+            .owner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let owner = match owners.get_valid(now_s) {
+            Ok(owner) => owner,
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error":"owner_storage_failed"})),
+                )
+                    .into_response()
+            }
+        };
+        if let Some(owner) = owner {
+            if owner.id != bridge_id {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({"result":"rejected","error":"occupied","owner":owner_json(Some(&owner), now_s)})),
+                )
+                    .into_response();
+            }
+            if let Some(current) = owners.owner.as_mut() {
+                current.last_seen = now_s;
+            }
+        }
+    }
+    let session = match bridge_render::simulator_command_check(message, &state.mac, &state.nonce) {
+        Ok(session) => session,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":"session_check_failed"})),
+            )
+                .into_response()
+        }
+    };
+    if session["accepted"] != true {
+        let error = session["error"].as_str().unwrap_or("session");
+        return match bridge_render::simulator_plan_ack(
+            "command",
+            "rejected",
+            "unchanged",
+            Some(error),
+            0,
+            None,
+        ) {
+            Ok(ack) => Json(ack).into_response(),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":"plan_ack_failed"})),
+            )
+                .into_response(),
+        };
+    }
+    let decision = match state
+        .plan
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .decide(message, clock.monotonic_ms)
+    {
+        Ok(decision) => decision,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error":"plan_decision_failed"})),
+            )
+                .into_response()
+        }
+    };
+    let error = decision["error"].as_str();
+    let granted = decision["granted_s"].as_u64().map(|value| value as u32);
+    match bridge_render::simulator_plan_ack(
+        "plan",
+        decision["result"].as_str().unwrap_or("rejected"),
+        decision["display"].as_str().unwrap_or("unchanged"),
+        error,
+        decision["plan_id"].as_u64().unwrap_or(0),
+        granted,
+    ) {
+        Ok(ack) => Json(ack).into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":"plan_ack_failed"})),
+        )
+            .into_response(),
+    }
 }
 
 async fn claim(State(state): State<SimState>, request: Request<Body>) -> Response {
@@ -878,7 +1051,7 @@ fn app(state: SimState) -> Router {
         .route("/sim/state", get(sim_state))
         .route("/sim/time", get(sim_time_get).post(sim_time_post))
         .route("/v2/data", post(endpoint_write))
-        .route("/v2/plan", post(endpoint_write))
+        .route("/v2/plan", post(plan))
         .route("/v2/activate", post(endpoint_write))
         .route("/v2/bundle/begin", post(endpoint_write))
         .route("/v2/bundle/chunk", post(endpoint_write))
@@ -908,6 +1081,7 @@ async fn main() -> Result<()> {
             .min(u128::from(u64::MAX)) as u64,
     };
     let owner = OwnerStore::load(&options.data_dir, &options.mac)?;
+    let plan = bridge_render::SimulatorPlan::new()?;
     let state = SimState {
         mac: options.mac.clone(),
         endpoint_token,
@@ -922,6 +1096,7 @@ async fn main() -> Result<()> {
             wall_offset_ms: 0,
         })),
         owner: Arc::new(Mutex::new(owner)),
+        plan: Arc::new(Mutex::new(plan)),
     };
     let listener = tokio::net::TcpListener::bind(options.listen)
         .await

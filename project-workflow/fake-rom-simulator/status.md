@@ -1,5 +1,9 @@
 # Fake ROM 与多设备实验时钟状态
 
+## 2026-09-24：Stage D / Task 13d 未配置设备 Plan 状态通过宿主验证
+
+模拟进程的 `/v2/plan` 现调用 ROM 同源 C++ 命令解析、session、Plan 判定与 ACK 构造；owner 占用按设备顺序检查，Plan ID/截止按进程隔离。重放 ACK 保留原授予秒数，status 的剩余秒随设备逻辑时间递减；wall 校时不改变截止。16 项集成测试、`bridge-render` 全套、Rust 格式与 `git diff --check` 通过。因为 Bundle 仍未配置，模拟器未执行实际 sleep/无线会合；Data、Bundle、Activate、显示和 Bridge 每 MAC 时钟仍待完成。
+
 ## 2026-09-24：Stage D / Task 13c owner 与 claim 通过宿主验证
 
 模拟设备现在要求显式实例数据目录，目录 marker 绑定虚构 MAC；`/claim` 经设备 token 鉴权和共享 C++ 参数/动作判定，owner 写入文件并按 32 位 uptime 秒租期恢复。13 项集成测试覆盖 claim/续约/冲突/force/release、lease 精确边界、wall 跳变、正常重启、目录与 MAC 隔离及异常文件拒绝；`bridge-render` 全套与 `git diff --check` 通过。存储故障/断电恢复、其他业务命令、BLE、显示和 Bridge 目标时钟仍未完成。下一步先让 Data/Plan 在模拟进程中走共享命令路径，未完成端点继续 501。

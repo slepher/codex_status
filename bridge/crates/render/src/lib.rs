@@ -442,6 +442,38 @@ extern "C" {
     fn codex_rgn_on_full() -> c_int;
     fn codex_rgn_dump(out: *mut c_char, out_len: c_int) -> c_int;
     fn codex_v2_status_snapshot(input: *const c_char, out: *mut c_char, cap: c_int) -> c_int;
+    fn codex_v2_plan_new() -> *mut std::ffi::c_void;
+    fn codex_v2_plan_free(p: *mut std::ffi::c_void);
+    fn codex_v2_plan_decide(
+        p: *mut std::ffi::c_void,
+        message: *const c_char,
+        now_ms: u64,
+        provisional: c_int,
+        out: *mut c_char,
+        cap: c_int,
+    ) -> c_int;
+    fn codex_v2_command_parse(message: *const c_char, out: *mut c_char, cap: c_int) -> c_int;
+    fn codex_v2_command_check(
+        message: *const c_char,
+        current_mac: *const c_char,
+        nonce: *const c_char,
+        out: *mut c_char,
+        cap: c_int,
+    ) -> c_int;
+    fn codex_v2_build_ack(
+        op: *const c_char,
+        result: *const c_char,
+        display: *const c_char,
+        retention: *const c_char,
+        error: *const c_char,
+        seq: i64,
+        plan_id: u64,
+        context: *const c_char,
+        accepted_remaining_s: u32,
+        fw_target: *const c_char,
+        out: *mut c_char,
+        cap: c_int,
+    ) -> c_int;
     fn codex_v2_claim_decide(
         message: *const c_char,
         have_owner: c_int,
@@ -495,6 +527,136 @@ pub fn simulator_claim_decision(
         "simulator claim decision failed ({rc})"
     );
     Ok(serde_json::from_str(&cstr(&out))?)
+}
+
+fn simulator_ffi_json(rc: c_int, out: &[i8], operation: &str) -> anyhow::Result<serde_json::Value> {
+    anyhow::ensure!(
+        rc > 0 && (rc as usize) < out.len(),
+        "simulator {operation} failed ({rc})"
+    );
+    Ok(serde_json::from_str(&cstr(out))?)
+}
+
+pub fn simulator_command_parse(message: &str) -> anyhow::Result<serde_json::Value> {
+    let message = CString::new(message)?;
+    let mut out = vec![0i8; 8192];
+    let rc = unsafe {
+        codex_v2_command_parse(message.as_ptr(), out.as_mut_ptr(), out.len() as c_int)
+    };
+    simulator_ffi_json(rc, &out, "command parse")
+}
+
+pub fn simulator_command_check(
+    message: &str,
+    mac: &str,
+    nonce: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let message = CString::new(message)?;
+    let mac = CString::new(mac)?;
+    let nonce = CString::new(nonce)?;
+    let mut out = vec![0i8; 8192];
+    let rc = unsafe {
+        codex_v2_command_check(
+            message.as_ptr(), mac.as_ptr(), nonce.as_ptr(), out.as_mut_ptr(), out.len() as c_int,
+        )
+    };
+    simulator_ffi_json(rc, &out, "command session check")
+}
+
+pub struct SimulatorPlan {
+    state: *mut std::ffi::c_void,
+    accepted: Option<(u64, String, u64, u32)>,
+}
+
+unsafe impl Send for SimulatorPlan {}
+
+impl SimulatorPlan {
+    pub fn new() -> anyhow::Result<Self> {
+        let state = unsafe { codex_v2_plan_new() };
+        anyhow::ensure!(!state.is_null(), "simulator plan allocation failed");
+        Ok(Self {
+            state,
+            accepted: None,
+        })
+    }
+
+    pub fn decide(&mut self, message: &str, now_ms: u64) -> anyhow::Result<serde_json::Value> {
+        let message_c = CString::new(message)?;
+        let parsed: serde_json::Value = serde_json::from_str(message)?;
+        let mut out = vec![0i8; 8192];
+        let rc = unsafe {
+            codex_v2_plan_decide(
+                self.state,
+                message_c.as_ptr(),
+                now_ms,
+                0,
+                out.as_mut_ptr(),
+                out.len() as c_int,
+            )
+        };
+        let decision = simulator_ffi_json(rc, &out, "plan decision")?;
+        if decision["accepted"] == true {
+            let id = decision["accepted_id"].as_u64().unwrap_or(0);
+            if self.accepted.as_ref().is_none_or(|(old_id, ..)| *old_id != id) {
+                self.accepted = Some((
+                    id,
+                    parsed["mode"].as_str().unwrap_or("sleep").to_owned(),
+                    now_ms,
+                    decision["state_granted_s"].as_u64().unwrap_or(0) as u32,
+                ));
+            }
+        }
+        Ok(decision)
+    }
+
+    pub fn status_fields(&self) -> (bool, &str, u64, u32, u64) {
+        match &self.accepted {
+            Some((id, mode, accepted_at_ms, granted_s)) => {
+                (true, mode, *id, *granted_s, *accepted_at_ms)
+            }
+            None => (false, "sleep", 0, 0, 0),
+        }
+    }
+}
+
+impl Drop for SimulatorPlan {
+    fn drop(&mut self) {
+        unsafe { codex_v2_plan_free(self.state) };
+    }
+}
+
+pub fn simulator_plan_ack(
+    op: &str,
+    result: &str,
+    display: &str,
+    error: Option<&str>,
+    plan_id: u64,
+    granted_s: Option<u32>,
+) -> anyhow::Result<serde_json::Value> {
+    let op = CString::new(op)?;
+    let result = CString::new(result)?;
+    let display = CString::new(display)?;
+    let retention = CString::new("ram")?;
+    let error = error.map(CString::new).transpose()?;
+    let target = CString::new("codex-status-154g")?;
+    let mut out = vec![0i8; 8192];
+    let rc = unsafe {
+        codex_v2_build_ack(
+            op.as_ptr(),
+            result.as_ptr(),
+            display.as_ptr(),
+            retention.as_ptr(),
+            error.as_ref().map_or(std::ptr::null(), |value| value.as_ptr()),
+            -1,
+            plan_id,
+            std::ptr::null(),
+            granted_s.unwrap_or(u32::MAX),
+            target.as_ptr(),
+            out.as_mut_ptr(),
+            out.len() as c_int,
+        )
+    };
+    simulator_ffi_json(rc, &out, "plan ACK")
 }
 
 /// Result of pushing one font container into the device font store.
