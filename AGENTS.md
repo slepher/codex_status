@@ -27,12 +27,20 @@
 固件（仓库根目录）：
 
 ```powershell
-pio run                    # 编译
-pio run -t upload          # USB 烧录（用网页 OTA 后先擦 otadata：erase_region 0xD000 0x2000）
+pio run -e zectrix-note4-b            # 编译（唯一目标；勿省略 -e，也不要构建其他 env）
+pio run -e zectrix-note4-b -t upload  # USB 烧录（用网页 OTA 后先擦 otadata：erase_region 0xD000 0x2000）
 pio device monitor
 ```
 
-pm env（M3，pioarduino `custom_sdkconfig`）构建：仓库改名后路径无空格，直接在仓库目录运行 `pio run` 即可（若路径再含空格，IDF 会拒绝，需用 junction 且让 pio 的真实 cwd 落在 junction 上）。勿用 `-v`（GBK 控制台会 UnicodeEncodeError 挂住构建）。生成物 sdkconfig*/CMakeLists.txt/.dummy 等已 gitignore。构建环境细节与踩坑见 `project-workflow/sleep-battery/task-7.md` §7。本板闪存必须 40 MHz（`board_build.f_flash` + `tools/bootloader_40m_fix.py`），否则 GD25Q64 在 80 MHz 下 ID 读错、写入失败。
+### 固件目标：只构建 Note4
+
+- **唯一目标：`zectrix-note4-b`。** 不要构建其他 env（尤其不要构建或切换到 `esp32-s3-epaper-154g` 及其 `-gray4`/`-btpm` 变体）；构建命令一律显式带 `-e zectrix-note4-b`。
+- **不要交替构建不同目标。** 项目根 `sdkconfig.defaults` 是**全项目唯一**生成物，被各目标争写；pioarduino `arduino.py` 会把当前环境的 `custom_sdkconfig`、MCU 与板卡指纹同该文件首行的 `# TASMOTA__...` 比对，`check_reinstall_frwrk()` 不匹配时会清理生成的 sdkconfig 文件并重装两个 Arduino framework 包。交替切换必然失配、必然重装（已双向实测，单次约 15 分钟量级）。多目标并存的正确解法是按目标隔离 `packages_dir`（见 `next.md` §7）；**在该隔离落地前只构建 Note4**。
+- 不要同时运行两个及以上 `pio` 进程；单个目标内部允许 PlatformIO 并行编译源文件。
+- 保留 `.pio/build/<env>` 与 SCons 缓存，不要因只改应用源码而例行清理或删除构建目录。
+- 每次构建后核对环境名、固件版本、产物大小与 SHA256，并把最终 ROM 路径与哈希写入 `PROGRESS.md`。
+
+pm env（M3，pioarduino `custom_sdkconfig`）构建：仓库改名后路径无空格，直接在仓库目录运行 `pio run -e zectrix-note4-b` 即可（若路径再含空格，IDF 会拒绝，需用 junction 且让 pio 的真实 cwd 落在 junction 上）。勿用 `-v`（GBK 控制台会 UnicodeEncodeError 挂住构建）。生成物 sdkconfig*/CMakeLists.txt/.dummy 等已 gitignore。构建环境细节与踩坑见 `project-workflow/sleep-battery/task-7.md` §7。⚠️ 下列这条只属于 `esp32-s3-epaper-154g`（1.54" 板；当前不构建，仅保留备查）：闪存必须 40 MHz（`board_build.f_flash` + `tools/bootloader_40m_fix.py`），否则 GD25Q64 在 80 MHz 下 ID 读错、写入失败。
 
 Rust 桥（`bridge/` 目录；Windows 才能跑 BLE/Tauri）：
 
