@@ -116,6 +116,22 @@ extern "C" {
         body_out: *mut std::os::raw::c_char,
         body_cap: c_int,
     ) -> c_int;
+    fn codex_v2_activate_new(configured: c_int, profile: *const std::os::raw::c_char) -> *mut c_void;
+    fn codex_v2_activate_free(p: *mut c_void);
+    fn codex_v2_activate_seed_fingerprint(
+        p: *mut c_void,
+        request: *const std::os::raw::c_char,
+        owner: *const std::os::raw::c_char,
+        template_id: *const std::os::raw::c_char,
+        expected: *const std::os::raw::c_char,
+        context: *const std::os::raw::c_char,
+    );
+    fn codex_v2_activate_decide(
+        p: *mut c_void,
+        message: *const std::os::raw::c_char,
+        out: *mut std::os::raw::c_char,
+        cap: c_int,
+    ) -> c_int;
     fn codex_v2_plan_high(p: *mut c_void) -> u64;
     fn codex_v2_plan_light_active(p: *mut c_void, now_ms: u64) -> c_int;
     fn codex_v2_boot_remaining(t_boot_ms: u64, now_ms: u64) -> u32;
@@ -350,6 +366,100 @@ fn shared_plan_decision_classifies_ack_and_preserves_plan_state() {
         assert_eq!(normal_cap["granted_s"], 600);
         codex_v2_plan_free(normal);
     }
+}
+
+#[test]
+fn shared_activate_decision_classifies_replay_and_profile_switches() {
+    let profile = serde_json::json!({
+        "context": "ctx-current",
+        "ids": ["t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7"]
+    });
+    let profile_text = std::ffi::CString::new(profile.to_string()).unwrap();
+    let harness = unsafe { codex_v2_activate_new(1, profile_text.as_ptr()) };
+    assert!(!harness.is_null());
+    let decide = |message: serde_json::Value| unsafe {
+        let text = std::ffi::CString::new(message.to_string()).unwrap();
+        let mut out = vec![0i8; 2048];
+        let rc = codex_v2_activate_decide(harness, text.as_ptr(), out.as_mut_ptr(), out.len() as c_int);
+        assert!(rc > 0);
+        serde_json::from_str::<serde_json::Value>(
+            std::ffi::CStr::from_ptr(out.as_ptr()).to_str().unwrap(),
+        )
+        .unwrap()
+    };
+    let command = |request: &str, template: &str, expected: &str| {
+        serde_json::json!({
+            "request_id": request,
+            "bridge_id": "owner",
+            "template_id": template,
+            "expected_active_context_id": expected,
+        })
+    };
+
+    let switch = decide(command("req-new", "t7", "ctx-current"));
+    assert_eq!(switch["action"], "switch");
+    assert_eq!(switch["index"], 7);
+    assert_eq!(switch["saved_request"], "");
+
+    unsafe {
+        let request = std::ffi::CString::new("req-done").unwrap();
+        let owner = std::ffi::CString::new("owner").unwrap();
+        let template = std::ffi::CString::new("t3").unwrap();
+        let expected = std::ffi::CString::new("ctx-before").unwrap();
+        let context = std::ffi::CString::new("ctx-after").unwrap();
+        codex_v2_activate_seed_fingerprint(
+            harness, request.as_ptr(), owner.as_ptr(), template.as_ptr(),
+            expected.as_ptr(), context.as_ptr(),
+        );
+    }
+    let replay = decide(command("req-done", "t3", "ctx-before"));
+    assert_eq!(replay["action"], "replay");
+    assert_eq!(replay["result"], "applied");
+    assert_eq!(replay["display"], "unchanged");
+    assert!(replay.get("error").is_none());
+    assert_eq!(replay["context"], "ctx-after");
+    assert_eq!(replay["saved_request"], "req-done");
+    assert_eq!(replay["saved_template"], "t3");
+
+    let conflict = decide(command("req-done", "t4", "ctx-before"));
+    assert_eq!(conflict["action"], "reject");
+    assert_eq!(conflict["result"], "rejected");
+    assert_eq!(conflict["display"], "unchanged");
+    assert_eq!(conflict["error"], "request_conflict");
+    assert_eq!(conflict["context"], "ctx-after");
+    assert_eq!(conflict["saved_template"], "t3");
+
+    let stale_context = decide(command("req-old", "t0", "ctx-old"));
+    assert_eq!(stale_context["action"], "reject");
+    assert_eq!(stale_context["result"], "rejected");
+    assert_eq!(stale_context["error"], "context");
+    assert_eq!(stale_context["context"], "ctx-current");
+    assert_eq!(stale_context["saved_request"], "req-done");
+
+    let unknown = decide(command("req-unknown", "missing", "ctx-current"));
+    assert_eq!(unknown["action"], "reject");
+    assert_eq!(unknown["error"], "unknown_template");
+    assert_eq!(unknown["saved_request"], "req-done");
+    unsafe { codex_v2_activate_free(harness) };
+
+    let unconfigured = unsafe { codex_v2_activate_new(0, profile_text.as_ptr()) };
+    assert!(!unconfigured.is_null());
+    let text = std::ffi::CString::new(command("req", "t0", "ctx-current").to_string()).unwrap();
+    let mut out = vec![0i8; 2048];
+    assert!(unsafe {
+        codex_v2_activate_decide(unconfigured, text.as_ptr(), out.as_mut_ptr(), out.len() as c_int)
+    } > 0);
+    let decision = unsafe {
+        serde_json::from_str::<serde_json::Value>(
+            std::ffi::CStr::from_ptr(out.as_ptr()).to_str().unwrap(),
+        )
+        .unwrap()
+    };
+    assert_eq!(decision["result"], "rejected");
+    assert_eq!(decision["display"], "unchanged");
+    assert_eq!(decision["error"], "context");
+    assert_eq!(decision["saved_request"], "");
+    unsafe { codex_v2_activate_free(unconfigured) };
 }
 
 #[test]

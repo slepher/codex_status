@@ -1,5 +1,9 @@
 # Fake ROM 与多设备实验时钟状态
 
+## 2026-09-24：Stage C / Task 12f Activate 决策切片通过宿主验证
+
+在 Bundle COMMIT `b702aa3` 后，串行抽取 Activate 的同请求重放/冲突、expected context 和 Profile 1–8 模板索引决策为 `src/v2_activate_command.{h,cpp}`。设备端仍在 token/owner/session 预检后调用共享决策；只有有效 switch 才进入原 `v2SwitchActive`，成功后才记录请求指纹并渲染。宿主测试覆盖上次 context 的成功重放、冲突、未配置、旧 context、未知模板、8 项索引和拒绝时指纹不变；`cargo test -p bridge-render --test v2_state` 16/16、`git diff --check` 通过。未构建/烧录 ROM、未接主 Bridge/实机。下一步 claim，再处理宿主端点及存储/显示适配；仍非可运行 Fake ROM。
+
 ## 2026-09-24：Stage C / Task 12e Bundle COMMIT 校验切片通过宿主验证
 
 在 CHUNK `fa50902` 后，共享 `v2DecideBundleCommit` 按原顺序处理已提交请求重放、CRC/会话/长度、LittleFS 接收文件读回、body owner/JSON、已有 job 同 CRC 或冲突判定。固件 `main.cpp` 仍在校验成功后生成 context、安装 Bundle，再按原顺序更新 committed 指纹、清理 RX、重置 DataSeq 与显示。宿主内存 LittleFS 测试覆盖重放/冲突、错会话/不完整/缺文件/错长度/CRC/owner/JSON、待安装和已有 job 分支；`cargo test -p bridge-render --test v2_state` 15/15、`git diff --check` 通过。Arduino 固件 `String::reserve` 返回 bool，共享代码保留原 OOM 拒绝；宿主 shim 的 reserve 不报告失败，故 OOM 未由宿主触发验证。未构建/烧录 ROM、接主 Bridge 或实机。下一步 Activate、claim 以及宿主完整端点。

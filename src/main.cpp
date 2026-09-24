@@ -54,6 +54,7 @@
 #include "v2_data_command.h"
 #include "v2_plan_command.h"
 #include "v2_bundle_command.h"
+#include "v2_activate_command.h"
 #include "bundle_store.h"
 
 // v2 platform targets (src/platform_target.h): the render/firmware target
@@ -3808,34 +3809,24 @@ static void handleV2Activate() {
     }
     JsonDocument doc;
     if (!v2Command(server.arg("plain"), doc)) return;
-    String id = doc["template_id"] | "";
-    String owner = doc["bridge_id"] | "";
-    String request = doc["request_id"] | "";
-    String expected = doc["expected_active_context_id"] | "";
-    if (request == v2ActivateRequest && owner == v2ActivateOwner) {
-        bool same = id == v2ActivateTemplate && expected == v2ActivateExpected;
-        v2Ack("activate", same ? "applied" : "rejected", "unchanged", "flash",
-              same ? nullptr : "request_conflict", -1, 0,
-              v2ActivateContext.c_str(), UINT32_MAX);
+    V2ActivateDecision decision = v2DecideActivate(
+        doc, v2BundleReady, v2Profile, v2ActivateRequest.c_str(),
+        v2ActivateOwner.c_str(), v2ActivateTemplate.c_str(),
+        v2ActivateExpected.c_str(), v2ActivateContext.c_str());
+    if (decision.action != V2_ACTIVATE_SWITCH) {
+        v2Ack("activate", decision.result, decision.display, "flash",
+              decision.error, -1, 0, decision.context, UINT32_MAX);
         return;
     }
-    if (!v2BundleReady || expected != v2Profile.contextId) {
-        v2Ack("activate", "rejected", "unchanged", "flash", "context", -1, 0,
-              v2Profile.contextId, UINT32_MAX);
-        return;
-    }
-    int index = -1;
-    for (uint8_t i = 0; i < v2Profile.count; i++) {
-        if (id == v2Profile.ids[i]) { index = i; break; }
-    }
-    if (index < 0 || !v2SwitchActive((uint8_t)index)) {
+    if (!v2SwitchActive((uint8_t)decision.index)) {
         v2Ack("activate", "rejected", "unchanged", "flash",
-              index < 0 ? "unknown_template" : "activation_failed", -1, 0,
+              "activation_failed", -1, 0,
               v2Profile.contextId, UINT32_MAX);
         return;
     }
-    v2ActivateRequest = request; v2ActivateOwner = owner; v2ActivateExpected = expected;
-    v2ActivateTemplate = id; v2ActivateContext = v2Profile.contextId;
+    v2ActivateRequest = decision.request; v2ActivateOwner = decision.owner;
+    v2ActivateExpected = decision.expected; v2ActivateTemplate = decision.templateId;
+    v2ActivateContext = v2Profile.contextId;
     renderCurrent();
     v2Ack("activate", "applied", "displayed", "flash", nullptr, -1, 0,
           v2Profile.contextId, UINT32_MAX);

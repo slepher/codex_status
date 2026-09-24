@@ -1,5 +1,9 @@
 # Codex Status 项目进度（交接文档）
 
+## Fake ROM Stage C Activate 切片：2026-09-24 — 宿主验证通过
+
+Bundle COMMIT 已提交 `b702aa3`；Activate 的请求重放、expected context 和 Profile 1–8 模板索引现在由固件与宿主共用 `src/v2_activate_command.{h,cpp}`。设备端只在新请求有效时调用原 `v2SwitchActive`，成功后才更新指纹、渲染和 ACK。宿主 render 测试 16/16、`git diff --check` 通过；未接主 Bridge/实机，未构建/烧录 ROM。下一步 claim 与完整宿主端点；见 `project-workflow/fake-rom-simulator/status.md`。
+
 ## Fake ROM Stage C Bundle COMMIT 切片：2026-09-24 — 宿主验证通过
 
 独立 `codex/fake` worktree 上，CHUNK 已提交 `fa50902`；COMMIT 的重放、会话完整性、接收文件读回 CRC、owner/JSON 和已有 job 判定现由固件与宿主共用 `v2DecideBundleCommit`。设备端仍负责 context 随机生成、实际安装和安装成功后的状态/显示副作用。内存 LittleFS 宿主测试 15/15、`git diff --check` 通过；OOM 分支保留固件原 bool 检查，宿主 shim 不模拟 reserve 失败。未接主 Bridge/实机、未构建/烧录 ROM。Activate/claim 与可运行 Fake ROM 仍待实现，见 `project-workflow/fake-rom-simulator/status.md`。

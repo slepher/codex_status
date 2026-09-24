@@ -6,6 +6,7 @@
 #include "v2_data_command.h"
 #include "v2_plan_command.h"
 #include "v2_bundle_command.h"
+#include "v2_activate_command.h"
 #include "bundle_store.h"
 #include "font_asset.h"
 #include "font_store.h"
@@ -43,6 +44,12 @@ struct BundleBeginHarness {
     bool hasCandidate = false;
     String committedOwner, committedRequest, committedContext;
     uint32_t committedCrc = 0, committedLength = 0;
+};
+
+struct ActivateHarness {
+    bool configured = false;
+    BsProfile profile{};
+    String request, owner, templateId, expected, context;
 };
 
 void writeBundleRx(JsonObject out, const V2BundleRx &rx) {
@@ -523,6 +530,62 @@ int codex_v2_bundle_commit_decide(void *p, const char *message,
     if (body.length() >= (size_t)body_cap) return -4;
     memcpy(body_out, body.c_str(), body.length() + 1);
     return (int)written;
+}
+void *codex_v2_activate_new(int configured, const char *profile_json) {
+    if (!profile_json) return nullptr;
+    auto *h = new ActivateHarness();
+    JsonDocument profile;
+    if (deserializeJson(profile, profile_json)) { delete h; return nullptr; }
+    h->configured = configured != 0;
+    const char *context = profile["context"] | "";
+    strncpy(h->profile.contextId, context, sizeof(h->profile.contextId) - 1);
+    JsonArrayConst ids = profile["ids"].as<JsonArrayConst>();
+    if (ids.size() > BS_MAX_TEMPLATES) { delete h; return nullptr; }
+    for (JsonVariantConst id : ids) {
+        const char *value = id | "";
+        strncpy(h->profile.ids[h->profile.count], value, BS_ID_LEN - 1);
+        ++h->profile.count;
+    }
+    return h;
+}
+void codex_v2_activate_free(void *p) { delete (ActivateHarness *)p; }
+void codex_v2_activate_seed_fingerprint(void *p, const char *request,
+                                        const char *owner, const char *template_id,
+                                        const char *expected, const char *context) {
+    if (!p) return;
+    ActivateHarness &h = *(ActivateHarness *)p;
+    h.request = request ? request : "";
+    h.owner = owner ? owner : "";
+    h.templateId = template_id ? template_id : "";
+    h.expected = expected ? expected : "";
+    h.context = context ? context : "";
+}
+int codex_v2_activate_decide(void *p, const char *message, char *out, int cap) {
+    if (!p || !message || !out || cap <= 0) return -99;
+    ActivateHarness &h = *(ActivateHarness *)p;
+    JsonDocument doc;
+    if (deserializeJson(doc, message)) return -2;
+    V2ActivateDecision decision = v2DecideActivate(
+        doc, h.configured, h.profile, h.request.c_str(), h.owner.c_str(),
+        h.templateId.c_str(), h.expected.c_str(), h.context.c_str());
+    JsonDocument result;
+    result["action"] = decision.action == V2_ACTIVATE_SWITCH ? "switch"
+                      : decision.action == V2_ACTIVATE_REPLAY ? "replay" : "reject";
+    result["result"] = decision.result;
+    result["display"] = decision.display;
+    if (decision.error) result["error"] = decision.error;
+    if (decision.context) result["context"] = decision.context;
+    result["index"] = decision.index;
+    result["request"] = decision.request;
+    result["owner"] = decision.owner;
+    result["template_id"] = decision.templateId;
+    result["expected"] = decision.expected;
+    result["saved_request"] = h.request;
+    result["saved_owner"] = h.owner;
+    result["saved_template"] = h.templateId;
+    result["saved_expected"] = h.expected;
+    result["saved_context"] = h.context;
+    return (int)serializeJson(result, out, (size_t)cap);
 }
 uint64_t codex_v2_plan_high(void *p) { return ((V2PlanState *)p)->highId(); }
 int codex_v2_plan_light_active(void *p, uint64_t now_ms) {
