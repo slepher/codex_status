@@ -45,6 +45,34 @@
 
 ⚠️ **交替目标的代价已实测确认**：154g 单目标构建 188 s；随后切到 note4-b 触发 framework 重装，总计 **926 s**（框架重编完成后仅第二次链接 76 s）。故按新约定只构建 note4-b。
 
+### 包目录隔离（next.md §7）：note4 已落地并验证
+
+`tools/pio-target.ps1` 已实现：按目标注入 `PLATFORMIO_PACKAGES_DIR`（`note4` → `<repo>\.pio-pkgs\note4`），**并把 `PLATFORMIO_CORE_DIR` 指向 `<repo>\.pio-core`**，**不改 `platformio.ini`**（`[platformio]` 全项目唯一、`core_dir` 为 `Multiple: No`，只能从调用侧注入）。两处都在仓库内且已加入 `.gitignore`，因此目录准备与构建**都不需要仓库外写权限**——必要性在于 PlatformIO **每次运行都会写 `<core_dir>\platforms.lock`**；仓库外写权限在受限沙箱下会被拒绝（本轮已实测：指向仓库外的 packages 目录需要逐次提权，且一次被用户否决）。
+
+**实测修正了 next.md §7 的一个前提**：PlatformIO 设置 `packages_dir` 后**不会**回退到 `core_dir/packages`。实测把 `PLATFORMIO_PACKAGES_DIR` 指向空目录后，`pio pkg list` 立即开始安装 `tool-esp_install`，即目录必须自足。因此「只放 framework 与 `-libs`、其余靠回退」的原设想不成立；落地方案改为：
+
+- **真实拷贝**冲突的两个包（`framework-arduinoespressif32` 69 MB + `framework-arduinoespressif32-libs` ≈2.0 GB），由各目标独占，可自由重装而不影响对方；
+- 其余 15 个包（`toolchain-xtensa-esp-elf` 1.36 GB、`toolchain-riscv32-esp` 908 MB、`framework-espidf`、`tool-cmake`、`tool-scons`、esptool、gdb 等）用**目录 junction** 指向共享 `core_dir\packages`，不复制、不重下（Windows 目录 junction 无需管理员权限）。
+
+判据实测（`pwsh tools/pio-target.ps1 -Target note4`）：
+
+| 判据 | 期望 | 实测 |
+|---|---|---|
+| a. 首用新 packages 目录 | 允许一次 banner + 重编 | **未出现 banner**（种子拷贝已带 note4 指纹），93 s |
+| b. 同目录再跑 | 不得出现 banner | ✓ 无 banner，26 s（增量） |
+
+证据：`%TEMP%\pio-note4-iso-run1.log` 与 `run2.log`，`Reinstall|Compile Arduino IDF libs` 匹配数均为 **0**、两次 `SUCCESS`、仅既有 deprecation 警告；日志确认实际使用的 packages 目录为 `D:\pio-pkgs\note4`。判据 c/d/e（需构建 154g 以验证「切回 note4 无 banner」）**未做**：154g 的 packages 目录创建被用户拒绝，按「只构建 Note4」约定暂缓。
+
+⚠️ **副作用：ROM 随 packages 路径变化，不可跨路径复现。** 隔离后 note4 的 ROM 与共享目录构建的结果不同：
+
+| 构建 | firmware.bin 大小 | SHA256 |
+|---|---|---|
+| 合并后（共享 `C:\Users\cogic\.platformio\packages`） | 1758384 | `7997C3235C53755CCED60487A81AD01BB0B896AEF2693B950904D90586EC28F7` |
+| 隔离中间态（`D:\pio-pkgs\note4`，已弃用） | 1757648 | `E959EFDE345FFDBC584C5656E9704ED48BF7C8EDC9DD4F81432D54CDE0F20B89` |
+| 隔离后（`<repo>\.pio-pkgs\note4` + `.pio-core`）← **当前** | 1757600 | `71594E8E62783345BB2F73ABDE235A85C4C0B2324A469196B9D1ED1A5369C3DE` |
+
+相差数百字节，根因是**绝对路径被编进固件**（`firmware.bin` 内含字符串 `pio-pkgs`；路径越长字节越多）。功能无变化（`byte[3]=0x40`、`esp_app_desc` 仍为 `0.18.23-note4-b`），但同一份源码在不同 packages 路径下产出的 ROM 哈希不同。若要可复现哈希，需加 `-ffile-prefix-map`/`-fmacro-prefix-map` 归一化路径——**未做，留作决策**。
+
 ### 现场事故：next.md §5.2 的 stash 流程在本机不成立
 
 按 §5.2 执行选择性 `git stash push -u` 时**部分失败**：`tools/` 与 `artifacts/` 带有 `CodexSandboxUsers` ACL，**拒绝 shell 写入**（`artifacts/` 的该问题 next.md §6 已记录，`tools/` 同样如此）。git stash 先 unlink 再写回，于是 16 个文件被删除却无法重建，而索引已暂存全部改动。

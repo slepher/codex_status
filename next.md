@@ -346,20 +346,31 @@ python artifacts/hash-forensics/compute_fingerprint.py
 两个发行目标共享同一份 `custom_sdkconfig`，但指纹不同（154g `|False|qio_opi|` vs note4 `|False|dio_opi|opi`），
 且**项目根 `sdkconfig.defaults` 是唯一的**（被两个目标争写）→ 交替切换必然失配、必然重装（已双向实测）。
 
-**实现**：新建 `tools/pio-target.ps1`（**不改 `platformio.ini`**），按 `-Target` 注入
-`PLATFORMIO_PACKAGES_DIR`（必要时 `PLATFORMIO_CORE_DIR`），例如 `D:\pio-pkgs\154g` / `D:\pio-pkgs\note4`。
-理由：冲突的全部内容（framework 与 `-libs`）都在 `packages_dir` 内，而最占地的 toolchain/penv 可留在公共 core dir。
-**必须从调用侧注入**，因为 `[platformio]` 段全项目唯一、`core_dir` 为 `Multiple: No`。
+**实现**（已落地 `tools/pio-target.ps1`；**不改 `platformio.ini`**）：
+
+**① 实测推翻了一个前提**：设置 `packages_dir` 后 PlatformIO **不会**回退到 `core_dir/packages`。实测把 `PLATFORMIO_PACKAGES_DIR` 指向空目录后，`pio pkg list` 立即开始安装 `tool-esp_install`。所以「只放 framework 与 `-libs`、其余靠回退」不成立——每个目标目录必须自足。
+
+**② 用「真实拷贝 + junction」代替重新下载**：只把真正冲突的两个包（`framework-arduinoespressif32` 69 MB + `framework-arduinoespressif32-libs` ≈2.0 GB）**真实拷贝**给各目标独占，可自由重装而不影响对方；其余 15 个包（`toolchain-xtensa-esp-elf` 1.36 GB、`toolchain-riscv32-esp` 908 MB、`framework-espidf`、`tool-cmake`、`tool-scons`、esptool、gdb 等）用**目录 junction** 指向共享 `core_dir\packages`（Windows 目录 junction 无需管理员权限）。
+
+**③ 全部落在仓库内，不需要越权访问**：packages 根默认 `<repo>\.pio-pkgs\<target>`，并把 `PLATFORMIO_CORE_DIR` 也指向 `<repo>\.pio-core`（内含指向共享 `platforms\espressif32` 的 junction）。必要性：PlatformIO **每次运行都会写 `<core_dir>\platforms.lock`**，若沿用机器级 core dir，则每次构建都要求仓库外写权限。两者均已加入 `.gitignore`。**必须从调用侧注入**，因为 `[platformio]` 段全项目唯一、`core_dir` 为 `Multiple: No`。
+
+```powershell
+pwsh tools/pio-target.ps1 -Target note4 -Setup   # 只准备目录，不构建
+pwsh tools/pio-target.ps1 -Target note4          # 构建（-Target 默认 note4）
+pwsh tools/pio-target.ps1 -Target note4 -t upload
+```
 
 **核心验证判据（逐条记录日志）：**
 
-- [ ] a. 154g 首用新 packages 目录 → **允许**一次 banner + 重编
-- [ ] b. 同目录再跑 154g → **不得**出现 banner / `Compile Arduino IDF libs`
-- [ ] c. note4 首用其 packages 目录 → **允许**一次
-- [ ] d. **切回 154g → 不得出现 banner**（关键断言）
-- [ ] e. 交替 154g → note4 → 154g（均为第二次以上）→ **三次都无 banner**
+- [x] a. note4 首用新 packages 目录 → **未出现 banner**（种子拷贝已带 note4 指纹），93 s
+- [x] b. 同目录再跑 note4 → **无** banner / `Compile Arduino IDF libs`，26–45 s
+- [ ] c. 154g 首用其 packages 目录 → **允许**一次（**未做**：154g 目录创建被用户拒绝，按「只构建 Note4」约定暂缓）
+- [ ] d. **切回 note4 → 不得出现 banner**（关键断言，**未做**）
+- [ ] e. 交替 note4 → 154g → note4（均为第二次以上）→ **三次都无 banner**（**未做**）
 
-**成本**：每个 packages 目录额外 1–1.5 GB 量级；两目录包版本需手动保持同步。
+**成本**：note4 目录 ≈2.1 GB（仅真实拷贝部分，junction 不占空间）；两目录的包版本需手动保持同步。
+
+**⚠️ 副作用：ROM 随 packages 路径变化，不可跨路径复现。** 绝对路径会被编进固件（`firmware.bin` 内含 `pio-pkgs` 字符串），故同一份源码在不同 packages 路径下 ROM 哈希不同（实测相差 736 B）。若要可复现哈希，需加 `-ffile-prefix-map`/`-fmacro-prefix-map` 归一化路径——**未做，留作决策**。
 
 ---
 

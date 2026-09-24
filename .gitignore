@@ -1,5 +1,11 @@
 # PlatformIO / build outputs (re-downloadable or regenerable)
 .pio
+# Per-target PlatformIO package roots used by tools/pio-target.ps1 to keep the
+# two firmware targets from reinstalling each other's framework packages.
+.pio-pkgs
+# Repository-local PlatformIO core dir (holds platforms.lock and junctions to
+# the shared platform installation) so builds need no access outside the repo.
+.pio-core
 bridge/target
 bridge/crates/app/gen
 bridge/target-note4-deploy/
