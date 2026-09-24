@@ -969,6 +969,8 @@ dependencies = [
  "anyhow",
  "axum",
  "bridge-render",
+ "form_urlencoded",
+ "serde",
  "serde_json",
  "tokio",
 ]

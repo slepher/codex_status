@@ -1,5 +1,9 @@
 # Fake ROM 与多设备实验时钟状态
 
+## 2026-09-24：Stage D / Task 13c owner 与 claim 通过宿主验证
+
+模拟设备现在要求显式实例数据目录，目录 marker 绑定虚构 MAC；`/claim` 经设备 token 鉴权和共享 C++ 参数/动作判定，owner 写入文件并按 32 位 uptime 秒租期恢复。13 项集成测试覆盖 claim/续约/冲突/force/release、lease 精确边界、wall 跳变、正常重启、目录与 MAC 隔离及异常文件拒绝；`bridge-render` 全套与 `git diff --check` 通过。存储故障/断电恢复、其他业务命令、BLE、显示和 Bridge 目标时钟仍未完成。下一步先让 Data/Plan 在模拟进程中走共享命令路径，未完成端点继续 501。
+
 ## 2026-09-24：Stage D / Task 13b 设备时钟通过宿主验证
 
 每个 `device-sim` 进程现在有独立的逻辑 monotonic/uptime 与 wall 视图；控制 token 可读写 `/sim/time`，支持 1x、暂停、step、0..1000x 倍率及 wall 偏移。倍率切换先结算旧时间；校时不回退 monotonic。`/v2/status` 与 `/sim/state` 改用时钟快照；`max` 与跨进程持久时钟明确未实现。9 项模拟进程集成测试、`bridge-render` 全套和 `git diff --check` 通过。Bridge 逐目标时钟、owner/PowerPlan 期限与业务状态尚未接线；下一步先接持久设备 owner/claim，再推进其余命令。

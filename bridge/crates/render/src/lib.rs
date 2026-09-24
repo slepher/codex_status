@@ -442,6 +442,13 @@ extern "C" {
     fn codex_rgn_on_full() -> c_int;
     fn codex_rgn_dump(out: *mut c_char, out_len: c_int) -> c_int;
     fn codex_v2_status_snapshot(input: *const c_char, out: *mut c_char, cap: c_int) -> c_int;
+    fn codex_v2_claim_decide(
+        message: *const c_char,
+        have_owner: c_int,
+        current_json: *const c_char,
+        out: *mut c_char,
+        cap: c_int,
+    ) -> c_int;
 }
 
 /// Build the simulator's `/v2/status` payload with the firmware's C++ builder.
@@ -463,6 +470,31 @@ pub fn simulator_status_snapshot(input: &serde_json::Value) -> anyhow::Result<se
         .get("status")
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("simulator status result missing"))
+}
+
+/// Run the firmware's shared claim argument preparation and action decision.
+pub fn simulator_claim_decision(
+    message: &serde_json::Value,
+    have_owner: bool,
+    current: &serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let message = CString::new(serde_json::to_string(message)?)?;
+    let current = CString::new(serde_json::to_string(current)?)?;
+    let mut out = vec![0i8; 8192];
+    let rc = unsafe {
+        codex_v2_claim_decide(
+            message.as_ptr(),
+            c_int::from(have_owner),
+            current.as_ptr(),
+            out.as_mut_ptr(),
+            out.len() as c_int,
+        )
+    };
+    anyhow::ensure!(
+        rc > 0 && (rc as usize) < out.len(),
+        "simulator claim decision failed ({rc})"
+    );
+    Ok(serde_json::from_str(&cstr(&out))?)
 }
 
 /// Result of pushing one font container into the device font store.

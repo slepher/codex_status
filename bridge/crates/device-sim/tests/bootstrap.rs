@@ -1,25 +1,36 @@
 use serde_json::Value;
 use std::{
+    fs,
     io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpStream},
+    path::PathBuf,
     process::{Child, Command, Stdio},
+    sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
 
 const ENDPOINT: &str = "endpoint-test-secret";
 const DEVICE: &str = "device-test-secret";
 const CONTROL: &str = "control-test-secret";
+static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 
 struct Simulator {
-    child: Child,
+    child: Option<Child>,
     ready: Value,
+    data_dir: PathBuf,
+    cleanup: bool,
 }
 
 impl Simulator {
     fn start(mac: &str, extra: &[&str]) -> Self {
+        Self::start_with_dir(mac, extra, temp_data_dir(), true)
+    }
+
+    fn start_with_dir(mac: &str, extra: &[&str], data_dir: PathBuf, cleanup: bool) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_device-sim"));
         command
-            .args(["--listen", "127.0.0.1:0", "--mac", mac])
+            .args(["--listen", "127.0.0.1:0", "--mac", mac, "--data-dir"])
+            .arg(&data_dir)
             .args(extra)
             .env("CODEX_STATUS_SIM_ENDPOINT_TOKEN", ENDPOINT)
             .env("CODEX_STATUS_SIM_DEVICE_TOKEN", DEVICE)
@@ -32,7 +43,12 @@ impl Simulator {
         let mut line = String::new();
         reader.read_line(&mut line).expect("read ready line");
         let ready: Value = serde_json::from_str(&line).expect("ready JSON");
-        Self { child, ready }
+        Self {
+            child: Some(child),
+            ready,
+            data_dir,
+            cleanup,
+        }
     }
 
     fn address(&self) -> SocketAddr {
@@ -43,13 +59,34 @@ impl Simulator {
             .parse()
             .unwrap()
     }
+
+    fn stop_preserving_data(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.cleanup = false;
+    }
 }
 
 impl Drop for Simulator {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if self.cleanup {
+            let _ = fs::remove_dir_all(&self.data_dir);
+        }
     }
+}
+
+fn temp_data_dir() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "codex-device-sim-{}-{}",
+        std::process::id(),
+        NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+    ))
 }
 
 fn request(
@@ -92,12 +129,45 @@ fn json_body(body: &[u8]) -> Value {
     serde_json::from_slice(body).expect("JSON response")
 }
 
+fn claim(sim: &Simulator, query: &str, token: Option<&str>) -> (u16, Value) {
+    let (code, body) = request(
+        sim.address(),
+        "POST",
+        &format!("/claim?{query}"),
+        token,
+        b"",
+    );
+    (code, json_body(&body))
+}
+
+fn sim_state(sim: &Simulator) -> Value {
+    let (code, body) = request(sim.address(), "GET", "/sim/state", Some(CONTROL), b"");
+    assert_eq!(code, 200);
+    json_body(&body)
+}
+
+fn claim_query(pairs: &[(&str, &str)]) -> String {
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    for (key, value) in pairs {
+        serializer.append_pair(key, value);
+    }
+    serializer.finish()
+}
+
 #[test]
 fn startup_requires_loopback_laa_mac_and_all_tokens() {
     let executable = env!("CARGO_BIN_EXE_device-sim");
     let base = || {
         let mut command = Command::new(executable);
-        command.args(["--listen", "127.0.0.1:0", "--mac", "02:00:00:00:00:01"]);
+        command
+            .args([
+                "--listen",
+                "127.0.0.1:0",
+                "--mac",
+                "02:00:00:00:00:01",
+                "--data-dir",
+            ])
+            .arg(temp_data_dir());
         command.env("CODEX_STATUS_SIM_ENDPOINT_TOKEN", ENDPOINT);
         command.env("CODEX_STATUS_SIM_DEVICE_TOKEN", DEVICE);
         command.env("CODEX_STATUS_SIM_CONTROL_TOKEN", CONTROL);
@@ -127,6 +197,45 @@ fn startup_requires_loopback_laa_mac_and_all_tokens() {
     let output = equal_tokens.output().unwrap();
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
+
+    let mut relative_dir = Command::new(executable);
+    relative_dir
+        .args([
+            "--listen",
+            "127.0.0.1:0",
+            "--mac",
+            "02:00:00:00:00:01",
+            "--data-dir",
+            "relative-simulator-data",
+        ])
+        .env("CODEX_STATUS_SIM_ENDPOINT_TOKEN", ENDPOINT)
+        .env("CODEX_STATUS_SIM_DEVICE_TOKEN", DEVICE)
+        .env("CODEX_STATUS_SIM_CONTROL_TOKEN", CONTROL)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = relative_dir.output().unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+
+    let executable_data = PathBuf::from(executable).parent().unwrap().join("data");
+    let mut protected_dir = Command::new(executable);
+    protected_dir
+        .args([
+            "--listen",
+            "127.0.0.1:0",
+            "--mac",
+            "02:00:00:00:00:01",
+            "--data-dir",
+        ])
+        .arg(executable_data)
+        .env("CODEX_STATUS_SIM_ENDPOINT_TOKEN", ENDPOINT)
+        .env("CODEX_STATUS_SIM_DEVICE_TOKEN", DEVICE)
+        .env("CODEX_STATUS_SIM_CONTROL_TOKEN", CONTROL)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = protected_dir.output().unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
 }
 
 #[test]
@@ -136,7 +245,7 @@ fn ready_and_status_are_safe_and_use_shared_builder() {
     assert_eq!(sim.ready["mac"], "02:AB:CD:00:00:01");
     assert_eq!(
         sim.ready["capabilities"],
-        serde_json::json!(["v2_status", "clock_control"])
+        serde_json::json!(["v2_status", "clock_control", "claim"])
     );
     let ready_text = sim.ready.to_string();
     assert!(!ready_text.contains(ENDPOINT));
@@ -173,14 +282,15 @@ fn token_domains_are_separate_and_sim_state_discloses_no_secrets() {
     assert_eq!(state["mac"], "02:00:00:00:00:02");
     assert_eq!(
         state["capabilities"],
-        serde_json::json!(["v2_status", "clock_control"])
+        serde_json::json!(["v2_status", "clock_control", "claim"])
     );
     assert_eq!(state["clock_persistence"], "unsupported");
+    assert_eq!(state["owner"], Value::Null);
     assert!(state["unsupported"]
         .as_array()
         .unwrap()
         .iter()
-        .all(|item| item != "clock-control"));
+        .all(|item| item != "clock-control" && item != "claim"));
     assert!(state.get("session_nonce").is_none());
     let text = state.to_string();
     assert!(!text.contains(ENDPOINT));
@@ -214,8 +324,8 @@ fn writes_require_their_domain_token_then_report_unsupported() {
         serde_json::json!({"error":"unauthorized","owner":null})
     );
     let (code, body) = request(sim.address(), "POST", "/claim", Some(DEVICE), b"{}");
-    assert_eq!(code, 501);
-    assert_eq!(json_body(&body)["error"], "unsupported");
+    assert_eq!(code, 400);
+    assert_eq!(json_body(&body), serde_json::json!({"error":"args"}));
 }
 
 #[test]
@@ -242,6 +352,11 @@ fn simulator_instances_have_independent_addresses_and_identity() {
     let second = Simulator::start("02:00:00:00:00:06", &[]);
     assert_ne!(first.address(), second.address());
     assert_ne!(first.ready["mac"], second.ready["mac"]);
+    assert_ne!(first.data_dir, second.data_dir);
+    let (code, claimed) = claim(&first, "id=first-owner", Some(DEVICE));
+    assert_eq!(code, 200);
+    assert_eq!(claimed["owner"]["id"], "first-owner");
+    assert_eq!(sim_state(&second)["owner"], Value::Null);
     let (code, body) = request(first.address(), "GET", "/v2/status", Some(ENDPOINT), b"");
     assert_eq!(code, 200);
     assert_eq!(json_body(&body)["device_mac"], first.ready["mac"]);
@@ -397,4 +512,276 @@ fn instances_advance_at_independent_rates() {
         first_later["monotonic_ms"].as_u64().unwrap() > first_at["monotonic_ms"].as_u64().unwrap()
     );
     assert_eq!(second_later["monotonic_ms"].as_u64().unwrap(), second_at);
+}
+
+#[test]
+fn claim_uses_shared_decision_and_enforces_token_owner_actions() {
+    let sim = Simulator::start("02:00:00:00:00:0B", &[]);
+    let empty_release = claim(&sim, "id=owner-a&release=1", Some(DEVICE));
+    assert_eq!(empty_release.0, 200);
+    assert_eq!(
+        empty_release.1,
+        serde_json::json!({"owner":null,"released":false})
+    );
+    assert_eq!(
+        claim(&sim, "id=%20%20%20", Some(DEVICE)),
+        (400, serde_json::json!({"error":"args"}))
+    );
+
+    let (code, unauthorized) = claim(&sim, "id=owner-a", None);
+    assert_eq!(code, 401);
+    assert_eq!(
+        unauthorized,
+        serde_json::json!({"error":"unauthorized","owner":null})
+    );
+    let (code, unauthorized) = claim(&sim, "id=owner-a", Some(ENDPOINT));
+    assert_eq!(code, 401);
+    assert_eq!(unauthorized["owner"], Value::Null);
+
+    let oversized_id = format!("{}zQ", "é".repeat(31));
+    let long_name = format!("{}z", "é".repeat(16));
+    let query = claim_query(&[
+        ("id", &oversized_id),
+        ("name", &long_name),
+        ("host", "host\nname"),
+        ("port", "65535"),
+        ("lease", "9999"),
+    ]);
+    let (code, first) = claim(&sim, &query, Some(DEVICE));
+    assert_eq!(code, 200);
+    assert_eq!(first["renew"], false);
+    assert_eq!(first["owner"]["id"], format!("{}z", "é".repeat(31)));
+    assert_eq!(first["owner"]["name"], "é".repeat(16));
+    assert_eq!(first["owner"]["host"], "host?name");
+    assert_eq!(first["owner"]["port"], 65535);
+    assert_eq!(first["owner"]["lease_s"], 3600);
+    let since = first["owner"]["since_s"].clone();
+    assert_eq!(
+        set_time(
+            &sim,
+            Some(CONTROL),
+            &serde_json::json!({"op":"rate","rate_ppm":0})
+        )
+        .0,
+        200
+    );
+    let seen = first["owner"]["last_seen_s"].clone();
+    assert_eq!(claim(&sim, "id=%20%20%20", Some(DEVICE)).0, 400);
+    for path in [
+        "/v2/data",
+        "/v2/plan",
+        "/v2/activate",
+        "/v2/bundle/begin",
+        "/v2/bundle/chunk",
+        "/v2/bundle/commit",
+    ] {
+        assert_eq!(
+            request(sim.address(), "POST", path, Some(ENDPOINT), b"{}").0,
+            501,
+            "{path}"
+        );
+        let after_other_write = sim_state(&sim)["owner"].clone();
+        assert_eq!(after_other_write["id"], first["owner"]["id"]);
+        assert_eq!(after_other_write["last_seen_s"], seen);
+    }
+
+    let (code, unauthorized) = claim(&sim, "id=ignored", Some(CONTROL));
+    assert_eq!(code, 401);
+    assert_eq!(unauthorized["owner"]["id"], first["owner"]["id"]);
+
+    let renew_query = claim_query(&[("id", &format!("{}z", "é".repeat(31))), ("name", "renewed")]);
+    let (code, renewed) = claim(&sim, &renew_query, Some(DEVICE));
+    assert_eq!(code, 200);
+    assert_eq!(renewed["renew"], true);
+    assert_eq!(renewed["owner"]["since_s"], since);
+    assert_eq!(renewed["owner"]["name"], "renewed");
+
+    let (code, occupied) = claim(&sim, "id=other", Some(DEVICE));
+    assert_eq!(code, 409);
+    assert_eq!(occupied["error"], "occupied");
+    assert_eq!(occupied["owner"]["id"], first["owner"]["id"]);
+
+    let (code, forced) = claim(&sim, "id=other&force=1", Some(DEVICE));
+    assert_eq!(code, 200);
+    assert_eq!(forced["renew"], false);
+    assert_eq!(forced["owner"]["id"], "other");
+    let (code, released) = claim(&sim, "id=other&release=1", Some(DEVICE));
+    assert_eq!(code, 200);
+    assert_eq!(released, serde_json::json!({"owner":null,"released":true}));
+    assert_eq!(sim_state(&sim)["owner"], Value::Null);
+}
+
+#[test]
+fn claim_lease_uses_paused_uptime_exact_boundary_and_ignores_wall_steps() {
+    let sim = Simulator::start("02:00:00:00:00:0C", &[]);
+    assert_eq!(
+        set_time(
+            &sim,
+            Some(CONTROL),
+            &serde_json::json!({"op":"rate","rate_ppm":0})
+        )
+        .0,
+        200
+    );
+    let (code, claimed) = claim(&sim, "id=lease-owner&lease=60", Some(DEVICE));
+    assert_eq!(code, 200);
+    let seen = claimed["owner"]["last_seen_s"].as_u64().unwrap() as u32;
+    let before = time(&sim, Some(CONTROL)).1["monotonic_ms"]
+        .as_u64()
+        .unwrap();
+    let target = u64::from(seen.wrapping_add(60)) * 1000;
+    assert!(target >= before);
+    assert_eq!(
+        set_time(
+            &sim,
+            Some(CONTROL),
+            &serde_json::json!({"op":"step","delta_ms":target-before})
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        set_time(
+            &sim,
+            Some(CONTROL),
+            &serde_json::json!({"op":"wall","offset_ms":500000})
+        )
+        .0,
+        200
+    );
+    let at_boundary = sim_state(&sim)["owner"].clone();
+    assert_eq!(at_boundary["id"], "lease-owner");
+    assert_eq!(at_boundary["expires_in_s"], 0);
+    assert_eq!(at_boundary["last_seen_s"], seen);
+
+    assert_eq!(
+        set_time(
+            &sim,
+            Some(CONTROL),
+            &serde_json::json!({"op":"step","delta_ms":1000})
+        )
+        .0,
+        200
+    );
+    assert_eq!(sim_state(&sim)["owner"], Value::Null);
+    let saved: Value =
+        serde_json::from_slice(&fs::read(sim.data_dir.join("owner.json")).unwrap()).unwrap();
+    assert_eq!(saved["owner"], Value::Null);
+}
+
+#[test]
+fn owner_is_restored_clamped_and_renewable_after_restart() {
+    let data_dir = temp_data_dir();
+    let mut first = Simulator::start_with_dir("02:00:00:00:00:0D", &[], data_dir.clone(), false);
+    assert_eq!(
+        set_time(
+            &first,
+            Some(CONTROL),
+            &serde_json::json!({"op":"rate","rate_ppm":0})
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        set_time(
+            &first,
+            Some(CONTROL),
+            &serde_json::json!({"op":"step","delta_ms":12000})
+        )
+        .0,
+        200
+    );
+    let (code, claimed) = claim(&first, "id=restart-owner&lease=120", Some(DEVICE));
+    assert_eq!(code, 200);
+    assert!(claimed["owner"]["since_s"].as_u64().unwrap() >= 12);
+    first.stop_preserving_data();
+
+    let restarted = Simulator::start_with_dir("02:00:00:00:00:0D", &[], data_dir.clone(), false);
+    let restored = sim_state(&restarted)["owner"].clone();
+    assert_eq!(restored["id"], "restart-owner");
+    assert_eq!(restored["since_s"], 0);
+    assert_eq!(restored["last_seen_s"], 0);
+    let (code, renewed) = claim(&restarted, "id=restart-owner&lease=120", Some(DEVICE));
+    assert_eq!(code, 200);
+    assert_eq!(renewed["renew"], true);
+    assert_eq!(renewed["owner"]["since_s"], 0);
+    drop(restarted);
+    fs::remove_dir_all(data_dir).unwrap();
+}
+
+#[test]
+fn instance_identity_rejects_mac_conflict_and_corrupt_owner_file() {
+    let data_dir = temp_data_dir();
+    let mut first = Simulator::start_with_dir("02:00:00:00:00:0E", &[], data_dir.clone(), false);
+    let marker: Value =
+        serde_json::from_slice(&fs::read(data_dir.join("simulator.json")).unwrap()).unwrap();
+    assert_eq!(
+        marker,
+        serde_json::json!({"schema":1,"mac":"02:00:00:00:00:0E"})
+    );
+    first.stop_preserving_data();
+
+    let mut conflict = Command::new(env!("CARGO_BIN_EXE_device-sim"));
+    conflict
+        .args([
+            "--listen",
+            "127.0.0.1:0",
+            "--mac",
+            "02:00:00:00:00:0F",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .env("CODEX_STATUS_SIM_ENDPOINT_TOKEN", ENDPOINT)
+        .env("CODEX_STATUS_SIM_DEVICE_TOKEN", DEVICE)
+        .env("CODEX_STATUS_SIM_CONTROL_TOKEN", CONTROL)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = conflict.output().unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+
+    fs::write(
+        data_dir.join("owner.json"),
+        br#"{"schema":1,"mac":"02:00:00:00:00:FF","owner":null}"#,
+    )
+    .unwrap();
+    let mut wrong_owner_mac = Command::new(env!("CARGO_BIN_EXE_device-sim"));
+    wrong_owner_mac
+        .args([
+            "--listen",
+            "127.0.0.1:0",
+            "--mac",
+            "02:00:00:00:00:0E",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .env("CODEX_STATUS_SIM_ENDPOINT_TOKEN", ENDPOINT)
+        .env("CODEX_STATUS_SIM_DEVICE_TOKEN", DEVICE)
+        .env("CODEX_STATUS_SIM_CONTROL_TOKEN", CONTROL)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = wrong_owner_mac.output().unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+
+    fs::write(data_dir.join("owner.json"), b"not-json").unwrap();
+    let mut corrupt = Command::new(env!("CARGO_BIN_EXE_device-sim"));
+    corrupt
+        .args([
+            "--listen",
+            "127.0.0.1:0",
+            "--mac",
+            "02:00:00:00:00:0E",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .env("CODEX_STATUS_SIM_ENDPOINT_TOKEN", ENDPOINT)
+        .env("CODEX_STATUS_SIM_DEVICE_TOKEN", DEVICE)
+        .env("CODEX_STATUS_SIM_CONTROL_TOKEN", CONTROL)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = corrupt.output().unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    fs::remove_dir_all(data_dir).unwrap();
 }

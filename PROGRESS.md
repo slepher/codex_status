@@ -1,5 +1,9 @@
 # Codex Status 项目进度（交接文档）
 
+## Fake ROM Stage D owner/claim：2026-09-24 — 逻辑租期与正常重启恢复通过
+
+在独立 `codex/fake` worktree，设备时钟 Task 13b 已提交 `7aa6d38`。Task 13c 将设备操作 token 鉴权的 `/claim` 接到 Stage C 共享 C++ 决策，新增每虚构 MAC 显式独立数据目录和 owner 文件；claim/续约/409/force/release、暂停 step 的精确 lease 边界、wall 校时不影响租期、正常重启后钳制 uptime 并续约、目录身份隔离与损坏拒绝均通过 13 项 loopback 集成测试。`cargo test -p bridge-render` 全套和 `git diff --check` 通过。仍未提供 `/status.json`，Data/Plan/Bundle/Activate 仍 501；存储断电撕裂、BLE、显示与 Bridge 逐目标时钟待后续阶段，见 `project-workflow/fake-rom-simulator/status.md`。
+
 ## Fake ROM Stage D 设备时钟：2026-09-24 — 可独立暂停、步进与倍速
 
 `codex/fake` 独立 worktree 的 Task 13a 启动层已提交 `a8578a6`。Task 13b 为每个 `device-sim` 进程增加单独的整数倍率逻辑时钟：1x、暂停、暂停时精确 step、倍率切换连续结算与独立 wall 偏移；`/v2/status` 和控制状态使用同一取样，控制面用独立 token。两个进程不同速率、非法命令原子拒绝等 9 项集成测试通过；`cargo test -p bridge-render` 与 `git diff --check` 也通过。当前进程冷启动从零开始，跨重启持久时钟、事件队列 `max`、owner/PowerPlan 截止及 Bridge 按 MAC 目标时钟均尚未接线；见 `project-workflow/fake-rom-simulator/task-13b-device-clock.md`。
