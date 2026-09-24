@@ -1,5 +1,9 @@
 # Codex Status 项目进度（交接文档）
 
+## Bridge 多实例启动：2026-09-24 — 主工作树实现，探针验证通过
+
+Bridge 增加按实例名隔离的 Windows 进程锁、运行数据、owner ID 与托盘背景形状；`tools/start-bridge.ps1` 可传独立 HTTP/MCP 端口、形状与精确设备 MAC/IP。默认实例仍用 8765/8766 和原数据/owner；命名实例不争用固定 UDP 8767，使用按 MAC 的 HTTP/BLE 路径。命名 owner ID 保证与默认不同且不超过设备 claim 的 32 字符上限。两组假 MAC/loopback 探针在 8875/8876、8877/8878 与旧默认 8765/8766 同时运行，重复启动受脚本和进程锁拦截；探针已停止。Bridge app check、23 项测试和隔离构建通过。详见 `project-workflow/bridge-multi-instance/`。待替换并重启主工作树 Bridge；未 OTA、未改 ROM。
+
 ## Fake ROM 前置协议日志：2026-09-24 — 宿主验证完成
 
 在多设备登记/BLE 改动提交 `c82487c` 后，串行完成 `project-workflow/fake-rom-simulator/` 的 Task 11a、10c、11b。Bridge BLE 现能按扫描 ID 记录候选广播、连接/GATT/完整 MAC 核验与 ACK；空窗口 info 日志每 30 秒汇总。当前已发布 1.54/Note4 ROM 确实发送 UDP，Bridge 的 v2 UDP 仅对已登记 MAC 作双状态认证改址，不写全局设备选择/IP/推送/BLE 标志，BLE 会合不依赖 UDP。HTTP/UDP/PowerPlan/Data/ACK 用安全字段和关联 ID 记录时间线；非成功 HTTP 错误不再附请求/响应正文。

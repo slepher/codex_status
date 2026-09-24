@@ -4,6 +4,7 @@ mod autostart;
 mod config;
 mod discovery;
 mod icon;
+mod instance;
 mod platform;
 mod watchdog;
 
@@ -18,7 +19,6 @@ use bridge_core::activity::{usage_fingerprint, Activity};
 use bridge_core::codex::locate_codex;
 use bridge_core::http::{serve, AppState};
 use bridge_core::runtime::{run_poller, PollerConfig};
-use bridge_core::short_id;
 use bridge_core::template::Library;
 use config::Config;
 use discovery::{arp_scan_for_mac, default_device_name, normalize_mac};
@@ -235,6 +235,7 @@ fn v2_occupancy_decision(
 }
 
 struct AppCtx {
+    instance: instance::Instance,
     config: Config,
     root: PathBuf,
     app_handle: OnceLock<AppHandle>,
@@ -566,6 +567,9 @@ fn tray_snapshot(ctx: &AppCtx) -> (Option<i32>, IconState, String) {
             .map(|p| format!("{p}%"))
             .unwrap_or_else(|| "--".to_string())
     );
+    if let Some(name) = &ctx.instance.name {
+        tip.insert_str(0, &format!("[{name}] "));
+    }
     if status.paused {
         tip.push_str(" · 已暂停");
     } else {
@@ -589,10 +593,11 @@ fn stale_or_ok(status: &RuntimeStatus, now: i64) -> IconState {
 
 fn refresh_tray(app: &AppHandle, ctx: &Arc<AppCtx>) {
     let (percent, state, tip) = tray_snapshot(ctx);
+    let shape = ctx.instance.shape;
     let app = app.clone();
     let _ = app.clone().run_on_main_thread(move || {
         if let Some(tray) = app.tray_by_id("bridge-tray") {
-            let _ = tray.set_icon(Some(icon::render(percent, state)));
+            let _ = tray.set_icon(Some(icon::render(percent, state, shape)));
             let _ = tray.set_tooltip(Some(tip.as_str()));
         }
     });
@@ -2184,6 +2189,12 @@ async fn reload_templates(state: State<'_, Arc<AppCtx>>) -> Result<usize, String
 /// The selected-device discovery below remains only for historical legacy
 /// compatibility and is never used for a registered v2 device.
 async fn udp_listen(ctx: Arc<AppCtx>) {
+    // Device announces target the fixed legacy port. Only the default bridge
+    // owns that socket; named instances use their exact MAC HTTP/BLE routes.
+    if ctx.instance.name.is_some() {
+        tracing::info!("UDP announce listener disabled for named instance");
+        return;
+    }
     let socket = match tokio::net::UdpSocket::bind(("0.0.0.0", 8767)).await {
         Ok(socket) => socket,
         Err(e) => {
@@ -3513,9 +3524,14 @@ fn main() {
         std::process::exit(1);
     }
 
+    let instance = instance::Instance::from_env().unwrap_or_else(|error| panic!("{error}"));
+    #[cfg(windows)]
+    let _instance_lock = instance::acquire(&instance).unwrap_or_else(|error| panic!("{error}"));
+
     let root = config::repo_root();
     let cfg_path = config::config_path(&root);
     let mut config = Config::load(&cfg_path);
+    assert_ne!(config.port, config.mcp_port, "HTTP and MCP ports must differ");
     if config.templates.is_relative() {
         config.templates = root.join(&config.templates);
     }
@@ -3578,9 +3594,10 @@ fn main() {
             configured
         }
     };
-    let bridge_id = short_id(&host_label());
+    let bridge_id = instance.bridge_id(&host_label());
     let (mcp_tx, _mcp_rx) = tokio::sync::watch::channel(mcp_port);
     let ctx = Arc::new(AppCtx {
+        instance,
         config,
         root: root.clone(),
         app_handle: OnceLock::new(),
@@ -3646,9 +3663,6 @@ fn main() {
     let ctx_setup = ctx.clone();
     watchdog::spawn(std::process::id());
     tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            show_panel(app);
-        }))
         .invoke_handler(tauri::generate_handler![
             get_status,
             get_device_status,
@@ -3712,8 +3726,8 @@ fn main() {
                 app,
                 "autostart",
                 "开机自启",
-                true,
-                autostart::matches_current_exe(),
+                ctx_setup.instance.name.is_none(),
+                ctx_setup.instance.name.is_none() && autostart::matches_current_exe(),
                 None::<&str>,
             )?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
@@ -3728,8 +3742,11 @@ fn main() {
             )?;
 
             let tray = TrayIconBuilder::with_id("bridge-tray")
-                .icon(icon::render(None, IconState::NoData))
-                .tooltip("Codex Status 桥")
+                .icon(icon::render(None, IconState::NoData, ctx_setup.instance.shape))
+                .tooltip(match &ctx_setup.instance.name {
+                    Some(name) => format!("Codex Status 桥 [{name}]"),
+                    None => "Codex Status 桥".into(),
+                })
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event({
@@ -3762,6 +3779,7 @@ fn main() {
                         }
                         "device" => open_url(&format!("http://{}", lan_ip())),
                         "autostart" => {
+                            if ctx.instance.name.is_some() { return; }
                             let enable = !autostart::enabled();
                             match autostart::set(enable) {
                                 Ok(()) => tracing::info!("autostart set to {enable}"),

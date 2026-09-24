@@ -3,6 +3,40 @@ use tauri::image::Image;
 pub const SIZE: u32 = 32;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Shape {
+    Square,
+    Circle,
+    Diamond,
+}
+
+impl Shape {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "square" => Some(Self::Square),
+            "circle" => Some(Self::Circle),
+            "diamond" => Some(Self::Diamond),
+            _ => None,
+        }
+    }
+
+    fn contains(self, x: i32, y: i32) -> bool {
+        let dx = (x * 2 + 1 - SIZE as i32).abs();
+        let dy = (y * 2 + 1 - SIZE as i32).abs();
+        match self {
+            Self::Square => {
+                x > 0
+                    && y > 0
+                    && x < SIZE as i32 - 1
+                    && y < SIZE as i32 - 1
+                    && !(dx == SIZE as i32 - 3 && dy == SIZE as i32 - 3)
+            }
+            Self::Circle => dx * dx + dy * dy <= 29 * 29,
+            Self::Diamond => dx + dy <= 30,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum State {
     Ok,
     Stale,
@@ -86,18 +120,15 @@ fn draw_text(px: &mut [u8], text: &str, x: i32, y: i32, scale: i32, c: [u8; 4]) 
 }
 
 /// Draw the tray icon: status-colored plate with the percent value as digits.
-pub fn render(percent: Option<i32>, state: State) -> Image<'static> {
+pub fn render(percent: Option<i32>, state: State, shape: Shape) -> Image<'static> {
     let mut px = vec![0u8; (SIZE * SIZE * 4) as usize];
     let plate = state.color();
-    fill_rect(&mut px, 1, 1, SIZE as i32 - 2, SIZE as i32 - 2, plate);
-    // soft corners
-    for (x, y) in [
-        (1, 1),
-        (SIZE as i32 - 2, 1),
-        (1, SIZE as i32 - 2),
-        (SIZE as i32 - 2, SIZE as i32 - 2),
-    ] {
-        set_pixel(&mut px, x, y, [0, 0, 0, 0]);
+    for y in 0..SIZE as i32 {
+        for x in 0..SIZE as i32 {
+            if shape.contains(x, y) {
+                set_pixel(&mut px, x, y, plate);
+            }
+        }
     }
     let text = match percent {
         Some(p) => p.clamp(0, 100).to_string(),
@@ -109,4 +140,18 @@ pub fn render(percent: Option<i32>, state: State) -> Image<'static> {
     let y = (SIZE as i32 - 5 * scale) / 2;
     draw_text(&mut px, &text, x, y, scale, [0xFF, 0xFF, 0xFF, 0xFF]);
     Image::new_owned(px, SIZE, SIZE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backgrounds_are_visibly_distinct() {
+        assert!(Shape::Square.contains(2, 2));
+        assert!(!Shape::Circle.contains(2, 2));
+        assert!(!Shape::Diamond.contains(2, 2));
+        assert!(Shape::Circle.contains(6, 8));
+        assert!(!Shape::Diamond.contains(6, 8));
+    }
 }

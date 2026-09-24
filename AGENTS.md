@@ -51,6 +51,7 @@ cargo run -p bridge-render -- --template <json> --out <png>   # 离线渲染对�
 
 ```powershell
 pwsh tools/start-bridge.ps1   # 后台启动 bridge-app（隐藏窗口、日志进 artifacts/、立即返回；重复调用只打印 PID）
+pwsh tools/start-bridge.ps1 -Instance note4 -Port 8775 -McpPort 8776 -IconShape circle -DeviceMac 7C4FADB93408 -DeviceIp 192.168.3.177  # 独立实例；需先构建同一 exe
 Stop-Process -Id (Get-Content artifacts/bridge-app-run.pid)   # 停止 bridge-app
 node tools/generate-quad-preview.mjs
 node tools/test-quad-preview.mjs
@@ -79,6 +80,7 @@ git diff --check                   # 提交前必查
 - 每个里程碑后更新 `PROGRESS.md`（现场、证据、待办）；多步工作用 `project-workflow/<initiative>/` 写 plan/task/status/review，先计划再动代码。
 - 提交信息用英文祈使句，沿用现有风格（如 `Firmware 0.8.0: status JSON, log ring, battery; bridge prefers JSON status`）。未经用户要求不要提交。
 - 后台进程启动必须立即返回、不挂住会话：桥用 `pwsh tools/start-bridge.ps1`（`UseShellExecute=true` 完全分离子进程 + 隐藏窗口 + cmd 重定向日志，避免子进程继承 stdio 句柄导致调用方阻塞）；其他服务照此模式（分离启动 + 日志重定向到 `artifacts/`），不用会继承管道句柄的前台/直连方式。不在前台跑长轮询；不是当前 debug/release 构建输出目录（如 `bridge/target/debug`）下运行的桥/设备服务不要擅自停止。停止当前构建目录的桥时先结束 watchdog 子进程（`--watchdog <pid>`）再停父进程，避免 watchdog 拉起重启。
+- 命名 Bridge 实例必须指定不同 HTTP/MCP 端口；各自运行数据在 `<exe>/instances/<name>/data`，默认实例保留 `<exe>/data`。命名实例不监听设备固定 UDP 8767，只走精确 MAC 的 HTTP/BLE；不同实例 owner ID 不同，同一设备仍由 claim/lease 决定占用。托盘背景形状可用 `-IconShape square|circle|diamond` 区分。
 - 不提交任何密钥：Wi-Fi 密码、BLE token 只存在于设备 RAM/NVS，不落仓库、不进日志。
 
 ## 硬件现场与坑
