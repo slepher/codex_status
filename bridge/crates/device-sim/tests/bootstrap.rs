@@ -134,7 +134,10 @@ fn ready_and_status_are_safe_and_use_shared_builder() {
     let sim = Simulator::start("02:ab:cd:00:00:01", &["--seed", "44"]);
     assert_eq!(sim.ready["schema_version"], 1);
     assert_eq!(sim.ready["mac"], "02:AB:CD:00:00:01");
-    assert_eq!(sim.ready["capabilities"], serde_json::json!(["v2_status"]));
+    assert_eq!(
+        sim.ready["capabilities"],
+        serde_json::json!(["v2_status", "clock_control"])
+    );
     let ready_text = sim.ready.to_string();
     assert!(!ready_text.contains(ENDPOINT));
     assert!(!ready_text.contains(DEVICE));
@@ -168,7 +171,16 @@ fn token_domains_are_separate_and_sim_state_discloses_no_secrets() {
     assert_eq!(code, 200);
     let state = json_body(&body);
     assert_eq!(state["mac"], "02:00:00:00:00:02");
-    assert_eq!(state["capabilities"], serde_json::json!(["v2_status"]));
+    assert_eq!(
+        state["capabilities"],
+        serde_json::json!(["v2_status", "clock_control"])
+    );
+    assert_eq!(state["clock_persistence"], "unsupported");
+    assert!(state["unsupported"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|item| item != "clock-control"));
     assert!(state.get("session_nonce").is_none());
     let text = state.to_string();
     assert!(!text.contains(ENDPOINT));
@@ -197,7 +209,10 @@ fn writes_require_their_domain_token_then_report_unsupported() {
     }
     let (code, body) = request(sim.address(), "POST", "/claim", Some(ENDPOINT), b"{}");
     assert_eq!(code, 401);
-    assert_eq!(json_body(&body), serde_json::json!({"error":"unauthorized","owner":null}));
+    assert_eq!(
+        json_body(&body),
+        serde_json::json!({"error":"unauthorized","owner":null})
+    );
     let (code, body) = request(sim.address(), "POST", "/claim", Some(DEVICE), b"{}");
     assert_eq!(code, 501);
     assert_eq!(json_body(&body)["error"], "unsupported");
@@ -233,4 +248,153 @@ fn simulator_instances_have_independent_addresses_and_identity() {
     let (code, body) = request(second.address(), "GET", "/v2/status", Some(ENDPOINT), b"");
     assert_eq!(code, 200);
     assert_eq!(json_body(&body)["device_mac"], second.ready["mac"]);
+}
+
+fn time(sim: &Simulator, token: Option<&str>) -> (u16, Value) {
+    let (code, body) = request(sim.address(), "GET", "/sim/time", token, b"");
+    (code, json_body(&body))
+}
+
+fn set_time(sim: &Simulator, token: Option<&str>, command: &Value) -> (u16, Value) {
+    let body = command.to_string();
+    let (code, response) = request(sim.address(), "POST", "/sim/time", token, body.as_bytes());
+    let result = serde_json::from_slice(&response).unwrap_or(Value::Null);
+    (code, result)
+}
+
+#[test]
+fn sim_clock_defaults_to_one_x_and_pause_step_and_rate_are_continuous() {
+    let sim = Simulator::start("02:00:00:00:00:07", &["--epoch-ms", "5000"]);
+    assert_eq!(time(&sim, Some(CONTROL)).0, 200);
+    for token in [None, Some(ENDPOINT), Some(DEVICE)] {
+        assert_eq!(time(&sim, token).0, 401);
+        assert_eq!(
+            set_time(&sim, token, &serde_json::json!({"op":"rate","rate_ppm":0})).0,
+            401
+        );
+    }
+
+    let (code, initial) = time(&sim, Some(CONTROL));
+    assert_eq!(code, 200);
+    assert_eq!(initial["rate_ppm"], 1_000_000);
+    assert_eq!(initial["uptime_ms"], initial["monotonic_ms"]);
+    assert_eq!(
+        initial["wall_ms"].as_u64().unwrap() - initial["monotonic_ms"].as_u64().unwrap(),
+        5000
+    );
+    let (code, _) = set_time(
+        &sim,
+        Some(CONTROL),
+        &serde_json::json!({"op":"step","delta_ms":1}),
+    );
+    assert_eq!(code, 400, "step is only valid while paused");
+    assert_eq!(time(&sim, Some(CONTROL)).1["rate_ppm"], 1_000_000);
+    std::thread::sleep(Duration::from_millis(60));
+    let (code, running) = time(&sim, Some(CONTROL));
+    assert_eq!(code, 200);
+    assert!(running["monotonic_ms"].as_u64().unwrap() >= initial["monotonic_ms"].as_u64().unwrap());
+
+    let (code, paused) = set_time(
+        &sim,
+        Some(CONTROL),
+        &serde_json::json!({"op":"rate","rate_ppm":0}),
+    );
+    assert_eq!(code, 200);
+    let stopped_at = paused["monotonic_ms"].as_u64().unwrap();
+    std::thread::sleep(Duration::from_millis(60));
+    assert_eq!(time(&sim, Some(CONTROL)).1["monotonic_ms"], stopped_at);
+
+    let (code, stepped) = set_time(
+        &sim,
+        Some(CONTROL),
+        &serde_json::json!({"op":"step","delta_ms":12345}),
+    );
+    assert_eq!(code, 200);
+    assert_eq!(stepped["monotonic_ms"], stopped_at + 12345);
+    let (code, accelerated) = set_time(
+        &sim,
+        Some(CONTROL),
+        &serde_json::json!({"op":"rate","rate_ppm":2_000_000}),
+    );
+    assert_eq!(code, 200);
+    let resumed_at = accelerated["monotonic_ms"].as_u64().unwrap();
+    assert_eq!(resumed_at, stopped_at + 12345);
+    assert_eq!(accelerated["rate_ppm"], 2_000_000);
+    std::thread::sleep(Duration::from_millis(60));
+    let (code, resumed) = time(&sim, Some(CONTROL));
+    assert_eq!(code, 200);
+    assert!(resumed["monotonic_ms"].as_u64().unwrap() >= resumed_at);
+}
+
+#[test]
+fn wall_offsets_do_not_change_monotonic_and_invalid_commands_are_atomic() {
+    let sim = Simulator::start("02:00:00:00:00:08", &["--epoch-ms", "1000"]);
+    let (_, paused) = set_time(
+        &sim,
+        Some(CONTROL),
+        &serde_json::json!({"op":"rate","rate_ppm":0}),
+    );
+    let mono = paused["monotonic_ms"].as_u64().unwrap();
+
+    let (code, forward) = set_time(
+        &sim,
+        Some(CONTROL),
+        &serde_json::json!({"op":"wall","offset_ms":500}),
+    );
+    assert_eq!(code, 200);
+    assert_eq!(forward["monotonic_ms"], mono);
+    assert_eq!(forward["wall_offset_ms"], 500);
+    assert_eq!(forward["wall_ms"], mono + 1500);
+
+    let (code, backward) = set_time(
+        &sim,
+        Some(CONTROL),
+        &serde_json::json!({"op":"wall","offset_ms":-250}),
+    );
+    assert_eq!(code, 200);
+    assert_eq!(backward["monotonic_ms"], mono);
+    assert_eq!(backward["wall_offset_ms"], -250);
+    assert_eq!(backward["wall_ms"], mono + 750);
+
+    for invalid in [
+        serde_json::json!({"op":"rate","rate_ppm":1_000_000_001}),
+        serde_json::json!({"op":"step","delta_ms":86_400_001}),
+        serde_json::json!({"op":"wall","offset_ms":-10000}),
+        serde_json::json!({"op":"wall","offset_ms":0,"extra":true}),
+        serde_json::json!({"op":"max"}),
+    ] {
+        let (code, _) = set_time(&sim, Some(CONTROL), &invalid);
+        assert_eq!(code, 400, "{invalid}");
+        let (_, current) = time(&sim, Some(CONTROL));
+        assert_eq!(current["monotonic_ms"], mono);
+        assert_eq!(current["wall_offset_ms"], -250);
+        assert_eq!(current["rate_ppm"], 0);
+    }
+    let (code, _) = set_time(
+        &sim,
+        Some(CONTROL),
+        &serde_json::json!({"op":"step","delta_ms":1.5}),
+    );
+    assert_eq!(code, 400);
+}
+
+#[test]
+fn instances_advance_at_independent_rates() {
+    let first = Simulator::start("02:00:00:00:00:09", &[]);
+    let second = Simulator::start("02:00:00:00:00:0A", &[]);
+    let (code, paused) = set_time(
+        &second,
+        Some(CONTROL),
+        &serde_json::json!({"op":"rate","rate_ppm":0}),
+    );
+    assert_eq!(code, 200);
+    let second_at = paused["monotonic_ms"].as_u64().unwrap();
+    let (_, first_at) = time(&first, Some(CONTROL));
+    std::thread::sleep(Duration::from_millis(60));
+    let (_, first_later) = time(&first, Some(CONTROL));
+    let (_, second_later) = time(&second, Some(CONTROL));
+    assert!(
+        first_later["monotonic_ms"].as_u64().unwrap() > first_at["monotonic_ms"].as_u64().unwrap()
+    );
+    assert_eq!(second_later["monotonic_ms"].as_u64().unwrap(), second_at);
 }

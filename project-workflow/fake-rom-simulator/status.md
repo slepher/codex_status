@@ -1,8 +1,12 @@
 # Fake ROM 与多设备实验时钟状态
 
+## 2026-09-24：Stage D / Task 13b 设备时钟通过宿主验证
+
+每个 `device-sim` 进程现在有独立的逻辑 monotonic/uptime 与 wall 视图；控制 token 可读写 `/sim/time`，支持 1x、暂停、step、0..1000x 倍率及 wall 偏移。倍率切换先结算旧时间；校时不回退 monotonic。`/v2/status` 与 `/sim/state` 改用时钟快照；`max` 与跨进程持久时钟明确未实现。9 项模拟进程集成测试、`bridge-render` 全套和 `git diff --check` 通过。Bridge 逐目标时钟、owner/PowerPlan 期限与业务状态尚未接线；下一步先接持久设备 owner/claim，再推进其余命令。
+
 ## 2026-09-24：Stage D / Task 13a 启动层通过宿主验证
 
-`device-sim` 在 loopback 以一进程一虚构 MAC 运行，三 token 域互不相同；鉴权 `/v2/status` 通过 Stage C 同源 C++ 生成未配置状态，`/sim/state` 只读，其余业务写入 501 unsupported。未提供 `/status.json`，避免 Bridge 误登记。两个模拟进程身份/端口隔离与错误路径通过 6 项集成测试；`cargo test -p device-sim`、`cargo test -p bridge-render` 和 `git diff --check` 通过。尚无状态持久化、可写协议、BLE、显示和实验时钟，不能视为完整 Fake ROM；下一步由主代理设计 Task 13b，再串行委托 Luna 编码。
+`device-sim` 在 loopback 以一进程一虚构 MAC 运行，三 token 域互不相同；鉴权 `/v2/status` 通过 Stage C 同源 C++ 生成未配置状态，`/sim/state` 只读，其余业务写入 501 unsupported。未提供 `/status.json`，避免 Bridge 误登记。两个模拟进程身份/端口隔离与错误路径通过 6 项集成测试；`cargo test -p device-sim`、`cargo test -p bridge-render` 和 `git diff --check` 通过，提交 `a8578a6`。尚无状态持久化、可写协议、BLE、显示和实验时钟，不能视为完整 Fake ROM；下一步 Task 13b 在设备端接可控逻辑时钟。
 
 ## 2026-09-24：Stage C 全量宿主回归通过
 

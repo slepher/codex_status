@@ -1,5 +1,9 @@
 # Codex Status 项目进度（交接文档）
 
+## Fake ROM Stage D 设备时钟：2026-09-24 — 可独立暂停、步进与倍速
+
+`codex/fake` 独立 worktree 的 Task 13a 启动层已提交 `a8578a6`。Task 13b 为每个 `device-sim` 进程增加单独的整数倍率逻辑时钟：1x、暂停、暂停时精确 step、倍率切换连续结算与独立 wall 偏移；`/v2/status` 和控制状态使用同一取样，控制面用独立 token。两个进程不同速率、非法命令原子拒绝等 9 项集成测试通过；`cargo test -p bridge-render` 与 `git diff --check` 也通过。当前进程冷启动从零开始，跨重启持久时钟、事件队列 `max`、owner/PowerPlan 截止及 Bridge 按 MAC 目标时钟均尚未接线；见 `project-workflow/fake-rom-simulator/task-13b-device-clock.md`。
+
 ## Fake ROM Stage D 启动层：2026-09-24 — 单设备 localhost 进程通过宿主验证
 
 在独立 `codex/fake` worktree，从多 Bridge tag 之后的 Stage C 继续推进。新增 `device-sim`：每进程显式虚构 MAC、动态 loopback 端口、三种互不相同的 token；鉴权 `/v2/status` 调用固件同源 C++ 快照，控制面只读，其余业务写入明确 501。两个进程的身份/端口隔离、认证和拒绝路径由 6 项集成测试覆盖；`cargo test -p device-sim`、`cargo test -p bridge-render`、`git diff --check` 通过。此切片尚无 owner/Bundle 持久状态、可写命令、BLE、显示或倍速时钟，不可作为完整 Fake ROM 登记到生产 Bridge。下一步串行接设备状态与协议写入，见 `project-workflow/fake-rom-simulator/status.md`。

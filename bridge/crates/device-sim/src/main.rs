@@ -11,12 +11,14 @@ use serde_json::json;
 use std::{
     env,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
-    time::Instant,
+    sync::{Arc, Mutex},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 const BODY_LIMIT: usize = 64 * 1024;
-const CAPABILITIES: &[&str] = &["v2_status"];
+const MAX_RATE_PPM: u64 = 1_000_000_000;
+const MAX_STEP_MS: u64 = 86_400_000;
+const CAPABILITIES: &[&str] = &["v2_status", "clock_control"];
 const UNSUPPORTED: &[&str] = &[
     "data",
     "plan",
@@ -26,7 +28,6 @@ const UNSUPPORTED: &[&str] = &[
     "BLE",
     "persistence",
     "display",
-    "clock-control",
 ];
 
 #[derive(Clone)]
@@ -36,7 +37,7 @@ struct SimState {
     device_token: Arc<str>,
     control_token: Arc<str>,
     nonce: String,
-    started: Instant,
+    clock: Arc<Mutex<SimClock>>,
 }
 
 #[derive(Debug)]
@@ -44,12 +45,88 @@ struct Options {
     listen: SocketAddr,
     mac: String,
     seed: u64,
+    epoch_ms: Option<u64>,
+}
+
+#[derive(Clone)]
+struct SimClock {
+    logical_ms: u64,
+    rate_ppm: u64,
+    anchor: Instant,
+    epoch_ms: u64,
+    wall_offset_ms: i64,
+}
+
+#[derive(Clone, Copy)]
+struct ClockSnapshot {
+    monotonic_ms: u64,
+    wall_ms: u64,
+    rate_ppm: u64,
+    wall_offset_ms: i64,
+}
+
+enum ClockCommand {
+    Rate(u64),
+    Step(u64),
+    Wall(i64),
+}
+
+impl SimClock {
+    fn logical_at(&self, now: Instant) -> u64 {
+        let elapsed = now.saturating_duration_since(self.anchor).as_nanos();
+        let advance = elapsed.saturating_mul(u128::from(self.rate_ppm)) / 1_000_000_000_000;
+        self.logical_ms
+            .saturating_add(advance.min(u128::from(u64::MAX)) as u64)
+    }
+
+    fn snapshot_at(&self, now: Instant) -> Option<ClockSnapshot> {
+        let monotonic_ms = self.logical_at(now);
+        let wall =
+            i128::from(self.epoch_ms) + i128::from(monotonic_ms) + i128::from(self.wall_offset_ms);
+        Some(ClockSnapshot {
+            monotonic_ms,
+            wall_ms: u64::try_from(wall).ok()?,
+            rate_ppm: self.rate_ppm,
+            wall_offset_ms: self.wall_offset_ms,
+        })
+    }
+
+    fn apply(&mut self, command: ClockCommand) -> Option<ClockSnapshot> {
+        let now = Instant::now();
+        let mut next = self.clone();
+        next.logical_ms = self.logical_at(now);
+        next.anchor = now;
+        match command {
+            ClockCommand::Rate(rate) => next.rate_ppm = rate,
+            ClockCommand::Step(delta) if self.rate_ppm == 0 => {
+                next.logical_ms = next.logical_ms.saturating_add(delta);
+            }
+            ClockCommand::Step(_) => return None,
+            ClockCommand::Wall(offset) => next.wall_offset_ms = offset,
+        }
+        let snapshot = next.snapshot_at(now)?;
+        *self = next;
+        Some(snapshot)
+    }
+}
+
+impl ClockSnapshot {
+    fn json(self) -> serde_json::Value {
+        serde_json::json!({
+            "monotonic_ms": self.monotonic_ms,
+            "uptime_ms": self.monotonic_ms,
+            "wall_ms": self.wall_ms,
+            "rate_ppm": self.rate_ppm,
+            "wall_offset_ms": self.wall_offset_ms
+        })
+    }
 }
 
 fn parse_options() -> Result<Options> {
     let mut listen = "127.0.0.1:0".to_owned();
     let mut mac = None;
     let mut seed = 1u64;
+    let mut epoch_ms = None;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         let value = args
@@ -62,6 +139,10 @@ fn parse_options() -> Result<Options> {
                 mac = Some(value);
             }
             "--seed" => seed = value.parse().context("invalid --seed")?,
+            "--epoch-ms" => {
+                ensure!(epoch_ms.is_none(), "--epoch-ms specified more than once");
+                epoch_ms = Some(value.parse().context("invalid --epoch-ms")?);
+            }
             _ => bail!("unknown option: {arg}"),
         }
     }
@@ -71,7 +152,12 @@ fn parse_options() -> Result<Options> {
         "--listen must use 127.0.0.1"
     );
     let mac = normalize_mac(mac.as_deref().context("--mac is required")?)?;
-    Ok(Options { listen, mac, seed })
+    Ok(Options {
+        listen,
+        mac,
+        seed,
+        epoch_ms,
+    })
 }
 
 fn normalize_mac(raw: &str) -> Result<String> {
@@ -133,6 +219,32 @@ fn bearer(request: &Request<Body>, expected: &str) -> bool {
         .is_some_and(|value| value.strip_prefix("Bearer ") == Some(expected))
 }
 
+fn clock_snapshot(state: &SimState) -> Option<ClockSnapshot> {
+    state
+        .clock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .snapshot_at(Instant::now())
+}
+
+fn parse_clock_command(body: &[u8]) -> Option<ClockCommand> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let object = value.as_object()?;
+    let op = object.get("op")?.as_str()?;
+    match op {
+        "rate" if object.len() == 2 => {
+            let rate = object.get("rate_ppm")?.as_u64()?;
+            (rate <= MAX_RATE_PPM).then_some(ClockCommand::Rate(rate))
+        }
+        "step" if object.len() == 2 => {
+            let delta = object.get("delta_ms")?.as_u64()?;
+            (delta <= MAX_STEP_MS).then_some(ClockCommand::Step(delta))
+        }
+        "wall" if object.len() == 2 => Some(ClockCommand::Wall(object.get("offset_ms")?.as_i64()?)),
+        _ => None,
+    }
+}
+
 async fn consume_body(request: Request<Body>) -> std::result::Result<(), Response> {
     to_bytes(request.into_body(), BODY_LIMIT)
         .await
@@ -161,7 +273,13 @@ async fn status(State(state): State<SimState>, request: Request<Body>) -> Respon
     if let Err(response) = consume_body(request).await {
         return response;
     }
-    let now_ms = state.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    let Some(clock) = clock_snapshot(&state) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":"clock_unavailable"})),
+        )
+            .into_response();
+    };
     let input = json!({
         "mac": state.mac,
         "session_nonce": state.nonce,
@@ -178,7 +296,7 @@ async fn status(State(state): State<SimState>, request: Request<Body>) -> Respon
         "plan_accepted": false,
         "provisional": false,
         "boot_ms": 0,
-        "now_ms": now_ms,
+        "now_ms": clock.monotonic_ms,
         "battery": 75
     });
     match bridge_render::simulator_status_snapshot(&input) {
@@ -198,13 +316,75 @@ async fn sim_state(State(state): State<SimState>, request: Request<Body>) -> Res
     if let Err(response) = consume_body(request).await {
         return response;
     }
+    let Some(clock) = clock_snapshot(&state) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":"clock_unavailable"})),
+        )
+            .into_response();
+    };
     Json(json!({
         "mac": state.mac,
         "capabilities": CAPABILITIES,
         "unsupported": UNSUPPORTED,
-        "uptime_ms": state.started.elapsed().as_millis().min(u64::MAX as u128) as u64
+        "uptime_ms": clock.monotonic_ms,
+        "clock": clock.json(),
+        "clock_persistence": "unsupported"
     }))
     .into_response()
+}
+
+async fn sim_time_get(State(state): State<SimState>, request: Request<Body>) -> Response {
+    if !bearer(&request, &state.control_token) {
+        return unauthorized();
+    }
+    if let Err(response) = consume_body(request).await {
+        return response;
+    }
+    match clock_snapshot(&state) {
+        Some(clock) => Json(clock.json()).into_response(),
+        None => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":"clock_unavailable"})),
+        )
+            .into_response(),
+    }
+}
+
+async fn sim_time_post(State(state): State<SimState>, request: Request<Body>) -> Response {
+    if !bearer(&request, &state.control_token) {
+        return unauthorized();
+    }
+    let body = match to_bytes(request.into_body(), BODY_LIMIT).await {
+        Ok(body) => body,
+        Err(_) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(json!({"error":"body_too_large"})),
+            )
+                .into_response()
+        }
+    };
+    let Some(command) = parse_clock_command(&body) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"invalid_clock_command"})),
+        )
+            .into_response();
+    };
+    let result = state
+        .clock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .apply(command);
+    match result {
+        Some(clock) => Json(clock.json()).into_response(),
+        None => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"invalid_clock_command"})),
+        )
+            .into_response(),
+    }
 }
 
 async fn unsupported(
@@ -236,19 +416,27 @@ async fn endpoint_write(State(state): State<SimState>, request: Request<Body>) -
 
 async fn claim(State(state): State<SimState>, request: Request<Body>) -> Response {
     if !bearer(&request, &state.device_token) {
-        return (StatusCode::UNAUTHORIZED, Json(json!({"error":"unauthorized","owner":null})))
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error":"unauthorized","owner":null})),
+        )
             .into_response();
     }
     if let Err(response) = consume_body(request).await {
         return response;
     }
-    (StatusCode::NOT_IMPLEMENTED, Json(json!({"error":"unsupported"}))).into_response()
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({"error":"unsupported"})),
+    )
+        .into_response()
 }
 
 fn app(state: SimState) -> Router {
     Router::new()
         .route("/v2/status", get(status))
         .route("/sim/state", get(sim_state))
+        .route("/sim/time", get(sim_time_get).post(sim_time_post))
         .route("/v2/data", post(endpoint_write))
         .route("/v2/plan", post(endpoint_write))
         .route("/v2/activate", post(endpoint_write))
@@ -271,13 +459,27 @@ async fn main() -> Result<()> {
             && device_token != control_token,
         "simulator tokens must be pairwise distinct"
     );
+    let epoch_ms = match options.epoch_ms {
+        Some(epoch_ms) => epoch_ms,
+        None => SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock is before Unix epoch")?
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64,
+    };
     let state = SimState {
         mac: options.mac.clone(),
         endpoint_token,
         device_token,
         control_token,
         nonce: deterministic_nonce(options.seed, &options.mac),
-        started: Instant::now(),
+        clock: Arc::new(Mutex::new(SimClock {
+            logical_ms: 0,
+            rate_ppm: 1_000_000,
+            anchor: Instant::now(),
+            epoch_ms,
+            wall_offset_ms: 0,
+        })),
     };
     let listener = tokio::net::TcpListener::bind(options.listen)
         .await

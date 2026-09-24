@@ -1,6 +1,6 @@
 # Task 13a — 单设备 localhost 进程与状态端点
 
-状态：宿主验证完成，待提交。Stage C 全量宿主回归 35/35，后续在 `codex/fake` 独立 worktree 实施。
+状态：宿主验证完成，已提交 `a8578a6`。Stage C 全量宿主回归 35/35，后续在 `codex/fake` 独立 worktree 实施。
 
 ## 决策
 
