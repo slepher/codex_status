@@ -1,5 +1,9 @@
 # Codex Status 项目进度（交接文档）
 
+## Fake ROM Stage C Bundle CHUNK 切片：2026-09-24 — 宿主验证通过
+
+独立 `codex/fake` worktree 上，Bundle BEGIN 已提交 `bd916c7`；CHUNK 的 START 会话/offset、WRITE 边界、END append 决策也已抽入固件与宿主共享的 `src/v2_bundle_command.{h,cpp}`。设备端保留原始流与 LittleFS I/O、endpoint token/owner、重放比对和失败时会话失效顺序。宿主 render 测试 14/14 与 `git diff --check` 通过；未接主 Bridge/实机，未构建/烧录 ROM。COMMIT、Activate/claim、宿主端点仍待实现，详见 `project-workflow/fake-rom-simulator/status.md`。
+
 ## Fake ROM Stage C Bundle BEGIN 切片：2026-09-24 — 宿主验证通过
 
 Data `02dd043`、Plan `e997a72` 已提交；接着在独立 `codex/fake` worktree 将 Bundle BEGIN 的重放、会话匹配、CRC/长度与恢复偏移决策抽为固件和宿主共用的 `src/v2_bundle_command.{h,cpp}`。设备端仍先鉴权，且仅在接收文件创建成功后写入新接收状态；重复 BEGIN 不续期。宿主 render 测试 13/13 与 `git diff --check` 通过。未碰主 Bridge、生产数据或实机，未构建/烧录 ROM。Bundle CHUNK/COMMIT、Activate/claim、宿主端点与完整 Fake ROM 尚待实现，见 `project-workflow/fake-rom-simulator/status.md`。

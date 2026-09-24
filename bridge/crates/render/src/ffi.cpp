@@ -411,6 +411,48 @@ int codex_v2_bundle_begin_commit_candidate(void *p) {
     h.hasCandidate = false;
     return 1;
 }
+int codex_v2_bundle_chunk_start(void *p, const char *request, const char *nonce,
+                                const char *offset, uint64_t now_ms,
+                                char *out, int cap) {
+    if (!p || !out || cap <= 0) return -99;
+    BundleBeginHarness &h = *(BundleBeginHarness *)p;
+    V2BundleChunkStartDecision decision = v2DecideBundleChunkStart(
+        h.current, request, nonce, offset, now_ms);
+    JsonDocument result;
+    result["allowed"] = decision.allowed;
+    result["replay"] = decision.replay;
+    result["offset"] = decision.offset;
+    if (decision.error) result["error"] = decision.error;
+    writeBundleRx(result["current"].to<JsonObject>(), h.current);
+    return (int)serializeJson(result, out, (size_t)cap);
+}
+int codex_v2_bundle_chunk_write(void *p, uint32_t offset, int replay,
+                                uint32_t processed, uint32_t size,
+                                char *out, int cap) {
+    if (!p || !out || cap <= 0) return -99;
+    BundleBeginHarness &h = *(BundleBeginHarness *)p;
+    V2BundleChunkWriteDecision decision = v2DecideBundleChunkWrite(
+        h.current, offset, replay != 0, processed, size);
+    JsonDocument result;
+    result["allowed"] = decision.allowed;
+    if (decision.error) result["error"] = decision.error;
+    writeBundleRx(result["current"].to<JsonObject>(), h.current);
+    return (int)serializeJson(result, out, (size_t)cap);
+}
+int codex_v2_bundle_chunk_end(void *p, uint32_t offset, int replay,
+                              uint32_t processed, uint64_t now_ms,
+                              char *out, int cap) {
+    if (!p || !out || cap <= 0) return -99;
+    BundleBeginHarness &h = *(BundleBeginHarness *)p;
+    V2BundleChunkEndDecision decision = v2DecideBundleChunkEnd(
+        h.current, offset, replay != 0, processed, now_ms);
+    JsonDocument result;
+    result["allowed"] = decision.allowed;
+    if (decision.error) result["error"] = decision.error;
+    result["next_offset"] = decision.nextOffset;
+    writeBundleRx(result["current"].to<JsonObject>(), h.current);
+    return (int)serializeJson(result, out, (size_t)cap);
+}
 uint64_t codex_v2_plan_high(void *p) { return ((V2PlanState *)p)->highId(); }
 int codex_v2_plan_light_active(void *p, uint64_t now_ms) {
     return ((V2PlanState *)p)->lightActive(now_ms) ? 1 : 0;

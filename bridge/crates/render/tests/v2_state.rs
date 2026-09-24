@@ -57,6 +57,33 @@ extern "C" {
         cap: c_int,
     ) -> c_int;
     fn codex_v2_bundle_begin_commit_candidate(p: *mut c_void) -> c_int;
+    fn codex_v2_bundle_chunk_start(
+        p: *mut c_void,
+        request: *const std::os::raw::c_char,
+        nonce: *const std::os::raw::c_char,
+        offset: *const std::os::raw::c_char,
+        now_ms: u64,
+        out: *mut std::os::raw::c_char,
+        cap: c_int,
+    ) -> c_int;
+    fn codex_v2_bundle_chunk_write(
+        p: *mut c_void,
+        offset: u32,
+        replay: c_int,
+        processed: u32,
+        size: u32,
+        out: *mut std::os::raw::c_char,
+        cap: c_int,
+    ) -> c_int;
+    fn codex_v2_bundle_chunk_end(
+        p: *mut c_void,
+        offset: u32,
+        replay: c_int,
+        processed: u32,
+        now_ms: u64,
+        out: *mut std::os::raw::c_char,
+        cap: c_int,
+    ) -> c_int;
     fn codex_v2_plan_high(p: *mut c_void) -> u64;
     fn codex_v2_plan_light_active(p: *mut c_void, now_ms: u64) -> c_int;
     fn codex_v2_boot_remaining(t_boot_ms: u64, now_ms: u64) -> u32;
@@ -393,6 +420,110 @@ fn shared_bundle_begin_decision_preserves_rx_for_replay_and_rejection() {
         assert_eq!(replay_conflict["action"], "reject");
         assert_eq!(replay_conflict["error"], "request_conflict");
         assert_eq!(replay_conflict["current"], before_replay);
+        codex_v2_bundle_begin_free(p);
+    }
+}
+
+#[test]
+fn shared_bundle_chunk_decisions_check_identity_offsets_and_end_state() {
+    unsafe {
+        let p = codex_v2_bundle_begin_new();
+        let owner = std::ffi::CString::new("owner").unwrap();
+        let request = std::ffi::CString::new("request").unwrap();
+        let nonce = std::ffi::CString::new("session").unwrap();
+        assert_eq!(codex_v2_bundle_begin_seed_rx(
+            p, owner.as_ptr(), request.as_ptr(), nonce.as_ptr(),
+            100, 0x12345678, 50, 10_000
+        ), 1);
+
+        let start = |request: &std::ffi::CString, nonce: &std::ffi::CString,
+                     offset: &std::ffi::CString, now_ms| {
+            let mut out = vec![0i8; 1024];
+            assert!(codex_v2_bundle_chunk_start(
+                p, request.as_ptr(), nonce.as_ptr(), offset.as_ptr(), now_ms,
+                out.as_mut_ptr(), out.len() as c_int
+            ) > 0);
+            serde_json::from_str::<serde_json::Value>(
+                std::ffi::CStr::from_ptr(out.as_ptr()).to_str().unwrap()
+            ).unwrap()
+        };
+        let replay = start(&request, &nonce, &std::ffi::CString::new("20").unwrap(), 100);
+        assert_eq!(replay["allowed"], true);
+        assert_eq!(replay["replay"], true);
+        assert_eq!(replay["offset"], 20);
+        let append = start(&request, &nonce, &std::ffi::CString::new("50").unwrap(), 100);
+        assert_eq!(append["allowed"], true);
+        assert_eq!(append["replay"], false);
+        assert_eq!(append["offset"], 50);
+
+        let before = replay["current"].clone();
+        for (request_id, session, offset, now_ms, error) in [
+            ("wrong", "session", "20", 100, "session"),
+            ("request", "wrong", "20", 100, "session"),
+            ("request", "session", "", 100, "session"),
+            ("request", "session", "2x", 100, "session"),
+            ("request", "session", "51", 100, "offset_or_size"),
+            ("request", "session", "20", 10_000, "session"),
+        ] {
+            let got = start(
+                &std::ffi::CString::new(request_id).unwrap(),
+                &std::ffi::CString::new(session).unwrap(),
+                &std::ffi::CString::new(offset).unwrap(),
+                now_ms,
+            );
+            assert_eq!(got["allowed"], false);
+            assert_eq!(got["error"], error);
+            assert_eq!(got["current"], before);
+        }
+
+        let write = |offset, replay, processed, size| {
+            let mut out = vec![0i8; 1024];
+            assert!(codex_v2_bundle_chunk_write(
+                p, offset, replay, processed, size, out.as_mut_ptr(), out.len() as c_int
+            ) > 0);
+            serde_json::from_str::<serde_json::Value>(
+                std::ffi::CStr::from_ptr(out.as_ptr()).to_str().unwrap()
+            ).unwrap()
+        };
+        let write_ok = write(80, 0, 10, 10);
+        assert_eq!(write_ok["allowed"], true);
+        let write_too_far = write(90, 0, 5, 6);
+        assert_eq!(write_too_far["allowed"], false);
+        assert_eq!(write_too_far["error"], "offset_or_size");
+        let write_u64_sum = write(0, 0, u32::MAX, 2);
+        assert_eq!(write_u64_sum["allowed"], false);
+        let replay_ok = write(20, 1, 20, 10);
+        assert_eq!(replay_ok["allowed"], true);
+        let replay_too_far = write(20, 1, 20, 11);
+        assert_eq!(replay_too_far["allowed"], false);
+
+        let end = |offset, replay, processed, now_ms| {
+            let mut out = vec![0i8; 1024];
+            assert!(codex_v2_bundle_chunk_end(
+                p, offset, replay, processed, now_ms, out.as_mut_ptr(), out.len() as c_int
+            ) > 0);
+            serde_json::from_str::<serde_json::Value>(
+                std::ffi::CStr::from_ptr(out.as_ptr()).to_str().unwrap()
+            ).unwrap()
+        };
+        let end_ok = end(50, 0, 10, 100);
+        assert_eq!(end_ok["allowed"], true);
+        assert_eq!(end_ok["next_offset"], 60);
+        assert_eq!(end_ok["current"], before, "decision must not mutate current RX");
+        let replay_end = end(20, 1, 10, 10_000);
+        assert_eq!(replay_end["allowed"], true);
+        assert_eq!(replay_end["next_offset"], 50);
+        for (offset, replay, processed, now_ms) in [
+            (50, 0, 0, 100),
+            (50, 0, 16_385, 100),
+            (49, 0, 1, 100),
+            (50, 0, 1, 10_000),
+        ] {
+            let got = end(offset, replay, processed, now_ms);
+            assert_eq!(got["allowed"], false);
+            assert_eq!(got["error"], "offset_or_size");
+            assert_eq!(got["current"], before);
+        }
         codex_v2_bundle_begin_free(p);
     }
 }

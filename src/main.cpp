@@ -3929,16 +3929,14 @@ static void handleV2BundleChunkRaw() {
         String mac;
         if (!endpointTokenAuthorized(mac)) { v2ChunkFailure = "unauthorized"; return; }
         if (!ownerAllows(v2Rx.owner)) { v2ChunkFailure = "occupied"; return; }
-        if (server.header("X-Request-Id") != v2Rx.request ||
-            server.header("X-Session-Nonce") != v2Rx.nonce ||
-            !v2Rx.live(v2NowMs())) return;
+        String request = server.header("X-Request-Id");
+        String nonce = server.header("X-Session-Nonce");
         String offsetText = server.header("X-Offset");
-        if (!offsetText.length()) return;
-        for (char c : offsetText) if (c < '0' || c > '9') return;
-        uint64_t parsedOffset = strtoull(offsetText.c_str(), nullptr, 10);
-        if (parsedOffset > v2Rx.offset) { v2ChunkFailure = "offset_or_size"; return; }
-        v2ChunkOffset = (uint32_t)parsedOffset;
-        v2ChunkReplay = v2ChunkOffset < v2Rx.offset;
+        V2BundleChunkStartDecision decision = v2DecideBundleChunkStart(
+            v2Rx, request.c_str(), nonce.c_str(), offsetText.c_str(), v2NowMs());
+        if (!decision.allowed) { v2ChunkFailure = decision.error; return; }
+        v2ChunkOffset = decision.offset;
+        v2ChunkReplay = decision.replay;
         v2ChunkWriting = !v2ChunkReplay;
         v2ChunkFile = LittleFS.open(v2RxPath, v2ChunkReplay ? "r" : "a");
         if (!v2ChunkFile || (v2ChunkReplay && !v2ChunkFile.seek(v2ChunkOffset))) {
@@ -3948,9 +3946,11 @@ static void handleV2BundleChunkRaw() {
         return;
     }
     if (raw.status == RAW_WRITE && v2ChunkOk) {
-        uint64_t end = (uint64_t)v2ChunkOffset + v2ChunkBytes + raw.currentSize;
-        if (end > (v2ChunkReplay ? v2Rx.offset : v2Rx.length)) {
-            v2ChunkFailure = "offset_or_size";
+        V2BundleChunkWriteDecision decision = v2DecideBundleChunkWrite(
+            v2Rx, v2ChunkOffset, v2ChunkReplay, v2ChunkBytes,
+            (uint32_t)raw.currentSize);
+        if (!decision.allowed) {
+            v2ChunkFailure = decision.error;
             v2ChunkOk = false;
             return;
         }
@@ -3975,16 +3975,16 @@ static void handleV2BundleChunkRaw() {
     }
     if (raw.status == RAW_END || raw.status == RAW_ABORTED) {
         if (v2ChunkFile) v2ChunkFile.close();
-        if (v2ChunkOk && !v2ChunkBytes) {
-            v2ChunkFailure = "offset_or_size";
-            v2ChunkOk = false;
+        if (v2ChunkOk) {
+            V2BundleChunkEndDecision decision = v2DecideBundleChunkEnd(
+                v2Rx, v2ChunkOffset, v2ChunkReplay, v2ChunkBytes, v2NowMs());
+            if (!decision.allowed) {
+                v2ChunkFailure = decision.error;
+                v2ChunkOk = false;
+            } else {
+                v2Rx.offset = decision.nextOffset;
+            }
         }
-        if (v2ChunkOk && !v2ChunkReplay &&
-            !v2Rx.append(v2ChunkOffset, v2ChunkBytes, v2NowMs())) {
-            v2ChunkFailure = "offset_or_size";
-            v2ChunkOk = false;
-        }
-        if (v2ChunkOk && !v2ChunkReplay) v2Rx.offset += v2ChunkBytes;
         if (!v2ChunkOk && v2ChunkWriting) v2Rx.deadline = 0;
     }
 }
