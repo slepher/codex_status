@@ -3588,13 +3588,6 @@ static void v2Response(int status, const String &body) {
     bleNotifyStatusQuiet(reply);
 }
 
-static String v2BodyBridgeId(const String &body) {
-    JsonDocument doc;
-    if (deserializeJson(doc, body)) return server.arg("bridge_id");
-    const char *id = doc["bridge_id"] | "";
-    return strlen(id) ? String(id) : server.arg("bridge_id");
-}
-
 static bool v2OwnerOk(const char *bridgeId) {
     if (!ownerAllows(bridgeId)) {
         v2Response(409,
@@ -3857,20 +3850,6 @@ static void v2BundleError(const char *error) {
           v2Profile.contextId, UINT32_MAX);
 }
 
-static bool v2BundleReplay(JsonDocument &doc) {
-    if (v2CommittedRequest != (doc["request_id"] | "") ||
-        v2CommittedOwner != (doc["bridge_id"] | "")) return false;
-    uint32_t crc = 0;
-    if (!v2ParseCrc(doc["content_crc"] | "", crc) || crc != v2CommittedCrc ||
-        (doc["length"] | 0u) != v2CommittedLength) {
-        v2BundleError("request_conflict");
-    } else {
-        v2Ack("bundle", "applied", "unchanged", "flash", nullptr, -1, 0,
-              v2CommittedContext.c_str(), UINT32_MAX);
-    }
-    return true;
-}
-
 static void handleV2BundleBegin() {
     String mac;
     if (!endpointTokenAuthorized(mac)) {
@@ -4008,37 +3987,31 @@ static void handleV2BundleCommit() {
         server.send(401, "application/json", "{\"result\":\"unauthorized\"}"); return;
     }
     JsonDocument doc;
-    if (!v2Command(server.arg("plain"), doc) || v2BundleReplay(doc)) return;
-    const char *owner = doc["bridge_id"] | "";
-    const char *request = doc["request_id"] | "";
-    uint32_t crc = 0;
-    if (!v2ParseCrc(doc["content_crc"] | "", crc)) { v2BundleError("crc"); return; }
-    if (!v2Rx.matches(owner, request, v2Nonce().c_str()) ||
-        !v2Rx.complete(doc["length"] | 0u, crc, v2NowMs())) { v2BundleError("session_or_length"); return; }
-    File f = LittleFS.open(v2RxPath, "r");
-    if (!f || f.size() != v2Rx.length) { if (f) f.close(); v2BundleError("length"); return; }
+    if (!v2Command(server.arg("plain"), doc)) return;
+    const String nonce = v2Nonce();
+    const uint64_t nowMs = v2NowMs();
+    const String bridgeIdFallback = server.arg("bridge_id");
+    const V2BundleFingerprint committed{
+        v2CommittedOwner.c_str(), v2CommittedRequest.c_str(), v2CommittedCrc,
+        v2CommittedLength, v2CommittedContext.c_str()
+    };
     String body;
-    if (!body.reserve(v2Rx.length)) {
-        f.close();
-        v2BundleError("oom");
+    V2BundleCommitDecision decision = v2DecideBundleCommit(
+        doc, v2Rx, committed, nonce.c_str(), nowMs, v2RxPath.c_str(),
+        bridgeIdFallback.c_str(), body);
+    if (decision.action == V2_BUNDLE_COMMIT_REJECT) {
+        v2BundleError(decision.error);
         return;
     }
-    while (f.available()) body += (char)f.read();
-    f.close();
-    if (body.length() != v2Rx.length || v2CrcOf(body) != crc) { v2BundleError("crc"); return; }
-    if (v2BodyBridgeId(body) != owner) { v2BundleError("owner"); return; }
-    JsonDocument idFilter, idDoc;
-    idFilter["job_id"] = true;
-    if (deserializeJson(idDoc, body, DeserializationOption::Filter(idFilter))) {
-        v2BundleError("json"); return;
+    if (decision.action == V2_BUNDLE_COMMIT_REPLAY) {
+        v2Ack("bundle", "applied", "unchanged", "flash", nullptr, -1, 0,
+              decision.replayContext, UINT32_MAX);
+        return;
     }
-    const char *jobId = idDoc["job_id"] | "";
-    uint32_t activeCrc = 0;
-    if (bsActiveJobPayload(jobId, activeCrc)) {
-        if (activeCrc != crc) { v2BundleError("request_conflict"); return; }
+    if (decision.action == V2_BUNDLE_COMMIT_ALREADY_ACTIVE) {
         bsProfile(v2Profile);
-        v2CommittedOwner = owner; v2CommittedRequest = request;
-        v2CommittedCrc = crc; v2CommittedLength = v2Rx.length;
+        v2CommittedOwner = decision.owner; v2CommittedRequest = decision.request;
+        v2CommittedCrc = decision.crc; v2CommittedLength = decision.length;
         v2CommittedContext = v2Profile.contextId;
         v2Rx.deadline = 0;
         LittleFS.remove(v2RxPath);
@@ -4052,8 +4025,9 @@ static void handleV2BundleCommit() {
     if (!bsInstall(body, FW_TARGET_ID, RENDER_TARGET_ID, ctx, err)) {
         v2BundleError(err.c_str()); return;
     }
-    v2CommittedOwner = owner; v2CommittedRequest = request;
-    v2CommittedCrc = crc; v2CommittedLength = v2Rx.length; v2CommittedContext = ctx;
+    v2CommittedOwner = decision.owner; v2CommittedRequest = decision.request;
+    v2CommittedCrc = decision.crc; v2CommittedLength = decision.length;
+    v2CommittedContext = ctx;
     v2Rx.deadline = 0;
     LittleFS.remove(v2RxPath);
     bsProfile(v2Profile);

@@ -1,5 +1,9 @@
 # Fake ROM 与多设备实验时钟状态
 
+## 2026-09-24：Stage C / Task 12e Bundle COMMIT 校验切片通过宿主验证
+
+在 CHUNK `fa50902` 后，共享 `v2DecideBundleCommit` 按原顺序处理已提交请求重放、CRC/会话/长度、LittleFS 接收文件读回、body owner/JSON、已有 job 同 CRC 或冲突判定。固件 `main.cpp` 仍在校验成功后生成 context、安装 Bundle，再按原顺序更新 committed 指纹、清理 RX、重置 DataSeq 与显示。宿主内存 LittleFS 测试覆盖重放/冲突、错会话/不完整/缺文件/错长度/CRC/owner/JSON、待安装和已有 job 分支；`cargo test -p bridge-render --test v2_state` 15/15、`git diff --check` 通过。Arduino 固件 `String::reserve` 返回 bool，共享代码保留原 OOM 拒绝；宿主 shim 的 reserve 不报告失败，故 OOM 未由宿主触发验证。未构建/烧录 ROM、接主 Bridge 或实机。下一步 Activate、claim 以及宿主完整端点。
+
 ## 2026-09-24：Stage C / Task 12d Bundle CHUNK 决策切片通过宿主验证
 
 在 BEGIN `bd916c7` 后，串行共享 CHUNK 的 START 身份/offset、WRITE 边界和 END append 接纳决策；固件 `main.cpp` 保持 endpoint token、owner、LittleFS 原始流、重放字节比较、文件关闭和新写入失败时使会话失效的原顺序。共享决策只读当前 RX，成功 END 后设备适配层才应用新 offset。宿主测试覆盖错身份/过期/非十进制或过大 offset、重放与新写、0 字节、16KB 上限及拒绝不改状态；`cargo test -p bridge-render --test v2_state` 14/14、`git diff --check` 通过。未修改 COMMIT，未接主 Bridge/实机、未构建/烧录 ROM。下一步 COMMIT；仍非可运行 Fake ROM。

@@ -84,6 +84,38 @@ extern "C" {
         out: *mut std::os::raw::c_char,
         cap: c_int,
     ) -> c_int;
+    fn codex_v2_bundle_commit_reset_store() -> c_int;
+    fn codex_v2_bundle_commit_install_active(
+        bundle: *const std::os::raw::c_char,
+        context: *const std::os::raw::c_char,
+    ) -> c_int;
+    fn codex_v2_bundle_commit_seed_rx(
+        p: *mut c_void,
+        owner: *const std::os::raw::c_char,
+        request: *const std::os::raw::c_char,
+        nonce: *const std::os::raw::c_char,
+        length: u32,
+        crc: u32,
+        offset: u32,
+        deadline: u64,
+    ) -> c_int;
+    fn codex_v2_bundle_commit_write_file(
+        path: *const std::os::raw::c_char,
+        body: *const u8,
+        length: c_int,
+    ) -> c_int;
+    fn codex_v2_bundle_commit_decide(
+        p: *mut c_void,
+        message: *const std::os::raw::c_char,
+        nonce: *const std::os::raw::c_char,
+        now_ms: u64,
+        path: *const std::os::raw::c_char,
+        fallback: *const std::os::raw::c_char,
+        out: *mut std::os::raw::c_char,
+        cap: c_int,
+        body_out: *mut std::os::raw::c_char,
+        body_cap: c_int,
+    ) -> c_int;
     fn codex_v2_plan_high(p: *mut c_void) -> u64;
     fn codex_v2_plan_light_active(p: *mut c_void, now_ms: u64) -> c_int;
     fn codex_v2_boot_remaining(t_boot_ms: u64, now_ms: u64) -> u32;
@@ -524,6 +556,276 @@ fn shared_bundle_chunk_decisions_check_identity_offsets_and_end_state() {
             assert_eq!(got["error"], "offset_or_size");
             assert_eq!(got["current"], before);
         }
+        codex_v2_bundle_begin_free(p);
+    }
+}
+
+#[test]
+fn shared_bundle_commit_decision_validates_payload_before_side_effects() {
+    fn make_bundle(job_id: &str) -> String {
+        let source: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../tools/test-bridge/templates/quad.json"
+        ))
+        .unwrap();
+        let compiled = bridge_core::compile::compile(
+            &source,
+            "epd-ssd1681-200x200-1bpp",
+        )
+        .unwrap();
+        let bundle = serde_json::json!({
+            "job_id": job_id,
+            "bridge_id": "owner",
+            "firmware_target": "codex-status-154g",
+            "render_target": "epd-ssd1681-200x200-1bpp",
+            "compiler_abi": 2,
+            "profile": {"template_ids": ["quad"], "initial_active_id": "quad"},
+            "templates": [{
+                "key": {"template_id": "quad", "render_target": "epd-ssd1681-200x200-1bpp"},
+                "source": source,
+                "compiled": compiled
+            }],
+            "resources": [],
+            "bindings": []
+        });
+        String::from_utf8(bridge_core::template::canonical_bytes(&bundle)).unwrap()
+    }
+    fn crc(body: &str) -> u32 {
+        unsafe { codex_v2_crc(body.as_ptr(), body.len() as c_int) }
+    }
+
+    let path = std::ffi::CString::new("/bundle/rx.bin").unwrap();
+    let fallback = std::ffi::CString::new("owner").unwrap();
+    let command = |owner: &str, request: &str, length: u32, crc: &str| {
+        serde_json::json!({
+            "bridge_id": owner,
+            "request_id": request,
+            "length": length,
+            "content_crc": crc,
+        })
+    };
+    let seed = |p: *mut c_void, owner: &str, request: &str, rx_nonce: &str,
+                length: u32, crc: u32, offset: u32| unsafe {
+        codex_v2_bundle_commit_seed_rx(
+            p,
+            std::ffi::CString::new(owner).unwrap().as_ptr(),
+            std::ffi::CString::new(request).unwrap().as_ptr(),
+            std::ffi::CString::new(rx_nonce).unwrap().as_ptr(),
+            length,
+            crc,
+            offset,
+            10_000,
+        )
+    };
+    let write_file = |file_path: &std::ffi::CString, body: &[u8]| unsafe {
+        codex_v2_bundle_commit_write_file(
+            file_path.as_ptr(),
+            body.as_ptr(),
+            body.len() as c_int,
+        )
+    };
+    let decide = |p: *mut c_void, message: serde_json::Value, nonce: &str,
+                  file_path: &std::ffi::CString, fallback: &std::ffi::CString,
+                  now_ms: u64| unsafe {
+        let text = std::ffi::CString::new(message.to_string()).unwrap();
+        let nonce = std::ffi::CString::new(nonce).unwrap();
+        let mut out = vec![0i8; 4096];
+        let mut body_out = vec![0i8; 300_000];
+        let rc = codex_v2_bundle_commit_decide(
+            p,
+            text.as_ptr(),
+            nonce.as_ptr(),
+            now_ms,
+            file_path.as_ptr(),
+            fallback.as_ptr(),
+            out.as_mut_ptr(),
+            out.len() as c_int,
+            body_out.as_mut_ptr(),
+            body_out.len() as c_int,
+        );
+        assert!(rc > 0);
+        let result = serde_json::from_str::<serde_json::Value>(
+            std::ffi::CStr::from_ptr(out.as_ptr()).to_str().unwrap(),
+        )
+        .unwrap();
+        let body = std::ffi::CStr::from_ptr(body_out.as_ptr())
+            .to_string_lossy()
+            .into_owned();
+        (result, body)
+    };
+
+    unsafe {
+        assert_eq!(codex_v2_bundle_commit_reset_store(), 1);
+        let p = codex_v2_bundle_begin_new();
+
+        // A submitted owner/request pair replays before session and file checks.
+        let replay_body = "replay payload";
+        let replay_crc = crc(replay_body);
+        let committed_owner = std::ffi::CString::new("done-owner").unwrap();
+        let committed_request = std::ffi::CString::new("done-request").unwrap();
+        let committed_context = std::ffi::CString::new("done-context").unwrap();
+        codex_v2_bundle_begin_committed(
+            p,
+            committed_owner.as_ptr(),
+            committed_request.as_ptr(),
+            replay_crc,
+            replay_body.len() as u32,
+            committed_context.as_ptr(),
+        );
+        assert_eq!(seed(p, "owner", "live-request", "session", 40, 0x11111111, 40), 1);
+        let replay = decide(
+            p,
+            command("done-owner", "done-request", replay_body.len() as u32,
+                    &format!("{replay_crc:08x}")),
+            "different-session",
+            &std::ffi::CString::new("/bundle/missing.bin").unwrap(),
+            &fallback,
+            50_000,
+        ).0;
+        assert_eq!(replay["action"], "replay");
+        assert_eq!(replay["replay_context"], "done-context");
+        assert_eq!(replay["current"]["request"], "live-request");
+        let replay_conflict = decide(
+            p,
+            command("done-owner", "done-request", 99, &format!("{replay_crc:08x}")),
+            "session",
+            &path,
+            &fallback,
+            1,
+        ).0;
+        assert_eq!(replay_conflict["action"], "reject");
+        assert_eq!(replay_conflict["error"], "request_conflict");
+        assert_eq!(replay_conflict["current"]["request"], "live-request");
+
+        // All ordinary validation errors leave the current RX metadata intact.
+        codex_v2_bundle_begin_committed(
+            p,
+            std::ffi::CString::new("").unwrap().as_ptr(),
+            std::ffi::CString::new("").unwrap().as_ptr(),
+            0, 0, std::ffi::CString::new("").unwrap().as_ptr(),
+        );
+        let simple_body = r#"{"bridge_id":"owner","job_id":"other"}"#;
+        let simple_crc = crc(simple_body);
+        let simple_bytes = simple_body.as_bytes();
+        let rx_request = "request";
+        assert_eq!(seed(p, "owner", rx_request, "wrong-session", simple_bytes.len() as u32, simple_crc, simple_bytes.len() as u32), 1);
+        let bad_crc = decide(
+            p,
+            command("owner", rx_request, simple_bytes.len() as u32, "nope"),
+            "session", &path, &fallback, 1,
+        ).0;
+        assert_eq!(bad_crc["error"], "crc");
+        assert_eq!(bad_crc["current"]["offset"], simple_bytes.len());
+
+        assert_eq!(seed(p, "owner", rx_request, "wrong-session", simple_bytes.len() as u32, simple_crc, simple_bytes.len() as u32), 1);
+        let session_error = decide(
+            p,
+            command("owner", rx_request, simple_bytes.len() as u32, &format!("{simple_crc:08x}")),
+            "session", &path, &fallback, 1,
+        ).0;
+        assert_eq!(session_error["error"], "session_or_length");
+        assert_eq!(session_error["current"]["nonce"], "wrong-session");
+
+        assert_eq!(seed(p, "owner", rx_request, "session", simple_bytes.len() as u32, simple_crc, simple_bytes.len() as u32 - 1), 1);
+        let incomplete = decide(
+            p,
+            command("owner", rx_request, simple_bytes.len() as u32, &format!("{simple_crc:08x}")),
+            "session", &path, &fallback, 1,
+        ).0;
+        assert_eq!(incomplete["error"], "session_or_length");
+        assert_eq!(incomplete["current"]["offset"], simple_bytes.len() - 1);
+
+        assert_eq!(seed(p, "owner", rx_request, "session", simple_bytes.len() as u32, simple_crc, simple_bytes.len() as u32), 1);
+        let missing = decide(
+            p,
+            command("owner", rx_request, simple_bytes.len() as u32, &format!("{simple_crc:08x}")),
+            "session", &std::ffi::CString::new("/bundle/missing.bin").unwrap(), &fallback, 1,
+        ).0;
+        assert_eq!(missing["error"], "length");
+
+        assert_eq!(seed(p, "owner", rx_request, "session", simple_bytes.len() as u32, simple_crc, simple_bytes.len() as u32), 1);
+        assert_eq!(write_file(&path, &simple_bytes[..simple_bytes.len() - 1]), 1);
+        let wrong_file_length = decide(
+            p,
+            command("owner", rx_request, simple_bytes.len() as u32, &format!("{simple_crc:08x}")),
+            "session", &path, &fallback, 1,
+        ).0;
+        assert_eq!(wrong_file_length["error"], "length");
+
+        let mut corrupt = simple_bytes.to_vec();
+        corrupt[0] ^= 1;
+        assert_eq!(seed(p, "owner", rx_request, "session", simple_bytes.len() as u32, simple_crc, simple_bytes.len() as u32), 1);
+        assert_eq!(write_file(&path, &corrupt), 1);
+        let bad_body_crc = decide(
+            p,
+            command("owner", rx_request, simple_bytes.len() as u32, &format!("{simple_crc:08x}")),
+            "session", &path, &fallback, 1,
+        ).0;
+        assert_eq!(bad_body_crc["error"], "crc");
+
+        let wrong_owner_body = r#"{"bridge_id":"someone-else","job_id":"other"}"#;
+        let wrong_owner_crc = crc(wrong_owner_body);
+        assert_eq!(seed(p, "owner", rx_request, "session", wrong_owner_body.len() as u32, wrong_owner_crc, wrong_owner_body.len() as u32), 1);
+        assert_eq!(write_file(&path, wrong_owner_body.as_bytes()), 1);
+        let wrong_owner = decide(
+            p,
+            command("owner", rx_request, wrong_owner_body.len() as u32, &format!("{wrong_owner_crc:08x}")),
+            "session", &path, &fallback, 1,
+        ).0;
+        assert_eq!(wrong_owner["error"], "owner");
+
+        let malformed = "{";
+        let malformed_crc = crc(malformed);
+        assert_eq!(seed(p, "owner", rx_request, "session", malformed.len() as u32, malformed_crc, malformed.len() as u32), 1);
+        assert_eq!(write_file(&path, malformed.as_bytes()), 1);
+        let json_error = decide(
+            p,
+            command("owner", rx_request, malformed.len() as u32, &format!("{malformed_crc:08x}")),
+            "session", &path, &fallback, 1,
+        ).0;
+        assert_eq!(json_error["error"], "json");
+
+        let new_bundle = make_bundle("new-job");
+        let new_bytes = new_bundle.as_bytes();
+        let new_crc = crc(&new_bundle);
+        assert_eq!(seed(p, "owner", rx_request, "session", new_bytes.len() as u32, new_crc, new_bytes.len() as u32), 1);
+        assert_eq!(write_file(&path, new_bytes), 1);
+        let install = decide(
+            p,
+            command("owner", rx_request, new_bytes.len() as u32, &format!("{new_crc:08x}")),
+            "session", &path, &fallback, 1,
+        );
+        assert_eq!(install.0["action"], "install");
+        assert_eq!(install.0["current"]["offset"], new_bytes.len());
+        assert_eq!(install.1, new_bundle);
+
+        // Existing valid fixture exercises both active-job branches.
+        let active_bundle = make_bundle("active-job");
+        let active_c = std::ffi::CString::new(active_bundle.as_str()).unwrap();
+        let active_context = std::ffi::CString::new("active-context").unwrap();
+        assert_eq!(codex_v2_bundle_commit_install_active(active_c.as_ptr(), active_context.as_ptr()), 1);
+        let active_crc = crc(&active_bundle);
+        assert_eq!(seed(p, "owner", rx_request, "session", active_bundle.len() as u32, active_crc, active_bundle.len() as u32), 1);
+        assert_eq!(write_file(&path, active_bundle.as_bytes()), 1);
+        let already_active = decide(
+            p,
+            command("owner", rx_request, active_bundle.len() as u32, &format!("{active_crc:08x}")),
+            "session", &path, &fallback, 1,
+        ).0;
+        assert_eq!(already_active["action"], "already_active");
+        assert_eq!(already_active["current"]["offset"], active_bundle.len());
+
+        let changed_active = format!(" \n{active_bundle}");
+        let changed_crc = crc(&changed_active);
+        assert_eq!(seed(p, "owner", rx_request, "session", changed_active.len() as u32, changed_crc, changed_active.len() as u32), 1);
+        assert_eq!(write_file(&path, changed_active.as_bytes()), 1);
+        let active_conflict = decide(
+            p,
+            command("owner", rx_request, changed_active.len() as u32, &format!("{changed_crc:08x}")),
+            "session", &path, &fallback, 1,
+        ).0;
+        assert_eq!(active_conflict["action"], "reject");
+        assert_eq!(active_conflict["error"], "request_conflict");
+        assert_eq!(active_conflict["current"]["offset"], changed_active.len());
         codex_v2_bundle_begin_free(p);
     }
 }

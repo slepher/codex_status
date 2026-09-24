@@ -1,6 +1,52 @@
 #include "v2_bundle_command.h"
+#include "bundle_store.h"
+#include "v2_runtime.h"
 
+#include <LittleFS.h>
 #include <string.h>
+#include <type_traits>
+
+namespace {
+template <typename StringType>
+bool reserveString(StringType &value, size_t capacity) {
+    if constexpr (std::is_same<decltype(value.reserve(capacity)), bool>::value) {
+        return value.reserve(capacity);
+    } else {
+        value.reserve(capacity);
+        return true;
+    }
+}
+
+struct CommittedReplay {
+    bool matched = false;
+    bool replay = false;
+    uint32_t crc = 0;
+    uint32_t length = 0;
+    const char *context = nullptr;
+    const char *error = nullptr;
+};
+
+CommittedReplay checkCommittedReplay(JsonDocument &doc,
+                                     const V2BundleFingerprint &committed) {
+    CommittedReplay result;
+    const char *owner = doc["bridge_id"] | "";
+    const char *request = doc["request_id"] | "";
+    const char *committedOwner = committed.owner ? committed.owner : "";
+    const char *committedRequest = committed.request ? committed.request : "";
+    if (strcmp(owner, committedOwner) || strcmp(request, committedRequest)) return result;
+
+    result.matched = true;
+    result.length = doc["length"] | 0u;
+    if (!v2ParseCrc(doc["content_crc"] | "", result.crc) ||
+        result.crc != committed.crc || result.length != committed.length) {
+        result.error = "request_conflict";
+    } else {
+        result.replay = true;
+        result.context = committed.context;
+    }
+    return result;
+}
+}
 
 V2BundleBeginDecision v2DecideBundleBegin(
     JsonDocument &doc, const V2BundleRx &current,
@@ -10,18 +56,12 @@ V2BundleBeginDecision v2DecideBundleBegin(
     const char *owner = doc["bridge_id"] | "";
     const char *request = doc["request_id"] | "";
     const uint32_t length = doc["length"] | 0u;
-    const char *committedOwner = committed.owner ? committed.owner : "";
-    const char *committedRequest = committed.request ? committed.request : "";
-
-    if (!strcmp(owner, committedOwner) && !strcmp(request, committedRequest)) {
-        uint32_t crc = 0;
-        if (!v2ParseCrc(doc["content_crc"] | "", crc) ||
-            crc != committed.crc || length != committed.length) {
-            decision.error = "request_conflict";
-        } else {
+    CommittedReplay replay = checkCommittedReplay(doc, committed);
+    if (replay.matched) {
+        if (replay.replay) {
             decision.action = V2_BUNDLE_BEGIN_REPLAY;
-            decision.replayContext = committed.context;
-        }
+            decision.replayContext = replay.context;
+        } else decision.error = replay.error;
         return decision;
     }
 
@@ -47,6 +87,94 @@ V2BundleBeginDecision v2DecideBundleBegin(
         return decision;
     }
     decision.action = V2_BUNDLE_BEGIN_START;
+    return decision;
+}
+
+V2BundleCommitDecision v2DecideBundleCommit(
+    JsonDocument &doc, const V2BundleRx &current,
+    const V2BundleFingerprint &committed, const char *sessionNonce,
+    uint64_t nowMs, const char *receivePath, const char *bridgeIdFallback,
+    String &bodyOut) {
+    V2BundleCommitDecision decision;
+    bodyOut = "";
+    const char *owner = doc["bridge_id"] | "";
+    const char *request = doc["request_id"] | "";
+    decision.owner = owner;
+    decision.request = request;
+    decision.length = doc["length"] | 0u;
+
+    CommittedReplay replay = checkCommittedReplay(doc, committed);
+    if (replay.matched) {
+        if (replay.replay) {
+            decision.action = V2_BUNDLE_COMMIT_REPLAY;
+            decision.crc = replay.crc;
+            decision.length = replay.length;
+            decision.replayContext = replay.context;
+        } else {
+            decision.error = replay.error;
+        }
+        return decision;
+    }
+
+    if (!v2ParseCrc(doc["content_crc"] | "", decision.crc)) {
+        decision.error = "crc";
+        return decision;
+    }
+    if (!current.matches(owner, request, sessionNonce) ||
+        !current.complete(decision.length, decision.crc, nowMs)) {
+        decision.error = "session_or_length";
+        return decision;
+    }
+
+    File file = LittleFS.open(receivePath, "r");
+    if (!file || file.size() != current.length) {
+        if (file) file.close();
+        decision.error = "length";
+        return decision;
+    }
+    if (!reserveString(bodyOut, current.length)) {
+        file.close();
+        decision.error = "oom";
+        return decision;
+    }
+    while (file.available()) bodyOut += (char)file.read();
+    file.close();
+    if (bodyOut.length() != current.length || v2CrcOf(bodyOut) != decision.crc) {
+        decision.error = "crc";
+        return decision;
+    }
+
+    JsonDocument bodyDoc;
+    DeserializationError bodyError = deserializeJson(bodyDoc, bodyOut);
+    const char *bodyOwner = "";
+    if (bodyError) {
+        bodyOwner = bridgeIdFallback ? bridgeIdFallback : "";
+    } else {
+        bodyOwner = bodyDoc["bridge_id"] | "";
+        if (!*bodyOwner) bodyOwner = bridgeIdFallback ? bridgeIdFallback : "";
+    }
+    if (strcmp(bodyOwner, owner)) {
+        decision.error = "owner";
+        return decision;
+    }
+
+    JsonDocument filter, idDoc;
+    filter["job_id"] = true;
+    if (deserializeJson(idDoc, bodyOut, DeserializationOption::Filter(filter))) {
+        decision.error = "json";
+        return decision;
+    }
+    const char *jobId = idDoc["job_id"] | "";
+    uint32_t activeCrc = 0;
+    if (bsActiveJobPayload(jobId, activeCrc)) {
+        if (activeCrc != decision.crc) {
+            decision.error = "request_conflict";
+            return decision;
+        }
+        decision.action = V2_BUNDLE_COMMIT_ALREADY_ACTIVE;
+        return decision;
+    }
+    decision.action = V2_BUNDLE_COMMIT_INSTALL;
     return decision;
 }
 

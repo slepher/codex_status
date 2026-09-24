@@ -453,6 +453,77 @@ int codex_v2_bundle_chunk_end(void *p, uint32_t offset, int replay,
     writeBundleRx(result["current"].to<JsonObject>(), h.current);
     return (int)serializeJson(result, out, (size_t)cap);
 }
+int codex_v2_bundle_commit_reset_store() {
+    LittleFS.files.clear();
+    LittleFS.dirs.clear();
+    LittleFS.capacity = 1024 * 1024;
+    LittleFS.writeBudget = -1;
+    bsBegin();
+    return 1;
+}
+int codex_v2_bundle_commit_install_active(const char *bundle, const char *context) {
+    if (!bundle || !context || !codex_v2_bundle_commit_reset_store()) return 0;
+    String error;
+    return bsInstall(String(bundle), "codex-status-154g",
+                     "epd-ssd1681-200x200-1bpp", context, error) ? 1 : 0;
+}
+int codex_v2_bundle_commit_seed_rx(void *p, const char *owner,
+                                   const char *request, const char *nonce,
+                                   uint32_t length, uint32_t crc, uint32_t offset,
+                                   uint64_t deadline) {
+    if (!p) return 0;
+    V2BundleRx rx;
+    if (!rx.begin(owner, request, nonce, length, crc, 0)) return 0;
+    if (offset > length) return 0;
+    rx.offset = offset;
+    rx.deadline = deadline;
+    ((BundleBeginHarness *)p)->current = rx;
+    return 1;
+}
+int codex_v2_bundle_commit_write_file(const char *path,
+                                      const uint8_t *body, int length) {
+    if (!path || !body || length <= 0) return 0;
+    File file = LittleFS.open(path, "w");
+    if (!file) return 0;
+    size_t written = file.write(body, (size_t)length);
+    file.close();
+    return written == (size_t)length ? 1 : 0;
+}
+int codex_v2_bundle_commit_decide(void *p, const char *message,
+                                  const char *nonce, uint64_t now_ms,
+                                  const char *path, const char *fallback,
+                                  char *out, int cap,
+                                  char *body_out, int body_cap) {
+    if (!p || !message || !nonce || !path || !out || cap <= 0 ||
+        !body_out || body_cap <= 0) return -99;
+    BundleBeginHarness &h = *(BundleBeginHarness *)p;
+    JsonDocument doc;
+    if (deserializeJson(doc, message)) return -2;
+    const V2BundleFingerprint committed{
+        h.committedOwner.c_str(), h.committedRequest.c_str(), h.committedCrc,
+        h.committedLength, h.committedContext.c_str()
+    };
+    String body;
+    V2BundleCommitDecision decision = v2DecideBundleCommit(
+        doc, h.current, committed, nonce, now_ms, path, fallback, body);
+    JsonDocument result;
+    const char *action = decision.action == V2_BUNDLE_COMMIT_REPLAY ? "replay"
+                       : decision.action == V2_BUNDLE_COMMIT_ALREADY_ACTIVE ? "already_active"
+                       : decision.action == V2_BUNDLE_COMMIT_INSTALL ? "install" : "reject";
+    result["action"] = action;
+    if (decision.error) result["error"] = decision.error;
+    if (decision.replayContext) result["replay_context"] = decision.replayContext;
+    result["owner"] = decision.owner;
+    result["request"] = decision.request;
+    result["crc"] = decision.crc;
+    result["length"] = decision.length;
+    writeBundleRx(result["current"].to<JsonObject>(), h.current);
+    size_t written = serializeJson(result, out, (size_t)cap);
+    if (!written) return -3;
+    if (body.length() >= (size_t)body_cap) return -4;
+    memcpy(body_out, body.c_str(), body.length() + 1);
+    return (int)written;
+}
 uint64_t codex_v2_plan_high(void *p) { return ((V2PlanState *)p)->highId(); }
 int codex_v2_plan_light_active(void *p, uint64_t now_ms) {
     return ((V2PlanState *)p)->lightActive(now_ms) ? 1 : 0;

@@ -26,10 +26,33 @@ struct V2BundleBeginDecision {
     V2BundleRx candidate{};
 };
 
+enum V2BundleCommitAction : uint8_t {
+    V2_BUNDLE_COMMIT_REJECT,
+    V2_BUNDLE_COMMIT_REPLAY,
+    V2_BUNDLE_COMMIT_ALREADY_ACTIVE,
+    V2_BUNDLE_COMMIT_INSTALL,
+};
+
+struct V2BundleCommitDecision {
+    V2BundleCommitAction action = V2_BUNDLE_COMMIT_REJECT;
+    const char *error = nullptr;
+    const char *replayContext = nullptr;
+    String owner;
+    String request;
+    uint32_t crc = 0;
+    uint32_t length = 0;
+};
+
 V2BundleBeginDecision v2DecideBundleBegin(
     JsonDocument &doc, const V2BundleRx &current,
     const V2BundleFingerprint &committed, const char *sessionNonce,
     uint64_t nowMs);
+
+V2BundleCommitDecision v2DecideBundleCommit(
+    JsonDocument &doc, const V2BundleRx &current,
+    const V2BundleFingerprint &committed, const char *sessionNonce,
+    uint64_t nowMs, const char *receivePath, const char *bridgeIdFallback,
+    String &bodyOut);
 
 struct V2BundleChunkStartDecision {
     bool allowed = false;
