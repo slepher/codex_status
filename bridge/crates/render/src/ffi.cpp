@@ -4,6 +4,7 @@
 #include "v2_state.h"
 #include "v2_runtime.h"
 #include "v2_data_command.h"
+#include "v2_plan_command.h"
 #include "bundle_store.h"
 #include "font_asset.h"
 #include "font_store.h"
@@ -300,6 +301,35 @@ int codex_v2_plan_accept(void *p, uint64_t id, int mode, uint32_t duration, uint
 }
 uint32_t codex_v2_plan_remaining(void *p, uint64_t now_ms) {
     return ((V2PlanState *)p)->remainingS(now_ms);
+}
+int codex_v2_plan_decide(void *p, const char *message, uint64_t now_ms,
+                         int provisional, char *out, int cap) {
+    if (!p || !message || !out || cap <= 0) return -99;
+    JsonDocument doc;
+    V2PlanDecision decision;
+    if (deserializeJson(doc, message)) {
+        decision.error = "plan_shape";
+    } else {
+        decision = v2DecidePlan(doc, *(V2PlanState *)p, now_ms, provisional != 0);
+    }
+    V2PlanState &state = *(V2PlanState *)p;
+    JsonDocument result;
+    result["accepted"] = decision.accepted;
+    result["result"] = decision.result;
+    result["display"] = decision.display;
+    if (decision.error) result["error"] = decision.error;
+    result["plan_id"] = decision.planId;
+    result["granted_s"] = decision.grantedS;
+    result["include_context"] = decision.includeContext;
+    result["high_id"] = state.highId();
+    result["accepted_id"] = state.acceptedId();
+    result["state_accepted"] = state.accepted();
+    result["state_granted_s"] = state.grantedS();
+    result["deadline_ms"] = state.deadlineMs();
+    result["remaining_s"] = state.remainingS(now_ms);
+    result["light_active"] = state.lightActive(now_ms);
+    result["from_boot"] = state.fromBoot();
+    return (int)serializeJson(result, out, (size_t)cap);
 }
 uint64_t codex_v2_plan_high(void *p) { return ((V2PlanState *)p)->highId(); }
 int codex_v2_plan_light_active(void *p, uint64_t now_ms) {

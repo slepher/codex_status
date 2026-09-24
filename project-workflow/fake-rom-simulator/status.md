@@ -1,5 +1,9 @@
 # Fake ROM 与多设备实验时钟状态
 
+## 2026-09-24：Stage C / Task 12b Plan 决策切片通过宿主验证
+
+在已提交的 Data 切片 `02dd043` 后，串行抽取 `src/main.cpp::applyV2Plan` 预检后的 PowerPlan 形状校验、授予上限选择和 ACK 分类为 `src/v2_plan_command.{h,cpp}`；宿主 render FFI 编译同一 C++ 实现。设备端认证和正式计划接受后的 deadline、模式持久化、日志副作用保留原顺序。同 ID 完全重放保留原截止；冲突、旧 ID 和非法形状不改计划。宿主测试覆盖 provisional 300s、常规 600s、最低 30s、重放、冲突、旧 ID 和 sleep；`cargo test -p bridge-render --test v2_state` 12/12 通过，`git diff --check` 通过。未接实机或主 Bridge，未构建/烧录 ROM。下一步继续 Bundle、Activate、claim 命令路径；仍无可运行 Fake ROM。
+
 ## 2026-09-24：Stage C / Task 12a Data 决策切片通过宿主验证
 
 在独立 `codex/fake` worktree（HEAD 与 `bridge-multi-instance-2026-09-24` tag 均为 `6d131ac`）开始 Stage C。ROM 文件已交接；只有一名 6-luna high 代理顺序编码。`src/main.cpp::applyV2Data` 的预检后决策和 ACK 分类已抽入 `src/v2_data_command.{h,cpp}`，与宿主 render FFI 编译同一 C++ 实现；设备端原 token/owner/session 预检、首次接受后的 fields/checkpoint/cache/显示顺序保留。拒绝与重放不触发副作用，未配置仍返回原 ACK。初审发现 ACK 的 result/error 混用后已修正。

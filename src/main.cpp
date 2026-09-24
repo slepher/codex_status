@@ -52,6 +52,7 @@
 #include "v2_state.h"
 #include "v2_runtime.h"
 #include "v2_data_command.h"
+#include "v2_plan_command.h"
 #include "bundle_store.h"
 
 // v2 platform targets (src/platform_target.h): the render/firmware target
@@ -3762,25 +3763,14 @@ static void handleV2Data() {
 static void applyV2Plan(const String &body) {
     JsonDocument doc;
     if (!v2Command(body, doc)) return;
-    V2PowerPlan plan;
-    plan.planId = doc["plan_id"] | 0ULL;
-    const char *mode = doc["mode"] | "sleep";
-    if (!doc["plan_id"].is<uint64_t>() || (!strcmp(mode, "light") && !doc["light_duration_s"].is<uint32_t>()) ||
-        (strcmp(mode, "light") && strcmp(mode, "sleep"))) {
-        v2Ack("plan", "rejected", "unchanged", "ram", "plan_shape", -1, 0, nullptr, UINT32_MAX);
+    V2PlanDecision decision = v2DecidePlan(doc, v2Plan, v2NowMs(), v2Provisional);
+    if (!decision.accepted) {
+        v2Ack("plan", decision.result, decision.display, "ram", decision.error,
+              -1, decision.planId, decision.includeContext ? v2Profile.contextId : nullptr,
+              UINT32_MAX);
         return;
     }
-    plan.mode = strcmp(mode, "light") == 0 ? V2_PLAN_LIGHT : V2_PLAN_SLEEP;
-    plan.lightDurationS = doc["light_duration_s"] | 0u;
-    plan.rendezvousPeriodS = doc["rendezvous_period_s"] | V2_RENDEZVOUS_S;
-    V2PlanAck rc = v2Plan.accept(plan, v2NowMs(), false,
-                                 v2Provisional ? V2_BOOT_PROVISIONAL_S : V2_MAX_LIGHT_S);
-    if (rc == V2_PLAN_STALE_ID || rc == V2_PLAN_CONFLICT) {
-        v2Ack("plan", "rejected", "unchanged", "ram",
-              rc == V2_PLAN_STALE_ID ? "stale_plan" : "plan_conflict", -1, plan.planId,
-              v2Profile.contextId, UINT32_MAX);
-        return;
-    }
+    const V2PowerPlan &plan = decision.plan;
     v2PlanReason = "bridge";
     if (plan.mode == V2_PLAN_LIGHT) {
         v2LightDeadlineMs = v2Plan.deadlineMs();
@@ -3796,8 +3786,9 @@ static void applyV2Plan(const String &body) {
         v2Provisional = false;
         DevLog.printf("[v2] plan %lu sleep\n", (unsigned long)plan.planId);
     }
-    v2Ack("plan", "applied", rtcMode == MODE_LIGHT ? "unchanged" : "unchanged", "ram",
-          nullptr, -1, plan.planId, v2Profile.contextId, v2Plan.grantedS());
+    v2Ack("plan", decision.result, decision.display, "ram", decision.error,
+          -1, decision.planId, decision.includeContext ? v2Profile.contextId : nullptr,
+          decision.grantedS);
 }
 
 static void handleV2Plan() {

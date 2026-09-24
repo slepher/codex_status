@@ -1,5 +1,9 @@
 # Codex Status 项目进度（交接文档）
 
+## Fake ROM Stage C Plan 决策切片：2026-09-24 — 宿主验证通过
+
+Data 切片已提交 `02dd043`，随后在同一独立 `codex/fake` worktree 串行完成 PowerPlan 的共享 C++ 命令决策：形状校验、计划授予限制、ACK 分类由固件和宿主 render FFI 调用同一 `src/v2_plan_command.{h,cpp}`。原有认证、deadline、模式持久化和日志副作用留在设备端。宿主测试证明同 ID 重放不续期，冲突/旧 ID/非法形状不改变计划；provisional 300s、常规 600s、最低 30s 与 sleep 均通过。`cargo test -p bridge-render --test v2_state` 12/12、`git diff --check` 通过。未碰主 Bridge、生产数据或实机，未构建/烧录 ROM。后续仍需 Bundle/Activate/claim、宿主端点和完整 Fake ROM；详见 `project-workflow/fake-rom-simulator/status.md`。
+
 ## Fake ROM Stage C Data 决策切片：2026-09-24 — 独立 worktree 宿主验证通过
 
 在 `codex/fake` 独立 worktree 从 `bridge-multi-instance-2026-09-24` tag 基线开始，ROM 文件已交接。`src/main.cpp::applyV2Data` 预检后的 Data 决策/ACK 分类由固件和宿主共用 `src/v2_data_command.{h,cpp}`；设备端认证、首次接受后的 checkpoint/缓存/显示原顺序保留。宿主 render FFI 覆盖首次接受、重放、冲突、旧 seq、错 context、CRC/字段顺序错误和未配置，拒绝不推进序列。`cargo test -p bridge-render --test v2_state` 11/11 通过（ArduinoJson 用已安装的只读头文件路径），`git diff --check` 通过。未改主工作树、未启动/停止 Bridge、未接设备、未构建/烧录实机 ROM、未提交。此切片仍不是可运行 Fake ROM；Stage C 后续 Plan/Bundle/Activate/claim 与宿主端点尚待实现，见 `project-workflow/fake-rom-simulator/status.md`。

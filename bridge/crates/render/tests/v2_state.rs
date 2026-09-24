@@ -20,6 +20,14 @@ extern "C" {
         max_light: u32,
     ) -> c_int;
     fn codex_v2_plan_remaining(p: *mut c_void, now_ms: u64) -> u32;
+    fn codex_v2_plan_decide(
+        p: *mut c_void,
+        message: *const std::os::raw::c_char,
+        now_ms: u64,
+        provisional: c_int,
+        out: *mut std::os::raw::c_char,
+        cap: c_int,
+    ) -> c_int;
     fn codex_v2_plan_high(p: *mut c_void) -> u64;
     fn codex_v2_plan_light_active(p: *mut c_void, now_ms: u64) -> c_int;
     fn codex_v2_boot_remaining(t_boot_ms: u64, now_ms: u64) -> u32;
@@ -128,6 +136,131 @@ fn device_safety_shortens_an_oversized_plan() {
         assert_eq!(codex_v2_plan_accept(p, 8, 1, 1, 0, 0, 600), ACCEPTED);
         assert_eq!(codex_v2_plan_remaining(p, 0), 30, "minimum light window");
         codex_v2_plan_free(p);
+    }
+}
+
+#[test]
+fn shared_plan_decision_classifies_ack_and_preserves_plan_state() {
+    let decide = |p: *mut c_void, message: serde_json::Value, now_ms, provisional| unsafe {
+        let text = std::ffi::CString::new(message.to_string()).unwrap();
+        let mut out = vec![0i8; 2048];
+        let rc = codex_v2_plan_decide(
+            p,
+            text.as_ptr(),
+            now_ms,
+            provisional,
+            out.as_mut_ptr(),
+            out.len() as c_int,
+        );
+        assert!(rc > 0);
+        serde_json::from_str::<serde_json::Value>(
+            std::ffi::CStr::from_ptr(out.as_ptr()).to_str().unwrap(),
+        )
+        .unwrap()
+    };
+    unsafe {
+        let p = codex_v2_plan_new();
+        let shape = decide(p, serde_json::json!({"plan_id": 1, "mode": "light"}), 0, 0);
+        assert_eq!(shape["accepted"], false);
+        assert_eq!(shape["result"], "rejected");
+        assert_eq!(shape["display"], "unchanged");
+        assert_eq!(shape["error"], "plan_shape");
+        assert_eq!(shape["plan_id"], 0);
+        assert_eq!(shape["include_context"], false);
+        assert_eq!(shape["state_accepted"], false);
+        assert_eq!(shape["high_id"], 0);
+
+        let provisional_cap = decide(
+            p,
+            serde_json::json!({"plan_id": 1, "mode": "light", "light_duration_s": 600}),
+            0,
+            1,
+        );
+        assert_eq!(provisional_cap["accepted"], true);
+        assert_eq!(provisional_cap["result"], "applied");
+        assert_eq!(provisional_cap["display"], "unchanged");
+        assert!(provisional_cap.get("error").is_none());
+        assert_eq!(provisional_cap["plan_id"], 1);
+        assert_eq!(provisional_cap["granted_s"], 300);
+        assert_eq!(provisional_cap["include_context"], true);
+        assert_eq!(provisional_cap["deadline_ms"], 300_000);
+
+        let replay = decide(
+            p,
+            serde_json::json!({"plan_id": 1, "mode": "light", "light_duration_s": 600}),
+            60_000,
+            1,
+        );
+        assert_eq!(replay["result"], "applied");
+        assert_eq!(replay["display"], "unchanged");
+        assert_eq!(replay["deadline_ms"], 300_000);
+        assert_eq!(replay["remaining_s"], 240);
+
+        let conflict = decide(
+            p,
+            serde_json::json!({"plan_id": 1, "mode": "light", "light_duration_s": 599}),
+            60_000,
+            1,
+        );
+        assert_eq!(conflict["accepted"], false);
+        assert_eq!(conflict["result"], "rejected");
+        assert_eq!(conflict["display"], "unchanged");
+        assert_eq!(conflict["error"], "plan_conflict");
+        assert_eq!(conflict["plan_id"], 1);
+        assert_eq!(conflict["include_context"], true);
+        assert_eq!(conflict["deadline_ms"], 300_000);
+        assert_eq!(conflict["remaining_s"], 240);
+
+        let stale = decide(
+            p,
+            serde_json::json!({"plan_id": 0, "mode": "sleep"}),
+            60_000,
+            1,
+        );
+        assert_eq!(stale["result"], "rejected");
+        assert_eq!(stale["display"], "unchanged");
+        assert_eq!(stale["error"], "stale_plan");
+        assert_eq!(stale["plan_id"], 0);
+        assert_eq!(stale["include_context"], true);
+        assert_eq!(stale["high_id"], 1);
+        assert_eq!(stale["deadline_ms"], 300_000);
+
+        let minimum = decide(
+            p,
+            serde_json::json!({"plan_id": 2, "mode": "light", "light_duration_s": 1}),
+            60_000,
+            1,
+        );
+        assert_eq!(minimum["accepted"], true);
+        assert_eq!(minimum["result"], "applied");
+        assert_eq!(minimum["display"], "unchanged");
+        assert_eq!(minimum["granted_s"], 30);
+        assert_eq!(minimum["include_context"], true);
+        assert_eq!(minimum["deadline_ms"], 90_000);
+        assert_eq!(minimum["remaining_s"], 30);
+
+        let sleep = decide(p, serde_json::json!({"plan_id": 3, "mode": "sleep"}), 61_000, 0);
+        assert_eq!(sleep["accepted"], true);
+        assert_eq!(sleep["result"], "applied");
+        assert_eq!(sleep["display"], "unchanged");
+        assert!(sleep.get("error").is_none());
+        assert_eq!(sleep["plan_id"], 3);
+        assert_eq!(sleep["granted_s"], 0);
+        assert_eq!(sleep["include_context"], true);
+        assert_eq!(sleep["light_active"], false);
+        assert_eq!(sleep["high_id"], 3);
+        codex_v2_plan_free(p);
+
+        let normal = codex_v2_plan_new();
+        let normal_cap = decide(
+            normal,
+            serde_json::json!({"plan_id": 8, "mode": "light", "light_duration_s": 900}),
+            0,
+            0,
+        );
+        assert_eq!(normal_cap["accepted"], true);
+        assert_eq!(normal_cap["granted_s"], 600);
+        codex_v2_plan_free(normal);
     }
 }
 
