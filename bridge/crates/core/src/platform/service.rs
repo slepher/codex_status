@@ -1246,6 +1246,35 @@ impl PlatformService {
         if let Some(c) = inner.coordinators.get_mut(&mac) {
             c.note_status(status, now);
         }
+        // A template switched ON THE DEVICE (button/local switch) changes which
+        // compiled requirements data frames are validated against, usually
+        // WITHOUT changing the context. Without this refresh the bridge keeps
+        // sending the previous template's field set and the device answers every
+        // frame with `incomplete` (firmware v2_runtime.cpp: fields.size() !=
+        // remoteCount). Only refresh for templates the profile actually installs.
+        let reported = status
+            .get("active_template_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let contract_template = inner
+            .coordinators
+            .get(&mac)
+            .and_then(|c| c.active_template_id.clone());
+        let installed = profile
+            .as_ref()
+            .is_some_and(|p| p.template_ids.iter().any(|t| t == reported));
+        if !reported.is_empty()
+            && contract_template.as_deref() != Some(reported)
+            && installed
+        {
+            let requirements = compiled_requirements(&inner, &mac, reported);
+            let triggers = triggers_for(&inner, &mac, reported);
+            if !requirements.is_empty() {
+                if let Some(c) = inner.coordinators.get_mut(&mac) {
+                    c.set_contract(reported, requirements, triggers);
+                }
+            }
+        }
         let mut power_reconciled = false;
         if let Some(c) = inner.coordinators.get_mut(&mac) {
             if let Some(pending) = c.plan.pending_explicit_light.clone() {
@@ -1997,6 +2026,65 @@ mod tests {
             "../../../../../tools/test-bridge/templates/quad.json"
         ))
         .unwrap()
+    }
+
+    fn mini_source() -> Value {
+        serde_json::from_str(include_str!(
+            "../../../../../tools/test-bridge/templates/mini.json"
+        ))
+        .unwrap()
+    }
+
+    /// A template switched on the device (same context!) must rebuild the data
+    /// contract, or every frame is rejected with `incomplete` on the device.
+    #[test]
+    fn device_side_template_switch_refreshes_the_data_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = service_with_device(dir.path());
+        let rt = crate::platform::model::RENDER_TARGET_154G;
+        svc.template_save("mini", rt, &mini_source(), 1000).unwrap();
+        svc.template_save("quad", rt, &quad_source(), 1001).unwrap();
+        let mut profile = Profile::draft("AA:BB:CC:DD:EE:FF");
+        profile.template_ids = vec!["mini".into(), "quad".into()];
+        profile.initial_active_id = Some("mini".into());
+        svc.profile_save(profile, 1002).unwrap();
+
+        let status = |template: &str| {
+            json!({
+                "configured": true,
+                "active_context_id": "ctx-1",
+                "active_template_id": template,
+                "committed_job_id": "",
+                "data_seq": 0,
+                "applied_seq": 0,
+            })
+        };
+        let fields = |svc: &PlatformService| -> Vec<String> {
+            let inner = svc.inner.lock().unwrap();
+            inner.coordinators["AA:BB:CC:DD:EE:FF"]
+                .requirements
+                .iter()
+                .map(|r| r.field.clone())
+                .collect()
+        };
+        let active = |svc: &PlatformService| -> Option<String> {
+            let inner = svc.inner.lock().unwrap();
+            inner.coordinators["AA:BB:CC:DD:EE:FF"].active_template_id.clone()
+        };
+
+        // First status adopts the device context and its template (mini).
+        svc.note_device_status("AA:BB:CC:DD:EE:FF", &status("mini")).unwrap();
+        assert_eq!(active(&svc).as_deref(), Some("mini"));
+        assert!(!fields(&svc).iter().any(|f| f == "buckets[codex].monthly.remaining"));
+
+        // The device switches locally to quad: same context, new template.
+        svc.note_device_status("AA:BB:CC:DD:EE:FF", &status("quad")).unwrap();
+        assert_eq!(active(&svc).as_deref(), Some("quad"));
+        let after = fields(&svc);
+        assert!(
+            after.iter().any(|f| f == "buckets[codex].monthly.remaining"),
+            "quad's requirement set must be active after a device-side switch: {after:?}"
+        );
     }
 
     #[test]

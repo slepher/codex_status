@@ -14,14 +14,14 @@
 |---|---|
 | 1.54" 设备 | MAC `70041DD7A340`，显示名"书桌屏"，IP `192.168.3.163`，`sync_enabled=true`，Profile `mini,quad` |
 | Note4 设备 | MAC `7C4FADB93408`，显示名"Note4"，IP `192.168.3.177`，`sync_enabled=true`，Profile `codex-status-a` |
-| 两设备可达性 | **均 ping 不通**（最后 ACK 约 2026-09-25 05:2x，距核查 5.9 小时）→ 任何实机任务的前提是先唤醒设备 |
-| Note4 已装固件 | `0.18.23-note4-b`（如 09-25 05:08 OTA 记录仍成立；PROGRESS 09-24 节里的 panel-power / 回退修正**未**刷入） |
-| 1.54 已装固件 | 最后记录 `0.16.7-bw`；master 上的时钟窗口保留修正（`clock-window-retention`）**未**刷入 |
+| 两设备可达性 | **2026-09-25 15:2x 已按键唤醒、实测可达**（`/status.json`+ARP 双证，MAC 与登记一致）；此后注意深睡仍会不可达 |
+| Note4 已装固件 | `0.18.23-note4-b`（09-25 实机核实：`0.18.23-note4-b`，slot `ota_1`，`wake=ext1`；PROGRESS 09-24 节里的 panel-power / 回退修正**未**刷入） |
+| 1.54 已装固件 | **2026-09-25 OTA 到 `0.18.23-bw`**（slot `ota_1`，1,740,576 B，`91937B18…`；此前为 `0.17.10-bw`）|
 | Note4 ROM | `.pio/build/zectrix-note4-b/firmware.bin` 1,758,032 B，SHA256 `42AAF00B…BCF72E`（= 当前 `main.cpp` 的 `0.18.23-note4-b`） |
-| 1.54 ROM | `.pio/build/esp32-s3-epaper-154g/firmware.bin` 1,744,496 B（08-25 00:55 构建，非当前源码；**当前源码只构建 Note4**） |
-| 桥 | `bridge/target/debug/bridge-app.exe` 2026-09-25 04:43 构建（含唤醒窗口下界修复 + 族同步保留修正）。**核查时进程未运行**（PID 文件 `artifacts/bridge-app-run.pid` 陈旧） |
-| 1.54 卡住的作业 | Bundle job `83f4324c` 状态 `sending`，另有多个 `waiting` 作业积压（含 `91b51cdb`） |
-| Note4 正常 | 最新 job `1b4500ad` = `succeeded`，`data_seq=applied_seq=57` |
+| 1.54 ROM | `.pio/build/esp32-s3-epaper-154g/firmware.bin` **1,740,576 B，SHA256 `91937B18…85CF`（2026-09-25 15:58 用当前源码重建，`0.18.23-bw`）——当日 16:10 已 OTA 进设备**；旧的合并期产物 1,744,496 B / `E9046F6B…` 已被覆盖 |
+| 桥 | `bridge/target/debug/bridge-app.exe` 2026-09-25 04:43 构建（含唤醒窗口下界修复 + 族同步保留修正）。**2026-09-25 15:13:45 起运行中：PID 21848 + watchdog 41784**（8765/8766/8767 在听）；起桥须用非受限命令（受限沙箱会假失败并回收子进程，见 A1/A2 结论） |
+| 1.54 队列/模板 | **已解决（2026-09-25）**：`bundle_jobs` 为空；job `2bfc710c` = `succeeded`，设备 `committed_job_id=2bfc710c`、`v2_templates=2`(`mini,quad`)、`active=quad` 并已渲染。残留：数据帧被拒 `incomplete` → **见 A7** |
+| Note4 正常 | 最新 job `1b4500ad` = `succeeded`；2026-09-25 实机 `data_seq=applied_seq=63`，`committed_job_id=1b4500ad`/`commit_seq=267` |
 
 ## 1. 产品需求 → 实现状态
 
@@ -57,7 +57,26 @@
 ### A2. 清掉 1.54 卡住的 Bundle 作业队列
 - **为什么紧急**：`bundle_jobs["70041DD7A340"]` 停在 `state=sending`（`83f4324c`，55,312 B，`saved_at` 1790053568），另有 6+ 个 `waiting` 作业积压。Coordinator **先处理未完成 Bundle 再处理 Data**，所以这台设备的数据投递会被永久顶住。
 - **具体动作**：设备可达后先只读核对设备侧 `committed_job_id`/`commit_seq`；确认哪个作业真的没提交，然后显式取消/重发，**不要**批量重发全部 `waiting` 作业。
-- **完成判据**：该 MAC 下不再有非终态作业；1.54 的 `data_seq/applied_seq` 开始推进，或明确判定为"设备侧 8 MB flash 装不下"（转 C1 处理）。
+- **结论（2026-09-25 实机复核，详见 `PROGRESS.md` §A1/A2）**：
+  - 队列已清干净：`platform_publish_cancel {"mac":"70041DD7A340"}` 实测对 `sending` 有效（工具描述 "queued (unstarted)" 不准确），`bundle_jobs` 已为空；`jobs[]` 里的 11 条 `waiting` 是**孤儿历史**（`refresh_bundle_history` 只在终态转换时改写，`service.rs:318-326`），不是活状态。
+  - 但**数据仍不通**：一次干净重发（`e60830a4`，55,312 B）在 BEGIN + 14 个 CHUNK 全 200 后，被设备在 **COMMIT** 拒绝，ACK 为 `{"result":"rejected","error":"oom"}`。flash 余量检查（`bundle_store.cpp:433-436`，不足会报 `"space"`）**没有**触发 → **不是"8 MB flash 装不下"**，而是 commit 期逐模板重建编译缓存时的 `malloc` 失败（`bundle_store.cpp:467-468`；1.54 空闲堆 ≈100 KB）。
+  - 原始卡死同型：09-24 04:48–05:19 对 `83f4324c` 也是"chunks 全 200 → COMMIT 被拒"，之后作业再无状态变化。**桥侧把"非 applied 的 COMMIT ACK"当成"保持 sending"**（`coordinator.rs:624-636` 只在 `committed==true` 改状态；`service.rs:922` 只在 committed 时刷新历史）→ 该设备被永久顶住。这是独立缺陷，建议先修（落 `Failed`+`last_error` 或加重试上限/退避）。
+  - 设备另有第二个故障：`[v2] active load failed: ct_abi` → `[v2] cannot rotate unknown-retention context; data disabled`，即已装 Bundle 的编译缓存 ABI 与固件不符，固件自关 data（`/v2/data` 返回 `rejected`）。建议核实 `bsLoadCompiled` 的"用槽内 source 重建缓存"兜底为何不生效（`bundle_store.cpp:568-591`）。
+  - **第二次尝试（用户授权，1.54 冷启动后 19 s 内发，堆最新鲜）给出了第二种拒绝**：新作业 `37217f05`，BEGIN + 14 分片全 200，COMMIT 返回 **`error:"owner"`**（不是 oom）。该错误全仓只有一处产出：`v2_bundle_command.cpp:144-158` 比较「COMMIT 请求体的 `bridge_id`」与「flash 暂存载荷里的 `bridge_id`」，且它位于 CRC(`:138`)与 session 匹配(`:110`)之后 ⇒ 请求体解析正常，是**设备侧重读 55 KB 暂存载荷时没拿到 `bridge_id`**（退路 `server.arg("bridge_id")` 桥从不发）。桥侧同值：`deliver()` 先 `bind_pending_bundle_owner`(`platform.rs:685`→`service.rs:844-871`) 强制 `payload.bridge_id == link.bridge_id`，不一致就不发包。
+  - **瓶颈判定为设备固件**：1.54 跑 `0.17.10-bw`，早于 `ca4022c`（0.18.23「stream bundle install from file」＝`oom` 那段的重写）；`owner` 检查本身（`b702aa3`，09-24）在 0.18.23 中未改。另注意**当前桥 exe（04:43 构建）成功提交数 = 0**（Note4 最后一次成功 `1b4500ad` 是 09-24 23:20，早于该构建）。
+  - 设备另有第二个故障：`[v2] active load failed: ct_abi` → `[v2] cannot rotate unknown-retention context; data disabled`，即已装 Bundle 的编译缓存 ABI 与固件不符，固件自关 data（`/v2/data` 返回 `rejected`）。建议核实 `bsLoadCompiled` 的"用槽内 source 重建缓存"兜底为何不生效（`bundle_store.cpp:568-591`）。
+- **✅ 已解决（2026-09-25 18:1x，详见 `PROGRESS.md` 顶部两节）**：把 1.54 OTA 到 `0.18.23-bw`（`firmware_ota`，54.1 s，ROM `91937B18…`）后，**一次 `platform_publish` 即 applied**：job `2bfc710c` = `succeeded`，设备 `committed_job_id=2bfc710c`、`v2_templates=2`(`mini,quad`)、`active=quad` 并渲染（`[clk] reserved …`），`[bundle] install total=78150 free=1810432`。**`oom`、`owner`、`ct_abi`/`data disabled` 三者同时消失** → 证实瓶颈是 0.17.10-bw 的 commit 路径（0.18.23 的流式安装 + 一次成功安装写入的新编译缓存/新 context）。
+- **残留（新开条目，见 A7）**：数据帧仍被设备拒 `incomplete`（字段条目数 ≠ 已装模板的远端 requirement 数），根因在桥侧字段契约 + Profile 的 `static1` 绑定。
+- **完成判据**：该 MAC 下不再有非终态作业（**已达成 2026-09-25**）；1.54 的 `data_seq/applied_seq` 开始推进，或给出确切失败阶段与根因并转 C1。**实机结论是后者**，且须更正原判据里的候选："设备侧 8 MB flash 装不下" **不成立**——flash 余量检查未触发，失败发生在 commit 期的堆分配（`oom`）。
+
+### A7. 1.54 数据面 `incomplete`：桥字段契约落后于设备的本地模板切换（2026-09-25 新开 → **已修并实机验收**）
+- **现象/证据**：OTA 到 `0.18.23-bw` 并成功安装 Bundle（job `2bfc710c`）后，第一帧数据 `seq=82` **applied**（当时设备在 `mini`），设备按键本地切到 `quad` 之后每帧都被拒；`platform_push_now` 的原始 ACK 给出确切原因 `error:"incomplete"`。
+- **机制**：`incomplete` 出自固件 `v2_runtime.cpp:114-118`（`fields.size() != remoteCount`，remoteCount = 已装模板里 `kind<=9` 的 requirement 数；其前的 CRC 检查 `:110` 已通过）→ **是条目数不符，不是内容错**。桥侧 `wire_fields`(`coordinator.rs:949-966`) 对每条 requirement 各发一条、缺值发 `v:null`（固件 `:128-133` 允许 null）——所以前提是"契约里的 requirement 列表 == 已装模板的"。
+- **根因（已确认）**：桥只在 **context 变化**时按设备上报的模板重建契约（`service.rs:1298-1321`，在 `note_device_status` 的 reconcile 分支内），设备"本地按键切模板"被桥提前采纳 context 后契约不再刷新 → 桥继续按上一个模板（`mini`，2 远端字段）发，设备按 `quad`（8 远端字段）校验。
+- **修复（2026-09-25）**：`note_device_status` 增加"设备上报的 `active_template_id` 与契约不同且该模板在 Profile 内 → 重建契约"（`set_contract`）；新增单测 `device_side_template_switch_refreshes_the_data_contract`；`cargo test -p bridge-core` **85 项全绿**，桥已重建并重启。
+- **叠加的配置缺陷已一并修掉**：1.54/Note4 的 Profile 绑定原本有 5/… 条指向测试源 `static1`（只提供 `weekly.usedPercent`/`weekly.resetsAt`）→ 现在两个 Profile 的绑定**全部指向真实源 `codex`**（1.54 8 条、Note4 7 条）。
+- **实机验收**：`platform_publish` job `48b47968` = applied/displayed；`platform_push_now` → **`{"op":"data","result":"applied","display_state":"displayed","data_seq":1}`**，设备 `data_seq=1 applied_seq=1 display=displayed renders=9`。
+- **仍待做**：按一次 1.54 按键本地切到 `quad`，现场确认契约会跟着刷新（单测已覆盖逻辑）。
 
 ### A3. 修掉 Note4 深睡时钟残影（唯一影响日常观感的显示缺陷）
 - **现象**：deep 期间只写时钟窗口，残影累积；`SYNC`/用量属整帧元素所以停在最后一次整帧（现场曾被读成 `04:64`）。
@@ -108,8 +127,8 @@
 
 ### B4. 1.54 时钟窗口保留修正 + 会合交替验收
 - `clock-window-retention` 已改源码（同一 context + 相同时钟区域才保留 RTC 时钟像素），**只做过 1.54 `pio run` 构建，未刷机**。
-- 由于现在只构建 Note4，1.54 需要单独决定：要么用 `.pio-pkgs/note4` 之外的隔离包目录重建 1.54（见 D4），要么承认 1.54 冻结在当前固件。
-- 待做：刷入后按 `/history` 的每分钟唤醒类型 + `clk_partials` + 可见刷新类型三项对照。
+- **2026-09-25：构建侧与刷机侧都已完成** —— 154g 隔离目录 + 当前源码 ROM 就绪（`91937B18…`，`0.18.23-bw`，含 `ca4022c` 与时钟窗口修复），并已 **OTA 进设备**（`0.17.10-bw → 0.18.23-bw`，54.1 s）；同一次会话里 Bundle 也装成功（A2 关闭）。见 `PROGRESS.md` 顶部两节。
+- 待做：按 `/history` 的每分钟唤醒类型 + `clk_partials` + 可见刷新类型三项对照（**实机验收**）；现在设备跑的是 `0.18.23-bw`，验收条件已具备。
 
 ## 4. 战略/长线（C 级：需要独立 initiative，不在近期窗口）
 
@@ -145,9 +164,13 @@
 - 结论：在 C1（Bundle v3）定案前不要启动，否则两套编码器要一起改。
 
 ### C6. 多 env / packages 目录隔离收尾
-- `tools/pio-target.ps1` 已落地并验证 note4 隔离（`.pio-pkgs/note4` + `.pio-core`，无 banner）。
-- 未做：判据 c/d/e（需构建 154g，用户曾拒绝创建其 packages 目录）；`next.md §6` 的 `extends` 重构未做。
-- **当前决定：不推进。** 既然唯一固件目标是 note4，争议点消失。如需恢复 1.54（见 B4），再回到本项。
+- `tools/pio-target.ps1` 已落地，**两侧都已实测**（2026-09-25）：`.pio-pkgs/note4` 与 `.pio-pkgs/154g` 各 2 real（两个冲突 framework 包，69 MB + 2057 MB）+ 15 junction，各 ≈2126 MB。
+- **154g 构建成功**：`pio run -d <repo> -e esp32-s3-epaper-154g` → SUCCESS 102.38 s，无 banner、无重装；产物 `1,740,576 B / 91937B18…`（`0.18.23-bw`），另见 `PROGRESS.md`「多 env 实测」节。
+- **判据 c/d/e 已实测（结论与预期相反）**：**交替构建仍会触发 framework 重装**——`sdkconfig.defaults` 是仓库根唯一生成物，切到 154g 后首行变成 154g 指纹，切回 note4 即触发 `*** Reinstall Arduino framework ***`。隔离的价值是**重装只发生在目标自己的包目录里、不伤对方**（整轮两个目录完好，note4 ROM hash 未变 `42AAF00B…`），**不是**省掉重装代价。
+- **重装在受限沙箱里跑不完**：uv 要写 `%LOCALAPPDATA%\uv\cache`（工作区外）→ `os error 5 拒绝访问` → `Failed to create a proper virtual environment`；`UV_CACHE_DIR` 指到工作区内可解这一条，但 `tool-esptoolpy` 的 editable 安装仍因写 junction 指向的共享包目录报 `Cannot update time stamp of directory 'esptool.egg-info'`（非致命警告）。要完整跑通需提权或把这两条路径纳入工作区。
+- **脚本坑**：`tools/pio-target.ps1` 在**后台作业**里会假失败——它 `& pio run` 时 cwd 丢失成 `D:\Documents\project`；给 pio 加 `-d <repo>`（或在前台 shell 跑脚本）即可。
+- `next.md §6` 的 `extends` 重构未做。「只构建 Note4」现仍成立，但已明确是**成本**约束。
+- **当前决定：不主动推进**；需要 1.54 固件时（见 A2/B4）用上面已验证的路径。
 
 ### C7. 其他单项遗留（已归档专项带出来的、仍然有效的条目）
 

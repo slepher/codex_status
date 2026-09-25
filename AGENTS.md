@@ -37,7 +37,7 @@ pio device monitor
 ### 固件目标：只构建 Note4
 
 - **唯一目标：`zectrix-note4-b`。** 不要构建其他 env（尤其不要构建或切换到 `esp32-s3-epaper-154g` 及其 `-gray4`/`-btpm` 变体）；构建命令一律显式带 `-e zectrix-note4-b`。
-- **不要交替构建不同目标。** 项目根 `sdkconfig.defaults` 是**全项目唯一**生成物，被各目标争写；pioarduino `arduino.py` 会把当前环境的 `custom_sdkconfig`、MCU 与板卡指纹同该文件首行的 `# TASMOTA__...` 比对，`check_reinstall_frwrk()` 不匹配时会清理生成的 sdkconfig 文件并重装两个 Arduino framework 包。交替切换必然失配、必然重装（已双向实测，单次约 15 分钟量级）。多目标并存的正确解法是按目标隔离 `packages_dir`（note4 的隔离已落地：`tools/pio-target.ps1` → `.pio-pkgs/note4` + `.pio-core`，见 `PROGRESS.md` §包目录隔离）；**仍只构建 Note4**。
+- **不要交替构建不同目标。** 项目根 `sdkconfig.defaults` 是**全项目唯一**生成物，被各目标争写；pioarduino `arduino.py` 会把当前环境的 `custom_sdkconfig`、MCU 与板卡指纹同该文件首行的 `# TASMOTA__...` 比对，`check_reinstall_frwrk()` 不匹配时会清理生成的 sdkconfig 文件并重装两个 Arduino framework 包。交替切换必然失配、必然重装（已双向实测，单次约 15 分钟量级）。多目标并存的正确解法是按目标隔离 `packages_dir`（`tools/pio-target.ps1` 支持 `-Target note4|154g`，按目标生成 `.pio-pkgs/<target>` + 仓库内 `.pio-core`；**两侧都已在 2026-09-25 实测**，见 `PROGRESS.md`「多 env 实测」与 backlog C6）。⚠️ 两点实测结论：① **交替构建仍会触发 framework 重装**（`sdkconfig.defaults` 是仓库根唯一生成物，切换即改写首行指纹），隔离只保证重装发生在目标自己的包目录里、不伤对方；② 受限沙箱下该脚本在**后台作业**里会因 `pio` 继承到错误 cwd（`D:\Documents\project`）而假失败，给 pio 加 `-d <repo>`（或在前台 shell 跑）即可。**仍只构建 Note4**——那是**成本**约束，不是能力约束。
 - 不要同时运行两个及以上 `pio` 进程；单个目标内部允许 PlatformIO 并行编译源文件。
 - 保留 `.pio/build/<env>` 与 SCons 缓存，不要因只改应用源码而例行清理或删除构建目录。
 - 每次构建后核对环境名、固件版本、产物大小与 SHA256，并把最终 ROM 路径与哈希写入 `PROGRESS.md`。
@@ -78,7 +78,7 @@ git diff --check                   # 提交前必查
 - 设备身份 = Wi-Fi MAC（学习并持久化），显示名可改但非主键；UDP/HTTP/BLE 通告 MAC 不符即拒绝。发现链：属性 IP → UDP → ARP（Windows）→ BLE（手动兜底）；mDNS 已关，勿再依赖 `.local`。
 - 占用只走显式 `POST /claim`：`usage`/`template` 永不创建/转移 owner（仅刷新匹配 id 的 `last_seen`）；owner 有效且 `bridge.hostId`（template 用 `bridge_id`）不符一律 409，`activate` 无旁路；lease 到期只清空。桥空闲自动 claim、60s 续约、他人占用不推送；推送仍是用户显式动作（claim 是协议行为，不等于推送模板）。
 - 改 GATT 特征表后 Windows 会缓存旧属性，需解除配对再重配（或后续评估 Service Changed）。
-- 便携数据布局：运行数据 `<exe>/data/`，种子 `<exe>/seed/`（开发回退 `tools/test-bridge/`）；程序不写仓库。
+- 便携数据布局：运行数据 `<exe>/data/`，种子 `<exe>/seed/`（开发回退 `tools/test-bridge/`）；程序不写仓库。⚠️ **`<exe>/data/` 就在 `bridge/target/debug/data/` 里**——`cargo` 报 `os error 5`（`target/debug/.fingerprint/...` 这类沙箱旧文件缺能力 ACE，`Set-Acl` 也改不动）而想"删 `target/debug` 重建"时，**先把 `data/` 备份出去**：它装着 `state.json`（设备登记/Profile/jobs/contexts/plans）、模板库、`device-token-*.json`、`bridge-app.json`（endpoint token）。2026-09-25 有一次真实事故（见 `PROGRESS.md`「桥：契约刷新修复 + ACL 闸门绕过」节）：删目录连带删掉运行时数据，靠写回配置 + 从 `tools/test-bridge/` 与仓库夹具重导模板 + 重新登记设备/重建 Profile 才恢复。**更安全的做法是 `cargo build/test --target-dir <仓库内新目录>`**，完全不碰现有 `target/debug`。
 - 推送是用户显式动作：v2 下 Profile = 1–8 个有序模板（全部参与按键循环，无 enabled 子集），显式发布冻结一个完整 Bundle；保存模板/Profile、MCP save、UI save 都只落盘，不得自动发布。legacy 设备保持 ≤3 槽限制并显式提示。
 - v2 数据语义：字段仅在 Bridge 绑定合同中分 push/pull；push 可见值/缺失/质量变化发送完整最新快照，pull-only 变化只更新缓存、不推送、不改 PowerPlan；只有成功 ACK 才更新确认指纹与 full_sync_deadline。设备不接收 push/pull 分类。
 - v2 电源：只有 Bridge 的正式 PowerPlan 改变 light deadline；读取/传输/claim/owner renew 都不隐式续租；BOOT provisional 300s 从物理唤醒起算，timer wake 不获得。
@@ -90,7 +90,7 @@ git diff --check                   # 提交前必查
 - 在仓库内创建新目录必须对创建步骤使用 `require_escalated` 提权执行，避免目录属主变成 `CodexSandboxOffline`、继承到不完整的 ACL。包括 `mkdir`/`New-Item`、补丁工具隐式建目录，以及构建或脚本首次生成目录；对自动生成的目录，先提权预建，无法预建时提权运行创建它的命令。不要先在沙箱中创建再修属主；若提权被拒绝，停止该创建步骤并说明原因。已存在的目录无需重复创建。
 - 每个里程碑后更新 `PROGRESS.md`（现场、证据、待办）；多步工作用 `project-workflow/<initiative>/` 写 plan/task/status/review，先计划再动代码。
 - 提交信息用英文祈使句，沿用现有风格（如 `Firmware 0.8.0: status JSON, log ring, battery; bridge prefers JSON status`）。未经用户要求不要提交。
-- 后台进程启动必须立即返回、不挂住会话：桥用 `pwsh tools/start-bridge.ps1`（`UseShellExecute=true` 完全分离子进程 + 隐藏窗口 + cmd 重定向日志，避免子进程继承 stdio 句柄导致调用方阻塞）；其他服务照此模式（分离启动 + 日志重定向到 `artifacts/`），不用会继承管道句柄的前台/直连方式。不在前台跑长轮询；不是当前 debug/release 构建输出目录（如 `bridge/target/debug`）下运行的桥/设备服务不要擅自停止。停止当前构建目录的桥时先结束 watchdog 子进程（`--watchdog <pid>`）再停父进程，避免 watchdog 拉起重启。
+- 后台进程启动必须立即返回、不挂住会话：桥用 `pwsh tools/start-bridge.ps1`（`UseShellExecute=true` 完全分离子进程 + 隐藏窗口 + cmd 重定向日志，避免子进程继承 stdio 句柄导致调用方阻塞）；其他服务照此模式（分离启动 + 日志重定向到 `artifacts/`），不用会继承管道句柄的前台/直连方式。不在前台跑长轮询；不是当前 debug/release 构建输出目录（如 `bridge/target/debug`）下运行的桥/设备服务不要擅自停止。停止当前构建目录的桥时先结束 watchdog 子进程（`--watchdog <pid>`）再停父进程，避免 watchdog 拉起重启。⚠️ **2026-09-25 实测：受限沙箱（workspace-write）下跑该脚本会假失败**——沙箱内 `Get-NetTCPConnection` 看不到刚起的监听者（脚本 10 s 后抛 "did not appear"），命令结束时沙箱还会回收已分离的子进程，且 WebView2 建 host 报 `HRESULT(0x800700AA) ERROR_BUSY`；**桥必须从非受限（提权）命令启动**，桥自己的日志在 `<exe>/data/logs/bridge-app.log.<UTC 日期>` 里（`artifacts/bridge-app-run.out/.err` 通常为空）。
 - 命名 Bridge 实例必须指定不同 HTTP/MCP 端口；各自运行数据在 `<exe>/instances/<name>/data`，默认实例保留 `<exe>/data`。命名实例不监听设备固定 UDP 8767，只走精确 MAC 的 HTTP/BLE；不同实例 owner ID 不同，同一设备仍由 claim/lease 决定占用。托盘背景形状可用 `-IconShape square|circle|diamond` 区分。
 - 不提交任何密钥：Wi-Fi 密码、BLE token 只存在于设备 RAM/NVS，不落仓库、不进日志。
 
@@ -103,7 +103,7 @@ git diff --check                   # 提交前必查
 | 1.54" 200×200 | `70041DD7A340` | `192.168.3.163` | 显示名"书桌屏"；BLE 名形如 `CodexStatus-<MAC后缀>` |
 | Note4 400×300 | `7C4FADB93408` | `192.168.3.177` | 显示名"Note4"；曾用 IP `192.168.3.177`/Wi-Fi `wd21-la` |
 
-- ⚠️ 本文旧版写的 `192.168.1.50` 与 `70:04:1D:AA:BB:CC` **与桥的登记不一致**（可能来自早期现场或另一块板）；动手前先用设备 `/status.json` + ARP 核实，核实后回写本表。
+- ✅ 已核实（2026-09-25）：设备 `/status.json` + ARP 实测 1.54 就是 `70041DD7A340` @ `192.168.3.163`，与本表及 `state.json` 登记一致。本文旧版写的 `192.168.1.50` 与 `70:04:1D:AA:BB:CC` **作废**，不要再引用。1.54 实机固件已于 2026-09-25 由 `0.17.10-bw` OTA 到 **`0.18.23-bw`**（此前记录 `0.16.7-bw` 更早已过期）。
 - USB 串口 COM 口动态（COM3/COM4/COM5）；用户常拔 USB（无串口时靠 Wi-Fi `/status.json`、`/log`）。**打开串口会复位板子**，所以不要为了看日志而丢掉一次按键唤醒的现场。
 - OTA：上传成功后延迟 1.5s 重启，HTTP 先返回 `UPDATE OK`（客户端超时属既有现象）；双槽 ota_0/ota_1 轮换。
 - 状态可读：`GET /status.json`（fw/槽位/重置原因/RSSI/电量/heap 等）、`GET /log`（4KB RAM 环形日志）与 `GET /pmstats`（PM light-sleep 统计/锁，0.13.0+，只读免 token）；桥优先用 JSON，旧固件回退 HTML。
