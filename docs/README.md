@@ -25,7 +25,7 @@
 | `generic-display-platform-design-v2.md` | **权威** | 通用显示平台 v2 架构。与它冲突的旧描述一律以它为准 |
 | `power-state.md` | **权威** | 电源状态、身份/发现、占用 claim/lease 语义（§9.1/§9.2/§13.3） |
 | `ble-rendezvous-power-design.md` | 设计已定稿，实现分 6 阶段 | 会合功耗设计；阶段 1/2 已上线，其余见 backlog C4 |
-| `fake-rom-simulator-design.md` | 设计；实现进行中 | 同源 ROM 模拟器；逐 MAC 时钟合同的修正在 `project-workflow/fake-rom-simulator/plan.md` |
+| `fake-rom-simulator-design.md` | 设计；实现进行中 | 同源 ROM 模拟器；逐 MAC 时钟合同的修正在 `docs/history/workflow/fake-rom-simulator/plan.md` |
 | `font-asset-format.md` | 已实现 | CSFN 容器与字体资产格式 |
 | `device-setup-experience.md` | 已过时 | 早期配网体验记录，仅作产品意图参考 |
 
@@ -42,7 +42,7 @@
 | `docs/history/icons-task.md` | 早期图标任务 |
 | `docs/history/next-2026-09-25.md` | 原 `next.md`：合并 + 多 env 重构 + 包目录隔离的**已完成**记录 |
 | `docs/history/bugs-2026-09-22.md` | 原 `bugs.md`：BUG-1 / BUG-2 结案记录 |
-| `docs/history/workflow/<name>/` | 已结项的 `project-workflow/*` 专项原件（2026-09-25 迁入 15 个：`bridge-multi-instance`、`bundle-v3`、`codex-quota-display`、`deep-pull-test`、`device-discovery`、`fake-rom-simulator`、`note4-bridge-publish`、`note4-buttons`、`note4-icon-correction`、`note4-live-sync`、`note4-ota-bringup`、`note4-template-96`、`pmstats`、`sleep-modes`、`wake-contact-trace`） |
+| `docs/history/workflow/<name>/` | 已结项的 `project-workflow/*` 专项原件。2026-09-25 分两批迁入 **17 个**：`bridge-multi-instance`、`bundle-v3`、`codex-quota-display`、`deep-pull-test`、`device-discovery`、`fake-rom-simulator`、`note4-bridge-publish`、`note4-buttons`、`note4-icon-correction`、`note4-live-sync`、`note4-ota-bringup`、`note4-template-96`、`pmstats`、`sleep-modes`、`wake-contact-trace`（第一批 15 个）；`generic-display-platform-design`、`live-template-delivery`（第二批，等 ACL 修好后补上） |
 
 ### 仍在 `project-workflow/` 的专项（未结项，别归档）
 
@@ -55,7 +55,6 @@
 | `bridge-family-sync-preservation` | 源码已修但未进入运行桥；未部署就有覆盖设备 `sync_enabled` 的风险 |
 | `ble-rendezvous-power` | stage 3–6 全部未实现 |
 | `power-plan-c` / `power-state` / `sleep-battery` | 功耗基线、整机硬件验收、M3 验收未闭环 |
-| `generic-display-platform-design` / `live-template-delivery` | **2026-09-25 归档时被 ACL 拒绝**，但两目录原因不同：前者文件所有者还是 `CodexSandboxOffline`（属主 + DACL 都错），后者属主正常、只是文件缺沙箱能力 ACE。修复步骤见 `docs/history/acl-repair-notes.md` |
 
 ### 构建夹具已迁出 `project-workflow`
 
@@ -64,9 +63,9 @@
 代码用 `include_str!`/`read_to_string` 引用——这是"归档文档却被构建依赖"的隐患。
 2026-09-25 已复制到 `bridge/crates/core/tests/fixtures/codex-status-a-400x300.json`（与源
 文件 SHA256 同为 `A429D4E0…B48F5`），并把 3 处引用改为该路径；`cargo test -p bridge-core`
-与 `-p bridge-render` 全绿。
-⚠️ **原文件因 ACL 无法删除，仍在 `concepts-400x300/` 下**；它的副本才是权威夹具，删除
-`project-workflow/` 时不要连带删掉 `tests/fixtures/`。
+与 `-p bridge-render` 全绿。**`tests/fixtures/` 里的那份才是权威夹具。**
+原文件在 `concepts-400x300/` 下仍留着（`generic-display-platform-implementation` 目录未归档），
+但它已不再被任何代码引用，将来随该目录一起处理即可。
 
 ## 归档判据（下次归档照着判）
 

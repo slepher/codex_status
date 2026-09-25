@@ -84,24 +84,29 @@
 
 ## 历史归档
 
-本轮已把 `PROGRESS.md` 从 89 KB 压到约 16 KB，并归档文档（详见 `docs/README.md`）：
+本轮把 `PROGRESS.md` 从 89 KB 压到约 17 KB，并归档文档（详见 `docs/README.md`）：
 
 | 归档 | 内容 |
 |---|---|
 | `docs/history/progress-archive-2026-09-25.md` | 本次下沉：原 `PROGRESS.md` 111 行起的全部历史节（2026-09-24 及更早 + 合并/包隔离过程细节，约 71 KB，逐字节保留） |
 | `docs/history/progress-archive-2026-09-23.md` | 2026-09-22 及更早的进度（通用平台 v2 实现、0.13–0.16 各轮实机修复） |
-| `docs/history/workflow/<initiative>/` | 已结项专项原件：2026-09-25 迁入 15 个（`codex-quota-display`、`live-template-delivery` 等大部分 09-09~09-25 的专项） |
+| `docs/history/workflow/<initiative>/` | 已结项专项原件，共 **17 个**（第一批 15 个；`generic-display-platform-design`、`live-template-delivery` 在 ACL 修好后补入） |
 | `docs/history/next-2026-09-25.md` | 原 `next.md`（合并/多 env/包隔离，均已完成） |
 | `docs/history/bugs-2026-09-22.md` | 原 `bugs.md`（BUG-1/BUG-2 结案） |
+| `docs/history/acl-repair-notes.md` | 沙箱 ACL 机制、判据与修复脚本 |
 | `docs/roadmap/backlog.md` | **待办的唯一事实来源**（紧急 A / 暂缓 B / 长线 C / 技术债 D） |
 | `docs/roadmap/archive-digest-legacy.md` / `-recent.md` | 各专项一页式摘要与"还欠什么" |
 | `docs/README.md` | 文档总索引与"该读哪一个" |
 
-两处归档未完成，原因已查清（详见 `docs/history/acl-repair-notes.md`，backlog D11）：两个目录**缺的都是沙箱能力 ACE**，但根因不同——
+### 沙箱写入边界（2026-09-25 查清并已修，结论修正了旧记录）
 
-| 目录 | 所有者 | 缺能力 ACE | 结论 |
-|---|---|---|---|
-| `project-workflow/generic-display-platform-design/`（3 文件） | `喵的问都死\CodexSandboxOffline` | 是 | **属主 + DACL 都错** |
-| `project-workflow/live-template-delivery/`（6 文件） | `喵的问都死\cogic` | 是 | 属主正常，**只有 DACL 错** |
+旧记录把两次归档失败归为"属主 + DACL"两种原因，实测后**真正挡路的是 DACL 里那条沙箱能力 ACE**
+（`S-1-4-1018769461-493222538`），不是属主：
 
-所以**不是单纯的所有者问题**。判据：能改的文件 SDDL 里有 `(A;ID;0x110156;;;S-1-4-1018769461-493222538)`，不能改的没有——沙箱用受限令牌，宽泛组 ACE 不生效，写入只认那条能力 SID。能力 ACE 是后加到仓库根的，**可继承 ACE 不回溯**，因此 `project-workflow/` 下仍有 86 个文件缺它（`generic-display-platform-implementation` 63、`ble-rendezvous-power` 13、`live-template-delivery` 6、`generic-display-platform-design` 3、`next-execution-plan-2026-09-23.md` 1）。修复要在**提权** PowerShell 里走 .NET（`icacls` 无法映射 `S-1-4-…`）、**不递归**。
+- 判据：能写的文件 SDDL 里有 `(A;ID;0x110156;;;S-1-4-1018769461-493222538)`，不能写的没有。
+  沙箱用受限令牌，`Authenticated Users`/`Users` 这类宽泛组 ACE **不生效**，写入只认那条能力 SID。
+- 能力 ACE 是后加到仓库根的，**可继承 ACE 不回溯**，所以早期创建的文件一直缺它（`project-workflow/` 下曾有 86 个）。
+- **补齐 ACE 后，即使属主仍是 `CodexSandboxOffline`，`git mv` 与 `Add-Content` 都成功** —— 所以属主不是闸门。
+- 属主是 `CodexSandboxOffline` 但缺 ACE 时，沙箱既改不了属主也改不了 DACL；属主是 `cogic` 而只是缺 ACE 时，**DACL 改得动**（令牌有 `WRITE_DAC`），本次已补 90 个对象。
+- **沙箱提权（含已批准的 `danger-full-access`）不会把令牌变成管理员**：实测 `elevated? False`，`SetOwner` 恒报 `Attempted to perform an unauthorized operation`。**改属主只能在管理员终端做**。
+- 仓库内仍有 64+ 个对象属主是 `CodexSandboxOffline`（ACE 已补齐，不影响使用）；要清干净见 backlog D13 与 `docs/history/acl-repair-notes.md`。
