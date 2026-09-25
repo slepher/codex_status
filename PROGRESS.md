@@ -76,11 +76,15 @@
 | 1.54 卡住作业 | Bundle job `83f4324c` 停在 `sending`（55,312 B），另有多个 `waiting` 积压 → 顶住该设备的数据投递 |
 | Note4 正常 | 最新 job `1b4500ad` `succeeded`，`data_seq=applied_seq=57` |
 
-**待办的唯一事实来源是 `docs/roadmap/backlog.md`**（紧急 A1–A5 / 暂缓 B1–B4 / 长线 C1–C6 / 技术债 D1–D10）。本轮核查已关闭两条过时结论：
+**待办的唯一事实来源是 `docs/roadmap/backlog.md`**（紧急 A1–A6 / 暂缓 B1–B4 / 长线 C1–C7 / 技术债 D1–D13）。可直接交给新窗口执行的实现工作单在 `docs/roadmap/prompts/`。
+
+本轮核查又关闭/下调了三条，都遵循**证据优先于旧文档**：
 
 - 「v2 会合路径没有 ghost 预算」**已过时**：`main.cpp` 的 `rtcClkPartials++`（1816）与 `rtcClkPartials >= CLK_GHOST_LIMIT` 判定（5166/5177）现已覆盖 light tick 与深睡会合两条时钟路径，且已随 `0.18.23-note4-b` OTA 上机；剩余工作只是调预算与实机验收。
+- 「族发布会把设备 `sync_enabled` 覆盖回 false」（backlog A6）**不成立**：修正本体在 `bridge/crates/app/ui/index.html:541`，引入于 `fc3c464`（2026-09-25 04:04:10），此后该文件未再改动；运行桥 `bridge-app.exe` 构建于 **04:43:36**，晚 39 分钟 → **当前桥已含该修正**，族草稿的 `false` 不会被复制。旧的「未构建」结论来自 `bridge-family-sync-preservation/status.md`（写于构建之前）。
+- 「panel-power 改动是否已进 ROM 需确认」（backlog B1）**已确认进了**：`panel_pwr` 与 `note4RestoreFrameBaseline()` 引入于 `e226d8e`，早于 `0.18.23` 的源码提交 `af2b607`，且之后未再改 `src/` → 已 OTA 的 `0.18.23-note4-b` 就含这两项，**B1 只剩实机测量，不需要重编固件**；`artifacts/codex-status-0.18.21-…panel-modes.bin` 是过期候选。
 - `bugs.md` 的 BUG-1 / BUG-2 **均已由 v2 实现修复**（ACK CRC 同源、deep 唤醒恢复数据检查点或轮换 context）；已结案并归档为 `docs/history/bugs-2026-09-22.md`（含文件行号证据）。
-- `next.md` 的合并/多 env/包隔离工作已完成，已归档为 `docs/history/next-2026-09-25.md`；其 §5.2 的 `git stash` 流程在本机**不成立**（见本文下一节），不要再照做。
+- `next.md` 的合并/多 env/包隔离工作已完成，已归档为 `docs/history/next-2026-09-25.md`；其 §5.2 的 `git stash` 流程在本机**不成立**，不要再照做。
 
 ## 历史归档
 

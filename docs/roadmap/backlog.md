@@ -77,20 +77,27 @@
   `docs/history/progress-archive-*.md`。以后每次里程碑只往 `PROGRESS.md` 追加**一节**并
   在超过 ~15 KB 时把旧节下沉到归档。
 
-### A6. 别让族发布把 1.54 的 `sync_enabled=true` 覆盖回 false（活回归风险）
-- **风险**：`bridge-family-sync-preservation` 的源码修正（`confirmFamilyPublish()` 从目标设备 Profile 复制 `sync_enabled`/`full_sync_s`）**已写但未构建进运行桥**；同时**1.54 族草稿仍是 `sync_enabled=false`**。只要有人从当前运行的模板页发布一次 1.54 族，隐藏的草稿值就会覆盖设备上刚被显式开启的 `sync_enabled=true`，静默关掉数据同步。
-- **具体动作**（择一，写清选了哪个）：① 重建并重启桥，确认运行二进制包含该修正；② 或先把 1.54 族草稿也改成 `sync_enabled=true`。
-- **完成判据**：能说清"这次发布之后设备侧 `sync_enabled` 是否可能被改回 false"，并在 `PROGRESS.md` 记录结论。
+### A6. ~~别让族发布把 1.54 的 `sync_enabled=true` 覆盖回 false~~ → **已关闭（2026-09-25 核实）**
+- **原判断（错）**："源码已修但未构建进运行桥"。用产物时间戳复核后证伪：
+  - 修正本体在 `bridge/crates/app/ui/index.html:541`（`sync_enabled: device.profile?.sync_enabled ?? false`，
+    即从**目标设备 Profile** 复制、不再取族草稿），引入于提交 `fc3c464`（**2026-09-25 04:04:10**）；
+  - 此后 `index.html` **再无改动**（`git log fc3c464..HEAD -- bridge/crates/app/ui/index.html` 为空）；
+  - 运行桥 `bridge/target/debug/bridge-app.exe` 构建于 **04:43:36**，比该提交晚 39 分钟。
+  - → 该 exe 的 UI 源码含此修正，**当前桥的族发布已经会保留设备侧的 `sync_enabled`**。
+- **实际风险等级下调**：1.54 族草稿仍是 `sync_enabled=false`，但它现在**不会**被复制到设备。
+  设备 Profile 自身是 `true`，从当前桥再发布也仍然是 `true`。只有当用户**回退到旧 exe** 才需要担心。
+- **残余的一行记录**：若将来重建桥，重建后请顺手确认 `index.html:541` 仍是这个语义（别被"族配置优先"的改动带回旧行为）。
+- （旧的"未构建"结论来自 `bridge-family-sync-preservation/status.md`，该文件写于构建之前；归档摘要沿用了它。已在本行修正。）
 
 ## 3. 暂缓（B 级：有价值但不阻塞，排期在 A 之后）
 
 ### B1. Note4 panel-power 双模式 + 帧缓存自愈修正上机验收
 - 源码已实现：NVS `pm/panel_pwr`（`keep`/`off_cache`）、深睡保存整帧缓存 + RTC 哈希、`note4RestoreFrameBaseline()` 自愈修正。
-- **没有**进入任何已构建 ROM：候选 `artifacts/codex-status-0.18.21-note4-b-panel-modes.bin`（SHA256 `917FAFAD…C9FD6A`）是 **0.18.21 时代的旧候选**；当前 `main.cpp` 已是 `0.18.23-note4-b` 且已 OTA，需确认这些改动是否已在其中，否则重编。
-- 待做：`keep` vs `off_cache` 的电流/波形/残影/重复按键唤醒测量；`/diag?panel_power=` 与 `/status.json.panel_power_mode` 实机回读。
+- **已核实无需重编**：`panel_pwr` 与 `note4RestoreFrameBaseline()` 都引入于 `e226d8e`，而该提交**早于** `0.18.23` 的源码提交 `af2b607`（`git show af2b607:src/main.cpp` 里两处都在），且 `af2b607..HEAD` 未再改动 `src/`。**所以已 OTA 的 `0.18.23-note4-b` 就含这两项**；`artifacts/codex-status-0.18.21-note4-b-panel-modes.bin` 只是过期的中间候选，可忽略。
+- B1 因此**只剩实机测量**，不含编码：`keep` vs `off_cache` 的电流/波形/残影/重复按键唤醒对照；`/diag?panel_power=keep|off_cache` 与 `/status.json.panel_power_mode` 回读；深睡缓存命中与 `note4RestoreFrameBaseline()` 自愈是否真的被走到（看 `/log`）。
 
-### B2. 1.54 族发布路径上的同步策略（已升为 A6；此处仅留背景）
-- 背景：`confirmFamilyPublish()` 的复制逻辑与族草稿 `sync_enabled=false` 的共存问题，见 A6。
+### B2. ~~1.54 族发布路径上的同步策略~~ → 随 A6 一并关闭
+- 结论：当前桥的族发布取自目标设备 Profile（`ui/index.html:541`），族草稿的 `sync_enabled=false` 不会被复制。详见 A6。
 
 ### B3. Note4 模板发布图标校正版
 - `note4-icon-correction` 已完成源码与逐像素对拍（sleep-20 恢复为 zzz、On/Off 位图互斥、电量区改 `[344,5,44,26]`）。
