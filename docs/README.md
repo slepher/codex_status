@@ -55,7 +55,7 @@
 | `bridge-family-sync-preservation` | 源码已修但未进入运行桥；未部署就有覆盖设备 `sync_enabled` 的风险 |
 | `ble-rendezvous-power` | stage 3–6 全部未实现 |
 | `power-plan-c` / `power-state` / `sleep-battery` | 功耗基线、整机硬件验收、M3 验收未闭环 |
-| `generic-display-platform-design` / `live-template-delivery` | **2026-09-25 归档时被 ACL 拒绝**（文件自身缺沙箱能力 ACE），需要提权或修 ACL 后才能移动 |
+| `generic-display-platform-design` / `live-template-delivery` | **2026-09-25 归档时被 ACL 拒绝**，但两目录原因不同：前者文件所有者还是 `CodexSandboxOffline`（属主 + DACL 都错），后者属主正常、只是文件缺沙箱能力 ACE。修复步骤见 `docs/history/acl-repair-notes.md` |
 
 ### 构建夹具已迁出 `project-workflow`
 

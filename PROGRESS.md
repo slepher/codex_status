@@ -97,8 +97,11 @@
 | `docs/roadmap/archive-digest-legacy.md` / `-recent.md` | 各专项一页式摘要与"还欠什么" |
 | `docs/README.md` | 文档总索引与"该读哪一个" |
 
-两处归档未完成，需要决策（见 backlog D11）：`project-workflow/generic-display-platform-design/` 与
-`project-workflow/live-template-delivery/` 的**文件自身 DACL 缺沙箱能力 ACE**，`git mv` /
-`Remove-Item` / `[IO.File]::Delete` 全部 `Permission denied`，沙箱提权也被拒。修复方式是在**提权**
-PowerShell 里对这两个目录重做 ACL（改属主 + 追加能力 ACE，走 .NET，不递归），然后
-`git mv project-workflow/<name> docs/history/workflow/`。
+两处归档未完成，原因已查清（详见 `docs/history/acl-repair-notes.md`，backlog D11）：两个目录**缺的都是沙箱能力 ACE**，但根因不同——
+
+| 目录 | 所有者 | 缺能力 ACE | 结论 |
+|---|---|---|---|
+| `project-workflow/generic-display-platform-design/`（3 文件） | `喵的问都死\CodexSandboxOffline` | 是 | **属主 + DACL 都错** |
+| `project-workflow/live-template-delivery/`（6 文件） | `喵的问都死\cogic` | 是 | 属主正常，**只有 DACL 错** |
+
+所以**不是单纯的所有者问题**。判据：能改的文件 SDDL 里有 `(A;ID;0x110156;;;S-1-4-1018769461-493222538)`，不能改的没有——沙箱用受限令牌，宽泛组 ACE 不生效，写入只认那条能力 SID。能力 ACE 是后加到仓库根的，**可继承 ACE 不回溯**，因此 `project-workflow/` 下仍有 86 个文件缺它（`generic-display-platform-implementation` 63、`ble-rendezvous-power` 13、`live-template-delivery` 6、`generic-display-platform-design` 3、`next-execution-plan-2026-09-23.md` 1）。修复要在**提权** PowerShell 里走 .NET（`icacls` 无法映射 `S-1-4-…`）、**不递归**。
