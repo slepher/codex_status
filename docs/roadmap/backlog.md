@@ -17,7 +17,7 @@
 | 两设备可达性 | **2026-09-25 15:2x 已按键唤醒、实测可达**（`/status.json`+ARP 双证，MAC 与登记一致）；此后注意深睡仍会不可达 |
 | Note4 已装固件 | `0.18.23-note4-b`（09-25 实机核实：`0.18.23-note4-b`，slot `ota_1`，`wake=ext1`；PROGRESS 09-24 节里的 panel-power / 回退修正**未**刷入） |
 | 1.54 已装固件 | **2026-09-25 OTA 到 `0.18.23-bw`**（slot `ota_1`，1,740,576 B，`91937B18…`；此前为 `0.17.10-bw`）|
-| Note4 ROM | `.pio/build/zectrix-note4-b/firmware.bin` 1,758,032 B，SHA256 `42AAF00B…BCF72E`（= 当前 `main.cpp` 的 `0.18.23-note4-b`） |
+| Note4 ROM | `.pio/build/zectrix-note4-b/firmware.bin` 1,758,032 B；**设备在机版本 = SHA256 `42AAF00B…BCF72E`（05:02 构建，已 OTA）**；本地产物因 2026-09-25 晚的构建探测被重编，现为 `6B3C386DFC59798A…5315`（18:10:05，内容等价，IDF 内嵌构建时间导致哈希必变） |
 | 1.54 ROM | `.pio/build/esp32-s3-epaper-154g/firmware.bin` **1,740,576 B，SHA256 `91937B18…85CF`（2026-09-25 15:58 用当前源码重建，`0.18.23-bw`）——当日 16:10 已 OTA 进设备**；旧的合并期产物 1,744,496 B / `E9046F6B…` 已被覆盖 |
 | 桥 | `bridge/target/debug/bridge-app.exe` 2026-09-25 04:43 构建（含唤醒窗口下界修复 + 族同步保留修正）。**2026-09-25 15:13:45 起运行中：PID 21848 + watchdog 41784**（8765/8766/8767 在听）；起桥须用非受限命令（受限沙箱会假失败并回收子进程，见 A1/A2 结论） |
 | 1.54 队列/模板 | **已解决（2026-09-25）**：`bundle_jobs` 为空；job `2bfc710c` = `succeeded`，设备 `committed_job_id=2bfc710c`、`v2_templates=2`(`mini,quad`)、`active=quad` 并已渲染。残留：数据帧被拒 `incomplete` → **见 A7** |

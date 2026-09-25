@@ -53,6 +53,20 @@
 - **实测结果**：priming（154g 首次，含一次重装路径）45.7 s 后——**note4 39.2 s、154g 42.1 s 交替，两侧均无 `*** Reinstall ***`、无 `Compile Arduino IDF libs`**，两侧 ROM 哈希不变。即：**切换代价从"每次重装/重编 IDF 库"降到几十秒增量**。priming 仍需一次完整重装，且该路径需要工作区外写权限（本沙箱下需一次性提权）。
 - **仍未解决的上游风险**：`next.md` R2（issue #532/#533，HybridCompile 把按内存类型的产物写进共享 `lib/`+`ld/`，本机实测 7 个文件错位）——包目录隔离只能把影响限制在单目标内，不能消除；持续跟踪上游。
 
+### 构建触发条件（2026-09-25 实测，note4 目标）
+
+| 改动 | 重编范围 | 实测 |
+|---|---|---|
+| 不改动 | **0 个 TU**、不重链接 | 32.8 s（全是脚本/PlatformIO 的检查开销），`compiles=0` |
+| 改 1 个 `.cpp`（`src/dev_log.cpp`） | **只重编那 1 个 TU + 重链接** | 46.2 s，`compiles=1`（`dev_log.cpp.o`） |
+| 改被广泛 include 的头（`src/template_engine.h`） | **10 个 TU**（`src/` 里所有 include 它的：`main/bundle_store/refresh_policy/template_engine/template_xfer/v2_*`） | 41 s，`compiles=10` |
+| 改 `custom_sdkconfig` / `board_build.arduino.memory_type` / `flash_size` 等**配置** | `*** Reinstall Arduino framework ***` + 删**所有** `sdkconfig.<env>` + 删/重下该目标 framework/libs + **重编 IDF 库**（≈"整个项目重编"那一类） | 本轮未重测（上次记录 15 min 量级；本轮 priming 到 15.5 s 就撞沙箱 uv 拒权而失败） |
+| 改 `platformio.ini`（哪怕加一行注释） | PlatformIO 用 `.pio/build/project.checksum`（当前 `9c777f73…`）判定工程不匹配 → **删 `.pio/build/<env>` 并全量重编应用**；注释不进 `custom_sdkconfig`，所以**不会**连带触发 framework 重装 | 未测（代价与扰动大）——机制见 `next.md` §10 R7/D3 |
+| 删 `.pio/build/<env>`、删包目录、`pio run -t clean` | 全量重编 | §10 明令禁止 |
+| **每目标 `sdkconfig.defaults` 快照还原**（切换目标时） | **不触发**任何重编（内容=该目标自己的，指纹匹配） | 实测 note4 39.2 s / 154g 42.1 s，`Reinstall=False`、`IDFlibs=False` |
+
+- **注意（探测的副作用，已如实记录）**：ESP-IDF 会把**编译日期/时间**写进镜像（本机 `firmware.bin` 里能搜到 `Sep 25 2026`、`18:51:24` 等串）→ **任何一次重编都会改变 ROM 哈希**。所以：① 上面探测让 note4 的本地产物变成 `6B3C386DFC59798A…`（18:10:05，1,758,032 B），与记录里的 `42AAF00B…` 不再相同——**设备上跑的仍是 05:02 那次 OTA 的 `42AAF00B…` 版本**，只是本地产物被重编过；② 之前"重建 154g ROM 与记录值逐字节相同"之所以成立，正是那次 `compiles=0`（154g 产物现在仍是 `91937B18…` ✓）；③ 以后要复现某个记录哈希，必须做到"零编译重建"，否则哈希必然变（内容等价、时间戳不同）。
+
 ## A1/A2 现场恢复：桥重启 + 清掉 1.54 Bundle 队列（2026-09-25）— **已被当日 OTA 解掉：见顶部「1.54 OTA 到 0.18.23-bw + 模板推送成功」节**（本节保留当时的失败现场与 `oom`/`owner` 归因）
 
 ### 现场（实机，15:13–15:35）
