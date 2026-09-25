@@ -2,9 +2,9 @@
 
 ## 项目概览
 
-便携墨水屏显示本机 Codex 余量：ESP32-S3（Waveshare 1.54" 200×200 B/W，SSD1681，局刷 ~300ms）本地渲染；Rust 桥接（Tauri v2 托盘进程）通过 `codex app-server` JSON-RPC 取数，经 Wi-Fi HTTP（主通道）或 BLE GATT（备选）下发 usage 与模板。换样式只换模板 JSON，不刷固件。当前固件 0.16.0-bw（v2 通用平台：每设备 Profile 1–8 全按键循环、CompiledTemplate、完整 A/B Bundle、单一 active context、Bridge 生成 PowerPlan、Codex 只是 DataSource；关 mDNS；设备身份 = Wi-Fi MAC + 可编辑显示名；显式 claim/lease 占用，桥按空闲自动占用）。设计见 `docs/generic-display-platform-design-v2.md`，实现工作区 `project-workflow/generic-display-platform-implementation/`。legacy（≤0.15.10）继续走旧通道与 ≤3 槽，不得把 8 项静默裁剪成 3 项。
+便携墨水屏显示本机 Codex 余量：ESP32-S3（Waveshare 1.54" 200×200 B/W，SSD1681，局刷 ~300ms）本地渲染；Rust 桥接（Tauri v2 托盘进程）通过 `codex app-server` JSON-RPC 取数，经 Wi-Fi HTTP（主通道）或 BLE GATT（备选）下发 usage 与模板。换样式只换模板 JSON，不刷固件。当前固件 `0.18.23-note4-b`（v2 通用平台：每设备 Profile 1–8 全按键循环、CompiledTemplate、完整 A/B Bundle、单一 active context、Bridge 生成 PowerPlan、Codex 只是 DataSource；关 mDNS；设备身份 = Wi-Fi MAC + 可编辑显示名；显式 claim/lease 占用，桥按空闲自动占用）。设计见 `docs/generic-display-platform-design-v2.md`。legacy（≤0.15.10）继续走旧通道与 ≤3 槽，不得把 8 项静默裁剪成 3 项。
 
-先读 `PROGRESS.md` 最新一节：它是权威交接文档，含设备现场、ROM SHA256 与待办。历史背景见 `docs/history/request.md`、`docs/device-setup-experience.md`；早期讨论见 `docs/history/discussion-summary.md`（历史资料）。
+先读 `PROGRESS.md` 最新一节（权威交接文档，只保留最新现场，含设备现场、ROM SHA256）；待办的**唯一事实来源**是 `docs/roadmap/backlog.md`。文档导航见 `docs/README.md`。历史背景见 `docs/history/request.md`、`docs/device-setup-experience.md`；早期讨论见 `docs/history/discussion-summary.md`（历史资料）；已结项专项见 `docs/roadmap/archive-digest-legacy.md` / `-recent.md`，原件在 `docs/history/workflow/`。
 
 ## 目录导航
 
@@ -19,7 +19,9 @@
 | `tools/test-bridge` | Python 测试桥（`start.ps1`/`stop.ps1`）、模板库 `templates/*.json`、`profiles.seed.json` |
 | `tools/device-auth` | `request_token.py`：经已绑定 BLE 链路协商 Wi-Fi 操作 token |
 | `tools/*.mjs` | Node 预览生成/场景测试（`generate-quad-preview.mjs`、`test-quad-preview.mjs`） |
-| `project-workflow/` | 任务计划、task 文档与评审记录 |
+| `project-workflow/` | **进行中**专项的计划/task/评审记录。已结项的归档在 `docs/history/workflow/`，摘要见 `docs/roadmap/archive-digest-*.md` |
+| `docs/roadmap/` | `backlog.md`（待办唯一来源）、`archive-digest-legacy.md`、`archive-digest-recent.md` |
+| `docs/history/` | 只读历史：进度归档、旧设计、已归档专项原件。**不要通读** |
 | `artifacts/` | 本地证据（ROM、日志、截图、预览），已 gitignore，不入库 |
 
 ## 常用命令
@@ -35,12 +37,12 @@ pio device monitor
 ### 固件目标：只构建 Note4
 
 - **唯一目标：`zectrix-note4-b`。** 不要构建其他 env（尤其不要构建或切换到 `esp32-s3-epaper-154g` 及其 `-gray4`/`-btpm` 变体）；构建命令一律显式带 `-e zectrix-note4-b`。
-- **不要交替构建不同目标。** 项目根 `sdkconfig.defaults` 是**全项目唯一**生成物，被各目标争写；pioarduino `arduino.py` 会把当前环境的 `custom_sdkconfig`、MCU 与板卡指纹同该文件首行的 `# TASMOTA__...` 比对，`check_reinstall_frwrk()` 不匹配时会清理生成的 sdkconfig 文件并重装两个 Arduino framework 包。交替切换必然失配、必然重装（已双向实测，单次约 15 分钟量级）。多目标并存的正确解法是按目标隔离 `packages_dir`（见 `next.md` §7）；**在该隔离落地前只构建 Note4**。
+- **不要交替构建不同目标。** 项目根 `sdkconfig.defaults` 是**全项目唯一**生成物，被各目标争写；pioarduino `arduino.py` 会把当前环境的 `custom_sdkconfig`、MCU 与板卡指纹同该文件首行的 `# TASMOTA__...` 比对，`check_reinstall_frwrk()` 不匹配时会清理生成的 sdkconfig 文件并重装两个 Arduino framework 包。交替切换必然失配、必然重装（已双向实测，单次约 15 分钟量级）。多目标并存的正确解法是按目标隔离 `packages_dir`（note4 的隔离已落地：`tools/pio-target.ps1` → `.pio-pkgs/note4` + `.pio-core`，见 `PROGRESS.md` §包目录隔离）；**仍只构建 Note4**。
 - 不要同时运行两个及以上 `pio` 进程；单个目标内部允许 PlatformIO 并行编译源文件。
 - 保留 `.pio/build/<env>` 与 SCons 缓存，不要因只改应用源码而例行清理或删除构建目录。
 - 每次构建后核对环境名、固件版本、产物大小与 SHA256，并把最终 ROM 路径与哈希写入 `PROGRESS.md`。
 
-pm env（M3，pioarduino `custom_sdkconfig`）构建：仓库改名后路径无空格，直接在仓库目录运行 `pio run -e zectrix-note4-b` 即可（若路径再含空格，IDF 会拒绝，需用 junction 且让 pio 的真实 cwd 落在 junction 上）。勿用 `-v`（GBK 控制台会 UnicodeEncodeError 挂住构建）。生成物 sdkconfig*/CMakeLists.txt/.dummy 等已 gitignore。构建环境细节与踩坑见 `project-workflow/sleep-battery/task-7.md` §7。⚠️ 下列这条只属于 `esp32-s3-epaper-154g`（1.54" 板；当前不构建，仅保留备查）：闪存必须 40 MHz（`board_build.f_flash` + `tools/bootloader_40m_fix.py`），否则 GD25Q64 在 80 MHz 下 ID 读错、写入失败。
+pm env（M3，pioarduino `custom_sdkconfig`）构建：仓库改名后路径无空格，直接在仓库目录运行 `pio run -e zectrix-note4-b` 即可（若路径再含空格，IDF 会拒绝，需用 junction 且让 pio 的真实 cwd 落在 junction 上）。勿用 `-v`（GBK 控制台会 UnicodeEncodeError 挂住构建）。生成物 sdkconfig*/CMakeLists.txt/.dummy 等已 gitignore。构建环境细节与踩坑见 `docs/history/workflow/sleep-battery/task-7.md` §7。⚠️ 下列这条只属于 `esp32-s3-epaper-154g`（1.54" 板；当前不构建，仅保留备查）：闪存必须 40 MHz（`board_build.f_flash` + `tools/bootloader_40m_fix.py`），否则 GD25Q64 在 80 MHz 下 ID 读错、写入失败。
 
 Rust 桥（`bridge/` 目录；Windows 才能跑 BLE/Tauri）：
 
@@ -94,9 +96,18 @@ git diff --check                   # 提交前必查
 
 ## 硬件现场与坑
 
-- 设备：192.168.1.50 / SSID `home-wifi`；BLE `CodexStatus-AABBCC`（`70:04:1D:AA:BB:CC`）；USB 串口 COM 口动态（COM3/COM4），用户常拔 USB（无串口，靠 Wi-Fi 状态页/`/status.json`、`/log`）。
+**设备以桥的登记记录为准**（`<exe>/data/platform/state.json` 的 `devices[].identity`），启动时不要照抄本文的旧地址：
+
+| 设备 | MAC | 登记 IP | 备注 |
+|---|---|---|---|
+| 1.54" 200×200 | `70041DD7A340` | `192.168.3.163` | 显示名"书桌屏"；BLE 名形如 `CodexStatus-<MAC后缀>` |
+| Note4 400×300 | `7C4FADB93408` | `192.168.3.177` | 显示名"Note4"；曾用 IP `192.168.3.177`/Wi-Fi `wd21-la` |
+
+- ⚠️ 本文旧版写的 `192.168.1.50` 与 `70:04:1D:AA:BB:CC` **与桥的登记不一致**（可能来自早期现场或另一块板）；动手前先用设备 `/status.json` + ARP 核实，核实后回写本表。
+- USB 串口 COM 口动态（COM3/COM4/COM5）；用户常拔 USB（无串口时靠 Wi-Fi `/status.json`、`/log`）。**打开串口会复位板子**，所以不要为了看日志而丢掉一次按键唤醒的现场。
 - OTA：上传成功后延迟 1.5s 重启，HTTP 先返回 `UPDATE OK`（客户端超时属既有现象）；双槽 ota_0/ota_1 轮换。
 - 状态可读：`GET /status.json`（fw/槽位/重置原因/RSSI/电量/heap 等）、`GET /log`（4KB RAM 环形日志）与 `GET /pmstats`（PM light-sleep 统计/锁，0.13.0+，只读免 token）；桥优先用 JSON，旧固件回退 HTML。
 - `cargo test --workspace` 可能因运行中的 `bridge-core.exe` 锁定 `target/debug` 失败（不是逻辑失败）；改用隔离 `CARGO_TARGET_DIR` 复测，或核实进程后由用户决定是否停桥。
 - Windows 控制台为 GBK：Python 桥启动时设 `PYTHONIOENCODING=utf-8`，避免 status notify 打印异常。
 - BLE 写入须按 MTU 分片（usage/模板），单次超 MTU 会 `Invalid Attribute Value Length`。
+- 更多历史踩坑（1.54 闪存 40 MHz、Note4 40 MHz bootloader 修 NVS/LittleFS、PSRAM、沙箱 ACL/`git stash` 事故）见 `docs/history/progress-archive-2026-09-25.md` 与 `docs/history/next-2026-09-25.md`，不要凭记忆重做。

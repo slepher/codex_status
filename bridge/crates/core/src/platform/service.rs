@@ -2344,7 +2344,7 @@ mod tests {
         caps.partial = false;
         caps.hardware_verified = false;
         svc.device_upsert(DeviceIdentity::new("7C4FADB93408", "Note4").unwrap(), caps, false).unwrap();
-        let source: Value = serde_json::from_str(include_str!("../../../../../project-workflow/generic-display-platform-implementation/concepts-400x300/codex-status-a-400x300.json")).unwrap();
+        let source: Value = serde_json::from_str(include_str!("../../tests/fixtures/codex-status-a-400x300.json")).unwrap();
         svc.template_save("codex-status-a", crate::platform::model::RENDER_TARGET_NOTE4, &source, 1000).unwrap();
         let mut profile = Profile::draft("7C4FADB93408");
         profile.template_ids = vec!["codex-status-a".into()];

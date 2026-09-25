@@ -285,7 +285,7 @@ mod tests {
     #[test]
     fn note4_template_compiles_and_renders_at_native_size() {
         let source: Value = serde_json::from_str(include_str!(
-            "../../../../project-workflow/generic-display-platform-implementation/concepts-400x300/codex-status-a-400x300.json"
+            "../tests/fixtures/codex-status-a-400x300.json"
         )).unwrap();
         let compiled = compile(&source, crate::platform::model::RENDER_TARGET_NOTE4).unwrap();
         assert_eq!((compiled.canvas_w, compiled.canvas_h), (400, 300));

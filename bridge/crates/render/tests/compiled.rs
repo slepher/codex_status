@@ -151,8 +151,7 @@ fn note4_regions_use_the_template_canvas() {
     let _guard = SERIAL.lock().unwrap();
     let tmpl = std::fs::read_to_string(
         repo_root().join(
-            "project-workflow/generic-display-platform-implementation/\
-             concepts-400x300/codex-status-a-400x300.json",
+            "bridge/crates/core/tests/fixtures/codex-status-a-400x300.json",
         ),
     )
     .expect("400x300 canonical template fixture");
