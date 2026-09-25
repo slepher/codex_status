@@ -88,7 +88,7 @@
 
 ## 明确不要做
 
-- **不要**从模板页发布 1.54 族：族草稿仍是 `sync_enabled=false`。**（补充：`backlog` A6 已核实当前桥的族发布会从目标设备 Profile 复制 `sync_enabled`，所以这条风险其实已不成立；但本任务仍不需要族发布，别顺手做。）**
+- **不要**做族发布：本任务用**设备级**发布（`platform_publish`，按 MAC）就够了。（注：族发布覆盖设备 `sync_enabled` 的风险已核实**不成立**，见 backlog A6；但本任务依然没有族发布的理由。）
 - **不要**手改 `state.json`：受支持的取消路径存在，用工具。只有在桥根本无法启动时才考虑，且必须**先停进程**（`PlatformService` 在内存里持有状态，下一次 persist 会整文件覆盖你的修改），并同时改 `bundle_jobs` 与 `jobs[]` 两处。
 - **不要**复活已取消的 `job_id`：同一 `request_id`（`bundle-<job_id>`，`v2_client.rs:341`）会按 `next_offset` 续传（`v2_client.rs:352-356`），可能接上一个半途 staged 的载荷。
 - **不要**改设备的 `committed_job_id`，也不要试图让桥"认领"设备已提交的作业。
