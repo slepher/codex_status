@@ -60,10 +60,13 @@
 - **完成判据**：该 MAC 下不再有非终态作业；1.54 的 `data_seq/applied_seq` 开始推进，或明确判定为"设备侧 8 MB flash 装不下"（转 C1 处理）。
 
 ### A3. 修掉 Note4 深睡时钟残影（唯一影响日常观感的显示缺陷）
-- **现象**：deep 期间只写时钟窗口，残影累积；`SKIP`/用量属整帧元素所以停在最后一次整帧（已被误读为 `04:64`）。
-- **现状核查**：`src/main.cpp` 的 `rtcClkPartials++`（1816）与 `rtcClkPartials >= CLK_GHOST_LIMIT` 判定（5166/5177）现在**同时覆盖** light tick 与深睡会合时钟路径；`0.18.23-note4-b` 已含此逻辑。所以"v2 会合路径没有 ghost 预算"这条 PROGRESS 记录**已过时**。
-- **仍需做**：实机确认 90 次预算是否合适（小面积高对比区建议调小到 ~30，与 `epdPartialCount` 的 30 对齐）；确认调小后整屏全刷频率可接受、无可见闪烁。改 `CLK_GHOST_LIMIT` 与 `refresh_policy.cpp:108` 的 `RGN_CLOCK` 预算必须同步。
-- **完成判据**：连续 ≥90 分钟深睡后时钟无可辨残影，且全刷次数有日志计数。
+- **现象**：deep 期间只写时钟窗口，残影累积；`SYNC`/用量属整帧元素所以停在最后一次整帧（现场曾被读成 `04:64`）。
+- **根因（已用代码核实，2026-09-25）**：**v2 设备上时钟窗口的 ghost 预算根本没有被评估**。预算判定只在 `deepNetworkCycle()`（`main.cpp:5166` 渲染门 / `5177` 强制清影），而它唯一的调用点在 `main.cpp:5697`，进入条件是 `!(deepWakePath && v2BundleReady)`（`main.cpp:5678`）。Note4 有已提交 v2 Bundle → 走 `5678-5693` → `deepNetworkCycle()` 从不被调用 → `rtcClkPartials >= CLK_GHOST_LIMIT` **永不成立**，计数器只增不减。v2 会合真正走的 `v2RendezvousClockRender()`（`main.cpp:4617`）只检查 `clkR.valid`/`activeTplHasNow`/`timeKnown()`/`clkPixelsValid`，**无预算检查**。
+- ⚠️ **曾经写错、此处纠正**：上一版这里写过「已过时，rtcClkPartials 现已覆盖两条路径」——那是错的，更早的 `PROGRESS.md:37` 才对。落笔前请自己复核 `main.cpp:5678` 的分支条件。
+- **深睡路径上两个预算都不生效**：`epdPartialCount` 是普通 RAM（深睡清零），而薄唤醒 `deepThinWake()`（`5275/5283`）在 `main.cpp:5528` 早于 `5531` 的 `epdBegin()` 就返回。
+- **两个 `RGN_CLOCK` 不是同一件事**：`refresh_policy.cpp:97` 的 `5` 是 `classRank()` 合并优先级；`:108` 的 `90` 才是 `classDefaultBudget()` 预算，且只被走 `epdFlush()` 的局刷消费，直接写时钟窗口的路径不经过它。
+- **改法**：在 `src/refresh_policy.h` 落单一来源宏（该头已被固件与宿主共同包含），`main.cpp:118` 与 `refresh_policy.cpp:108` 都改为引用它；再给 `v2RendezvousClockRender()` 补上 budget 检查（`forceCleanRefresh` + `renderCurrent()` + `clkCaptureFromFramebuffer()` **之后**才清 `rtcClkPartials`）。预算先从 90 调到 30 并实机验收。
+- **工单**：`docs/roadmap/prompts/A3-note4-clock-ghost-budget.md`。**完成判据**：连续 ≥90 分钟深睡后时钟无可辨残影，`clk_partials` 到预算后归零、`epd_busy_fails` 不增长，且全刷频率可接受。
 
 ### A4. 关闭 `bugs.md` 的两个 v2 数据缺陷（已修，需归档结案）
 - **核查结论**：BUG-1 与 BUG-2 **都已在 v2 实现中修复**——

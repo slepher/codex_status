@@ -80,7 +80,10 @@
 
 本轮核查又关闭/下调了三条，都遵循**证据优先于旧文档**：
 
-- 「v2 会合路径没有 ghost 预算」**已过时**：`main.cpp` 的 `rtcClkPartials++`（1816）与 `rtcClkPartials >= CLK_GHOST_LIMIT` 判定（5166/5177）现已覆盖 light tick 与深睡会合两条时钟路径，且已随 `0.18.23-note4-b` OTA 上机；剩余工作只是调预算与实机验收。
+- **修正上一版的错误结论**：我曾写「v2 会合路径已覆盖 ghost 预算」并宣判旧记录过时——**那是错的**。已用代码核实：预算判定只在 `deepNetworkCycle()`（`main.cpp:5166/5177`），而它唯一的调用点在 `main.cpp:5697` 的 `else if (deepWakePath)` 分支内，进入条件是 **`!(deepWakePath && v2BundleReady)`**（`main.cpp:5678`）。Note4 有已提交 v2 Bundle → 走 `5678-5693` 分支 → **`deepNetworkCycle()` 从不被调用**，`rtcClkPartials >= CLK_GHOST_LIMIT` 在该设备上永不成立。更早的记录 `PROGRESS.md:37`（"v2 会合路径没有任何 ghost 检查"）**才是对的**，A3 是真需求。
+  - 附带确认：深睡薄唤醒 `deepThinWake()`（`main.cpp:5275/5283`）同样无预算检查；且 `epdPartialCount` 是普通 RAM（深睡清零），而薄唤醒在 `main.cpp:5528` 早于 `5531` 的 `epdBegin()` 就返回了 → 深睡路径上**两个预算都不生效**。
+  - `refresh_policy.cpp` 里两个 `RGN_CLOCK` 不是同一件事：`:97` 的 `5` 是 `classRank()` 的区域合并优先级，`:108` 的 `90` 才是 `classDefaultBudget()` 的每区域预算；而且它只被走 `epdFlush()` 的局刷消费，**直接写时钟窗口的路径根本不经过它**。`src/refresh_policy.h` 已被固件与宿主共同包含，适合放单一来源宏。
+  - 工单见 `docs/roadmap/prompts/A3-note4-clock-ghost-budget.md`。
 - 「族发布会把设备 `sync_enabled` 覆盖回 false」（backlog A6）**不成立**：修正本体在 `bridge/crates/app/ui/index.html:541`，引入于 `fc3c464`（2026-09-25 04:04:10），此后该文件未再改动；运行桥 `bridge-app.exe` 构建于 **04:43:36**，晚 39 分钟 → **当前桥已含该修正**，族草稿的 `false` 不会被复制。旧的「未构建」结论来自 `bridge-family-sync-preservation/status.md`（写于构建之前）。
 - 「panel-power 改动是否已进 ROM 需确认」（backlog B1）**已确认进了**：`panel_pwr` 与 `note4RestoreFrameBaseline()` 引入于 `e226d8e`，早于 `0.18.23` 的源码提交 `af2b607`，且之后未再改 `src/` → 已 OTA 的 `0.18.23-note4-b` 就含这两项，**B1 只剩实机测量，不需要重编固件**；`artifacts/codex-status-0.18.21-…panel-modes.bin` 是过期候选。
 - `bugs.md` 的 BUG-1 / BUG-2 **均已由 v2 实现修复**（ACK CRC 同源、deep 唤醒恢复数据检查点或轮换 context）；已结案并归档为 `docs/history/bugs-2026-09-22.md`（含文件行号证据）。
