@@ -166,7 +166,11 @@
 ### C6. 多 env / packages 目录隔离收尾
 - `tools/pio-target.ps1` 已落地，**两侧都已实测**（2026-09-25）：`.pio-pkgs/note4` 与 `.pio-pkgs/154g` 各 2 real（两个冲突 framework 包，69 MB + 2057 MB）+ 15 junction，各 ≈2126 MB。
 - **154g 构建成功**：`pio run -d <repo> -e esp32-s3-epaper-154g` → SUCCESS 102.38 s，无 banner、无重装；产物 `1,740,576 B / 91937B18…`（`0.18.23-bw`），另见 `PROGRESS.md`「多 env 实测」节。
-- **判据 c/d/e 已实测（结论与预期相反）**：**交替构建仍会触发 framework 重装**——`sdkconfig.defaults` 是仓库根唯一生成物，切到 154g 后首行变成 154g 指纹，切回 note4 即触发 `*** Reinstall Arduino framework ***`。隔离的价值是**重装只发生在目标自己的包目录里、不伤对方**（整轮两个目录完好，note4 ROM hash 未变 `42AAF00B…`），**不是**省掉重装代价。
+- **判据 c/d/e 已实测（2026-09-25，两个阶段两种结论）**：
+  - 只做包目录隔离**不足以**免重装：**交替构建仍会触发 framework 重装**（`sdkconfig.defaults` 是仓库根唯一生成物，切到 154g 后首行变成 154g 指纹，切回 note4 即触发 `*** Reinstall Arduino framework ***`）；隔离的价值是**重装只发生在目标自己的包目录里、不伤对方**（整轮两个目录完好，note4 ROM hash 未变 `42AAF00B…`）。
+  - **随后补上"每目标整份 sdkconfig 快照"后，交替已不再重装**：`tools/pio-target.ps1` 把 `sdkconfig.defaults` 按目标快照到 `.pio-core/sdkconfig.defaults.<target>.snapshot`，构建前还原、构建后再快照（还原的是该目标自己生成过的完整文件，不是伪造首行——`next.md` §10 禁止的是后者；安全证明：重建的 154g ROM 与记录值逐字节相同 `91937B18…`）。实测：priming 45.7 s → **note4 39.2 s、154g 42.1 s，两侧均无 `*** Reinstall ***`/`Compile Arduino IDF libs`**，ROM 哈希不变。副作用：priming 仍需一次完整重装，且该路径需工作区外写权限（受限沙箱下需提权；uv 缓存 `%LOCALAPPDATA%\uv\cache` 否则 `os error 5`）。
+  - 同一脚本还修了 cwd 依赖（`Set-Location $RepoRoot` + `pio run -d $RepoRoot`）：嵌套 pwsh/沙箱 broker 会把 `pio` 的 cwd 换成别的目录 → `NotPlatformIOProjectError`。
+- **上次考察的出处**（下个窗口先读这些，不要重推）：`docs/history/next-2026-09-25.md` §7/§10/§11 + `artifacts/hash-forensics/{compute_fingerprint,dump_effective,pin_down,why_differ}.py`（本地 gitignore）+ 上游 pioarduino PR #511 / issue #532、#533 / Meshtastic PR #11834。
 - **重装在受限沙箱里跑不完**：uv 要写 `%LOCALAPPDATA%\uv\cache`（工作区外）→ `os error 5 拒绝访问` → `Failed to create a proper virtual environment`；`UV_CACHE_DIR` 指到工作区内可解这一条，但 `tool-esptoolpy` 的 editable 安装仍因写 junction 指向的共享包目录报 `Cannot update time stamp of directory 'esptool.egg-info'`（非致命警告）。要完整跑通需提权或把这两条路径纳入工作区。
 - **脚本坑**：`tools/pio-target.ps1` 在**后台作业**里会假失败——它 `& pio run` 时 cwd 丢失成 `D:\Documents\project`；给 pio 加 `-d <repo>`（或在前台 shell 跑脚本）即可。
 - `next.md §6` 的 `extends` 重构未做。「只构建 Note4」现仍成立，但已明确是**成本**约束。

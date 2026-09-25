@@ -45,6 +45,14 @@
 - **新坑（务必记住）**：`tools/pio-target.ps1` 在**后台作业**里会假失败——脚本本身没问题（用 `$PSScriptRoot` 定位仓库），但它 `& pio run` 时 `pio` 继承到的 cwd 变成 `D:\Documents\project`（与本仓库无关的目录）→ `NotPlatformIOProjectError`；同一 shell 里直接 `pio project config` 却正常。可靠做法：**给 pio 加 `-d <repo>`**，或在前台 shell 里跑脚本。
 - **待办**：① 想刷 1.54 就用上面这个 ROM，但 OTA 是独立决定（设备需在 awake/light 窗口；命令形状 `firmware_ota {rom:…, device_ip:192.168.3.163, device_mac:70041DD7A340}`）；注意它**不含** `owner` 校验的改动（见 A1/A2 节），所以能治 `oom`/`ct_abi`、不保证治 `owner`。② C6 判据 c/d/e 已实测（上面），若真要"切换不重装"，得让 `sdkconfig.defaults` 按目标隔离或在构建前写回目标指纹——属改动，需决策。③ 重装路径需提权或把 uv 缓存/esptool 包纳入工作区。
 
+### 交替构建已消除重装（2026-09-25 晚补做 next.md §7 判据 c/d/e）
+
+- **上次的考察已保存，且这轮是接它的"待定"项**：根因/上游依据在 `docs/history/next-2026-09-25.md` §7、§10、§11（含 pioarduino PR #511、issue #532/#533、Meshtastic PR #11834、PlatformIO 四页文档），调查脚本在 `artifacts/hash-forensics/`（`compute_fingerprint.py`/`dump_effective.py`/`pin_down.py`/`why_differ.py`，本地 gitignore）。§7 当时把 c/d/e 留空、并写"隔离方案**待定**：先诊断并隔离项目根 `sdkconfig.defaults` 与已安装 package 状态"；§10 同时禁止"固定/手工编辑 `sdkconfig.defaults` 首行"。
+- **这轮实测（推翻 §7 的乐观前提）**：只做包目录隔离**不足以**免重装——判据在仓库根那个共享文件上。实测：154g 之后首次构建 note4 → `*** Reinstall Arduino framework ***` → 且该路径在受限沙箱里**跑不完**（uv 要写 `%LOCALAPPDATA%\uv\cache` → `os error 5`）。
+- **解法（已落地 `tools/pio-target.ps1`）**：把 `sdkconfig.defaults` 按目标**整份快照**（存 `.pio-core/sdkconfig.defaults.<target>.snapshot`），构建前若与当前文件不同就整份还原，构建成功后再快照。**还原的是该目标自己生成过的完整文件（内容+指纹自洽），不是伪造首行**——这正是 §10 禁令的本意所在；安全证明：重建出的 154g ROM 与记录值**逐字节相同**（`91937B18…`）。快照过期（platformio.ini 改了）只会失配一次→走正确的"重生成"路径→构建后自动刷新快照。顺手修了脚本的 cwd 依赖（`Set-Location $RepoRoot` + `pio run -d $RepoRoot`，因为嵌套 pwsh/沙箱 broker 会把子进程 cwd 换成别的目录）。
+- **实测结果**：priming（154g 首次，含一次重装路径）45.7 s 后——**note4 39.2 s、154g 42.1 s 交替，两侧均无 `*** Reinstall ***`、无 `Compile Arduino IDF libs`**，两侧 ROM 哈希不变。即：**切换代价从"每次重装/重编 IDF 库"降到几十秒增量**。priming 仍需一次完整重装，且该路径需要工作区外写权限（本沙箱下需一次性提权）。
+- **仍未解决的上游风险**：`next.md` R2（issue #532/#533，HybridCompile 把按内存类型的产物写进共享 `lib/`+`ld/`，本机实测 7 个文件错位）——包目录隔离只能把影响限制在单目标内，不能消除；持续跟踪上游。
+
 ## A1/A2 现场恢复：桥重启 + 清掉 1.54 Bundle 队列（2026-09-25）— **已被当日 OTA 解掉：见顶部「1.54 OTA 到 0.18.23-bw + 模板推送成功」节**（本节保留当时的失败现场与 `oom`/`owner` 归因）
 
 ### 现场（实机，15:13–15:35）

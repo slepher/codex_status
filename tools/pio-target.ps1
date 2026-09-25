@@ -210,8 +210,46 @@ $env:PLATFORMIO_PACKAGES_DIR = $pkgDir
 Write-Host ''
 Write-Host "PLATFORMIO_CORE_DIR     = $env:PLATFORMIO_CORE_DIR"
 Write-Host "PLATFORMIO_PACKAGES_DIR = $env:PLATFORMIO_PACKAGES_DIR"
+
+# ------------------------------------------------- sdkconfig.defaults --------
+# pioarduino's arduino.py treats the PROJECT-ROOT sdkconfig.defaults as a single
+# project-wide artifact: it compares MD5(custom_sdkconfig + mcu + board memory
+# fingerprint) against that file's first line ("# TASMOTA__<hash>") and, on
+# mismatch, prints "*** Reinstall Arduino framework ***", deletes EVERY
+# sdkconfig.<env> and removes THIS target's framework + libs, forcing a full IDF
+# lib recompile. Per-target packages dirs alone therefore do NOT make target
+# switching cheap: the gate sits on the shared file.
+#
+# So keep one snapshot of that file per target (it is build output, not hand
+# written input) and restore it before building: the fingerprint then always
+# matches, nothing is deleted and the target's own compiled IDF libs are reused.
+# A stale snapshot (platformio.ini changed) simply mismatches once, which is the
+# correct "regenerate" path, and is re-snapshotted after the build.
+$sdkPath = Join-Path $RepoRoot 'sdkconfig.defaults'
+$sdkSnapshot = Join-Path $localCoreDir "sdkconfig.defaults.$Target.snapshot"
+if (Test-Path -LiteralPath $sdkSnapshot) {
+    $want = (Get-Content -LiteralPath $sdkSnapshot -TotalCount 1)
+    $have = if (Test-Path -LiteralPath $sdkPath) { Get-Content -LiteralPath $sdkPath -TotalCount 1 } else { '' }
+    if ($want -ne $have) {
+        Copy-Item -LiteralPath $sdkSnapshot -Destination $sdkPath -Force
+        Write-Host "sdkconfig.defaults restored for '$Target' -> $($want.Trim())"
+    } else {
+        Write-Host "sdkconfig.defaults already matches '$Target'"
+    }
+}
+
 Write-Host "pio run -e $envName $($PioArgs -join ' ')"
 Write-Host ''
 
-& pio run -e $envName @PioArgs
-exit $LASTEXITCODE
+# PlatformIO resolves the project from its process cwd, and a nested pwsh (or a
+# sandbox broker) can hand the child a different cwd (observed: D:\Documents\project),
+# so pin both the shell location and pio's own --project-dir.
+Set-Location -LiteralPath $RepoRoot
+& pio run -d $RepoRoot -e $envName @PioArgs
+$pioExit = $LASTEXITCODE
+
+if ($pioExit -eq 0 -and (Test-Path -LiteralPath $sdkPath)) {
+    Copy-Item -LiteralPath $sdkPath -Destination $sdkSnapshot -Force
+    Write-Host "sdkconfig.defaults snapshotted for '$Target'"
+}
+exit $pioExit
