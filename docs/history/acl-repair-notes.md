@@ -38,7 +38,92 @@ shell 里对某些已存在的文件报 "Access to the path … is denied"，而
 | `generic-display-platform-design/` | 3 |
 | `next-execution-plan-2026-09-23.md` | 1 |
 
-## 修复脚本（在**提权**的 PowerShell 里运行）
+## 只改所有者（最小修复，推荐先做这一步）
+
+**实测：DSH 会话里改不了所有者。** 当前令牌不是管理员，`SetOwner` 直接被拒：
+
+```
+SetOwner FAILED: Attempted to perform an unauthorized operation.
+elevated?     False
+current SID:  S-1-5-21-341968838-3967994556-1780607818-1001
+```
+
+改所有者需要 `SeRestorePrivilege`，只有**提权**进程有。所以这一步必须由你自己执行。
+在**提权**的 PowerShell 里粘这段（复制粘贴即用，不含变量占位）：
+
+```powershell
+$root = 'D:\Documents\PlatformIO\Projects\codex_status'
+$me   = New-Object System.Security.Principal.SecurityIdentifier(
+          [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
+
+"running as: $($me.Value)   elevated: " +
+  ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+   ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+# 只处理确实需要改的 4 个目录（其余 project-workflow 文件属主已经是 cogic）
+$targets = @(
+  "$root\project-workflow\generic-display-platform-design",
+  "$root\project-workflow\live-template-delivery",
+  "$root\project-workflow\ble-rendezvous-power",
+  "$root\project-workflow\generic-display-platform-implementation"
+)
+
+# 顺带把仓库根的沙箱能力 SID 抓出来（不要写死，随机能力 SID 每次会话可能不同）
+$capMatch = [regex]::Match((Get-Acl $root).Sddl, 'S-1-4-\d+(?:-\d+)+')
+$capSid   = if ($capMatch.Success) { $capMatch.Value } else { $null }
+"capability SID: $capSid"
+
+foreach ($t in $targets) {
+    if (-not (Test-Path $t)) { "skip (missing): $t"; continue }
+
+    # 1) 目录本身：改属主
+    $a = Get-Acl $t; $a.SetOwner($me); Set-Acl -Path $t -AclObject $a
+    "owner set: $t"
+
+    # 2) 目录上加可继承的能力 ACE —— 不递归，只动这一个目录对象
+    if ($capSid) {
+        $a = Get-Acl $t
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            (New-Object System.Security.Principal.SecurityIdentifier($capSid)),
+            'Write,Delete,DeleteSubdirectoriesAndFiles,Synchronize',
+            'ContainerInherit,ObjectInherit', 'None', 'Allow')
+        $a.AddAccessRule($rule); Set-Acl -Path $t -AclObject $a
+        "ace  set: $t"
+    }
+
+    # 3) 已存在文件：既要改属主，也要补能力 ACE（可继承 ACE 不会回溯）
+    Get-ChildItem $t -Recurse -File | ForEach-Object {
+        try {
+            $fa = Get-Acl $_.FullName
+            $fa.SetOwner($me)
+            if ($capSid) {
+                $fa.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                    (New-Object System.Security.Principal.SecurityIdentifier($capSid)),
+                    'Write,Delete,Synchronize', 'None', 'None', 'Allow')))
+            }
+            Set-Acl -Path $_.FullName -AclObject $fa
+        } catch { "  file FAIL: $($_.FullName) — $($_.Exception.Message)" }
+    }
+}
+
+# 4) 复核：应全部为 cogic，且 SDDL 里都有能力 ACE
+foreach ($t in $targets) {
+    if (-not (Test-Path $t)) { continue }
+    $bad = Get-ChildItem $t -Recurse -File |
+           Where-Object { (Get-Acl $_.FullName).Owner -ne "$env:USERDOMAIN\$env:USERNAME" }
+    "{0,-56} not-mine={1}" -f $t, $bad.Count
+}
+```
+
+**为什么三步要一起做（而不是"只改属主"）**：受限令牌既没有 `SeRestorePrivilege`（改属主）也没有
+`WRITE_DAC`（改 DACL，缺的正是那条 ACE），所以两者在沙箱里都做不到。而在**提权**进程里
+`SeTakeOwnershipPrivilege` / `SeRestorePrivilege` 都在，第 1 步能成功；但只改属主**不会**让沙箱会话
+恢复写入能力——沙箱仍用受限令牌，判定只看那条能力 ACE。所以第 2 步（目录 ACE）与第 3 步
+（逐个已存在文件补 ACE，因为可继承 ACE 不回溯）必须跟上，否则改了属主照样写不进去。
+
+修完后回到本文件的下一节，执行两个 `git mv` 并更新文档。
+
+## 完整修复脚本（在**提权**的 PowerShell 里运行）
 
 要点：**必须走 .NET**。`icacls /grant "*S-1-4-…"` 会因无法映射账户名报
 `No mapping between account names and security IDs`。**不要递归整棵树**
