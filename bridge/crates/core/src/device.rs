@@ -1,4 +1,4 @@
-//! Fetch and parse the device's LAN status page (`<li>Key: value</li>` list).
+//! Fetch and parse the device's structured status document (`/status.json`).
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
@@ -45,35 +45,18 @@ fn parse_device_addr(address: &str) -> Result<SocketAddr> {
         .map_err(|e| anyhow!("bad device address {address}: {e}"))
 }
 
-/// Prefer the structured `/status.json` (fw >= 0.8.0), fall back to parsing
-/// the HTML status page on older firmware.
+/// Fetch the structured `/status.json` document. Firmware that only serves the
+/// HTML status page is no longer supported.
 pub fn fetch(ip: &str, timeout: Duration) -> Result<DeviceStatus> {
-    if let Ok(body) = http_get(ip, "/status.json", timeout) {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
-            if let Some(fields) = fields_from_json(&value) {
-                return Ok(DeviceStatus {
-                    fields,
-                    raw: Some(value),
-                });
-            }
-        }
-    }
-    let body = http_get(ip, "/", timeout)?;
-    let mut fields = Vec::new();
-    let mut rest = body.as_str();
-    while let Some(start) = rest.find("<li>") {
-        let after = &rest[start + 4..];
-        let Some(end) = after.find("</li>") else { break };
-        let text = after[..end].trim();
-        if let Some((key, value)) = text.split_once(':') {
-            fields.push((key.trim().to_string(), value.trim().to_string()));
-        }
-        rest = &after[end..];
-    }
-    if fields.is_empty() {
-        return Err(anyhow!("no status fields found on device page"));
-    }
-    Ok(DeviceStatus { fields, raw: None })
+    let body = http_get(ip, "/status.json", timeout)?;
+    let value: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| anyhow!("invalid /status.json from {ip}: {e}"))?;
+    let fields =
+        fields_from_json(&value).ok_or_else(|| anyhow!("no status fields found on {ip}"))?;
+    Ok(DeviceStatus {
+        fields,
+        raw: Some(value),
+    })
 }
 
 /// Raw PM statistics from `GET /pmstats` (firmware >= 0.13.0): light-sleep

@@ -11,10 +11,6 @@ pub struct Config {
     pub templates: PathBuf,
     /// Seed templates shipped in the repo, copied into `templates` on first run.
     pub seeds: PathBuf,
-    /// Runtime profile state.
-    pub profiles: PathBuf,
-    /// Seed profile shipped in the repo, copied into `profiles` on first run.
-    pub profile_seed: PathBuf,
     pub interval_secs: u64,
     pub ble_interval_secs: u64,
     pub mcp_port: u16,
@@ -41,8 +37,6 @@ impl Default for Config {
             token: "test-token-123".to_string(),
             templates: data.join("templates"),
             seeds: bridge_core::paths::seed_templates(),
-            profiles: data.join("profiles.json"),
-            profile_seed: bridge_core::paths::profile_seed(),
             interval_secs: 180,
             ble_interval_secs: 300,
             mcp_port: 8766,
@@ -81,12 +75,6 @@ impl Config {
         }
         if let Ok(v) = std::env::var("CODEX_STATUS_SEEDS") {
             self.seeds = PathBuf::from(v);
-        }
-        if let Ok(v) = std::env::var("CODEX_STATUS_PROFILES") {
-            self.profiles = PathBuf::from(v);
-        }
-        if let Ok(v) = std::env::var("CODEX_STATUS_PROFILE_SEED") {
-            self.profile_seed = PathBuf::from(v);
         }
         if let Ok(v) = std::env::var("CODEX_STATUS_INTERVAL") {
             if let Ok(secs) = v.parse() {

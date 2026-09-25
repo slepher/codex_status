@@ -54,16 +54,3 @@ pub fn seed_templates() -> PathBuf {
     }
     repo_root().join("tools/test-bridge/templates")
 }
-
-/// Seed profile: `<exe>/seed/profiles.seed.json` when bundled, else the repo
-/// copy. `CODEX_STATUS_PROFILE_SEED` overrides.
-pub fn profile_seed() -> PathBuf {
-    if let Ok(explicit) = std::env::var("CODEX_STATUS_PROFILE_SEED") {
-        return PathBuf::from(explicit);
-    }
-    let bundled = exe_dir().join("seed/profiles.seed.json");
-    if bundled.is_file() {
-        return bundled;
-    }
-    repo_root().join("tools/test-bridge/profiles.seed.json")
-}

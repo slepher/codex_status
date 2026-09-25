@@ -708,8 +708,6 @@ pub struct DeviceRecord {
     pub identity: DeviceIdentity,
     pub capabilities: DeviceCapabilities,
     #[serde(default)]
-    pub legacy: bool,
-    #[serde(default)]
     pub profile: Option<Profile>,
     /// Last observed device state (authoritative snapshot digest from Status).
     #[serde(default)]

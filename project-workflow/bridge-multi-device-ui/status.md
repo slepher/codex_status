@@ -17,3 +17,27 @@
 `git diff --check` 通过；未对设备发布或刷机。
 
 按 MAC 多设备路由与统一族发布菜单仍是待办，两个族的统一推送项暂时禁用。
+
+## 2026-09-25：Phase 3 开工 —— 按 MAC 多设备路由 + 删除桥侧 legacy/迁移
+
+用户决定（当轮）：范围取 `design.md` 第 3 阶段（完整多设备运行路由），**并同步清掉桥侧
+legacy 通道与历史迁移代码**（用户明确表示没有要求过对历史版本的支持与迁移）；改完由
+实施方停桥 → 重建 → 重启并自检。现场、分步骤与验收见 `task-phase3.md`。
+
+已完成：
+- **Profile 丢失已修复并还原**：根因是 `migrate_family_profiles` 在旧源为空时循环零次、
+  `complete` 仍为 `true`，于是照样写 `family-profile-154g-imported` 标记、从此永不重试
+  （上次删 `target/debug` 连带删掉 `data/` 后正是这条路）。两族 `默认` 草稿已用
+  `family_profile_copy_v2` 从设备 v2 Profile 还原（`mini,quad` / `codex-status-a`），
+  只落盘、未发布。
+- **迁移与 legacy profile 存储/≤3 槽推送已删除**：`core/src/profile.rs`、
+  `core/tests/legacy.rs`、`tools/test-bridge/profiles.seed.json`、`paths::profile_seed`、
+  `Config.profiles/profile_seed`、Tauri `get_profiles`/`save_profile`/`delete_profile`/
+  `push_profile`、MCP `profiles_list`/`profile_save`/`profile_push`、
+  `push_templates_http`/`remote_template`、排队 flush 的模板分支。`AGENTS.md` 已同步订正。
+- **B1 已写好待接线**：`bridge/crates/app/src/device_runtime.rs`（按 MAC 的
+  `DeviceRuntime` + `DeviceRegistry` + 单测）。
+
+待做：A3/A4（`legacy` 设备标志、`claim_unsupported`、`device.rs` 的 HTML `/status` 回退）、
+B2–B6（AppCtx 换成注册表、发现链按 MAC 路由、claim/renew 按 MAC、`platform.rs` 显式 MAC、
+设备页选择器）、A5 决策（文件模板库 `Library` 去留）、重建重启与 `PROGRESS.md`/`backlog.md` 更新。

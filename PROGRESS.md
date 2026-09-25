@@ -1,5 +1,92 @@
 # Codex Status 项目进度（交接文档）
 
+## 桥：Profile 丢失根因修复 + 桥侧 legacy/迁移清除 + 按 MAC 多设备路由（2026-09-25，进行中）
+
+专项现场在 `project-workflow/bridge-multi-device-ui/task-phase3.md`（含分步验收、收尾流程、自检清单）；
+设计合同 `design.md` 已加"2026-09-25 修订"注明哪些 legacy/迁移条目作废。
+
+### 用户诉求与决定
+用户发现"模板页里的 profile 没了"，要求从 code base 还原；随后要求实现"设备页切换设备"，并选定
+**design.md 第 3 阶段的完整按 MAC 多设备路由**，且**同步清掉桥侧 legacy 通道与历史迁移代码**
+（用户明确表示没有要求过对历史版本的支持和迁移）。改完由实施方停桥→重建→重启并自检。
+
+### ① Profile 丢失的根因（已修）
+`migrate_family_profiles()` 在旧 `profiles.json` 缺失/为空时循环一次都不跑，`complete` 仍为 `true`，
+于是**照样写"已导入"标记** `data/family-profile-154g-imported` → 从此永不重试。上次删 `bridge/target/debug`
+连带删掉 `data/` 后正是这条路：标记落盘、`family_profiles` 却是空的。**这不是设备或模板问题，是一个静默成功的迁移。**
+- **还原**：用**运行中桥**的 MCP `family_profile_copy_v2`（只落盘、不发布）从设备 v2 Profile 还原两族草稿：
+  `epd-ssd1681-200x200-1bpp / default / 默认 → mini,quad`、`epd-ssd2683-400x300 / default / 默认 → codex-status-a`，
+  绑定全部指向真实源 `codex`。核实 `state.json`：`family_profiles=2`、`devices=2`、`templates=3`。
+- **修复**：删除 `migrate_family_profiles` + `write_family_import_marker` + 调用点，并删掉陈旧标记文件；这条路径不复存在。
+
+### ② 桥侧 legacy 通道与迁移已删除（已验收）
+事实基础：**UI 已不再调用任何旧命令**（`get_profiles`/`save_profile`/`delete_profile`/`push_profile` 在
+`ui/index.html` 中 0 引用），两台登记设备均 `legacy=false`、`compiler_abi=2`——旧通道在桥里已是死代码。
+删除清单：`core/src/profile.rs`、`core/tests/legacy.rs`、`tools/test-bridge/profiles.seed.json`、`core::paths::profile_seed`、
+`Config.profiles/profile_seed` + 两个环境变量、`ensure_runtime` 的 profile 拷贝、Tauri `get_profiles`/`save_profile`/
+`delete_profile`/`push_profile`、MCP `profiles_list`/`profile_save`/`profile_push`、`push_templates_http`、`remote_template`、
+排队 flush 的模板分支、platform 的 `DeviceRecord.legacy` 字段与 `migrate_legacy_profile`、`claim_unsupported`（固件 <0.13.4）、
+`core/src/device.rs` 的 HTML `/status` 回退。现在**非 v2 固件被直接拒绝注册**、桥只读 `/status.json`。
+- **验收**：`cargo check --workspace --all-targets` → **Finished，exit 0**（含全部 test target，无 `unused` 警告）；
+  全 bridge 只剩一处 "legacy" 字样，是 `platform.rs` 里故意保留的拒绝文案 `device reports a legacy protocol`。
+- **文档订正**：`AGENTS.md`（旧 ≤3 槽规则、MCP 旧工具表、`profiles.seed.json`、HTML 回退）、`README.md`（悬挂引用）、
+  `design.md`（加修订说明）。
+- 规模：`git diff --stat` 15 文件 **+217/-1162**（该阶段）。
+
+### ③ 设备页选择器（前端已完成）
+`ui/index.html` 设备页顶部新增「当前设备（点击切换）」：列出全部已登记设备，当前项高亮 + `当前` 徽章，
+点击弹确认框才切换，选择持久化于 `localStorage['codex-status-device-mac']`。选择语义按 `design.md` §2：
+**记住的 MAC 仍在则用它；否则用桥自己的设备；两台以上且未选择时不猜、提示"请先在上方选择设备"（不取列表首项）**。
+设备页 15 处设备相关调用全部显式携带 MAC（`get_status`/`get_device_status`/`rename_device`/`device_discover`/
+`claim_device`/`release_device`/`platform_status_refresh`/`platform_power`/`platform_plan`/`platform_publish(_preview/_cancel)`）。
+校验：内联脚本 `node --check` exit 0；`#registered-devices` 唯一；UI 内 `legacy|claim_unsupported` 为 0。**切换不推送、不改模板页族选择。**
+
+### ④ 按 MAC 运行路由（已完成并实机自检）
+`AppCtx` 的单组 `device_mac/ip/name` 与单设备缓存已换成 `devices: Mutex<device_runtime::DeviceRegistry>`
+（新文件 `bridge/crates/app/src/device_runtime.rs`：按 MAC 的 `DeviceRuntime` + `DeviceRegistry` + 8 个单测）。
+`ctx.device_mac/ip/name/*_cache/last_claim_at/yielded/fail_streak/ip_dirty/pending_ota_rom` 在 `bridge/crates/app/`
+里**引用为 0**（grep 核实）。发现链按认证 MAC 路由：`observe_device` 取代了 `learn_mac` 的单全局身份规则
+（只写该 MAC 自己的记录、不覆盖用户起的名）；`note_failure(ctx, mac) >= 2` 触发 ARP 回退、`arp_running` 仍作全局闸门。
+owner/claim/yielded/note/pending 均按 MAC 归位。
+- **MAC 解析合同**（`design.md` §2，两个入口共用 `sole_registered_mac`）：显式 `mac` 必须已登记；未给 `mac` 时
+  **只在恰好一台已登记设备时**才允许兼容默认，多台一律返回 `select a device: several are registered (<MAC 列表>)`，
+  既不取列表首项、也不拿"当前选中设备"顶替。UI 的 12 个 Tauri 命令与 MCP 平台工具都走这条规则。
+- **实机自检（2026-09-25 21:10，桥 PID 32316 + watchdog 45960）**：
+  `platform_status_refresh {}` / `template_activate {}` / `platform_publish_preview {}` → 全部
+  `select a device: several are registered (70041DD7A340, 7C4FADB93408)`；
+  `platform_status_refresh {"mac":"70041DD7A340"}` → `result=ok`，设备实况 `active=quad`、`battery 45`、
+  `commit_seq 405`、`applied_seq 4`；`platform_overview` → 两台都在（书桌屏 profile_count=2、Note4 =1）。
+  桥日志显示两台设备**各自**被轮询与 claim（每个 MAC 一条 `/v2/status` 与 `POST /claim status=200`），
+  即按 MAC 路由确实在跑，没有串到同一台。
+- **测试**：`cargo test -p bridge-core -p bridge-app` → **38 + 84 项全绿**（另有 7/8/6 项测试二进制全绿）；
+  `cargo check --workspace --all-targets` exit 0；`git diff --check` 干净。
+- **顺带修正的两处**：① `main.rs` 里 `profile_save`/`profile_push` 两处旧工具残留（一个 activity 分支、一处
+  `get_mcp_info` 的工具清单串）；② A4 删除 HTML 回退后，`v2_fallback_server` 测试夹具仍要求 `GET /`，
+  已同步为 `/status.json` → `/v2/status`（测试意图不变，仍验证"投递前必须经认证 v2 状态"）。
+
+### 未决 / 遗留（不谎报为已完成）
+1. **`ui/index.html` 的界面没有被我"肉眼"验收**：我无法操作 Tauri 窗口。已验证的是它依赖的后端契约
+   （12 个命令的 `mac` 参数、无 MAC 拒绝语义、真实设备应答）、内联 JS 语法（`node --check` exit 0）、
+   以及新 UI 在重编时被嵌入 exe（宏展开期读取 `frontendDir`；注意 Tauri 对 UI 资源做压缩，
+   **不能**用 exe 内明文搜索来判断是否嵌入——用同版本对照串验证过这点）。
+2. **`data/templates/` 一直是空的、启动日志 `templates: []`**——这是**改动前就有**的状态（09:26 的启动日志即如此），
+   不是本次引入：手工拷贝到该目录可成功（属主正常），所以嫌疑是 `ensure_runtime()` 里 `let _ = std::fs::copy(...)`
+   把失败吞掉了（`config.seeds` 解析或读取失败都不留痕迹）。影响面仅限文件模板库 `Library`（见 3）。
+3. **A5 待决策**：文件模板库 `Library`（`data/templates/*.json`）是否一并删除。它现在只支撑
+   `get_status.templates`（UI 未消费）、`preview_template`/`reload_templates`（已无 UI 接线）与 MCP 的
+   `template_get/validate/render/save`。删它要把这些改指向 v2 登记表，属能力变更，故未擅动；已记入 `task-phase3.md`。
+4. `data/family_profiles` 的 1.54 草稿顺序现在是 `quad,mini`（initial `quad`），与设备当前 active 一致——
+   本次还原时是 `mini,quad`，之后由桥的按 MAC 对账写成；两台设备的 Profile 与两族草稿都在，无丢失。
+
+### 收尾现场（已只读核实）
+- 进程：**watchdog = PID 5064**（证据：桥日志 `09:28:20Z INFO bridge_app::watchdog: watchdog started (pid 5064)`）；
+  **主进程 = 24612**（`netstat -ano`：8765/8766/8767 LISTENING 属主均为它；`artifacts/bridge-app-run.pid`=24612）。
+  停桥顺序必须是**先 watchdog 再主进程**。
+- 起桥必须用**非受限（提权）**命令（受限沙箱会假失败并回收分离子进程、WebView2 报 `ERROR_BUSY`）。
+- 本次**不需要**删 `target/debug`；重建前把 `data/`（`state.json`、`device-token-*.json`、`bridge-app.json`）当运行时数据处理。
+- 待核对：`data/templates/` 上次事故后是空的，预期启动时由 `ensure_runtime` 从 `tools/test-bridge/templates/` 拷回；
+  `data/profiles.json` **不应**再被创建。
+
 ## 桥：契约刷新修复 + ACL 闸门绕过（删构建目录）与运行时数据损失/恢复（2026-09-25 晚）
 
 - **ACL 闸门（第二次遇到）**：`cargo test` 卡在写 `bridge/target/debug/.fingerprint/bridge-render-*/lib-bridge_render` → `os error 5`。实测**沙箱内无法修**：该文件属主是 `喵的问都死\CodexSandboxOffline` 且缺能力 ACE → `Set-Acl` 报 `Attempted to perform an unauthorized operation`（用 `SecurityIdentifier` 对象也一样；字符串 SID 会先报"identity references could not be translated"）。按用户指示走**删除重建**：停桥（watchdog 先）→ 删 `bridge/target/debug`（删除本身也被同一闸门拦住 `incremental/*`、`bridge-core.exe`，需一次提权）→ `cargo test -p bridge-core`（**85 项全绿**）+ `cargo build -p bridge-app`（112 s）→ 重启桥。

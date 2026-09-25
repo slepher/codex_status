@@ -24,14 +24,10 @@ pub struct McpConfig {
     pub token: String,
     /// Runtime templates (working copies), never the repository.
     pub templates: PathBuf,
-    /// Runtime profile state.
-    pub profiles: PathBuf,
     /// Runtime data root (backups, previews).
     pub data_root: PathBuf,
     /// Seed template dir from the repo/bundle.
     pub seeds: PathBuf,
-    /// Seed profile file from the repo/bundle.
-    pub profile_seed: PathBuf,
     /// Last known device address (attribute, not identity).
     pub device_ip: String,
     /// Editable display name (`CodexStatus-<MAC suffix>` by default).
@@ -99,12 +95,6 @@ pub fn ensure_runtime(cfg: &McpConfig) {
             }
         }
     }
-    if !cfg.profiles.exists() && cfg.profile_seed.exists() {
-        if let Some(parent) = cfg.profiles.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::copy(&cfg.profile_seed, &cfg.profiles);
-    }
 }
 
 impl McpConfig {
@@ -168,10 +158,8 @@ impl McpConfig {
             port,
             token,
             templates,
-            profiles: data_root.join("profiles.json"),
             data_root,
             seeds: bridge_core::paths::seed_templates(),
-            profile_seed: bridge_core::paths::profile_seed(),
             device_ip,
             device_name,
             device_mac,
@@ -497,136 +485,6 @@ async fn firmware_ota_inner(cfg: &McpConfig, args: &Value) -> Result<Vec<Value>,
     }
 }
 
-/// One template record from the device's `/status.json` (hash, active flag).
-fn remote_template(status: &Value, id: &str) -> Option<(String, bool)> {
-    status
-        .get("templates")?
-        .as_array()?
-        .iter()
-        .find(|t| t.get("id").and_then(Value::as_str) == Some(id))
-        .map(|t| {
-            (
-                t.get("hash")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                t.get("active").and_then(Value::as_bool).unwrap_or(false),
-            )
-        })
-}
-
-/// Explicit template push over HTTP (docs/power-state.md §5/§9). BLE carries
-/// identity only (pairing, endpoint/token, OTA token); the template body goes
-/// to the device's `POST /template`, gated by the endpoint token the bridge
-/// wrote over BLE. Templates whose hash already matches `/status.json` are
-/// skipped; the activation target is re-sent only when it is not already the
-/// active template.
-pub async fn push_templates_http(
-    cfg: &McpConfig,
-    ids: &[String],
-    activate: Option<&str>,
-) -> Result<String, String> {
-    if ids.is_empty() {
-        return Err("no templates to push".to_string());
-    }
-    let library = load_library(cfg).map_err(|e| e.to_string())?;
-    let ip = cfg.device_ip.trim().trim_end_matches('/');
-    let base = format!("http://{ip}");
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let text = client
-        .get(format!("{base}/status.json"))
-        .send()
-        .await
-        .map_err(|e| format!("device {ip} unreachable over HTTP: {e}"))?
-        .text()
-        .await
-        .map_err(|e| e.to_string())?;
-    let status: Value =
-        serde_json::from_str(&text).map_err(|e| format!("device {ip} /status.json: {e}"))?;
-
-    // Occupancy pre-check (firmware >= 0.13.4): the device itself returns 409
-    // for non-owners, but a clear message is better than a raw HTTP error.
-    if let Some(owner) = status.get("owner").filter(|o| !o.is_null()) {
-        let valid = owner
-            .get("expires_in_s")
-            .and_then(|v| v.as_i64())
-            .map(|secs| secs > 0)
-            .unwrap_or(true);
-        let owner_id = owner.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        if valid && !owner_id.is_empty() && owner_id != cfg.bridge_id {
-            let name = owner.get("name").and_then(|v| v.as_str()).unwrap_or(owner_id);
-            return Err(format!(
-                "device is occupied by {name}; use device_claim (force) from the panel/MCP first"
-            ));
-        }
-    }
-
-    // Send the activation target last so the device ends on the chosen template.
-    let mut order: Vec<String> = ids.to_vec();
-    if let Some(target) = activate {
-        if let Some(pos) = order.iter().position(|id| id == target) {
-            let target = order.remove(pos);
-            order.push(target);
-        }
-    }
-
-    let mut pushed: Vec<String> = Vec::new();
-    let mut skipped = 0usize;
-    let mut activated = false;
-    for id in &order {
-        let entry = library
-            .get(id)
-            .ok_or_else(|| format!("template not found: {id}"))?;
-        let hash = template_hash(&entry.bytes);
-        let remote = remote_template(&status, id);
-        let unchanged = remote.as_ref().map(|(h, _)| h == &hash).unwrap_or(false);
-        let need_activate =
-            activate == Some(id.as_str()) && !remote.map(|(_, active)| active).unwrap_or(false);
-        if unchanged && !need_activate {
-            skipped += 1;
-            continue;
-        }
-        let url = format!(
-            "{base}/template?id={id}&version={}&hash={hash}&activate={}&bridge_id={}",
-            entry.version,
-            if need_activate { 1 } else { 0 },
-            cfg.bridge_id
-        );
-        let resp = client
-            .post(&url)
-            .bearer_auth(&cfg.token)
-            .header("Content-Type", "application/json")
-            .body(entry.bytes.clone())
-            .send()
-            .await
-            .map_err(|e| format!("POST /template {id}: {e}"))?;
-        let code = resp.status();
-        if !code.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("POST /template {id} -> HTTP {code} {body}"));
-        }
-        pushed.push(id.clone());
-        if need_activate {
-            activated = true;
-        }
-    }
-    let summary = format!(
-        "pushed {} template(s) over HTTP to {ip} ({}; skipped {skipped} unchanged{})",
-        pushed.len(),
-        if pushed.is_empty() {
-            "no changes".to_string()
-        } else {
-            pushed.join(", ")
-        },
-        if activated { ", activated" } else { "" }
-    );
-    tracing::info!("{summary}");
-    Ok(summary)
-}
-
 fn fetch_live_usage(cfg: &McpConfig) -> Option<String> {
     let addr = format!("127.0.0.1:{}", cfg.port).parse().ok()?;
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).ok()?;
@@ -766,7 +624,7 @@ fn tool_definitions() -> Value {
         {
             "name": "template_save",
             "title": "保存模板",
-            "description": "校验并保存模板 JSON 到模板目录（只落盘，不会推送；旧版自动备份）。保存后会返回固件引擎渲染的预览图，供支持图形显示的客户端直接展示。推送请使用 profile_push",
+            "description": "校验并保存模板 JSON 到模板目录（只落盘，不会推送；旧版自动备份）。保存后会返回固件引擎渲染的预览图，供支持图形显示的客户端直接展示。推送请使用 platform_publish",
             "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false},
             "inputSchema": {
                 "type": "object",
@@ -775,56 +633,6 @@ fn tool_definitions() -> Value {
                     "json": {"type": "string"}
                 },
                 "required": ["id", "json"],
-                "additionalProperties": false
-            }
-        },
-        {
-            "name": "profiles_list",
-            "title": "列出推送配置",
-            "description": "列出全部推送配置（profile：名称 + 最多三个模板 + 激活模板）及可用模板",
-            "annotations": {"readOnlyHint": true},
-            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
-        },
-        {
-            "name": "profile_save",
-            "title": "保存推送配置",
-            "description": "新建或更新推送配置（profile）。templates 为 0..=3 个模板（可传字符串或 {id, enabled} 对象）；顺序即推送顺序，第一个已启用模板为默认显示",
-            "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false},
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string"},
-                    "name": {"type": "string"},
-                    "templates": {
-                        "type": "array",
-                        "items": {
-                            "anyOf": [
-                                {"type": "string"},
-                                {
-                                    "type": "object",
-                                    "properties": {
-                                        "id": {"type": "string"},
-                                        "enabled": {"type": "boolean"}
-                                    },
-                                    "required": ["id"]
-                                }
-                            ]
-                        }
-                    }
-                },
-                "required": ["id", "templates"],
-                "additionalProperties": false
-            }
-        },
-        {
-            "name": "profile_push",
-            "title": "推送配置到设备",
-            "description": "用户显式动作：把某个推送配置里的模板（最多三个）通过 HTTP 推到设备，并激活第一个模板（设备 hash 未变化的模板跳过传输；空配置会报错）",
-            "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true},
-            "inputSchema": {
-                "type": "object",
-                "properties": {"id": {"type": "string"}},
-                "required": ["id"],
                 "additionalProperties": false
             }
         },
@@ -1321,7 +1129,7 @@ async fn call_tool(cfg: &McpConfig, name: &str, args: &Value) -> Result<Vec<Valu
             std::fs::write(&file, &pretty).map_err(|e| e.to_string())?;
             let hash = template_hash(pretty.as_bytes());
             let mut content = vec![text_block(format!(
-                "saved {} ({} bytes, hash {hash}); 仅落盘，推送请用 profile_push",
+                "saved {} ({} bytes, hash {hash}); 仅落盘，推送请用 platform_publish",
                 file.display(),
                 pretty.len()
             ))];
@@ -1343,88 +1151,6 @@ async fn call_tool(cfg: &McpConfig, name: &str, args: &Value) -> Result<Vec<Valu
                 }
             }
             Ok(content)
-        }
-        "profiles_list" => {
-            let library = load_library(cfg).map_err(|e| e.to_string())?;
-            let known: Vec<String> = library.entries.values().map(|e| e.id.clone()).collect();
-            let profiles = bridge_core::profile::ProfilesFile::load(&profiles_path(cfg))
-                .map_err(|e| e.to_string())?;
-            let list: Vec<Value> = profiles
-                .profiles
-                .iter()
-                .map(|p| {
-                    json!({
-                        "id": p.id,
-                        "name": p.name,
-                        "templates": p.templates,
-                        "enabled": p.enabled_ids(),
-                    })
-                })
-                .collect();
-            Ok(vec![text_block(
-                json!({"profiles": list, "templates": known}).to_string(),
-            )])
-        }
-        "profile_save" => {
-            let id = require_str(args, "id")?;
-            let library = load_library(cfg).map_err(|e| e.to_string())?;
-            let known: Vec<String> = library.entries.values().map(|e| e.id.clone()).collect();
-            let templates: Vec<bridge_core::profile::ProfileEntry> = args
-                .get("templates")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|item| {
-                            if let Some(id) = item.as_str() {
-                                Some(bridge_core::profile::ProfileEntry {
-                                    id: id.to_string(),
-                                    enabled: true,
-                                })
-                            } else {
-                                let id = item.get("id").and_then(|v| v.as_str())?.to_string();
-                                let enabled = item
-                                    .get("enabled")
-                                    .and_then(|v| v.as_bool())
-                                    .unwrap_or(true);
-                                Some(bridge_core::profile::ProfileEntry { id, enabled })
-                            }
-                        })
-                        .collect()
-                })
-                .ok_or_else(|| "missing argument: templates".to_string())?;
-            let profile = bridge_core::profile::Profile {
-                id,
-                name: args
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                templates,
-            };
-            let path = profiles_path(cfg);
-            let mut profiles = bridge_core::profile::ProfilesFile::load(&path)
-                .map_err(|e| e.to_string())?;
-            profiles.upsert(profile, &known).map_err(|e| e.to_string())?;
-            profiles.save(&path).map_err(|e| e.to_string())?;
-            Ok(vec![text_block(format!(
-                "profile saved -> {}",
-                path.display()
-            ))])
-        }
-        "profile_push" => {
-            let id = require_str(args, "id")?;
-            let profiles = bridge_core::profile::ProfilesFile::load(&profiles_path(cfg))
-                .map_err(|e| e.to_string())?;
-            let profile = profiles
-                .get(&id)
-                .ok_or_else(|| format!("profile not found: {id}"))?;
-            let enabled = profile.enabled_ids();
-            if enabled.is_empty() {
-                return Err("profile has no enabled templates; nothing to push".to_string());
-            }
-            let activate = enabled.first().cloned();
-            let summary = push_templates_http(cfg, &enabled, activate.as_deref()).await?;
-            Ok(vec![text_block(format!("profile {id}: {summary}"))])
         }
         "firmware_ota" => firmware_ota(cfg, args).await,
         "pm_stats" => {
@@ -1464,10 +1190,6 @@ async fn call_tool(cfg: &McpConfig, name: &str, args: &Value) -> Result<Vec<Valu
     }
 }
 
-fn profiles_path(cfg: &McpConfig) -> std::path::PathBuf {
-    cfg.profiles.clone()
-}
-
 fn require_str(args: &Value, key: &str) -> Result<String, String> {
     args.get(key)
         .and_then(|v| v.as_str())
@@ -1493,7 +1215,7 @@ pub async fn handle_request(cfg: &McpConfig, request: &Value) -> Option<Value> {
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "codex-status", "version": env!("CARGO_PKG_VERSION")},
-                "instructions": "模板编辑工具：先 template_get 读取现状，template_render 用固件同源引擎出图给用户确认。模板保存只落盘；推送到设备是用户显式动作，用 profile_push（配置=最多三个模板的组合）。不要跳过渲染确认，也不要在用户未同意时推送。设备功耗/light sleep 诊断用 pm_stats（只读，勿高频）。设备身份/发现/占用：bridge_status/device_owner 只读；device_rename、device_discover、device_claim(force)、device_release 会改变桥或设备状态，需用户明确要求。调试四件套：device_sleep（推 deep 并保持 deep）、device_wake（pull 固定 light，回在线读日志）、device_mode（auto|deep|light，绕过 10 分钟安静迟滞）、device_contact_s（覆盖 pull 间隔，加速循环）。"
+                "instructions": "模板编辑工具：先 template_get 读取现状，template_render 用固件同源引擎出图给用户确认。模板保存只落盘；推送到设备是用户显式动作，用 platform_publish（显式发布该设备 Profile 的完整 Bundle）。不要跳过渲染确认，也不要在用户未同意时推送。设备功耗/light sleep 诊断用 pm_stats（只读，勿高频）。设备身份/发现/占用：bridge_status/device_owner 只读；device_rename、device_discover、device_claim(force)、device_release 会改变桥或设备状态，需用户明确要求。调试四件套：device_sleep（推 deep 并保持 deep）、device_wake（pull 固定 light，回在线读日志）、device_mode（auto|deep|light，绕过 10 分钟安静迟滞）、device_contact_s（覆盖 pull 间隔，加速循环）。"
             }),
         )),
         "notifications/initialized" => None,
@@ -1538,10 +1260,8 @@ mod device_token_tests {
             port: 8765,
             token: String::new(),
             templates: PathBuf::new(),
-            profiles: PathBuf::new(),
             data_root: root.clone(),
             seeds: PathBuf::new(),
-            profile_seed: PathBuf::new(),
             device_ip: String::new(),
             device_name: String::new(),
             device_mac: None,

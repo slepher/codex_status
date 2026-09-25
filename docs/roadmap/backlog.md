@@ -36,7 +36,7 @@
 | 深睡功耗与电池续航 | 部分交付 | panel-power 双模式已实现但未刷入；bench 电流/残影/重复唤醒**从未测量**（见 D1） |
 | 1.54 设备时钟局刷与全刷交替 | 源码已修 | 未刷机、未实机验收（见 B4） |
 | 字体引擎化（CSFN 容器 + 设备字体库 + manifest 增量发布） | 引擎已实现，协议未定稿 | `note4-bridge-publish/protocol.md` 仍是**待双方确认草案**，设备侧无增量端点（见 D3） |
-| Bridge 多设备界面 + 按 MAC 推送 | 已交付 | 族发布保留设备同步策略的源码修正**未构建进运行桥**（见 B2） |
+| Bridge 多设备界面 + 按 MAC 推送 | 已交付 | 单设备全局身份已换成按 MAC 运行记录；UI 与 MCP 的设备类操作要求显式 MAC，多设备缺 MAC 一律要求选择（2026-09-25 两台实机自检，见 `PROGRESS.md` 顶部节）；剩余见 C7 的 `bridge-multi-device-ui` 行 |
 | Bridge 多实例 | 已交付（tag `bridge-multi-instance-2026-09-24`） | 无 |
 | Fake ROM 设备模拟器（同源 C++ + 可控实验时钟） | 进行中，无可用产物 | Stage D 未完成、E/F/G 未开始（见 C2） |
 | 唤醒会合诊断（一次唤醒一条记录） | 仅计划 | 固件与桥两侧都未实现（见 C3） |
@@ -184,7 +184,7 @@
 |---|---|
 | `ble-rendezvous-power` | **stage 3–6 全部未实现**（GATT v2 事务；时钟优先会合 + radio 硬切断 + `POST /power`；桥常驻监听 + WAKE/RENEW/SLEEP；分阶段启用与实测功耗）。另：AP/桥不可达时的失败路径未测；stage 2 固定机位照片验收与 90 次局刷 soak 未做；stage 1 的 BLE 回归需一次 BOOT 点击 + 用户提供基线照片；task-10 的 BOOT blink 检查与"无 AP"失败运行未做；task-8 的 5 项 OTA 改进未做 |
 | `power-state` | task-5 **整机硬件验收整项未做**：按键/GP3 LED、插电拔电宽限、低电 5% 断电、WIFI OFF 深睡节奏、T10 电池斜率、T9 push 延迟、UDP 换 IP 生效、桥失联 `OFF N M`、OTA 回归、三端模板哈希一致 |
-| `bridge-multi-device-ui` | 按 MAC 的发布路由与统一族推送菜单未实现（当前禁用）；`family_publish_preview` 预检事务未接线；0/1/多设备、跨族、离线、被占用、在途作业的验收全未做；没有双设备实机验证 |
+| `bridge-multi-device-ui` | **已做（2026-09-25，见 `PROGRESS.md` 顶部节）**：桥侧 legacy 通道与历史迁移删除（含静默写标记缺陷）；`AppCtx` 全局单设备字段与缓存改为按 MAC 运行记录（新 `device_runtime.rs`）；发现/claim/owner/note/pending 按 MAC 路由；UI 与 MCP 的设备类操作要求显式 MAC，多设备缺 MAC 直接拒绝（两台实机自检通过）。**仍缺**：文件模板库 `Library` 去留待决策（A5）；统一族推送菜单的 0/1/多设备、跨族、离线、被占用、在途作业验收；双设备**发布**（非只读）实机验证；`ui/index.html` 未被人眼验收 |
 | `pmstats` | T10 拔电电池斜率对照（5 ms vs 25 ms）未做；诊断面 `?timers=1` / `?diag=1` / `POST /diag` 去留未决（倾向保留） |
 | `device-discovery` | ARP 邻居表冷路径（真实换网）未复现；自动 `ble=1` 通告触发路径未捕获到（UDP 广播偶发丢失，机制未变） |
 | `deep-pull-test` | deep 窗口内不起 WebServer ⇒ **桥在设备 deep 期间无法 push/OTA**（这是后续 pending 排队设计存在的根因） |

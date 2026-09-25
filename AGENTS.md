@@ -2,7 +2,7 @@
 
 ## 项目概览
 
-便携墨水屏显示本机 Codex 余量：ESP32-S3（Waveshare 1.54" 200×200 B/W，SSD1681，局刷 ~300ms）本地渲染；Rust 桥接（Tauri v2 托盘进程）通过 `codex app-server` JSON-RPC 取数，经 Wi-Fi HTTP（主通道）或 BLE GATT（备选）下发 usage 与模板。换样式只换模板 JSON，不刷固件。当前固件 `0.18.23-note4-b`（v2 通用平台：每设备 Profile 1–8 全按键循环、CompiledTemplate、完整 A/B Bundle、单一 active context、Bridge 生成 PowerPlan、Codex 只是 DataSource；关 mDNS；设备身份 = Wi-Fi MAC + 可编辑显示名；显式 claim/lease 占用，桥按空闲自动占用）。设计见 `docs/generic-display-platform-design-v2.md`。legacy（≤0.15.10）继续走旧通道与 ≤3 槽，不得把 8 项静默裁剪成 3 项。
+便携墨水屏显示本机 Codex 余量：ESP32-S3（Waveshare 1.54" 200×200 B/W，SSD1681，局刷 ~300ms）本地渲染；Rust 桥接（Tauri v2 托盘进程）通过 `codex app-server` JSON-RPC 取数，经 Wi-Fi HTTP（主通道）或 BLE GATT（备选）下发 usage 与模板。换样式只换模板 JSON，不刷固件。当前固件 `0.18.23-note4-b`（v2 通用平台：每设备 Profile 1–8 全按键循环、CompiledTemplate、完整 A/B Bundle、单一 active context、Bridge 生成 PowerPlan、Codex 只是 DataSource；关 mDNS；设备身份 = Wi-Fi MAC + 可编辑显示名；显式 claim/lease 占用，桥按空闲自动占用）。设计见 `docs/generic-display-platform-design-v2.md`。旧版 ≤3 槽通道与桥侧 legacy profile 存储已删除（2026-09-25），桥只服务 v2 固件；不得把 8 项静默裁剪成 3 项。
 
 先读 `PROGRESS.md` 最新一节（权威交接文档，只保留最新现场，含设备现场、ROM SHA256）；待办的**唯一事实来源**是 `docs/roadmap/backlog.md`。文档导航见 `docs/README.md`。历史背景见 `docs/history/request.md`、`docs/device-setup-experience.md`；早期讨论见 `docs/history/discussion-summary.md`（历史资料）；已结项专项见 `docs/roadmap/archive-digest-legacy.md` / `-recent.md`，原件在 `docs/history/workflow/`。
 
@@ -14,9 +14,9 @@
 | `bridge/crates/core` | app-server 客户端、usage 信封、模板库（canonical JSON + CRC32）、LAN HTTP `/usage` `/template` |
 | `bridge/crates/ble` | btleplug central：endpoint/usage/模板推送 |
 | `bridge/crates/render` | 把固件同一份 C++ 引擎编进宿主，像素级预览/离线对拍 |
-| `bridge/crates/mcp` | MCP 工具（legacy：status/get/validate/render/save/profile_save/profile_push/firmware_ota/pm_stats/device_* 调试；v2：platform_overview/template_list/template_get_v2/template_validate_v2/template_save_v2/profile_get_v2/profile_save_v2/platform_publish(_cancel)/template_activate/data_sources_v2/data_probe_v2/power_view_v2/power_plan/platform_status_refresh/platform_recovery），由托盘内建 HTTP 端点 `http://127.0.0.1:8766/mcp` 提供（见 `opencode.jsonc`；设备类与 v2 平台工具由 app 侧实现，与 UI 共用 application service） |
+| `bridge/crates/mcp` | MCP 工具（单设备工具：bridge_status/template_get/template_validate/template_render/template_save/firmware_ota/pm_stats/device_*；v2：platform_overview/template_list/template_get_v2/template_validate_v2/template_save_v2/profile_get_v2/profile_save_v2/platform_publish(_cancel)/template_activate/data_sources_v2/data_probe_v2/power_view_v2/power_plan/platform_status_refresh/platform_recovery），由托盘内建 HTTP 端点 `http://127.0.0.1:8766/mcp` 提供（见 `opencode.jsonc`；设备类与 v2 平台工具由 app 侧实现，与 UI 共用 application service） |
 | `bridge/crates/app` | 生产形态：单实例托盘 + 内建 HTTP/BLE/MCP，运行数据在 `<exe>/data/`；`src/discovery.rs` 为 ARP 发现回退；身份/发现/占用见 `docs/power-state.md` §9.1/§9.2 |
-| `tools/test-bridge` | Python 测试桥（`start.ps1`/`stop.ps1`）、模板库 `templates/*.json`、`profiles.seed.json` |
+| `tools/test-bridge` | Python 测试桥（`start.ps1`/`stop.ps1`）、模板库 `templates/*.json` |
 | `tools/device-auth` | `request_token.py`：经已绑定 BLE 链路协商 Wi-Fi 操作 token |
 | `tools/*.mjs` | Node 预览生成/场景测试（`generate-quad-preview.mjs`、`test-quad-preview.mjs`） |
 | `project-workflow/` | **进行中**专项的计划/task/评审记录。已结项的归档在 `docs/history/workflow/`，摘要见 `docs/roadmap/archive-digest-*.md` |
@@ -80,7 +80,7 @@ git diff --check                   # 提交前必查
 - 占用只走显式 `POST /claim`：`usage`/`template` 永不创建/转移 owner（仅刷新匹配 id 的 `last_seen`）；owner 有效且 `bridge.hostId`（template 用 `bridge_id`）不符一律 409，`activate` 无旁路；lease 到期只清空。桥空闲自动 claim、60s 续约、他人占用不推送；推送仍是用户显式动作（claim 是协议行为，不等于推送模板）。
 - 改 GATT 特征表后 Windows 会缓存旧属性，需解除配对再重配（或后续评估 Service Changed）。
 - 便携数据布局：运行数据 `<exe>/data/`，种子 `<exe>/seed/`（开发回退 `tools/test-bridge/`）；程序不写仓库。⚠️ **`<exe>/data/` 就在 `bridge/target/debug/data/` 里**——`cargo` 报 `os error 5`（`target/debug/.fingerprint/...` 这类沙箱旧文件缺能力 ACE，`Set-Acl` 也改不动）而想"删 `target/debug` 重建"时，**先把 `data/` 备份出去**：它装着 `state.json`（设备登记/Profile/jobs/contexts/plans）、模板库、`device-token-*.json`、`bridge-app.json`（endpoint token）。2026-09-25 有一次真实事故（见 `PROGRESS.md`「桥：契约刷新修复 + ACL 闸门绕过」节）：删目录连带删掉运行时数据，靠写回配置 + 从 `tools/test-bridge/` 与仓库夹具重导模板 + 重新登记设备/重建 Profile 才恢复。**更安全的做法是 `cargo build/test --target-dir <仓库内新目录>`**，完全不碰现有 `target/debug`。
-- 推送是用户显式动作：v2 下 Profile = 1–8 个有序模板（全部参与按键循环，无 enabled 子集），显式发布冻结一个完整 Bundle；保存模板/Profile、MCP save、UI save 都只落盘，不得自动发布。legacy 设备保持 ≤3 槽限制并显式提示。
+- 推送是用户显式动作：v2 下 Profile = 1–8 个有序模板（全部参与按键循环，无 enabled 子集），显式发布冻结一个完整 Bundle；保存模板/Profile、MCP save、UI save 都只落盘，不得自动发布。旧版 ≤3 槽通道与 `profiles.json` 存储已删除（2026-09-25），桥只服务 v2 设备。
 - v2 数据语义：字段仅在 Bridge 绑定合同中分 push/pull；push 可见值/缺失/质量变化发送完整最新快照，pull-only 变化只更新缓存、不推送、不改 PowerPlan；只有成功 ACK 才更新确认指纹与 full_sync_deadline。设备不接收 push/pull 分类。
 - v2 电源：只有 Bridge 的正式 PowerPlan 改变 light deadline；读取/传输/claim/owner renew 都不隐式续租；BOOT provisional 300s 从物理唤醒起算，timer wake 不获得。
 - 版本号 `FW_VERSION` 在 `src/main.cpp`；固件发布后在 `PROGRESS.md` 记录 ROM 路径与 SHA256。
@@ -92,6 +92,7 @@ git diff --check                   # 提交前必查
 - 每个里程碑后更新 `PROGRESS.md`（现场、证据、待办）；多步工作用 `project-workflow/<initiative>/` 写 plan/task/status/review，先计划再动代码。
 - 提交信息用英文祈使句，沿用现有风格（如 `Firmware 0.8.0: status JSON, log ring, battery; bridge prefers JSON status`）。未经用户要求不要提交。
 - 后台进程启动必须立即返回、不挂住会话：桥用 `pwsh tools/start-bridge.ps1`（`UseShellExecute=true` 完全分离子进程 + 隐藏窗口 + cmd 重定向日志，避免子进程继承 stdio 句柄导致调用方阻塞）；其他服务照此模式（分离启动 + 日志重定向到 `artifacts/`），不用会继承管道句柄的前台/直连方式。不在前台跑长轮询；不是当前 debug/release 构建输出目录（如 `bridge/target/debug`）下运行的桥/设备服务不要擅自停止。停止当前构建目录的桥时先结束 watchdog 子进程（`--watchdog <pid>`）再停父进程，避免 watchdog 拉起重启。⚠️ **2026-09-25 实测：受限沙箱（workspace-write）下跑该脚本会假失败**——沙箱内 `Get-NetTCPConnection` 看不到刚起的监听者（脚本 10 s 后抛 "did not appear"），命令结束时沙箱还会回收已分离的子进程，且 WebView2 建 host 报 `HRESULT(0x800700AA) ERROR_BUSY`；**桥必须从非受限（提权）命令启动**，桥自己的日志在 `<exe>/data/logs/bridge-app.log.<UTC 日期>` 里（`artifacts/bridge-app-run.out/.err` 通常为空）。
+- **纯重启不需要提权（2026-09-25 实测）**：用 `pwsh tools/restart-bridge.ps1`——它只杀**主进程**（占用 HTTP 端口那个），让应用自带的 watchdog（`bridge/crates/app/src/watchdog.rs`）把桥拉回来，全程在受限沙箱内完成、不弹审批弹窗。两条硬限制来自 watchdog 本身：只在**非零退出码**时重启（强杀算），且**5 分钟内 3 次**异常退出就放弃并退出（记录在 `<exe>/data/logs/watchdog.log`，脚本会先打印预算并在放弃后拒绝执行）。**重建**必须先让两个进程都退出（运行中的 exe 被锁住，`cargo build` 替换不了），所以重建后那次启动仍需一次提权；要在一次任务里反复「重建 + 重启」又不弹窗，就把会话的权限预设切成 `danger-full-access`（DSH 里预设 = 沙箱模式 + 审批策略捆绑，`workspace-write` 绑 `ask`、`danger-full-access` 绑 `never`；当前会话用 `/permission` 或 GUI 的权限选择器切换，新会话默认值见 `permission.defaultPreset` / `DSH_PERMISSION_MODE`）。
 - 命名 Bridge 实例必须指定不同 HTTP/MCP 端口；各自运行数据在 `<exe>/instances/<name>/data`，默认实例保留 `<exe>/data`。命名实例不监听设备固定 UDP 8767，只走精确 MAC 的 HTTP/BLE；不同实例 owner ID 不同，同一设备仍由 claim/lease 决定占用。托盘背景形状可用 `-IconShape square|circle|diamond` 区分。
 - 不提交任何密钥：Wi-Fi 密码、BLE token 只存在于设备 RAM/NVS，不落仓库、不进日志。
 
@@ -107,7 +108,7 @@ git diff --check                   # 提交前必查
 - ✅ 已核实（2026-09-25）：设备 `/status.json` + ARP 实测 1.54 就是 `70041DD7A340` @ `192.168.3.163`，与本表及 `state.json` 登记一致。本文旧版写的 `192.168.1.50` 与 `70:04:1D:AA:BB:CC` **作废**，不要再引用。1.54 实机固件已于 2026-09-25 由 `0.17.10-bw` OTA 到 **`0.18.23-bw`**（此前记录 `0.16.7-bw` 更早已过期）。
 - USB 串口 COM 口动态（COM3/COM4/COM5）；用户常拔 USB（无串口时靠 Wi-Fi `/status.json`、`/log`）。**打开串口会复位板子**，所以不要为了看日志而丢掉一次按键唤醒的现场。
 - OTA：上传成功后延迟 1.5s 重启，HTTP 先返回 `UPDATE OK`（客户端超时属既有现象）；双槽 ota_0/ota_1 轮换。
-- 状态可读：`GET /status.json`（fw/槽位/重置原因/RSSI/电量/heap 等）、`GET /log`（4KB RAM 环形日志）与 `GET /pmstats`（PM light-sleep 统计/锁，0.13.0+，只读免 token）；桥优先用 JSON，旧固件回退 HTML。
+- 状态可读：`GET /status.json`（fw/槽位/重置原因/RSSI/电量/heap 等）、`GET /log`（4KB RAM 环形日志）与 `GET /pmstats`（PM light-sleep 统计/锁，0.13.0+，只读免 token）；桥**只读 `/status.json`**——旧 HTML 状态页回退与 `claim_unsupported`（固件 <0.13.4）已随 legacy 通道一并删除（2026-09-25），非 v2 固件会被直接拒绝注册。
 - `cargo test --workspace` 可能因运行中的 `bridge-core.exe` 锁定 `target/debug` 失败（不是逻辑失败）；改用隔离 `CARGO_TARGET_DIR` 复测，或核实进程后由用户决定是否停桥。
 - Windows 控制台为 GBK：Python 桥启动时设 `PYTHONIOENCODING=utf-8`，避免 status notify 打印异常。
 - BLE 写入须按 MTU 分片（usage/模板），单次超 MTU 会 `Invalid Attribute Value Length`。

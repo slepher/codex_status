@@ -37,9 +37,9 @@ ESP32-S3 固件 ◀── Wi-Fi / BLE ──┘   本地模板引擎 ──▶ S
 | `bridge/crates/core` | app-server 客户端、usage 信封、模板库（canonical JSON + CRC32）、LAN HTTP |
 | `bridge/crates/ble` | btleplug central：endpoint/usage/模板推送 |
 | `bridge/crates/render` | 把固件同一份 C++ 引擎编进宿主，用于像素级预览/对拍 |
-| `bridge/crates/mcp` | MCP 工具（status/get/validate/render/save/profile_push/firmware_ota/…） |
+| `bridge/crates/mcp` | MCP 工具（bridge_status/template_*/firmware_ota/pm_stats/device_* 与 v2 平台工具） |
 | `bridge/crates/app` | 生产形态：托盘 + 内建 HTTP/BLE/MCP；`discovery.rs` 为 ARP 发现回退 |
-| `tools/test-bridge` | Python 测试桥、模板库 `templates/*.json`、`profiles.seed.json` |
+| `tools/test-bridge` | Python 测试桥、模板库 `templates/*.json` |
 | `tools/*.mjs` | Node 预览生成/场景测试 |
 | `docs/` | 协议与设备文档；`docs/history/` 为历史归档 |
 | `project-workflow/` | 各里程碑的计划/任务/评审记录 |

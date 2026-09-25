@@ -718,11 +718,6 @@ impl PlatformService {
             .get(&mac)
             .and_then(|d| d.profile.clone())
             .context("device has no profile")?;
-        if let Some(record) = inner.devices.get(&mac) {
-            if record.legacy {
-                bail!("device {mac} runs legacy firmware; publish uses the legacy template path");
-            }
-        }
         profile.validate_publishable(&caps)?;
         let font_plan = self.profile_fonts(&inner, &profile)?;
         if !profile.sync_enabled {
@@ -1133,7 +1128,6 @@ impl PlatformService {
                     "ip": d.identity.ip,
                     "discovered_via": d.identity.discovered_via,
                     "last_seen_at": d.identity.last_seen_at,
-                    "legacy": d.legacy,
                     "capabilities": d.capabilities,
                     "hardware_verified": d.capabilities.hardware_verified,
                     "owner": coordinator.map(|c| c.session.clone()),
@@ -1174,7 +1168,6 @@ impl PlatformService {
         &self,
         identity: DeviceIdentity,
         capabilities: DeviceCapabilities,
-        legacy: bool,
     ) -> Result<()> {
         capabilities.validate()?;
         let mac = identity.device_mac.clone();
@@ -1183,7 +1176,6 @@ impl PlatformService {
         let record = DeviceRecord {
             identity,
             capabilities: capabilities.clone(),
-            legacy,
             profile: existing.as_ref().and_then(|d| d.profile.clone()),
             observed: existing
                 .as_ref()
@@ -1667,31 +1659,6 @@ impl PlatformService {
         Ok(profile)
     }
 
-    /// Legacy migration: the ≤3 enabled legacy profile upgrades to a 1–8 order
-    /// without silent truncation; entries beyond 8 are an explicit error.
-    pub fn migrate_legacy_profile(
-        &self,
-        mac: &str,
-        legacy_ids: &[String],
-        now: u64,
-    ) -> Result<Profile> {
-        if legacy_ids.len() > MAX_PROFILE_TEMPLATES {
-            bail!(
-                "legacy profile has {} entries; refusing to truncate to {MAX_PROFILE_TEMPLATES}",
-                legacy_ids.len()
-            );
-        }
-        if legacy_ids.is_empty() {
-            bail!("legacy profile is empty");
-        }
-        let mut profile = Profile::draft(&mac.to_uppercase());
-        profile.template_ids = legacy_ids.to_vec();
-        profile.initial_active_id = legacy_ids.first().cloned();
-        profile.sync_enabled = false;
-        self.profile_save(profile.clone(), now)?;
-        Ok(profile)
-    }
-
     // ---- Overview --------------------------------------------------------
 
     pub fn overview(&self) -> Value {
@@ -1749,7 +1716,6 @@ impl PlatformService {
             "devices": inner.devices.values().map(|d| json!({
                 "device_mac": d.identity.device_mac,
                 "name": d.identity.name,
-                "legacy": d.legacy,
                 "hardware_verified": d.capabilities.hardware_verified,
                 "profile_count": d.profile.as_ref().map(|p| p.template_ids.len()).unwrap_or(0),
             })).collect::<Vec<_>>(),
@@ -2015,7 +1981,6 @@ mod tests {
         svc.device_upsert(
             DeviceIdentity::new("AA:BB:CC:DD:EE:FF", "Test").unwrap(),
             DeviceCapabilities::ssd1681_154g(),
-            false,
         )
         .unwrap();
         svc
@@ -2387,7 +2352,7 @@ mod tests {
         caps.max_manifest_bytes = 100_000;
         caps.free_bytes = 1_000_000;
         caps.install_peak_bytes = 1_000_000;
-        svc.device_upsert(DeviceIdentity::new("AA:BB:CC:DD:EE:FF", "Test").unwrap(), caps, false).unwrap();
+        svc.device_upsert(DeviceIdentity::new("AA:BB:CC:DD:EE:FF", "Test").unwrap(), caps).unwrap();
         svc.template_save("quad", crate::platform::model::RENDER_TARGET_154G, &quad_source(), 1000).unwrap();
         let mut profile = Profile::draft("AA:BB:CC:DD:EE:FF");
         profile.template_ids = vec!["quad".into()];
@@ -2431,7 +2396,7 @@ mod tests {
         caps.height = 300;
         caps.partial = false;
         caps.hardware_verified = false;
-        svc.device_upsert(DeviceIdentity::new("7C4FADB93408", "Note4").unwrap(), caps, false).unwrap();
+        svc.device_upsert(DeviceIdentity::new("7C4FADB93408", "Note4").unwrap(), caps).unwrap();
         let source: Value = serde_json::from_str(include_str!("../../tests/fixtures/codex-status-a-400x300.json")).unwrap();
         svc.template_save("codex-status-a", crate::platform::model::RENDER_TARGET_NOTE4, &source, 1000).unwrap();
         let mut profile = Profile::draft("7C4FADB93408");
@@ -2563,16 +2528,6 @@ mod tests {
         let summary = svc2.coordinator_summary(mac, 1000).unwrap();
         assert!(summary["context"]["next_seq"].as_u64().unwrap() >= next_seq);
         assert_eq!(summary["context"]["context_id"], "ctx-1");
-    }
-
-    #[test]
-    fn migration_rejects_truncation() {
-        let dir = tempfile::tempdir().unwrap();
-        let svc = service_with_device(dir.path());
-        let long: Vec<String> = (0..9).map(|i| format!("t{i}")).collect();
-        assert!(svc
-            .migrate_legacy_profile("AA:BB:CC:DD:EE:FF", &long, 0)
-            .is_err());
     }
 
     #[test]

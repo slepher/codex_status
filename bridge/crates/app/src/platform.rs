@@ -30,35 +30,12 @@ pub fn service(ctx: &AppCtx) -> &Arc<PlatformService> {
     &ctx.platform
 }
 
-/// Device link from the live identity + cached device token; `None` when the
-/// token has not been negotiated yet (click BOOT to open the BLE session).
+/// Device link from the selected device's runtime record + cached device token;
+/// `None` when the token has not been negotiated yet (click BOOT to open the
+/// BLE session) or no device is selected.
 pub fn device_link(ctx: &AppCtx) -> Option<DeviceLink> {
-    let ip = ctx.device_ip.lock().unwrap().clone();
-    if ip.is_empty() || ip == "0.0.0.0" {
-        return None;
-    }
-    let mac = ctx
-        .device_mac
-        .lock()
-        .unwrap()
-        .clone()
-        .unwrap_or_else(|| "".to_string());
-    if mac.is_empty() {
-        return None;
-    }
-    // v2 business endpoints authenticate with the endpoint token the bridge
-    // wrote over BLE (the same trust as /usage and /template); the device
-    // operation token stays reserved for /claim, /update and /doUpdate.
-    let token = ctx.config.token.clone();
-    if token.is_empty() {
-        return None;
-    }
-    Some(DeviceLink {
-        mac,
-        ip,
-        token,
-        bridge_id: ctx.bridge_id.clone(),
-    })
+    let mac = crate::selected_mac(ctx)?;
+    device_link_for_mac(ctx, &mac)
 }
 
 pub(super) fn device_link_for_mac(ctx: &AppCtx, requested_mac: &str) -> Option<DeviceLink> {
@@ -142,10 +119,7 @@ fn registered_device_facts(
             "status.json reports MAC {status_mac}, not requested {requested_mac}"
         ));
     }
-    let (capabilities, legacy) = caps_from_status(status)?;
-    if legacy {
-        return Err("v2 capabilities missing: device reports a legacy protocol".into());
-    }
+    let capabilities = caps_from_status(status)?;
     let authenticated_mac = v2_status
         .get("device_mac")
         .and_then(Value::as_str)
@@ -203,7 +177,7 @@ async fn register_device_v2(ctx: &AppCtx, args: &Value) -> Result<Value, String>
         .unwrap_or_else(|| format!("CodexStatus-{}", &mac[6..]));
     let identity = registration_identity(&mac, &endpoint, &name)?;
     service(ctx)
-        .device_upsert(identity, capabilities, false)
+        .device_upsert(identity, capabilities)
         .map_err(err_text)?;
     service(ctx)
         .device_get(&mac)
@@ -222,9 +196,6 @@ pub(super) async fn revalidate_registered_v2_endpoint(
     let Some(existing) = service(ctx).device_get(&mac) else {
         return Ok(false);
     };
-    if existing["legacy"] != false {
-        return Ok(false);
-    }
     let Some(previous_endpoint) = existing["ip"].as_str().map(str::to_string) else {
         return Ok(false);
     };
@@ -249,7 +220,7 @@ pub(super) async fn revalidate_registered_v2_endpoint(
     let Some(current) = service(ctx).device_get(&mac) else {
         return Ok(false);
     };
-    if current["legacy"] != false || current["ip"].as_str() != Some(&previous_endpoint) {
+    if current["ip"].as_str() != Some(&previous_endpoint) {
         return Ok(false);
     }
     let name = current["name"]
@@ -260,8 +231,12 @@ pub(super) async fn revalidate_registered_v2_endpoint(
     let mut identity = registration_identity(&mac, &endpoint, &name)?;
     identity.discovered_via = "udp".into();
     service(ctx)
-        .device_upsert(identity, capabilities, false)
+        .device_upsert(identity, capabilities)
         .map_err(err_text)?;
+    // Keep this MAC's runtime record in step with the verified endpoint. The
+    // write is keyed by the MAC the authenticated status confirmed, so no other
+    // device's address can be touched here.
+    crate::observe_device(ctx, &mac, Some(&endpoint), None, "udp");
     Ok(true)
 }
 
@@ -370,8 +345,11 @@ mod registration_tests {
     }
 }
 
-fn endpoint(ctx: &AppCtx) -> String {
-    ctx.device_ip.lock().unwrap().clone()
+/// Address of one device's runtime record (empty when unknown).
+fn endpoint_for(ctx: &AppCtx, mac: &str) -> String {
+    crate::device_facts_for(ctx, mac)
+        .map(|facts| facts.endpoint())
+        .unwrap_or_default()
 }
 
 fn err_text(e: impl std::fmt::Display) -> String {
@@ -396,34 +374,31 @@ where
 pub fn overview(ctx: &AppCtx) -> Value {
     let mut value = service(ctx).overview();
     value["device"] = device_summary(ctx);
-    value["legacy_device"] = json!(
-        !service(ctx).devices().is_empty()
-            && service(ctx).devices()[0]["legacy"]
-                .as_bool()
-                .unwrap_or(false)
-    );
     value["link"] = match device_link(ctx) {
         Some(link) => json!({"mac": link.mac, "ip": link.ip, "token_cached": true}),
-        None => {
-            json!({"mac": ctx.device_mac.lock().unwrap().clone(), "ip": endpoint(ctx), "token_cached": false})
-        }
+        None => match crate::selected_mac(ctx) {
+            Some(mac) => json!({"mac": mac, "ip": endpoint_for(ctx, &mac), "token_cached": false}),
+            None => json!({"mac": Value::Null, "ip": "", "token_cached": false}),
+        },
     };
     value
 }
 
+/// Summary of the device an operation without an explicit MAC resolves to.
 fn device_summary(ctx: &AppCtx) -> Value {
-    let mac = ctx.device_mac.lock().unwrap().clone();
-    let name = ctx.device_name.lock().unwrap().clone();
-    json!({
-        "device_mac": mac,
-        "name": name,
-        "ip": endpoint(ctx),
-    })
+    match crate::device_facts(ctx) {
+        Some(facts) => json!({
+            "device_mac": facts.mac,
+            "name": facts.display_name(),
+            "ip": facts.endpoint(),
+        }),
+        None => json!({"device_mac": Value::Null, "name": "", "ip": ""}),
+    }
 }
 
 pub fn device_rows(ctx: &AppCtx) -> Value {
     json!({
-        "selected_device_mac": ctx.device_mac.lock().unwrap().clone(),
+        "selected_device_mac": crate::selected_mac(ctx),
         "devices": service(ctx).devices(),
         "templates": service(ctx).templates(),
     })
@@ -556,7 +531,7 @@ fn base64(bytes: &[u8]) -> String {
 }
 
 pub fn profile_get(ctx: &AppCtx) -> Value {
-    let mac = ctx.device_mac.lock().unwrap().clone().unwrap_or_default();
+    let mac = crate::selected_mac(ctx).unwrap_or_default();
     json!({
         "device_mac": mac,
         "profile": service(ctx).profile_get(&mac),
@@ -905,21 +880,11 @@ pub async fn request_light(ctx: &AppCtx, mac: &str) -> Value {
         Err(e) => return json!({"result": "failed", "error": e.to_string()}),
     };
     ctx.force_ble.notify_one();
-    let selected_mac = ctx
-        .device_mac
-        .lock()
-        .unwrap()
-        .as_deref()
-        .and_then(DeviceIdentity::normalized_mac);
-    let requested_mac = DeviceIdentity::normalized_mac(mac);
-    let online = selected_mac.is_some()
-        && selected_mac == requested_mac
-        && ctx
-            .device_cache
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|c| c.online);
+    // "Online" means this MAC's own cached status is fresh — never another
+    // device's cache.
+    let online = crate::device_facts_for(ctx, mac)
+        .map(|facts| facts.is_online())
+        .unwrap_or(false);
     if !online {
         return json!({"result": "queued", "transport": "ble_rendezvous",
             "plan": plan, "already_pending": already_pending, "ack": null});
@@ -1043,11 +1008,11 @@ pub async fn refresh_status(ctx: &AppCtx, mac: &str) -> Value {
 /// coordinator light hold and, once the rebooted device answers HTTP, send one
 /// explicit 300 s light PowerPlan. Run from a spawned task: the bounded wait
 /// (reboot + Wi-Fi) must not delay the MCP response.
-pub async fn post_ota_window(ctx: &AppCtx, secs: u32) {
-    let mac = ctx.device_mac.lock().unwrap().clone().unwrap_or_default();
-    if mac.is_empty() {
+pub async fn post_ota_window(ctx: &AppCtx, requested_mac: &str, secs: u32) {
+    let Some(mac) = DeviceIdentity::normalized_mac(requested_mac) else {
+        tracing::warn!("post-OTA window skipped: invalid device MAC");
         return;
-    }
+    };
     if let Err(e) = service(ctx).hold_light(&mac, now_secs() + secs as u64) {
         tracing::debug!("post-OTA hold: {e}");
         return;
@@ -1152,8 +1117,10 @@ pub fn note_envelope(ctx: &AppCtx, envelope: &Value) {
 // Power (device submenu)
 // ---------------------------------------------------------------------------
 
-pub fn power_view(ctx: &AppCtx) -> Value {
-    let mac = ctx.device_mac.lock().unwrap().clone().unwrap_or_default();
+pub fn power_view(ctx: &AppCtx, requested_mac: &str) -> Value {
+    let mac = DeviceIdentity::normalized_mac(requested_mac)
+        .or_else(|| crate::selected_mac(ctx))
+        .unwrap_or_default();
     let summary = service(ctx).coordinator_summary(&mac, now_secs());
     let explicit = summary.as_ref().map(|s| &s["plan"]);
     let pending = explicit.map(|p| &p["pending_explicit_light"]);
@@ -1173,8 +1140,9 @@ pub fn power_view(ctx: &AppCtx) -> Value {
     })
 }
 
-pub fn recovery(ctx: &AppCtx, digest: &Value) -> Result<Value, String> {
-    let mac = ctx.device_mac.lock().unwrap().clone().unwrap_or_default();
+pub fn recovery(ctx: &AppCtx, requested_mac: &str, digest: &Value) -> Result<Value, String> {
+    let mac = DeviceIdentity::normalized_mac(requested_mac)
+        .ok_or_else(|| "invalid device MAC".to_string())?;
     let profile = service(ctx)
         .recovery_import(&mac, digest, now_secs())
         .map_err(err_text)?;
@@ -1190,16 +1158,12 @@ pub fn recovery(ctx: &AppCtx, digest: &Value) -> Result<Value, String> {
 // Device registration / MCP helper
 // ---------------------------------------------------------------------------
 
-/// Capabilities from a `/status.json` document. Firmware that reports
-/// `fw_target` speaks v2; anything older is legacy (≤3 templates, legacy
-/// channel) and must be shown as such instead of silently truncating.
-pub fn caps_from_status(raw: &Value) -> Result<(DeviceCapabilities, bool), String> {
+/// Capabilities from a `/status.json` document. Firmware that does not report
+/// `fw_target` does not speak v2 and is refused.
+pub fn caps_from_status(raw: &Value) -> Result<DeviceCapabilities, String> {
     let fw_target = raw.get("fw_target").and_then(|v| v.as_str());
     let Some(fw_target) = fw_target else {
-        let mut caps = DeviceCapabilities::ssd1681_154g();
-        caps.max_templates = 3;
-        caps.max_light_s = 600;
-        return Ok((caps, true));
+        return Err("v2 capabilities missing: device reports a legacy protocol".into());
     };
     let render_target = raw
         .get("render_target")
@@ -1299,7 +1263,7 @@ pub fn caps_from_status(raw: &Value) -> Result<(DeviceCapabilities, bool), Strin
         ..DeviceCapabilities::ssd1681_154g()
     };
     caps.validate().map_err(|e| e.to_string())?;
-    Ok((caps, false))
+    Ok(caps)
 }
 
 #[cfg(test)]
@@ -1321,8 +1285,7 @@ mod capability_tests {
         complete["partial"] = json!(false);
         complete["max_templates"] = json!(8);
         complete["max_bundle_bytes"] = json!(262_144);
-        let (caps, legacy) = caps_from_status(&complete).unwrap();
-        assert!(!legacy);
+        let caps = caps_from_status(&complete).unwrap();
         assert_eq!((caps.width, caps.height), (400, 300));
         assert!(!caps.hardware_verified);
         complete["width"] = json!(200);
@@ -1384,40 +1347,43 @@ mod capability_tests {
 
 /// Feed the device's own status digest (MAC-verified HTTP read) into the
 /// coordinator; the authenticated `/v2/status` remains authoritative for writes.
-pub fn note_status_json(ctx: &AppCtx, raw: &Value) {
-    let mac = ctx.device_mac.lock().unwrap().clone().unwrap_or_default();
-    if mac.is_empty() {
+pub fn note_status_json(ctx: &AppCtx, requested_mac: &str, raw: &Value) {
+    let Some(mac) = DeviceIdentity::normalized_mac(requested_mac) else {
         return;
-    }
+    };
     let _ = service(ctx).note_device_status(&mac, raw);
 }
 
-/// Register/refresh the current device in the platform service. Legacy devices
-/// keep the legacy flag so the UI shows the limitation instead of truncating.
-pub fn ensure_device(ctx: &AppCtx, capabilities: DeviceCapabilities, legacy: bool) {
-    let mac = ctx.device_mac.lock().unwrap().clone().unwrap_or_default();
-    if mac.is_empty() {
+/// Register/refresh one device in the platform service. Only v2 firmware
+/// reaches this point; the capability contract is enforced upstream. The
+/// identity written is exactly the `mac` the authenticated status reported.
+pub fn ensure_device(
+    ctx: &AppCtx,
+    requested_mac: &str,
+    endpoint: &str,
+    capabilities: DeviceCapabilities,
+) {
+    let Some(mac) = DeviceIdentity::normalized_mac(requested_mac) else {
         return;
-    }
-    let name = ctx.device_name.lock().unwrap().clone();
+    };
+    let name = crate::device_facts_for(ctx, &mac)
+        .map(|facts| facts.display_name())
+        .unwrap_or_default();
     if let Ok(identity) = DeviceIdentity::new(&mac, &name) {
         let mut identity = identity;
-        identity.ip = Some(endpoint(ctx));
-        let _ = service(ctx).device_upsert(identity, capabilities, legacy);
+        identity.ip = Some(endpoint.to_string());
+        let _ = service(ctx).device_upsert(identity, capabilities);
     }
 }
 
-/// True when the device speaks the v2 protocol: the legacy Wi-Fi push channel
-/// must then stay quiet (one device, one data channel).
+/// True when the selected device is registered in the v2 platform store: the
+/// single-device Wi-Fi push channel must then stay quiet (one device, one data
+/// channel). Every registered device speaks v2.
 pub fn is_v2_device(ctx: &AppCtx) -> bool {
-    let mac = ctx.device_mac.lock().unwrap().clone().unwrap_or_default();
-    if mac.is_empty() {
+    let Some(mac) = crate::selected_mac(ctx) else {
         return false;
-    }
-    service(ctx)
-        .device_get(&mac)
-        .map(|d| !d["legacy"].as_bool().unwrap_or(true))
-        .unwrap_or(false)
+    };
+    service(ctx).device_get(&mac).is_some()
 }
 
 /// Outcome of one v2 BLE scan and, when connected, its rendezvous.
@@ -1587,9 +1553,8 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
         None => return Ok(BleOpportunity::NoDevice),
     };
     let still_registered = service(ctx).devices().into_iter().any(|device| {
-        device["legacy"].as_bool() == Some(false)
-            && device["device_mac"].as_str().and_then(DeviceIdentity::normalized_mac)
-                == Some(mac.clone())
+        device["device_mac"].as_str().and_then(DeviceIdentity::normalized_mac)
+            == Some(mac.clone())
     });
     // The firmware closes BLE 200 ms after the Plan ACK. Fetch before the
     // ordinary timeout starts so a failed optional request cannot consume the
@@ -1727,10 +1692,7 @@ pub async fn cycle(ctx: &AppCtx, mac: &str, refresh: bool, deliver_now: bool) {
     let Some(mac) = DeviceIdentity::normalized_mac(mac) else {
         return;
     };
-    let Some(device) = service(ctx).device_get(&mac) else {
-        return;
-    };
-    if device["legacy"].as_bool().unwrap_or(true) {
+    if service(ctx).device_get(&mac).is_none() {
         return;
     }
     if !matches!(crate::v2_occupancy_gate(ctx, &mac).await, crate::Occupancy::Owned) {
@@ -1889,7 +1851,10 @@ pub async fn tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, Stri
                 .ok_or("missing source_id")?;
             data_probe(ctx, id)?
         }
-        "power_view_v2" => power_view(ctx),
+        "power_view_v2" => {
+            let mac = target_mac(ctx, args)?;
+            power_view(ctx, &mac)
+        }
         "power_plan" => {
             let mac = target_mac(ctx, args)?;
             let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("auto");
@@ -1934,7 +1899,8 @@ pub async fn tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, Stri
         }
         "platform_recovery" => {
             let digest = args.get("digest").cloned().ok_or("missing digest")?;
-            recovery(ctx, &digest)?
+            let mac = target_mac(ctx, args)?;
+            recovery(ctx, &mac, &digest)?
         }
         other => return Err(format!("unknown platform tool: {other}")),
     };
@@ -1945,30 +1911,26 @@ fn requested_mac(args: &Value) -> Result<Option<String>, String> {
     let Some(value) = args.get("mac") else {
         return Ok(None);
     };
-    let raw = value.as_str().ok_or("mac must be a string")?;
+    let raw = value
+        .as_str()
+        .map(str::trim)
+        .filter(|mac| !mac.is_empty())
+        .ok_or("mac must be a non-empty string")?;
     DeviceIdentity::normalized_mac(raw)
         .map(Some)
         .ok_or_else(|| "invalid device MAC".to_string())
 }
 
+/// Resolve the MAC an MCP tool acts on: explicit `mac`, else the only
+/// registered device. Two or more registered devices without a MAC is an error
+/// (`design.md` §2) — never "the first entry", and never merely whichever
+/// device the process has selected.
 fn target_mac(ctx: &AppCtx, args: &Value) -> Result<String, String> {
     let Some(mac) = requested_mac(args)? else {
-        return device_mac(ctx);
+        return crate::sole_registered_mac(ctx);
     };
-    let device = service(ctx)
-        .device_get(&mac)
-        .ok_or_else(|| format!("device {mac} is not registered"))?;
-    if device["legacy"].as_bool().unwrap_or(true) {
-        return Err(format!("device {mac} is registered as legacy"));
+    if service(ctx).device_get(&mac).is_none() {
+        return Err(format!("device {mac} is not registered"));
     }
     Ok(mac)
-}
-
-fn device_mac(ctx: &AppCtx) -> Result<String, String> {
-    ctx.device_mac
-        .lock()
-        .unwrap()
-        .clone()
-        .filter(|m| !m.is_empty())
-        .ok_or_else(|| "device MAC not learned yet".to_string())
 }

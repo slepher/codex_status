@@ -75,6 +75,10 @@
   .prow .order { width: 16px; text-align: right; color: var(--muted); flex: none; }
   .prow .name { cursor: pointer; flex: 1; min-width: 60px; user-select: text; }
   .prow .name:hover { text-decoration: underline; }
+  .prow.pick { cursor: pointer; }
+  .prow.pick.current { background: var(--card); box-shadow: inset 2px 0 0 0 var(--accent); }
+  .prow .name small { display: block; color: var(--muted); font-weight: 400; }
+  .badge { display: inline-block; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--accent); color: var(--accent); font-size: 11px; }
   .prow .ctl { display: flex; gap: 6px; align-items: center; }
   .switch { position: relative; width: 40px; height: 20px; border-radius: 10px; background: var(--line); cursor: pointer; flex: none; }
   .switch.on { background: var(--accent); }
@@ -145,6 +149,11 @@
         </div>
       </div>
       <div class="card">
+        <h2>当前设备（点击切换）</h2>
+        <div id="registered-devices" class="plist muted">加载中…</div>
+        <div class="sub">MAC 才是唯一键。切换后本页的身份、实况、v2 状态、功耗、占用与恢复读取都按选中设备刷新；切换不会向设备推送，也不改变模板页的族选择。</div>
+      </div>
+      <div class="card">
         <h2>身份</h2>
         <div class="row"><span>名称（点击重命名）</span><span class="name" id="dev-name" onclick="modalRenameDevice()">--</span></div>
         <div class="row"><span>MAC（唯一键）</span><span id="dev-mac" class="muted">--</span></div>
@@ -164,10 +173,6 @@
           <div class="ring"><b id="ring-week">--</b><small>周余量</small></div>
           <div class="ring"><b id="ring-5h">--</b><small>5H 余量</small></div>
         </div>
-      </div>
-      <div class="card">
-        <h2>已登记设备</h2>
-        <div id="registered-devices" class="plist muted">加载中…</div>
       </div>
       <div class="card">
         <h2>设备</h2>
@@ -512,7 +517,7 @@
     if (!familyProfile) return;
     try {
       const { devices = [] } = await invoke('platform_devices');
-      const matches = devices.filter(d => !d.legacy && d.capabilities?.render_target === selectedRenderTarget);
+      const matches = devices.filter(d => d.capabilities?.render_target === selectedRenderTarget);
       const options = matches.map(d => `<option value="${escapeAttr(d.device_mac)}">${escapeHtml(d.name || d.device_mac)} · ${escapeHtml(d.device_mac)}${d.ip ? ' · ' + escapeHtml(d.ip) : ''}</option>`).join('');
       openModal(`<h3>推送配置到设备</h3>
         <div class="sub">${escapeHtml(familyProfile.name)} · ${familyLabel(selectedRenderTarget)}</div>
@@ -530,7 +535,7 @@
     if (!familyProfile || !mac || !ids.length) return;
     try {
       const { devices = [] } = await invoke('platform_devices');
-      const device = devices.find(d => d.device_mac === mac && !d.legacy && d.capabilities?.render_target === selectedRenderTarget);
+      const device = devices.find(d => d.device_mac === mac && d.capabilities?.render_target === selectedRenderTarget);
       if (!device) {
         throw new Error('目标设备已变化，请重新选择');
       }
@@ -836,7 +841,7 @@
 
   async function refresh() {
     try {
-      const s = await invoke('get_status');
+      const s = await invoke('get_status', { mac: selectedDeviceMac });
       const weekly = s.weekly_remaining;
       $('ring-week').textContent = weekly == null ? '--' : weekly + '%';
       $('sub').textContent = `LAN ${s.lan_ip}:${s.http.split(':').pop()} · 轮询 ${s.interval_secs}s · BLE ${s.ble_interval_secs}s`;
@@ -887,8 +892,6 @@
       $('dev-owner').textContent = `${who}@${owner.host || '?'}:${owner.port || '?'}${left}`;
     } else if (device.yielded) {
       $('dev-owner').textContent = '已释放（本地让步，点"占用/恢复"重新参与）';
-    } else if (device.claim_unsupported) {
-      $('dev-owner').textContent = '未启用（固件 < 0.13.4）';
     } else {
       $('dev-owner').textContent = '空闲 / 本桥自动占用';
     }
@@ -909,7 +912,7 @@
   async function submitRenameDevice() {
     const name = $('modal-device-name').value.trim();
     try {
-      const device = await invoke('rename_device', { name });
+      const device = await invoke('rename_device', { name, mac: selectedDeviceMac });
       closeModal();
       renderDeviceIdentity(device);
     } catch (e) {
@@ -921,7 +924,7 @@
   async function discoverDevice(via) {
     $('device-state').textContent = `正在发现（${via}）…`;
     try {
-      const device = await invoke('device_discover', { via });
+      const device = await invoke('device_discover', { via, mac: selectedDeviceMac });
       renderDeviceIdentity(device);
       $('device-state').textContent = `发现成功 · ${device.ip}`;
       refresh();
@@ -933,7 +936,7 @@
   async function claimDevice(force) {
     $('device-state').textContent = force ? '正在强制接管…' : '正在占用…';
     try {
-      const r = await invoke('claim_device', { force });
+      const r = await invoke('claim_device', { force, mac: selectedDeviceMac });
       renderDeviceIdentity(r.device);
       $('device-state').textContent = '占用完成';
       refresh();
@@ -945,7 +948,7 @@
   async function releaseDevice() {
     $('device-state').textContent = '正在释放…';
     try {
-      const r = await invoke('release_device');
+      const r = await invoke('release_device', { mac: selectedDeviceMac });
       renderDeviceIdentity(r.device);
       $('device-state').textContent = '已释放（不再自动占用）';
       refresh();
@@ -957,7 +960,7 @@
   async function refreshDevice() {
     lastDeviceFetch = Date.now();
     try {
-      const d = await invoke('get_device_status');
+      const d = await invoke('get_device_status', { mac: selectedDeviceMac });
       renderDeviceIdentity(d.device);
       if (!d.online) {
         $('device-state').textContent = `设备离线（${d.ip}）${d.error ? '：' + d.error : ''}`;
@@ -1127,6 +1130,11 @@
 
   /* ---------- v2 platform pages (same application service as MCP) ---------- */
 
+  /* The device page selects its own device and every operation carries that MAC
+     explicitly; the Bridge never switches a global device behind the user. */
+  const DEVICE_MAC_KEY = 'codex-status-device-mac';
+  let selectedDeviceMac = localStorage.getItem(DEVICE_MAC_KEY) || null;
+  let platformDevices = [];
   let platformDevice = null;
   let platformProfile = null;
   let platformTemplates = [];
@@ -1167,23 +1175,76 @@
     } catch (e) { /* templates are loaded for family selection and validation */ }
   }
 
+  /// The device this page shows: the remembered MAC while it still exists,
+  /// otherwise the Bridge's own device. Never "the first of several" — with two
+  /// or more devices and no choice the page asks instead of guessing.
+  function resolveSelectedDevice(backendSelected) {
+    if (selectedDeviceMac && platformDevices.some(d => d.device_mac === selectedDeviceMac)) {
+      return selectedDeviceMac;
+    }
+    const fallback = platformDevices.find(d => d.device_mac === backendSelected)
+      || (platformDevices.length === 1 ? platformDevices[0] : null);
+    selectedDeviceMac = fallback ? fallback.device_mac : null;
+    if (selectedDeviceMac) localStorage.setItem(DEVICE_MAC_KEY, selectedDeviceMac);
+    else localStorage.removeItem(DEVICE_MAC_KEY);
+    return selectedDeviceMac;
+  }
+
+  function renderRegisteredDevices(selected) {
+    $('registered-devices').innerHTML = platformDevices.length
+      ? platformDevices.map(d => {
+          const on = d.device_mac === selected;
+          return `<div class="prow pick${on ? ' current' : ''}" onclick="pickDevice('${escapeAttr(d.device_mac)}')">` +
+            `<span class="name"><b>${escapeHtml(d.name || fallbackDeviceName(d))}</b>` +
+            `<small>${escapeHtml(d.device_mac)} · ${escapeHtml(d.ip || 'IP 未知')} · ${escapeHtml(d.job?.state || '无发布任务')}</small></span>` +
+            `<span class="ctl">${on ? '<span class="badge">当前</span>' : ''}</span></div>`;
+        }).join('')
+      : '<div class="todo" style="padding:10px">尚无已登记设备；先按键唤醒设备并重新发现。</div>';
+  }
+
+  function pickDevice(mac) {
+    if (!mac || mac === selectedDeviceMac) return;
+    const device = platformDevices.find(d => d.device_mac === mac);
+    openModal(`<h3>切换当前设备</h3>
+      <div>设备页将切换到 <b>${escapeHtml(device?.name || mac)}</b> · <code>${escapeHtml(mac)}</code>。</div>
+      <div class="muted">身份、实况、v2 状态、功耗、占用与恢复读取都会按它刷新。切换不会向任何设备推送，模板页的族选择也不受影响；当前设备未保存的 Profile 草稿会被丢弃。</div>
+      <div class="foot"><button onclick="closeModal()">取消</button>
+      <button class="primary" onclick="applyDeviceSelection('${escapeAttr(mac)}')">切换</button></div>`);
+  }
+
+  async function applyDeviceSelection(mac) {
+    selectedDeviceMac = mac;
+    localStorage.setItem(DEVICE_MAC_KEY, mac);
+    closeModal();
+    await refreshPlatformDevice();
+    await refreshDevice();
+    await refreshPlatformPower();
+    refresh();
+  }
+
   async function refreshPlatformDevice() {
     try {
       const data = await invoke('platform_devices');
-      $('registered-devices').innerHTML = (data.devices || []).map(d =>
-        `<div class="row"><span>${d.device_mac === data.selected_device_mac ? '当前 · ' : ''}${escapeHtml(d.name || '未命名')} · ${escapeHtml(d.device_mac)}</span>` +
-        `<span class="muted">${escapeHtml(d.ip || 'IP 未知')} · ${escapeHtml(d.job?.state || '无发布任务')}</span></div>`
-      ).join('') || '尚无已登记设备';
-      const device = (data.devices || []).find(d => d.device_mac === data.selected_device_mac) || (data.devices || [])[0];
+      platformDevices = data.devices || [];
+      const selected = resolveSelectedDevice(data.selected_device_mac);
+      renderRegisteredDevices(selected);
+      const device = platformDevices.find(d => d.device_mac === selected);
       platformDevice = device || null;
       if (!device) {
-        $('pt-device-state').textContent = 'v2 平台状态：尚未学习到设备 MAC';
+        $('pt-device-state').textContent = platformDevices.length > 1
+          ? 'v2 平台状态：请先在上方选择设备'
+          : 'v2 平台状态：尚未学习到设备 MAC';
+        $('pt-targets').textContent = '--';
+        $('pt-active').textContent = '--';
+        $('pt-jobinfo').textContent = '--';
+        $('pt-expect').textContent = '';
+        platformProfile = null;
+        renderPlatformOrder();
         return;
       }
       const caps = device.capabilities || {};
-      const legacy = device.legacy ? '（legacy：≤3 模板，走旧通道）' : '';
       $('pt-device-state').innerHTML =
-        `v2 平台状态 ${legacy} ${device.hardware_verified === false ? platformStateBadge('unverified') : ''}`;
+        `v2 平台状态 ${device.hardware_verified === false ? platformStateBadge('unverified') : ''}`;
       $('pt-targets').textContent =
         `${caps.firmware_target || '--'} / ${caps.render_target || '--'} · abi ${caps.compiler_abi || '--'}`;
       $('pt-active').textContent =
@@ -1194,8 +1255,8 @@
         (job.bytes != null ? ` · ${job.transferred_bytes || 0}/${job.bytes} B` : '') +
         (job.last_error ? ` · ${job.last_error}` : '') +
         (job.ack ? ` · ACK ${job.ack}` : '');
-      $('pt-expect').textContent = (data.devices || []).length > 1
-        ? '多设备：每台独立协调器，不做跨设备原子发布。' : '';
+      $('pt-expect').textContent = platformDevices.length > 1
+        ? '多设备：每台独立协调器，不做跨设备原子发布；上面的操作只作用于选中设备。' : '';
       const profile = device.profile;
       platformProfile = profile || null;
       $('pt-render-target').value = (profile && profile.render_target) || caps.render_target || '';
@@ -1307,7 +1368,7 @@
 
   async function publishPlatform() {
     try {
-      const preview = await invoke('platform_publish_preview');
+      const preview = await invoke('platform_publish_preview', { mac: selectedDeviceMac });
       platformPreviewTargetId = preview.target_id || null;
       openModal(`<h3>确认发布目标</h3>
         <pre style="white-space:pre-wrap;font-size:12px">${escapeHtml(JSON.stringify(preview, null, 2))}</pre>
@@ -1319,14 +1380,14 @@
   }
 
   async function previewPlatformPublish() {
-    try { const result = await invoke('platform_publish_preview');
+    try { const result = await invoke('platform_publish_preview', { mac: selectedDeviceMac });
       openModal(`<h3>发布预检</h3><pre style="white-space:pre-wrap;font-size:12px">${escapeHtml(JSON.stringify(result, null, 2))}</pre><div class="foot"><button onclick="closeModal()">关闭</button></div>`);
     } catch (e) { openModal(`<h3>预检失败</h3><div>${escapeHtml(String(e))}</div><div class="foot"><button onclick="closeModal()">关闭</button></div>`); }
   }
 
   async function confirmPlatformPublish() {
     try {
-      const result = await invoke('platform_publish', {expectedTargetId: platformPreviewTargetId});
+      const result = await invoke('platform_publish', {expectedTargetId: platformPreviewTargetId, mac: selectedDeviceMac});
       openModal(`<h3>发布已排队</h3>
         <pre style="white-space:pre-wrap;font-size:12px">${escapeHtml(JSON.stringify(result, null, 2))}</pre>
         <div class="sub">发布冻结当前内容；等待设备会合/唤醒后提交。保存不会自动发布。</div>
@@ -1339,12 +1400,12 @@
   }
 
   async function cancelPlatformPublish() {
-    await invoke('platform_publish_cancel');
+    await invoke('platform_publish_cancel', { mac: selectedDeviceMac });
     await refreshPlatformDevice();
   }
 
   async function refreshPlatformStatus() {
-    const result = await invoke('platform_status_refresh');
+    const result = await invoke('platform_status_refresh', { mac: selectedDeviceMac });
     openModal(`<h3>设备权威状态</h3>
       <pre style="white-space:pre-wrap;font-size:12px">${escapeHtml(JSON.stringify(result, null, 2))}</pre>
       <div class="foot"><button onclick="closeModal()">关闭</button></div>`);
@@ -1353,7 +1414,7 @@
 
   async function recoverPlatform() {
     try {
-      const status = await invoke('platform_status_refresh');
+      const status = await invoke('platform_status_refresh', { mac: selectedDeviceMac });
       const digest = (status && status.status) || {};
       const result = await invoke('platform_recovery', { digest });
       openModal(`<h3>恢复导入</h3>
@@ -1368,7 +1429,7 @@
 
   async function refreshPlatformPower() {
     try {
-      const data = await invoke('platform_power');
+      const data = await invoke('platform_power', { mac: selectedDeviceMac });
       const summary = data.coordinator || {};
       const plan = summary.plan || {};
       const sent = plan.last_sent || {};
@@ -1388,7 +1449,7 @@
 
   async function platformPlan(mode) {
     try {
-      const result = await invoke('platform_plan', { mode });
+      const result = await invoke('platform_plan', { mode, mac: selectedDeviceMac });
       openModal(`<h3>PowerPlan ${escapeHtml(mode)}</h3>
         <pre style="white-space:pre-wrap;font-size:12px">${escapeHtml(JSON.stringify(result, null, 2))}</pre>
         <div class="foot"><button onclick="closeModal()">关闭</button></div>`);
@@ -1445,11 +1506,10 @@
   }
 
   renderFamilyMenu();
-  refresh();
   refreshProfiles();
   refreshPlatformTemplates();
-  refreshPlatformDevice();
-  refreshPlatformPower();
+  // Resolve the selected device before painting the device-dependent cards.
+  refreshPlatformDevice().then(() => { refresh(); refreshPlatformPower(); });
   refreshPlatformData();
   setInterval(refresh, 3000);
 </script>
