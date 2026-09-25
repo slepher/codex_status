@@ -40,16 +40,39 @@ shell 里对某些已存在的文件报 "Access to the path … is denied"，而
 
 ## 只改所有者（最小修复，推荐先做这一步）
 
-**实测：DSH 会话里改不了所有者。** 当前令牌不是管理员，`SetOwner` 直接被拒：
+**实测：DSH 会话里改不了所有者，连 `danger-full-access` 提权也不行。** 2026-09-25 试了三次：
 
 ```
 SetOwner FAILED: Attempted to perform an unauthorized operation.
-elevated?     False
+elevated?     False          ← 提权批准后依然是 False
 current SID:  S-1-5-21-341968838-3967994556-1780607818-1001
 ```
 
+**关键结论：沙箱提权只放宽"路径写入"限制，不会把令牌变成管理员**，因此 `SeRestorePrivilege`
+永远拿不到。所以这一步只能由你在管理员终端执行。（`elevated? False` 是判据：只要它是 False，
+改属主就一定失败。）
+
+### 同一次实测得到的其余事实（有用）
+
+把"改属主 + 补 ACE"放在同一个循环里跑，失败了 64 项、成功 90 项，**失败集合与"属主不是 cogic"
+的集合完全重合**：
+
+| 目录 | 总对象 | 属主非 cogic | 缺 ACE | 结果 |
+|---|---|---|---|---|
+| `generic-display-platform-design` | 4 | **4** | 4 | 全失败 |
+| `generic-display-platform-implementation` | 95 | **55** | 55 | 属主非 cogic 的 55 个全失败，其余 40 个补 ACE 成功 |
+| `ble-rendezvous-power` | 14 | **4** | 4 | 4 个失败，其余 10 个补 ACE 成功 |
+| `live-template-delivery` | 7 | 1 | 1 | 只有目录本身失败（它属主是 `CodexSandboxOffline`），6 个文件补 ACE 成功 |
+
+推论：
+1. **属主是闸门。** 属主是 `CodexSandboxOffline` 的对象，我的令牌既改不了属主也改不了 DACL。
+2. **属主是 cogic 但缺 ACE 的对象，DACL 是可以改的**（沙箱令牌带 `WRITE_DAC`），所以补 ACE
+   那一步能在沙箱内完成——90 个对象已经补好了。
+3. 因此在管理员终端里跑下面这段时，**真正必须做的只有"改属主"**；补 ACE 可以留着，
+   重复执行也无害（脚本会跳过已有 ACE 的对象）。
+
 改所有者需要 `SeRestorePrivilege`，只有**提权**进程有。所以这一步必须由你自己执行。
-在**提权**的 PowerShell 里粘这段（复制粘贴即用，不含变量占位）：
+在**管理员** PowerShell 里粘这段（复制粘贴即用，不含变量占位）：
 
 ```powershell
 $root = 'D:\Documents\PlatformIO\Projects\codex_status'
@@ -59,6 +82,12 @@ $me   = New-Object System.Security.Principal.SecurityIdentifier(
 "running as: $($me.Value)   elevated: " +
   ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
    ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+# 硬闸门：不是管理员就别继续，否则每个对象都报 "unauthorized operation"
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+          ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw '先以管理员身份重开 PowerShell（"以管理员身份运行"），否则改不了属主。'
+}
 
 # 只处理确实需要改的 4 个目录（其余 project-workflow 文件属主已经是 cogic）
 $targets = @(
