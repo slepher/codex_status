@@ -1,5 +1,9 @@
 # Astra 修订评审（2026-09-26）
 
+## D/E/F 出口复核
+
+软件验收通过：M01–M18 每类有代表性结果或精确边界（`evidence.md`）；24 h 双 MAC 协作运行各 1,440 次 wake，失步输入保持每 MAC 独立；同一快照两次进程重启的 1 h trace 与帧 CRC 逐字节相同。首次回放失败暴露宿主模板时钟泄漏，已修共享引擎并补定向像素测试。完整 Rust 目标测试、默认 Note4 ROM 构建、marker/大小/SHA 核对通过，具体数值见 PROGRESS 顶节。这里的“完整”限定软件 Fake ROM；G 已取消，真实 GATT/面板/掉电边界只留硬件 case 文档。
+
 ## D 增量复核
 
 29 项 bootstrap 通过；新增硬退出并非短写返回错误：slot 或 metadata 同步后进程立即终止，重启仍保留旧完整 job。OTA pending 在延迟重启前终止，重启完成切换。动态字段从 Data 写入到帧字节与预览一致。USB/电池输入只验证软件决定，不作为真实 ADC/USB/屏幕证据。仅 Note4 固件重建成功，产物 SHA256 见 PROGRESS；D 的 BLE 生命周期、E/F 尚无出口证据。

@@ -712,8 +712,35 @@ pub struct DeviceRecord {
     /// Last observed device state (authoritative snapshot digest from Status).
     #[serde(default)]
     pub observed: ObservedState,
+    /// Last MAC-checked, endpoint-token authenticated /v2/status response.
+    #[serde(default)]
+    pub last_authenticated: Option<AuthenticatedStatus>,
+    #[serde(default)]
+    pub last_authenticated_contact_at: Option<u64>,
+    #[serde(default)]
+    pub last_authenticated_transport: Option<String>,
+    /// Most recent authenticated status attempt; never replaces the snapshot.
+    #[serde(default)]
+    pub last_status_attempt: Option<StatusAttempt>,
     #[serde(default)]
     pub sync_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthenticatedStatus {
+    pub observed_at: u64,
+    #[serde(default)]
+    pub transport: String,
+    #[serde(default)]
+    pub schema_version: u32,
+    pub body: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusAttempt {
+    pub at: u64,
+    pub outcome: String,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

@@ -79,13 +79,16 @@ static bool targetUnverified = false;
 #define FW_VERSION    "0.13.9-clkwin"
 #elif defined(CODEX_TARGET_NOTE4)
 #ifdef CODEX_NOTE4_ROM_B
-#define FW_VERSION    "0.18.23-note4-b"
+#define FW_VERSION    "0.18.24-note4-b"
 #else
 #define FW_VERSION    "0.18.19-note4-a"
 #endif
 #else
-#define FW_VERSION    "0.18.23-bw"
+#define FW_VERSION    "0.18.24-bw"
 #endif
+// Bridge OTA queue checks this exact build identity before freezing an image.
+static const char OTA_IMAGE_IDENTITY[] __attribute__((used)) =
+    "codex-status-ota-v1|" FW_TARGET_ID "|" FW_VERSION;
 #define AP_PASSWORD   "codex1234"
 #define MAX_SLOTS     3
 
@@ -2834,6 +2837,7 @@ static void handleStatus() {
 static void handleStatusJson() {
     JsonDocument doc;
     doc["fw"] = FW_VERSION;
+    doc["ota_identity"] = OTA_IMAGE_IDENTITY;
     doc["mac"] = macText();
     const esp_partition_t *running = esp_ota_get_running_partition();
     const esp_partition_t *next = esp_ota_get_next_update_partition(nullptr);
@@ -4098,6 +4102,7 @@ static void handleV2Status() {
     markSynced();   // authenticated bridge contact (v2 HTTP channel)
     V2StatusSnapshot snapshot;
     snapshot.mac = macText();
+    snapshot.firmwareVersion = FW_VERSION;
     snapshot.sessionNonce = v2Nonce();
     snapshot.profile = &v2Profile;
     snapshot.configured = v2BundleReady;

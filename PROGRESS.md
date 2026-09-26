@@ -1,5 +1,60 @@
 # Codex Status 项目进度（交接文档）
 
+## Fake ROM D/E/F 软件验收完成（2026-09-26）
+
+- 用户范围为 D/E/F；G 整套实机回归取消。M01–M18 按错误类别取代表软件 case，明细见 `docs/history/workflow/fake-rom-simulator-def/evidence.md`。D/E/F 不能证明的 Windows GATT 缓存、面板 BUSY/LUT、真实 Flash/RTC 掉电边界仅记录在同目录 `hardware-cases.md`；没有实现或执行硬件 case。
+- Fake ROM 已用固件同源 C++ 处理 Bundle/Data/Activate/Plan/claim 与画面；两族真实 v2_client 安装、1–8 项循环、A/B 文件恢复、丢 ACK 后认证对账、有限版本 OTA 与 USB/低电软件判定通过代表性测试。timer wake 仅开放有界 fake BLE 窗口，真实 `bridge_ble::V2Connection` 经显式 loopback 注册表连接、分片与身份/nonce 校验；正式 BLE Plan 后 HTTP 才开放。隔离 Bridge 的 `CODEX_STATUS_SIM_COOPERATIVE=1` 关闭后台轮询，`/sim/run` 单轮与 `/sim/clock` step 通过在途屏障；设备与 Bridge 各 MAC 的单调/wall 时钟可暂停、推进、跨进程恢复，真实 MAC 保持宿主时钟。
+- 隔离 1.54 Fake A `0200000000A1` 与 Note4 Fake B `0200000000B2` 完整协作运行 **24 h 虚拟时间、2,880 个事件、各 1,440 次 timer wake**；`artifacts/fake-rom-f/day.ndjson`（ignored）SHA256 `243652A49D5E346BC2A977F692EE4915820BF4B614492600A1F92678B47A7DCD`。另 10 min 失步输入 A 1.0×、B 设备 1.1× / Bridge 0.9×，A 增 10 wake、B 增 11 wake，B 设备/桥时间独立。所有端点均为 127.0.0.1，运行数据在独立 `artifacts/`，生产 Bridge/实机未触碰。
+- 首次同快照双回放发现画面 CRC 不同：共享模板引擎在宿主渲染 `device.now/date` 时读真实 `time(nullptr)`。现由 `TplEnv` 可选实验 wall 时间供 Fake ROM 使用；默认生产路径继续读设备时钟。新增跨设备 1 h wall 偏移像素测试。修复后同一磁盘快照两次进程重启、各 1 h/101 事件的归一化 trace 与帧 CRC **逐字节相同**，`replay3.ndjson`/`replay4.ndjson` SHA256 均 `76AC0223DA6E40372B4F5B391DA0A83D83FE2D16E7E1879D7FCD4D359DB7CF84`。旧失败 trace 留在 ignored artifacts 用于归因，不算通过证据。
+- 隔离 Cargo target 下 `cargo test -p bridge-render -p device-sim -p bridge-core -p bridge-ble -p bridge-app` 通过（device-sim bootstrap **32/32**、core 90/90、app 39/39、ble 14/14、render 全部）；`node --check tools/fake-rom-runner.mjs`、`git diff --check` 通过。仅按默认目标 `pwsh tools/pio-target.ps1 -Target note4` 重建成功，ROM `.pio/build/zectrix-note4-b/firmware.bin`，`0.18.24-note4-b`，**1,758,720 B**，SHA256 **`2008735108E95CEC2511527A0A5B028496B0E1B947EC4D53F8ACD6B7BF22C9D0`**，target/version marker 均在；未刷写。隔离 Bridge/watchdog/Fake 进程已全部停止。
+
+## 双设备 ROM 顺序发布与实机验证（2026-09-26，主路径完成）
+
+- 用户本轮明确授权顺序发布 Note4 与 1.54 两份 ROM 并实机测试；`AGENTS.md` 的默认只构建 Note4 成本约束已增加本轮 154g 标准 B/W 目标例外，两个 PIO 进程不并行。现场以 `bridge/target/debug/data/platform/state.json` 登记为准：Note4 `7C4FADB93408`、1.54 `70041DD7A340`。
+- Note4 已发布 ROM：`.pio/build/zectrix-note4-b/firmware.bin`，`0.18.24-note4-b`，1,759,040 B，SHA256 `7B123BA616D3E75E38BFF2D8EBD9F3C945B2FF25CB9BCF4FC2B256C83E3A832D`，含 `codex-status-ota-v1|zectrix-note4-400x300|0.18.24-note4-b` marker。
+- 新构建 1.54：`tools/pio-target.ps1 -Target 154g` 单目标成功（51.36 s，无 framework 重装）；`.pio/build/esp32-s3-epaper-154g/firmware.bin`，`0.18.24-bw`，1,740,832 B，SHA256 `55B8BC9421CE1CA2DE981982A37318271B25A99DAF866F824B116C9FF1B30D78`，含 `codex-status-ota-v1|codex-status-154g|0.18.24-bw` marker；镜像头 `e9 07 02 30` 对应 8 MB / 40 MHz。
+- 两台登记 IP 上 `/status.json` 本轮各 4 s 超时；设备操作 token 文件均在。先向 Note4 MAC 持久入队 OTA：job `a0959afd`，request `sleep-aware-20260926-note4-01824`，冻结 SHA256/大小与上述 ROM 一致。自然会合后 1 次上传收到 `UPDATE OK`；随后同 MAC 认证 `/v2/status` 快照 `fw=0.18.24-note4-b`、`observed_at=1790408480`。旧 ROM 的上传前认证 `fw` 未知，因此 job 保留 `awaiting_confirmation` / `version_seen_unproven`，未重刷；公开状态在设备再次深睡时不可读，精确运行镜像 SHA256 仍未证明。
+- 完成首台上传与新版本认证观察后，才向 1.54 MAC 入队：job `584b67f5`，request `sleep-aware-20260926-154g-01824`，冻结 SHA256/大小与上述 1.54 ROM 一致。自然会合后 1 次上传收到 `UPDATE OK`；随后同 MAC 认证状态见 `fw=0.18.24-bw`。两台 OTA 均只上传 1 次，仍为 `awaiting_confirmation` / `version_seen_unproven`，没有精确运行镜像 SHA256 证据。
+- 发现并修正：OTA 有 ACK 且认证见预期版本后仍因待精确确认永久阻挡后续模板发布；当前只解除对独立业务的阻塞，OTA 状态/不重刷约束保留。重建 Bridge 后，Note4 Bundle job `e48f608e` 与 1.54 job `98d2c0b9` 均自然会合 `succeeded` 且认证 `committed_job_id` 匹配；1.54 另一个 job `776b2f66` 在 waiting 时跨 Bridge 重启，之后自然交付 `succeeded`。运行数据保留设备 2、模板 3、族配置 2。
+- 电源与显示：Note4 显式 light PowerPlan `209` 收到 600 s ACK；显式 sleep `210` 收到设备 applied/0 s，发现 Bridge 未记 sleep ACK 后已修正并重建。最终显式 sleep `214` 的 HTTP ACK `applied/0` 已由 `power_view_v2` 复核 last_sent/last_accepted 均为 214、剩余 0。错误 token 的只读 `/v2/status` 探针限时 50 s / 17 次均无 HTTP 响应，401 未获结论，随后已结束临时 light 请求。Note4 认证 `display_state` 曾在 failed/displayed 间交替；用户看见实物屏幕为正常休眠画面，渲染报告异常待设备日志归因。
+- 最终 Bridge `bridge/target/debug/bridge-app.exe` 33,591,808 B，SHA256 `18099053D269073F4D708C2CE3D4F26EA65051466A0A90547F5B9B78A81C6BEF`；主 PID `16692`、watchdog `30368`，HTTP/MCP 监听 8765/8766。core OTA 定向测试、app 38 项与 `git diff --check` 通过。剩余实机矩阵：错 IP/401/409 注入、长期 PowerPlan 截止期、精确镜像身份、Note4 间歇 display_state=failed 归因；待办唯一来源见 `docs/roadmap/backlog.md`。
+
+## Bridge 休眠快照与按 MAC 延后操作：S1–S4 实施，S5 待实机（2026-09-26）
+
+- 设备页从平台持久记录按需初始化每台已登记设备的 runtime；保存 MAC 核对且 endpoint-token 认证的 `/v2/status` 有界快照、采样时间、BLE 认证联系时间与单独的最近尝试。正常深睡显示预计休眠/等待联系，不清空旧快照；401/错 MAC 单列阻塞。公开 `/status.json` 仅作近期补充，不再作为发布确认。MCP `platform_overview` 返回同一记录。当前设备未刷新 ROM 时认证 `fw` 字段缺失，旧快照如实显示未知。
+- 模板发布冻结后等待下次认证会合；重启时 `Sending → Unknown`，禁止未经状态对账重发。OTA 入队先校验 `codex-status-ota-v1|target|version` 镜像标识，再冻结文件、SHA256/大小与目标 MAC 并持久化；MCP `firmware_ota(_status/_cancel)` 共用 app service。按 MAC 的认证、正式 PowerPlan、claim 与互斥执行；旧的 selected-MAC/global pending OTA flush 已删除。上传 ACK、预期版本观察和精确镜像确认分层；当前精确身份不可用，保留 `awaiting_confirmation`、不自动重刷。
+- Q1–Q3 决定：同类任务冲突，queued/waiting 须显式取消再新建；同 MAC OTA/发布各一项按创建时间串行（同秒 OTA 先）；版本只作限定证据，`image_verified` 才可作为 OTA 精确完成。详见 `project-workflow/sleep-aware-bridge/design.md`。未提交、未刷写真实设备、未执行真实发布/OTA。
+- 验证：core 平台服务 20 项、app 38 项、mcp 2 项通过；UI 内联 JS `node --check` 与 `git diff --check` 通过。最终 Bridge `cargo build -p bridge-app` 成功：`bridge/target/debug/bridge-app.exe` 33,589,248 B，SHA256 `ABFD76695CF453B757BE8C7C8F4CED3500AA28693AAD60A2E55C05AF427722E1`。watchdog → 主进程安全停旧版再启动：主 PID `49864` 监听 8765/8766，watchdog `18940`；MCP overview 返回设备 2，运行数据保留模板 3、族配置 2，当前两台最近尝试均 offline（正常深睡），没有 OTA 任务。
+- 固件只构建 `zectrix-note4-b`，版本 `0.18.24-note4-b`：`.pio/build/zectrix-note4-b/firmware.bin` 1,759,040 B，SHA256 `7B123BA616D3E75E38BFF2D8EBD9F3C945B2FF25CB9BCF4FC2B256C83E3A832D`；二进制核对含目标/版本 marker。因共享 `sdkconfig.defaults` 指纹，首次 `pio run -d <repo> -e zectrix-note4-b` 触发 framework 重装，历时约 15m48s；没有构建其他 env。
+- S5 剩余：两台设备自然认证会合的真实任务交付/错误矩阵与 PowerPlan 截止期、Note4 新 ROM 上机后的认证 `fw` 验证，以及运行镜像精确摘要能力。当前任务未授权刷写，故不把单测当作实机验收；唯一待办入口已更新 `docs/roadmap/backlog.md`。
+
+## 休眠设备状态与延后操作：Luna 调查 + Astra 方案（2026-09-26）
+
+- 用户确认合同：设备日常休眠属正常；设备页显示上次成功通信数据与时间，显式模板发布/OTA 安排在目标 MAC 下次认证会合，不把暂时不可达报成设备故障。`has no runtime record` 是桥的本地记录缺口，需单独修复。
+- Luna 只读核查桥端与 ROM：`get_device_status` 没用现有的 `ensure_runtime_record`；设备页完整快照仅在进程内存；模板发布已有按 MAC 持久任务；OTA 只有部分 MCP 错误分支的内存队列，flush 从当前 selected MAC 取目标且传 `mac`，底层 OTA 读取 `device_mac`；现有 OTA 成功只看 60s 内版本变化。固件定时 deep 唤醒是有界会合，`/v2/status` 有 endpoint token 鉴权。
+- Astra 基于以上证据写 `project-workflow/sleep-aware-bridge/plan.md`、`design.md`、`task.md`、`review.md`：最后成功快照/尝试分离、按 MAC 持久 OTA、会合交付、ACK/重启确认、取消与故障矩阵。明确当前能力与提案的差别，精确镜像确认需要新增 ROM 能力。Q1 任务替换、Q2 OTA/发布排序、Q3 版本确认门槛留作产品决策并给安全默认建议。
+- **仅文档，未改桥/ROM 实现，未构建、重启或触碰设备。** 待办唯一来源仍是 `docs/roadmap/backlog.md`。
+
+## Bridge 模板菜单越窗修复（2026-09-26）
+
+- 用户截图显示模板页打开「配置」下拉菜单后产生页面横向滚动条。根因是菜单绝对定位 `left:0`，按钮靠右时 210px 宽菜单向窗口外延伸并扩大文档 `scrollWidth`。
+- `ui/index.html` 将该菜单与「⋯」菜单一样右对齐；菜单宽度限制在视口内，长状态/模板名允许折行，按钮组窄窗口时靠右排列。普通 WebView 内容仍会被 Tauri 原生窗口裁切，不采用窗口外渲染。
+- 内联 JS 语法、HTML DOM id 唯一性、`git diff --check` 通过；`cargo build -p bridge-app` 成功（9.34s）。新 exe `bridge/target/debug/bridge-app.exe` 33,404,928 B，SHA256 `7AB1C3E014E3597E40C0B5DFE46AE678A11A2274943F767A668AE0F5CAC5CC8D`。
+- 已按 watchdog → 主进程顺序停旧版，并从非受限命令启动新版；主进程 PID `54980` 监听 8765/8766，watchdog PID `4716`。运行数据目录未清理；设备 2、模板 3、族配置 2 仍在。用户截图已确认旧版现象；本轮 UI 捕获工具再次返回空清单，修复后的实际窗口截图未能自动验收。
+
+## Bridge 新界面已重建并重启（2026-09-26）
+
+- 用户要求让上一轮 UI 第一版进入运行中的 Bridge。先核对主进程 `47028`（HTTP 8765/MCP 8766）与同路径 watchdog `22924`，按 watchdog → 主进程顺序停止；没有清理 `target/debug` 或 `data/`。
+- `cargo build -p bridge-app` 成功（33.72s），新 exe `bridge/target/debug/bridge-app.exe` 33,404,928 B，SHA256 `C916F25F36A92C84CC94128A244A5A847EDF17D3A32FCB65582CBB94EAB2D5BB`。
+- 非受限启动脚本成功；新主进程 PID `23880` 监听 `0.0.0.0:8765` 与 `127.0.0.1:8766`，另有同路径 watchdog PID `55124`。运行数据保留：`state.json` 中设备 2、模板 3、族配置 2；`git diff --check` 通过。
+- 尚未肉眼验收 Tauri 窗口布局；该窗口默认隐藏在托盘，用户打开后可直接查看新版。
+
+## Bridge 界面视觉与内容第一版（2026-09-25）
+
+- `bridge/crates/app/ui/index.html`：四个 Tab 换成统一的浅色纸面、深绿强调、清晰卡片/按钮/导航风格；模板页保留现有功能内容。设备页按当前屏幕与连接、余量、占用、平台状态、Profile/发布排序，固件细节和恢复收起；数据页突出来源和字段快照，测试 JSON 收起；MCP 页突出接入地址与复制提示，端口设置收起。去掉一直没有赋值的设备页 5H 余量占位。
+- 不变更后端命令或设备协议。内联 JS 语法、HTML DOM（72 个 id 无重复，四个 Tab 对应）和 `git diff --check` 均通过。
+- **未重建/重启运行中的桥**：UI 是嵌入 exe 的，当前窗口仍是旧版。Windows UI 捕获工具返回空窗口/浏览器清单，本轮没有实际截图验收；下一轮按用户反馈做视觉细化。工作记录见 `project-workflow/bridge-ui-redesign/`。
+
 ## 桥：Profile 丢失根因修复 + 桥侧 legacy/迁移清除 + 按 MAC 多设备路由（2026-09-25，进行中）
 
 专项现场在 `project-workflow/bridge-multi-device-ui/task-phase3.md`（含分步验收、收尾流程、自检清单）；

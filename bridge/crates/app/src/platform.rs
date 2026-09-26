@@ -30,6 +30,11 @@ pub fn service(ctx: &AppCtx) -> &Arc<PlatformService> {
     &ctx.platform
 }
 
+fn delivery_lock(ctx: &AppCtx, mac: &str) -> Arc<tokio::sync::Mutex<()>> {
+    ctx.per_mac_delivery.lock().unwrap().entry(mac.to_uppercase())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+}
+
 /// Device link from the selected device's runtime record + cached device token;
 /// `None` when the token has not been negotiated yet (click BOOT to open the
 /// BLE session) or no device is selected.
@@ -137,7 +142,7 @@ fn registration_identity(mac: &str, endpoint: &str, name: &str) -> Result<Device
     let mut identity = DeviceIdentity::new(mac, name).map_err(err_text)?;
     identity.ip = Some(endpoint.to_string());
     identity.discovered_via = "manual".into();
-    identity.last_seen_at = now_secs();
+    identity.last_seen_at = device_now(&mac);
     Ok(identity)
 }
 
@@ -595,7 +600,7 @@ pub fn family_profile_copy_from_device(
     name: &str,
 ) -> Result<Value, String> {
     let saved = service(ctx)
-        .family_profile_copy_from_device(mac, id, name, now_secs())
+        .family_profile_copy_from_device(mac, id, name, device_now(&mac))
         .map_err(err_text)?;
     Ok(json!({"saved": saved}))
 }
@@ -610,12 +615,11 @@ pub async fn publish(
     expected_target_id: Option<&str>,
 ) -> Result<Value, String> {
     let job = service(ctx)
-        .publish_checked(mac, now_secs(), expected_target_id, Some(&ctx.bridge_id))
+        .publish_checked(mac, device_now(&mac), expected_target_id, Some(&ctx.bridge_id))
         .map_err(err_text)?;
-    let delivery = deliver(ctx, mac).await;
     Ok(json!({
         "job": job,
-        "delivery": delivery,
+        "delivery": {"result": "waiting_for_authenticated_contact"},
         "state": service(ctx).job(mac),
     }))
 }
@@ -635,8 +639,9 @@ pub fn font_import(ctx: &AppCtx, path: &str) -> Result<Value, String> {
 }
 
 pub fn job_cancel(ctx: &AppCtx, mac: &str) -> Value {
-    service(ctx).cancel_job(mac, now_secs());
-    json!({"cancelled": true, "job": service(ctx).job(mac)})
+    service(ctx).cancel_job(mac, device_now(&mac));
+    let job = service(ctx).job(mac);
+    json!({"cancelled": job.as_ref().is_some_and(|j| j["state"] == "cancelled"), "job": job})
 }
 
 pub async fn activate(ctx: &AppCtx, mac: &str, template_id: &str) -> Result<Value, String> {
@@ -646,15 +651,20 @@ pub async fn activate(ctx: &AppCtx, mac: &str, template_id: &str) -> Result<Valu
 
 /// Execute at most one pending coordinator action against the device.
 pub async fn deliver(ctx: &AppCtx, mac: &str) -> Value {
-    let _delivery = ctx.v2_delivery.lock().await;
+    let lock = delivery_lock(ctx, mac);
+    let _delivery = lock.lock().await;
+    if service(ctx).ota_job(mac).is_some_and(|j| j.blocks_following_work()) {
+        return json!({"result": "waiting_for_ota_confirmation"});
+    }
     if service(ctx).asset_job_pending(mac) {
         return json!({"result": "waiting_for_device_protocol", "reason": "versioned manifest/object endpoints are pending joint device confirmation"});
     }
     let Some(link) = device_link_for_mac(ctx, mac) else {
+        let _ = service(ctx).note_status_attempt(mac, "waiting_for_link", None);
         return json!({"result": "waiting_for_link", "reason": "device token/ip not available; open a BOOT session"});
     };
     let reachable = true;
-    let decision = service(ctx).next_http_delivery(mac, reachable, now_secs());
+    let decision = service(ctx).next_http_delivery(mac, reachable, device_now(&mac));
     match decision["decision"].as_str().unwrap_or("none") {
         "bundle" => {
             if let Err(e) = service(ctx).bind_pending_bundle_owner(mac, &link.bridge_id) {
@@ -688,12 +698,12 @@ pub async fn deliver(ctx: &AppCtx, mac: &str) -> Value {
                         .unwrap_or_default();
                     if ack["result"] == "applied" {
                         let ctx_id = ack["active_context_id"].as_str().unwrap_or("");
-                        service(ctx).retry_job(mac, &job_id, true, now_secs());
+                        service(ctx).retry_job(mac, &job_id, true, device_now(&mac));
                         if !ctx_id.is_empty() {
-                            let _ = service(ctx).adopt_activation_context(mac, ctx_id, now_secs());
+                            let _ = service(ctx).adopt_activation_context(mac, ctx_id, device_now(&mac));
                         }
                     } else {
-                        let _ = service(ctx).retry_job(mac, &job_id, false, now_secs());
+                        let _ = service(ctx).retry_job(mac, &job_id, false, device_now(&mac));
                     }
                     json!({"result": "bundle", "ack": ack})
                 }
@@ -727,7 +737,7 @@ pub async fn deliver(ctx: &AppCtx, mac: &str) -> Value {
                 Ok(ack) => {
                     if ack["result"] == "applied" {
                         if let Some(ctx_id) = ack["active_context_id"].as_str() {
-                            let _ = service(ctx).note_activate_done(mac, ctx_id, now_secs());
+                            let _ = service(ctx).note_activate_done(mac, ctx_id, device_now(&mac));
                         }
                     }
                     json!({"result": "activate", "ack": ack})
@@ -809,13 +819,14 @@ pub async fn send_plan(
     wake_reason: &str,
     provisional_remaining_s: u32,
 ) -> Value {
-    let _delivery = ctx.v2_delivery.lock().await;
+    let lock = delivery_lock(ctx, mac);
+    let _delivery = lock.lock().await;
     let Some(link) = device_link_for_mac(ctx, mac) else {
         return json!({"result": "waiting_for_link"});
     };
     let plan = match service(ctx).plan_for_rendezvous(
         mac,
-        now_secs(),
+        device_now(&mac),
         wake_reason,
         provisional_remaining_s,
     ) {
@@ -844,7 +855,7 @@ pub async fn send_plan(
                     remaining as u32,
                     plan.mode == bridge_core::platform::model::PlanMode::Light
                         && provisional_remaining_s > 0,
-                    now_secs(),
+                    device_now(&mac),
                 );
             }
             let ack_category = if !accepted {
@@ -874,8 +885,9 @@ pub async fn send_plan(
 /// User-requested light window. Freeze one formal plan before attempting any
 /// transport so a deep-sleeping device receives the same ID over BLE later.
 pub async fn request_light(ctx: &AppCtx, mac: &str) -> Value {
-    let _delivery = ctx.v2_delivery.lock().await;
-    let (plan, already_pending) = match service(ctx).queue_explicit_light(mac, now_secs()) {
+    let lock = delivery_lock(ctx, mac);
+    let _delivery = lock.lock().await;
+    let (plan, already_pending) = match service(ctx).queue_explicit_light(mac, device_now(&mac)) {
         Ok(value) => value,
         Err(e) => return json!({"result": "failed", "error": e.to_string()}),
     };
@@ -906,7 +918,7 @@ pub async fn request_light(ctx: &AppCtx, mac: &str) -> Value {
         Ok(ack) if ack["result"] == "applied" => {
             let remaining = ack["accepted_remaining_s"].as_u64().unwrap_or(0) as u32;
             let confirmation =
-                service(ctx).note_plan_ack(mac, plan.plan_id, remaining, false, now_secs());
+                service(ctx).note_plan_ack(mac, plan.plan_id, remaining, false, device_now(&mac));
             tracing::info!(event = "ack", device_mac = %mac, plan_id = plan.plan_id,
                 result = ack["result"].as_str().unwrap_or("unknown"),
                 ack_plan_id = ack["plan_id"].as_u64().unwrap_or(0),
@@ -958,7 +970,7 @@ pub async fn refresh_status(ctx: &AppCtx, mac: &str) -> Value {
             mac,
             false,
             None,
-            crate::now_secs(),
+            device_now(&mac) as i64,
         );
         return json!({"result": "waiting_for_link"});
     };
@@ -971,32 +983,41 @@ pub async fn refresh_status(ctx: &AppCtx, mac: &str) -> Value {
                 .zip(DeviceIdentity::normalized_mac(mac))
                 .is_some_and(|(actual, expected)| actual == expected);
             if !matches_target {
+                let _ = service(ctx).note_status_attempt(mac, "mac_mismatch", Some("authenticated response named another MAC"));
                 crate::update_v2_status_cache(
                     &mut ctx.v2_status_cache.lock().unwrap(),
                     mac,
                     false,
                     None,
-                    crate::now_secs(),
+                    device_now(&mac) as i64,
                 );
                 return json!({"result": "error", "error": format!("authenticated status MAC {} does not match target MAC {}", status["device_mac"].as_str().unwrap_or("<missing>"), expected_mac)});
             }
             let _ = service(ctx).note_device_status(mac, &status);
+            if let Err(e) = service(ctx).note_authenticated_status(mac, &status) {
+                return json!({"result": "error", "error": format!("persist authenticated status: {e}")});
+            }
+            let _ = service(ctx).ota_note_authenticated_version(mac, &status);
             crate::update_v2_status_cache(
                 &mut ctx.v2_status_cache.lock().unwrap(),
                 mac,
                 true,
                 Some(status.clone()),
-                crate::now_secs(),
+                device_now(&mac) as i64,
             );
             json!({"result": "ok", "status": status})
         }
         Err(e) => {
+            let outcome = if e.contains("401") || e.contains("403") || e.contains("409") {
+                "blocked"
+            } else { "offline" };
+            let _ = service(ctx).note_status_attempt(mac, outcome, Some(&e));
             crate::update_v2_status_cache(
                 &mut ctx.v2_status_cache.lock().unwrap(),
                 mac,
                 false,
                 None,
-                crate::now_secs(),
+                device_now(&mac) as i64,
             );
             json!({"result": "offline", "error": e})
         }
@@ -1013,7 +1034,7 @@ pub async fn post_ota_window(ctx: &AppCtx, requested_mac: &str, secs: u32) {
         tracing::warn!("post-OTA window skipped: invalid device MAC");
         return;
     };
-    if let Err(e) = service(ctx).hold_light(&mac, now_secs() + secs as u64) {
+    if let Err(e) = service(ctx).hold_light(&mac, device_now(&mac) + secs as u64) {
         tracing::debug!("post-OTA hold: {e}");
         return;
     }
@@ -1058,7 +1079,7 @@ pub async fn post_ota_window(ctx: &AppCtx, requested_mac: &str, secs: u32) {
                     plan.plan_id,
                     ack["accepted_remaining_s"].as_u64().unwrap_or(0) as u32,
                     false,
-                    now_secs(),
+                    device_now(&mac),
                 );
             }
             tracing::info!(
@@ -1121,7 +1142,7 @@ pub fn power_view(ctx: &AppCtx, requested_mac: &str) -> Value {
     let mac = DeviceIdentity::normalized_mac(requested_mac)
         .or_else(|| crate::selected_mac(ctx))
         .unwrap_or_default();
-    let summary = service(ctx).coordinator_summary(&mac, now_secs());
+    let summary = service(ctx).coordinator_summary(&mac, device_now(&mac));
     let explicit = summary.as_ref().map(|s| &s["plan"]);
     let pending = explicit.map(|p| &p["pending_explicit_light"]);
     let ack = explicit.map(|p| &p["last_explicit_light_ack"]);
@@ -1133,7 +1154,7 @@ pub fn power_view(ctx: &AppCtx, requested_mac: &str) -> Value {
         "coordinator": summary,
         "explicit_light": {"state": if pending.is_some_and(|p| !p.is_null()) { "queued" }
             else if ack.is_some_and(|a| !a.is_null()) {
-                if now_secs() < hold_until { "applied" } else { "expired" }
+                if device_now(&mac) < hold_until { "applied" } else { "expired" }
             } else { "none" },
             "pending_plan": pending, "ack": ack},
         "note": "reads never extend the light deadline; only a formal PowerPlan does",
@@ -1144,7 +1165,7 @@ pub fn recovery(ctx: &AppCtx, requested_mac: &str, digest: &Value) -> Result<Val
     let mac = DeviceIdentity::normalized_mac(requested_mac)
         .ok_or_else(|| "invalid device MAC".to_string())?;
     let profile = service(ctx)
-        .recovery_import(&mac, digest, now_secs())
+        .recovery_import(&mac, digest, device_now(&mac))
         .map_err(err_text)?;
     Ok(json!({
         "imported": true,
@@ -1341,17 +1362,10 @@ mod capability_tests {
         );
         assert!(requested_mac(&json!({"mac": "not-a-mac"})).is_err());
         assert!(requested_mac(&json!({"mac": 42})).is_err());
+        assert_eq!(requested_mac(&json!({"device_mac": "70:04:1d:aa:bb:cc"})).unwrap(), Some("70041DAABBCC".into()));
+        assert!(requested_mac(&json!({"mac": "70041DAABBCC", "device_mac": "112233445566"})).is_err());
         assert_eq!(requested_mac(&json!({})).unwrap(), None);
     }
-}
-
-/// Feed the device's own status digest (MAC-verified HTTP read) into the
-/// coordinator; the authenticated `/v2/status` remains authoritative for writes.
-pub fn note_status_json(ctx: &AppCtx, requested_mac: &str, raw: &Value) {
-    let Some(mac) = DeviceIdentity::normalized_mac(requested_mac) else {
-        return;
-    };
-    let _ = service(ctx).note_device_status(&mac, raw);
 }
 
 /// Register/refresh one device in the platform service. Only v2 firmware
@@ -1416,7 +1430,7 @@ async fn sync_wake_history(
             return;
         }
     };
-    let now = now_secs() as i64;
+    let now = device_now(&mac) as i64;
     if !store.due(now) {
         return;
     }
@@ -1478,7 +1492,7 @@ async fn sync_wake_history(
                 "wake history generation mismatch");
             return;
         }
-        let progress = match store.append_page(&reply, now_secs() as i64) {
+        let progress = match store.append_page(&reply, device_now(&mac) as i64) {
             Ok(progress) => progress,
             Err(error) => {
                 tracing::debug!(device_mac = %mac, wake_generation = generation, error = %error,
@@ -1505,7 +1519,7 @@ fn wake_history_sync_due(mac: &str, status: &Value) -> bool {
         return false;
     };
     wake_history::Store::open(mac, generation)
-        .map(|store| store.due(now_secs() as i64))
+        .map(|store| store.due(device_now(&mac) as i64))
         .unwrap_or(false)
 }
 
@@ -1552,6 +1566,8 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
         Some((mac, link)) => (mac, link),
         None => return Ok(BleOpportunity::NoDevice),
     };
+    let lock = delivery_lock(ctx, &mac);
+    let _device_delivery = lock.lock().await;
     let still_registered = service(ctx).devices().into_iter().any(|device| {
         device["device_mac"].as_str().and_then(DeviceIdentity::normalized_mac)
             == Some(mac.clone())
@@ -1576,7 +1592,8 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
         service(ctx)
             .note_device_status(&mac, &state)
             .map_err(err_text)?;
-        let decision = service(ctx).next_delivery(&mac, true, now_secs());
+        service(ctx).note_ble_contact(&mac).map_err(err_text)?;
+        let decision = service(ctx).next_delivery(&mac, true, device_now(&mac));
         if decision["decision"] == "ble_data" {
             if let Some(body) = service(ctx).data_message_body(&mac) {
                 let ack = link.command("data", body.clone()).await.map_err(err_text)?;
@@ -1618,7 +1635,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
         let plan = service(ctx)
             .plan_for_rendezvous(
                 &mac,
-                now_secs(),
+                device_now(&mac),
                 if remaining > 0 {
                     "manual"
                 } else {
@@ -1656,7 +1673,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             plan.plan_id,
             ack["accepted_remaining_s"].as_u64().unwrap_or(0) as u32,
             remaining > 0,
-            now_secs(),
+            device_now(&mac),
         );
         tracing::info!(
             event = "ack",
@@ -1695,20 +1712,38 @@ pub async fn cycle(ctx: &AppCtx, mac: &str, refresh: bool, deliver_now: bool) {
     if service(ctx).device_get(&mac).is_none() {
         return;
     }
-    if !matches!(crate::v2_occupancy_gate(ctx, &mac).await, crate::Occupancy::Owned) {
-        return;
-    }
     if refresh {
         if refresh_status(ctx, &mac).await["result"].as_str() != Some("ok") {
             return;
         }
+    }
+    if !matches!(crate::v2_occupancy_gate(ctx, &mac).await, crate::Occupancy::Owned) {
+        return;
+    }
+    let ota = service(ctx).ota_job(&mac);
+    let publish = service(ctx).job(&mac);
+    if ota.as_ref().is_some_and(|j| j.blocks_following_work()) {
+        return;
+    }
+    if publish.as_ref().is_some_and(|j| j["state"] == "unknown") {
+        return; // authenticated status already reconciled; do not resubmit an unknown install
+    }
+    let ota_first = ota.as_ref().is_some_and(|j| j.state == "queued")
+        && publish.as_ref().filter(|j| matches!(j["state"].as_str(), Some("waiting" | "sending" | "unknown")))
+            .and_then(|j| j["created_at"].as_u64())
+            .is_none_or(|created| ota.as_ref().unwrap().created_at <= created);
+    if ota_first && bridge_mcp::load_device_token_at(&crate::mcp_config(ctx).data_root, &mac).is_none() {
+        return;
+    }
+    let mut ota_window = false;
+    if refresh {
         // Formal plan for the current rendezvous: the Bridge is the only source
         // of light/sleep decisions. A BOOT wake is answered with the *remaining*
         // provisional window; everything else is a fresh decision. Repeats are
         // idempotent on the device; a new id is only generated when the decision
         // really changes or the window has expired.
         let status = service(ctx)
-            .coordinator_summary(&mac, now_secs())
+            .coordinator_summary(&mac, device_now(&mac))
             .unwrap_or(Value::Null);
         let provisional = status["session"]["power"]["provisional"]
             .as_bool()
@@ -1716,15 +1751,79 @@ pub async fn cycle(ctx: &AppCtx, mac: &str, refresh: bool, deliver_now: bool) {
         let remaining = status["session"]["power"]["provisional_remaining_s"]
             .as_u64()
             .unwrap_or(0) as u32;
-        if provisional {
-            let _ = send_plan(ctx, &mac, "manual", remaining).await;
+        let plan_result = if provisional {
+            send_plan(ctx, &mac, "manual", remaining).await
         } else {
-            let _ = send_plan(ctx, &mac, "rendezvous", 0).await;
-        }
+            send_plan(ctx, &mac, "rendezvous", 0).await
+        };
+        ota_window = plan_result["accepted"] == true
+            && plan_result["ack"]["accepted_remaining_s"].as_u64().unwrap_or(0) >= 120;
     }
     if deliver_now {
+        if ota_first {
+            if !ota_window { return; }
+            let _ = deliver_ota(ctx, &mac).await;
+            return;
+        }
         let _ = deliver(ctx, &mac).await;
     }
+}
+
+pub fn enqueue_ota(ctx: &AppCtx, mac: &str, args: &Value) -> Result<Value, String> {
+    if args.get("device_ip").is_some() {
+        return Err("device_ip override is not allowed for queued OTA; target by registered MAC".into());
+    }
+    let rom = args.get("rom").and_then(Value::as_str).ok_or("missing rom")?;
+    let path = std::path::Path::new(rom);
+    let path = if path.is_absolute() { path.to_path_buf() } else { ctx.root.join(path) };
+    let version = args.get("expected_version").and_then(Value::as_str).ok_or("missing expected_version")?;
+    let target = args.get("firmware_target").and_then(Value::as_str).ok_or("missing firmware_target")?;
+    let request_id = args.get("request_id").and_then(Value::as_str).ok_or("missing request_id")?;
+    let job = service(ctx).queue_ota(mac, &ctx.bridge_id, request_id, &path, version, target)
+        .map_err(err_text)?;
+    Ok(json!({"accepted": true, "job_id": job.job_id, "state": job.state, "device_mac": mac,
+        "sha256": job.sha256, "size": job.size, "expected_version": job.expected_version}))
+}
+
+async fn deliver_ota(ctx: &AppCtx, mac: &str) -> Value {
+    let lock = delivery_lock(ctx, mac);
+    let _delivery = lock.lock().await;
+    if !matches!(crate::v2_occupancy_gate(ctx, mac).await, crate::Occupancy::Owned) {
+        return json!({"result": "blocked", "reason": "not authenticated owner"});
+    }
+    let Some(job) = service(ctx).ota_job(mac) else { return json!({"result": "idle"}); };
+    if job.state != "queued" { return json!({"result": job.state}); }
+    let Some(link) = device_link_for_mac(ctx, mac) else { return json!({"result": "waiting_for_link"}); };
+    let cfg = crate::mcp_config(ctx);
+    if bridge_mcp::load_device_token_at(&cfg.data_root, mac).is_none() {
+        return json!({"result": "blocked", "reason": "device operation token unavailable"});
+    }
+    let path = match service(ctx).ota_begin(mac) {
+        Ok(Some(path)) => path,
+        Ok(None) => return json!({"result": "idle"}),
+        Err(e) => return json!({"result": "failed", "error": e.to_string()}),
+    };
+    let result = bridge_mcp::firmware_upload(&cfg, &path, &link.ip, mac, &job.firmware_target).await;
+    if let Err(error) = &result {
+        let terminal = error.contains("UPDATE FAILED") || error.contains("ROM") || error.contains("read ");
+        let before_upload = terminal || error.contains("not reachable")
+            || error.contains("reports MAC") || error.contains("HTTP 401")
+            || error.contains("HTTP 409") || error.contains("token unavailable");
+        if before_upload {
+            let _ = service(ctx).ota_preflight_failed(mac, error, terminal);
+            return json!({"result": if terminal { "failed" } else { "queued" }, "error": error});
+        }
+    }
+    let _ = service(ctx).ota_await_confirmation(mac, result.is_ok(), result.as_ref().err().map(String::as_str));
+    if result.is_ok() {
+        drop(_delivery);
+        post_ota_window(ctx, mac, 300).await;
+    }
+    json!({"result": "awaiting_confirmation", "upload_ack": result.is_ok(), "error": result.err()})
+}
+
+fn device_now(mac: &str) -> u64 {
+    bridge_core::device_clock::wall_secs(mac)
 }
 
 pub fn now_secs() -> u64 {
@@ -1831,6 +1930,18 @@ pub async fn tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, Stri
             let mac = target_mac(ctx, args)?;
             job_cancel(ctx, &mac)
         }
+        "firmware_ota" => {
+            let mac = target_mac(ctx, args)?;
+            enqueue_ota(ctx, &mac, args)?
+        }
+        "firmware_ota_status" => {
+            let mac = target_mac(ctx, args)?;
+            json!({"job": service(ctx).ota_job(&mac)})
+        }
+        "firmware_ota_cancel" => {
+            let mac = target_mac(ctx, args)?;
+            service(ctx).ota_cancel(&mac).map_err(err_text)?
+        }
         "template_activate" => {
             let mac = target_mac(ctx, args)?;
             let id = args
@@ -1882,7 +1993,20 @@ pub async fn tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, Stri
                             .map_err(err_text)
                     })
                     .await?;
-                    json!({"plan": body, "ack": ack})
+                    let confirmation = if ack["result"] == "applied"
+                        && ack["plan_id"].as_u64() == Some(plan.plan_id)
+                    {
+                        service(ctx).note_plan_ack(
+                            &mac,
+                            plan.plan_id,
+                            ack["accepted_remaining_s"].as_u64().unwrap_or(0) as u32,
+                            false,
+                            device_now(&mac),
+                        )
+                    } else {
+                        json!({"outcome": "unconfirmed"})
+                    };
+                    json!({"plan": body, "ack": ack, "confirmation": confirmation})
                 }
                 other => return Err(format!("mode must be light|sleep (got {other})")),
             }
@@ -1908,7 +2032,13 @@ pub async fn tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, Stri
 }
 
 fn requested_mac(args: &Value) -> Result<Option<String>, String> {
-    let Some(value) = args.get("mac") else {
+    if let (Some(a), Some(b)) = (args.get("mac"), args.get("device_mac")) {
+        if a.as_str().and_then(DeviceIdentity::normalized_mac)
+            != b.as_str().and_then(DeviceIdentity::normalized_mac) {
+            return Err("mac and device_mac disagree".into());
+        }
+    }
+    let Some(value) = args.get("mac").or_else(|| args.get("device_mac")) else {
         return Ok(None);
     };
     let raw = value

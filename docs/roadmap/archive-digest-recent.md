@@ -1,4 +1,10 @@
-# 近期专项归档摘要（2026-09-23 ~ 2026-09-25）
+# 近期专项归档摘要（2026-09-23 ~ 2026-09-26）
+
+## fake-rom-simulator-def（2026-09-26）
+
+- **目标与范围**：完成 Fake ROM D/E/F 软件模拟器；用户取消 G 整套实机回归，硬件特有错误仅记录 case 文档。
+- **结论**：固件同源业务与渲染、两族 A/B Bundle、有限 OTA、电源/显示生命周期、Bridge 逐 MAC 实验时钟、fake BLE 与协作单轮调度完成。M01–M18 按代表性软件 case 验收；双 MAC 24 h 协作运行各 1,440 次唤醒，同一磁盘快照双回放的 trace/帧 CRC 相同。回放曾揭出宿主渲染读取系统 `time(nullptr)`，已用可选实验 wall 时间修复。默认 Note4 ROM 已重建，未刷写；完整 SHA、测试和 trace 证据见 `PROGRESS.md` 顶节。
+- **原件**：`docs/history/workflow/fake-rom-simulator-def/` 的 `evidence.md`、`clock-audit.md`、`hardware-cases.md`、plan/task/status/review。先前 A–D13d 原件仍在相邻 `fake-rom-simulator/`。真实 GATT/面板/掉电边界未执行，且不属于本次交付。
 
 > 用途：`project-workflow/<name>/` 归档后的检索入口。每节保留：做了什么、结论/关键证据、还欠什么。
 > 归档目录：`docs/history/workflow/<name>/`。

@@ -24,9 +24,9 @@ const MAX_RATE_PPM: u64 = 1_000_000_000;
 const MAX_STEP_MS: u64 = 86_400_000;
 const CAPABILITIES: &[&str] = &["v2_status", "clock_control", "claim", "plan_state",
     "bundle_transfer", "bundle_persistence", "data_render", "activate",
-    "power_sleep_http", "button_cycle", "ota_catalog"];
+    "power_sleep_http", "button_cycle", "ota_catalog", "fake_ble_rendezvous"];
 const UNSUPPORTED: &[&str] = &[
-    "BLE",
+    "physical_ble",
     "physical_display",
     "power_lifecycle",
 ];
@@ -50,6 +50,7 @@ struct SimState {
     power: Arc<Mutex<SimPower>>,
     power_reconcile: Arc<Mutex<()>>,
     stall_ack_after: Arc<Mutex<Option<StallFault>>>,
+    ble_rx: Arc<Mutex<Vec<u8>>>,
 }
 
 #[derive(Clone)]
@@ -76,6 +77,7 @@ struct SimPower {
     provisional: bool,
     safety_deadline_ms: u64,
     next_contact_ms: Option<u64>,
+    ble_window_until_ms: Option<u64>,
     wake_count: u64,
     last_sleep_reason: String,
 }
@@ -87,7 +89,7 @@ impl SimPower {
             manual_ble_hold: false, battery_pct: 75, boot_ms: 0,
             provisional: wake_cause == "button",
             safety_deadline_ms: if configured { 600_000 } else { 0 },
-            next_contact_ms: None, wake_count: 0,
+            next_contact_ms: None, ble_window_until_ms: None, wake_count: 0,
             last_sleep_reason: String::new(),
         }
     }
@@ -96,6 +98,7 @@ impl SimPower {
         self.light = false;
         self.provisional = false;
         self.next_contact_ms = Some(at_ms.saturating_add(60_000));
+        self.ble_window_until_ms = None;
         self.last_sleep_reason = reason.to_owned();
     }
 
@@ -106,6 +109,7 @@ impl SimPower {
             "boot_ms":self.boot_ms,"provisional":self.provisional,
             "safety_deadline_ms":self.safety_deadline_ms,
             "next_contact_ms":self.next_contact_ms,
+            "ble_window_until_ms":self.ble_window_until_ms,
             "wake_count":self.wake_count,
             "last_sleep_reason":self.last_sleep_reason,
             "now_ms":now_ms})
@@ -740,6 +744,7 @@ fn reboot_device(state: &SimState, cause: &str) -> Result<SimSession> {
 
 fn reset_power_after_reboot(state: &SimState, now_ms: u64, cause: &str) -> Result<()> {
     reboot_device(state, cause)?;
+    state.ble_rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
     let configured = state.bundle.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
         .status()?["configured"] == true;
     let mut power = state.power.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -749,6 +754,7 @@ fn reset_power_after_reboot(state: &SimState, now_ms: u64, cause: &str) -> Resul
     power.provisional = cause == "button";
     power.safety_deadline_ms = now_ms.saturating_add(600_000);
     power.next_contact_ms = None;
+    power.ble_window_until_ms = None;
     power.wake_count += 1;
     drop(power);
     state.owner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).on_boot();
@@ -799,9 +805,19 @@ fn reconcile_power(state: &SimState, now_ms: u64) -> Result<SimPower> {
         };
         if let Some((at, why)) = transition { power.enter_deep(at, why); }
     }
+    if power.ble_window_until_ms.is_some_and(|until| now_ms >= until) {
+        power.ble_window_until_ms = None;
+        power.last_sleep_reason = "rendezvous timeout".to_owned();
+    }
     for _ in 0..10_000 {
         let Some(first) = power.next_contact_ms.filter(|first| !power.light && now_ms >= *first)
-            else { return Ok(power.clone()); };
+            else {
+                if power.ble_window_until_ms.is_some_and(|until| now_ms >= until) {
+                    power.ble_window_until_ms = None;
+                    power.last_sleep_reason = "rendezvous timeout".to_owned();
+                }
+                return Ok(power.clone());
+            };
         drop(power);
         // A timer wake runs the BLE rendezvous. Without a fake BLE peer
         // there is no accepted light plan, so HTTP stays unavailable.
@@ -809,8 +825,9 @@ fn reconcile_power(state: &SimState, now_ms: u64) -> Result<SimPower> {
         power = state.power.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         result?;
         power.light = false;
+        power.ble_window_until_ms = Some(first.saturating_add(5_000));
         power.next_contact_ms = first.checked_add(60_000);
-        power.last_sleep_reason = "rendezvous timeout".to_owned();
+        power.last_sleep_reason = "ble rendezvous".to_owned();
     }
     anyhow::bail!("too many timer wakes in one clock step")
 }
@@ -1003,7 +1020,11 @@ async fn public_status(State(state): State<SimState>) -> Response {
 }
 
 async fn status(State(state): State<SimState>, request: Request<Body>) -> Response {
-    if let Some(response) = device_gate(&state).await { return response; }
+    status_impl(state, request, true).await
+}
+
+async fn status_impl(state: SimState, request: Request<Body>, gate: bool) -> Response {
+    if gate { if let Some(response) = device_gate(&state).await { return response; } }
     if !bearer(&request, &state.endpoint_token) {
         return unauthorized();
     }
@@ -1376,6 +1397,9 @@ async fn sim_button(State(state): State<SimState>, request: Request<Body>) -> Re
     }
     let uptime_ms = device_uptime_ms(&state, clock);
     let mut bundle = state.bundle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if bundle.set_wall_secs((clock.wall_ms / 1000).min(i64::MAX as u64) as i64).is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
     let count = bundle.status().ok().and_then(|status|
         status["commit_seq"].as_u64()).unwrap_or(0).saturating_add(1);
     let context = format!("{:016x}{:016x}", clock.monotonic_ms, count);
@@ -1568,7 +1592,12 @@ async fn ota_upload(State(state): State<SimState>, request: Request<Body>) -> Re
 }
 
 async fn device_command(State(state): State<SimState>, request: Request<Body>, operation: &str) -> Response {
-    if let Some(response) = device_gate(&state).await { return response; }
+    device_command_impl(state, request, operation, true).await
+}
+
+async fn device_command_impl(state: SimState, request: Request<Body>, operation: &str,
+    gate: bool) -> Response {
+    if gate { if let Some(response) = device_gate(&state).await { return response; } }
     if !bearer(&request, &state.endpoint_token) { return unauthorized(); }
     let body = match to_bytes(request.into_body(), BODY_LIMIT).await {
         Ok(body) => body,
@@ -1614,6 +1643,9 @@ async fn device_command(State(state): State<SimState>, request: Request<Body>, o
     }
     let result = {
         let mut bundle = state.bundle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if bundle.set_wall_secs((clock.wall_ms / 1000).min(i64::MAX as u64) as i64).is_err() {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
         if operation == "commit" {
             let count = bundle.status().ok().and_then(|status|
                 status["commit_seq"].as_u64()).unwrap_or(0).saturating_add(1);
@@ -1705,7 +1737,11 @@ async fn bundle_chunk(State(state): State<SimState>, request: Request<Body>) -> 
 }
 
 async fn plan(State(state): State<SimState>, request: Request<Body>) -> Response {
-    if let Some(response) = device_gate(&state).await { return response; }
+    plan_impl(state, request, true).await
+}
+
+async fn plan_impl(state: SimState, request: Request<Body>, gate: bool) -> Response {
+    if gate { if let Some(response) = device_gate(&state).await { return response; } }
     if !bearer(&request, &state.endpoint_token) {
         return unauthorized();
     }
@@ -1853,13 +1889,169 @@ async fn plan(State(state): State<SimState>, request: Request<Body>) -> Response
         decision["plan_id"].as_u64().unwrap_or(0),
         granted,
     ) {
-        Ok(ack) => Json(ack).into_response(),
+        Ok(ack) => {
+            if ack["result"] == "applied" {
+                let _ = reconcile_power(&state, clock.monotonic_ms);
+            }
+            Json(ack).into_response()
+        },
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error":"plan_ack_failed"})),
         )
             .into_response(),
     }
+}
+
+async fn sim_ble_info(State(state): State<SimState>, request: Request<Body>) -> Response {
+    if !bearer(&request, &state.endpoint_token) { return unauthorized(); }
+    let Some(clock) = clock_snapshot(&state) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Ok(power) = reconcile_power(&state, clock.monotonic_ms) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if !power.light && power.ble_window_until_ms.is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    Json(json!({"mac":state.mac,"rendezvous_v":2,"bonded":true,"encrypted":true,
+        "wake_generation":session_snapshot(&state).boot_id,"wake_seq":power.wake_count,
+        "wake_cause":if power.ble_window_until_ms.is_some() {"timer"} else {"light"}}))
+        .into_response()
+}
+
+async fn sim_ble_token(State(state): State<SimState>, request: Request<Body>) -> Response {
+    if !bearer(&request, &state.endpoint_token) { return unauthorized(); }
+    let Some(clock) = clock_snapshot(&state) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Ok(power) = reconcile_power(&state, clock.monotonic_ms) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if !power.light && power.ble_window_until_ms.is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    Json(json!({"token":state.device_token.as_ref()})).into_response()
+}
+
+async fn sim_ble_command(State(state): State<SimState>, request: Request<Body>) -> Response {
+    if !bearer(&request, &state.endpoint_token) { return unauthorized(); }
+    let body = match to_bytes(request.into_body(), 8192).await {
+        Ok(body) => body,
+        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    };
+    let Ok(message) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if message["token"] != state.endpoint_token.as_ref() {
+        return unauthorized();
+    }
+    let Some(clock) = clock_snapshot(&state) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Ok(power) = reconcile_power(&state, clock.monotonic_ms) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if !power.light && power.ble_window_until_ms.is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some(op) = message["op"].as_str() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let request_id = message["request_id"].clone();
+    if !request_id.is_string() { return StatusCode::BAD_REQUEST.into_response(); }
+    let response = match op {
+        "status" => {
+            let request = Request::builder().uri("/v2/status")
+                .header(header::AUTHORIZATION, format!("Bearer {}", state.endpoint_token))
+                .body(Body::empty()).unwrap();
+            status_impl(state.clone(), request, false).await
+        }
+        "plan" => {
+            let request = Request::builder().uri("/v2/plan")
+                .header(header::AUTHORIZATION, format!("Bearer {}", state.endpoint_token))
+                .body(Body::from(body.to_vec())).unwrap();
+            plan_impl(state.clone(), request, false).await
+        }
+        "data" => {
+            let request = Request::builder().uri("/v2/data")
+                .header(header::AUTHORIZATION, format!("Bearer {}", state.endpoint_token))
+                .body(Body::from(body.to_vec())).unwrap();
+            device_command_impl(state.clone(), request, "data", false).await
+        }
+        _ => Json(json!({"result":"http_required"})).into_response(),
+    };
+    if response.status() != StatusCode::OK { return response; }
+    let Ok(bytes) = to_bytes(response.into_body(), BODY_LIMIT).await else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Ok(mut ack) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if op == "status" { ack["result"] = "applied".into(); }
+    ack["ack"] = "v2".into();
+    ack["request_id"] = request_id;
+    ack["wake_generation"] = session_snapshot(&state).boot_id.into();
+    ack["wake_seq"] = power.wake_count.into();
+    if op == "plan" && ack["result"] == "applied" {
+        let light_plan = {
+            let plan = state.plan.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            plan.status_fields().1 == "light"
+        };
+        if light_plan {
+            let mut power = state.power.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            power.light = true;
+            power.ble_window_until_ms = None;
+            power.next_contact_ms = None;
+        }
+    }
+    Json(ack).into_response()
+}
+
+async fn sim_ble_fragment(State(state): State<SimState>, request: Request<Body>) -> Response {
+    if !bearer(&request, &state.endpoint_token) { return unauthorized(); }
+    let Some(clock) = clock_snapshot(&state) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Ok(power) = reconcile_power(&state, clock.monotonic_ms) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if !power.light && power.ble_window_until_ms.is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let args: HashMap<String, String> = form_urlencoded::parse(
+        request.uri().query().unwrap_or("").as_bytes())
+        .map(|(key, value)| (key.into_owned(), value.into_owned())).collect();
+    let Some(offset) = args.get("offset").and_then(|value| value.parse::<usize>().ok()) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(final_chunk) = args.get("final").map(String::as_str) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if !matches!(final_chunk, "0" | "1") {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let body = match to_bytes(request.into_body(), 180).await {
+        Ok(body) if !body.is_empty() => body,
+        _ => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    };
+    let completed = {
+        let mut rx = state.ble_rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if offset != rx.len() || rx.len().saturating_add(body.len()) > 8192 {
+            rx.clear();
+            return StatusCode::CONFLICT.into_response();
+        }
+        rx.extend_from_slice(&body);
+        (final_chunk == "1").then(|| std::mem::take(&mut *rx))
+    };
+    let Some(completed) = completed else {
+        return Json(json!({"result":"more"})).into_response();
+    };
+    let request = Request::builder().uri("/sim/ble/command")
+        .header(header::AUTHORIZATION, format!("Bearer {}", state.endpoint_token))
+        .body(Body::from(completed)).unwrap();
+    sim_ble_command(State(state), request).await
 }
 
 async fn claim(State(state): State<SimState>, request: Request<Body>) -> Response {
@@ -2072,6 +2264,10 @@ fn app(state: SimState) -> Router {
         .route("/sim/button", post(sim_button))
         .route("/sim/storage", post(sim_storage))
         .route("/sim/versions", get(sim_versions_get).post(sim_versions_post))
+        .route("/sim/ble/info", get(sim_ble_info))
+        .route("/sim/ble/token", get(sim_ble_token))
+        .route("/sim/ble/command", post(sim_ble_command))
+        .route("/sim/ble/fragment", post(sim_ble_fragment))
         .route("/update", get(ota_token_route))
         .route("/diag", post(ota_token_route))
         .route("/doUpdate", post(ota_upload))
@@ -2136,6 +2332,7 @@ async fn main() -> Result<()> {
         power: Arc::new(Mutex::new(power)),
         power_reconcile: Arc::new(Mutex::new(())),
         stall_ack_after: Arc::new(Mutex::new(None)),
+        ble_rx: Arc::new(Mutex::new(Vec::new())),
     };
     let listener = tokio::net::TcpListener::bind(options.listen)
         .await

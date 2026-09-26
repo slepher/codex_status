@@ -1,5 +1,9 @@
 # Fake ROM 修订记录
 
+## 2026-09-26：D/E/F 软件出口完成
+
+同源设备业务、A/B/OTA/电源与两族像素对拍的 D 代表 case 完成；E 接入 Bridge 逐 MAC 时钟、跨进程恢复、fake BLE 的真实 `V2Connection` 路径及协作 `/sim/run`/`/sim/clock` 屏障。F 双 Fake MAC 24 h 协作运行，各 1,440 次 timer wake；独立失步输入使 A/B 分别新增 10/11 次 wake。发现宿主 `device.now/date` 误读系统时钟后修共享 `TplEnv` 输入，同一快照双回放 1 h 的 trace/帧 CRC 完全相同。M01–M18 代表证据见 `evidence.md`，ROM、测试、trace SHA256 见 PROGRESS 最新节。G 按用户决定取消；硬件特有错误仅记 `hardware-cases.md`，未实现或实测。隔离进程已停止，生产 Bridge 与设备未动。
+
 ## 2026-09-26：D 的硬退出、动态帧与电源输入
 
 在 `8448afa` 首批提交后，补上文件同步后直接退出的 slot/metadata 双切点回归、OTA pending 在延迟重启前退出的恢复、动态 Data 帧逐字节对拍。控制面增加 USB/deep-on-USB/手动 BLE hold/电池输入；共享固件判定 USB 影响 Plan 入睡，低电阈值由固件与宿主同一 `v2BatteryPowerOff` 决定。bootstrap 29/29；Note4 构建与 ROM 哈希见 PROGRESS 顶节。D/E/F 仍进行中。

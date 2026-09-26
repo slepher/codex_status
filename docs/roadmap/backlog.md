@@ -37,8 +37,10 @@
 | 1.54 设备时钟局刷与全刷交替 | 源码已修 | 未刷机、未实机验收（见 B4） |
 | 字体引擎化（CSFN 容器 + 设备字体库 + manifest 增量发布） | 引擎已实现，协议未定稿 | `note4-bridge-publish/protocol.md` 仍是**待双方确认草案**，设备侧无增量端点（见 D3） |
 | Bridge 多设备界面 + 按 MAC 推送 | 已交付 | 单设备全局身份已换成按 MAC 运行记录；UI 与 MCP 的设备类操作要求显式 MAC，多设备缺 MAC 一律要求选择（2026-09-25 两台实机自检，见 `PROGRESS.md` 顶部节）；剩余见 C7 的 `bridge-multi-device-ui` 行 |
+| Bridge 界面视觉与信息层级 | 第一版已重建并运行 | 四个 Tab 已统一视觉；设备/数据/MCP 内容已重排。待打开窗口肉眼验收，并按第一版反馈细化（见 `project-workflow/bridge-ui-redesign/`） |
+| Bridge 休眠设备的状态与延后操作 | S1–S4 已实现；S5 实机主路径通过、故障矩阵待验 | 两台 ROM 已按登记 MAC 顺序自然会合 OTA，各 1 次上传 ACK 且后续认证见新版本；两台完整 Bundle 发布 `succeeded`，1.54 的 waiting 发布跨 Bridge 重启后自然提交。实机发现并修正 OTA 待精确确认时阻塞后续发布、显式 sleep ACK 未记账；Bridge 已重建。剩余：错 IP/401/409 端到端注入、长期 PowerPlan 截止期、Note4 间歇 `display_state=failed` 诊断。当前 ROM 不提供可对照整文件哈希的运行镜像身份，OTA 保留 `awaiting_confirmation` / `version_seen_unproven`，精确 `image_verified` 待后续能力。证据见 `project-workflow/sleep-aware-bridge/`、`PROGRESS.md` 顶节。 |
 | Bridge 多实例 | 已交付（tag `bridge-multi-instance-2026-09-24`） | 无 |
-| Fake ROM 设备模拟器（同源 C++ + 可控实验时钟） | 进行中，无可用产物 | Stage D 未完成、E/F/G 未开始（见 C2） |
+| Fake ROM 设备模拟器（同源 C++ + 可控实验时钟） | D/E/F 软件验收完成；G 按用户决定取消 | 软件证据见 `PROGRESS.md` 最新节；硬件特有错误仅留 case 文档，不在本项执行 |
 | 唤醒会合诊断（一次唤醒一条记录） | 仅计划 | 固件与桥两侧都未实现（见 C3） |
 | Bundle v3（manifest + 原始 dense 对象，省 ~71%） | 仅设计 | 未实现（见 C1） |
 | `device_first` / `bridge_first` 双策略会合 | 仅设计 + spike | 未实现（见 C4） |
@@ -136,11 +138,6 @@
 - 设计已定稿（`docs/history/workflow/bundle-v3/design.md`）：`CSB3` 容器 + `ct-dense-v1` 对象，`mini+quad` 从 55.3 KB 降到约 16.2 KB（省 ~71%）。
 - **为什么重要**：1.54 是 8 MB flash，55 KB Bundle 的十六进制编码（45 KB 十六进制字符）是它最容易 OOM/超时的环节，也是 A2 的根因候选。
 - 需改：固件（新格式解析 + A/B 原子安装 + 拒绝路径）、桥编译器（canonical dense 编码器）、Python 测试桥哈希三方同步；设备能力加 `bundle_format: 3`；v3 ROM 把 pre-v3 Bundle 视为不存在。
-
-### C2. Fake ROM 设备模拟器（Stage D 收尾 → E/F/G）
-- 已完成：A（显式时间）、B（多设备运行层）、B2（协议时间线日志）、C（Data/Plan/Bundle/Activate/claim 同源 C++ 决策）、D 的 13a/13b/13c/13d。
-- 未完成：**D 剩余**（Data/Bundle/Activate 走共享命令路径、显示效果、持久状态、断电重启端到端）→ **E**（Bridge 按 MAC 目标时钟接线）→ **F**（同步/失步/丢 ACK/重启/multi-device 联合场景）→ **G**（实机回归）。
-- 当前 `device-sim` 仍是"未配置设备"：无 Bundle 所以不走 sleep/无线会合，Data/Bundle/Activate 返回 501。不能登记为完整 Fake ROM。
 
 ### C3. 唤醒会合诊断记录（wake-contact-trace）
 - **代码已实现并已合入 master**（先前记录"仅计划"是错的）：`bridge/crates/app/src/wake_history.rs`、

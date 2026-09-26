@@ -381,6 +381,7 @@ extern "C" {
     fn codex_sim_bundle_new(data_dir: *const c_char, target: *const c_char,
         boot_id: u64, wake_cause: *const c_char) -> *mut std::ffi::c_void;
     fn codex_sim_bundle_free(p: *mut std::ffi::c_void);
+    fn codex_sim_bundle_set_wall(p: *mut std::ffi::c_void, epoch_secs: i64) -> c_int;
     fn codex_sim_bundle_status(p: *mut std::ffi::c_void, out: *mut c_char, cap: c_int) -> c_int;
     fn codex_sim_bundle_frame(p: *mut std::ffi::c_void, out: *mut u8, cap: c_int) -> c_int;
     fn codex_sim_store_budget(p: *mut std::ffi::c_void, budget: i64) -> c_int;
@@ -519,6 +520,12 @@ pub struct SimulatorBundle {
 unsafe impl Send for SimulatorBundle {}
 
 impl SimulatorBundle {
+    pub fn set_wall_secs(&mut self, epoch_secs: i64) -> anyhow::Result<()> {
+        anyhow::ensure!(unsafe { codex_sim_bundle_set_wall(self.state, epoch_secs) } == 1,
+            "simulator wall clock unavailable");
+        Ok(())
+    }
+
     pub fn new(data_dir: &std::path::Path, target: &str, boot_id: u64,
         wake_cause: &str) -> anyhow::Result<Self> {
         let data_dir = CString::new(data_dir.to_str().ok_or_else(||

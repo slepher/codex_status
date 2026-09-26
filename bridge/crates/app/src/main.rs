@@ -85,11 +85,13 @@ struct CachedOwner {
 #[derive(Clone)]
 struct CachedV2Status {
     fetched_at: i64,
+    fetched_mono_ms: Option<u64>,
     online: bool,
     status: Option<Value>,
     owner: Option<Value>,
     owner_observed_at: Option<i64>,
     last_claim_at: Option<i64>,
+    last_claim_mono_ms: Option<u64>,
     yielded: bool,
 }
 
@@ -118,6 +120,7 @@ fn update_v2_status_cache(
         mac.clone(),
         CachedV2Status {
             fetched_at,
+            fetched_mono_ms: bridge_core::device_clock::monotonic_ms(&mac),
             online,
             status: if online { status } else { previous_status },
             owner,
@@ -127,6 +130,7 @@ fn update_v2_status_cache(
                 previous.and_then(|entry| entry.owner_observed_at)
             },
             last_claim_at: previous.and_then(|entry| entry.last_claim_at),
+            last_claim_mono_ms: previous.and_then(|entry| entry.last_claim_mono_ms),
             yielded: previous.is_some_and(|entry| entry.yielded),
         },
     );
@@ -142,18 +146,21 @@ fn update_v2_claim_cache(
     let Some(mac) = bridge_core::platform::model::DeviceIdentity::normalized_mac(mac) else {
         return;
     };
-    let entry = cache.entry(mac).or_insert(CachedV2Status {
+    let entry = cache.entry(mac.clone()).or_insert(CachedV2Status {
         fetched_at: 0,
+        fetched_mono_ms: None,
         online: false,
         status: None,
         owner: None,
         owner_observed_at: None,
         last_claim_at: None,
+        last_claim_mono_ms: None,
         yielded: false,
     });
     entry.owner = owner.filter(|owner| !owner.is_null());
     entry.owner_observed_at = Some(claimed_at);
     entry.last_claim_at = Some(claimed_at);
+    entry.last_claim_mono_ms = bridge_core::device_clock::monotonic_ms(mac.as_str());
     entry.yielded = yielded;
 }
 
@@ -163,11 +170,13 @@ fn update_v2_owner_cache(cache: &mut HashMap<String, CachedV2Status>, mac: &str,
     };
     let entry = cache.entry(mac).or_insert(CachedV2Status {
         fetched_at: 0,
+        fetched_mono_ms: None,
         online: false,
         status: None,
         owner: None,
         owner_observed_at: None,
         last_claim_at: None,
+        last_claim_mono_ms: None,
         yielded: false,
     });
     entry.owner = (!owner.is_null()).then_some(owner);
@@ -190,12 +199,27 @@ fn v2_cycle_targets(
                 return None;
             }
             let status = cache.get(&mac)?;
-            (status.online
-                && status.fetched_at <= now
-                && now.saturating_sub(status.fetched_at) <= 30)
+            let now = scheduled_now(&mac, now);
+            (status.online && v2_status_fresh(&mac, status, now, 30))
                 .then_some(mac)
         })
         .collect()
+}
+
+fn v2_status_fresh(mac: &str, status: &CachedV2Status, now: i64, ttl_s: u64) -> bool {
+    if let Some(monotonic) = bridge_core::device_clock::monotonic_ms(mac) {
+        return status.fetched_mono_ms.is_some_and(|at|
+            monotonic >= at && monotonic - at <= ttl_s * 1000);
+    }
+    status.fetched_at <= now && now.saturating_sub(status.fetched_at) <= ttl_s as i64
+}
+
+fn v2_claim_renew_due(mac: &str, status: &CachedV2Status, now: i64) -> bool {
+    if let Some(monotonic) = bridge_core::device_clock::monotonic_ms(mac) {
+        return status.last_claim_mono_ms.is_none_or(|at|
+            monotonic >= at && monotonic - at >= 60_000);
+    }
+    status.last_claim_at.is_none_or(|at| now.saturating_sub(at) >= 60)
 }
 
 enum V2OccupancyDecision {
@@ -207,12 +231,13 @@ enum V2OccupancyDecision {
 }
 
 fn v2_occupancy_decision(
+    mac: &str,
     status: Option<&CachedV2Status>,
     bridge_id: &str,
     now: i64,
 ) -> V2OccupancyDecision {
     let Some(status) =
-        status.filter(|status| status.online && now.saturating_sub(status.fetched_at) <= 30)
+        status.filter(|status| status.online && v2_status_fresh(mac, status, now, 30))
     else {
         return V2OccupancyDecision::Offline;
     };
@@ -223,10 +248,7 @@ fn v2_occupancy_decision(
         if owner_id(owner) != Some(bridge_id) {
             return V2OccupancyDecision::Other(owner.clone());
         }
-        let renew = status
-            .last_claim_at
-            .map(|at| now.saturating_sub(at) >= 60)
-            .unwrap_or(true);
+        let renew = v2_claim_renew_due(mac, status, now);
         return V2OccupancyDecision::Owned { renew };
     }
     V2OccupancyDecision::Claim
@@ -241,6 +263,8 @@ struct AppCtx {
     library: Arc<RwLock<Library>>,
     force_ble: Arc<Notify>,
     v2_delivery: tokio::sync::Mutex<()>,
+    sim_control: tokio::sync::Mutex<()>,
+    per_mac_delivery: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     status: Mutex<RuntimeStatus>,
     /// Per-MAC runtime records (address, name, caches, occupancy, queues).
     ///
@@ -280,6 +304,18 @@ fn now_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+fn device_now_secs(mac: &str) -> i64 {
+    bridge_core::device_clock::wall_secs(mac) as i64
+}
+
+fn scheduled_now(mac: &str, fallback: i64) -> i64 {
+    if bridge_core::device_clock::snapshot(mac).is_some() {
+        device_now_secs(mac)
+    } else {
+        fallback
+    }
 }
 
 /// Tray stays OK while a successful push is this recent (5 min heartbeat + jitter).
@@ -402,7 +438,6 @@ struct DeviceFacts {
     last_claim_at: Option<i64>,
     yielded: bool,
     note: Option<String>,
-    pending_ota_rom: Option<PathBuf>,
 }
 
 impl DeviceFacts {
@@ -449,7 +484,6 @@ fn device_facts_for(ctx: &AppCtx, mac: &str) -> Option<DeviceFacts> {
         last_claim_at: device.last_claim_at,
         yielded: device.yielded,
         note: device.note.clone(),
-        pending_ota_rom: device.pending_ota_rom.clone(),
     })
 }
 
@@ -474,10 +508,11 @@ fn ensure_runtime_record(ctx: &AppCtx, mac: &str) -> Option<DeviceFacts> {
     }
     if devices(ctx).get(&mac).is_none() {
         let registered = platform::service(ctx).device_get(&mac);
+        let registered = registered?;
         let ip = registered
-            .as_ref()
-            .and_then(|device| device["ip"].as_str().map(str::to_string));
-        devices(ctx).observe(&mac, ip.as_deref(), None, "platform", now_secs());
+            ["ip"].as_str().map(str::to_string);
+        let name = registered["name"].as_str();
+        devices(ctx).observe(&mac, ip.as_deref(), name, "platform", device_now_secs(&mac));
     }
     device_facts_for(ctx, &mac)
 }
@@ -573,7 +608,7 @@ fn observe_device(
     if normalized.len() != 12 {
         return false;
     }
-    let now = now_secs();
+    let now = device_now_secs(&mac);
     let mut registry = devices(ctx);
     registry.observe(&normalized, ip, name, via, now);
     true
@@ -586,7 +621,7 @@ fn set_device_ip(ctx: &AppCtx, mac: &str, ip: &str, via: &str) -> bool {
     if ip.is_empty() {
         return false;
     }
-    let now = now_secs();
+    let now = device_now_secs(&mac);
     let changed = {
         let mut registry = devices(ctx);
         match registry.get_mut(mac) {
@@ -635,13 +670,6 @@ fn note_contact(ctx: &AppCtx, mac: &str) {
 fn set_yielded(ctx: &AppCtx, mac: &str, yielded: bool) {
     if let Some(device) = devices(ctx).get_mut(mac) {
         device.yielded = yielded;
-    }
-}
-
-/// Queue an OTA ROM for one MAC (never for "the" device).
-fn set_pending_ota(ctx: &AppCtx, mac: &str, rom: Option<PathBuf>) {
-    if let Some(device) = devices(ctx).get_mut(mac) {
-        device.pending_ota_rom = rom;
     }
 }
 
@@ -727,7 +755,7 @@ fn set_owner_cache(ctx: &AppCtx, mac: &str, owner: Option<Value>) {
     };
     if let Some(device) = devices(ctx).get_mut(mac) {
         device.owner = Some(CachedOwner {
-            fetched_at: now_secs(),
+            fetched_at: device_now_secs(&mac),
             owner,
         });
     }
@@ -737,7 +765,7 @@ fn cached_owner(ctx: &AppCtx, mac: &str) -> Option<Value> {
     devices(ctx)
         .get(mac)
         .and_then(|device| device.owner.clone())
-        .filter(|cache| now_secs() - cache.fetched_at <= 30)
+        .filter(|cache| device_now_secs(&mac) - cache.fetched_at <= 30)
         .and_then(|cache| cache.owner)
 }
 
@@ -1069,6 +1097,9 @@ async fn mcp_handler(
                 | "platform_font_list"
                 | "platform_font_import"
                 | "platform_publish_cancel"
+                | "firmware_ota"
+                | "firmware_ota_status"
+                | "firmware_ota_cancel"
                 | "template_activate"
                 | "data_sources_v2"
                 | "data_source_save_v2"
@@ -1111,77 +1142,7 @@ async fn mcp_handler(
     let mcp_cfg = mcp_config(&ctx);
     match bridge_mcp::handle_request(&mcp_cfg, &request).await {
         Some(response) => {
-            let is_error = response
-                .pointer("/result/isError")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let text = response
-                .pointer("/result/content/0/text")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let unreachable = text.contains("unreachable")
-                || text.contains("not reachable")
-                || text.contains("did not change");
-            // v0.14 queued pushes (docs §13.4): a push aimed at a sleeping
-            // device is queued instead of failed; the next pull contact keeps
-            // the device awake for `pending` and the flush task sends it.
-            if is_error
-                && matches!(tool.as_deref(), Some("firmware_ota"))
-                && (ctx.activity.expects_deep() || unreachable)
-            {
-                let rom = request
-                    .pointer("/params/arguments/rom")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let path = PathBuf::from(rom);
-                let path = if path.is_absolute() {
-                    path
-                } else {
-                    ctx.root.join(path)
-                };
-                // The queued ROM belongs to one device: the MAC the tool acted
-                // on, else the selected device.
-                let target = mcp_config(&ctx)
-                    .device_mac
-                    .and_then(|mac| ensure_runtime_record(&ctx, &mac))
-                    .or_else(|| device_facts(&ctx));
-                let Some(target) = target else {
-                    return (
-                        axum::http::StatusCode::CONFLICT,
-                        "no device registered; refusing to queue an OTA",
-                    )
-                        .into_response();
-                };
-                set_pending_ota(&ctx, &target.mac, Some(path));
-                ctx.activity.queue_ota();
-                let queued = "设备在 deep 睡眠；OTA 已排队，下次联系窗口自动执行".to_string();
-                let queued_response = json!({
-                    "jsonrpc": "2.0",
-                    "id": request.get("id").cloned().unwrap_or(Value::Null),
-                    "result": {"content": [{"type": "text", "text": queued}], "isError": false}
-                });
-                return (
-                    [(axum::http::header::CONTENT_TYPE, "application/json")],
-                    queued_response.to_string(),
-                )
-                    .into_response();
-            }
-            let ok = !is_error;
-            if ok && tool.as_deref() == Some("firmware_ota") {
-                // The fresh firmware keeps a minimum light window by itself;
-                // take control of it with a formal 300 s light PowerPlan.
-                let target = mcp_config(&ctx)
-                    .device_mac
-                    .and_then(|mac| ensure_runtime_record(&ctx, &mac))
-                    .or_else(|| device_facts(&ctx));
-                if let Some(target) = target {
-                    let ctx2 = ctx.clone();
-                    let mac = target.mac;
-                    tokio::spawn(async move {
-                        platform::post_ota_window(&ctx2, &mac, 300).await;
-                    });
-                }
-            }
+            let ok = !response.pointer("/result/isError").and_then(Value::as_bool).unwrap_or(false);
             if ok && matches!(tool.as_deref(), Some("template_save")) {
                 ctx.activity.note_activity("template-save");
                 if let Some(handle) = ctx.app_handle.get() {
@@ -1199,6 +1160,19 @@ async fn mcp_handler(
 }
 
 async fn mcp_serve(ctx: Arc<AppCtx>) {
+    let sim_clock_enabled = if std::env::var_os("CODEX_STATUS_BRIDGE_SIM_CONTROL_TOKEN").is_some() {
+        let path = bridge_core::paths::data_root().join("sim-bridge-clocks.json");
+        if path.exists() {
+            let restored = std::fs::read_to_string(&path)
+                .map_err(anyhow::Error::from)
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).map_err(anyhow::Error::from))
+                .and_then(|state| bridge_core::device_clock::restore(&state));
+            if let Err(error) = restored {
+                tracing::error!("bridge experiment clock state rejected: {error:#}");
+                false
+            } else { true }
+        } else { true }
+    } else { false };
     let mut rx = ctx.mcp_tx.subscribe();
     loop {
         let port = *rx.borrow();
@@ -1206,9 +1180,15 @@ async fn mcp_serve(ctx: Arc<AppCtx>) {
             Ok(listener) => {
                 *ctx.mcp_error.lock().unwrap() = None;
                 tracing::info!("mcp http listening on http://127.0.0.1:{port}/mcp");
-                let app = axum::Router::new()
-                    .route("/mcp", axum::routing::post(mcp_handler))
-                    .with_state(ctx.clone());
+                let mut app = axum::Router::new()
+                    .route("/mcp", axum::routing::post(mcp_handler));
+                if sim_clock_enabled {
+                    app = app.route("/sim/clock", axum::routing::post(sim_clock_handler));
+                    if std::env::var("CODEX_STATUS_SIM_COOPERATIVE").as_deref() == Ok("1") {
+                        app = app.route("/sim/run", axum::routing::post(sim_run_handler));
+                    }
+                }
+                let app = app.with_state(ctx.clone());
                 tokio::select! {
                     _ = axum::serve(listener, app) => {}
                     _ = rx.changed() => {}
@@ -1224,6 +1204,114 @@ async fn mcp_serve(ctx: Arc<AppCtx>) {
             }
         }
     }
+}
+
+async fn sim_clock_handler(
+    axum::extract::State(ctx): axum::extract::State<Arc<AppCtx>>,
+    headers: axum::http::HeaderMap,
+    axum::Json(command): axum::Json<Value>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Ok(token) = std::env::var("CODEX_STATUS_BRIDGE_SIM_CONTROL_TOKEN") else {
+        return axum::http::StatusCode::NOT_FOUND.into_response();
+    };
+    if headers.get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok()) != Some(format!("Bearer {token}").as_str()) {
+        return axum::http::StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some(mac) = command["mac"].as_str() else {
+        return axum::http::StatusCode::BAD_REQUEST.into_response();
+    };
+    let Ok(_barrier) = ctx.sim_control.try_lock() else {
+        return (axum::http::StatusCode::CONFLICT,
+            axum::Json(json!({"state":"in_flight"}))).into_response();
+    };
+    let op = command["op"].as_str().unwrap_or("");
+    if op == "step" && std::env::var("CODEX_STATUS_SIM_COOPERATIVE").as_deref() != Ok("1") {
+        return (axum::http::StatusCode::CONFLICT,
+            axum::Json(json!({"error":"cooperative_mode_required"}))).into_response();
+    }
+    let result = match op {
+        "set" => match (command["monotonic_ms"].as_u64(),
+            command["wall_ms"].as_i64(),command["rate_ppm"].as_u64()) {
+            (Some(monotonic),Some(wall),Some(rate)) =>
+                bridge_core::device_clock::configure(mac,monotonic,wall,rate),
+            _ => Err(anyhow::anyhow!("invalid clock settings")),
+        },
+        "rate" => command["rate_ppm"].as_u64()
+            .ok_or_else(|| anyhow::anyhow!("rate_ppm required"))
+            .and_then(|rate| bridge_core::device_clock::change_rate(mac,rate)),
+        "step" => command["delta_ms"].as_u64()
+            .ok_or_else(|| anyhow::anyhow!("delta_ms required"))
+            .and_then(|delta| bridge_core::device_clock::step(mac,delta)),
+        "wall" => command["wall_ms"].as_i64()
+            .ok_or_else(|| anyhow::anyhow!("wall_ms required"))
+            .and_then(|wall| bridge_core::device_clock::set_wall(mac,wall)),
+        "get" => bridge_core::device_clock::snapshot(mac)
+            .ok_or_else(|| anyhow::anyhow!("no experiment clock")),
+        "clear" => {
+            bridge_core::device_clock::clear(mac);
+            Ok(json!({"mac":mac,"cleared":true}))
+        },
+        _ => Err(anyhow::anyhow!("invalid clock operation")),
+    };
+    match result {
+        Ok(value) => {
+            if op != "get" {
+                let path = bridge_core::paths::data_root().join("sim-bridge-clocks.json");
+                let saved = bridge_core::device_clock::export()
+                    .and_then(|state| Ok(serde_json::to_vec(&state)?))
+                    .and_then(|bytes| bridge_core::platform::store::atomic_write(&path, &bytes));
+                if let Err(error) = saved {
+                    return (axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(json!({"error":format!("clock storage failed: {error}")})))
+                        .into_response();
+                }
+            }
+            axum::Json(value).into_response()
+        },
+        Err(error) => (axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error":error.to_string()}))).into_response(),
+    }
+}
+
+async fn sim_run_handler(
+    axum::extract::State(ctx): axum::extract::State<Arc<AppCtx>>,
+    headers: axum::http::HeaderMap,
+    axum::Json(command): axum::Json<Value>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Ok(token) = std::env::var("CODEX_STATUS_BRIDGE_SIM_CONTROL_TOKEN") else {
+        return axum::http::StatusCode::NOT_FOUND.into_response();
+    };
+    if headers.get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok()) != Some(format!("Bearer {token}").as_str()) {
+        return axum::http::StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some(mac) = command["mac"].as_str()
+        .and_then(bridge_core::platform::model::DeviceIdentity::normalized_mac) else {
+        return axum::http::StatusCode::BAD_REQUEST.into_response();
+    };
+    if bridge_core::device_clock::snapshot(&mac).is_none() {
+        return axum::http::StatusCode::CONFLICT.into_response();
+    }
+    let _barrier = ctx.sim_control.lock().await;
+    let outcome = match command["kind"].as_str().unwrap_or("") {
+        "ble" => match platform::ble_cycle(&ctx, &[mac.clone()]).await {
+            Ok(platform::BleOpportunity::NoDevice) => json!({"state":"idle","contact":false}),
+            Ok(platform::BleOpportunity::Connected {result, ..}) =>
+                json!({"state":"idle","contact":true,"result":result}),
+            Err(error) => json!({"state":"idle","error":error}),
+        },
+        "http" => {
+            platform::cycle(&ctx,&mac,true,true).await;
+            json!({"state":"idle","cycle":"complete"})
+        },
+        _ => return axum::http::StatusCode::BAD_REQUEST.into_response(),
+    };
+    axum::Json(json!({"mac":mac,"outcome":outcome,
+        "clock":bridge_core::device_clock::snapshot(&mac),
+        "device":ctx.platform.device_get(&mac)})).into_response()
 }
 
 fn persist_mcp_port(_root: &Path, port: u16) {
@@ -1549,11 +1637,11 @@ async fn occupancy_gate(ctx: &AppCtx, mac: &str) -> Occupancy {
     if let Some(owner) = cached_owner(ctx, mac).filter(owner_valid) {
         if owner_id(&owner) == Some(ctx.bridge_id.as_str()) {
             let renew = last_claim_at(ctx, mac)
-                .map(|at| now_secs() - at >= 60)
+                .map(|at| device_now_secs(&mac) - at >= 60)
                 .unwrap_or(true);
             if renew {
                 match post_claim(ctx, mac, false, false).await {
-                    Ok(_) => set_last_claim_at(ctx, mac, now_secs()),
+                    Ok(_) => set_last_claim_at(ctx, mac, device_now_secs(&mac)),
                     Err(ClaimError::Occupied(owner)) => {
                         set_owner_cache(ctx, mac, Some(owner.clone()));
                         return Occupancy::Other(owner);
@@ -1567,7 +1655,7 @@ async fn occupancy_gate(ctx: &AppCtx, mac: &str) -> Occupancy {
     }
     match post_claim(ctx, mac, false, false).await {
         Ok(_) => {
-            set_last_claim_at(ctx, mac, now_secs());
+            set_last_claim_at(ctx, mac, device_now_secs(&mac));
             Occupancy::Owned
         }
         Err(ClaimError::Occupied(owner)) => {
@@ -1584,7 +1672,7 @@ async fn v2_occupancy_gate(ctx: &AppCtx, mac: &str) -> Occupancy {
     };
     let decision = {
         let cache = ctx.v2_status_cache.lock().unwrap();
-        v2_occupancy_decision(cache.get(&mac), &ctx.bridge_id, now_secs())
+        v2_occupancy_decision(&mac, cache.get(&mac), &ctx.bridge_id, device_now_secs(&mac))
     };
     match decision {
         V2OccupancyDecision::Offline => Occupancy::Failed(
@@ -1596,7 +1684,7 @@ async fn v2_occupancy_gate(ctx: &AppCtx, mac: &str) -> Occupancy {
         V2OccupancyDecision::Owned { renew: true } | V2OccupancyDecision::Claim => {
             match post_claim_for_mac(ctx, false, false, &mac).await {
                 Ok(owner) => {
-                    let now = now_secs();
+                    let now = device_now_secs(&mac);
                     update_v2_claim_cache(
                         &mut ctx.v2_status_cache.lock().unwrap(),
                         &mac,
@@ -1607,7 +1695,7 @@ async fn v2_occupancy_gate(ctx: &AppCtx, mac: &str) -> Occupancy {
                     Occupancy::Owned
                 }
                 Err(ClaimError::Occupied(owner)) => {
-                    let now = now_secs();
+                    let now = device_now_secs(&mac);
                     update_v2_owner_cache(
                         &mut ctx.v2_status_cache.lock().unwrap(),
                         &mac,
@@ -1645,7 +1733,7 @@ fn device_identity_json(ctx: &AppCtx) -> Option<Value> {
 }
 
 fn device_identity_for_mac(ctx: &AppCtx, mac: &str) -> Result<Value, String> {
-    device_facts_for(ctx, mac)
+    ensure_runtime_record(ctx, mac)
         .map(|facts| device_facts_json(&facts))
         .ok_or_else(|| format!("device {mac} has no runtime record"))
 }
@@ -1823,7 +1911,7 @@ async fn device_tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, S
                 &mut ctx.v2_status_cache.lock().unwrap(),
                 &mac,
                 owner.clone(),
-                now_secs(),
+                device_now_secs(&mac),
                 false,
             );
             mark_ip_dirty(ctx, &mac);
@@ -1840,7 +1928,7 @@ async fn device_tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, S
                 &mut ctx.v2_status_cache.lock().unwrap(),
                 &mac,
                 None,
-                now_secs(),
+                device_now_secs(&mac),
                 true,
             );
             Ok(format!(
@@ -2182,9 +2270,29 @@ async fn get_device_status(
     mac: Option<String>,
 ) -> Result<Value, String> {
     let mac = resolve_target_mac(&state, mac.as_deref())?;
-    let facts = device_facts_for(&state, &mac)
+    let facts = ensure_runtime_record(&state, &mac)
         .ok_or_else(|| format!("device {mac} has no runtime record"))?;
     let device = device_facts_json(&facts);
+    let registered = platform::service(&state).device_get(&mac).unwrap_or(Value::Null);
+    let last = &registered["last_authenticated"];
+    let observed_at = last["observed_at"].as_u64();
+    let age_s = observed_at.map(|at| (device_now_secs(&mac) as u64).saturating_sub(at));
+    let clock_anomaly = observed_at.is_some_and(|at| (device_now_secs(&mac) as u64) < at);
+    let recent = !clock_anomaly && age_s.is_some_and(|age| age <= 30)
+        && state.v2_status_cache.lock().unwrap().get(&mac)
+            .is_some_and(|v| v.online && v.fetched_at <= device_now_secs(&mac)
+                && device_now_secs(&mac).saturating_sub(v.fetched_at) <= 30);
+    let contact_at = registered["last_authenticated_contact_at"].as_u64();
+    let recent_contact = contact_at.is_some_and(|at| at <= device_now_secs(&mac) as u64
+        && (device_now_secs(&mac) as u64).saturating_sub(at) <= 30);
+    let blocked = (registered["last_status_attempt"]["outcome"] == "blocked"
+        || registered["last_status_attempt"]["outcome"] == "mac_mismatch")
+        && registered["last_status_attempt"]["at"].as_u64().unwrap_or(0)
+            >= contact_at.unwrap_or(0);
+    let reachability = if blocked { "blocked" }
+        else if recent || recent_contact { "recently_authenticated" }
+        else if last["body"]["power"]["mode"] == "sleep" { "expected_sleep" }
+        else { "unknown" };
     match facts.status.clone() {
         Some(cached) => {
             let map: serde_json::Map<String, Value> = cached
@@ -2193,9 +2301,20 @@ async fn get_device_status(
                 .map(|(k, v)| (k.clone(), json!(v)))
                 .collect();
             Ok(json!({
-                "online": cached.online,
+                "online": recent,
+                "public_online": cached.online && cached.fetched_at <= device_now_secs(&mac)
+                    && device_now_secs(&mac).saturating_sub(cached.fetched_at) <= 30,
+                "public_sampled_at": cached.fetched_at,
                 "ip": cached.ip,
-                "fetched_at": cached.fetched_at,
+                "fetched_at": observed_at,
+                "last_success": last,
+                "last_authenticated_contact_at": registered["last_authenticated_contact_at"],
+                "last_authenticated_transport": registered["last_authenticated_transport"],
+                "last_attempt": registered["last_status_attempt"],
+                "age_s": age_s,
+                "clock_anomaly": clock_anomaly,
+                "reachability": reachability,
+                "record_observed": registered["record_observed"],
                 "fields": map,
                 "owner": cached.owner,
                 "device": device,
@@ -2203,8 +2322,17 @@ async fn get_device_status(
         }
         None => Ok(json!({
             "online": false,
+            "public_online": false,
             "ip": facts.endpoint(),
             "pending": true,
+            "last_success": last,
+            "last_authenticated_contact_at": registered["last_authenticated_contact_at"],
+            "last_authenticated_transport": registered["last_authenticated_transport"],
+            "last_attempt": registered["last_status_attempt"],
+            "age_s": age_s,
+            "clock_anomaly": clock_anomaly,
+            "reachability": reachability,
+            "record_observed": registered["record_observed"],
             "fields": {},
             "owner": Value::Null,
             "device": device,
@@ -2218,12 +2346,12 @@ async fn get_device_status(
 async fn get_pmstats(state: State<'_, Arc<AppCtx>>, mac: Option<String>) -> Result<Value, String> {
     const TTL_SECS: i64 = 10;
     let mac = resolve_target_mac(&state, mac.as_deref())?;
-    let facts = device_facts_for(&state, &mac)
+    let facts = ensure_runtime_record(&state, &mac)
         .ok_or_else(|| format!("device {mac} has no runtime record"))?;
     if let Some(cached) = facts
         .pmstats
         .as_ref()
-        .filter(|cached| now_secs() - cached.fetched_at < TTL_SECS)
+        .filter(|cached| device_now_secs(&mac) - cached.fetched_at < TTL_SECS)
     {
         return Ok(json!({
             "online": cached.online,
@@ -2245,7 +2373,7 @@ async fn get_pmstats(state: State<'_, Arc<AppCtx>>, mac: Option<String>) -> Resu
     };
     if let Some(device) = devices(&state).get_mut(&mac) {
         device.pmstats = Some(CachedPmStats {
-            fetched_at: now_secs(),
+            fetched_at: device_now_secs(&mac),
             online,
             ip: ip.clone(),
             text: text.clone(),
@@ -2254,7 +2382,7 @@ async fn get_pmstats(state: State<'_, Arc<AppCtx>>, mac: Option<String>) -> Resu
     Ok(json!({
         "online": online,
         "ip": ip,
-        "fetched_at": now_secs(),
+        "fetched_at": device_now_secs(&mac),
         "text": text,
     }))
 }
@@ -2526,9 +2654,9 @@ async fn udp_listen(ctx: Arc<AppCtx>) {
             };
             if last_revalidation
                 .get(&mac)
-                .is_none_or(|last| now_secs().saturating_sub(*last) >= 10)
+                .is_none_or(|last| device_now_secs(&mac).saturating_sub(*last) >= 10)
             {
-                last_revalidation.insert(mac.clone(), now_secs());
+                last_revalidation.insert(mac.clone(), device_now_secs(&mac));
                 let ctx = ctx.clone();
                 let mac_for_task = mac.clone();
                 let endpoint_for_task = endpoint.clone();
@@ -2898,7 +3026,7 @@ fn maybe_arp_fallback(ctx: &Arc<AppCtx>) {
     };
     let recently = device_facts_for(ctx, &mac)
         .and_then(|facts| facts.discover)
-        .map(|d| d.via == "arp" && now_secs() - d.at < 60)
+        .map(|d| d.via == "arp" && device_now_secs(&mac) - d.at < 60)
         .unwrap_or(false);
     if recently {
         ctx.arp_running.store(false, Ordering::SeqCst);
@@ -2996,7 +3124,6 @@ async fn refresh_http_status(ctx: &Arc<AppCtx>, mac: &str, ip: &str) {
             match platform::caps_from_status(raw) {
                 Ok(caps) => {
                     platform::ensure_device(ctx, mac, ip, caps);
-                    platform::note_status_json(ctx, mac, raw);
                 }
                 Err(e) => tracing::warn!("device capability contract rejected: {e}"),
             }
@@ -3033,7 +3160,7 @@ async fn refresh_http_status(ctx: &Arc<AppCtx>, mac: &str, ip: &str) {
     };
     if let Some(device) = devices(ctx).get_mut(mac) {
         device.status = Some(CachedDevice {
-            fetched_at: now_secs(),
+            fetched_at: device_now_secs(&mac),
             online,
             ip: ip.to_string(),
             fields,
@@ -3065,7 +3192,13 @@ async fn v2_status_poll_loop(ctx: Arc<AppCtx>) {
             if platform::device_link_for_mac(&ctx, &mac).is_none() {
                 continue;
             }
-            let _ = platform::refresh_status(&ctx, &mac).await;
+            let pending = device["ota_job"]["state"] == "queued"
+                || device["job"]["state"] == "waiting";
+            if pending {
+                platform::cycle(&ctx, &mac, true, true).await;
+            } else {
+                let _ = platform::refresh_status(&ctx, &mac).await;
+            }
         }
     }
 }
@@ -3108,6 +3241,10 @@ async fn run_services(ctx: Arc<AppCtx>) {
         });
     }
 
+    if std::env::var("CODEX_STATUS_SIM_COOPERATIVE").as_deref() == Ok("1") {
+        return;
+    }
+
     let poller = PollerConfig {
         exe,
         codex_override: ctx.config.codex_path.clone(),
@@ -3125,8 +3262,10 @@ async fn run_services(ctx: Arc<AppCtx>) {
     tokio::spawn(async move { udp_listen(udp_ctx).await });
     let cache_ctx = ctx.clone();
     tokio::spawn(async move { device_cache_loop(cache_ctx).await });
-    let status_ctx = ctx.clone();
-    tokio::spawn(async move { v2_status_poll_loop(status_ctx).await });
+    if std::env::var("CODEX_STATUS_PLATFORM_STATUS_POLL").as_deref() != Ok("0") {
+        let status_ctx = ctx.clone();
+        tokio::spawn(async move { v2_status_poll_loop(status_ctx).await });
+    }
 
     // v2 platform loop: feed the Codex envelope into the DataSource and run one
     // coordinator delivery per device on a bounded cadence. Never used to renew
@@ -3156,32 +3295,6 @@ async fn run_services(ctx: Arc<AppCtx>) {
                         if stamp != last_stamp {
                             last_stamp = stamp;
                             platform::note_envelope(&ctx, &env);
-                        }
-                    }
-                }
-                // Pending v2 work must keep the *pull* response light, otherwise
-                // a timer-woken device bounces straight back to deep before the
-                // coordinator can deliver. Reads/status never extend the light
-                // lease; this only mirrors the single-device pending-work rule.
-                let mac = selected_mac(&ctx).unwrap_or_default();
-                if platform::is_v2_device(&ctx) && !mac.is_empty() {
-                    if let Some(summary) =
-                        platform::service(&ctx).coordinator_summary(&mac, now_secs().max(0) as u64)
-                    {
-                        let pending = summary["push_dirty"].as_bool().unwrap_or(false)
-                            || summary["in_flight"].is_object()
-                            || summary["pending_activate"].is_string()
-                            || summary["job"]
-                                .as_object()
-                                .map(|j| {
-                                    !matches!(
-                                        j.get("state").and_then(|s| s.as_str()),
-                                        Some("succeeded") | Some("failed") | Some("cancelled")
-                                    )
-                                })
-                                .unwrap_or(false);
-                        if pending {
-                            ctx.activity.note_activity("platform");
                         }
                     }
                 }
@@ -3299,7 +3412,7 @@ async fn run_services(ctx: Arc<AppCtx>) {
                 let renew_due = self_owned
                     && facts
                         .last_claim_at
-                        .map(|at| now_secs() - at >= 60)
+                        .map(|at| device_now_secs(&mac) - at >= 60)
                         .unwrap_or(true);
                 let push_needed = forced
                     || contact_new
@@ -3430,87 +3543,6 @@ async fn run_services(ctx: Arc<AppCtx>) {
         });
     }
 
-    // v0.14 queued pushes (docs §13.4): while the device is deep, an OTA request
-    // is queued; the first contact after that (a pull keeps the device awake for
-    // `pending`) flushes it.
-    {
-        let ctx = ctx.clone();
-        tokio::spawn(async move {
-            let mut last_gen = ctx.activity.contact_generation();
-            let mut last_flush = 0u64;
-            let mut fails = 0u32;
-            let mut last_pending = false;
-            loop {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                let pending_ota = ctx.activity.pending_ota();
-                if !pending_ota {
-                    last_gen = ctx.activity.contact_generation();
-                    fails = 0;
-                    last_pending = false;
-                    continue;
-                }
-                // A fresh request is retried promptly even after earlier failures
-                // instead of inheriting the backoff.
-                if pending_ota != last_pending {
-                    last_pending = pending_ota;
-                    fails = 0;
-                    last_flush = 0;
-                }
-                let gen = ctx.activity.contact_generation();
-                let now = now_secs() as u64;
-                // Backoff after failed attempts: 60s, 2m, 4m, 8m, ... max 30m.
-                // A pull contact (gen change) still retries immediately.
-                let wait = if fails == 0 {
-                    60u64
-                } else {
-                    (60u64 << fails.min(5)).min(1800)
-                };
-                if gen == last_gen && now.saturating_sub(last_flush) < wait {
-                    continue;
-                }
-                last_gen = gen;
-                last_flush = now;
-                let mut failed = false;
-                if pending_ota {
-                    // The queued ROM belongs to exactly one MAC; resolve it from
-                    // that device's record, not from a global slot.
-                    let target = selected_mac(&ctx).and_then(|mac| ensure_runtime_record(&ctx, &mac));
-                    let rom = target.as_ref().and_then(|facts| facts.pending_ota_rom.clone());
-                    if let (Some(target), Some(rom)) = (target.as_ref(), rom) {
-                        let request = json!({
-                            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                            "params": {"name": "firmware_ota",
-                                       "arguments": {"rom": rom.display().to_string(),
-                                                     "mac": target.mac}}
-                        });
-                        let cfg = mcp_config(&ctx);
-                        let response = bridge_mcp::handle_request(&cfg, &request).await;
-                        let failed_ota = response
-                            .as_ref()
-                            .and_then(|r| r.pointer("/result/isError"))
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(true);
-                        if failed_ota {
-                            failed = true;
-                            tracing::warn!("queued OTA attempt failed; backing off");
-                        } else {
-                            ctx.activity.clear_pending_ota();
-                            set_pending_ota(&ctx, &target.mac, None);
-                            let ctx2 = ctx.clone();
-                            let mac = target.mac.clone();
-                            tokio::spawn(async move {
-                                platform::post_ota_window(&ctx2, &mac, 300).await;
-                            });
-                        }
-                    } else {
-                        ctx.activity.clear_pending_ota();
-                    }
-                }
-                fails = if failed { fails.saturating_add(1) } else { 0 };
-            }
-        });
-    }
-
     // v0.12 demand-driven BLE (docs/power-state.md §5/§9): no periodic scanning
     // and no template transfers. A cycle runs only when the device asks for a
     // handshake in its UDP announce (`ble=1`), which refreshes the endpoint
@@ -3538,7 +3570,7 @@ async fn run_services(ctx: Arc<AppCtx>) {
                 match platform::ble_cycle(&ctx, &candidates).await {
                     Ok(platform::BleOpportunity::NoDevice) => {}
                     Ok(platform::BleOpportunity::Connected { mac, result }) => {
-                        last_v2_attempt.insert(mac.clone(), now_secs());
+                        last_v2_attempt.insert(mac.clone(), device_now_secs(&mac));
                         match result {
                             Ok(()) => tracing::info!(event = "result", device_mac = %mac,
                                 transport = "ble", "v2 rendezvous complete"),
@@ -3639,6 +3671,7 @@ fn v2_ble_candidates(devices: &[Value], last_attempt: &HashMap<String, i64>, now
                 .and_then(bridge_core::platform::model::DeviceIdentity::normalized_mac)
         })
         .filter(|mac| {
+            let now = scheduled_now(mac, now);
             last_attempt
                 .get(mac)
                 .map_or(true, |at| now.saturating_sub(*at) >= 55)
@@ -3777,6 +3810,8 @@ fn main() {
         library: Arc::new(RwLock::new(library)),
         force_ble: Arc::new(Notify::new()),
         v2_delivery: tokio::sync::Mutex::new(()),
+        sim_control: tokio::sync::Mutex::new(()),
+        per_mac_delivery: Mutex::new(HashMap::new()),
         status: Mutex::new(RuntimeStatus {
             last_sync: None,
             last_error: None,
@@ -4290,7 +4325,7 @@ mod v2_status_cache_tests {
 
         update_v2_status_cache(&mut cache, mac_a, false, None, 101);
         assert!(matches!(
-            v2_occupancy_decision(cache.get("AABBCCDDEE01"), "bridge-a", 101),
+            v2_occupancy_decision("AABBCCDDEE01", cache.get("AABBCCDDEE01"), "bridge-a", 101),
             V2OccupancyDecision::Offline
         ));
         assert_eq!(cache["AABBCCDDEE02"].owner, b_before.owner);
@@ -4314,7 +4349,7 @@ mod v2_status_cache_tests {
         assert_eq!(cache["AABBCCDDEE01"].last_claim_at, Some(40));
         assert_eq!(cache["AABBCCDDEE01"].owner_observed_at, Some(102));
         assert!(matches!(
-            v2_occupancy_decision(cache.get("AABBCCDDEE01"), "bridge-a", 102),
+            v2_occupancy_decision("AABBCCDDEE01", cache.get("AABBCCDDEE01"), "bridge-a", 102),
             V2OccupancyDecision::Other(_)
         ));
 
@@ -4334,7 +4369,7 @@ mod v2_status_cache_tests {
             false,
         );
         assert!(matches!(
-            v2_occupancy_decision(cache.get("AABBCCDDEE01"), "bridge-a", 103),
+            v2_occupancy_decision("AABBCCDDEE01", cache.get("AABBCCDDEE01"), "bridge-a", 103),
             V2OccupancyDecision::Owned { renew: false }
         ));
         assert_eq!(cache["AABBCCDDEE02"].owner, b_before.owner);
@@ -4345,8 +4380,33 @@ mod v2_status_cache_tests {
         assert_eq!(cache["AABBCCDDEE02"].last_claim_at, b_before.last_claim_at);
         assert_eq!(cache["AABBCCDDEE02"].yielded, b_before.yielded);
         assert!(matches!(
-            v2_occupancy_decision(cache.get("AABBCCDDEE02"), "bridge-b", 103),
+            v2_occupancy_decision("AABBCCDDEE02", cache.get("AABBCCDDEE02"), "bridge-b", 103),
             V2OccupancyDecision::Yielded
         ));
+    }
+
+    #[test]
+    fn fake_wall_jump_does_not_extend_status_or_claim_freshness() {
+        let mac = "0200000000D1";
+        let other = "0200000000D2";
+        bridge_core::device_clock::configure(mac, 1000, 1_000_000, 0).unwrap();
+        bridge_core::device_clock::configure(other, 7000, 2_000_000, 0).unwrap();
+        let mut cache = HashMap::new();
+        update_v2_status_cache(&mut cache, mac, true,
+            Some(json!({"owner":{"id":"bridge-a","expires_in_s":120}})), 1000);
+        update_v2_claim_cache(&mut cache, mac,
+            Some(json!({"id":"bridge-a","expires_in_s":120})),1000,false);
+        bridge_core::device_clock::set_wall(mac, 9_000_000).unwrap();
+        let status = &cache[mac];
+        assert!(super::v2_status_fresh(mac,status,9000,30));
+        assert!(!super::v2_claim_renew_due(mac,status,9000));
+        bridge_core::device_clock::step(mac,30_001).unwrap();
+        assert!(!super::v2_status_fresh(mac,status,9000,30));
+        assert!(!super::v2_claim_renew_due(mac,status,9000));
+        bridge_core::device_clock::step(mac,29_999).unwrap();
+        assert!(super::v2_claim_renew_due(mac,status,9000));
+        assert_eq!(bridge_core::device_clock::monotonic_ms(other),Some(7000));
+        bridge_core::device_clock::clear(mac);
+        bridge_core::device_clock::clear(other);
     }
 }

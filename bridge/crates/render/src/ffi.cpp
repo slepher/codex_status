@@ -77,6 +77,8 @@ struct SimBundleDevice {
     bool failNextDisplay = false;
     uint32_t displayWrites = 0;
     const char *refreshKind = "none";
+    long long wallEpochSecs = 0;
+    bool hasWallEpoch = false;
 };
 
 const char *simRender(SimBundleDevice &device) {
@@ -91,6 +93,8 @@ const char *simRender(SimBundleDevice &device) {
     env.battery = 75;
     env.state = "WIFI ON";
     env.mode = "light";
+    env.hasNowEpoch = device.hasWallEpoch;
+    env.nowEpochSecs = device.wallEpochSecs;
     if (!tplDrawCt(device.compiled, device.usage.length() ? device.usage : String("{}"), env)) {
         device.displayState = 3;
         return "failed";
@@ -205,6 +209,14 @@ void *codex_sim_bundle_new(const char *data_dir, const char *target,
 }
 
 void codex_sim_bundle_free(void *p) { delete (SimBundleDevice *)p; }
+
+int codex_sim_bundle_set_wall(void *p, long long epoch_secs) {
+    if (!p) return 0;
+    auto &device = *(SimBundleDevice *)p;
+    device.hasWallEpoch = true;
+    device.wallEpochSecs = epoch_secs;
+    return 1;
+}
 
 int codex_sim_bundle_status(void *p, char *out, int cap) {
     if (!p) return -1;

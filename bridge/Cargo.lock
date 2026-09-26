@@ -975,6 +975,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "bridge-ble",
  "bridge-core",
  "bridge-render",
  "form_urlencoded",

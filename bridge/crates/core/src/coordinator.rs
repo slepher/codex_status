@@ -578,7 +578,9 @@ impl Coordinator {
                 PublishState::Sending => {
                     return Err("a publish is already in progress for this device".into())
                 }
-                PublishState::Waiting => { /* explicit replace of an unstarted job */ }
+                PublishState::Waiting | PublishState::Unknown => {
+                    return Err("unfinished publish job; cancel the queued job or reconcile unknown result first".into())
+                }
                 _ => {}
             }
         }
@@ -612,7 +614,7 @@ impl Coordinator {
 
     pub fn cancel_job(&mut self, now: u64) {
         if let Some(job) = self.job.as_mut() {
-            if !job.state.is_terminal() {
+            if job.state == PublishState::Waiting {
                 job.state = PublishState::Cancelled;
                 job.updated_at = now;
             }

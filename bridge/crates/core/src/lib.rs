@@ -3,6 +3,7 @@ pub mod codex;
 pub mod compile;
 pub mod coordinator;
 pub mod datasource;
+pub mod device_clock;
 pub mod device;
 pub mod envelope;
 pub mod http;

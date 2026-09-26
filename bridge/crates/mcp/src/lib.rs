@@ -336,6 +336,7 @@ async fn post_firmware(
     token: &str,
     bytes: Vec<u8>,
     filename: &str,
+    target: Option<&str>,
 ) -> reqwest::Result<reqwest::Response> {
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -345,8 +346,10 @@ async fn post_firmware(
         .file_name(filename.to_string())
         .mime_str("application/octet-stream")?;
     let form = reqwest::multipart::Form::new().part("firmware", part);
+    let url = format!("http://{ip}/doUpdate?token={token}{}",
+        target.map(|t| format!("&target={t}")).unwrap_or_default());
     client
-        .post(format!("http://{ip}/doUpdate?token={token}"))
+        .post(url)
         .multipart(form)
         .send()
         .await
@@ -364,7 +367,12 @@ async fn firmware_ota(cfg: &McpConfig, args: &Value) -> Result<Vec<Value>, Strin
 }
 
 async fn firmware_ota_inner(cfg: &McpConfig, args: &Value) -> Result<Vec<Value>, String> {
+    let upload_only = args.get("_upload_only").and_then(Value::as_bool).unwrap_or(false);
     let rom = require_str(args, "rom")?;
+    let declared_target = args.get("firmware_target").and_then(Value::as_str);
+    if upload_only && declared_target.is_none() {
+        return Err("queued OTA requires firmware_target".into());
+    }
     let path = {
         let p = PathBuf::from(&rom);
         if p.is_absolute() {
@@ -416,6 +424,9 @@ async fn firmware_ota_inner(cfg: &McpConfig, args: &Value) -> Result<Vec<Value>,
     }
 
     let mut token = load_device_token(cfg, &target_mac);
+    if token.is_none() && upload_only {
+        return Err("device operation token unavailable; wait for a bonded BLE session".into());
+    }
     if token.is_none() {
         token = Some(fetch_device_token(cfg, &target_mac).await.map_err(|e| {
             format!("device token unavailable ({e}); click BOOT on the device to open its BLE session, then retry")
@@ -441,14 +452,14 @@ async fn firmware_ota_inner(cfg: &McpConfig, args: &Value) -> Result<Vec<Value>,
         let _ = client.post(&abort_url).send().await;
     }
 
-    let mut upload = post_firmware(&ip, token.as_deref().unwrap(), bytes.clone(), filename).await;
-    if matches!(&upload, Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED) {
+    let mut upload = post_firmware(&ip, token.as_deref().unwrap(), bytes.clone(), filename, declared_target).await;
+    if !upload_only && matches!(&upload, Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED) {
         tracing::warn!("device token rejected; re-requesting over BLE");
         let fresh = fetch_device_token(cfg, &target_mac).await.map_err(|e| {
             format!("device token rejected and re-fetch failed ({e}); click BOOT on the device, then retry")
         })?;
         token = Some(fresh);
-        upload = post_firmware(&ip, token.as_deref().unwrap(), bytes.clone(), filename).await;
+        upload = post_firmware(&ip, token.as_deref().unwrap(), bytes.clone(), filename, declared_target).await;
     }
     match upload {
         Ok(resp) if !resp.status().is_success() => {
@@ -461,11 +472,21 @@ async fn firmware_ota_inner(cfg: &McpConfig, args: &Value) -> Result<Vec<Value>,
             if body.contains("UPDATE FAILED") {
                 return Err("device reported UPDATE FAILED (see its /log)".to_string());
             }
+            if upload_only {
+                if body.contains("UPDATE OK") {
+                    return Ok(vec![text_block("upload_ack".to_string())]);
+                }
+                return Err("OTA upload response had no UPDATE OK; result unknown".into());
+            }
         }
         Err(e) => {
+            if upload_only {
+                return Err(format!("OTA upload response lost; result unknown ({})",
+                    if e.is_timeout() { "timeout" } else { "transport" }));
+            }
             // A reset mid-response can also mean the device already rebooted,
             // so fall through to the version check before declaring failure.
-            tracing::warn!("doUpdate transport error: {e}");
+            tracing::warn!("doUpdate transport error (details omitted to protect token)");
         }
     }
 
@@ -483,6 +504,14 @@ async fn firmware_ota_inner(cfg: &McpConfig, args: &Value) -> Result<Vec<Value>,
                 .to_string(),
         ),
     }
+}
+
+/// App service uses this only after a persisted, MAC-bound OTA job is claimed.
+/// It reports upload acknowledgement, never firmware confirmation.
+pub async fn firmware_upload(cfg: &McpConfig, rom: &Path, ip: &str, mac: &str, target: &str) -> Result<(), String> {
+    let args = serde_json::json!({"rom": rom, "device_ip": ip, "device_mac": mac,
+        "firmware_target": target, "_upload_only": true});
+    firmware_ota_inner(cfg, &args).await.map(|_| ())
 }
 
 fn fetch_live_usage(cfg: &McpConfig) -> Option<String> {
@@ -638,19 +667,33 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "firmware_ota",
-            "title": "OTA 升级固件",
-            "description": "把本地 ROM 上传到设备 /doUpdate 并等待重启后版本变化（约 20–90s）。设备 token 按状态页报告的 Wi-Fi MAC 读取对应缓存，缺失/失效时经已绑定 BLE 链路获取（需设备处于 BLE 会话：单击 BOOT）",
+            "title": "排队 OTA 固件",
+            "description": "冻结本地 ROM 并按目标 MAC 持久排队，在下次认证会合尝试上传。返回 queued 不表示升级完成；需查询状态。声明版本和目标必须出现在镜像内。",
             "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false},
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "rom": {"type": "string", "description": "ROM 路径（绝对或相对仓库根）"},
-                    "device_ip": {"type": "string", "description": "覆盖默认设备地址"},
-                    "device_mac": {"type": "string", "description": "可选目标 Wi-Fi MAC；必须与目标设备状态页报告的 MAC 一致"}
+                    "device_mac": {"type": "string", "description": "已登记的目标 Wi-Fi MAC"},
+                    "request_id": {"type": "string", "description": "幂等请求 ID"},
+                    "expected_version": {"type": "string"},
+                    "firmware_target": {"type": "string"}
                 },
-                "required": ["rom"],
+                "required": ["rom", "request_id", "expected_version", "firmware_target"],
                 "additionalProperties": false
             }
+        },
+        {
+            "name": "firmware_ota_status", "title": "查询 OTA 任务",
+            "description": "查看目标 MAC 的持久 OTA 阶段及确认等级",
+            "annotations": {"readOnlyHint": true},
+            "inputSchema": {"type":"object", "properties":{"device_mac":{"type":"string"}}, "additionalProperties":false}
+        },
+        {
+            "name": "firmware_ota_cancel", "title": "取消 OTA 任务",
+            "description": "排队未开始可取消；可能提交的任务仅记录停止后续尝试请求",
+            "annotations": {"readOnlyHint": false},
+            "inputSchema": {"type":"object", "properties":{"device_mac":{"type":"string"}}, "additionalProperties":false}
         },
         {
             "name": "pm_stats",
@@ -1245,7 +1288,7 @@ pub async fn handle_request(cfg: &McpConfig, request: &Value) -> Option<Value> {
 
 #[cfg(test)]
 mod device_token_tests {
-    use super::{load_device_token, save_device_token, McpConfig};
+    use super::{firmware_upload, load_device_token, save_device_token, McpConfig};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1299,5 +1342,26 @@ mod device_token_tests {
         assert_eq!(load_device_token(&cfg, mac_a), None);
         assert!(save_device_token(&cfg, mac_a, &"z".repeat(32)).is_err());
         let _ = std::fs::remove_dir_all(cfg.data_root);
+    }
+
+    #[tokio::test]
+    async fn ota_wrong_mac_stops_before_upload() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let n = socket.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..n]).starts_with("GET /status.json "));
+            let body = r#"{"fw":"v1","mac":"112233445566"}"#;
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        });
+        let cfg = config();
+        let rom = cfg.root.join("rom.bin");
+        std::fs::write(&rom, vec![0xe9; 2048]).unwrap();
+        let result = firmware_upload(&cfg, &rom, &address.to_string(), "AABBCCDDEEFF", "codex-status-154g").await;
+        assert!(result.unwrap_err().contains("reports MAC"));
+        server.await.unwrap();
     }
 }

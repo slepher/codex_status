@@ -956,15 +956,16 @@ impl Pusher {
 /// Plan C: stamp every rendezvous command with the bridge's wall clock and UTC
 /// offset so the device can sync before its single post-window render. Missing
 /// or invalid fields leave the device on its local-RTC fallback.
-fn stamp_clock(body: &mut serde_json::Value) {
-    body["server_time"] = json!(bridge_core::now_secs());
+fn stamp_clock(body: &mut serde_json::Value, mac: &str) {
+    body["server_time"] = json!(bridge_core::device_clock::wall_secs(mac));
     body["tz_offset_min"] = json!(bridge_core::local_offset_minutes());
 }
 
 /// Authenticated v2 opportunity on the existing GATT table. The status value
 /// is read as a long attribute, so an ACK is not lost to notification MTU cuts.
 pub struct V2Connection {
-    peripheral: Peripheral,
+    peripheral: Option<Peripheral>,
+    fake_url: Option<String>,
     token: String,
     bridge_id: String,
     nonce: String,
@@ -1023,6 +1024,47 @@ impl V2Connection {
     ) -> Result<Option<(String, Self)>> {
         let targets = normalize_target_macs(target_macs)?;
         if targets.is_empty() {
+            return Ok(None);
+        }
+        if let Ok(raw) = std::env::var("CODEX_STATUS_SIM_BLE_ENDPOINTS") {
+            let endpoints: serde_json::Value = serde_json::from_str(&raw)
+                .context("invalid fake BLE endpoint registry")?;
+            let client = reqwest::Client::builder().timeout(Duration::from_secs(3)).build()?;
+            for mac in &targets {
+                let Some(url) = endpoints[mac].as_str() else { continue; };
+                let parsed = reqwest::Url::parse(url)?;
+                if parsed.scheme() != "http" || !matches!(parsed.host_str(),
+                    Some("127.0.0.1" | "localhost")) || parsed.port().is_none() {
+                    bail!("fake BLE endpoint must be an explicit loopback HTTP address");
+                }
+                let response = match client.get(format!("{}/sim/ble/info", url.trim_end_matches('/')))
+                    .bearer_auth(token).send().await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        tracing::warn!(device_mac = mac, %error, "fake BLE candidate unavailable");
+                        continue;
+                    }
+                };
+                if response.status() == reqwest::StatusCode::NOT_FOUND { continue; }
+                let info: serde_json::Value = response.error_for_status()?.json().await?;
+                let authorized_mac = info_authorized_target(&info, &targets)
+                    .context("fake BLE device identity mismatch")?;
+                if authorized_mac != *mac || info["rendezvous_v"].as_u64().unwrap_or(0) < 2 {
+                    bail!("fake BLE rendezvous identity/version mismatch");
+                }
+                let device_mac = authorized_mac.as_bytes().chunks(2)
+                    .map(|p| std::str::from_utf8(p).unwrap())
+                    .collect::<Vec<_>>().join(":");
+                return Ok(Some((authorized_mac, Self {
+                    peripheral: None, fake_url: Some(url.trim_end_matches('/').to_owned()),
+                    token: token.to_owned(), bridge_id: bridge_id.to_owned(),
+                    nonce: String::new(), device_mac,
+                    auth_ready: info["bonded"] == true && info["encrypted"] == true,
+                    wake_identity: wake_identity(&info),
+                    wake_cause: text_field(&info, &["wake_cause"]).unwrap_or_default(),
+                    device_last_stage: "info".into(), timings: vec![],
+                })));
+            }
             return Ok(None);
         }
         let adapter = Pusher::adapter().await?;
@@ -1136,7 +1178,8 @@ impl V2Connection {
         Ok(Some((
             authorized_mac,
             Self {
-                peripheral,
+                peripheral: Some(peripheral),
+                fake_url: None,
                 token: token.to_owned(),
                 bridge_id: bridge_id.to_owned(),
                 nonce: String::new(),
@@ -1155,8 +1198,9 @@ impl V2Connection {
     /// Refresh the endpoint credentials on this already MAC-verified link.
     /// The caller must verify the registered target before invoking this.
     pub async fn write_endpoint(&self, host: &str, port: u16, token: &str) -> Result<()> {
+        if self.fake_url.is_some() { return Ok(()); }
         Pusher::write_json(
-            &self.peripheral,
+            self.peripheral.as_ref().unwrap(),
             CHR_ENDPOINT,
             &Pusher::endpoint_payload(host, port, token),
         )
@@ -1169,7 +1213,13 @@ impl V2Connection {
         if !self.auth_ready {
             bail!("BLE device link is not encrypted and bonded");
         }
-        Pusher::request_token_on_peripheral(&self.peripheral).await
+        if let Some(url) = &self.fake_url {
+            let reply: serde_json::Value = reqwest::Client::new()
+                .get(format!("{url}/sim/ble/token"))
+                .bearer_auth(&self.token).send().await?.error_for_status()?.json().await?;
+            return Ok(reply["token"].as_str().context("fake BLE token response")?.to_owned());
+        }
+        Pusher::request_token_on_peripheral(self.peripheral.as_ref().unwrap()).await
     }
 
     pub async fn command(
@@ -1191,14 +1241,38 @@ impl V2Connection {
         body["bridge_id"] = json!(self.bridge_id);
         body["device_mac"] = json!(self.device_mac);
         body["token"] = json!(self.token);
-        stamp_clock(&mut body);
+        stamp_clock(&mut body, &self.device_mac);
         let bytes = serde_json::to_vec(&body)?;
         if bytes.len() > 8192 {
             bail!("v2 BLE command exceeds 8192 bytes");
         }
+        if let Some(url) = &self.fake_url {
+            let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?;
+            let mut reply = serde_json::Value::Null;
+            for (index, chunk) in bytes.chunks(180).enumerate() {
+                let final_chunk = (index + 1) * 180 >= bytes.len();
+                reply = client.post(format!("{url}/sim/ble/fragment?offset={}&final={}",
+                    index * 180, u8::from(final_chunk)))
+                    .bearer_auth(&self.token).body(chunk.to_vec()).send().await?
+                    .error_for_status()?.json().await?;
+                if !final_chunk && reply["result"] != "more" {
+                    bail!("fake BLE fragment was not accepted");
+                }
+            }
+            if reply["ack"] != "v2" || reply["request_id"] != id {
+                bail!("fake BLE ACK identity mismatch");
+            }
+            if op == "status" && reply["result"] == "applied" {
+                self.nonce = reply["session_nonce"].as_str()
+                    .context("fake BLE session nonce")?.to_owned();
+            }
+            self.timings.push((op.to_owned(), 0));
+            return Ok(reply);
+        }
         let lookup_start = Instant::now();
         let status = self
             .peripheral
+            .as_ref().unwrap()
             .characteristics()
             .into_iter()
             .find(|c| c.uuid == Pusher::uuid(CHR_STATUS))
@@ -1213,7 +1287,7 @@ impl V2Connection {
         };
         tracing::info!(device_mac = %self.device_mac, op, characteristic = "status", duration_ms = lookup_start.elapsed().as_millis(), "BLE ACK characteristic found");
         let write_start = Instant::now();
-        if let Err(error) = Pusher::write_json(&self.peripheral, CHR_TPL_CTRL, &bytes).await {
+        if let Err(error) = Pusher::write_json(self.peripheral.as_ref().unwrap(), CHR_TPL_CTRL, &bytes).await {
             self.log_failure(&id, op, "write", "write_failed");
             tracing::warn!(device_mac = %self.device_mac, op, request_id = %id, stage = "write", category = error_category("write"), duration_ms = write_start.elapsed().as_millis(), "BLE command write failed");
             return Err(error);
@@ -1232,7 +1306,8 @@ impl V2Connection {
         let started = Instant::now();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            let raw = match tokio::time::timeout_at(deadline, self.peripheral.read(&status)).await {
+            let raw = match tokio::time::timeout_at(deadline,
+                self.peripheral.as_ref().unwrap().read(&status)).await {
                 Ok(Ok(raw)) => raw,
                 Ok(Err(_)) => {
                     self.log_failure(&id, op, "ack", "read_failed");
@@ -1333,7 +1408,9 @@ impl V2Connection {
     /// btleplug's cached GATT objects, so `discover_services` must run on
     /// every cycle (that is why discovery is not skipped in `connect`).
     pub async fn close(self) {
-        let _ = self.peripheral.disconnect().await;
+        if let Some(peripheral) = self.peripheral {
+            let _ = peripheral.disconnect().await;
+        }
         tracing::debug!(timings = ?self.timings, "v2 rendezvous link closed");
     }
 }
@@ -1519,7 +1596,7 @@ mod tests {
     #[test]
     fn rendezvous_commands_carry_the_bridge_clock() {
         let mut body = json!({"op": "plan"});
-        super::stamp_clock(&mut body);
+        super::stamp_clock(&mut body, "70041DD7A340");
         let now = body["server_time"].as_u64().unwrap();
         assert!(now > 1_600_000_000, "server_time must be a fresh epoch");
         let tz = body["tz_offset_min"].as_i64().unwrap();

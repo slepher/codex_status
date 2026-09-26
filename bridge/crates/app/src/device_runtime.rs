@@ -17,7 +17,6 @@
 //!    (`design.md` §2: "多设备时缺少 MAC 返回请选择设备，不能取列表首项").
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 
 use crate::{normalize_mac, CachedDevice, CachedOwner, CachedPmStats, Discovery};
 
@@ -49,8 +48,6 @@ pub struct DeviceRuntime {
     /// Per-device note shown on the device page (offline, occupied, push error).
     /// It replaced the single global note once more than one device existed.
     pub note: Option<String>,
-    /// ROM path of an OTA queued while this device was asleep.
-    pub pending_ota_rom: Option<PathBuf>,
 }
 
 impl DeviceRuntime {

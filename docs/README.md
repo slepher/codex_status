@@ -13,8 +13,9 @@
 | 查历史里程碑（0.13–0.18 各轮实机修复） | `docs/history/progress-archive-2026-09-23.md`（≤09-22）、`docs/history/progress-archive-2026-09-25.md`（09-24 及合并过程） |
 | 改协议/模板/渲染 | `docs/generic-display-platform-design-v2.md`（权威架构）+ `AGENTS.md` §关键不变量 |
 | 改电源/唤醒/占用 | `docs/power-state.md` + `docs/generic-display-platform-design-v2.md` §7 |
+| 改休眠设备的状态页、模板/OTA 延后投递 | `docs/generic-display-platform-design-v2.md` + `project-workflow/sleep-aware-bridge/design.md` / `task.md` |
 | 改 BLE 会合功耗 | `docs/ble-rendezvous-power-design.md` |
-| 改模拟器/实验时钟 | `docs/fake-rom-simulator-design.md` + `project-workflow/fake-rom-simulator/plan.md`（**仍在工作区**，进行中） |
+| 改模拟器/实验时钟 | `docs/fake-rom-simulator-design.md` + `docs/history/workflow/fake-rom-simulator-def/evidence.md`（D/E/F 已结项） |
 | 改字体资产 | `docs/font-asset-format.md` + `project-workflow/note4-bridge-publish/protocol.md`（**草案，未定稿**） |
 | 查缺陷结案 | `docs/history/bugs-2026-09-22.md`（原 `bugs.md`，已结案） |
 
@@ -25,7 +26,7 @@
 | `generic-display-platform-design-v2.md` | **权威** | 通用显示平台 v2 架构。与它冲突的旧描述一律以它为准 |
 | `power-state.md` | **权威** | 电源状态、身份/发现、占用 claim/lease 语义（§9.1/§9.2/§13.3） |
 | `ble-rendezvous-power-design.md` | 设计已定稿，实现分 6 阶段 | 会合功耗设计；阶段 1/2 已上线，其余见 backlog C4 |
-| `fake-rom-simulator-design.md` | 设计；实现进行中 | 同源 ROM 模拟器；逐 MAC 时钟合同的修正在 `docs/history/workflow/fake-rom-simulator/plan.md` |
+| `fake-rom-simulator-design.md` | D/E/F 软件验收完成 | 逐 MAC 时钟、fake BLE、协作调度与代表性故障矩阵；G 已取消，证据归档在 `docs/history/workflow/fake-rom-simulator-def/` |
 | `font-asset-format.md` | 已实现 | CSFN 容器与字体资产格式 |
 | `device-setup-experience.md` | 已过时 | 早期配网体验记录，仅作产品意图参考 |
 
@@ -43,8 +44,11 @@
 | `docs/history/next-2026-09-25.md` | 原 `next.md`：合并 + 多 env 重构 + 包目录隔离的**已完成**记录 |
 | `docs/history/bugs-2026-09-22.md` | 原 `bugs.md`：BUG-1 / BUG-2 结案记录 |
 | `docs/history/workflow/<name>/` | 已结项的 `project-workflow/*` 专项原件。2026-09-25 分两批迁入 **17 个**：`bridge-multi-instance`、`bundle-v3`、`codex-quota-display`、`deep-pull-test`、`device-discovery`、`fake-rom-simulator`、`note4-bridge-publish`、`note4-buttons`、`note4-icon-correction`、`note4-live-sync`、`note4-ota-bringup`、`note4-template-96`、`pmstats`、`sleep-modes`、`wake-contact-trace`（第一批 15 个）；`generic-display-platform-design`、`live-template-delivery`（第二批，等 ACL 修好后补上） |
+| `docs/history/workflow/fake-rom-simulator-def/` | 2026-09-26 D/E/F 完成原件：计划、任务、时钟审计、M01–M18 证据、硬件边界 case、状态和评审 |
 
 ### 仍在 `project-workflow/` 的专项（未结项，别归档）
+
+Fake ROM D/E/F 已结项并归档；下表只列仍需推进的专项。
 
 | 专项 | 为什么还留着 |
 |---|---|
@@ -52,6 +56,7 @@
 | `note4-panel-power` | 面板供电双模式与帧缓存自愈修正未刷机、bench 测量全缺 |
 | `clock-window-retention` | 1.54 时钟窗口保留修正已构建但未刷机、未实机复测 |
 | `bridge-multi-device-ui` | 按 MAC 推送与统一族发布菜单未实现 |
+| `sleep-aware-bridge` | S1–S4 已实现，S5 的硬件故障矩阵仍待验证；方案与现场见该目录和 PROGRESS |
 | `bridge-family-sync-preservation` | 源码已修但未进入运行桥；未部署就有覆盖设备 `sync_enabled` 的风险 |
 | `ble-rendezvous-power` | stage 3–6 全部未实现 |
 | `power-plan-c` / `power-state` / `sleep-battery` | 功耗基线、整机硬件验收、M3 验收未闭环 |

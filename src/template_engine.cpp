@@ -218,7 +218,7 @@ static bool evalBind(const BindSpec &s, TextTimeFormat format, JsonDocument &usa
     case B_DEV_NOW: {
         // Device local clock (server_time synced + RTC): the loop redraws once
         // per minute while the active template references this bind.
-        time_t n = time(nullptr);
+        time_t n = (time_t)(env.hasNowEpoch ? env.nowEpochSecs : time(nullptr));
         if (n < 1600000000) return false;
         struct tm *lt = localtime(&n);
         if (!lt) return false;
@@ -228,7 +228,7 @@ static bool evalBind(const BindSpec &s, TextTimeFormat format, JsonDocument &usa
         return true;
     }
     case B_DEV_DATE: {
-        time_t n = time(nullptr);
+        time_t n = (time_t)(env.hasNowEpoch ? env.nowEpochSecs : time(nullptr));
         if (n < 1600000000) return false;
         struct tm *lt = localtime(&n);
         if (!lt) return false;
@@ -319,7 +319,7 @@ static bool bindExists(const BindSpec &s, JsonDocument &usage, const TplEnv &env
     case B_DEV_STATE:   return env.state.length() > 0;
     case B_DEV_OFFLINE: return env.offlineMins >= 0;
     case B_DEV_NOW:
-    case B_DEV_DATE:    return time(nullptr) > 1600000000;
+    case B_DEV_DATE:    return (env.hasNowEpoch ? env.nowEpochSecs : time(nullptr)) > 1600000000;
     case B_DEV_MODE:    return env.mode.length() > 0;
     case B_PLAN:        return haveUsage && !usage["account"]["plan"].isNull();
     case B_LABEL:       return haveUsage && !usage["bridge"]["label"].isNull();

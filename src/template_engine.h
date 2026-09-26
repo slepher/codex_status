@@ -9,6 +9,8 @@ struct TplEnv {
     String state;                // AP / BLE ON / BLE OFF / WIFI OFF
     int offlineMins = -1;        // minutes since the last successful sync
     String mode;                 // "deep" / "light" (v0.14 device.mode)
+    bool hasNowEpoch = false;    // host simulation supplies its experiment clock
+    long long nowEpochSecs = 0;
 };
 
 // Draw a template onto the current Paint image (caller has cleared the frame).
