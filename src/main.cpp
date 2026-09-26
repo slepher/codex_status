@@ -79,12 +79,12 @@ static bool targetUnverified = false;
 #define FW_VERSION    "0.13.9-clkwin"
 #elif defined(CODEX_TARGET_NOTE4)
 #ifdef CODEX_NOTE4_ROM_B
-#define FW_VERSION    "0.18.24-note4-b"
+#define FW_VERSION    "0.18.25-note4-b"
 #else
 #define FW_VERSION    "0.18.19-note4-a"
 #endif
 #else
-#define FW_VERSION    "0.18.24-bw"
+#define FW_VERSION    "0.18.25-bw"
 #endif
 // Bridge OTA queue checks this exact build identity before freezing an image.
 static const char OTA_IMAGE_IDENTITY[] __attribute__((used)) =
@@ -189,7 +189,7 @@ RTC_DATA_ATTR static uint8_t  rtcMode = MODE_DEEP;
 RTC_DATA_ATTR static uint16_t rtcNextContactS = DEEP_CONTACT_DEFAULT_S;
 RTC_DATA_ATTR static uint32_t rtcNextNetAt = 0;     // epoch of the next pull
 RTC_DATA_ATTR static uint32_t rtcUsageRev = 0;      // bridge usage_rev last seen
-RTC_DATA_ATTR static uint32_t rtcEpochAtSleep = 0;  // clock at the last deep sleep
+RTC_DATA_ATTR static uint64_t rtcEpochUsAtSleep = 0; // wall clock at the last deep sleep
 RTC_DATA_ATTR static uint64_t rtcClkUsAtSleep = 0;  // RTC timer at the last sleep
 RTC_DATA_ATTR static uint32_t rtcDeepCycles = 0;    // thin clock wakes
 RTC_DATA_ATTR static uint32_t rtcNetCycles = 0;     // deep network windows
@@ -2496,7 +2496,9 @@ static void deepSleepRaw(uint32_t sec) {
         rtcAccBleMs += rtcLastBleMs;
         rtcAccRenderMs += wakeRenderMs;
     }
-    rtcEpochAtSleep = timeKnown() ? (uint32_t)time(nullptr) : 0;
+    struct timeval wallAtSleep;
+    rtcEpochUsAtSleep = timeKnown() && gettimeofday(&wallAtSleep, nullptr) == 0
+        ? (uint64_t)wallAtSleep.tv_sec * 1000000ULL + (uint64_t)wallAtSleep.tv_usec : 0;
     rtcClkUsAtSleep = esp_rtc_get_time_us();
     armWakeSources((uint64_t)sec * 1000000ULL);
     setStage(90);
@@ -4933,11 +4935,12 @@ static void persistMode() {
 // Deep sleep does not lose the RTC timer; reconstruct the wall clock from the
 // last sleep anchor so minute ticks stay aligned without a network contact.
 static void restoreTimeFromRtc() {
-    if (!rtcEpochAtSleep || !rtcClkUsAtSleep) return;
+    if (!rtcEpochUsAtSleep || !rtcClkUsAtSleep) return;
     uint64_t nowUs = esp_rtc_get_time_us();
     if (nowUs <= rtcClkUsAtSleep) return;
-    time_t t = (time_t)rtcEpochAtSleep + (time_t)((nowUs - rtcClkUsAtSleep) / 1000000ULL);
-    struct timeval tv = {t, 0};
+    uint64_t epochUs = rtcEpochUsAtSleep + nowUs - rtcClkUsAtSleep;
+    struct timeval tv = {(time_t)(epochUs / 1000000ULL),
+                         (suseconds_t)(epochUs % 1000000ULL)};
     settimeofday(&tv, nullptr);
 }
 
@@ -5548,7 +5551,7 @@ void setup() {
         rtcNextContactS = DEEP_CONTACT_DEFAULT_S;
         rtcNextNetAt = 0;
         rtcUsageRev = 0;
-        rtcEpochAtSleep = 0;
+        rtcEpochUsAtSleep = 0;
         rtcClkUsAtSleep = 0;
         rtcApChannel = 0;
         rtcApBssid[0] = 0;

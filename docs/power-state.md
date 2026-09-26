@@ -302,12 +302,14 @@ DevLog/`/log`），用于证明 light sleep 生效。0.13.0 起同一文本也�
 
 ### 13.5 时间与持久化
 
-- 深睡时间用 `esp_rtc_get_time_us()` 差分（RTC 域连续）；当前
+- 深睡前保存完整的 UTC 秒与微秒，唤醒后加上 `esp_rtc_get_time_us()`
+  差分（RTC 域连续）恢复完整 `timeval`，避免每次分钟唤醒丢失亚秒。
+  当前
   `CONFIG_RTC_CLK_SRC_INT_RC=y`（内部 RC，有漂移），可选
   `CONFIG_RTC_CLK_SRC_EXT_CRYS`（需确认板上 32.768k 晶振）或使用板上
   **PCF85063**（I2C，现固件未用）。
 - RTC/NVS 清单：`mode`、`usage_rev`、`last_change`、`next_net_at`、
-  `retryStage`、`epochAtSleep`+`rtcTimeAtSleepUs`、时钟 rect/旧像素/
+  `retryStage`、`epochUsAtSleep`+`rtcTimeAtSleepUs`、时钟 rect/旧像素/
   `partialCount`；NVS 兜 OTA/软复位。
 
 ### 13.6 功耗估算（按 A/B 实测修正）

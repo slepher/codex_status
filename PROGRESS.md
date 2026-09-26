@@ -1,5 +1,12 @@
 # Codex Status 项目进度（交接文档）
 
+## 两台设备离线深睡时钟亚秒丢失修复（2026-09-26，双 ROM 已发布）
+
+- 用户实测 Bridge 离线一天：Note4 约慢 15 分钟，1.54 约慢 8 分钟。`deepSleepRaw()` 原用整秒 `time(nullptr)` 保存锚点，`restoreTimeFromRtc()` 每次把微秒清零；分钟唤醒时清醒阶段的亚秒可能反复丢失。现保存完整 `gettimeofday()` 微秒 epoch，并以 RTC 连续微秒差恢复完整 `timeval`。两台共用此路径；内部 RC 的物理漂移仍须上机复测。
+- 顺序构建成功：Note4 `.pio/build/zectrix-note4-b/firmware.bin`，`0.18.25-note4-b`，1,758,832 B，SHA256 `A976A38C03FB6ECCF02E6E648C0724D1F875CE2FA3701508519C0064DA718135`；1.54 `.pio/build/esp32-s3-epaper-154g/firmware.bin`，`0.18.25-bw`，1,741,040 B，SHA256 `5D875228CAD845F3F769270F398A50F968EC82A77BA343E200BD8FE66A9FD120`。目标与版本 marker 均核对通过；RTC slow headroom 分别 3,728 B / 4,180 B。
+- 旧 `0.18.24` OTA 任务各自停在上传 ACK 且认证见版本后的 `awaiting_confirmation`，原队列会拒绝新任务。Bridge core 现允许此状态被显式新版本任务接替，仍拒绝未收到 ACK/版本证据的任务；定向回归通过。为避免带入另一项未提交 UI，从干净 worktree 构建 Bridge；原 exe 与平台 state 已备份在 ignored `artifacts/`，新 `bridge/target/debug/bridge-app.exe` SHA256 `96C3FBA27DBE917E30CEF32A26B9C8E5241686D8A96C7AFF7D9BAF04FCE21F1A`，已按 watchdog→主进程顺序替换启动，设备 2、模板 3 保留。
+- 用户授权顺序 OTA。Note4 MAC `7C4FADB93408` job `23b3310b`（request `rtc-micros-20260926-note4-01825`）冻结镜像与上述 SHA256/大小一致；一次上传 ACK 后，同 MAC 认证 `/v2/status` 从上传前 `0.18.24-note4-b` 变为 `0.18.25-note4-b`，`observed_at=1790433669`，任务保留 `awaiting_confirmation` / `version_observed`（设备未提供精确运行镜像 SHA）。首台确认后才排 1.54 MAC `70041DD7A340` job `6de8b626`（request `rtc-micros-20260926-154g-01825`）；同样一次上传 ACK，认证版本 `0.18.24-bw` → `0.18.25-bw`，`observed_at=1790433882`，任务 `awaiting_confirmation` / `version_observed`。两台模板/Profile 原状态保留，1.54 认证电量 12%。离线 24 h 准度复测仍列在 backlog，不能把版本变化当成漂移改善的证明。
+
 ## Fake ROM D/E/F 软件验收完成（2026-09-26）
 
 - 用户范围为 D/E/F；G 整套实机回归取消。M01–M18 按错误类别取代表软件 case，明细见 `docs/history/workflow/fake-rom-simulator-def/evidence.md`。D/E/F 不能证明的 Windows GATT 缓存、面板 BUSY/LUT、真实 Flash/RTC 掉电边界仅记录在同目录 `hardware-cases.md`；没有实现或执行硬件 case。

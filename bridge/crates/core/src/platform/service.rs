@@ -976,7 +976,12 @@ impl PlatformService {
                 }
                 bail!("request_id reused with different OTA content");
             }
-            if existing.pending() { bail!("device has an unfinished OTA job; cancel or confirm it first"); }
+            if existing.pending() && !(existing.state == "awaiting_confirmation"
+                && existing.upload_ack
+                && matches!(existing.confirmation.as_deref(),
+                    Some("version_observed" | "version_seen_unproven"))) {
+                bail!("device has an unfinished OTA job; cancel or confirm it first");
+            }
         }
         let blob = format!("ota-{mac}-{digest}.bin");
         let path = self.dir.join(&blob);
@@ -2374,6 +2379,15 @@ mod tests {
         assert_eq!(resumed.ota_job(mac).unwrap().confirmation.as_deref(), Some("version_seen_unproven"));
         assert_eq!(resumed.ota_job(mac).unwrap().state, "awaiting_confirmation");
         assert!(!resumed.ota_job(mac).unwrap().blocks_following_work());
+        let next_version = "0.99.1-bw";
+        let mut next_bytes = bytes;
+        let next_marker = format!("codex-status-ota-v1|{target}|{next_version}\0");
+        next_bytes[32..32 + next_marker.len()].copy_from_slice(next_marker.as_bytes());
+        std::fs::write(&source, next_bytes).unwrap();
+        let next = resumed.queue_ota(mac, "bridge", "request-2", &source, next_version, &target).unwrap();
+        assert_eq!(next.state, "queued");
+        assert_ne!(next.job_id, job.job_id);
+        assert!(!resumed.dir.join(job.blob).exists());
     }
 
     #[test]
