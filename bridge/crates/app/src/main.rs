@@ -1019,6 +1019,9 @@ async fn mcp_handler(
     body: String,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+    let _sim_barrier = if std::env::var("CODEX_STATUS_SIM_COOPERATIVE").as_deref() == Ok("1") {
+        Some(ctx.sim_control.lock().await)
+    } else { None };
     let host_ok = headers
         .get(axum::http::header::HOST)
         .and_then(|v| v.to_str().ok())

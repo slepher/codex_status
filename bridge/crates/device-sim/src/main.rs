@@ -24,11 +24,11 @@ const MAX_RATE_PPM: u64 = 1_000_000_000;
 const MAX_STEP_MS: u64 = 86_400_000;
 const CAPABILITIES: &[&str] = &["v2_status", "clock_control", "claim", "plan_state",
     "bundle_transfer", "bundle_persistence", "data_render", "activate",
-    "power_sleep_http", "button_cycle", "ota_catalog", "fake_ble_rendezvous"];
+    "power_sleep_http", "power_lifecycle", "button_cycle", "ota_catalog", "fake_ble_rendezvous"];
 const UNSUPPORTED: &[&str] = &[
     "physical_ble",
     "physical_display",
-    "power_lifecycle",
+    "physical_power",
 ];
 
 #[derive(Clone)]

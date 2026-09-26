@@ -19,7 +19,7 @@
 | M13 | `device-sim` 的 `ota_upload_can_commit_after_its_ack_is_lost`、`ota_pending_survives_process_death_before_delayed_reboot`；`core` 的 `ota_freezes_per_mac_and_never_reuploads_after_restart` | 运行镜像精确 SHA 无设备证明 |
 | M14 | `device-sim` 的 OTA override/上传来源断言；隔离 Bridge OTA 保持 `awaiting_confirmation` / `version_seen_unproven`（见 PROGRESS） | 版本相同不能推断 `image_verified` |
 | M15 | `core` 的 `publish_freeze_and_queue_order`、`queued_ota_cancel_removes_frozen_blob`、`incremental_job_persists_frozen_bytes_across_restart_and_edit` | 同类任务冲突按产品合同 |
-| M16 | `device-sim` 的 `timer_ble_rendezvous_accepts_formal_plan_before_http_opens`、`bridge_v2_connection_uses_fake_ble_without_os_radio`；隔离 Bridge 协作 BLE/HTTP 运行 | 真实射频/GATT 缓存在 H01 |
+| M16 | `device-sim` 的 `timer_ble_rendezvous_accepts_formal_plan_before_http_opens`、`bridge_v2_connection_uses_fake_ble_without_os_radio`；隔离 Bridge 24 h 协作运行逐 BLE 窗口断言 `V2Connection` 会合成功 | 真实射频/GATT 缓存在 H01 |
 | M17 | `device-sim` 的 `instances_advance_at_independent_rates`、`wall_offsets_do_not_change_monotonic_and_invalid_commands_are_atomic`；`core` 的 `device_clock::independent_views_and_wall_jump_do_not_move_monotonic`；`app` 的 `fake_wall_jump_does_not_extend_status_or_claim_freshness` | 实验单调与 wall 分开 |
 | M18 | `device-sim` 的实例锁、坏 owner 文件、OTA pending/Bundle 写中硬退出；隔离 Bridge 的 M07 重启对账 | 仅隔离目录；生产数据未触碰 |
 

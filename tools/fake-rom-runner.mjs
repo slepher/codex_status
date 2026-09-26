@@ -70,7 +70,14 @@ for (let event = 0; event < maxEvents && coordinate <= untilMs; event++) {
   for (let index = 0; index < states.length; index++) {
     const device = config.devices[index];
     const state = states[index];
-    if (state.power.ble_window_until_ms !== null) await bridgeRun(device.mac, 'ble');
+    if (state.power.ble_window_until_ms !== null) {
+      const run = await bridgeRun(device.mac, 'ble');
+      if (run.outcome?.contact !== true || run.outcome?.error ||
+          run.outcome?.result?.Err !== undefined) {
+        throw new Error(`BLE rendezvous failed for ${device.mac} at ${coordinate}ms: ` +
+          JSON.stringify(run.outcome));
+      }
+    }
     const afterBle = await deviceState(device);
     if (afterBle.power.mode === 'light') await bridgeRun(device.mac, 'http');
   }

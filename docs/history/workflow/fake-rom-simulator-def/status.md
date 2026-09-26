@@ -2,7 +2,7 @@
 
 ## 2026-09-26：D/E/F 软件出口完成
 
-同源设备业务、A/B/OTA/电源与两族像素对拍的 D 代表 case 完成；E 接入 Bridge 逐 MAC 时钟、跨进程恢复、fake BLE 的真实 `V2Connection` 路径及协作 `/sim/run`/`/sim/clock` 屏障。F 双 Fake MAC 24 h 协作运行，各 1,440 次 timer wake；独立失步输入使 A/B 分别新增 10/11 次 wake。发现宿主 `device.now/date` 误读系统时钟后修共享 `TplEnv` 输入，同一快照双回放 1 h 的 trace/帧 CRC 完全相同。M01–M18 代表证据见 `evidence.md`，ROM、测试、trace SHA256 见 PROGRESS 最新节。G 按用户决定取消；硬件特有错误仅记 `hardware-cases.md`，未实现或实测。隔离进程已停止，生产 Bridge 与设备未动。
+同源设备业务、A/B/OTA/电源与两族像素对拍的 D 代表 case 完成；E 接入 Bridge 逐 MAC 时钟、跨进程恢复、fake BLE 的真实 `V2Connection` 路径及协作 `/sim/run`/`/sim/clock` 屏障。F 双 Fake MAC 最终 24 h 协作回放共 2,861 事件、各 1,430 次 timer wake（前 10 min 为 light Plan），每个 BLE 窗口均断言会合成功；独立失步输入使 A/B 分别新增 10/11 次 wake。发现宿主 `device.now/date` 误读系统时钟后修共享 `TplEnv` 输入，同一快照双回放 1 h 的 trace/帧 CRC 完全相同。M01–M18 代表证据见 `evidence.md`，ROM、测试、最终 trace SHA256 见 PROGRESS 最新节。G 按用户决定取消；硬件特有错误仅记 `hardware-cases.md`，未实现或实测。隔离进程已停止，生产 Bridge 与设备未动。
 
 ## 2026-09-26：D 的硬退出、动态帧与电源输入
 

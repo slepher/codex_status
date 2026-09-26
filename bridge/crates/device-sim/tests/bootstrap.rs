@@ -1062,7 +1062,7 @@ fn ready_and_status_are_safe_and_use_shared_builder() {
         sim.ready["capabilities"],
         serde_json::json!(["v2_status", "clock_control", "claim", "plan_state",
             "bundle_transfer", "bundle_persistence", "data_render", "activate",
-            "power_sleep_http", "button_cycle", "ota_catalog", "fake_ble_rendezvous"])
+            "power_sleep_http", "power_lifecycle", "button_cycle", "ota_catalog", "fake_ble_rendezvous"])
     );
     let ready_text = sim.ready.to_string();
     assert!(!ready_text.contains(ENDPOINT));
@@ -1102,7 +1102,7 @@ fn token_domains_are_separate_and_sim_state_discloses_no_secrets() {
         state["capabilities"],
         serde_json::json!(["v2_status", "clock_control", "claim", "plan_state",
             "bundle_transfer", "bundle_persistence", "data_render", "activate",
-            "power_sleep_http", "button_cycle", "ota_catalog", "fake_ble_rendezvous"])
+            "power_sleep_http", "power_lifecycle", "button_cycle", "ota_catalog", "fake_ble_rendezvous"])
     );
     assert_eq!(state["clock_persistence"], "instance_file");
     assert_eq!(state["plan"]["accepted"], false);
@@ -1110,7 +1110,7 @@ fn token_domains_are_separate_and_sim_state_discloses_no_secrets() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|item| item == "power_lifecycle"));
+        .any(|item| item == "physical_power"));
     assert_eq!(state["owner"], Value::Null);
     assert!(state["unsupported"]
         .as_array()
