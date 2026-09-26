@@ -2,6 +2,8 @@
 // in host tests.
 #pragma once
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <set>
 #include <string>
@@ -24,6 +26,48 @@ public:
     std::set<std::string> dirs;
     size_t capacity = 1024 * 1024;
     long long writeBudget = -1; // inject a torn write after exactly N bytes
+    std::string root;
+    static std::string encoded(const std::string &path) {
+        const char *hex = "0123456789abcdef";
+        std::string name = "littlefs-";
+        for (unsigned char c : path) { name += hex[c >> 4]; name += hex[c & 15]; }
+        return name;
+    }
+    static std::string decoded(const std::string &name) {
+        if (name.rfind("littlefs-", 0) != 0 || (name.size() - 9) % 2) return {};
+        std::string path;
+        for (size_t i = 9; i < name.size(); i += 2) {
+            unsigned value = 0;
+            for (int j = 0; j < 2; ++j) {
+                char c = name[i + j];
+                unsigned digit = c >= '0' && c <= '9' ? c - '0'
+                    : c >= 'a' && c <= 'f' ? c - 'a' + 10 : 16;
+                if (digit > 15) return {};
+                value = (value << 4) | digit;
+            }
+            path += (char)value;
+        }
+        return path;
+    }
+    void useDirectory(const std::string &directory) {
+        files.clear(); dirs.clear(); root = directory;
+        for (const auto &entry : std::filesystem::directory_iterator(root)) {
+            if (!entry.is_regular_file()) continue;
+            std::string path = decoded(entry.path().filename().string());
+            if (path.empty() || path[0] != '/') continue;
+            std::ifstream in(entry.path(), std::ios::binary);
+            files[path] = std::vector<uint8_t>(std::istreambuf_iterator<char>(in), {});
+        }
+    }
+    bool sync(const std::string &path) {
+        if (root.empty()) return true;
+        std::ofstream out(std::filesystem::path(root) / encoded(path),
+                          std::ios::binary | std::ios::trunc);
+        const auto &bytes = files.at(path);
+        out.write((const char *)bytes.data(), (std::streamsize)bytes.size());
+        out.flush();
+        return out.good();
+    }
     bool begin(bool, const char *, int, const char *) { return true; }
     bool exists(const char *p) {
         if (!strcmp(p, "/")) return true;
@@ -41,12 +85,19 @@ public:
     bool rmdir(const char *p) {
         std::string prefix = std::string(p) + "/";
         for (auto it = files.begin(); it != files.end();) {
-            it = it->first.compare(0, prefix.size(), prefix) == 0 ? files.erase(it) : std::next(it);
+            if (it->first.compare(0, prefix.size(), prefix) == 0) {
+                if (!root.empty()) std::filesystem::remove(std::filesystem::path(root) / encoded(it->first));
+                it = files.erase(it);
+            } else ++it;
         }
         dirs.erase(p);
         return true;
     }
-    bool remove(const char *p) { return files.erase(p) != 0; }
+    bool remove(const char *p) {
+        bool removed = files.erase(p) != 0;
+        if (removed && !root.empty()) std::filesystem::remove(std::filesystem::path(root) / encoded(p));
+        return removed;
+    }
     bool rename(const char *from, const char *to);
     size_t totalBytes() const { return capacity; }
     size_t usedBytes() const { size_t n = 0; for (const auto &f : files) n += f.second.size(); return n; }
@@ -68,9 +119,12 @@ class File {
 public:
     File() = default;
     File(const char *p, const char *mode) : path(p) {
-        if (mode[0] == 'w') LittleFS.files[path].clear();
+        if (mode[0] == 'w') {
+            LittleFS.files[path].clear();
+            opened = LittleFS.sync(path);
+        }
         if (mode[0] == 'a') pos = LittleFS.files[path].size();
-        opened = LittleFS.files.count(path) != 0;
+        if (mode[0] != 'w') opened = LittleFS.files.count(path) != 0;
         size_t slash = path.find_last_of('/');
         nameBuf = slash == std::string::npos ? path : path.substr(slash + 1);
         if (!opened) {
@@ -126,6 +180,7 @@ public:
         auto &bytes = LittleFS.files[path];
         if (pos + len > bytes.size()) bytes.resize(pos + len);
         memcpy(bytes.data() + pos, data, len); pos += len;
+        if (!LittleFS.sync(path)) return 0;
         if (LittleFS.writeBudget >= 0) LittleFS.writeBudget -= len;
         return len;
     }
@@ -134,6 +189,15 @@ public:
 inline bool LittleFSClass::rename(const char *from, const char *to) {
     auto it = files.find(from);
     if (it == files.end()) return false;
+    if (!root.empty()) {
+        auto source = std::filesystem::path(root) / encoded(from);
+        auto target = std::filesystem::path(root) / encoded(to);
+        std::error_code error;
+        std::filesystem::remove(target, error);
+        if (error) return false;
+        std::filesystem::rename(source, target, error);
+        if (error) return false;
+    }
     files[to] = it->second;
     files.erase(it);
     return true;

@@ -378,6 +378,27 @@ pub const ROW_BYTES: usize = (WIDTH as usize + 7) / 8;
 pub const BUF_LEN: usize = ROW_BYTES * HEIGHT as usize;
 
 extern "C" {
+    fn codex_sim_bundle_new(data_dir: *const c_char, target: *const c_char,
+        boot_id: u64, wake_cause: *const c_char) -> *mut std::ffi::c_void;
+    fn codex_sim_bundle_free(p: *mut std::ffi::c_void);
+    fn codex_sim_bundle_status(p: *mut std::ffi::c_void, out: *mut c_char, cap: c_int) -> c_int;
+    fn codex_sim_bundle_frame(p: *mut std::ffi::c_void, out: *mut u8, cap: c_int) -> c_int;
+    fn codex_sim_store_budget(p: *mut std::ffi::c_void, budget: i64) -> c_int;
+    fn codex_sim_display_fail_next(p: *mut std::ffi::c_void) -> c_int;
+    fn codex_sim_button_next(p: *mut std::ffi::c_void, now_ms: u64,
+        context: *const c_char, out: *mut c_char, cap: c_int) -> c_int;
+    fn codex_sim_bundle_begin(p: *mut std::ffi::c_void, message: *const c_char,
+        nonce: *const c_char, now_ms: u64, out: *mut c_char, cap: c_int) -> c_int;
+    fn codex_sim_bundle_chunk(p: *mut std::ffi::c_void, request: *const c_char,
+        nonce: *const c_char, offset: *const c_char, body: *const u8, len: c_int,
+        now_ms: u64, out: *mut c_char, cap: c_int) -> c_int;
+    fn codex_sim_bundle_commit(p: *mut std::ffi::c_void, message: *const c_char,
+        nonce: *const c_char, now_ms: u64, context: *const c_char,
+        out: *mut c_char, cap: c_int) -> c_int;
+    fn codex_sim_data(p: *mut std::ffi::c_void, message: *const c_char,
+        out: *mut c_char, cap: c_int) -> c_int;
+    fn codex_sim_activate(p: *mut std::ffi::c_void, message: *const c_char,
+        now_ms: u64, context: *const c_char, out: *mut c_char, cap: c_int) -> c_int;
     fn codex_set_canvas(w: c_int, h: c_int);
     fn codex_ct_artifact(source: *const c_char, blob: *const u8, len: c_int,
         out: *mut u8, cap: c_int, metadata: *mut c_char, meta_cap: c_int) -> c_int;
@@ -452,6 +473,9 @@ extern "C" {
         out: *mut c_char,
         cap: c_int,
     ) -> c_int;
+    fn codex_v2_power_sleep_decide(p: *mut std::ffi::c_void, configured: c_int,
+        light_mode: c_int, plugged: c_int, deep_on_usb: c_int, manual_hold: c_int,
+        provisional: c_int, boot_ms: u64, safety_deadline_ms: u64, now_ms: u64) -> c_int;
     fn codex_v2_command_parse(message: *const c_char, out: *mut c_char, cap: c_int) -> c_int;
     fn codex_v2_command_check(
         message: *const c_char,
@@ -481,6 +505,121 @@ extern "C" {
         out: *mut c_char,
         cap: c_int,
     ) -> c_int;
+}
+
+/// Executes the firmware Bundle decisions and A/B store in the simulator's
+/// single C++ device context. One instance is allowed per process.
+pub struct SimulatorBundle {
+    state: *mut std::ffi::c_void,
+}
+
+unsafe impl Send for SimulatorBundle {}
+
+impl SimulatorBundle {
+    pub fn new(data_dir: &std::path::Path, target: &str, boot_id: u64,
+        wake_cause: &str) -> anyhow::Result<Self> {
+        let data_dir = CString::new(data_dir.to_str().ok_or_else(||
+            anyhow::anyhow!("simulator data directory is not UTF-8"))?)?;
+        let target = CString::new(target)?;
+        let wake_cause = CString::new(wake_cause)?;
+        let state = unsafe { codex_sim_bundle_new(data_dir.as_ptr(), target.as_ptr(),
+            boot_id, wake_cause.as_ptr()) };
+        anyhow::ensure!(!state.is_null(), "simulator Bundle storage invalid or unavailable");
+        Ok(Self { state })
+    }
+
+    fn result(&self, operation: &str, call: impl FnOnce(*mut c_char, c_int) -> c_int)
+        -> anyhow::Result<serde_json::Value> {
+        let mut out = vec![0i8; 8192];
+        let rc = call(out.as_mut_ptr(), out.len() as c_int);
+        simulator_ffi_json(rc, &out, operation)
+    }
+
+    pub fn status(&self) -> anyhow::Result<serde_json::Value> {
+        self.result("bundle status", |out, cap| unsafe {
+            codex_sim_bundle_status(self.state, out, cap)
+        })
+    }
+
+    pub fn frame_bits(&self) -> anyhow::Result<Vec<u8>> {
+        let mut bits = vec![0u8; 15_000];
+        let len = unsafe { codex_sim_bundle_frame(self.state, bits.as_mut_ptr(), bits.len() as c_int) };
+        anyhow::ensure!(len >= 0 && (len as usize) <= bits.len(), "simulator frame read failed");
+        bits.truncate(len as usize);
+        Ok(bits)
+    }
+
+    pub fn set_write_budget(&mut self, budget: i64) -> anyhow::Result<()> {
+        anyhow::ensure!(unsafe { codex_sim_store_budget(self.state, budget) } == 1,
+            "invalid simulator write budget");
+        Ok(())
+    }
+
+    pub fn fail_next_display(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(unsafe { codex_sim_display_fail_next(self.state) } == 1,
+            "cannot arm simulator display failure");
+        Ok(())
+    }
+
+    pub fn button_next(&mut self, now_ms: u64, context: &str)
+        -> anyhow::Result<serde_json::Value> {
+        let context = CString::new(context)?;
+        self.result("button next", |out, cap| unsafe {
+            codex_sim_button_next(self.state, now_ms, context.as_ptr(), out, cap)
+        })
+    }
+
+    pub fn begin(&mut self, message: &str, nonce: &str, now_ms: u64)
+        -> anyhow::Result<serde_json::Value> {
+        let message = CString::new(message)?;
+        let nonce = CString::new(nonce)?;
+        self.result("bundle begin", |out, cap| unsafe {
+            codex_sim_bundle_begin(self.state, message.as_ptr(), nonce.as_ptr(), now_ms, out, cap)
+        })
+    }
+
+    pub fn chunk(&mut self, request: &str, nonce: &str, offset: &str, body: &[u8],
+                 now_ms: u64) -> anyhow::Result<serde_json::Value> {
+        let request = CString::new(request)?;
+        let nonce = CString::new(nonce)?;
+        let offset = CString::new(offset)?;
+        anyhow::ensure!(body.len() <= i32::MAX as usize, "bundle chunk too large");
+        self.result("bundle chunk", |out, cap| unsafe {
+            codex_sim_bundle_chunk(self.state, request.as_ptr(), nonce.as_ptr(),
+                offset.as_ptr(), body.as_ptr(), body.len() as c_int, now_ms, out, cap)
+        })
+    }
+
+    pub fn commit(&mut self, message: &str, nonce: &str, now_ms: u64, context: &str)
+        -> anyhow::Result<serde_json::Value> {
+        let message = CString::new(message)?;
+        let nonce = CString::new(nonce)?;
+        let context = CString::new(context)?;
+        self.result("bundle commit", |out, cap| unsafe {
+            codex_sim_bundle_commit(self.state, message.as_ptr(), nonce.as_ptr(),
+                now_ms, context.as_ptr(), out, cap)
+        })
+    }
+
+    pub fn data(&mut self, message: &str) -> anyhow::Result<serde_json::Value> {
+        let message = CString::new(message)?;
+        self.result("data", |out, cap| unsafe {
+            codex_sim_data(self.state, message.as_ptr(), out, cap)
+        })
+    }
+
+    pub fn activate(&mut self, message: &str, now_ms: u64, context: &str)
+        -> anyhow::Result<serde_json::Value> {
+        let message = CString::new(message)?;
+        let context = CString::new(context)?;
+        self.result("activate", |out, cap| unsafe {
+            codex_sim_activate(self.state, message.as_ptr(), now_ms, context.as_ptr(), out, cap)
+        })
+    }
+}
+
+impl Drop for SimulatorBundle {
+    fn drop(&mut self) { unsafe { codex_sim_bundle_free(self.state) }; }
 }
 
 /// Build the simulator's `/v2/status` payload with the firmware's C++ builder.
@@ -616,6 +755,14 @@ impl SimulatorPlan {
             }
             None => (false, "sleep", 0, 0, 0),
         }
+    }
+
+    pub fn sleep_reason(&self, configured: bool, light_mode: bool, plugged: bool,
+        deep_on_usb: bool, manual_hold: bool, provisional: bool,
+        boot_ms: u64, safety_deadline_ms: u64, now_ms: u64) -> u8 {
+        unsafe { codex_v2_power_sleep_decide(self.state, configured.into(), light_mode.into(),
+            plugged.into(), deep_on_usb.into(), manual_hold.into(), provisional.into(),
+            boot_ms, safety_deadline_ms, now_ms) as u8 }
     }
 }
 

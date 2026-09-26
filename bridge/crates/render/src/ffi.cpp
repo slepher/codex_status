@@ -55,6 +55,91 @@ struct ActivateHarness {
     String request, owner, templateId, expected, context;
 };
 
+// One device-sim process owns one instance. The host LittleFS shim is process
+// global, matching the firmware's single mounted filesystem.
+struct SimBundleDevice {
+    String firmwareTarget, renderTarget;
+    V2BundleRx rx{};
+    String committedOwner, committedRequest, committedContext;
+    uint32_t committedCrc = 0, committedLength = 0;
+    BsProfile profile{};
+    bool configured = false;
+    CtTemplate compiled{};
+    bool compiledValid = false;
+    V2DataSeq dataSeq{};
+    String usage;
+    String activateRequest, activateOwner, activateTemplate, activateExpected, activateContext;
+    uint8_t displayState = 0;
+    std::vector<uint8_t> frame;
+    std::vector<uint8_t> candidate;
+    RgnSet regions{};
+    bool frameTrusted = false;
+    bool failNextDisplay = false;
+    uint32_t displayWrites = 0;
+    const char *refreshKind = "none";
+};
+
+const char *simRender(SimBundleDevice &device) {
+    if (!device.compiledValid) return "failed";
+    const size_t length = (size_t)((g_canvas_w + 7) / 8) * g_canvas_h;
+    device.candidate.resize(length);
+    Paint_NewImage(device.candidate.data(), g_canvas_w, g_canvas_h, ROTATE_0, WHITE);
+    Paint_Clear(WHITE);
+    TplEnv env;
+    env.channel = "PULL";
+    env.syncHHMM = "--:--";
+    env.battery = 75;
+    env.state = "WIFI ON";
+    env.mode = "light";
+    if (!tplDrawCt(device.compiled, device.usage.length() ? device.usage : String("{}"), env)) {
+        device.displayState = 3;
+        return "failed";
+    }
+    std::vector<uint8_t> blank;
+    if (device.frame.empty()) blank.assign(length, 0xFF);
+    const uint8_t *previous = device.frame.empty() ? blank.data() : device.frame.data();
+    RfnDecision decision = rgnDecide(device.regions, previous, device.candidate.data(),
+                                     device.frameTrusted, false, false);
+    if (decision.action == RFN_NONE) {
+        device.displayState = 1;
+        device.refreshKind = "none";
+        return "unchanged";
+    }
+    if (device.failNextDisplay) {
+        device.failNextDisplay = false;
+        device.frameTrusted = false;
+        device.displayState = 3;
+        device.refreshKind = "failed";
+        return "failed";
+    }
+    if (decision.action == RFN_PARTIAL) rgnOnPartial(device.regions);
+    else rgnOnFull(device.regions);
+    device.frame = device.candidate;
+    device.frameTrusted = true;
+    device.refreshKind = rfnActionName(decision.action);
+    device.displayWrites++;
+    device.displayState = 1;
+    return "displayed";
+}
+
+String simBundleAck(const SimBundleDevice &device, const char *result, const char *display, const char *error,
+                    const char *context = nullptr) {
+    return v2BuildAck("bundle", result, display, "flash", error, -1, 0,
+                      context, UINT32_MAX, device.firmwareTarget.c_str());
+}
+
+int simCopy(const String &value, char *out, int cap) {
+    if (!out || cap <= 0 || value.length() >= (size_t)cap) return -1;
+    memcpy(out, value.c_str(), value.length() + 1);
+    return (int)value.length();
+}
+
+V2BundleFingerprint simFingerprint(const SimBundleDevice &device) {
+    return {device.committedOwner.c_str(), device.committedRequest.c_str(),
+            device.committedCrc, device.committedLength,
+            device.committedContext.c_str()};
+}
+
 void writeBundleRx(JsonObject out, const V2BundleRx &rx) {
     out["owner"] = rx.owner;
     out["request"] = rx.request;
@@ -67,6 +152,308 @@ void writeBundleRx(JsonObject out, const V2BundleRx &rx) {
 }
 
 extern "C" {
+
+void *codex_sim_bundle_new(const char *data_dir, const char *target,
+                           uint64_t boot_id, const char *wake_cause) {
+    if (!data_dir || !target || !wake_cause) return nullptr;
+    const bool note4 = !strcmp(target, "zectrix-note4-400x300");
+    if (!note4 && strcmp(target, "codex-status-154g")) return nullptr;
+    LittleFS.useDirectory(data_dir);
+    LittleFS.capacity = 1024 * 1024;
+    LittleFS.writeBudget = -1;
+    bool restored = bsBegin();
+    if (!restored && (LittleFS.exists("/bundle/a.bin") ||
+                      LittleFS.exists("/bundle/b.bin") ||
+                      LittleFS.exists("/bundle/m0.bin") ||
+                      LittleFS.exists("/bundle/m1.bin"))) return nullptr;
+    auto *device = new SimBundleDevice();
+    device->firmwareTarget = target;
+    device->renderTarget = note4 ? "epd-ssd2683-400x300-1bpp" : "epd-ssd1681-200x200-1bpp";
+    g_canvas_w = note4 ? 400 : 200;
+    g_canvas_h = note4 ? 300 : 200;
+    tplSetCanvas(g_canvas_w, g_canvas_h);
+    rgnSetPanel(g_canvas_w, g_canvas_h);
+    if (restored) {
+        String error;
+        device->configured = bsProfile(device->profile);
+        if (!device->configured || strcmp(device->profile.firmwareTarget, target) ||
+            strcmp(device->profile.renderTarget, device->renderTarget.c_str())) {
+            delete device; return nullptr;
+        }
+        device->dataSeq.beginContext(0, 1);
+        bool retained = false;
+        if (!strcmp(wake_cause, "deep") || !strcmp(wake_cause, "button")) {
+            V2DataCheckpoint checkpoint{};
+            std::ifstream rtc(std::filesystem::path(data_dir) / "sim-rtc.bin", std::ios::binary);
+            if (rtc.read((char *)&checkpoint, sizeof(checkpoint)) &&
+                rtc.peek() == std::char_traits<char>::eof())
+                retained = checkpoint.restore(device->profile.contextId, device->dataSeq);
+        }
+        if (!retained) {
+            char context[BS_CTX_LEN];
+            snprintf(context, sizeof(context), "%016llx%016llx",
+                     (unsigned long long)boot_id,
+                     (unsigned long long)bsCommitSeq() + 1ULL);
+            if (!bsSetActive(device->profile.initial, context, error) ||
+                !bsProfile(device->profile)) { delete device; return nullptr; }
+        }
+        device->compiledValid = bsLoadCompiled(device->profile.initial, device->compiled, error);
+        if (!device->compiledValid) { delete device; return nullptr; }
+        rgnBuildCt(device->compiled, device->regions);
+    }
+    return device;
+}
+
+void codex_sim_bundle_free(void *p) { delete (SimBundleDevice *)p; }
+
+int codex_sim_bundle_status(void *p, char *out, int cap) {
+    if (!p) return -1;
+    SimBundleDevice &device = *(SimBundleDevice *)p;
+    JsonDocument doc;
+    doc["configured"] = device.configured;
+    doc["firmware_target"] = device.firmwareTarget;
+    doc["render_target"] = device.renderTarget;
+    doc["rx_owner"] = device.rx.owner;
+    doc["context"] = device.profile.contextId;
+    doc["job_id"] = device.profile.jobId;
+    doc["commit_seq"] = bsCommitSeq();
+    doc["applied_seq"] = device.dataSeq.appliedSeq();
+    doc["data_crc"] = device.dataSeq.appliedCrc();
+    doc["display_state_code"] = device.displayState;
+    doc["frame_crc"] = device.frame.empty() ? 0 : v2Crc32(device.frame.data(), device.frame.size());
+    doc["candidate_crc"] = device.candidate.empty() ? 0 :
+        v2Crc32(device.candidate.data(), device.candidate.size());
+    doc["frame_trusted"] = device.frameTrusted;
+    doc["display_writes"] = device.displayWrites;
+    doc["refresh_kind"] = device.refreshKind;
+    doc["free_bytes"] = bsFreeBytes();
+    doc["write_budget"] = LittleFS.writeBudget;
+    JsonArray ids = doc["template_ids"].to<JsonArray>();
+    for (uint8_t i = 0; i < device.profile.count; ++i) ids.add(device.profile.ids[i]);
+    if (device.configured && device.profile.initial < device.profile.count)
+        doc["active_template_id"] = device.profile.ids[device.profile.initial];
+    String value;
+    serializeJson(doc, value);
+    return simCopy(value, out, cap);
+}
+
+int codex_sim_bundle_frame(void *p, uint8_t *out, int cap) {
+    if (!p || !out || cap < 0) return -1;
+    const auto &frame = ((SimBundleDevice *)p)->frame;
+    if (frame.size() > (size_t)cap) return -1;
+    if (!frame.empty()) memcpy(out, frame.data(), frame.size());
+    return (int)frame.size();
+}
+
+int codex_sim_store_budget(void *p, long long budget) {
+    if (!p || budget < -1 || budget > 1048576) return 0;
+    LittleFS.writeBudget = budget;
+    return 1;
+}
+
+int codex_sim_display_fail_next(void *p) {
+    if (!p) return 0;
+    ((SimBundleDevice *)p)->failNextDisplay = true;
+    return 1;
+}
+
+int codex_sim_button_next(void *p, uint64_t now_ms, const char *new_context,
+                          char *out, int cap) {
+    if (!p || !new_context) return -1;
+    SimBundleDevice &device = *(SimBundleDevice *)p;
+    if (!device.configured || !device.profile.count)
+        return simCopy("{\"result\":\"rejected\",\"error\":\"unconfigured\"}", out, cap);
+    const uint8_t next = (uint8_t)((device.profile.initial + 1) % device.profile.count);
+    String error;
+    if (!bsSetActive(next, new_context, error) || !bsProfile(device.profile) ||
+        !bsLoadCompiled(device.profile.initial, device.compiled, error))
+        return simCopy("{\"result\":\"rejected\",\"error\":\"activation_failed\"}", out, cap);
+    device.compiledValid = true;
+    rgnBuildCt(device.compiled, device.regions);
+    device.dataSeq.beginContext(now_ms, 1);
+    const char *display = simRender(device);
+    JsonDocument response;
+    response["result"] = "applied";
+    response["active_template_id"] = device.profile.ids[device.profile.initial];
+    response["active_context_id"] = device.profile.contextId;
+    response["display_state"] = display;
+    String value;
+    serializeJson(response, value);
+    return simCopy(value, out, cap);
+}
+
+int codex_sim_bundle_begin(void *p, const char *message, const char *nonce,
+                           uint64_t now_ms, char *out, int cap) {
+    if (!p || !message || !nonce) return -1;
+    SimBundleDevice &device = *(SimBundleDevice *)p;
+    JsonDocument doc;
+    if (deserializeJson(doc, message)) return simCopy(simBundleAck(device, "rejected", "unchanged", "json"), out, cap);
+    V2BundleBeginDecision decision = v2DecideBundleBegin(
+        doc, device.rx, simFingerprint(device), nonce, now_ms);
+    if (decision.action == V2_BUNDLE_BEGIN_REJECT)
+        return simCopy(simBundleAck(device, "rejected", "unchanged", decision.error), out, cap);
+    if (decision.action == V2_BUNDLE_BEGIN_REPLAY)
+        return simCopy(simBundleAck(device, "applied", "unchanged", nullptr, decision.replayContext), out, cap);
+    if (decision.action == V2_BUNDLE_BEGIN_START) {
+        File file = LittleFS.open("/bundle/rx.tmp", "w");
+        if (!file) return simCopy(simBundleAck(device, "rejected", "unchanged", "open"), out, cap);
+        file.close();
+        device.rx = decision.candidate;
+    }
+    JsonDocument ack;
+    ack["result"] = "applied";
+    ack["next_offset"] = decision.nextOffset;
+    String value;
+    serializeJson(ack, value);
+    return simCopy(value, out, cap);
+}
+
+int codex_sim_bundle_chunk(void *p, const char *request, const char *nonce,
+                           const char *offset_text, const uint8_t *body, int length,
+                           uint64_t now_ms, char *out, int cap) {
+    if (!p || !request || !nonce || !offset_text || !body || length <= 0) return -1;
+    SimBundleDevice &device = *(SimBundleDevice *)p;
+    V2BundleChunkStartDecision start = v2DecideBundleChunkStart(
+        device.rx, request, nonce, offset_text, now_ms);
+    if (!start.allowed) return simCopy(simBundleAck(device, "rejected", "unchanged", start.error), out, cap);
+    V2BundleChunkWriteDecision write = v2DecideBundleChunkWrite(
+        device.rx, start.offset, start.replay, 0, (uint32_t)length);
+    if (!write.allowed) return simCopy(simBundleAck(device, "rejected", "unchanged", write.error), out, cap);
+    File file = LittleFS.open("/bundle/rx.tmp", start.replay ? "r" : "a");
+    if (!file) return simCopy(simBundleAck(device, "rejected", "unchanged", "open"), out, cap);
+    bool ok = true;
+    if (start.replay) {
+        ok = file.seek(start.offset);
+        for (int i = 0; ok && i < length; ++i) ok = file.read() == body[i];
+    } else ok = file.write(body, (size_t)length) == (size_t)length;
+    file.close();
+    if (!ok) {
+        if (!start.replay) device.rx.deadline = 0;
+        return simCopy(simBundleAck(device, "rejected", "unchanged",
+                                    start.replay ? "chunk_conflict" : "write"), out, cap);
+    }
+    V2BundleChunkEndDecision end = v2DecideBundleChunkEnd(
+        device.rx, start.offset, start.replay, (uint32_t)length, now_ms);
+    if (!end.allowed) return simCopy(simBundleAck(device, "rejected", "unchanged", end.error), out, cap);
+    device.rx.offset = end.nextOffset;
+    JsonDocument ack;
+    ack["result"] = "applied";
+    ack["next_offset"] = end.nextOffset;
+    String value;
+    serializeJson(ack, value);
+    return simCopy(value, out, cap);
+}
+
+int codex_sim_bundle_commit(void *p, const char *message, const char *nonce,
+                            uint64_t now_ms, const char *context, char *out, int cap) {
+    if (!p || !message || !nonce || !context) return -1;
+    SimBundleDevice &device = *(SimBundleDevice *)p;
+    JsonDocument doc;
+    if (deserializeJson(doc, message)) return simCopy(simBundleAck(device, "rejected", "unchanged", "json"), out, cap);
+    V2BundleCommitDecision decision = v2DecideBundleCommit(
+        doc, device.rx, simFingerprint(device), nonce, now_ms,
+        "/bundle/rx.tmp", doc["bridge_id"] | "");
+    if (decision.action == V2_BUNDLE_COMMIT_REJECT)
+        return simCopy(simBundleAck(device, "rejected", "unchanged", decision.error), out, cap);
+    if (decision.action == V2_BUNDLE_COMMIT_REPLAY)
+        return simCopy(simBundleAck(device, "applied", "unchanged", nullptr, decision.replayContext), out, cap);
+    if (decision.action == V2_BUNDLE_COMMIT_INSTALL) {
+        File file = LittleFS.open("/bundle/rx.tmp", "r");
+        if (!file || file.size() != decision.length)
+            return simCopy(simBundleAck(device, "rejected", "unchanged", "length"), out, cap);
+        String error;
+        bool installed = bsInstall(file, decision.length, decision.crc,
+            device.firmwareTarget.c_str(), device.renderTarget.c_str(), context, error);
+        file.close();
+        if (!installed) return simCopy(simBundleAck(device, "rejected", "unchanged", error.c_str()), out, cap);
+    }
+    if (!bsProfile(device.profile))
+        return simCopy(simBundleAck(device, "rejected", "unchanged", "profile"), out, cap);
+    device.configured = true;
+    device.committedOwner = decision.owner;
+    device.committedRequest = decision.request;
+    device.committedCrc = decision.crc;
+    device.committedLength = decision.length;
+    device.committedContext = device.profile.contextId;
+    device.rx.deadline = 0;
+    LittleFS.remove("/bundle/rx.tmp");
+    String error;
+    device.compiledValid = bsLoadCompiled(device.profile.initial, device.compiled, error);
+    if (!device.compiledValid)
+        return simCopy(simBundleAck(device, "rejected", "failed", error.c_str()), out, cap);
+    rgnBuildCt(device.compiled, device.regions);
+    device.dataSeq.beginContext(now_ms, 1);
+    device.usage = "";
+    const char *display = simRender(device);
+    return simCopy(simBundleAck(device, "applied", display, nullptr, device.profile.contextId), out, cap);
+}
+
+int codex_sim_data(void *p, const char *message, char *out, int cap) {
+    if (!p || !message) return -1;
+    SimBundleDevice &device = *(SimBundleDevice *)p;
+    JsonDocument doc;
+    if (deserializeJson(doc, message))
+        return simCopy(v2BuildAck("data", "rejected", "failed", "ram", "json", -1, 0,
+                                 nullptr, UINT32_MAX, device.firmwareTarget.c_str()), out, cap);
+    uint64_t seq = doc["seq"] | 0ULL;
+    V2DataDecision decision = v2DecideData(device.configured && device.compiledValid,
+        device.compiledValid ? &device.compiled : nullptr, String(message), seq,
+        device.profile.contextId, device.dataSeq);
+    const char *display = decision.display ? decision.display : "unchanged";
+    if (decision.firstApplied) {
+        device.usage = decision.usage;
+        V2DataCheckpoint checkpoint{};
+        checkpoint.save(device.profile.contextId, device.dataSeq);
+        std::ofstream rtc(std::filesystem::path(LittleFS.root) / "sim-rtc.bin",
+                          std::ios::binary | std::ios::trunc);
+        rtc.write((const char *)&checkpoint, sizeof(checkpoint));
+        rtc.flush();
+        if (!rtc.good()) return -2;
+        display = simRender(device);
+    }
+    return simCopy(v2BuildAck("data", decision.result, display, "ram",
+        decision.error.length() ? decision.error.c_str() : nullptr, decision.seq, 0,
+        decision.includeContext ? device.profile.contextId : nullptr,
+        UINT32_MAX, device.firmwareTarget.c_str()), out, cap);
+}
+
+int codex_sim_activate(void *p, const char *message, uint64_t now_ms,
+                       const char *new_context, char *out, int cap) {
+    if (!p || !message || !new_context) return -1;
+    SimBundleDevice &device = *(SimBundleDevice *)p;
+    JsonDocument doc;
+    if (deserializeJson(doc, message))
+        return simCopy(v2BuildAck("activate", "rejected", "unchanged", "flash", "json", -1, 0,
+                                 nullptr, UINT32_MAX, device.firmwareTarget.c_str()), out, cap);
+    V2ActivateDecision decision = v2DecideActivate(doc, device.configured, device.profile,
+        device.activateRequest.c_str(), device.activateOwner.c_str(),
+        device.activateTemplate.c_str(), device.activateExpected.c_str(),
+        device.activateContext.c_str());
+    if (decision.action != V2_ACTIVATE_SWITCH)
+        return simCopy(v2BuildAck("activate", decision.result, decision.display, "flash",
+            decision.error, -1, 0, decision.context, UINT32_MAX,
+            device.firmwareTarget.c_str()), out, cap);
+    String error;
+    if (!bsSetActive((uint8_t)decision.index, new_context, error) ||
+        !bsProfile(device.profile) ||
+        !bsLoadCompiled(device.profile.initial, device.compiled, error)) {
+        device.compiledValid = false;
+        return simCopy(v2BuildAck("activate", "rejected", "unchanged", "flash",
+            "activation_failed", -1, 0, device.profile.contextId, UINT32_MAX,
+            device.firmwareTarget.c_str()), out, cap);
+    }
+    device.compiledValid = true;
+    rgnBuildCt(device.compiled, device.regions);
+    device.dataSeq.beginContext(now_ms, 1);
+    device.activateRequest = decision.request;
+    device.activateOwner = decision.owner;
+    device.activateTemplate = decision.templateId;
+    device.activateExpected = decision.expected;
+    device.activateContext = device.profile.contextId;
+    const char *display = simRender(device);
+    return simCopy(v2BuildAck("activate", "applied", display, "flash", nullptr,
+        -1, 0, device.profile.contextId, UINT32_MAX, device.firmwareTarget.c_str()), out, cap);
+}
 
 void codex_set_canvas(int w, int h) {
     g_canvas_w = w;
@@ -693,6 +1080,7 @@ int codex_v2_status_snapshot(const char *input, char *out, int cap) {
     V2StatusSnapshot snapshot;
     snapshot.mac = doc["mac"] | "";
     snapshot.sessionNonce = doc["session_nonce"] | "";
+    snapshot.firmwareVersion = doc["firmware_version"] | "";
     BsProfile profile{};
     const char *context = doc["context"] | "";
     const char *job = doc["job_id"] | "";
@@ -744,6 +1132,16 @@ int codex_v2_status_snapshot(const char *input, char *out, int cap) {
 uint64_t codex_v2_plan_high(void *p) { return ((V2PlanState *)p)->highId(); }
 int codex_v2_plan_light_active(void *p, uint64_t now_ms) {
     return ((V2PlanState *)p)->lightActive(now_ms) ? 1 : 0;
+}
+int codex_v2_power_sleep_decide(void *p, int configured, int light_mode,
+                                int plugged, int deep_on_usb, int manual_hold,
+                                int provisional, uint64_t boot_ms,
+                                uint64_t safety_deadline_ms, uint64_t now_ms) {
+    if (!p) return -1;
+    return (int)v2PowerSleepDecision(configured != 0, light_mode != 0,
+        plugged != 0, deep_on_usb != 0, manual_hold != 0,
+        *(V2PlanState *)p, provisional != 0, boot_ms,
+        safety_deadline_ms, now_ms);
 }
 uint32_t codex_v2_boot_remaining(uint64_t t_boot_ms, uint64_t now_ms) {
     return V2PlanState::bootProvisionalRemaining(t_boot_ms, now_ms);

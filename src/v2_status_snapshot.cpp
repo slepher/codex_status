@@ -8,6 +8,7 @@ String v2BuildStatusSnapshot(const V2StatusSnapshot &snapshot) {
     doc["result"] = "applied";
     doc["protocol"] = 2;
     doc["device_mac"] = snapshot.mac;
+    if (snapshot.firmwareVersion.length()) doc["fw"] = snapshot.firmwareVersion;
     // Firmware-only wake diagnostics, emitted here so the field order matches the
     // device's original document. Unbound on the host/simulator: absent keys.
     if (snapshot.wake) {

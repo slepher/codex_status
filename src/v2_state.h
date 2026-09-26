@@ -132,6 +132,29 @@ class V2PlanState {
     bool sourceBoot_ = false;
 };
 
+enum V2PowerSleepReason : uint8_t {
+    V2_POWER_STAY_LIGHT = 0,
+    V2_POWER_PLAN_ENDED,
+    V2_POWER_BOOT_ENDED,
+    V2_POWER_SAFETY_ENDED,
+};
+
+inline V2PowerSleepReason v2PowerSleepDecision(
+    bool bundleReady, bool lightMode, bool plugged, bool deepOnUsb,
+    bool manualBleHold, const V2PlanState &plan, bool provisional,
+    uint64_t bootMs, uint64_t safetyDeadlineMs, uint64_t nowMs) {
+    if (!bundleReady || !lightMode || (plugged && !deepOnUsb) || manualBleHold)
+        return V2_POWER_STAY_LIGHT;
+    if (plan.accepted())
+        return plan.lightActive(nowMs) ? V2_POWER_STAY_LIGHT : V2_POWER_PLAN_ENDED;
+    if (provisional)
+        return V2PlanState::bootProvisionalRemaining(bootMs, nowMs)
+            ? V2_POWER_STAY_LIGHT : V2_POWER_BOOT_ENDED;
+    if (safetyDeadlineMs && nowMs >= safetyDeadlineMs)
+        return V2_POWER_SAFETY_ENDED;
+    return V2_POWER_STAY_LIGHT;
+}
+
 enum V2DataAck : uint8_t {
     V2_DATA_APPLIED = 0,
     V2_DATA_UNCHANGED = 1,   // same seq + same content: idempotent replay

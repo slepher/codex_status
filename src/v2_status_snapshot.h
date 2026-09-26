@@ -18,6 +18,7 @@ struct V2WakeSnapshot {
 
 struct V2StatusSnapshot {
     String mac;
+    String firmwareVersion;
     String sessionNonce;
     const BsProfile *profile = nullptr;
     bool configured = false;
