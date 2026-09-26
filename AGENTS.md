@@ -2,7 +2,7 @@
 
 ## 项目概览
 
-便携墨水屏显示本机 Codex 余量：ESP32-S3（Waveshare 1.54" 200×200 B/W，SSD1681，局刷 ~300ms）本地渲染；Rust 桥接（Tauri v2 托盘进程）通过 `codex app-server` JSON-RPC 取数，经 Wi-Fi HTTP（主通道）或 BLE GATT（备选）下发 usage 与模板。换样式只换模板 JSON，不刷固件。当前固件 `0.18.23-note4-b`（v2 通用平台：每设备 Profile 1–8 全按键循环、CompiledTemplate、完整 A/B Bundle、单一 active context、Bridge 生成 PowerPlan、Codex 只是 DataSource；关 mDNS；设备身份 = Wi-Fi MAC + 可编辑显示名；显式 claim/lease 占用，桥按空闲自动占用）。设计见 `docs/generic-display-platform-design-v2.md`。旧版 ≤3 槽通道与桥侧 legacy profile 存储已删除（2026-09-25），桥只服务 v2 固件；不得把 8 项静默裁剪成 3 项。
+便携墨水屏显示本机 Codex 余量：ESP32-S3（Waveshare 1.54" 200×200 B/W，SSD1681，局刷 ~300ms）本地渲染；Rust 桥接（Tauri v2 托盘进程）通过 `codex app-server` JSON-RPC 取数，经 Wi-Fi HTTP（主通道）或 BLE GATT（备选）下发 usage 与模板。换样式只换模板 JSON，不刷固件。2026-09-26 两台实机认证状态分别已见 Note4 `0.18.25-note4-b` 与 1.54 `0.18.25-bw`（v2 通用平台：每设备 Profile 1–8 全按键循环、CompiledTemplate、完整 A/B Bundle、单一 active context、Bridge 生成 PowerPlan、Codex 只是 DataSource；关 mDNS；设备身份 = Wi-Fi MAC + 可编辑显示名；显式 claim/lease 占用，桥按空闲自动占用）。设计见 `docs/generic-display-platform-design-v2.md`。旧版 ≤3 槽通道与桥侧 legacy profile 存储已删除（2026-09-25），桥只服务 v2 固件；不得把 8 项静默裁剪成 3 项。
 
 先读 `PROGRESS.md` 最新一节（权威交接文档，只保留最新现场，含设备现场、ROM SHA256）；待办的**唯一事实来源**是 `docs/roadmap/backlog.md`。文档导航见 `docs/README.md`。历史背景见 `docs/history/request.md`、`docs/device-setup-experience.md`；早期讨论见 `docs/history/discussion-summary.md`（历史资料）；已结项专项见 `docs/roadmap/archive-digest-legacy.md` / `-recent.md`，原件在 `docs/history/workflow/`。
 
@@ -29,15 +29,16 @@
 固件（仓库根目录）：
 
 ```powershell
-pio run -e zectrix-note4-b            # 编译（唯一目标；勿省略 -e，也不要构建其他 env）
+pio run -e zectrix-note4-b            # 默认构建目标；勿省略 -e
+pwsh tools/pio-target.ps1 -Target 154g # 仅本次已授权的 1.54 标准 B/W ROM；见下方例外
 pio run -e zectrix-note4-b -t upload  # USB 烧录（用网页 OTA 后先擦 otadata：erase_region 0xD000 0x2000）
 pio device monitor
 ```
 
-### 固件目标：只构建 Note4
+### 固件目标：默认只构建 Note4；本次双 ROM 实机测试例外
 
-- **唯一目标：`zectrix-note4-b`。** 不要构建其他 env（尤其不要构建或切换到 `esp32-s3-epaper-154g` 及其 `-gray4`/`-btpm` 变体）；构建命令一律显式带 `-e zectrix-note4-b`。
-- **不要交替构建不同目标。** 项目根 `sdkconfig.defaults` 是**全项目唯一**生成物，被各目标争写；pioarduino `arduino.py` 会把当前环境的 `custom_sdkconfig`、MCU 与板卡指纹同该文件首行的 `# TASMOTA__...` 比对，`check_reinstall_frwrk()` 不匹配时会清理生成的 sdkconfig 文件并重装两个 Arduino framework 包。**没有**每目标 sdkconfig 快照时，交替切换必然失配、必然重装（已双向实测，单次约 15 分钟量级；`tools/pio-target.ps1` 现已带该快照，见下方 ③）。多目标并存的正确解法是按目标隔离 `packages_dir`（`tools/pio-target.ps1` 支持 `-Target note4|154g`，按目标生成 `.pio-pkgs/<target>` + 仓库内 `.pio-core`；**两侧都已在 2026-09-25 实测**，见 `PROGRESS.md`「多 env 实测」与 backlog C6）。⚠️ 三点实测结论：① 只做包目录隔离**不足以**免重装：判据在仓库根那个共享文件上，切回另一目标会命中 `*** Reinstall Arduino framework ***`（隔离只保证重装发生在目标自己的包目录里、不伤对方）；② 受限沙箱下该脚本曾因 `pio` 继承到错误 cwd（`D:\Documents\project`）而假失败——现已由脚本自身 `Set-Location $RepoRoot` + `pio run -d $RepoRoot` 修掉（历史记录见 `PROGRESS.md`）；**仍只构建 Note4**——那是**成本**约束，不是能力约束。③ 脚本另按目标**整份快照 `sdkconfig.defaults`**（`.pio-core/sdkconfig.defaults.<target>.snapshot`，构建前还原/构建后再存）来消除交替触发的 `*** Reinstall ***`：还原的是该目标自己生成过的完整文件（内容+指纹自洽），**不是** `next.md` §10 禁止的"伪造首行"；安全判据是重建 ROM 与记录值逐字节相同（154g `91937B18…`）。实测 priming 后 note4 39 s / 154g 42 s 交替**均无重装**。priming 那一次仍需重装，且该路径要工作区外写权限（沙箱内需提权）。
+- **默认唯一目标：`zectrix-note4-b`。** 2026-09-26 用户明确授权依次发布 Note4 与 1.54 两份 ROM 并实机测试；本次允许为 1.54 构建且仅构建 `esp32-s3-epaper-154g`，使用 `tools/pio-target.ps1 -Target 154g` 的隔离包目录与完整 sdkconfig 快照。两个目标不得并行构建；不得构建 `-gray4`/`-btpm` 等变体。构建前核对目标，发布前核对 ROM marker、大小、SHA256、登记 MAC 与设备自报身份。该例外不代表以后默认可以构建其他 env。
+- **目标切换只通过隔离脚本。** 项目根 `sdkconfig.defaults` 是**全项目唯一**生成物，被各目标争写；pioarduino `arduino.py` 会把当前环境的 `custom_sdkconfig`、MCU 与板卡指纹同该文件首行的 `# TASMOTA__...` 比对，`check_reinstall_frwrk()` 不匹配时会清理生成的 sdkconfig 文件并重装两个 Arduino framework 包。**没有**每目标 sdkconfig 快照时，交替切换必然失配、必然重装（已双向实测，单次约 15 分钟量级；`tools/pio-target.ps1` 现已带该快照，见下方 ③）。多目标并存的正确解法是按目标隔离 `packages_dir`（`tools/pio-target.ps1` 支持 `-Target note4|154g`，按目标生成 `.pio-pkgs/<target>` + 仓库内 `.pio-core`；**两侧都已在 2026-09-25 实测**，见 `PROGRESS.md`「多 env 实测」与 backlog C6）。⚠️ 三点实测结论：① 只做包目录隔离**不足以**免重装：判据在仓库根那个共享文件上，切回另一目标会命中 `*** Reinstall Arduino framework ***`（隔离只保证重装发生在目标自己的包目录里、不伤对方）；② 受限沙箱下该脚本曾因 `pio` 继承到错误 cwd（`D:\Documents\project`）而假失败——现已由脚本自身 `Set-Location $RepoRoot` + `pio run -d $RepoRoot` 修掉（历史记录见 `PROGRESS.md`）；默认只构建 Note4 是成本约束，本次例外由用户授权。③ 脚本另按目标**整份快照 `sdkconfig.defaults`**（`.pio-core/sdkconfig.defaults.<target>.snapshot`，构建前还原/构建后再存）来消除交替触发的 `*** Reinstall ***`：还原的是该目标自己生成过的完整文件（内容+指纹自洽），**不是** `next.md` §10 禁止的"伪造首行"；安全判据是重建 ROM 与记录值逐字节相同（154g `91937B18…`）。实测 priming 后 note4 39 s / 154g 42 s 交替**均无重装**。priming 那一次仍需重装，且该路径要工作区外写权限（沙箱内需提权）。
 - 不要同时运行两个及以上 `pio` 进程；单个目标内部允许 PlatformIO 并行编译源文件。
 - **重编范围（2026-09-25 实测）**：改 1 个 `.cpp` → 只重编该 TU + 重链接（note4 46 s）；改被广泛 include 的头（如 `src/template_engine.h`）→ 10 个 TU（41 s）；改 `custom_sdkconfig`/`memory_type`/`flash_size` → `*** Reinstall ***` + 重编 IDF 库（"整个项目重编"那一类）；改 `platformio.ini`（哪怕注释）→ `project.checksum` 失配 → 删 `.pio/build/<env>` 全量重编应用（不连带 framework 重装）；删 `.pio/build`/包目录/`-t clean` → 全量。⚠️ ESP-IDF 把**编译日期时间**写进镜像，所以**任何重编都会改变 ROM 哈希**——要复现记录里的哈希必须"零编译重建"（改完源码记得把 `PROGRESS.md` 的 ROM 行更新成新哈希，别让记录与产物对不上）。
 - 保留 `.pio/build/<env>` 与 SCons 缓存，不要因只改应用源码而例行清理或删除构建目录。
@@ -61,9 +62,9 @@ cargo run -p bridge-render -- --template <json> --out <png>   # 离线渲染对�
 工具与校验：
 
 ```powershell
-pwsh tools/start-bridge.ps1   # 后台启动 bridge-app（隐藏窗口、日志进 artifacts/、立即返回；重复调用只打印 PID）
+pwsh tools/start-bridge.ps1   # 默认实例：按需 Windows 计划任务 CodexStatusBridge 启动；立即返回，重复调用只打印 PID
 pwsh tools/start-bridge.ps1 -Instance note4 -Port 8775 -McpPort 8776 -IconShape circle -DeviceMac 7C4FADB93408 -DeviceIp 192.168.3.177  # 独立实例；需先构建同一 exe
-Stop-Process -Id (Get-Content artifacts/bridge-app-run.pid)   # 停止 bridge-app
+Get-ScheduledTask -TaskName CodexStatusBridge  # 查看默认实例任务状态（无登录自启动触发器）
 node tools/generate-quad-preview.mjs
 node tools/test-quad-preview.mjs
 pwsh tools/test-bridge/start.ps1   # 后台启动 Python 测试桥；stop.ps1 停止
@@ -91,8 +92,9 @@ git diff --check                   # 提交前必查
 - 在仓库内创建新目录必须对创建步骤使用 `require_escalated` 提权执行，避免目录属主变成 `CodexSandboxOffline`、继承到不完整的 ACL。包括 `mkdir`/`New-Item`、补丁工具隐式建目录，以及构建或脚本首次生成目录；对自动生成的目录，先提权预建，无法预建时提权运行创建它的命令。不要先在沙箱中创建再修属主；若提权被拒绝，停止该创建步骤并说明原因。已存在的目录无需重复创建。
 - 每个里程碑后更新 `PROGRESS.md`（现场、证据、待办）；多步工作用 `project-workflow/<initiative>/` 写 plan/task/status/review，先计划再动代码。
 - 提交信息用英文祈使句，沿用现有风格（如 `Firmware 0.8.0: status JSON, log ring, battery; bridge prefers JSON status`）。未经用户要求不要提交。
-- 后台进程启动必须立即返回、不挂住会话：桥用 `pwsh tools/start-bridge.ps1`（`UseShellExecute=true` 完全分离子进程 + 隐藏窗口 + cmd 重定向日志，避免子进程继承 stdio 句柄导致调用方阻塞）；其他服务照此模式（分离启动 + 日志重定向到 `artifacts/`），不用会继承管道句柄的前台/直连方式。不在前台跑长轮询；不是当前 debug/release 构建输出目录（如 `bridge/target/debug`）下运行的桥/设备服务不要擅自停止。停止当前构建目录的桥时先结束 watchdog 子进程（`--watchdog <pid>`）再停父进程，避免 watchdog 拉起重启。⚠️ **2026-09-25 实测：受限沙箱（workspace-write）下跑该脚本会假失败**——沙箱内 `Get-NetTCPConnection` 看不到刚起的监听者（脚本 10 s 后抛 "did not appear"），命令结束时沙箱还会回收已分离的子进程，且 WebView2 建 host 报 `HRESULT(0x800700AA) ERROR_BUSY`；**桥必须从非受限（提权）命令启动**，桥自己的日志在 `<exe>/data/logs/bridge-app.log.<UTC 日期>` 里（`artifacts/bridge-app-run.out/.err` 通常为空）。
-- **纯重启不需要提权（2026-09-25 实测）**：用 `pwsh tools/restart-bridge.ps1`——它只杀**主进程**（占用 HTTP 端口那个），让应用自带的 watchdog（`bridge/crates/app/src/watchdog.rs`）把桥拉回来，全程在受限沙箱内完成、不弹审批弹窗。两条硬限制来自 watchdog 本身：只在**非零退出码**时重启（强杀算），且**5 分钟内 3 次**异常退出就放弃并退出（记录在 `<exe>/data/logs/watchdog.log`，脚本会先打印预算并在放弃后拒绝执行）。**重建**必须先让两个进程都退出（运行中的 exe 被锁住，`cargo build` 替换不了），所以重建后那次启动仍需一次提权；要在一次任务里反复「重建 + 重启」又不弹窗，就把会话的权限预设切成 `danger-full-access`（DSH 里预设 = 沙箱模式 + 审批策略捆绑，`workspace-write` 绑 `ask`、`danger-full-access` 绑 `never`；当前会话用 `/permission` 或 GUI 的权限选择器切换，新会话默认值见 `permission.defaultPreset` / `DSH_PERMISSION_MODE`）。
+- **默认 Bridge 启动**：从非受限（提权）命令运行 `pwsh -File <仓库绝对路径>\tools\start-bridge.ps1`。标准默认实例（8765/8766、方形图标、无设备参数）会注册/复用当前交互用户的**按需 Windows 计划任务 `CodexStatusBridge`**，由任务计划程序启动 `<repo>/bridge/target/debug/bridge-app.exe`；任务无登录触发器、无运行时限，重复启动只报告现有 PID。2026-09-27 实测：旧 `UseShellExecute=true`/`cmd.exe` 虽分离 stdio，退出 Codex 时 Bridge 与 watchdog 仍一起退出；改由计划任务启动后主进程父级是任务计划程序的 `svchost.exe`，8765/8766 正常监听，**关闭 Codex 后持续运行仍待跨会话复核**（见 backlog）。受限沙箱的 `Get-NetTCPConnection` 看不到监听者，启动会假失败；不得从受限工具会话直接起桥。桥日志在 `<exe>/data/logs/bridge-app.log.<UTC 日期>`，计划任务不依赖 `artifacts/bridge-app-run.out/.err`。带自定义端口、设备参数或命名实例仍走脚本原有的分离启动路径，未验证其退出 Codex 后的存活性。其他后台服务仍须立即返回、不继承工具会话的 stdio；不在前台跑长轮询。
+- **停止或重建默认 Bridge**：只操作当前 `bridge/target/debug` 对应的进程，不擅自停止别处运行的实例。先结束同 exe 的 `--watchdog <主 PID>`，再 `Stop-ScheduledTask -TaskName CodexStatusBridge`；若任务已是 `Ready` 而端口仍被 watchdog 拉起的主进程监听，再按监听 PID 停该主进程。重建 exe 前确保两者都退出，保留 `<exe>/data/`，构建成功后用上面的脚本按需重新启动。Bridge UI 嵌入 exe：修改 `bridge/crates/app/ui/index.html` 后须在**包含该 UI 改动的工作区**重建并重启；2026-09-26 曾从干净 worktree 构建，导致旧界面覆盖新版。停止/重启前核对路径、端口及任务状态。
+- **旧的 watchdog 纯重启路径**：`pwsh tools/restart-bridge.ps1` 只强杀主进程，依赖 watchdog 拉回；2026-09-25 曾在旧分离启动方式下验证，但**改为计划任务后尚未验证任务状态与新进程归属，不要用它代替上面的计划任务启动/重建流程**。watchdog 仅在非零退出码时重启，且 5 分钟内 3 次异常退出就放弃（见 `<exe>/data/logs/watchdog.log`）。构建时运行中的 exe 被锁住，必须先按上述顺序停进程。需要反复重建/启动时，非受限权限可通过本会话权限预设管理；不要为了绕过审批而在受限沙箱中启动后台桥。
 - 命名 Bridge 实例必须指定不同 HTTP/MCP 端口；各自运行数据在 `<exe>/instances/<name>/data`，默认实例保留 `<exe>/data`。命名实例不监听设备固定 UDP 8767，只走精确 MAC 的 HTTP/BLE；不同实例 owner ID 不同，同一设备仍由 claim/lease 决定占用。托盘背景形状可用 `-IconShape square|circle|diamond` 区分。
 - 不提交任何密钥：Wi-Fi 密码、BLE token 只存在于设备 RAM/NVS，不落仓库、不进日志。
 
@@ -105,7 +107,7 @@ git diff --check                   # 提交前必查
 | 1.54" 200×200 | `70041DD7A340` | `192.168.3.163` | 显示名"书桌屏"；BLE 名形如 `CodexStatus-<MAC后缀>` |
 | Note4 400×300 | `7C4FADB93408` | `192.168.3.177` | 显示名"Note4"；曾用 IP `192.168.3.177`/Wi-Fi `wd21-la` |
 
-- ✅ 已核实（2026-09-25）：设备 `/status.json` + ARP 实测 1.54 就是 `70041DD7A340` @ `192.168.3.163`，与本表及 `state.json` 登记一致。本文旧版写的 `192.168.1.50` 与 `70:04:1D:AA:BB:CC` **作废**，不要再引用。1.54 实机固件已于 2026-09-25 由 `0.17.10-bw` OTA 到 **`0.18.23-bw`**（此前记录 `0.16.7-bw` 更早已过期）。
+- ✅ 已核实（2026-09-25）：设备 `/status.json` + ARP 实测 1.54 就是 `70041DD7A340` @ `192.168.3.163`，与本表及 `state.json` 登记一致。本文旧版写的 `192.168.1.50` 与 `70:04:1D:AA:BB:CC` **作废**，不要再引用。1.54 于 2026-09-25 OTA 到 `0.18.23-bw`；2026-09-26 经按 MAC 排队 OTA 后认证状态已见 **`0.18.25-bw`**。Note4 同法已见 **`0.18.25-note4-b`**；精确运行镜像哈希仍未由设备证明，见 `PROGRESS.md` 顶节。
 - USB 串口 COM 口动态（COM3/COM4/COM5）；用户常拔 USB（无串口时靠 Wi-Fi `/status.json`、`/log`）。**打开串口会复位板子**，所以不要为了看日志而丢掉一次按键唤醒的现场。
 - OTA：上传成功后延迟 1.5s 重启，HTTP 先返回 `UPDATE OK`（客户端超时属既有现象）；双槽 ota_0/ota_1 轮换。
 - 状态可读：`GET /status.json`（fw/槽位/重置原因/RSSI/电量/heap 等）、`GET /log`（4KB RAM 环形日志）与 `GET /pmstats`（PM light-sleep 统计/锁，0.13.0+，只读免 token）；桥**只读 `/status.json`**——旧 HTML 状态页回退与 `claim_unsupported`（固件 <0.13.4）已随 legacy 通道一并删除（2026-09-25），非 v2 固件会被直接拒绝注册。

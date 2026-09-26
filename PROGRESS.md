@@ -1,5 +1,21 @@
 # Codex Status 项目进度（交接文档）
 
+## Bridge 配置行删除按钮比例修复（2026-09-27）
+
+- 用户截图显示「已启用」开关旁的删除按钮被拉成高灰色椭圆。根因是新版全局 `button { min-height: 32px }` 覆盖旧 `.xbtn` 的 `height: 22px`；现对 `.xbtn` 明确 `min-height: 22px`，保持正圆，默认使用浅色底/弱强调字色，悬停才显示错误色，并为图标按钮加可读的 `aria-label`。未改模板启用/删除行为。
+- 当前工作区 `cargo build -p bridge-app` 成功（8.01s），`git diff --check` 通过；计划任务 `CodexStatusBridge` 已重启，新 exe 33,891,840 B，SHA256 `492D618EAB0309F26643DEACADE6738729A0F1BEBEEE8D70FD7B693AA6752A56`。主 PID 32972 监听 8765/8766，state 仍有设备 2、模板 3。实际窗口截图待再次确认。
+
+## Bridge 新界面重新进入运行版（2026-09-27）
+
+- 用户发现桥界面退回旧风格。根因：2026-09-26 为 OTA 修复从干净 worktree 构建并替换了 `bridge/target/debug/bridge-app.exe`；当时新版 UI 仍是当前工作区未提交的 `bridge/crates/app/ui/index.html` 改动，故未进入该 exe。新版源码并未丢失。
+- 已先停 `CodexStatusBridge` 的 watchdog→任务主进程，再在当前工作区 `cargo build -p bridge-app` 成功（1m11s），不清理或迁移 `<exe>/data/`。新 exe 33,892,352 B，SHA256 `95358F9C0FE294ED2AC676E01AC72723ECA0F7997C83B26D56F5BAB5CEC468E9`；计划任务已重新启动，主 PID 21012 监听 8765/8766，平台 state 仍有设备 2、模板 3。`git diff --check` 通过。窗口实际视觉尚待用户打开托盘确认。
+
+## Bridge 独立于 Codex 启动（2026-09-27，待关闭 Codex 复核）
+
+- 用户实测：2026-09-27 02:23 经旧 `tools/start-bridge.ps1` 的 `UseShellExecute=true`/`cmd.exe` 分离启动后，Bridge 主进程 PID 56044 和 watchdog PID 28360 曾监听 8765/8766，但退出 Codex 时两者仍一起退出。`bridge/target/debug/data/logs/watchdog.log` 没有这次异常退出记录；分离 stdio 不足以证明脱离调用方生命周期。
+- 在当前交互用户下注册**按需、无登录触发器、无限运行时限**的 Windows 计划任务 `CodexStatusBridge`，由任务计划程序启动现有 `bridge/target/debug/bridge-app.exe`，不重建 exe、不触碰 `<exe>/data/`。当前任务状态 `Running`，Bridge 主 PID 24568 的父进程是 `svchost.exe` PID 2860，watchdog PID 2704；HTTP 8765/MCP 8766 均由 24568 监听。`tools/start-bridge.ps1` 的标准默认实例现在复用该任务；重复调用确认只报告现有 PID。脚本语法与 `git diff --check` 通过。
+- 关闭 Codex 后进程是否仍在的**跨会话实测**尚未完成，列入 `docs/roadmap/backlog.md`。计划任务只负责按需启动，本次没有设置登录自启动；标准默认实例以外的旧分离启动路径未改。
+
 ## 两台设备离线深睡时钟亚秒丢失修复（2026-09-26，双 ROM 已发布）
 
 - 用户实测 Bridge 离线一天：Note4 约慢 15 分钟，1.54 约慢 8 分钟。`deepSleepRaw()` 原用整秒 `time(nullptr)` 保存锚点，`restoreTimeFromRtc()` 每次把微秒清零；分钟唤醒时清醒阶段的亚秒可能反复丢失。现保存完整 `gettimeofday()` 微秒 epoch，并以 RTC 连续微秒差恢复完整 `timeval`。两台共用此路径；内部 RC 的物理漂移仍须上机复测。

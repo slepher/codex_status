@@ -46,6 +46,7 @@
 | Bundle v3（manifest + 原始 dense 对象，省 ~71%） | 仅设计 | 未实现（见 C1） |
 | `device_first` / `bridge_first` 双策略会合 | 仅设计 + spike | 未实现（见 C4） |
 | 功耗基线 A/B（DFS 40/80、BT modem sleep、会合节奏） | 未做 | 30–60 分钟基线从未采集（见 C4） |
+| Bridge 独立于 Codex 生命周期 | 已改为按需 Windows 计划任务启动，待跨会话验收 | 退出 Codex 后确认 `CodexStatusBridge` 仍为 Running、Bridge 8765/8766 仍监听；本会话进程父级已核实为任务计划程序的 `svchost.exe`，见 `PROGRESS.md` 2026-09-27 节 |
 
 ## 2. 紧急（A 级：先做这些）
 
