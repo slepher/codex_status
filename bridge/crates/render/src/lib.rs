@@ -384,6 +384,8 @@ extern "C" {
     fn codex_sim_bundle_status(p: *mut std::ffi::c_void, out: *mut c_char, cap: c_int) -> c_int;
     fn codex_sim_bundle_frame(p: *mut std::ffi::c_void, out: *mut u8, cap: c_int) -> c_int;
     fn codex_sim_store_budget(p: *mut std::ffi::c_void, budget: i64) -> c_int;
+    fn codex_sim_store_crash_after_sync(p: *mut std::ffi::c_void,
+        kind: *const c_char, count: c_int) -> c_int;
     fn codex_sim_display_fail_next(p: *mut std::ffi::c_void) -> c_int;
     fn codex_sim_button_next(p: *mut std::ffi::c_void, now_ms: u64,
         context: *const c_char, out: *mut c_char, cap: c_int) -> c_int;
@@ -476,6 +478,7 @@ extern "C" {
     fn codex_v2_power_sleep_decide(p: *mut std::ffi::c_void, configured: c_int,
         light_mode: c_int, plugged: c_int, deep_on_usb: c_int, manual_hold: c_int,
         provisional: c_int, boot_ms: u64, safety_deadline_ms: u64, now_ms: u64) -> c_int;
+    fn codex_v2_battery_power_off(plugged: c_int, battery_pct: c_int) -> c_int;
     fn codex_v2_command_parse(message: *const c_char, out: *mut c_char, cap: c_int) -> c_int;
     fn codex_v2_command_check(
         message: *const c_char,
@@ -552,6 +555,14 @@ impl SimulatorBundle {
     pub fn set_write_budget(&mut self, budget: i64) -> anyhow::Result<()> {
         anyhow::ensure!(unsafe { codex_sim_store_budget(self.state, budget) } == 1,
             "invalid simulator write budget");
+        Ok(())
+    }
+
+    pub fn crash_after_sync(&mut self, kind: &str, count: i32) -> anyhow::Result<()> {
+        let kind = CString::new(kind)?;
+        anyhow::ensure!(unsafe { codex_sim_store_crash_after_sync(
+            self.state, kind.as_ptr(), count) } == 1,
+            "invalid simulator crash boundary");
         Ok(())
     }
 
@@ -770,6 +781,10 @@ impl Drop for SimulatorPlan {
     fn drop(&mut self) {
         unsafe { codex_v2_plan_free(self.state) };
     }
+}
+
+pub fn battery_power_off(plugged: bool, battery_pct: u8) -> bool {
+    unsafe { codex_v2_battery_power_off(plugged.into(), battery_pct.into()) != 0 }
 }
 
 pub fn simulator_plan_ack(

@@ -251,6 +251,14 @@ int codex_sim_store_budget(void *p, long long budget) {
     return 1;
 }
 
+int codex_sim_store_crash_after_sync(void *p, const char *kind, int count) {
+    if (!p || !kind || count < 1 || count > 100 ||
+        (strcmp(kind, "slot") && strcmp(kind, "meta"))) return 0;
+    LittleFS.crashAfterSyncKind = kind;
+    LittleFS.crashAfterSyncCount = count;
+    return 1;
+}
+
 int codex_sim_display_fail_next(void *p) {
     if (!p) return 0;
     ((SimBundleDevice *)p)->failNextDisplay = true;
@@ -1142,6 +1150,9 @@ int codex_v2_power_sleep_decide(void *p, int configured, int light_mode,
         plugged != 0, deep_on_usb != 0, manual_hold != 0,
         *(V2PlanState *)p, provisional != 0, boot_ms,
         safety_deadline_ms, now_ms);
+}
+int codex_v2_battery_power_off(int plugged, int battery_pct) {
+    return v2BatteryPowerOff(plugged != 0, battery_pct) ? 1 : 0;
 }
 uint32_t codex_v2_boot_remaining(uint64_t t_boot_ms, uint64_t now_ms) {
     return V2PlanState::bootProvisionalRemaining(t_boot_ms, now_ms);

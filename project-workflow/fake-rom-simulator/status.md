@@ -1,5 +1,9 @@
 # Fake ROM 修订记录
 
+## 2026-09-26：D 的硬退出、动态帧与电源输入
+
+在 `8448afa` 首批提交后，补上文件同步后直接退出的 slot/metadata 双切点回归、OTA pending 在延迟重启前退出的恢复、动态 Data 帧逐字节对拍。控制面增加 USB/deep-on-USB/手动 BLE hold/电池输入；共享固件判定 USB 影响 Plan 入睡，低电阈值由固件与宿主同一 `v2BatteryPowerOff` 决定。bootstrap 29/29；Note4 构建与 ROM 哈希见 PROGRESS 顶节。D/E/F 仍进行中。
+
 ## 2026-09-26：实施增量（未越过 D1/D2/D3 门槛）
 
 同源 C++ Bundle/Data/Activate 业务与 A/B store 已连到 device-sim HTTP，154g 和 Note4 目标有不同身份与编译画布；实例目录文件持久、独占锁与跨 boot nonce 已接。有限 OTA 的 2–3 预置版本、完整上传校验、默认延迟切换与显式 override 来源区分已接。`/sim/storage` 可以注入短写。新增同源电源判定、timer BLE-only 失联、按键 provisional、boot 相对 owner/Plan 时间、按键 8 项循环和 display candidate/成功帧/失败注入。24 h 虚拟时间与 1,442 次本地 wake 已测试；这只是设备单侧逐事件推进。隔离真实 Bridge 已完成双 Fake MAC 的冻结发布/重启后延后交付与一次 OTA 正常路径；全部故障矩阵、fake BLE/协作时钟、全切点断电/电量/USB 仍未完成，阶段状态以 backlog C2 为准。

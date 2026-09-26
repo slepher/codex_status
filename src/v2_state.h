@@ -139,6 +139,10 @@ enum V2PowerSleepReason : uint8_t {
     V2_POWER_SAFETY_ENDED,
 };
 
+inline bool v2BatteryPowerOff(bool plugged, int batteryPct) {
+    return !plugged && batteryPct < 5;
+}
+
 inline V2PowerSleepReason v2PowerSleepDecision(
     bool bundleReady, bool lightMode, bool plugged, bool deepOnUsb,
     bool manualBleHold, const V2PlanState &plan, bool provisional,

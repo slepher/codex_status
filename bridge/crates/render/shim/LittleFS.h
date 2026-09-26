@@ -2,6 +2,7 @@
 // in host tests.
 #pragma once
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -26,6 +27,8 @@ public:
     std::set<std::string> dirs;
     size_t capacity = 1024 * 1024;
     long long writeBudget = -1; // inject a torn write after exactly N bytes
+    std::string crashAfterSyncKind;
+    int crashAfterSyncCount = 0;
     std::string root;
     static std::string encoded(const std::string &path) {
         const char *hex = "0123456789abcdef";
@@ -51,6 +54,7 @@ public:
     }
     void useDirectory(const std::string &directory) {
         files.clear(); dirs.clear(); root = directory;
+        crashAfterSyncKind.clear(); crashAfterSyncCount = 0;
         for (const auto &entry : std::filesystem::directory_iterator(root)) {
             if (!entry.is_regular_file()) continue;
             std::string path = decoded(entry.path().filename().string());
@@ -66,7 +70,13 @@ public:
         const auto &bytes = files.at(path);
         out.write((const char *)bytes.data(), (std::streamsize)bytes.size());
         out.flush();
-        return out.good();
+        if (!out.good()) return false;
+        const bool slot = path == "/bundle/a.bin" || path == "/bundle/b.bin";
+        const bool meta = path == "/bundle/m0.bin" || path == "/bundle/m1.bin";
+        if (((crashAfterSyncKind == "slot" && slot) ||
+             (crashAfterSyncKind == "meta" && meta)) && --crashAfterSyncCount == 0)
+            std::_Exit(77);
+        return true;
     }
     bool begin(bool, const char *, int, const char *) { return true; }
     bool exists(const char *p) {

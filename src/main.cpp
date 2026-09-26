@@ -103,7 +103,6 @@ static const int EPD_FB_BYTES = (EPD_W / 8) * EPD_H;
 #define BATT_CHECK_MS    (5UL * 60UL * 1000UL)
 #define ANNOUNCE_MS      (5UL * 60UL * 1000UL)   // UDP announce heartbeat
 #define BRIDGE_LOST_MIN  6                       // bridge heartbeat 5 min + margin
-#define LOW_BATT_PCT     5
 #define BLE_AUTO_PCT     20
 #define STORE_MAX_LOCAL  8
 
@@ -3955,7 +3954,7 @@ static void checkBattery() {
     batteryPct = batteryPercent();
     DevLog.printf("[pm] battery %d%% (%u mV) plugged=%d\n",
                   batteryPct, (unsigned)batteryMilliVolts(), plugged ? 1 : 0);
-    if (!plugged && batteryPct < LOW_BATT_PCT) {
+    if (v2BatteryPowerOff(plugged, batteryPct)) {
         DevLog.println("[pm] battery <5%: power off");
         powerOff();
     }
@@ -5996,22 +5995,22 @@ void loop() {
     // claims and status polls never do. The BOOT provisional 300 s closes the
     // radio when the Bridge stays unreachable (v2 §7/§12).
     if (v2BundleReady && rtcMode == MODE_LIGHT && (!plugged || rtcDeepOnUsb)) {
-        const uint64_t nowV2 = v2NowMs();
-        if (!v2ManualBleHoldActive()) {
-            if (v2Plan.accepted()) {
-                if (!v2Plan.lightActive(nowV2)) {
-                    DevLog.printf("[v2] formal light window ended (%s)\n", v2PlanReason.c_str());
-                    enterDeep("v2 plan");
-                }
-            } else if (v2Provisional &&
-                       V2PlanState::bootProvisionalRemaining(v2BootMs, nowV2) == 0) {
-                DevLog.println("[v2] boot provisional 300s expired without a formal plan");
-                enterDeep("v2 provisional");
-            } else if (!v2Provisional && v2SafetyDeadlineMs &&
-                       nowV2 >= v2SafetyDeadlineMs) {
-                DevLog.println("[v2] no formal plan within the max light lease; sleeping");
-                enterDeep("v2 safety");
-            }
+        switch (v2PowerSleepDecision(true, true, plugged, rtcDeepOnUsb,
+                                     v2ManualBleHoldActive(), v2Plan, v2Provisional,
+                                     v2BootMs, v2SafetyDeadlineMs, v2NowMs())) {
+        case V2_POWER_PLAN_ENDED:
+            DevLog.printf("[v2] formal light window ended (%s)\n", v2PlanReason.c_str());
+            enterDeep("v2 plan");
+            break;
+        case V2_POWER_BOOT_ENDED:
+            DevLog.println("[v2] boot provisional 300s expired without a formal plan");
+            enterDeep("v2 provisional");
+            break;
+        case V2_POWER_SAFETY_ENDED:
+            DevLog.println("[v2] no formal plan within the max light lease; sleeping");
+            enterDeep("v2 safety");
+            break;
+        default: break;
         }
     }
 

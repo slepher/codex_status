@@ -1,5 +1,9 @@
 # Astra 修订评审（2026-09-26）
 
+## D 增量复核
+
+29 项 bootstrap 通过；新增硬退出并非短写返回错误：slot 或 metadata 同步后进程立即终止，重启仍保留旧完整 job。OTA pending 在延迟重启前终止，重启完成切换。动态字段从 Data 写入到帧字节与预览一致。USB/电池输入只验证软件决定，不作为真实 ADC/USB/屏幕证据。仅 Note4 固件重建成功，产物 SHA256 见 PROGRESS；D 的 BLE 生命周期、E/F 尚无出口证据。
+
 ## 实施增量复核（2026-09-26，进行中）
 
 当前改动覆盖 D1 的主 HTTP 路径、D2 文件/显示/电源局部切片及 D3 OTA 模型切片。Bundle 保存/激活采用共享 `bsInstall`/`bsSetActive`，而非 Rust 伪造成功；Note4/154g 分别测试，8 项不裁剪。宿主文件写入逐次落盘，测试在短写后强杀进程并由 `bsBegin` 恢复旧 metadata。显示失败保留最后成功帧并使基线失信；按键 8 项循环与 24 h / 1,442 次本地 timer wake 已测试。OTA 校验目录 SHA/大小，上传与 override 有独立来源；目录真相仅在控制面。真实 `v2Rendezvous` 的 timer wake 只有 BLE 机会，因此模拟器 timer wake 后 HTTP 保持失联，按键可触发 300 s provisional。隔离 Bridge 的 M07 提交后断链已复现并对账成功；D/E/F 出口仍未全部完成，设备单侧计时不能证明 BLE/协作加速闭环。

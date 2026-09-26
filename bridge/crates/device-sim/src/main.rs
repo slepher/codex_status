@@ -68,6 +68,10 @@ struct StallFault {
 struct SimPower {
     configured: bool,
     light: bool,
+    plugged: bool,
+    deep_on_usb: bool,
+    manual_ble_hold: bool,
+    battery_pct: u8,
     boot_ms: u64,
     provisional: bool,
     safety_deadline_ms: u64,
@@ -79,7 +83,8 @@ struct SimPower {
 impl SimPower {
     fn new(configured: bool, wake_cause: &str) -> Self {
         Self {
-            configured, light: true, boot_ms: 0,
+            configured, light: true, plugged: false, deep_on_usb: false,
+            manual_ble_hold: false, battery_pct: 75, boot_ms: 0,
             provisional: wake_cause == "button",
             safety_deadline_ms: if configured { 600_000 } else { 0 },
             next_contact_ms: None, wake_count: 0,
@@ -96,6 +101,8 @@ impl SimPower {
 
     fn json(&self, now_ms: u64) -> serde_json::Value {
         json!({"mode":if self.light {"light"} else {"deep"},
+            "plugged":self.plugged,"deep_on_usb":self.deep_on_usb,
+            "manual_ble_hold":self.manual_ble_hold,"battery_pct":self.battery_pct,
             "boot_ms":self.boot_ms,"provisional":self.provisional,
             "safety_deadline_ms":self.safety_deadline_ms,
             "next_contact_ms":self.next_contact_ms,
@@ -764,7 +771,8 @@ fn reconcile_power(state: &SimState, now_ms: u64) -> Result<SimPower> {
     let (reason, plan_deadline) = {
         let plan = state.plan.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_, mode, _, granted_s, accepted_at_ms) = plan.status_fields();
-        (plan.sleep_reason(configured, before.light, false, false, false,
+        (plan.sleep_reason(configured, before.light, before.plugged,
+            before.deep_on_usb, before.manual_ble_hold,
             before.provisional, 0,
             before.safety_deadline_ms.saturating_sub(before.boot_ms), local_now),
          if mode == "light" {before.boot_ms.saturating_add(accepted_at_ms)
@@ -777,6 +785,12 @@ fn reconcile_power(state: &SimState, now_ms: u64) -> Result<SimPower> {
         power.safety_deadline_ms = now_ms.saturating_add(600_000);
     }
     if power.light {
+        // The low-battery cut-off is a separate boot/loop decision in the ROM.
+        if bridge_render::battery_power_off(power.plugged, power.battery_pct) {
+            power.enter_deep(now_ms, "low battery");
+            power.next_contact_ms = None;
+            return Ok(power.clone());
+        }
         let transition = match reason {
             1 => Some((plan_deadline, "v2 plan")),
             2 => Some((power.boot_ms.saturating_add(300_000), "v2 provisional")),
@@ -957,7 +971,8 @@ async fn public_status(State(state): State<SimState>) -> Response {
     let note4 = state.target == "zectrix-note4-400x300";
     let fw = state.ota.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
         .active_version().fw.clone();
-    let boot_ms = state.power.lock().unwrap_or_else(std::sync::PoisonError::into_inner).boot_ms;
+    let power = state.power.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    let boot_ms = power.boot_ms;
     Json(json!({
         "mac": state.mac,
         "fw": fw,
@@ -973,7 +988,7 @@ async fn public_status(State(state): State<SimState>) -> Response {
         "free_bytes": bundle["free_bytes"],
         "uptime_s": clock.monotonic_ms.saturating_sub(boot_ms) / 1000,
         "mode": "light",
-        "battery": 75,
+        "battery": power.battery_pct,
         "v2_bundle": bundle["configured"],
         "commit_seq": bundle["commit_seq"],
         "active_context_id": bundle["context"],
@@ -1039,7 +1054,8 @@ async fn status(State(state): State<SimState>, request: Request<Body>) -> Respon
         "provisional": power.provisional,
         "boot_ms": power.boot_ms,
         "now_ms": device_uptime_ms(&state, clock),
-        "battery": 75
+        "battery": state.power.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .battery_pct
     });
     match bridge_render::simulator_status_snapshot(&input) {
         Ok(status) => Json(status).into_response(),
@@ -1257,6 +1273,47 @@ async fn sim_display(State(state): State<SimState>, request: Request<Body>) -> R
     }
 }
 
+async fn sim_power(State(state): State<SimState>, request: Request<Body>) -> Response {
+    if !bearer(&request, &state.control_token) { return unauthorized(); }
+    let body = match to_bytes(request.into_body(), BODY_LIMIT).await {
+        Ok(body) => body,
+        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    };
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let Some(object) = value.as_object() else { return StatusCode::BAD_REQUEST.into_response(); };
+    if object.is_empty() || object.keys().any(|key| ![
+        "plugged", "deep_on_usb", "manual_ble_hold", "battery_pct"
+    ].contains(&key.as_str()))
+        || object.iter().any(|(key, value)| if key == "battery_pct" {
+            value.as_u64().is_none_or(|pct| pct > 100)
+        } else { !value.is_boolean() }) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let Some(clock) = clock_snapshot(&state) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    {
+        let mut power = state.power.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(value) = object.get("plugged") { power.plugged = value.as_bool().unwrap(); }
+        if let Some(value) = object.get("deep_on_usb") {
+            power.deep_on_usb = value.as_bool().unwrap();
+        }
+        if let Some(value) = object.get("manual_ble_hold") {
+            power.manual_ble_hold = value.as_bool().unwrap();
+        }
+        if let Some(value) = object.get("battery_pct") {
+            power.battery_pct = value.as_u64().unwrap() as u8;
+        }
+    }
+    match reconcile_power(&state, clock.monotonic_ms) {
+        Ok(power) => Json(power.json(clock.monotonic_ms)).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
 async fn sim_fault(State(state): State<SimState>, request: Request<Body>) -> Response {
     if !bearer(&request, &state.control_token) { return unauthorized(); }
     let body = match to_bytes(request.into_body(), BODY_LIMIT).await {
@@ -1340,6 +1397,21 @@ async fn sim_storage(State(state): State<SimState>, request: Request<Body>) -> R
         Err(_) => return (StatusCode::BAD_REQUEST,
             Json(json!({"error":"invalid_storage_command"}))).into_response(),
     };
+    if value.as_object().is_some_and(|object| object.len() == 2 &&
+        object.contains_key("crash_after_sync") && object.contains_key("count")) {
+        let kind = value["crash_after_sync"].as_str().unwrap_or("");
+        let count = value["count"].as_i64().unwrap_or(0);
+        if !(1..=100).contains(&count) {
+            return (StatusCode::BAD_REQUEST,
+                Json(json!({"error":"invalid_storage_command"}))).into_response();
+        }
+        let mut bundle = state.bundle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        return match bundle.crash_after_sync(kind, count as i32) {
+            Ok(()) => Json(json!({"crash_after_sync":kind,"count":count})).into_response(),
+            Err(_) => (StatusCode::BAD_REQUEST,
+                Json(json!({"error":"invalid_storage_command"}))).into_response(),
+        };
+    }
     if value.as_object().is_none_or(|object| object.len() != 1 || !object.contains_key("write_budget")) {
         return (StatusCode::BAD_REQUEST,
             Json(json!({"error":"invalid_storage_command"}))).into_response();
@@ -1995,6 +2067,7 @@ fn app(state: SimState) -> Router {
         .route("/sim/time", get(sim_time_get).post(sim_time_post))
         .route("/sim/wake", post(sim_wake))
         .route("/sim/display", post(sim_display))
+        .route("/sim/power", post(sim_power))
         .route("/sim/fault", post(sim_fault))
         .route("/sim/button", post(sim_button))
         .route("/sim/storage", post(sim_storage))

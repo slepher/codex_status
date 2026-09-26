@@ -221,6 +221,27 @@ fn ota_upload_can_commit_after_its_ack_is_lost() {
         None, b"").1)["fw"], "0.18.25-bw");
 }
 
+#[test]
+fn ota_pending_survives_process_death_before_delayed_reboot() {
+    let mut sim = Simulator::start("02:00:00:00:00:38", &[]);
+    let rom = inert_rom("codex-status-154g", "0.18.25-bw");
+    let (code, ack) = ota_request(&sim,
+        "/doUpdate?token=device-test-secret&target=codex-status-154g", &rom);
+    assert_eq!(code, 200);
+    assert!(ack.contains("UPDATE OK"));
+    let queued = json_body(&request(sim.address(), "GET", "/sim/versions", Some(CONTROL), b"").1);
+    assert_eq!(queued["active"], "v1");
+    assert_eq!(queued["pending"], "v2");
+    let data_dir = sim.data_dir.clone();
+    sim.stop_preserving_data();
+    let recovered = Simulator::start_with_dir("02:00:00:00:00:38", &[], data_dir, true);
+    let versions = json_body(&request(recovered.address(), "GET", "/sim/versions", Some(CONTROL), b"").1);
+    assert_eq!(versions["active"], "v2");
+    assert_eq!(versions["source"], "ota_upload");
+    assert_eq!(json_body(&request(recovered.address(), "GET", "/status.json", None, b"").1)["fw"],
+        "0.18.25-bw");
+}
+
 fn claim(sim: &Simulator, query: &str, token: Option<&str>) -> (u16, Value) {
     let (code, body) = request(
         sim.address(),
@@ -288,6 +309,111 @@ fn committed_frame_matches_shared_preview_bits_byte_for_byte() {
             "{}", &env).unwrap();
         assert_eq!(frame.len(), ((width + 7) / 8 * height) as usize);
         assert_eq!(frame, preview);
+    }
+}
+
+#[test]
+fn data_bound_frame_matches_shared_preview_after_value_change() {
+    let sim = Simulator::start("02:00:00:00:00:1C", &[]);
+    let mut source: Value = serde_json::from_str(include_str!(
+        "../../../../tools/test-bridge/templates/quad.json"
+    )).unwrap();
+    source["id"] = "dynamic".into();
+    source["elements"] = serde_json::json!([{
+        "type":"text", "bind":"account.plan", "font":"f16", "color":"black",
+        "x":8,"y":8
+    }]);
+    let compiled = bridge_core::compile::compile(&source,
+        "epd-ssd1681-200x200-1bpp").unwrap();
+    let requirement = compiled.requirements.iter()
+        .find(|field| field.field == "account.plan").unwrap();
+    let field_index = requirement.index;
+    let bundle = serde_json::json!({
+        "bridge_id":"bridge-test", "job_id":"dynamic-job",
+        "firmware_target":"codex-status-154g",
+        "render_target":"epd-ssd1681-200x200-1bpp", "compiler_abi":2,
+        "profile":{"template_ids":["dynamic"],"initial_active_id":"dynamic"},
+        "templates":[{"key":{"template_id":"dynamic",
+            "render_target":"epd-ssd1681-200x200-1bpp"},
+            "source":source,"compiled":compiled}],
+        "resources":[],"bindings":[]
+    });
+    let bytes = bridge_core::template::canonical_bytes(&bundle);
+    let ack = bridge_core::v2_client::install_bundle(&sim.address().to_string(), ENDPOINT,
+        "02:00:00:00:00:1C", "bridge-test", &bytes, 4096,
+        Duration::from_secs(3)).unwrap();
+    assert_eq!(ack["result"], "applied");
+    let context = ack["active_context_id"].as_str().unwrap();
+    for (seq, plan) in [(1, "Plus"), (2, "Pro")] {
+        let fields = vec![serde_json::json!({
+            "i":field_index,"k":"account.plan","v":plan,"q":"good"
+        })];
+        let data = serde_json::json!({
+            "bridge_id":"bridge-test", "active_context_id":context,"seq":seq,
+            "crc":format!("{:08x}",bridge_core::coordinator::data_fields_crc(&fields)),
+            "fields":fields
+        });
+        let ack = bridge_core::v2_client::data(&sim.address().to_string(), ENDPOINT,
+            "02:00:00:00:00:1C", &data, Duration::from_secs(3)).unwrap();
+        assert_eq!(ack["result"], "applied");
+        let frame = request(sim.address(), "GET", "/sim/frame", Some(CONTROL), b"").1;
+        let usage = serde_json::json!({"account":{"plan":plan}}).to_string();
+        let env = bridge_render::Env { channel:"PULL", battery:75, state:"WIFI ON",
+            ..bridge_render::Env::default() };
+        let expected = bridge_render::render_bits(&bundle["templates"][0]["source"].to_string(),
+            &usage, &env).unwrap();
+        assert_eq!(frame, expected, "dynamic frame for {plan}");
+    }
+}
+
+#[test]
+fn bundle_hard_exit_during_slot_or_metadata_sync_restores_prior_job() {
+    for kind in ["slot", "meta"] {
+        let mut sim = Simulator::start("02:00:00:00:00:1B", &[]);
+        let mut source: Value = serde_json::from_str(include_str!(
+            "../../../../tools/test-bridge/templates/quad.json"
+        )).unwrap();
+        source["id"] = "quad0".into();
+        let compiled = bridge_core::compile::compile(
+            &source, "epd-ssd1681-200x200-1bpp"
+        ).unwrap();
+        let old_bundle = serde_json::json!({
+            "bridge_id":"bridge-test", "job_id":"old-job",
+            "firmware_target":"codex-status-154g",
+            "render_target":"epd-ssd1681-200x200-1bpp", "compiler_abi":2,
+            "profile":{"template_ids":["quad0"],"initial_active_id":"quad0"},
+            "templates":[{"key":{"template_id":"quad0",
+                "render_target":"epd-ssd1681-200x200-1bpp"},
+                "source":source,"compiled":compiled}],
+            "resources":[],"bindings":[]
+        });
+        let old_bytes = bridge_core::template::canonical_bytes(&old_bundle);
+        let ack = bridge_core::v2_client::install_bundle(
+            &sim.address().to_string(), ENDPOINT, "02:00:00:00:00:1B",
+            "bridge-test", &old_bytes, 4096, Duration::from_secs(3)
+        ).unwrap();
+        assert_eq!(ack["result"], "applied");
+        let fault = serde_json::json!({"crash_after_sync":kind,"count":1});
+        assert_eq!(request(sim.address(), "POST", "/sim/storage", Some(CONTROL),
+            fault.to_string().as_bytes()).0, 200);
+        let mut new_bundle = old_bundle;
+        new_bundle["job_id"] = "new-job".into();
+        let new_bytes = bridge_core::template::canonical_bytes(&new_bundle);
+        assert!(bridge_core::v2_client::install_bundle(
+            &sim.address().to_string(), ENDPOINT, "02:00:00:00:00:1B",
+            "bridge-test", &new_bytes, 4096, Duration::from_secs(3)
+        ).is_err(), "{kind} sync must terminate process before ACK");
+        let data_dir = sim.data_dir.clone();
+        sim.stop_preserving_data();
+        let recovered = Simulator::start_with_dir(
+            "02:00:00:00:00:1B", &[], data_dir, true
+        );
+        let (code, body) = request(recovered.address(), "GET", "/v2/status", Some(ENDPOINT), b"");
+        assert_eq!(code, 200);
+        let status = json_body(&body);
+        assert_eq!(status["configured"], true, "{kind}: {status}");
+        assert_eq!(status["committed_job_id"], "old-job", "{kind}: {status}");
+        assert_eq!(status["template_ids"].as_array().unwrap().len(), 1);
     }
 }
 
@@ -490,8 +616,13 @@ fn configured_power_sleeps_and_timer_and_button_wakes_have_distinct_windows() {
         "02:00:00:00:00:35", &data, Duration::from_secs(3)).unwrap()["result"], "applied");
     assert_eq!(claim(&sim, "id=bridge-test&lease=120", Some(DEVICE)).0, 200);
     let nonce = status["session_nonce"].clone();
+    assert_eq!(request(sim.address(), "POST", "/sim/power", Some(CONTROL),
+        br#"{"plugged":true,"deep_on_usb":false}"#).0, 200);
     let sleep = plan_message(&status, "bridge-test", "sleep-now", 1, "sleep", None);
     assert_eq!(post_plan(&sim, Some(ENDPOINT), &sleep).1["result"], "applied");
+    assert_eq!(sim_state(&sim)["power"]["mode"], "light");
+    assert_eq!(request(sim.address(), "POST", "/sim/power", Some(CONTROL),
+        br#"{"plugged":false}"#).0, 200);
     let asleep = sim_state(&sim);
     assert_eq!(asleep["power"]["mode"], "deep");
     assert_eq!(asleep["power"]["last_sleep_reason"], "v2 plan");
@@ -532,6 +663,30 @@ fn configured_power_sleeps_and_timer_and_button_wakes_have_distinct_windows() {
     assert_eq!(day["power"]["mode"], "deep");
     assert_eq!(day["power"]["wake_count"], 1442);
     assert_eq!(day["bundle"]["job_id"], "power-job");
+}
+
+#[test]
+fn low_battery_powers_off_without_scheduling_timer_contact() {
+    let sim = Simulator::start("02:00:00:00:00:39", &[]);
+    assert_eq!(request(sim.address(), "POST", "/sim/power", Some(ENDPOINT),
+        br#"{"battery_pct":4}"#).0, 401);
+    let (code, body) = request(sim.address(), "POST", "/sim/power", Some(CONTROL),
+        br#"{"battery_pct":4}"#);
+    assert_eq!(code, 200);
+    let power = json_body(&body);
+    assert_eq!(power["mode"], "deep");
+    assert_eq!(power["last_sleep_reason"], "low battery");
+    assert_eq!(power["next_contact_ms"], Value::Null);
+    assert_eq!(set_time(&sim, Some(CONTROL),
+        &serde_json::json!({"op":"rate","rate_ppm":0})).0, 200);
+    assert_eq!(set_time(&sim, Some(CONTROL),
+        &serde_json::json!({"op":"step","delta_ms":3600000})).0, 200);
+    assert_eq!(sim_state(&sim)["power"]["wake_count"], 0);
+    assert_eq!(request(sim.address(), "POST", "/sim/power", Some(CONTROL),
+        br#"{"plugged":true}"#).0, 200);
+    assert_eq!(request(sim.address(), "POST", "/sim/wake", Some(CONTROL),
+        br#"{"cause":"button"}"#).0, 200);
+    assert_eq!(sim_state(&sim)["power"]["mode"], "light");
 }
 
 #[test]
