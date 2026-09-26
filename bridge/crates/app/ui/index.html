@@ -56,7 +56,7 @@
 
   /* dropdown + menus */
   .menu-wrap { position: relative; }
-  .menu { position: absolute; z-index: 40; top: calc(100% + 4px); left: 0; min-width: 210px; background: Canvas; border: 1px solid var(--line); border-radius: 10px; padding: 6px; box-shadow: 0 8px 24px rgba(0,0,0,.35); display: none; }
+  .menu { position: absolute; z-index: 40; top: calc(100% + 4px); left: 0; min-width: 210px; max-width: calc(100vw - 24px); background: Canvas; border: 1px solid var(--line); border-radius: 10px; padding: 6px; box-shadow: 0 8px 24px rgba(0,0,0,.35); display: none; }
   .menu.right { left: auto; right: 0; }
   .menu.open { display: block; }
   .menu .item { display: flex; gap: 8px; align-items: center; padding: 7px 10px; border-radius: 7px; cursor: pointer; }
@@ -84,8 +84,8 @@
   .switch.on { background: var(--accent); }
   .switch::after { content: ''; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #fff; transition: left .12s; }
   .switch.on::after { left: 22px; }
-  .xbtn { display: flex; align-items: center; justify-content: center; width: 22px; height: 22px; padding: 0; border-radius: 50%; border: 0; background: rgba(127,127,127,.35); color: #fff; font-weight: 700; font-size: 15px; line-height: 1; cursor: pointer; }
-  .xbtn:hover { background: var(--err); }
+  .xbtn { display: flex; align-items: center; justify-content: center; width: 22px; height: 22px; min-height: 22px; padding: 0; border-radius: 50%; border: 0; background: var(--page); color: var(--muted); font-weight: 700; font-size: 15px; line-height: 1; cursor: pointer; }
+  .xbtn:hover { background: var(--err); color: #fff; }
 
   /* modal */
   .backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: none; align-items: center; justify-content: center; z-index: 90; }
@@ -97,6 +97,103 @@
   .modal .pick { max-height: 46vh; overflow: auto; margin-top: 8px; border-top: 1px solid var(--line); }
   .modal .pick .prow { border-bottom: 1px dashed var(--line); }
   .modal .all { display: flex; justify-content: space-between; align-items: center; margin-top: 8px; }
+
+  /* Bridge visual direction: quiet ink, warm paper, clear action hierarchy. */
+  :root {
+    color-scheme: light;
+    --page: #f2f3ef;
+    --surface: #fff;
+    --card: #fff;
+    --line: #dfe5df;
+    --ink: #172d2b;
+    --muted: #63736f;
+    --accent: #276b59;
+    --accent-soft: #e6f1eb;
+    --ok: #278766;
+    --warn: #b78222;
+    --err: #bd554b;
+  }
+  html { background: var(--page); }
+  body { min-width: 320px; background: var(--page); color: var(--ink); line-height: 1.45; }
+  header { padding: 20px 22px 15px; background: var(--surface); border-bottom: 1px solid var(--line); }
+  header h1 { display: flex; align-items: center; gap: 9px; font-size: 18px; letter-spacing: -.02em; }
+  header .sub { margin: 6px 0 0 17px; font-size: 11px; line-height: 1.5; }
+  .dot { width: 9px; height: 9px; margin: 0; box-shadow: 0 0 0 3px var(--accent-soft); }
+  .tabs { gap: 3px; padding: 8px 16px; background: var(--surface); border-bottom: 1px solid var(--line); }
+  .tabs button { flex: 1; min-height: 38px; padding: 8px; border: 0; border-radius: 8px; font-weight: 600; color: var(--muted); }
+  .tabs button.on { color: var(--accent); background: var(--accent-soft); }
+  .tabs button:hover:not(.on) { background: var(--page); color: var(--ink); }
+  main { max-width: 900px; margin: 0 auto; padding: 22px; }
+  .page-heading { margin: 0 0 17px; }
+  .page-heading h2 { margin: 0 0 3px; font-size: 20px; line-height: 1.25; letter-spacing: -.025em; }
+  .page-heading p { margin: 0; color: var(--muted); font-size: 12px; }
+  .card { margin-bottom: 12px; padding: 17px 18px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); box-shadow: 0 2px 8px rgba(27,49,39,.025); }
+  .card h2 { margin-bottom: 12px; font-size: 14px; letter-spacing: -.01em; }
+  .card .sub { line-height: 1.55; }
+  .bar { flex-wrap: wrap; gap: 12px; }
+  .bar .status { min-width: 0; overflow-wrap: anywhere; color: var(--ink); font-size: 13px; font-weight: 600; }
+  .bar .menus { flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+  .bar .menus button { height: 32px; padding: 0 11px; }
+  .row { gap: 15px; align-items: baseline; padding: 9px 0; border-bottom: 1px solid #edf0ec; }
+  .row span:last-child { text-align: right; overflow-wrap: anywhere; }
+  .toolbar { gap: 7px; }
+  button, select, input, textarea { font: inherit; }
+  button { min-height: 32px; padding: 6px 11px; border: 1px solid #d7e1d9; border-radius: 8px; background: var(--surface); color: var(--ink); transition: background .15s, border-color .15s; }
+  button:hover:not(:disabled) { background: #f1f6f2; border-color: #a8c8b6; }
+  button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover:not(:disabled) { background: #1d5949; border-color: #1d5949; }
+  button.danger { background: #fff8f6; }
+  select, input, textarea { min-height: 34px; background: var(--surface); border-color: #d7e1d9; }
+  textarea { width: 100%; padding: 10px; border: 1px solid var(--line); border-radius: 9px; resize: vertical; color: var(--ink); }
+  .muted, .sub, .todo, .ring small { color: var(--muted); }
+  .badge, .tag { border: 1px solid #b9dac6; border-radius: 999px; background: var(--accent-soft); color: var(--accent); font-size: 11px; padding: 3px 8px; }
+  .prow { padding: 10px 5px; min-height: 70px; border-bottom: 1px solid #edf0ec; border-radius: 0; }
+  .prow.pick { border-radius: 9px; padding: 10px; }
+  .prow.pick.current { background: var(--accent-soft); box-shadow: inset 3px 0 var(--accent); }
+  .prow .name { min-width: 0; overflow-wrap: anywhere; }
+  .prow .name small { line-height: 1.5; }
+  .rings { gap: 10px; justify-content: stretch; padding: 0; }
+  .ring { width: auto; height: auto; min-height: 94px; flex: 1; border: 1px solid var(--line); border-radius: 11px; background: #f8faf7; }
+  .ring b { font-size: 26px; letter-spacing: -.04em; line-height: 1.1; }
+  .ring small { margin-top: 5px; font-size: 11px; }
+  details.card { padding: 0; }
+  details.card > summary { padding: 16px 18px; color: var(--ink); font-size: 14px; font-weight: 600; list-style-position: inside; }
+  details.card[open] > summary { border-bottom: 1px solid var(--line); }
+  details.card > .card { margin: 12px; box-shadow: none; }
+  .menu, .modal { background: var(--surface); box-shadow: 0 18px 46px rgba(18,43,34,.15); }
+  .menu .item { overflow-wrap: anywhere; }
+  .menu .item:hover { background: var(--accent-soft); }
+  .section-note { margin: 3px 0 13px; color: var(--muted); font-size: 12px; }
+  .metric-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+  .metric { min-width: 0; padding: 13px 11px; border: 1px solid var(--line); border-radius: 10px; background: #f8faf7; }
+  .metric strong { display: block; overflow-wrap: anywhere; font-size: 17px; line-height: 1.25; }
+  .metric span { display: block; margin-top: 5px; color: var(--muted); font-size: 11px; }
+  .action-strip { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 14px; }
+  .mono { font-family: ui-monospace, Consolas, monospace; font-size: 11px; }
+  .device-name { font-weight: 700; color: var(--accent); cursor: pointer; }
+  .device-name:hover { text-decoration: underline; }
+  .field-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; padding: 10px 0; border-bottom: 1px solid #edf0ec; }
+  .field-row:last-child { border-bottom: 0; }
+  .field-row b { display: block; overflow-wrap: anywhere; font-size: 12px; font-weight: 600; }
+  .field-row small { display: block; margin-top: 3px; color: var(--muted); }
+  .field-value { max-width: 43%; text-align: right; overflow-wrap: anywhere; font-size: 12px; }
+  .field-value strong { display: block; }
+  .field-value small { display: block; }
+  #pt-sources .pmeta { flex: 1; min-width: 0; }
+  #pt-sources .pmeta small { display: block; color: var(--muted); }
+  #mcp-url { font-family: ui-monospace, Consolas, monospace; font-size: 11px; }
+  @media (max-width: 520px) {
+    header { padding: 17px 15px 12px; }
+    main { padding: 16px 12px; }
+    .tabs { padding: 6px 9px; }
+    .card { padding: 14px; }
+    .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .bar .menus { width: 100%; }
+    .row { align-items: flex-start; }
+    .row span:first-child { flex: 0 0 42%; }
+    .row span:last-child { max-width: 58%; }
+  }
 </style>
 </head>
 <body>
@@ -114,6 +211,7 @@
 
   <main>
     <section class="panel on" id="tab-templates">
+      <div class="page-heading"><h2>模板与配置</h2><p>整理每台屏幕的内容，保存草稿后再选择是否发布。</p></div>
       <div class="card">
         <div class="bar">
           <div class="status" id="profile-status"></div>
@@ -124,7 +222,7 @@
             </div>
             <div class="menu-wrap">
               <button id="profile-btn" onclick="toggleMenu('menu-profile', event)">配置 ▾</button>
-              <div class="menu" id="menu-profile"></div>
+              <div class="menu right" id="menu-profile"></div>
             </div>
             <div class="menu-wrap">
               <button class="icon" onclick="toggleMenu('menu-actions', event)">⋯</button>
@@ -139,6 +237,11 @@
     </section>
 
     <section class="panel" id="tab-device">
+      <div class="page-heading"><h2>设备</h2><p>先看当前屏幕的状态，再处理配置与发布。</p></div>
+      <div class="card">
+        <h2>当前屏幕</h2>
+        <div id="registered-devices" class="plist muted">加载中…</div>
+      </div>
       <div class="card">
         <div class="bar">
           <div class="status" id="device-state">读取中…</div>
@@ -147,52 +250,51 @@
             <button onclick="refreshDevice()">刷新</button>
           </div>
         </div>
-      </div>
-      <div class="card">
-        <h2>当前设备（点击切换）</h2>
-        <div id="registered-devices" class="plist muted">加载中…</div>
-        <div class="sub">MAC 才是唯一键。切换后本页的身份、实况、v2 状态、功耗、占用与恢复读取都按选中设备刷新；切换不会向设备推送，也不改变模板页的族选择。</div>
-      </div>
-      <div class="card">
-        <h2>身份</h2>
-        <div class="row"><span>名称（点击重命名）</span><span class="name" id="dev-name" onclick="modalRenameDevice()">--</span></div>
-        <div class="row"><span>MAC（唯一键）</span><span id="dev-mac" class="muted">--</span></div>
-        <div class="row"><span>IP（属性）</span><span id="dev-ip" class="muted">--</span></div>
-        <div class="row"><span>最后发现</span><span id="dev-discover" class="muted">--</span></div>
-        <div class="row"><span>占用</span><span id="dev-owner">--</span></div>
-        <div class="toolbar" style="margin-top:8px">
-          <button onclick="claimDevice(false)">占用/恢复</button>
-          <button onclick="claimDevice(true)">强制接管</button>
-          <button onclick="releaseDevice()">释放</button>
-          <button onclick="discoverDevice('ble')">经 BLE 发现</button>
+        <div class="metric-grid" style="margin-top:14px">
+          <div class="metric"><strong id="dev-batt">--</strong><span>设备电量</span></div>
+          <div class="metric"><strong id="dev-wifi">--</strong><span>Wi-Fi / RSSI</span></div>
+          <div class="metric"><strong id="dev-sync">--</strong><span>最近同步</span></div>
         </div>
       </div>
       <div class="card">
-        <h2>余量</h2>
+        <h2>Codex 余量</h2>
         <div class="rings">
           <div class="ring"><b id="ring-week">--</b><small>周余量</small></div>
-          <div class="ring"><b id="ring-5h">--</b><small>5H 余量</small></div>
         </div>
       </div>
       <div class="card">
-        <h2>设备</h2>
+        <h2>连接与占用</h2>
+        <div class="row"><span>显示名称</span><span class="device-name" id="dev-name" onclick="modalRenameDevice()" title="点击重命名">--</span></div>
+        <div class="row"><span>占用状态</span><span id="dev-owner">--</span></div>
+        <div class="row"><span>IP 地址</span><span id="dev-ip" class="muted">--</span></div>
+        <div class="row"><span>最后发现</span><span id="dev-discover" class="muted">--</span></div>
+        <div class="row"><span>MAC</span><span id="dev-mac" class="muted mono">--</span></div>
+        <div class="action-strip">
+          <button onclick="claimDevice(false)">占用/恢复</button>
+          <button onclick="releaseDevice()">释放</button>
+          <button onclick="discoverDevice('ble')">BLE 发现</button>
+        </div>
+        <details style="margin-top:12px"><summary>高级占用操作</summary><div class="action-strip"><button class="danger" onclick="claimDevice(true)">强制接管</button></div></details>
+      </div>
+      <details class="card">
+        <summary>设备详细信息</summary>
+        <div class="card">
         <div class="row"><span>ROM 版本</span><span id="dev-fw">--</span></div>
         <div class="row"><span>运行槽位</span><span id="dev-slot">--</span></div>
         <div class="row"><span>重置原因</span><span id="dev-reset">--</span></div>
-        <div class="row"><span>电量</span><span id="dev-batt">--</span></div>
-        <div class="row"><span>Wi-Fi / RSSI</span><span id="dev-wifi">--</span></div>
         <div class="row"><span>BLE 连接</span><span id="dev-ble">--</span></div>
         <div class="row"><span>模板</span><span id="dev-templates">--</span></div>
         <div class="row"><span>EPD 写入</span><span id="dev-epd">--</span></div>
         <div class="row"><span>Free heap</span><span id="dev-heap">--</span></div>
-        <div class="row"><span>最近 BLE 同步</span><span id="dev-sync">--</span></div>
-      </div>
+        </div>
+      </details>
       <div class="card">
+        <h2>平台运行状态</h2>
         <div class="bar">
           <div class="status" id="pt-device-state">v2 平台状态</div>
           <div class="menus">
             <button onclick="refreshPlatformDevice()">刷新</button>
-            <button onclick="refreshPlatformStatus()">读取设备权威状态</button>
+            <button onclick="refreshPlatformStatus()">从设备读取</button>
           </div>
         </div>
         <div class="row"><span>固件 target / render target</span><span id="pt-targets" class="muted">--</span></div>
@@ -201,7 +303,8 @@
         <div class="sub" id="pt-expect"></div>
       </div>
       <div class="card">
-        <h2>Profile（1–8 项，顺序即按键循环）</h2>
+        <h2>屏幕内容与发布</h2>
+        <p class="section-note">Profile 最多 8 项；这里的顺序就是设备按键切换顺序。</p>
         <div id="pt-profile" class="plist todo">加载中…</div>
         <div class="toolbar" style="margin-top:8px">
           <label>绑定目标 <select id="pt-render-target" onchange="renderPlatformOrder();refreshPlatformFonts()">
@@ -227,13 +330,14 @@
         </div>
         <div class="sub">全部已安装模板参与循环。改顺序、初始项、目标或字体后先保存；目标必须与设备当前 ROM 一致。发布冻结当时内容，之后编辑不漂移。</div>
       </div>
-      <div class="card">
-        <h2>恢复读取（最小入口）</h2>
-        <div class="sub">不自动唤醒、不 claim、不发布、不改 active；恢复出的 Profile 默认关闭同步。</div>
-        <div class="toolbar" style="margin-top:8px">
-          <button onclick="recoverPlatform()">从设备摘要导入</button>
+      <details class="card">
+        <summary>恢复与维护</summary>
+        <div class="card">
+          <h2>从设备恢复 Profile</h2>
+          <div class="sub">从设备摘要导入，不自动唤醒、占用或发布；恢复出的 Profile 默认关闭同步。</div>
+          <div class="action-strip"><button onclick="recoverPlatform()">从设备摘要导入</button></div>
         </div>
-      </div>
+      </details>
       <details class="card" id="device-power" ontoggle="if(this.open){refreshPmStats(false);refreshPlatformPower();}">
         <summary>功耗与同步计划</summary>
 <div class="card">
@@ -304,47 +408,48 @@
     </section>
 
     <section class="panel" id="tab-data">
+      <div class="page-heading"><h2>数据</h2><p>查看来源是否可用，以及设备会收到哪些字段。</p></div>
       <div class="card">
+        <h2>数据源</h2>
         <div class="bar">
-          <div class="status" id="pt-data-state">DataSource（Codex / Static JSON）</div>
+          <div class="status" id="pt-data-state">Codex 与本地测试源</div>
           <div class="menus">
             <button onclick="refreshPlatformData()">刷新</button>
-            <button onclick="probePlatformSource('codex')">采集 Codex</button>
+            <button class="primary" onclick="probePlatformSource('codex')">立即采集 Codex</button>
           </div>
         </div>
         <div id="pt-sources" class="plist todo">加载中…</div>
       </div>
       <div class="card">
-        <h2>最新 SourceSnapshot 字段（push/pull 绑定）</h2>
+        <h2>最新字段快照</h2>
         <div id="pt-fields" class="plist todo">加载中…</div>
-        <div class="sub">push 字段可见值/缺失/质量变化触发投递（整个最新快照）；pull 只更新缓存，随下一次 push 搭车，不改 PowerPlan。</div>
+        <div class="sub">push 字段变化会触发投递；pull 字段只更新缓存，等待下一次投递。</div>
       </div>
-      <div class="card">
-        <h2>Static JSON 数据源（测试/离线）</h2>
+      <details class="card">
+        <summary>测试与离线数据源</summary>
+        <div class="card">
+        <h2>Static JSON</h2>
+        <p class="section-note">用于测试数据绑定或离线预览。</p>
         <textarea id="pt-static-json" rows="5" placeholder='{"source_id":"static1","kind":"static_json","config":{"values":{"buckets[codex].weekly.usedPercent":30},"triggers":{"usedPercent":"push"}}}'
-                  style="width:100%;font-family:ui-monospace,Consolas,monospace;font-size:12px;border-radius:8px;border:1px solid var(--line);background:transparent;color:inherit"></textarea>
+                  class="mono"></textarea>
         <div class="actions" style="margin-top:8px">
           <button onclick="savePlatformSource()">保存数据源</button>
         </div>
-        <div class="sub">每设备完整同步阈值在设备同步设置中显示（默认 3600s）。</div>
-      </div>
+        </div>
+      </details>
     </section>
 
     <section class="panel" id="tab-mcp">
+      <div class="page-heading"><h2>MCP 接入</h2><p>让本机 Agent 读取桥的设备与模板能力。</p></div>
       <div class="card">
-        <h2>MCP 服务（本地 HTTP）</h2>
-        <div class="toolbar">
-          <span class="muted">端口</span>
-          <input id="mcp-port" type="number" min="1024" max="65535" style="width:92px">
-          <button onclick="saveMcpPort()">保存并重启</button>
-          <span id="mcp-state" class="muted"></span>
-        </div>
-        <div class="row"><span>URL</span><span id="mcp-url">--</span></div>
+        <h2>本地服务</h2>
+        <div class="row"><span>状态</span><span id="mcp-state" class="badge">读取中…</span></div>
+        <div class="row"><span>接入地址</span><span id="mcp-url">--</span></div>
       </div>
       <div class="card">
-        <h2>给 agent 的接入提示</h2>
+        <h2>给 Agent 的接入提示</h2>
         <div class="toolbar">
-          <span class="muted">目标 agent</span>
+          <label class="muted" for="mcp-agent">目标 Agent</label>
           <select id="mcp-agent" onchange="renderMcpPrompt()">
             <option value="generic">通用（默认）</option>
             <option value="opencode">opencode</option>
@@ -354,12 +459,20 @@
             <option value="vscode">VS Code</option>
           </select>
         </div>
-        <textarea id="mcp-prompt" readonly rows="6"
-                  style="width:100%;font-family:ui-monospace,Consolas,monospace;font-size:12px;border-radius:8px;border:1px solid var(--line);background:transparent;color:inherit"></textarea>
-        <div class="actions" style="margin-top:8px">
-          <button onclick="copyText($('mcp-prompt').value)">复制提示文本</button>
-        </div>
+        <textarea id="mcp-prompt" readonly rows="6" class="mono"></textarea>
+        <div class="action-strip"><button class="primary" onclick="copyText($('mcp-prompt').value)">复制接入提示</button></div>
       </div>
+      <details class="card">
+        <summary>服务设置</summary>
+        <div class="card">
+        <p class="section-note">更改端口会保存设置并重启 MCP 服务。</p>
+        <div class="toolbar">
+          <label class="muted" for="mcp-port">监听端口</label>
+          <input id="mcp-port" type="number" min="1024" max="65535" style="width:100px">
+          <button onclick="saveMcpPort()">保存并重启</button>
+        </div>
+        </div>
+      </details>
     </section>
   </main>
 
@@ -753,7 +866,7 @@
         <span class="ctl">
           <span class="muted" style="font-size:12px">${isEnabled ? '已启用' : '已禁用'}</span>
           <span class="switch ${isEnabled ? 'on' : ''}" onclick="toggleFamilyTemplate('${escapeAttr(id)}')"></span>
-          <button class="xbtn" title="从配置删除" onclick="removeFamilyTemplate(${index})">×</button>
+          <button class="xbtn" title="从配置删除" aria-label="从配置删除 ${escapeAttr(id)}" onclick="removeFamilyTemplate(${index})">×</button>
         </span>
       </div>`;
     }).join('');
@@ -962,22 +1075,32 @@
     try {
       const d = await invoke('get_device_status', { mac: selectedDeviceMac });
       renderDeviceIdentity(d.device);
-      if (!d.online) {
-        $('device-state').textContent = `设备离线（${d.ip}）${d.error ? '：' + d.error : ''}`;
-        ['dev-fw','dev-slot','dev-reset','dev-batt','dev-wifi','dev-ble','dev-templates','dev-epd','dev-heap'].forEach((id) => { $(id).textContent = '--'; });
-        return;
-      }
       const f = d.fields || {};
-      $('device-state').textContent = `在线 · ${d.ip}`;
-      $('dev-fw').textContent = f['Version'] || '--';
-      $('dev-slot').textContent = f['Running'] || '--';
-      $('dev-reset').textContent = f['Reset reason'] || '--';
-      $('dev-batt').textContent = f['Battery'] || '—（固件 0.8.0 提供）';
-      $('dev-wifi').textContent = `${f['SSID'] || '--'} · ${f['RSSI'] || '--'}`;
-      $('dev-ble').textContent = f['BLE connected'] || '--';
-      $('dev-templates').textContent = f['Templates'] || '--';
-      $('dev-epd').textContent = f['EPD writes'] || '--';
-      $('dev-heap').textContent = f['Free heap'] || '--';
+      const publicRecent = !!d.public_online;
+      const snapshot = d.last_success?.body || {};
+      const sampled = d.last_success?.observed_at;
+      $('device-state').textContent = sampled
+        ? `${d.reachability === 'blocked' ? '认证/占用受阻' : d.reachability === 'recently_authenticated' ? '最近已认证' : d.reachability === 'expected_sleep' ? '预计休眠' : '等待下次联系'} · 上次完整认证快照 ${new Date(sampled * 1000).toLocaleString()}（${d.clock_anomaly ? '本机时钟异常' : fmtDuration(d.age_s || 0) + '前'}）`
+        : (d.last_authenticated_contact_at
+            ? `上次认证联系 ${new Date(d.last_authenticated_contact_at * 1000).toLocaleString()}（${d.last_authenticated_transport || '未知通道'}） · 尚无完整状态快照`
+            : d.record_observed?.active_template_id
+                ? '尚无完整认证快照 · 历史状态采样时间未知 · 等待设备联系'
+                : '尚无成功认证通信记录 · 等待设备联系');
+      if (sampled && d.last_authenticated_contact_at > sampled) {
+        $('device-state').textContent += ` · 最近认证联系 ${new Date(d.last_authenticated_contact_at * 1000).toLocaleString()}（${d.last_authenticated_transport}）`;
+      }
+      if (d.reachability === 'blocked' && d.last_attempt?.error) {
+        $('device-state').textContent += ` · 最近尝试：${d.last_attempt.error}`;
+      }
+      $('dev-fw').textContent = snapshot.fw || (publicRecent ? f['Version'] : null) || '--';
+      $('dev-slot').textContent = snapshot.slot || (publicRecent ? f['Running'] : null) || '--';
+      $('dev-reset').textContent = snapshot.reset_reason || (publicRecent ? f['Reset reason'] : null) || '--';
+      $('dev-batt').textContent = snapshot.power?.battery == null ? '--' : `${snapshot.power.battery}%`;
+      $('dev-wifi').textContent = publicRecent ? `${f['SSID'] || '--'} · ${f['RSSI'] || '--'}` : '--';
+      $('dev-ble').textContent = publicRecent ? (f['BLE connected'] || '--') : '--';
+      $('dev-templates').textContent = snapshot.template_ids?.join(', ') || '--';
+      $('dev-epd').textContent = publicRecent ? (f['EPD writes'] || '--') : '--';
+      $('dev-heap').textContent = publicRecent ? (f['Free heap'] || '--') : '--';
     } catch (e) {
       $('device-state').textContent = '读取失败：' + e;
     }
@@ -1003,9 +1126,9 @@
     lastPmFetch = Date.now();
     $('pm-state').textContent = '读取中…';
     try {
-      const r = await invoke('get_pmstats');
+      const r = await invoke('get_pmstats', { mac: selectedDeviceMac });
       if (!r.online) {
-        $('pm-state').textContent = `设备 ${r.ip} 读取失败：${r.text || '不可达'}`;
+        $('pm-state').textContent = `等待设备联系 · 上次功耗采样保留（${r.ip || '地址未知'}）`;
         return;
       }
       renderPmStats(r);
@@ -1255,6 +1378,11 @@
         (job.bytes != null ? ` · ${job.transferred_bytes || 0}/${job.bytes} B` : '') +
         (job.last_error ? ` · ${job.last_error}` : '') +
         (job.ack ? ` · ACK ${job.ack}` : '');
+      if (device.ota_job) {
+        const ota = device.ota_job;
+        $('pt-jobinfo').textContent += ` · OTA ${ota.job_id}（${ota.state}）` +
+          (ota.last_error ? `：${ota.last_error}` : '');
+      }
       $('pt-expect').textContent = platformDevices.length > 1
         ? '多设备：每台独立协调器，不做跨设备原子发布；上面的操作只作用于选中设备。' : '';
       const profile = device.profile;
@@ -1464,22 +1592,24 @@
     try {
       const data = await invoke('platform_data_sources');
       const sources = data.sources || [];
-      $('pt-sources').innerHTML = sources.map((s) => `
+      $('pt-data-state').textContent = `${sources.length} 个数据源`;
+      $('pt-sources').innerHTML = sources.length ? sources.map((s) => `
         <div class="prow">
           <div class="pmeta">
             <b>${escapeHtml(s.source_id)}</b>
             <small>${escapeHtml(String(s.kind))} · ${s.enabled ? '启用' : '停用'} · 质量 ${escapeHtml(String(s.quality || '--'))}</small>
-            <small>${s.error ? '错误：' + escapeHtml(String(s.error)) : '有效期至 ' + new Date((s.valid_until || 0) * 1000).toLocaleTimeString()}</small>
+            <small>${s.error ? '错误：' + escapeHtml(String(s.error)) : s.valid_until ? '有效期至 ' + new Date(s.valid_until * 1000).toLocaleTimeString() : '尚无有效快照'}</small>
           </div>
           <div class="pactions"><button onclick="probePlatformSource('${escapeAttr(s.source_id)}')">采集测试</button></div>
-        </div>`).join('');
+        </div>`).join('') : '<div class="muted">尚无数据源。</div>';
       const fields = sources.flatMap((s) => (s.fields || []).map((f) => ({ source: s.source_id, ...f })));
       $('pt-fields').innerHTML = fields.length ? fields.map((f) => `
-        <div class="row">
-          <span title="${escapeAttr(f.field)}">${escapeHtml(f.field)}</span>
-          <span class="muted">${escapeHtml(JSON.stringify(f.value))} · ${escapeHtml(String(f.trigger))} · ${escapeHtml(String(f.quality))}</span>
+        <div class="field-row">
+          <div><b title="${escapeAttr(f.field)}">${escapeHtml(f.field)}</b><small>${escapeHtml(f.source)} · ${escapeHtml(String(f.trigger))}</small></div>
+          <div class="field-value"><strong>${escapeHtml(f.value == null ? '缺失' : JSON.stringify(f.value))}</strong><small>质量 ${escapeHtml(String(f.quality || '--'))}</small></div>
         </div>`).join('') : '<div class="muted">尚无快照；等待 Codex 采集或手动采集。</div>';
     } catch (e) {
+      $('pt-data-state').textContent = '数据源读取失败';
       $('pt-sources').innerHTML = '<div class="muted">数据源读取失败：' + escapeHtml(String(e)) + '</div>';
     }
   }
