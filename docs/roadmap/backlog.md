@@ -42,10 +42,11 @@
 | Bridge 休眠设备的状态与延后操作 | S1–S4 已实现；S5 实机主路径通过、故障矩阵待验 | 两台 ROM 已按登记 MAC 顺序自然会合 OTA，各 1 次上传 ACK 且后续认证见新版本；两台完整 Bundle 发布 `succeeded`，1.54 的 waiting 发布跨 Bridge 重启后自然提交。实机发现并修正 OTA 待精确确认时阻塞后续发布、显式 sleep ACK 未记账；Bridge 已重建。剩余：错 IP/401/409 端到端注入、长期 PowerPlan 截止期、Note4 间歇 `display_state=failed` 诊断。当前 ROM 不提供可对照整文件哈希的运行镜像身份，OTA 保留 `awaiting_confirmation` / `version_seen_unproven`，精确 `image_verified` 待后续能力。证据见 `project-workflow/sleep-aware-bridge/`、`PROGRESS.md` 顶节。 |
 | Bridge 多实例 | 已交付（tag `bridge-multi-instance-2026-09-24`） | 无 |
 | Fake ROM 设备模拟器（同源 C++ + 可控实验时钟） | D/E/F 软件验收完成；G 按用户决定取消 | 软件证据见 `PROGRESS.md` 最新节；硬件特有错误仅留 case 文档，不在本项执行 |
+| 设备页、周期 Wi-Fi 与统一诊断流 | 设计草案 | 15 轮冷却、light 入口/退出同步、OTA/Bundle Wi-Fi 结果报告、跨深睡 log/history 合并、设备页字段与归属；见 C8 |
 | 唤醒会合诊断（一次唤醒一条记录） | 仅计划 | 固件与桥两侧都未实现（见 C3） |
 | Bundle v3（manifest + 原始 dense 对象，省 ~71%） | 仅设计 | 未实现（见 C1） |
-| `device_first` / `bridge_first` 双策略会合 | 仅设计 + spike | 未实现（见 C4） |
-| 功耗基线 A/B（DFS 40/80、BT modem sleep、会合节奏） | 未做 | 30–60 分钟基线从未采集（见 C4） |
+| `device_first` / `bridge_first` 双策略会合 | `device_first` 已运行；双策略切换仅设计 + spike | `bridge_first` 及设备主动连接 Bridge 的反向 v2 HTTP 交换均未实现（见 C4） |
+| 功耗基线 A/B（DFS 40/80、BT modem sleep、会合节奏） | Note4 BLE 三臂 PM 驻留已实测 | A/B/C 分别 34/32/34 周期；板级电流、整周期能量及长期稳定性仍待测（见 C4） |
 | Bridge 独立于 Codex 生命周期 | 已改为按需 Windows 计划任务启动，待跨会话验收 | 退出 Codex 后确认 `CodexStatusBridge` 仍为 Running、Bridge 8765/8766 仍监听；本会话进程父级已核实为任务计划程序的 `svchost.exe`，见 `PROGRESS.md` 2026-09-27 节 |
 
 ## 2. 紧急（A 级：先做这些）
@@ -153,9 +154,18 @@
 - 相关：`tools/wake-contact-trace.mjs` 已存在，可先做离线对拍再上机。
 
 ### C4. 功耗与会合策略（power-plan-c / next-execution-plan）
-- 未做：30–60 分钟基线采集（≥30 个 deep 周期）、A2/A3（DFS 40/80 × BT modem sleep）、A5（整分钟对齐导致的 ~2 分钟间隔）、A4（`device_first` vs `bridge_first`）。
-- `bridge_first` 只有 spike 通过，生产协议/策略切换未实现；`task-5-advert-rendezvous.md` 的认证载荷/密钥/窗口规则待冻结。
+- 用户已选 B 方案用于 Note4 与 1.54 B/W：BT modem sleep + main XTAL、BLE 会合期 240/80 MHz DFS 且不启用自动 light sleep；未连接广播最多 4s，已连接等指令最多 6s，成功 ACK 后沿用 200ms 提前收尾。两份干净 ROM 已顺序构建并逐台 OTA，新版本及后续真实 timer BLE ACK 均已观察；1.54 设备日志确认 `esp_bt_sleep_enable()` 返回 `ESP_OK`。仍待两台新版 4s/6s 长期会合率、1.54 BLE 专属频率驻留与整机电池端电量测量。B 的 Note4 3s/6s 旧样本不能当作新版 4s/6s 或 1.54 的成功率。
+- 已做：Note4 BLE 等待 A/B/C 三臂各 ≥30 个 deep 周期，分别为 BMS 关/80 MHz、BMS 开/80 MHz、BMS 开/40 MHz；有效回答 33/34、32/32、30/34。C 的 4 次未答是 3 次 3s 未连接、1 次连接后 6s 无命令。随后同 C 参数仅延长截止到 5s 广播/9s 等命令，实机 **34/34 回答**、平均 BLE 窗口 2.277s（旧 C 2.858s）；两轮在广播后 4.2/4.3s 才建链，说明 5s 上限有实际覆盖，9s 上限收益尚未单独验证。各组约 34 轮且未交错测试，不能把成功率变化归因于窗口或推出净耗电下降；详见 `project-workflow/power-plan-c/task-4-modem-sleep.md`。Bridge 为 15s 实验周期临时缩短同 MAC 冷却到 8s，测后已恢复生产 55s。下一步是电流仪下的 30–60 分钟整周期基线、5s/9s 长时对照与连接回归；BMS 关/40 MHz 第四臂、A5（整分钟对齐导致的 ~2 分钟间隔）、A4（`device_first` vs `bridge_first`）仍待测。
+- 已列出 Note4 每分钟互斥阶段电量和 BLE 电流敏感度，见 `project-workflow/power-plan-c/energy-budget-per-minute.md`；当前表只给芯片/CPU 参考情景，整机面板、PSRAM、稳压及偶发 Wi-Fi/light 的电池端增量仍待仪器实测，不能把表中合计当续航承诺。
+- A2 Note4 80/40 MHz 旧短测、早启用 DFS 的 80/10 MHz 临时 A/B 已做（2026-09-27/28，见 `PROGRESS.md`）：旧 BLE 等待 141 个 240 MHz **运行点**快照不能代表整窗驻留。早启用 PM 后，80 臂等待 1.723s 中 1.337s 在 80 MHz 档；10 臂等待 2.043s 中 1.589s 仍在 80 MHz 档，**10 MHz 档增量为 0**。随后三臂独立实机测试证明 BMS 开启时 80/40 MHz 最低档分别有 24.9%/38.2% 驻留；C 5s/9s 复测为 35.0% 的 40 MHz 驻留、34/34 回答。**A2/A3 尚未具备生产发布依据**：需整周期电流与长时连接回归；当前 BLE 等待无需继续追 10/20 MHz 下限。
+- `bridge_first` 生产协议/策略切换未实现；`task-5-advert-rendezvous.md` §9 已按用户决定将长期离线/错窗恢复留在 `bridge_first` 内部。Note4 RF P0 双版筛查 A/B/C 各3轮：A 1/3、B 3/3、C 0/3；B独立harness停发再恢复测试通过，详见§9.8，不能算认证重对齐或长期成功率。现有24h Fake ROM只跑device_first GATT，正常bridge_first时间窗口尚无实现/模型验收；几何敏感度与清醒设备短扫描实测见§9.9。下一步须实现Bridge预定Publisher和设备真实deep定时扫描，双端记录启动/首包单调时刻，测不同相位/漂移下的命中率及P95误差；以B另做认证/持久epoch/未来窗口 P1，验证两端重启、ACK丢失、安全/owner。A短扫命中率与C适配器收发竞争需另定时序后复测。业务路径采用设备主动连接 Bridge HTTP、机会性状态/电量广播；反向 v2 HTTP/双向认证/显式 claim 封装、能力协商仍待实现。owner 空闲/到期时不得借未认证广播 claim 或改排期，须先单独评审权限合同。
 - 前置：C3 的记录格式（否则没有可信的对照口径）。
+
+### C8. 设备同步与诊断协议（device-sync-diagnostics）
+- `sync-v1` 实施合同已在 `project-workflow/device-sync-diagnostics/design.md` 定稿：沿用现有 Bridge→设备 HTTP；新增端点/鉴权/幂等、完整批次异常、15 轮持久计数、统一日志、OTA 运行镜像身份均已有规范，但当前均未实现。两目标 RTC 空间、Flash 预留/断电恢复和真实分区哈希算法须在实施时过证据门槛，不能静默降级。
+- 实现每 15 次深睡 BLE 会合的一次性 Wi-Fi 同步，以及正式 light 入口和退出时的 Wi-Fi 同步；成功同步才重置计数。普通 BLE 保持精简，诊断日志按冻结批次经 Wi-Fi 增量同步，未确认内容保留。
+- 合并普通 `/log` 与跨深睡 `/history` 为统一、跨深睡、可分页/确认/报告 gap 的诊断流；OTA/Bundle 执行后以 Wi-Fi 报告分级结果并有限重试。设备页移除 Codex 余量、改善设备详情的采集时间和缺失解释；屏幕内容、模板、字体归模板页仅作归属声明，数据页排版暂不处理。
+- 以 Fake ROM 验证绝大多数协议和故障场景（S01–S14）；实机只验证 RF/GATT、ESP32 Wi-Fi 入网与 HTTP、light/deep 切换、RTC/Flash/bootloader 等模拟器不能证明的部分（H01–H03）。详见 `project-workflow/device-sync-diagnostics/plan.md`。
 
 ### C5. 字体资产增量发布
 - 引擎侧已交付（单一字体注册表 + CSFN 容器 + 设备字体库），整包 Bundle 可发布。

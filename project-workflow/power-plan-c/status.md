@@ -20,7 +20,7 @@ Status: task-1/2/3 已代码落地并实机上线；固件已推进到 0.17.9-bw
 | task-1 固件窗口/渲染/校时/时钟修复/DFS | 已上线（0.17.1，后续 0.17.2） | 含连接期窗口扩展；见下实机记录 |
 | task-2 桥时间下发/连续扫描/窗口去重 | 已上线；§4 提速已实测定稿（见 09-23 节） | 事件驱动发现 + 每周期 disconnect/discover + 20ms ACK；常驻 adapter/扫描与跳 discovery 实测失败 |
 | task-3 遥测与验收 | 埋点+预估工具已上线；30–60min 基线 pending | 实测 wake 6.2–8.6s 待调参；见下功耗预估 |
-| task-4 BT modem sleep 实测定值 | pending | 等 task-3 基线后切 btpm env A/B；DFS 40/80 臂见 task-6 §5 |
+| task-4 BT modem sleep 实测定值 | 三臂 PM 驻留短测完成；板级电流待测 | 2026-09-28 Note4 A/B/C 各 34/32/34 deep 周期，回答 33/32/30；B 为下一轮电流仪候选，C 需复测连接率；见 task-4 末节 |
 | task-5 双策略会合/窗口对齐 | 权威设计已同步，需 spike | device_first / bridge_first 独立 A/B；未实现 |
 | task-6 bridge_first 实现 + 统一 A/B | spike 首轮完成（见 09-23 节） | 计划见 `task-6-bridge-first-impl.md` |
 
