@@ -1,6 +1,6 @@
 # Prompt：字体资产化（随 Profile 推送 + 增量同步）与渲染引擎抗锯齿
 
-你是 Codex Status 的固件/桥接实现代理。本任务有两个工作流：**A. 把字体变成可随 Profile 推送、按内容去重同步的资产**；**B. 给渲染引擎加抗锯齿（灰度）能力**。先读 `AGENTS.md`、`PROGRESS.md` 最新节、`docs/generic-display-platform-design-v2.md`（template/target/bundle 章节）、`project-workflow/generic-display-platform-implementation/status.md`，以及 `src/template_engine.{h,cpp}`、`src/refresh_policy.cpp`、`src/bundle_store.{h,cpp}`、`bridge/crates/core/src/platform/{model,service,store}.rs`。
+你是 Codex Status 的固件/桥接实现代理。本任务有两个工作流：**A. 把字体变成可随 Profile 推送、按内容去重同步的资产**；**B. 给渲染引擎加抗锯齿（灰度）能力**。先读 `AGENTS.md`、`PROGRESS.md` 最新节、`docs/generic-display-platform-design.md`（template/target/bundle 章节）、`project-workflow/generic-display-platform-implementation/status.md`，以及 `src/template_engine.{h,cpp}`、`src/refresh_policy.cpp`、`src/bundle_store.{h,cpp}`、`bridge/crates/core/src/platform/{model,service,store}.rs`。
 
 ## 现状（不要凭想象，先核对）
 

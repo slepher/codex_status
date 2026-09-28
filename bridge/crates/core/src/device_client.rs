@@ -1,4 +1,4 @@
-//! Bridge side of the v2 device protocol (HTTP transport): authenticated Status
+//! Bridge side of the device protocol (HTTP transport): authenticated Status
 //! read, complete Data, PowerPlan, Activate and the bounded
 //! BEGIN/CHUNK/COMMIT Bundle install.
 //!
@@ -125,7 +125,7 @@ fn post_json(ip: &str, path: &str, token: &str, body: &Value, timeout: Duration)
         seq = seq.unwrap_or(0),
         plan_id = plan_id.unwrap_or(0),
         job_id = job_id.as_deref().unwrap_or(""),
-        "v2 HTTP request"
+        "device HTTP request"
     );
     let response = request(ip, "POST", path, token, Some(&text), &[], timeout);
     let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -142,7 +142,7 @@ fn post_json(ip: &str, path: &str, token: &str, body: &Value, timeout: Duration)
                 job_id = job_id.as_deref().unwrap_or(""),
                 elapsed_ms,
                 error_category = safe_error_category(&error),
-                "v2 HTTP result"
+                "device HTTP result"
             );
             return Err(error).with_context(|| format!("POST {path}"));
         }
@@ -165,7 +165,7 @@ fn post_json(ip: &str, path: &str, token: &str, body: &Value, timeout: Duration)
         status,
         elapsed_ms,
         error_category,
-        "v2 HTTP result"
+        "device HTTP result"
     );
     let parsed: Value =
         serde_json::from_str(&response_body).unwrap_or(json!({"raw": response_body}));
@@ -220,55 +220,89 @@ fn safe_error_category(error: &anyhow::Error) -> &'static str {
 /// Authenticated Status read: the only authoritative device state.
 pub fn status(ip: &str, token: &str, timeout: Duration) -> Result<Value> {
     let started = Instant::now();
-    tracing::info!(event = "send", operation = "/v2/status", "v2 HTTP request");
-    let response = request(ip, "GET", "/v2/status", token, None, &[], timeout);
+    tracing::info!(event = "send", operation = "/api/status", "device HTTP request");
+    let response = request(ip, "GET", "/api/status", token, None, &[], timeout);
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let (status, body) = match response {
         Ok(response) => response,
         Err(error) => {
             tracing::warn!(
                 event = "result",
-                operation = "/v2/status",
+                operation = "/api/status",
                 elapsed_ms,
                 error_category = safe_error_category(&error),
-                "v2 HTTP result"
+                "device HTTP result"
             );
             return Err(error);
         }
     };
     tracing::info!(
         event = "result",
-        operation = "/v2/status",
+        operation = "/api/status",
         status,
         elapsed_ms,
         error_category = if status == 200 { "none" }
             else if status == 401 { "identity_rejected" }
             else { "http_non_success" },
-        "v2 HTTP result"
+        "device HTTP result"
     );
     if status == 401 {
         bail!("device rejected the endpoint token (401)");
     }
     if status != 200 {
-        bail!("device /v2/status HTTP {status}");
+        bail!("device /api/status HTTP {status}");
     }
-    Ok(serde_json::from_str(&body).context("v2 status json")?)
+    Ok(serde_json::from_str(&body).context("device status json")?)
+}
+
+/// sync-v1 keeps the device's precise error code (notably claim_required,
+/// digest_mismatch and batch_lost) and validates every response identity.
+pub fn sync(
+    ip: &str, token: &str, mac: &str, bridge_id: &str, nonce: &str,
+    op: &str, request_id: &str, fields: &Value, timeout: Duration,
+) -> Result<Value> {
+    let path = match op {
+        "begin" | "page" | "ack" | "complete" | "arm" | "image" =>
+            format!("/api/sync/{op}"),
+        _ => bail!("unknown sync operation"),
+    };
+    let mut body = fields.clone();
+    if !body.is_object() { bail!("sync fields must be an object"); }
+    body["sync_version"] = json!(1);
+    body["device_mac"] = json!(mac);
+    body["bridge_id"] = json!(bridge_id);
+    body["session_nonce"] = json!(nonce);
+    body["request_id"] = json!(request_id);
+    let bytes = serde_json::to_vec(&body)?;
+    if bytes.len() > 4096 { bail!("sync request body exceeds 4096 bytes"); }
+    let (status, text) = request(ip, "POST", &path, token, Some(&bytes), &[], timeout)?;
+    let reply: Value = serde_json::from_str(&text).context("sync response JSON")?;
+    if status == 401 { bail!("sync unauthorized (401)"); }
+    if reply["device_mac"] != mac || reply["session_nonce"] != nonce ||
+        reply["request_id"] != request_id || reply["sync_version"] != 1 ||
+        reply["op"] != format!("sync_{op}") {
+        bail!("sync response identity mismatch");
+    }
+    if status != 200 || !matches!(reply["result"].as_str(), Some("applied" | "already_complete")) {
+        let error = reply["error"].as_str().unwrap_or("rejected");
+        bail!("sync {op} HTTP {status}: {error}");
+    }
+    Ok(reply)
 }
 
 /// Complete bounded Data snapshot (atomic apply + simple ACK).
 pub fn data(ip: &str, token: &str, expected_mac: &str, message: &Value, timeout: Duration) -> Result<Value> {
-    session_post(ip, "/v2/data", token, expected_mac, message, timeout)
+    session_post(ip, "/api/data", token, expected_mac, message, timeout)
 }
 
 /// Formal PowerPlan (the only thing that changes the light deadline).
 pub fn plan(ip: &str, token: &str, expected_mac: &str, plan: &Value, timeout: Duration) -> Result<Value> {
-    session_post(ip, "/v2/plan", token, expected_mac, plan, timeout)
+    session_post(ip, "/api/plan", token, expected_mac, plan, timeout)
 }
 
 fn session_post(ip: &str, path: &str, token: &str, expected_mac: &str, message: &Value, timeout: Duration) -> Result<Value> {
     let mut command = message.clone();
     let (nonce, device_mac) = session_nonce(ip, token, expected_mac, timeout)?;
-    command["protocol"] = json!(2);
     command["session_nonce"] = json!(nonce);
     command["device_mac"] = json!(device_mac);
     command["request_id"] = json!(format!("{}-{:08x}", path.rsplit('/').next().unwrap_or("command"),
@@ -288,8 +322,8 @@ pub fn activate(
 ) -> Result<Value> {
     let (nonce, device_mac) = session_nonce(ip, token, expected_mac, timeout)?;
     let request_id = format!("activate-{expected_context}-{template_id}");
-    post_json(ip, "/v2/activate", token, &json!({
-        "protocol": 2, "device_mac": device_mac, "bridge_id": bridge_id, "session_nonce": nonce,
+    post_json(ip, "/api/activate", token, &json!({
+        "device_mac": device_mac, "bridge_id": bridge_id, "session_nonce": nonce,
         "request_id": request_id, "template_id": template_id,
         "expected_active_context_id": expected_context,
     }), timeout)
@@ -304,17 +338,17 @@ fn session_nonce(ip: &str, token: &str, expected_mac: &str, timeout: Duration) -
     let actual = DeviceIdentity::normalized_mac(mac)
         .with_context(|| format!("invalid device MAC {mac} in authenticated status for target {expected_mac}"))?;
     if actual != expected {
-        tracing::warn!(event = "preflight_reject", operation = "/v2/status",
+        tracing::warn!(event = "preflight_reject", operation = "/api/status",
             device_mac = %expected, reported_mac = %actual, error_category = "identity_mismatch",
-            "v2 HTTP identity preflight rejected");
+            "device HTTP identity preflight rejected");
         bail!("authenticated status MAC {mac} does not match target MAC {expected_mac}");
     }
-    tracing::info!(event = "preflight_accept", operation = "/v2/status",
+    tracing::info!(event = "preflight_accept", operation = "/api/status",
         device_mac = %expected, reported_mac = %actual, error_category = "none",
-        "v2 HTTP identity preflight accepted");
+        "device HTTP identity preflight accepted");
     let nonce = state["session_nonce"].as_str().unwrap_or("");
     if nonce.len() != 32 || !nonce.bytes().all(|c| c.is_ascii_hexdigit()) {
-        bail!("device lacks v2 session protection; update firmware before publishing or activating");
+        bail!("device lacks required session protection; update firmware before publishing or activating");
     }
     Ok((nonce.to_owned(), mac.to_owned()))
 }
@@ -342,10 +376,10 @@ pub fn install_bundle(
     if request_id.len() > 64 || !request_id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_') {
         bail!("invalid bundle job_id");
     }
-    let command = json!({"protocol": 2, "device_mac": device_mac, "bridge_id": bridge_id,
+    let command = json!({"device_mac": device_mac, "bridge_id": bridge_id,
         "request_id": request_id, "session_nonce": nonce,
         "length": payload.len(), "content_crc": content_crc});
-    let ack = post_json(ip, "/v2/bundle/begin", token, &command, timeout)?;
+    let ack = post_json(ip, "/api/bundle/begin", token, &command, timeout)?;
     if ack["result"] != "applied" {
         return Ok(ack);
     }
@@ -357,14 +391,14 @@ pub fn install_bundle(
     if offset > payload.len() { bail!("bundle begin offset exceeds payload"); }
     while offset < payload.len() {
         let end = (offset + chunk_bytes).min(payload.len());
-        let path = format!("/v2/bundle/chunk?request_id={request_id}&session_nonce={nonce}&offset={offset}");
+        let path = format!("/api/bundle/chunk?request_id={request_id}&session_nonce={nonce}&offset={offset}");
         let offset_text = offset.to_string();
         let trace_device_mac = event_id(&command, "device_mac").unwrap_or_default();
         let trace_job_id = event_id(&bundle, "job_id").unwrap_or_default();
         let started = Instant::now();
-        tracing::info!(event = "send", operation = "/v2/bundle/chunk",
+        tracing::info!(event = "send", operation = "/api/bundle/chunk",
             request_id = %request_id, device_mac = %trace_device_mac, job_id = %trace_job_id,
-            offset, "v2 HTTP request");
+            offset, "device HTTP request");
         let response = request(
             ip,
             "POST",
@@ -378,26 +412,26 @@ pub fn install_bundle(
         let (status, body) = match response {
             Ok(response) => response,
             Err(error) => {
-                tracing::warn!(event = "result", operation = "/v2/bundle/chunk",
+                tracing::warn!(event = "result", operation = "/api/bundle/chunk",
                     request_id = %request_id, device_mac = %trace_device_mac, job_id = %trace_job_id,
-                    offset, elapsed_ms, error_category = safe_error_category(&error), "v2 HTTP result");
+                    offset, elapsed_ms, error_category = safe_error_category(&error), "device HTTP result");
                 return Err(error).with_context(|| format!("bundle chunk at offset {offset}"));
             }
         };
-        tracing::info!(event = "result", operation = "/v2/bundle/chunk",
+        tracing::info!(event = "result", operation = "/api/bundle/chunk",
             request_id = %request_id, device_mac = %trace_device_mac, job_id = %trace_job_id,
             offset, status, elapsed_ms,
             error_category = if (200..300).contains(&status) { "none" } else { "http_non_success" },
-            "v2 HTTP result");
+            "device HTTP result");
         if !(200..300).contains(&status) {
             bail!("bundle chunk at offset {offset} failed: HTTP {status}");
         }
         let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
         if parsed["result"] != "applied" {
-            tracing::warn!(event = "ack", operation = "/v2/bundle/chunk",
+            tracing::warn!(event = "ack", operation = "/api/bundle/chunk",
                 request_id = %request_id, device_mac = %trace_device_mac, job_id = %trace_job_id,
                 offset, result = parsed["result"].as_str().unwrap_or("unknown"),
-                error_category = "ack_rejected", "v2 Bundle chunk acknowledgement");
+                error_category = "ack_rejected", "device Bundle chunk acknowledgement");
             return Ok(parsed);
         }
         let next = parsed["next_offset"].as_u64().unwrap_or(u64::MAX);
@@ -408,7 +442,7 @@ pub fn install_bundle(
     }
     post_json(
         ip,
-        "/v2/bundle/commit",
+        "/api/bundle/commit",
         token,
         &command,
         timeout,
@@ -493,7 +527,7 @@ mod tests {
             });
             let result = post_json(
                 &address,
-                "/v2/data",
+                "/api/data",
                 "secret-token",
                 &json!({"device_mac": "AABBCCDDEEFF", "request_id": "data-1", "seq": 1,
                     "session_nonce": "request-secret", "snapshot": {"account": "request-secret"}}),

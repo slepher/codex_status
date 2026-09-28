@@ -11,9 +11,9 @@
 | 决定下一步做什么 | `docs/roadmap/backlog.md` §2 紧急 / §3 暂缓 |
 | 查某个已结项专项做了什么 | `docs/roadmap/archive-digest-legacy.md` / `archive-digest-recent.md` → 需要细节再进 `docs/history/workflow/<name>/` |
 | 查历史里程碑（0.13–0.18 各轮实机修复） | `docs/history/progress-archive-2026-09-23.md`（≤09-22）、`docs/history/progress-archive-2026-09-25.md`（09-24 及合并过程） |
-| 改协议/模板/渲染 | `docs/generic-display-platform-design-v2.md`（权威架构）+ `AGENTS.md` §关键不变量 |
-| 改电源/唤醒/占用 | `docs/power-state.md` + `docs/generic-display-platform-design-v2.md` §7 |
-| 改休眠设备的状态页、模板/OTA 延后投递 | `docs/generic-display-platform-design-v2.md` + `project-workflow/sleep-aware-bridge/design.md` / `task.md` |
+| 改协议/模板/渲染 | `docs/generic-display-platform-design.md`（权威架构）+ `AGENTS.md` §关键不变量 |
+| 改电源/唤醒/占用 | `docs/power-state.md` + `docs/generic-display-platform-design.md` §7 |
+| 改休眠设备的状态页、模板/OTA 延后投递 | `docs/generic-display-platform-design.md` + `project-workflow/sleep-aware-bridge/design.md` / `task.md` |
 | 改 BLE 会合功耗 | `docs/ble-rendezvous-power-design.md` |
 | 改模拟器/实验时钟 | `docs/fake-rom-simulator-design.md` + `docs/history/workflow/fake-rom-simulator-def/evidence.md`（D/E/F 已结项） |
 | 改字体资产 | `docs/font-asset-format.md` + `project-workflow/note4-bridge-publish/protocol.md`（**草案，未定稿**） |
@@ -23,7 +23,7 @@
 
 | 文件 | 状态 | 说明 |
 |---|---|---|
-| `generic-display-platform-design-v2.md` | **权威** | 通用显示平台 v2 架构。与它冲突的旧描述一律以它为准 |
+| `generic-display-platform-design.md` | **权威** | 通用显示平台现行架构。与它冲突的旧描述一律以它为准 |
 | `power-state.md` | **权威** | 电源状态、身份/发现、占用 claim/lease 语义（§9.1/§9.2/§13.3） |
 | `ble-rendezvous-power-design.md` | 设计已定稿，实现分 6 阶段 | 会合功耗设计；阶段 1/2 已上线，其余见 backlog C4 |
 | `fake-rom-simulator-design.md` | D/E/F 软件验收完成 | 逐 MAC 时钟、fake BLE、协作调度与代表性故障矩阵；G 已取消，证据归档在 `docs/history/workflow/fake-rom-simulator-def/` |
@@ -36,7 +36,7 @@
 |---|---|
 | `docs/history/progress-archive-2026-09-23.md` | 2026-09-22 及更早的进度节（48 节） |
 | `docs/history/progress-archive-2026-09-25.md` | 2026-09-24 及更早的历史节 + 合并/包隔离过程细节（原 `PROGRESS.md` 111 行起，逐字节保留） |
-| `docs/history/generic-display-platform-design-v1.md` | v1 架构，已被 v2 取代，仅留决策史 |
+| `docs/history/generic-display-platform-design-v1.md` | 早期架构，已被现行设计取代，仅留决策史 |
 | `docs/history/request.md` | 项目最初需求原文 |
 | `docs/history/discussion-summary.md` | 早期讨论摘要 |
 | `docs/history/sleep-plan-v4.md` | 早期睡眠计划 |

@@ -22,7 +22,7 @@
 | `/v2/status` 用 endpoint token，OTA/claim 用设备操作 token；设备 token 在 NVS；上传返回 UPDATE OK 后延迟重启，并设置 post-OTA 窗口 | `src/main.cpp:3575,4087,4707,4748`；两个 token 不可混用 |
 | timer wake 执行有界网络拉取/BLE 会合，并非长期 HTTP 在线 | `src/main.cpp:5069,5663`；旧 pull pending 分支见 `5160` |
 
-以 `docs/generic-display-platform-design-v2.md` §§2、4、7、8、10、11 为准：每设备串行事务、显式发布、Bridge 唯一正式 PowerPlan、业务 ACK 才确认、MAC 身份与 owner 校验。`docs/power-state.md` §§9.1/9.2/13.3/13.4 提供历史发现和延后投递背景；其旧 profile_push、隐式保活、旧固件兼容文案不作为本设计合同。bridge_first 仍是候选，不能把它当现成唤醒通道。
+以 `docs/generic-display-platform-design.md` §§2、4、7、8、10、11 为准：每设备串行事务、显式发布、Bridge 唯一正式 PowerPlan、业务 ACK 才确认、MAC 身份与 owner 校验。`docs/power-state.md` §§9.1/9.2/13.3/13.4 提供历史发现和延后投递背景；其旧 profile_push、隐式保活、旧固件兼容文案不作为本设计合同。bridge_first 仍是候选，不能把它当现成唤醒通道。
 
 ## 2. 状态数据合同
 

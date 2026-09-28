@@ -16,9 +16,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bridge_ble::{lan_ip, BleConfig, Pusher};
-use bridge_core::activity::{usage_fingerprint, Activity};
+use bridge_core::activity::Activity;
 use bridge_core::codex::locate_codex;
-use bridge_core::http::{serve, AppState};
+use bridge_core::http::serve;
 use bridge_core::runtime::{run_poller, PollerConfig};
 use bridge_core::template::Library;
 use config::Config;
@@ -35,14 +35,6 @@ struct RuntimeStatus {
     last_error: Option<String>,
     last_error_at: Option<i64>,
     paused: bool,
-    last_push_at: Option<i64>,
-    last_push_error: Option<String>,
-    /// Last successful `POST /usage`; while fresh, the HTTP path is the healthy
-    /// data route and BLE scanning stays off (docs/history/sleep-plan-v4.md §4.6).
-    last_push_ok_at: Option<i64>,
-    /// Consecutive failed push attempts; a single timeout must not invalidate
-    /// the HTTP path (the device's WebServer occasionally misses a request).
-    push_fail_streak: u32,
 }
 
 /// Last device status read, served to the panel without a blocking fetch.
@@ -73,17 +65,16 @@ struct Discovery {
     at: i64,
 }
 
-/// Last `owner` seen in `/status.json` plus when it was read.
+/// Last `owner` seen in `/status.json`.
 #[derive(Clone)]
 struct CachedOwner {
-    fetched_at: i64,
     owner: Option<Value>,
 }
 
-/// Per-device result of the authenticated v2 status endpoint. Offline updates
+/// Per-device result of the authenticated device status endpoint. Offline updates
 /// retain the last successful body for diagnostics.
 #[derive(Clone)]
-struct CachedV2Status {
+struct CachedDeviceStatus {
     fetched_at: i64,
     fetched_mono_ms: Option<u64>,
     online: bool,
@@ -95,8 +86,8 @@ struct CachedV2Status {
     yielded: bool,
 }
 
-fn update_v2_status_cache(
-    cache: &mut HashMap<String, CachedV2Status>,
+fn update_device_status_cache(
+    cache: &mut HashMap<String, CachedDeviceStatus>,
     mac: &str,
     online: bool,
     status: Option<Value>,
@@ -118,7 +109,7 @@ fn update_v2_status_cache(
     };
     cache.insert(
         mac.clone(),
-        CachedV2Status {
+        CachedDeviceStatus {
             fetched_at,
             fetched_mono_ms: bridge_core::device_clock::monotonic_ms(&mac),
             online,
@@ -136,8 +127,8 @@ fn update_v2_status_cache(
     );
 }
 
-fn update_v2_claim_cache(
-    cache: &mut HashMap<String, CachedV2Status>,
+fn update_device_claim_cache(
+    cache: &mut HashMap<String, CachedDeviceStatus>,
     mac: &str,
     owner: Option<Value>,
     claimed_at: i64,
@@ -146,7 +137,7 @@ fn update_v2_claim_cache(
     let Some(mac) = bridge_core::platform::model::DeviceIdentity::normalized_mac(mac) else {
         return;
     };
-    let entry = cache.entry(mac.clone()).or_insert(CachedV2Status {
+    let entry = cache.entry(mac.clone()).or_insert(CachedDeviceStatus {
         fetched_at: 0,
         fetched_mono_ms: None,
         online: false,
@@ -164,11 +155,11 @@ fn update_v2_claim_cache(
     entry.yielded = yielded;
 }
 
-fn update_v2_owner_cache(cache: &mut HashMap<String, CachedV2Status>, mac: &str, owner: Value, at: i64) {
+fn update_device_owner_cache(cache: &mut HashMap<String, CachedDeviceStatus>, mac: &str, owner: Value, at: i64) {
     let Some(mac) = bridge_core::platform::model::DeviceIdentity::normalized_mac(mac) else {
         return;
     };
-    let entry = cache.entry(mac).or_insert(CachedV2Status {
+    let entry = cache.entry(mac).or_insert(CachedDeviceStatus {
         fetched_at: 0,
         fetched_mono_ms: None,
         online: false,
@@ -183,9 +174,9 @@ fn update_v2_owner_cache(cache: &mut HashMap<String, CachedV2Status>, mac: &str,
     entry.owner_observed_at = Some(at);
 }
 
-fn v2_cycle_targets(
+fn device_cycle_targets(
     devices: &[Value],
-    cache: &HashMap<String, CachedV2Status>,
+    cache: &HashMap<String, CachedDeviceStatus>,
     now: i64,
 ) -> Vec<String> {
     devices
@@ -200,13 +191,13 @@ fn v2_cycle_targets(
             }
             let status = cache.get(&mac)?;
             let now = scheduled_now(&mac, now);
-            (status.online && v2_status_fresh(&mac, status, now, 30))
+            (status.online && device_status_fresh(&mac, status, now, 30))
                 .then_some(mac)
         })
         .collect()
 }
 
-fn v2_status_fresh(mac: &str, status: &CachedV2Status, now: i64, ttl_s: u64) -> bool {
+fn device_status_fresh(mac: &str, status: &CachedDeviceStatus, now: i64, ttl_s: u64) -> bool {
     if let Some(monotonic) = bridge_core::device_clock::monotonic_ms(mac) {
         return status.fetched_mono_ms.is_some_and(|at|
             monotonic >= at && monotonic - at <= ttl_s * 1000);
@@ -214,7 +205,7 @@ fn v2_status_fresh(mac: &str, status: &CachedV2Status, now: i64, ttl_s: u64) -> 
     status.fetched_at <= now && now.saturating_sub(status.fetched_at) <= ttl_s as i64
 }
 
-fn v2_claim_renew_due(mac: &str, status: &CachedV2Status, now: i64) -> bool {
+fn device_claim_renew_due(mac: &str, status: &CachedDeviceStatus, now: i64) -> bool {
     if let Some(monotonic) = bridge_core::device_clock::monotonic_ms(mac) {
         return status.last_claim_mono_ms.is_none_or(|at|
             monotonic >= at && monotonic - at >= 60_000);
@@ -222,7 +213,7 @@ fn v2_claim_renew_due(mac: &str, status: &CachedV2Status, now: i64) -> bool {
     status.last_claim_at.is_none_or(|at| now.saturating_sub(at) >= 60)
 }
 
-enum V2OccupancyDecision {
+enum DeviceOccupancyDecision {
     Offline,
     Yielded,
     Other(Value),
@@ -230,28 +221,28 @@ enum V2OccupancyDecision {
     Claim,
 }
 
-fn v2_occupancy_decision(
+fn device_occupancy_decision(
     mac: &str,
-    status: Option<&CachedV2Status>,
+    status: Option<&CachedDeviceStatus>,
     bridge_id: &str,
     now: i64,
-) -> V2OccupancyDecision {
+) -> DeviceOccupancyDecision {
     let Some(status) =
-        status.filter(|status| status.online && v2_status_fresh(mac, status, now, 30))
+        status.filter(|status| status.online && device_status_fresh(mac, status, now, 30))
     else {
-        return V2OccupancyDecision::Offline;
+        return DeviceOccupancyDecision::Offline;
     };
     if status.yielded {
-        return V2OccupancyDecision::Yielded;
+        return DeviceOccupancyDecision::Yielded;
     }
     if let Some(owner) = status.owner.as_ref().filter(|owner| owner_valid(owner)) {
         if owner_id(owner) != Some(bridge_id) {
-            return V2OccupancyDecision::Other(owner.clone());
+            return DeviceOccupancyDecision::Other(owner.clone());
         }
-        let renew = v2_claim_renew_due(mac, status, now);
-        return V2OccupancyDecision::Owned { renew };
+        let renew = device_claim_renew_due(mac, status, now);
+        return DeviceOccupancyDecision::Owned { renew };
     }
-    V2OccupancyDecision::Claim
+    DeviceOccupancyDecision::Claim
 }
 
 struct AppCtx {
@@ -262,7 +253,7 @@ struct AppCtx {
     envelope: Arc<RwLock<Option<Value>>>,
     library: Arc<RwLock<Library>>,
     force_ble: Arc<Notify>,
-    v2_delivery: tokio::sync::Mutex<()>,
+    device_delivery: tokio::sync::Mutex<()>,
     sim_control: tokio::sync::Mutex<()>,
     per_mac_delivery: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     status: Mutex<RuntimeStatus>,
@@ -276,8 +267,8 @@ struct AppCtx {
     bridge_name: Mutex<String>,
     /// Reused as the device-side owner id (envelope `bridge.hostId`).
     bridge_id: String,
-    /// Authenticated v2 status and reachability, isolated by normalized MAC.
-    v2_status_cache: Mutex<HashMap<String, CachedV2Status>>,
+    /// Authenticated device status and reachability, isolated by normalized MAC.
+    device_status_cache: Mutex<HashMap<String, CachedDeviceStatus>>,
     /// An ARP fallback scan is already running.
     arp_running: AtomicBool,
     /// v0.14 mode/activity state shared with the HTTP pull path
@@ -285,16 +276,10 @@ struct AppCtx {
     activity: Arc<Activity>,
     /// The device asked for a BLE handshake in its UDP announce (`ble=1`).
     udp_ble: AtomicBool,
-    /// Set when the push loop's target device changed its address or the user
-    /// asked for a sync: send immediately instead of waiting for the heartbeat.
-    /// (The per-device `ip_dirty` record field carries the same signal for the
-    /// MAC it belongs to.)
-    push_requested: AtomicBool,
-    force_push: Arc<Notify>,
     mcp_port: Mutex<u16>,
     mcp_error: Mutex<Option<String>>,
     mcp_tx: tokio::sync::watch::Sender<u16>,
-    /// v2 platform application service: the single business model shared by the
+    /// platform application service: the single business model shared by the
     /// four UI pages and MCP (templates, devices, data sources, power, MCP).
     platform: Arc<bridge_core::platform::service::PlatformService>,
 }
@@ -435,7 +420,6 @@ struct DeviceFacts {
     status: Option<CachedDevice>,
     pmstats: Option<CachedPmStats>,
     owner: Option<CachedOwner>,
-    last_claim_at: Option<i64>,
     yielded: bool,
     note: Option<String>,
 }
@@ -459,10 +443,6 @@ impl DeviceFacts {
         self.status.as_ref().is_some_and(|cache| cache.online)
     }
 
-    fn note(&self) -> Option<String> {
-        self.note.clone()
-    }
-
 }
 
 /// Registry lock helper.
@@ -481,7 +461,6 @@ fn device_facts_for(ctx: &AppCtx, mac: &str) -> Option<DeviceFacts> {
         status: device.status.clone(),
         pmstats: device.pmstats.clone(),
         owner: device.owner.clone(),
-        last_claim_at: device.last_claim_at,
         yielded: device.yielded,
         note: device.note.clone(),
     })
@@ -631,12 +610,7 @@ fn set_device_ip(ctx: &AppCtx, mac: &str, ip: &str, via: &str) -> bool {
     };
     if changed {
         tracing::info!("device {mac} endpoint updated: {ip} (via {via})");
-        // Only the device the push loop targets needs to be woken; other MACs
-        // keep their own dirty flags and are picked up by their own path.
         let selected = selected_mac(ctx).as_deref() == Some(&normalize_mac(mac));
-        if selected {
-            ctx.force_push.notify_one();
-        }
         if selected {
             save_identity(ctx);
         }
@@ -673,56 +647,6 @@ fn set_yielded(ctx: &AppCtx, mac: &str, yielded: bool) {
     }
 }
 
-fn is_yielded(ctx: &AppCtx, mac: &str) -> bool {
-    devices(ctx).get(mac).is_some_and(|device| device.yielded)
-}
-
-fn last_claim_at(ctx: &AppCtx, mac: &str) -> Option<i64> {
-    devices(ctx).get(mac).and_then(|device| device.last_claim_at)
-}
-
-/// Record a successful `/claim` for one MAC (the 60 s renew throttle).
-fn set_last_claim_at(ctx: &AppCtx, mac: &str, at: i64) {
-    if let Some(device) = devices(ctx).get_mut(mac) {
-        device.last_claim_at = Some(at);
-    }
-}
-
-fn mark_ip_dirty(ctx: &AppCtx, mac: &str) {
-    let mut registry = devices(ctx);
-    if let Some(device) = registry.get_mut(mac) {
-        device.ip_dirty = true;
-    }
-    let selected = registry.primary_mac().map(str::to_string);
-    drop(registry);
-    if selected.as_deref() == Some(&normalize_mac(mac)) {
-        ctx.force_push.notify_one();
-    }
-}
-
-/// Dirty the device the single-device push loop targets (debug helpers).
-fn mark_selected_ip_dirty(ctx: &AppCtx) {
-    ctx.push_requested.store(true, Ordering::SeqCst);
-    match selected_mac(ctx) {
-        Some(mac) => mark_ip_dirty(ctx, &mac),
-        None => ctx.force_push.notify_one(),
-    }
-}
-
-/// Consume the "send now" signal: the selected device's own record flag or the
-/// bridge-level request (address change / user sync) both force one push.
-fn take_ip_dirty(ctx: &AppCtx) -> bool {
-    let requested = ctx.push_requested.swap(false, Ordering::SeqCst);
-    let mut registry = devices(ctx);
-    let dirty = registry
-        .primary_mac()
-        .map(str::to_string)
-        .and_then(|mac| registry.get_mut(&mac))
-        .map(|device| std::mem::replace(&mut device.ip_dirty, false))
-        .unwrap_or(false);
-    requested || dirty
-}
-
 fn owner_id(owner: &Value) -> Option<&str> {
     owner.get("id").and_then(|v| v.as_str())
 }
@@ -755,18 +679,9 @@ fn set_owner_cache(ctx: &AppCtx, mac: &str, owner: Option<Value>) {
     };
     if let Some(device) = devices(ctx).get_mut(mac) {
         device.owner = Some(CachedOwner {
-            fetched_at: device_now_secs(&mac),
             owner,
         });
     }
-}
-
-fn cached_owner(ctx: &AppCtx, mac: &str) -> Option<Value> {
-    devices(ctx)
-        .get(mac)
-        .and_then(|device| device.owner.clone())
-        .filter(|cache| device_now_secs(&mac) - cache.fetched_at <= 30)
-        .and_then(|cache| cache.owner)
 }
 
 /// Adopt identity from a BLE info JSON (`{mac, ip, http_port}`).
@@ -973,9 +888,6 @@ async fn get_status(
         "weekly_remaining": weekly_remaining(&usage),
         "templates": templates,
         "paused": status.paused,
-        "last_push_at": status.last_push_at,
-        "last_push_error": status.last_push_error,
-        "last_push_ok_at": status.last_push_ok_at,
         "last_sync": status.last_sync,
         "last_error": status.last_error,
         "device_note": device_note,
@@ -1054,10 +966,6 @@ async fn mcp_handler(
                 | "device_owner"
                 | "device_claim"
                 | "device_release"
-                | "device_sleep"
-                | "device_wake"
-                | "device_mode"
-                | "device_contact_s"
         ) {
             let id = request.get("id").cloned().unwrap_or(Value::Null);
             let args = request
@@ -1080,21 +988,21 @@ async fn mcp_handler(
             )
                 .into_response();
         }
-        // v2 platform tools share the exact application service the UI uses.
+        // platform tools share the exact application service the UI uses.
         if matches!(
             name,
             "platform_overview"
-                | "platform_device_register_v2"
-                | "template_list"
-                | "template_get_v2"
-                | "template_save_v2"
-                | "template_validate_v2"
-                | "profile_get_v2"
-                | "profile_save_v2"
-                | "family_profiles_v2"
-                | "family_profile_save_v2"
-                | "family_profile_delete_v2"
-                | "family_profile_copy_v2"
+                | "platform_device_register"
+                | "platform_template_list"
+                | "platform_template_get"
+                | "platform_template_save"
+                | "platform_template_validate"
+                | "platform_profile_get"
+                | "platform_profile_save"
+                | "platform_family_profiles"
+                | "family_platform_profile_save"
+                | "platform_family_profile_delete"
+                | "platform_family_profile_copy"
                 | "platform_publish"
                 | "platform_publish_preview"
                 | "platform_font_list"
@@ -1103,11 +1011,11 @@ async fn mcp_handler(
                 | "firmware_ota"
                 | "firmware_ota_status"
                 | "firmware_ota_cancel"
-                | "template_activate"
-                | "data_sources_v2"
-                | "data_source_save_v2"
-                | "data_probe_v2"
-                | "power_view_v2"
+                | "platform_template_activate"
+                | "platform_data_sources"
+                | "platform_data_source_save"
+                | "platform_data_probe"
+                | "platform_power_view"
                 | "power_plan"
                 | "platform_status_refresh"
                 | "platform_push_now"
@@ -1120,7 +1028,7 @@ async fn mcp_handler(
                 .unwrap_or_else(|| json!({}));
             let response = match platform::tool(&ctx, name, &args).await {
                 Ok(text) => {
-                    if name == "template_save_v2" {
+                    if name == "platform_template_save" {
                         if let Some(handle) = ctx.app_handle.get() {
                             let _ = handle.emit("templates-changed", ());
                         }
@@ -1145,13 +1053,6 @@ async fn mcp_handler(
     let mcp_cfg = mcp_config(&ctx);
     match bridge_mcp::handle_request(&mcp_cfg, &request).await {
         Some(response) => {
-            let ok = !response.pointer("/result/isError").and_then(Value::as_bool).unwrap_or(false);
-            if ok && matches!(tool.as_deref(), Some("template_save")) {
-                ctx.activity.note_activity("template-save");
-                if let Some(handle) = ctx.app_handle.get() {
-                    let _ = handle.emit("templates-changed", ());
-                }
-            }
             (
                 [(axum::http::header::CONTENT_TYPE, "application/json")],
                 response.to_string(),
@@ -1399,7 +1300,7 @@ async fn post_claim_to_endpoint(
     endpoint: &str,
     target_mac: &str,
     claim_token: &str,
-    v2_token: &str,
+    device_token: &str,
     bridge_id: &str,
     name: &str,
     host: &str,
@@ -1428,13 +1329,13 @@ async fn post_claim_to_endpoint(
         Some(mac) => mac,
         None => {
             tracing::info!(event = "preflight_fallback", device_mac = %expected_mac,
-                operation = "/v2/status", "using authenticated v2 status for claim identity");
-            let v2_endpoint = endpoint.clone();
-            let v2_token = v2_token.to_owned();
-            let v2_status = tokio::task::spawn_blocking(move || {
-                bridge_core::v2_client::status(
-                    &v2_endpoint,
-                    &v2_token,
+                operation = "/api/status", "using authenticated device status for claim identity");
+            let device_endpoint = endpoint.clone();
+            let device_token = device_token.to_owned();
+            let device_status = tokio::task::spawn_blocking(move || {
+                bridge_core::device_client::status(
+                    &device_endpoint,
+                    &device_token,
                     Duration::from_secs(2),
                 )
             })
@@ -1446,7 +1347,7 @@ async fn post_claim_to_endpoint(
                     "claim identity preflight failed");
                 ClaimError::Other(format!("device identity check failed: {e}"))
             })?;
-            v2_status
+            device_status
                 .get("device_mac")
                 .and_then(Value::as_str)
                 .and_then(bridge_core::platform::model::DeviceIdentity::normalized_mac)
@@ -1532,22 +1433,6 @@ fn parse_claim_response(
     Ok(doc.get("owner").cloned().filter(|o| !o.is_null()))
 }
 
-/// Claim with the cached device token (no BLE scan; the push loop must stay
-/// cheap). A missing/expired token surfaces as a user action prompt.
-async fn post_claim(
-    ctx: &AppCtx,
-    mac: &str,
-    force: bool,
-    release: bool,
-) -> Result<Option<Value>, ClaimError> {
-    let Some(mac) = bridge_core::platform::model::DeviceIdentity::normalized_mac(mac) else {
-        return Err(ClaimError::Other(
-            "device MAC is not confirmed; refusing claim".into(),
-        ));
-    };
-    post_claim_for_mac(ctx, force, release, &mac).await
-}
-
 fn claim_endpoint_for_mac(ctx: &AppCtx, mac: &str) -> Result<String, ClaimError> {
     let target_mac = bridge_core::platform::model::DeviceIdentity::normalized_mac(mac)
         .ok_or_else(|| ClaimError::Other("invalid target MAC; refusing claim".into()))?;
@@ -1627,69 +1512,27 @@ enum Occupancy {
     Failed(String),
 }
 
-/// Auto occupation decision (docs/power-state.md §9 / task-4): free/expired ->
-/// claim; self -> renew (60 s throttle); other -> report. Never pushes while
-/// another bridge owns the device.
-///
-/// Occupancy, the renew throttle and the yielded flag are per-MAC record
-/// fields, so a decision for device A can never move device B's state.
-async fn occupancy_gate(ctx: &AppCtx, mac: &str) -> Occupancy {
-    if is_yielded(ctx, mac) {
-        return Occupancy::Yielded;
-    }
-    if let Some(owner) = cached_owner(ctx, mac).filter(owner_valid) {
-        if owner_id(&owner) == Some(ctx.bridge_id.as_str()) {
-            let renew = last_claim_at(ctx, mac)
-                .map(|at| device_now_secs(&mac) - at >= 60)
-                .unwrap_or(true);
-            if renew {
-                match post_claim(ctx, mac, false, false).await {
-                    Ok(_) => set_last_claim_at(ctx, mac, device_now_secs(&mac)),
-                    Err(ClaimError::Occupied(owner)) => {
-                        set_owner_cache(ctx, mac, Some(owner.clone()));
-                        return Occupancy::Other(owner);
-                    }
-                    Err(e) => return Occupancy::Failed(e.to_string()),
-                }
-            }
-            return Occupancy::Owned;
-        }
-        return Occupancy::Other(owner);
-    }
-    match post_claim(ctx, mac, false, false).await {
-        Ok(_) => {
-            set_last_claim_at(ctx, mac, device_now_secs(&mac));
-            Occupancy::Owned
-        }
-        Err(ClaimError::Occupied(owner)) => {
-            set_owner_cache(ctx, mac, Some(owner.clone()));
-            Occupancy::Other(owner)
-        }
-        Err(e) => Occupancy::Failed(e.to_string()),
-    }
-}
-
-async fn v2_occupancy_gate(ctx: &AppCtx, mac: &str) -> Occupancy {
+async fn device_occupancy_gate(ctx: &AppCtx, mac: &str) -> Occupancy {
     let Some(mac) = bridge_core::platform::model::DeviceIdentity::normalized_mac(mac) else {
         return Occupancy::Failed("invalid target MAC; refusing claim".into());
     };
     let decision = {
-        let cache = ctx.v2_status_cache.lock().unwrap();
-        v2_occupancy_decision(&mac, cache.get(&mac), &ctx.bridge_id, device_now_secs(&mac))
+        let cache = ctx.device_status_cache.lock().unwrap();
+        device_occupancy_decision(&mac, cache.get(&mac), &ctx.bridge_id, device_now_secs(&mac))
     };
     match decision {
-        V2OccupancyDecision::Offline => Occupancy::Failed(
+        DeviceOccupancyDecision::Offline => Occupancy::Failed(
             "target has no authenticated online status within the last 30 seconds".into(),
         ),
-        V2OccupancyDecision::Yielded => Occupancy::Yielded,
-        V2OccupancyDecision::Other(owner) => Occupancy::Other(owner),
-        V2OccupancyDecision::Owned { renew: false } => Occupancy::Owned,
-        V2OccupancyDecision::Owned { renew: true } | V2OccupancyDecision::Claim => {
+        DeviceOccupancyDecision::Yielded => Occupancy::Yielded,
+        DeviceOccupancyDecision::Other(owner) => Occupancy::Other(owner),
+        DeviceOccupancyDecision::Owned { renew: false } => Occupancy::Owned,
+        DeviceOccupancyDecision::Owned { renew: true } | DeviceOccupancyDecision::Claim => {
             match post_claim_for_mac(ctx, false, false, &mac).await {
                 Ok(owner) => {
                     let now = device_now_secs(&mac);
-                    update_v2_claim_cache(
-                        &mut ctx.v2_status_cache.lock().unwrap(),
+                    update_device_claim_cache(
+                        &mut ctx.device_status_cache.lock().unwrap(),
                         &mac,
                         owner,
                         now,
@@ -1699,8 +1542,8 @@ async fn v2_occupancy_gate(ctx: &AppCtx, mac: &str) -> Occupancy {
                 }
                 Err(ClaimError::Occupied(owner)) => {
                     let now = device_now_secs(&mac);
-                    update_v2_owner_cache(
-                        &mut ctx.v2_status_cache.lock().unwrap(),
+                    update_device_owner_cache(
+                        &mut ctx.device_status_cache.lock().unwrap(),
                         &mac,
                         owner.clone(),
                         now,
@@ -1910,14 +1753,13 @@ async fn device_tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, S
             let owner = post_claim_explicit_for_mac(ctx, force, false, &mac)
                 .await
                 .map_err(claim_error_text)?;
-            update_v2_claim_cache(
-                &mut ctx.v2_status_cache.lock().unwrap(),
+            update_device_claim_cache(
+                &mut ctx.device_status_cache.lock().unwrap(),
                 &mac,
                 owner.clone(),
                 device_now_secs(&mac),
                 false,
             );
-            mark_ip_dirty(ctx, &mac);
             Ok(json!({"owner": owner, "mac": mac, "yielded": false}).to_string())
         }
         "device_release" => {
@@ -1927,8 +1769,8 @@ async fn device_tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, S
                 .await
                 .map_err(claim_error_text)?;
             set_yielded(ctx, &mac, true);
-            update_v2_claim_cache(
-                &mut ctx.v2_status_cache.lock().unwrap(),
+            update_device_claim_cache(
+                &mut ctx.device_status_cache.lock().unwrap(),
                 &mac,
                 None,
                 device_now_secs(&mac),
@@ -1937,59 +1779,6 @@ async fn device_tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, S
             Ok(format!(
                 "device {mac} released; auto-claim paused until device_claim"
             ))
-        }
-        // Debug helper: shortens the light -> deep loop for battery/deep tests.
-        // `note_deep` makes the next envelope carry mode=deep (and next_contact
-        // 60); the dirty flag + notify make the push loop send it even though it
-        // now "expects deep". The firmware applies its 60 s grace and sleeps.
-        "device_sleep" => {
-            // Persist deep as well: the pull response follows the push within a
-            // minute and would otherwise bring the device back to light while
-            // the 10 min quiet window is not yet satisfied.
-            ctx.activity.request_deep();
-            ctx.activity.note_deep(60);
-            mark_selected_ip_dirty(ctx);
-            Ok("deep hint queued + pull responses forced deep; device sleeps after the 60 s grace (clear with device_mode auto)"
-                .to_string())
-        }
-        // Debug: make the next pull answer light so the device wakes up and
-        // stays online (readable /status.json, /log). The forced push carries
-        // mode=light to cancel a pending deep hint when the device is awake.
-        "device_wake" => {
-            ctx.activity.request_light();
-            mark_selected_ip_dirty(ctx);
-            Ok(
-                "light requested: next pull answers light; push carries mode=light when reachable"
-                    .to_string(),
-            )
-        }
-        // Debug: persistent mode override for pull responses/pushes so the
-        // deep/light loop does not depend on the 10 min quiet hysteresis.
-        "device_mode" => {
-            let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("auto");
-            let code = match mode {
-                "auto" => 0u8,
-                "deep" => 1,
-                "light" => 2,
-                other => return Err(format!("mode must be auto|deep|light (got {other})")),
-            };
-            ctx.activity.set_debug_mode(code);
-            Ok(format!(
-                "debug mode = {mode} (pull responses and push envelopes)"
-            ))
-        }
-        // Debug: override the pull cadence (0 = auto) to speed up deep cycles.
-        "device_contact_s" => {
-            let s = args.get("s").and_then(|v| v.as_u64()).unwrap_or(u64::MAX);
-            if s != 0 && !(30..=3600).contains(&s) {
-                return Err("s must be 0 (auto) or 30..=3600 seconds".to_string());
-            }
-            ctx.activity.set_debug_contact_s(s);
-            if s == 0 {
-                Ok("debug pull cadence cleared (auto)".to_string())
-            } else {
-                Ok(format!("debug pull cadence = {s}s"))
-            }
         }
         other => Err(format!("unknown device tool: {other}")),
     }
@@ -2047,7 +1836,7 @@ async fn release_device(
 }
 
 // ---------------------------------------------------------------------------
-// v2 platform commands: the four UI pages call exactly the same service the MCP
+// platform commands: the four UI pages call exactly the same service the MCP
 // tools use (no second business logic, no save-implies-publish).
 // ---------------------------------------------------------------------------
 
@@ -2282,7 +2071,7 @@ async fn get_device_status(
     let age_s = observed_at.map(|at| (device_now_secs(&mac) as u64).saturating_sub(at));
     let clock_anomaly = observed_at.is_some_and(|at| (device_now_secs(&mac) as u64) < at);
     let recent = !clock_anomaly && age_s.is_some_and(|age| age <= 30)
-        && state.v2_status_cache.lock().unwrap().get(&mac)
+        && state.device_status_cache.lock().unwrap().get(&mac)
             .is_some_and(|v| v.online && v.fetched_at <= device_now_secs(&mac)
                 && device_now_secs(&mac).saturating_sub(v.fetched_at) <= 30);
     let contact_at = registered["last_authenticated_contact_at"].as_u64();
@@ -2395,7 +2184,7 @@ async fn get_mcp_info(state: State<'_, Arc<AppCtx>>) -> Result<Value, String> {
     let port = *state.mcp_port.lock().unwrap();
     let error = state.mcp_error.lock().unwrap().clone();
     let url = format!("http://127.0.0.1:{port}/mcp");
-    let tools = "bridge_status / template_get / template_validate / template_render / template_save / firmware_ota / pm_stats / device_* / v2 平台工具（platform_*、template_*_v2、profile_*_v2、family_profile_*_v2、data_*_v2、power_*）";
+    let tools = "bridge_status / template_render / firmware_ota / pm_stats / device_* / platform_*";
 
     let generic_prompt = format!(
         "本机已启动 Codex Status 的 MCP 服务（Streamable HTTP）：{url}\n\
@@ -2507,18 +2296,20 @@ async fn preview_template(
 
 #[tauri::command]
 async fn force_sync(state: State<'_, Arc<AppCtx>>) -> Result<(), String> {
-    request_sync(&state);
+    let mac = selected_mac(&state).ok_or("no device selected")?;
+    if platform::service(&state).device_get(&mac).is_none() {
+        return Err("device is not registered for the current protocol".into());
+    }
+    platform::cycle(&state, &mac, true, true).await;
     Ok(())
 }
 
-/// Explicit user action: push the envelope over HTTP immediately and run one
-/// BLE handshake (endpoint/token refresh).
-fn request_sync(ctx: &AppCtx) {
-    ctx.activity.note_activity("sync");
-    mark_selected_ip_dirty(ctx);
-    ctx.force_push.notify_one();
-    ctx.udp_ble.store(true, Ordering::SeqCst);
-    ctx.force_ble.notify_one();
+/// Tray action: ask the registered device coordinator for one immediate cycle.
+fn request_sync(ctx: &Arc<AppCtx>) {
+    let Some(mac) = selected_mac(ctx) else { return };
+    if platform::service(ctx).device_get(&mac).is_none() { return }
+    let ctx = ctx.clone();
+    tokio::spawn(async move { platform::cycle(&ctx, &mac, true, true).await; });
 }
 
 /// Seed the runtime directory from the repo copies. Existing files are never
@@ -2561,7 +2352,7 @@ async fn reload_templates(state: State<'_, Arc<AppCtx>>) -> Result<usize, String
 }
 
 /// UDP announce listener (docs/power-state.md §9). Announcements are per-MAC
-/// address hints for registered v2 devices that are verified over HTTP.
+/// address hints for registered devices that are verified over HTTP.
 async fn udp_listen(ctx: Arc<AppCtx>) {
     // Device announces target the fixed UDP port. Only the default bridge
     // owns that socket; named instances use their exact MAC HTTP/BLE routes.
@@ -2583,20 +2374,20 @@ async fn udp_listen(ctx: Arc<AppCtx>) {
     tracing::info!("udp announce listener on :8767");
     let mut buf = [0u8; 1024];
     let mut last_revalidation = HashMap::<String, i64>::new();
-    let mut v2_udp_sampler = V2UdpTraceSampler::default();
+    let mut device_udp_sampler = DeviceUdpTraceSampler::default();
     loop {
         let Ok((n, from)) = socket.recv_from(&mut buf).await else {
             continue;
         };
         let Ok(doc) = serde_json::from_slice::<Value>(&buf[..n]) else {
-            if let Some(suppressed) = v2_udp_sampler.record(None, "malformed_json", now_secs()) {
+            if let Some(suppressed) = device_udp_sampler.record(None, "malformed_json", now_secs()) {
                 tracing::debug!(event = "udp_discard", category = "malformed_json", suppressed,
                     "unrelated UDP traffic sampled");
             }
             continue;
         };
         if doc.get("magic").and_then(|v| v.as_str()) != Some("codex-status") {
-            if let Some(suppressed) = v2_udp_sampler.record(None, "unrelated_magic", now_secs()) {
+            if let Some(suppressed) = device_udp_sampler.record(None, "unrelated_magic", now_secs()) {
                 tracing::debug!(event = "udp_discard", category = "unrelated_magic", suppressed,
                     "unrelated UDP traffic sampled");
             }
@@ -2605,48 +2396,48 @@ async fn udp_listen(ctx: Arc<AppCtx>) {
         let raw_mac = doc.get("mac").and_then(Value::as_str).unwrap_or("");
         let devices = ctx.platform.devices();
         if bridge_core::platform::model::DeviceIdentity::normalized_mac(raw_mac).is_none() {
-            if let Some(suppressed) = v2_udp_sampler.record(None, "format_invalid", now_secs()) {
+            if let Some(suppressed) = device_udp_sampler.record(None, "format_invalid", now_secs()) {
                 tracing::debug!(event = "udp_discard", category = "format_invalid", suppressed,
                     "UDP announce with invalid identity sampled");
             }
             continue;
         }
-        let hint = classify_v2_udp_hint(&doc, from.ip(), &devices);
-        let registered_v2 = hint.is_registered();
-        if registered_v2 {
+        let hint = classify_device_udp_hint(&doc, from.ip(), &devices);
+        let registered_device = hint.is_registered();
+        if registered_device {
             let (mac, endpoint) = match hint {
-                V2UdpHint::Changed { mac, endpoint } => {
+                DeviceUdpHint::Changed { mac, endpoint } => {
                     if let Some(suppressed) =
-                        v2_udp_sampler.record(Some(&mac), "endpoint_changed", now_secs())
+                        device_udp_sampler.record(Some(&mac), "endpoint_changed", now_secs())
                     {
                         tracing::info!(event = "udp_accept", device_mac = %mac, source = %from,
                             endpoint = %endpoint, category = "endpoint_changed", suppressed,
-                            "registered v2 UDP announce accepted");
+                            "registered device UDP announce accepted");
                     }
                     (mac, endpoint)
                 }
-                V2UdpHint::Unchanged { mac } => {
+                DeviceUdpHint::Unchanged { mac } => {
                     if let Some(suppressed) =
-                        v2_udp_sampler.record(Some(&mac), "unchanged", now_secs())
+                        device_udp_sampler.record(Some(&mac), "unchanged", now_secs())
                     {
                         tracing::trace!(event = "udp_duplicate", device_mac = %mac, source = %from,
-                            suppressed, "registered v2 UDP announce unchanged");
+                            suppressed, "registered device UDP announce unchanged");
                     }
                     continue;
                 }
-                V2UdpHint::Rejected {
+                DeviceUdpHint::Rejected {
                     mac,
                     category,
                     registered,
                 } => {
                     let mac_for_log = if registered { mac.as_deref() } else { None };
                     if let Some(suppressed) =
-                        v2_udp_sampler.record(mac_for_log, category, now_secs())
+                        device_udp_sampler.record(mac_for_log, category, now_secs())
                     {
                         if registered {
                             tracing::warn!(event = "udp_reject", device_mac = mac.as_deref().unwrap_or(""),
                                 source = %from, category, suppressed,
-                                "registered v2 UDP announce rejected");
+                                "registered device UDP announce rejected");
                         } else {
                             tracing::debug!(event = "udp_reject", source = %from, category, suppressed,
                                 "unregistered UDP announce ignored");
@@ -2664,7 +2455,7 @@ async fn udp_listen(ctx: Arc<AppCtx>) {
                 let mac_for_task = mac.clone();
                 let endpoint_for_task = endpoint.clone();
                 tokio::spawn(async move {
-                    match platform::revalidate_registered_v2_endpoint(
+                    match platform::revalidate_registered_device_endpoint(
                         &ctx,
                         &mac_for_task,
                         &endpoint_for_task,
@@ -2678,8 +2469,8 @@ async fn udp_listen(ctx: Arc<AppCtx>) {
                         Ok(false) => {}
                         Err(error) => {
                             tracing::warn!(event = "udp_reject", device_mac = %mac_for_task,
-                                source = %endpoint_for_task, category = safe_v2_error_category(&error),
-                                "registered v2 UDP endpoint verification failed")
+                                source = %endpoint_for_task, category = safe_device_error_category(&error),
+                                "registered device UDP endpoint verification failed")
                         }
                     }
                 });
@@ -2690,7 +2481,7 @@ async fn udp_listen(ctx: Arc<AppCtx>) {
     }
 }
 
-enum V2UdpHint {
+enum DeviceUdpHint {
     Changed {
         mac: String,
         endpoint: String,
@@ -2705,7 +2496,7 @@ enum V2UdpHint {
     },
 }
 
-impl V2UdpHint {
+impl DeviceUdpHint {
     fn is_registered(&self) -> bool {
         match self {
             Self::Changed { .. } | Self::Unchanged { .. } => true,
@@ -2714,11 +2505,11 @@ impl V2UdpHint {
     }
 }
 
-fn classify_v2_udp_hint(doc: &Value, source: std::net::IpAddr, devices: &[Value]) -> V2UdpHint {
+fn classify_device_udp_hint(doc: &Value, source: std::net::IpAddr, devices: &[Value]) -> DeviceUdpHint {
     use bridge_core::platform::model::DeviceIdentity;
 
     if doc.get("magic").and_then(Value::as_str) != Some("codex-status") {
-        return V2UdpHint::Rejected {
+        return DeviceUdpHint::Rejected {
             mac: None,
             category: "format_invalid",
             registered: false,
@@ -2729,7 +2520,7 @@ fn classify_v2_udp_hint(doc: &Value, source: std::net::IpAddr, devices: &[Value]
         .and_then(Value::as_str)
         .and_then(DeviceIdentity::normalized_mac)
     else {
-        return V2UdpHint::Rejected {
+        return DeviceUdpHint::Rejected {
             mac: None,
             category: "format_invalid",
             registered: false,
@@ -2740,16 +2531,16 @@ fn classify_v2_udp_hint(doc: &Value, source: std::net::IpAddr, devices: &[Value]
         .and_then(Value::as_str)
         .and_then(|ip| ip.parse::<std::net::Ipv4Addr>().ok())
     else {
-        let registered = is_registered_v2_mac(&mac, devices);
-        return V2UdpHint::Rejected {
+        let registered = is_registered_device_mac(&mac, devices);
+        return DeviceUdpHint::Rejected {
             mac: Some(mac),
             category: "format_invalid",
             registered,
         };
     };
     if source != std::net::IpAddr::V4(ip) {
-        let registered = is_registered_v2_mac(&mac, devices);
-        return V2UdpHint::Rejected {
+        let registered = is_registered_device_mac(&mac, devices);
+        return DeviceUdpHint::Rejected {
             mac: Some(mac),
             category: "source_mismatch",
             registered,
@@ -2761,8 +2552,8 @@ fn classify_v2_udp_hint(doc: &Value, source: std::net::IpAddr, devices: &[Value]
             .and_then(|port| u16::try_from(port).ok())
             .filter(|port| *port != 0)
         else {
-            let registered = is_registered_v2_mac(&mac, devices);
-            return V2UdpHint::Rejected {
+            let registered = is_registered_device_mac(&mac, devices);
+            return DeviceUdpHint::Rejected {
                 mac: Some(mac),
                 category: "format_invalid",
                 registered,
@@ -2780,14 +2571,14 @@ fn classify_v2_udp_hint(doc: &Value, source: std::net::IpAddr, devices: &[Value]
             == Some(mac.as_str())
     });
     let Some(device) = registered_device else {
-        return V2UdpHint::Rejected {
+        return DeviceUdpHint::Rejected {
             mac: None,
             category: "identity_unregistered",
             registered: false,
         };
     };
     let Some(previous_endpoint) = device["ip"].as_str() else {
-        return V2UdpHint::Rejected {
+        return DeviceUdpHint::Rejected {
             mac: Some(mac),
             category: "identity_mismatch",
             registered: true,
@@ -2798,13 +2589,13 @@ fn classify_v2_udp_hint(doc: &Value, source: std::net::IpAddr, devices: &[Value]
         .map(|port| format!("{ip}:{port}"))
         .unwrap_or_else(|| ip.to_string());
     if previous_endpoint == endpoint {
-        V2UdpHint::Unchanged { mac }
+        DeviceUdpHint::Unchanged { mac }
     } else {
-        V2UdpHint::Changed { mac, endpoint }
+        DeviceUdpHint::Changed { mac, endpoint }
     }
 }
 
-fn is_registered_v2_mac(mac: &str, devices: &[Value]) -> bool {
+fn is_registered_device_mac(mac: &str, devices: &[Value]) -> bool {
     use bridge_core::platform::model::DeviceIdentity;
     devices.iter().any(|device| {
         device["device_mac"]
@@ -2816,12 +2607,12 @@ fn is_registered_v2_mac(mac: &str, devices: &[Value]) -> bool {
 }
 
 #[derive(Default)]
-struct V2UdpTraceSampler {
+struct DeviceUdpTraceSampler {
     last_logged: HashMap<(String, &'static str), i64>,
     suppressed: HashMap<(String, &'static str), u64>,
 }
 
-impl V2UdpTraceSampler {
+impl DeviceUdpTraceSampler {
     fn record(&mut self, mac: Option<&str>, category: &'static str, now: i64) -> Option<u64> {
         let key = (mac.unwrap_or_default().to_owned(), category);
         if !self.last_logged.contains_key(&key) && self.last_logged.len() >= 256 {
@@ -2846,7 +2637,7 @@ impl V2UdpTraceSampler {
     }
 }
 
-fn safe_v2_error_category(error: &str) -> &'static str {
+fn safe_device_error_category(error: &str) -> &'static str {
     let text = error.to_ascii_lowercase();
     if text.contains("does not match") || text.contains("expected") || text.contains("identity") {
         "identity_mismatch"
@@ -2858,8 +2649,8 @@ fn safe_v2_error_category(error: &str) -> &'static str {
 }
 
 #[cfg(test)]
-mod v2_udp_hint_tests {
-    use super::{classify_v2_udp_hint, V2UdpHint, V2UdpTraceSampler};
+mod device_udp_hint_tests {
+    use super::{classify_device_udp_hint, DeviceUdpHint, DeviceUdpTraceSampler};
     use serde_json::json;
     use std::net::IpAddr;
 
@@ -2878,17 +2669,17 @@ mod v2_udp_hint_tests {
             "ip": "192.168.1.11"
         });
 
-        assert!(matches!(classify_v2_udp_hint(&announce,
+        assert!(matches!(classify_device_udp_hint(&announce,
             "192.168.1.11".parse::<IpAddr>().unwrap(), &devices),
-            V2UdpHint::Changed { mac, endpoint } if mac == "AABBCCDDEE01" && endpoint == "192.168.1.11"));
+            DeviceUdpHint::Changed { mac, endpoint } if mac == "AABBCCDDEE01" && endpoint == "192.168.1.11"));
         assert_eq!(devices[1]["ip"], "192.168.1.20");
         assert!(matches!(
-            classify_v2_udp_hint(
+            classify_device_udp_hint(
                 &announce,
                 "192.168.1.12".parse::<IpAddr>().unwrap(),
                 &devices
             ),
-            V2UdpHint::Rejected {
+            DeviceUdpHint::Rejected {
                 category: "source_mismatch",
                 registered: true,
                 ..
@@ -2905,8 +2696,8 @@ mod v2_udp_hint_tests {
             "ip": "192.168.1.11"
         });
         assert!(matches!(
-            classify_v2_udp_hint(&unknown, "192.168.1.11".parse::<IpAddr>().unwrap(), &known),
-            V2UdpHint::Rejected {
+            classify_device_udp_hint(&unknown, "192.168.1.11".parse::<IpAddr>().unwrap(), &known),
+            DeviceUdpHint::Rejected {
                 category: "identity_unregistered",
                 registered: false,
                 mac: None
@@ -2919,8 +2710,8 @@ mod v2_udp_hint_tests {
             "ip": "192.168.1.10"
         });
         assert!(
-            matches!(classify_v2_udp_hint(&same, "192.168.1.10".parse::<IpAddr>().unwrap(), &known),
-            V2UdpHint::Unchanged { mac } if mac == "AABBCCDDEE01")
+            matches!(classify_device_udp_hint(&same, "192.168.1.10".parse::<IpAddr>().unwrap(), &known),
+            DeviceUdpHint::Unchanged { mac } if mac == "AABBCCDDEE01")
         );
 
         let same_with_port_80 = json!({
@@ -2930,12 +2721,12 @@ mod v2_udp_hint_tests {
             "port": 80
         });
         assert!(matches!(
-            classify_v2_udp_hint(
+            classify_device_udp_hint(
                 &same_with_port_80,
                 "192.168.1.10".parse::<IpAddr>().unwrap(),
                 &known
             ),
-            V2UdpHint::Unchanged { .. }
+            DeviceUdpHint::Unchanged { .. }
         ));
 
         for port in [json!(0), json!(65536), json!("80")] {
@@ -2946,8 +2737,8 @@ mod v2_udp_hint_tests {
                 "port": port
             });
             assert!(matches!(
-                classify_v2_udp_hint(&announce, "192.168.1.11".parse::<IpAddr>().unwrap(), &known),
-                V2UdpHint::Rejected {
+                classify_device_udp_hint(&announce, "192.168.1.11".parse::<IpAddr>().unwrap(), &known),
+                DeviceUdpHint::Rejected {
                     category: "format_invalid",
                     registered: true,
                     ..
@@ -2962,12 +2753,12 @@ mod v2_udp_hint_tests {
         let source = "192.168.1.10".parse::<IpAddr>().unwrap();
         let base = json!({"magic":"codex-status", "mac":"AA:BB:CC:DD:EE:01", "ip":"192.168.1.10"});
         assert!(matches!(
-            classify_v2_udp_hint(&base, source, &known),
-            V2UdpHint::Unchanged { .. }
+            classify_device_udp_hint(&base, source, &known),
+            DeviceUdpHint::Unchanged { .. }
         ));
         assert!(matches!(
-            classify_v2_udp_hint(&base, "192.168.1.11".parse().unwrap(), &known),
-            V2UdpHint::Rejected {
+            classify_device_udp_hint(&base, "192.168.1.11".parse().unwrap(), &known),
+            DeviceUdpHint::Rejected {
                 category: "source_mismatch",
                 registered: true,
                 ..
@@ -2976,8 +2767,8 @@ mod v2_udp_hint_tests {
         let unknown =
             json!({"magic":"codex-status", "mac":"AA:BB:CC:DD:EE:02", "ip":"192.168.1.10"});
         assert!(matches!(
-            classify_v2_udp_hint(&unknown, source, &known),
-            V2UdpHint::Rejected {
+            classify_device_udp_hint(&unknown, source, &known),
+            DeviceUdpHint::Rejected {
                 category: "identity_unregistered",
                 registered: false,
                 mac: None
@@ -2985,14 +2776,14 @@ mod v2_udp_hint_tests {
         ));
         let moved = json!({"magic":"codex-status", "mac":"AA:BB:CC:DD:EE:01", "ip":"192.168.1.12"});
         assert!(matches!(
-            classify_v2_udp_hint(&moved, "192.168.1.12".parse().unwrap(), &known),
-            V2UdpHint::Changed { .. }
+            classify_device_udp_hint(&moved, "192.168.1.12".parse().unwrap(), &known),
+            DeviceUdpHint::Changed { .. }
         ));
     }
 
     #[test]
     fn udp_trace_sampling_is_bounded_and_counts_suppressed_events() {
-        let mut sampler = V2UdpTraceSampler::default();
+        let mut sampler = DeviceUdpTraceSampler::default();
         assert_eq!(
             sampler.record(Some("AABBCCDDEE01"), "source_mismatch", 100),
             Some(0)
@@ -3057,8 +2848,8 @@ fn maybe_arp_fallback(ctx: &Arc<AppCtx>) {
 /// Refresh the selected device's plain-HTTP status cache every 10 s; the panel
 /// reads that cache. The loop stays single-device (as before) but every read and
 /// write is keyed by the MAC it was aimed at, so another device's record is
-/// never touched; a registered v2 device is polled over its authenticated
-/// `/v2/status` instead (`v2_status_poll_loop`).
+/// never touched; a registered device is polled over its authenticated
+/// `/api/status` instead (`device_status_poll_loop`).
 async fn device_cache_loop(ctx: Arc<AppCtx>) {
     loop {
         tokio::time::sleep(Duration::from_secs(10)).await;
@@ -3174,7 +2965,7 @@ async fn refresh_http_status(ctx: &Arc<AppCtx>, mac: &str, ip: &str) {
 
 /// Poll registered devices independently of the single-device cache.
 /// This path is read-only and records each result under the target MAC.
-async fn v2_status_poll_loop(ctx: Arc<AppCtx>) {
+async fn device_status_poll_loop(ctx: Arc<AppCtx>) {
     loop {
         tokio::time::sleep(Duration::from_secs(10)).await;
         if ctx.status.lock().unwrap().paused {
@@ -3226,16 +3017,10 @@ async fn run_services(ctx: Arc<AppCtx>) {
     let addr = format!("0.0.0.0:{}", ctx.config.port)
         .parse()
         .expect("addr");
-    let http_state = AppState {
-        token: Arc::new(ctx.config.token.clone()),
-        envelope: ctx.envelope.clone(),
-        library: ctx.library.clone(),
-        activity: ctx.activity.clone(),
-    };
     {
         let ctx = ctx.clone();
         tokio::spawn(async move {
-            if let Err(e) = serve(addr, http_state).await {
+            if let Err(e) = serve(addr).await {
                 tracing::error!("http server: {e}");
                 let mut status = ctx.status.lock().unwrap();
                 status.last_error = Some(format!("http: {e}"));
@@ -3267,10 +3052,10 @@ async fn run_services(ctx: Arc<AppCtx>) {
     tokio::spawn(async move { device_cache_loop(cache_ctx).await });
     if std::env::var("CODEX_STATUS_PLATFORM_STATUS_POLL").as_deref() != Ok("0") {
         let status_ctx = ctx.clone();
-        tokio::spawn(async move { v2_status_poll_loop(status_ctx).await });
+        tokio::spawn(async move { device_status_poll_loop(status_ctx).await });
     }
 
-    // v2 platform loop: feed the Codex envelope into the DataSource and run one
+    // platform loop: feed the Codex envelope into the DataSource and run one
     // coordinator delivery per device on a bounded cadence. Never used to renew
     // a light window (only data/publish/render actions trigger work).
     {
@@ -3303,8 +3088,8 @@ async fn run_services(ctx: Arc<AppCtx>) {
                 }
                 let devices = platform::service(&ctx).devices();
                 let targets = {
-                    let cache = ctx.v2_status_cache.lock().unwrap();
-                    v2_cycle_targets(&devices, &cache, now_secs())
+                    let cache = ctx.device_status_cache.lock().unwrap();
+                    device_cycle_targets(&devices, &cache, now_secs())
                 };
                 for target_mac in targets {
                     if platform::device_link_for_mac(&ctx, &target_mac).is_none() {
@@ -3325,235 +3110,14 @@ async fn run_services(ctx: Arc<AppCtx>) {
         });
     }
 
-    // Usage push (docs/history/sleep-plan-v4.md §4.3/§4.6): POST the envelope to the device on
-    // fingerprint change or 5 min heartbeat. Connection errors just mean the
-    // device is in DEEP; the BLE/window path covers that.
-    {
-        let ctx = ctx.clone();
-        tokio::spawn(async move {
-            let client = match reqwest::Client::builder()
-                .no_proxy()
-                .timeout(Duration::from_secs(3))
-                .build()
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!("usage push client: {e}");
-                    return;
-                }
-            };
-            let mut last_fp: u64 = 0;
-            let mut last_ok: u64 = 0;
-            let mut last_gate: u64 = 0;
-            let mut last_contact_gen = ctx.activity.contact_generation();
-            let mut last_mode: Option<&'static str> = None;
-            let mut deep_skip_logged = false;
-            loop {
-                // Check the fingerprint every 3 s so an envelope change reaches
-                // the device well inside the T9 ≤5 s budget. A UDP endpoint
-                // update wakes the loop and skips the fingerprint gate.
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(3)) => {}
-                    _ = ctx.force_push.notified() => {}
-                }
-                let forced = take_ip_dirty(&ctx);
-                let usage = ctx.envelope.try_read().ok().and_then(|g| g.clone());
-                let Some(usage) = usage else { continue };
-                let fp = usage_fingerprint(&usage);
-                let now = now_secs() as u64;
-                // v0.14: a pull or announce means the device is awake again;
-                // treat it like a forced push so the fresh data goes out at once.
-                let contact_gen = ctx.activity.contact_generation();
-                let contact_new = contact_gen != last_contact_gen;
-                last_contact_gen = contact_gen;
-                // Bridge-controlled sleep: the desired mode is the same
-                // quiet/dwell decision as the pull response. A light->deep
-                // transition pushes immediately instead of waiting for the
-                // 5-minute heartbeat, so the device sleeps on the bridge's
-                // schedule (design §13.4).
-                let mode_now = ctx.activity.mode_str();
-                let mode_changed = last_mode != Some(mode_now);
-                // Expected deep sleep: the device pulls on its own schedule and
-                // cannot receive pushes; do not count failures or alert.
-                if ctx.activity.expects_deep() && !forced && !contact_new {
-                    if !deep_skip_logged {
-                        tracing::info!("device expected deep; pushes paused");
-                        deep_skip_logged = true;
-                    }
-                    continue;
-                }
-                deep_skip_logged = false;
-                // Registered devices use the coordinator data path (`/v2/data`),
-                // not the single-device Wi-Fi push: one device, one data channel.
-                if platform::is_v2_device(&ctx) {
-                    continue;
-                }
-                // Everything below concerns exactly one device: the selected
-                // one. Its occupancy, note, failure streak and address are read
-                // from that MAC's record.
-                let Some(mac) = selected_mac(&ctx) else {
-                    continue;
-                };
-                let Some(facts) = device_facts_for(&ctx, &mac) else {
-                    continue;
-                };
-                if facts.endpoint().is_empty() {
-                    continue;
-                }
-                // While occupied/yielded, re-check every 15 s so a lease expiry
-                // or another bridge's release is picked up before the 5 min
-                // heartbeat (the gate itself only spends HTTP when claiming).
-                let note_set = facts.note().is_some();
-                let recheck = note_set && now.saturating_sub(last_gate) >= 15;
-                let self_owned = facts
-                    .owner
-                    .as_ref()
-                    .and_then(|cache| cache.owner.clone())
-                    .filter(owner_valid)
-                    .map(|o| owner_id(&o) == Some(ctx.bridge_id.as_str()))
-                    .unwrap_or(false);
-                let renew_due = self_owned
-                    && facts
-                        .last_claim_at
-                        .map(|at| device_now_secs(&mac) - at >= 60)
-                        .unwrap_or(true);
-                let push_needed = forced
-                    || contact_new
-                    || fp != last_fp
-                    || now.saturating_sub(last_ok) >= 300
-                    || mode_changed;
-                if !push_needed && !recheck && !renew_due {
-                    continue;
-                }
-                last_gate = now;
-                // Auto occupation decision before every write (task-4): free ->
-                // claim, self -> renew (60 s), other -> do not push at all.
-                match occupancy_gate(&ctx, &mac).await {
-                    Occupancy::Owned => set_device_note(&ctx, &mac, None),
-                    Occupancy::Yielded => {
-                        set_device_note(
-                            &ctx,
-                            &mac,
-                            Some("已释放（本地让步），等待手动恢复".to_string()),
-                        );
-                        continue;
-                    }
-                    Occupancy::Other(owner) => {
-                        set_device_note(
-                            &ctx,
-                            &mac,
-                            Some(format!("被 {} 占用", owner_line(&owner))),
-                        );
-                        continue;
-                    }
-                    Occupancy::Failed(e) => {
-                        set_device_note(&ctx, &mac, Some(format!("占用检查失败：{e}")));
-                        continue;
-                    }
-                }
-                if !push_needed {
-                    // Renewal/recheck only: no data changed, keep the heartbeat.
-                    continue;
-                }
-                last_mode = Some(mode_now);
-                // Push envelope carries the mode decision (docs §13.4) so the
-                // device follows the bridge's quiet/dwell sleep schedule.
-                // `server_time`/`tz_offset_min` are stamped fresh here (the
-                // cached envelope's timestamp can be minutes old) so the device
-                // clock/timezone follow this PC on every push.
-                let mut push_usage = usage.clone();
-                if let Some(obj) = push_usage.as_object_mut() {
-                    obj.insert("server_time".to_string(), json!(now));
-                    obj.insert(
-                        "tz_offset_min".to_string(),
-                        json!(bridge_core::local_offset_minutes()),
-                    );
-                    obj.insert("mode".to_string(), Value::String(mode_now.to_string()));
-                    obj.insert(
-                        "next_contact_s".to_string(),
-                        json!(ctx.activity.next_contact_s()),
-                    );
-                    obj.insert("usage_rev".to_string(), json!(ctx.activity.usage_rev()));
-                }
-                let text = push_usage.to_string();
-                let device_ip = facts.endpoint();
-                let url = format!("http://{device_ip}/usage");
-                match client
-                    .post(&url)
-                    .bearer_auth(&ctx.config.token)
-                    .header("Content-Type", "application/json")
-                    .body(text)
-                    .send()
-                    .await
-                {
-                    Ok(resp) if resp.status().is_success() => {
-                        last_fp = fp;
-                        last_ok = now;
-                        ctx.activity.note_contact("push");
-                        tracing::info!("usage push -> {} ({})", resp.status(), url);
-                        let mut status = ctx.status.lock().unwrap();
-                        status.last_push_ok_at = Some(now as i64);
-                        status.push_fail_streak = 0;
-                        status.last_sync = Some(now as i64);
-                        if status
-                            .last_error
-                            .as_deref()
-                            .is_some_and(|e| e.starts_with("ble:"))
-                        {
-                            status.last_error = None;
-                            status.last_error_at = None;
-                        }
-                    }
-                    Ok(resp) if resp.status() == reqwest::StatusCode::CONFLICT => {
-                        // Lost a race with another bridge: show the new owner,
-                        // count it as a protocol outcome, not a push failure.
-                        let body = resp.text().await.unwrap_or_default();
-                        let doc: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-                        let owner = doc.get("owner").cloned().filter(|o| !o.is_null());
-                        let text = owner
-                            .as_ref()
-                            .map(|o| format!("被 {} 占用", owner_line(o)))
-                            .unwrap_or_else(|| "设备被其他桥占用".to_string());
-                        set_owner_cache(&ctx, &mac, owner);
-                        set_device_note(&ctx, &mac, Some(text));
-                        tracing::warn!("usage push rejected (409) by {device_ip}");
-                    }
-                    Ok(resp) => {
-                        tracing::warn!("usage push -> {} ({})", resp.status(), url);
-                        let mut status = ctx.status.lock().unwrap();
-                        status.last_error = Some(format!("push: HTTP {}", resp.status()));
-                        status.last_error_at = Some(now as i64);
-                        status.push_fail_streak = status.push_fail_streak.saturating_add(1);
-                        if status.push_fail_streak >= 2 {
-                            status.last_push_ok_at = None;
-                        }
-                    }
-                    Err(e) => {
-                        if ctx.activity.expects_deep() {
-                            // Device went to sleep; silence is expected.
-                            tracing::debug!("usage push skipped (device deep): {e}");
-                        } else {
-                            tracing::debug!("usage push skipped: {e}");
-                            let mut status = ctx.status.lock().unwrap();
-                            status.push_fail_streak = status.push_fail_streak.saturating_add(1);
-                            if status.push_fail_streak >= 2 {
-                                status.last_push_ok_at = None;
-                            }
-                        }
-                    }
-                }
-            }
-        });
-    }
-
     // v0.12 demand-driven BLE (docs/power-state.md §5/§9): no periodic scanning
     // and no template transfers. A cycle runs only when the device asks for a
     // handshake in its UDP announce (`ble=1`), which refreshes the endpoint
     // record (host/port/token) over the bonded link. Templates go over HTTP.
     //
     // Plan C: keep the 250 ms wake cadence and throttle actual GATT attempts
-    // independently for each registered v2 device.
-    let mut last_v2_attempt = HashMap::<String, i64>::new();
+    // independently for each registered device.
+    let mut last_device_attempt = HashMap::<String, i64>::new();
     loop {
         if ctx.status.lock().unwrap().paused {
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -3564,29 +3128,29 @@ async fn run_services(ctx: Arc<AppCtx>) {
             _ = tokio::time::sleep(Duration::from_millis(250)) => {}
         }
         let udp_request = ctx.udp_ble.swap(false, Ordering::SeqCst);
-        let current_is_v2 = platform::is_v2_device(&ctx);
+        let current_is_registered_device = platform::is_registered_device(&ctx);
         let devices = ctx.platform.devices();
-        let registered_v2 = v2_ble_candidates(&devices, &HashMap::new(), now_secs());
-        if !udp_request || current_is_v2 || !registered_v2.is_empty() {
-            let candidates = v2_ble_candidates(&devices, &last_v2_attempt, now_secs());
+        let registered_device = device_ble_candidates(&devices, &HashMap::new(), now_secs());
+        if !udp_request || current_is_registered_device || !registered_device.is_empty() {
+            let candidates = device_ble_candidates(&devices, &last_device_attempt, now_secs());
             if !candidates.is_empty() {
                 match platform::ble_cycle(&ctx, &candidates).await {
                     Ok(platform::BleOpportunity::NoDevice) => {}
                     Ok(platform::BleOpportunity::Connected { mac, result }) => {
-                        last_v2_attempt.insert(mac.clone(), device_now_secs(&mac));
+                        last_device_attempt.insert(mac.clone(), device_now_secs(&mac));
                         match result {
                             Ok(()) => tracing::info!(event = "result", device_mac = %mac,
-                                transport = "ble", "v2 rendezvous complete"),
+                                transport = "ble", "device rendezvous complete"),
                             Err(error) => tracing::warn!(event = "result", device_mac = %mac,
-                                transport = "ble", error_category = safe_v2_error_category(&error),
-                                "v2 rendezvous failed"),
+                                transport = "ble", error_category = safe_device_error_category(&error),
+                                "device rendezvous failed"),
                         }
                     }
                     Err(error) => {
                         tracing::debug!(
                             event = "result",
-                            error_category = safe_v2_error_category(&error),
-                            "v2 BLE opportunity unavailable"
+                            error_category = safe_device_error_category(&error),
+                            "device BLE opportunity unavailable"
                         );
                     }
                 }
@@ -3611,16 +3175,9 @@ async fn run_services(ctx: Arc<AppCtx>) {
             host: lan_ip(),
             port: ctx.config.port,
             token: ctx.config.token.clone(),
-            // Identity handshake only: `Some(vec![])` leaves templates untouched.
-            template_ids: Some(Vec::new()),
-            activate: None,
             scan_timeout_ms: 30000,
         };
-        let pusher = Pusher::new(
-            ble_cfg,
-            ctx.library.clone(),
-            format!("http://127.0.0.1:{}", ctx.config.port),
-        );
+        let pusher = Pusher::new(ble_cfg);
         match pusher.cycle_once(&adapter).await {
             Ok(info) => {
                 tracing::info!("ble handshake done (udp announce)");
@@ -3665,7 +3222,7 @@ async fn run_services(ctx: Arc<AppCtx>) {
     }
 }
 
-fn v2_ble_candidates(devices: &[Value], last_attempt: &HashMap<String, i64>, now: i64) -> Vec<String> {
+fn device_ble_candidates(devices: &[Value], last_attempt: &HashMap<String, i64>, now: i64) -> Vec<String> {
     devices
         .iter()
         .filter_map(|device| {
@@ -3683,7 +3240,7 @@ fn v2_ble_candidates(devices: &[Value], last_attempt: &HashMap<String, i64>, now
 }
 
 #[cfg(test)]
-mod v2_ble_candidate_tests {
+mod device_ble_candidate_tests {
     use super::*;
 
     fn device(mac: &str) -> Value {
@@ -3691,14 +3248,14 @@ mod v2_ble_candidate_tests {
     }
 
     #[test]
-    fn throttles_each_registered_v2_mac_independently() {
+    fn throttles_each_registered_device_mac_independently() {
         let devices = [device("AA:BB:CC:DD:EE:01"), device("aabbccddee02")];
         let attempts = HashMap::from([("AABBCCDDEE01".to_string(), 100)]);
 
-        let due = v2_ble_candidates(&devices, &attempts, 120);
+        let due = device_ble_candidates(&devices, &attempts, 120);
         assert_eq!(due, ["AABBCCDDEE02"]);
 
-        let due = v2_ble_candidates(&devices, &attempts, 155);
+        let due = device_ble_candidates(&devices, &attempts, 155);
         assert!(due.contains(&"AABBCCDDEE01".to_string()));
         assert!(due.contains(&"AABBCCDDEE02".to_string()));
     }
@@ -3709,7 +3266,7 @@ mod v2_ble_candidate_tests {
             device("not-a-mac"),
         ];
         let attempts = HashMap::from([("AABBCCDDEE03".to_string(), 100)]);
-        let due = v2_ble_candidates(&devices, &attempts, 120);
+        let due = device_ble_candidates(&devices, &attempts, 120);
         assert!(due.is_empty());
     }
 }
@@ -3812,7 +3369,7 @@ fn main() {
         envelope: Arc::new(RwLock::new(None)),
         library: Arc::new(RwLock::new(library)),
         force_ble: Arc::new(Notify::new()),
-        v2_delivery: tokio::sync::Mutex::new(()),
+        device_delivery: tokio::sync::Mutex::new(()),
         sim_control: tokio::sync::Mutex::new(()),
         per_mac_delivery: Mutex::new(HashMap::new()),
         status: Mutex::new(RuntimeStatus {
@@ -3820,20 +3377,14 @@ fn main() {
             last_error: None,
             last_error_at: None,
             paused: false,
-            last_push_at: None,
-            last_push_error: None,
-            last_push_ok_at: None,
-            push_fail_streak: 0,
         }),
         devices: Mutex::new(registry),
         bridge_name: Mutex::new(bridge_name),
         bridge_id,
-        v2_status_cache: Mutex::new(HashMap::new()),
+        device_status_cache: Mutex::new(HashMap::new()),
         arp_running: AtomicBool::new(false),
         udp_ble: AtomicBool::new(false),
-        push_requested: AtomicBool::new(false),
         activity: Arc::new(Activity::new()),
-        force_push: Arc::new(Notify::new()),
         mcp_port: Mutex::new(mcp_port),
         mcp_error: Mutex::new(None),
         mcp_tx,
@@ -4087,7 +3638,7 @@ mod claim_target_tests {
         (endpoint, worker)
     }
 
-    fn v2_fallback_server(
+    fn device_fallback_server(
         mac: &'static str,
         expect_claim: bool,
     ) -> (String, thread::JoinHandle<bool>) {
@@ -4108,7 +3659,7 @@ mod claim_target_tests {
 
             let (mut stream, _) = listener.accept().unwrap();
             let request = read_request(&mut stream);
-            assert!(request.starts_with("GET /v2/status "));
+            assert!(request.starts_with("GET /api/status "));
             assert!(request.contains("Authorization: Bearer endpoint-token\r\n"));
             let body = format!(
                 r#"{{"device_mac":"{mac}","session_nonce":"0123456789abcdef0123456789abcdef"}}"#
@@ -4184,8 +3735,8 @@ mod claim_target_tests {
     }
 
     #[tokio::test]
-    async fn claim_falls_back_to_authenticated_v2_status_before_posting() {
-        let (endpoint, server) = v2_fallback_server("AA:BB:CC:DD:EE:01", true);
+    async fn claim_falls_back_to_authenticated_device_status_before_posting() {
+        let (endpoint, server) = device_fallback_server("AA:BB:CC:DD:EE:01", true);
         let result = post_claim_to_endpoint(
             &endpoint,
             "aa-bb-cc-dd-ee-01",
@@ -4205,8 +3756,8 @@ mod claim_target_tests {
     }
 
     #[tokio::test]
-    async fn claim_refuses_wrong_v2_target_mac_without_posting() {
-        let (endpoint, server) = v2_fallback_server("AA:BB:CC:DD:EE:02", false);
+    async fn claim_refuses_wrong_device_target_mac_without_posting() {
+        let (endpoint, server) = device_fallback_server("AA:BB:CC:DD:EE:02", false);
         let result = post_claim_to_endpoint(
             &endpoint,
             "AA:BB:CC:DD:EE:01",
@@ -4227,10 +3778,10 @@ mod claim_target_tests {
 }
 
 #[cfg(test)]
-mod v2_status_cache_tests {
+mod device_status_cache_tests {
     use super::{
-        update_v2_claim_cache, update_v2_owner_cache, update_v2_status_cache,
-        v2_cycle_targets, v2_occupancy_decision, CachedV2Status, V2OccupancyDecision,
+        update_device_claim_cache, update_device_owner_cache, update_device_status_cache,
+        device_cycle_targets, device_occupancy_decision, CachedDeviceStatus, DeviceOccupancyDecision,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -4246,21 +3797,21 @@ mod v2_status_cache_tests {
             json!({"device_mac": "", "ip": "192.168.3.12"}),
         ];
         let mut cache = HashMap::new();
-        update_v2_status_cache(
+        update_device_status_cache(
             &mut cache,
             mac_a,
             true,
             Some(json!({"device_mac": mac_a})),
             100,
         );
-        update_v2_status_cache(
+        update_device_status_cache(
             &mut cache,
             mac_b,
             true,
             Some(json!({"device_mac": mac_b})),
             69,
         );
-        update_v2_status_cache(
+        update_device_status_cache(
             &mut cache,
             mac_unregistered,
             true,
@@ -4269,23 +3820,23 @@ mod v2_status_cache_tests {
         );
 
         assert_eq!(
-            v2_cycle_targets(&devices, &cache, 100),
+            device_cycle_targets(&devices, &cache, 100),
             vec!["AABBCCDDEE01"]
         );
     }
 
     #[test]
     fn online_offline_and_mismatched_updates_stay_with_their_mac() {
-        let mut cache: HashMap<String, CachedV2Status> = HashMap::new();
+        let mut cache: HashMap<String, CachedDeviceStatus> = HashMap::new();
         let mac_a = "AA:BB:CC:DD:EE:01";
         let mac_b = "AA:BB:CC:DD:EE:02";
         let status_a = json!({"device_mac": mac_a, "fw": "a"});
         let status_b = json!({"device_mac": mac_b, "fw": "b"});
 
-        update_v2_status_cache(&mut cache, mac_a, true, Some(status_a.clone()), 10);
-        update_v2_status_cache(&mut cache, mac_b, true, Some(status_b.clone()), 11);
+        update_device_status_cache(&mut cache, mac_a, true, Some(status_a.clone()), 10);
+        update_device_status_cache(&mut cache, mac_b, true, Some(status_b.clone()), 11);
         // A failed/mismatched response for A changes only A's reachability.
-        update_v2_status_cache(&mut cache, "aa-bb-cc-dd-ee-01", false, None, 12);
+        update_device_status_cache(&mut cache, "aa-bb-cc-dd-ee-01", false, None, 12);
 
         let a = &cache["AABBCCDDEE01"];
         let b = &cache["AABBCCDDEE02"];
@@ -4302,22 +3853,22 @@ mod v2_status_cache_tests {
         let mac_a = "AA:BB:CC:DD:EE:01";
         let mac_b = "AA:BB:CC:DD:EE:02";
         let mut cache = HashMap::new();
-        update_v2_status_cache(
+        update_device_status_cache(
             &mut cache,
             mac_a,
             true,
             Some(json!({"owner": {"id": "bridge-a", "expires_in_s": 100}})),
             100,
         );
-        update_v2_status_cache(
+        update_device_status_cache(
             &mut cache,
             mac_b,
             true,
             Some(json!({"owner": {"id": "bridge-b", "expires_in_s": 100}})),
             100,
         );
-        update_v2_claim_cache(&mut cache, mac_a, None, 40, false);
-        update_v2_claim_cache(
+        update_device_claim_cache(&mut cache, mac_a, None, 40, false);
+        update_device_claim_cache(
             &mut cache,
             mac_b,
             Some(json!({"id": "bridge-b", "expires_in_s": 100})),
@@ -4326,24 +3877,24 @@ mod v2_status_cache_tests {
         );
         let b_before = cache["AABBCCDDEE02"].clone();
 
-        update_v2_status_cache(&mut cache, mac_a, false, None, 101);
+        update_device_status_cache(&mut cache, mac_a, false, None, 101);
         assert!(matches!(
-            v2_occupancy_decision("AABBCCDDEE01", cache.get("AABBCCDDEE01"), "bridge-a", 101),
-            V2OccupancyDecision::Offline
+            device_occupancy_decision("AABBCCDDEE01", cache.get("AABBCCDDEE01"), "bridge-a", 101),
+            DeviceOccupancyDecision::Offline
         ));
         assert_eq!(cache["AABBCCDDEE02"].owner, b_before.owner);
         assert_eq!(cache["AABBCCDDEE02"].last_claim_at, b_before.last_claim_at);
         assert_eq!(cache["AABBCCDDEE02"].yielded, b_before.yielded);
 
         // A fresh status reporting another owner blocks A only.
-        update_v2_status_cache(
+        update_device_status_cache(
             &mut cache,
             mac_a,
             true,
             Some(json!({"owner": {"id": "bridge-c", "expires_in_s": 100}})),
             102,
         );
-        update_v2_owner_cache(
+        update_device_owner_cache(
             &mut cache,
             mac_a,
             json!({"id": "bridge-c", "expires_in_s": 100}),
@@ -4352,19 +3903,19 @@ mod v2_status_cache_tests {
         assert_eq!(cache["AABBCCDDEE01"].last_claim_at, Some(40));
         assert_eq!(cache["AABBCCDDEE01"].owner_observed_at, Some(102));
         assert!(matches!(
-            v2_occupancy_decision("AABBCCDDEE01", cache.get("AABBCCDDEE01"), "bridge-a", 102),
-            V2OccupancyDecision::Other(_)
+            device_occupancy_decision("AABBCCDDEE01", cache.get("AABBCCDDEE01"), "bridge-a", 102),
+            DeviceOccupancyDecision::Other(_)
         ));
 
         // A successful per-MAC renewal updates A without changing B.
-        update_v2_status_cache(
+        update_device_status_cache(
             &mut cache,
             mac_a,
             true,
             Some(json!({"owner": {"id": "bridge-a", "expires_in_s": 100}})),
             102,
         );
-        update_v2_claim_cache(
+        update_device_claim_cache(
             &mut cache,
             mac_a,
             Some(json!({"id": "bridge-a", "expires_in_s": 100})),
@@ -4372,8 +3923,8 @@ mod v2_status_cache_tests {
             false,
         );
         assert!(matches!(
-            v2_occupancy_decision("AABBCCDDEE01", cache.get("AABBCCDDEE01"), "bridge-a", 103),
-            V2OccupancyDecision::Owned { renew: false }
+            device_occupancy_decision("AABBCCDDEE01", cache.get("AABBCCDDEE01"), "bridge-a", 103),
+            DeviceOccupancyDecision::Owned { renew: false }
         ));
         assert_eq!(cache["AABBCCDDEE02"].owner, b_before.owner);
         assert_eq!(
@@ -4383,8 +3934,8 @@ mod v2_status_cache_tests {
         assert_eq!(cache["AABBCCDDEE02"].last_claim_at, b_before.last_claim_at);
         assert_eq!(cache["AABBCCDDEE02"].yielded, b_before.yielded);
         assert!(matches!(
-            v2_occupancy_decision("AABBCCDDEE02", cache.get("AABBCCDDEE02"), "bridge-b", 103),
-            V2OccupancyDecision::Yielded
+            device_occupancy_decision("AABBCCDDEE02", cache.get("AABBCCDDEE02"), "bridge-b", 103),
+            DeviceOccupancyDecision::Yielded
         ));
     }
 
@@ -4395,19 +3946,19 @@ mod v2_status_cache_tests {
         bridge_core::device_clock::configure(mac, 1000, 1_000_000, 0).unwrap();
         bridge_core::device_clock::configure(other, 7000, 2_000_000, 0).unwrap();
         let mut cache = HashMap::new();
-        update_v2_status_cache(&mut cache, mac, true,
+        update_device_status_cache(&mut cache, mac, true,
             Some(json!({"owner":{"id":"bridge-a","expires_in_s":120}})), 1000);
-        update_v2_claim_cache(&mut cache, mac,
+        update_device_claim_cache(&mut cache, mac,
             Some(json!({"id":"bridge-a","expires_in_s":120})),1000,false);
         bridge_core::device_clock::set_wall(mac, 9_000_000).unwrap();
         let status = &cache[mac];
-        assert!(super::v2_status_fresh(mac,status,9000,30));
-        assert!(!super::v2_claim_renew_due(mac,status,9000));
+        assert!(super::device_status_fresh(mac,status,9000,30));
+        assert!(!super::device_claim_renew_due(mac,status,9000));
         bridge_core::device_clock::step(mac,30_001).unwrap();
-        assert!(!super::v2_status_fresh(mac,status,9000,30));
-        assert!(!super::v2_claim_renew_due(mac,status,9000));
+        assert!(!super::device_status_fresh(mac,status,9000,30));
+        assert!(!super::device_claim_renew_due(mac,status,9000));
         bridge_core::device_clock::step(mac,29_999).unwrap();
-        assert!(super::v2_claim_renew_due(mac,status,9000));
+        assert!(super::device_claim_renew_due(mac,status,9000));
         assert_eq!(bridge_core::device_clock::monotonic_ms(other),Some(7000));
         bridge_core::device_clock::clear(mac);
         bridge_core::device_clock::clear(other);

@@ -378,6 +378,31 @@ pub const ROW_BYTES: usize = (WIDTH as usize + 7) / 8;
 pub const BUF_LEN: usize = ROW_BYTES * HEIGHT as usize;
 
 extern "C" {
+    #[cfg(test)]
+    fn codex_sync_core_check() -> c_int;
+    #[cfg(test)]
+    fn codex_sync_store_check() -> c_int;
+    fn codex_sim_sync_new(data_dir: *const c_char, mac: *const c_char,
+        target: *const c_char, seed: u64, boot_id: u64,
+        wake_cause: *const c_char) -> *mut std::ffi::c_void;
+    fn codex_sim_sync_free(p: *mut std::ffi::c_void);
+    fn codex_sim_sync_set_owner(p: *mut std::ffi::c_void,
+        owner: *const c_char, enabled: c_int) -> c_int;
+    fn codex_sim_sync_round(p: *mut std::ffi::c_void, wake_seq: u32,
+        uptime_ms: u32) -> c_int;
+    fn codex_sim_sync_reason(p: *mut std::ffi::c_void, bit: c_int,
+        uptime_ms: u32) -> c_int;
+    fn codex_sim_sync_append_text(p: *mut std::ffi::c_void,
+        text: *const c_char, uptime_ms: u32) -> c_int;
+    fn codex_sim_sync_corrupt(p: *mut std::ffi::c_void,
+        header: c_int, seq: u64) -> c_int;
+    fn codex_sim_sync_fail(p: *mut std::ffi::c_void, uptime_ms: u32) -> c_int;
+    fn codex_sim_sync_consume_skip(p: *mut std::ffi::c_void) -> c_int;
+    fn codex_sim_sync_status(p: *mut std::ffi::c_void,
+        out: *mut c_char, cap: c_int) -> c_int;
+    fn codex_sim_sync_command(p: *mut std::ffi::c_void,
+        operation: *const c_char, message: *const c_char,
+        snapshot: *const c_char, out: *mut c_char, cap: c_int) -> c_int;
     fn codex_sim_bundle_new(data_dir: *const c_char, target: *const c_char,
         boot_id: u64, wake_cause: *const c_char) -> *mut std::ffi::c_void;
     fn codex_sim_bundle_free(p: *mut std::ffi::c_void);
@@ -511,6 +536,98 @@ extern "C" {
     ) -> c_int;
 }
 
+#[cfg(test)]
+#[test]
+fn shared_sync_core_integrity() {
+    assert_eq!(unsafe { codex_sync_core_check() }, 0);
+    assert_eq!(unsafe { codex_sync_store_check() }, 0);
+}
+
+/// Host instance of the production diagnostic ring and frozen Flash store.
+/// The host LittleFS shim is process global, so use one instance per process.
+pub struct SimulatorSync { state: *mut std::ffi::c_void }
+unsafe impl Send for SimulatorSync {}
+
+impl SimulatorSync {
+    pub fn new(data_dir: &std::path::Path, mac: &str, target: &str,
+               seed: u64, boot_id: u64, wake_cause: &str) -> anyhow::Result<Self> {
+        let dir = CString::new(data_dir.to_str().ok_or_else(||
+            anyhow::anyhow!("simulator data directory is not UTF-8"))?)?;
+        let mac = CString::new(mac)?;
+        let target = CString::new(target)?;
+        let wake = CString::new(wake_cause)?;
+        let state = unsafe { codex_sim_sync_new(dir.as_ptr(), mac.as_ptr(),
+            target.as_ptr(), seed, boot_id, wake.as_ptr()) };
+        anyhow::ensure!(!state.is_null(), "simulator sync store unavailable");
+        Ok(Self { state })
+    }
+
+    pub fn set_owner(&mut self, owner: &str, enabled: bool) -> anyhow::Result<()> {
+        let owner = CString::new(owner)?;
+        anyhow::ensure!(unsafe { codex_sim_sync_set_owner(self.state,
+            owner.as_ptr(), enabled as c_int) } == 1, "sync owner persistence failed");
+        Ok(())
+    }
+
+    pub fn deep_round(&mut self, wake_seq: u32, uptime_ms: u32) -> anyhow::Result<()> {
+        anyhow::ensure!(unsafe { codex_sim_sync_round(self.state, wake_seq, uptime_ms) } == 1,
+            "sync RTC persistence failed");
+        Ok(())
+    }
+
+    pub fn add_reason(&mut self, bit: i32, uptime_ms: u32) -> anyhow::Result<()> {
+        anyhow::ensure!(unsafe { codex_sim_sync_reason(self.state, bit, uptime_ms) } == 1,
+            "sync RTC persistence failed");
+        Ok(())
+    }
+
+    pub fn append_text(&mut self, text: &str, uptime_ms: u32) -> anyhow::Result<()> {
+        let text = CString::new(text)?;
+        anyhow::ensure!(unsafe { codex_sim_sync_append_text(self.state,
+            text.as_ptr(), uptime_ms) } == 1, "sync diagnostic append failed");
+        Ok(())
+    }
+
+    pub fn corrupt(&mut self, header: bool, seq: u64) -> anyhow::Result<()> {
+        anyhow::ensure!(unsafe { codex_sim_sync_corrupt(self.state,
+            header as c_int, seq) } == 1, "sync diagnostic corruption point unavailable");
+        Ok(())
+    }
+
+    pub fn fail(&mut self, uptime_ms: u32) -> anyhow::Result<()> {
+        anyhow::ensure!(unsafe { codex_sim_sync_fail(self.state, uptime_ms) } == 1,
+            "sync failure could not be persisted");
+        Ok(())
+    }
+
+    pub fn consume_skip(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(unsafe { codex_sim_sync_consume_skip(self.state) } == 1,
+            "sync skip could not be persisted");
+        Ok(())
+    }
+
+    pub fn status(&self) -> anyhow::Result<serde_json::Value> {
+        let mut out = vec![0i8; 8192];
+        let rc = unsafe { codex_sim_sync_status(self.state, out.as_mut_ptr(), out.len() as c_int) };
+        simulator_ffi_json(rc, &out, "sync status")
+    }
+
+    pub fn command(&mut self, op: &str, message: &str,
+                   snapshot: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let op = CString::new(op)?;
+        let message = CString::new(message)?;
+        let snapshot = CString::new(snapshot.to_string())?;
+        let mut out = vec![0i8; 8192];
+        let rc = unsafe { codex_sim_sync_command(self.state, op.as_ptr(), message.as_ptr(),
+            snapshot.as_ptr(), out.as_mut_ptr(), out.len() as c_int) };
+        simulator_ffi_json(rc, &out, "sync command")
+    }
+}
+
+impl Drop for SimulatorSync {
+    fn drop(&mut self) { unsafe { codex_sim_sync_free(self.state) } }
+}
+
 /// Executes the firmware Bundle decisions and A/B store in the simulator's
 /// single C++ device context. One instance is allowed per process.
 pub struct SimulatorBundle {
@@ -640,7 +757,7 @@ impl Drop for SimulatorBundle {
     fn drop(&mut self) { unsafe { codex_sim_bundle_free(self.state) }; }
 }
 
-/// Build the simulator's `/v2/status` payload with the firmware's C++ builder.
+/// Build the simulator's `/api/status` payload with the firmware's C++ builder.
 /// This only creates a status snapshot; it does not simulate command side effects.
 pub fn simulator_status_snapshot(input: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
     let input = serde_json::to_string(input)?;

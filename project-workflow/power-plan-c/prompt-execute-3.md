@@ -22,7 +22,7 @@
 - 已提交 **`99ef3c0`**（上一基线 `e1e93fc`），本次提交包含：`src/main.cpp`、`src/ble_bridge.{h,cpp}`、
   `bridge/crates/ble/{lib.rs,Cargo.toml,examples/adv-spike.rs}`、
   `bridge/crates/{app/src/{main,platform}.rs, core/src/{coordinator.rs,platform/service.rs}}`、
-  plan/status/task-2/4/5 文档、新增 task-6；`docs/generic-display-platform-design-v2.md` 与
+  plan/status/task-2/4/5 文档、新增 task-6；`docs/generic-display-platform-design.md` 与
   `PROGRESS.md` 已被上游同步（勿回退）。**勿动** `docs/fake-rom-simulator-design.md`。
 - ROM：0.17.5 `6D46A6A0…`、0.17.6 `C1C43933…`、0.17.7 `9EF5981B…`、0.17.8 `31F7EA73…`、
   0.17.9 `36359E9D…`（`artifacts/codex-status-0.17.*.bin`）。

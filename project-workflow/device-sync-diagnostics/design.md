@@ -20,7 +20,7 @@
 
 | 事实 | 源位置（定稿时，行号可能随实现移动） |
 |---|---|
-| 当前 v2 timer 只开 BLE，light Plan 后才走 Wi-Fi | src/main.cpp:4596、4600、5724 |
+| 当前 timer 只开 BLE，light Plan 后才走 Wi-Fi | src/main.cpp:4596、4600、5724 |
 | 15 分钟是 BLE history 取数周期，不是第 15 轮 Wi-Fi | bridge/crates/app/src/wake_history.rs:15；platform.rs:1415、1648、1700 |
 | RTC history 64×48 B；文字日志另有普通 RAM 4096 B环 | src/main.cpp:500、552、574；src/dev_log.cpp:3 |
 | 命令检查 protocol/MAC/request_id/session_nonce；BLE 要绑定、加密及 endpoint token | src/v2_command_envelope.cpp；src/main.cpp:4091、4518 |
@@ -35,7 +35,7 @@
 
 每 MAC 复用现有 coordinator，最多一个活动同步批次；不得另建通用任务框架。不同设备计数、日志、游标、owner、任务完全隔离。
 
-Wi-Fi MAC 为身份；IP、显示名、广播仅是发现属性。保持 endpoint token（v2业务）与 device token（claim/OTA等操作）分域。新同步端点必须有有效匹配 owner；owner为空返回 claim_required，由现有显式 POST /claim 建立，不能靠 begin/data/读取隐式占用。BLE开网可沿用现有空闲owner bootstrap例外，但只给网络机会；有效他人owner拒绝。所有命令不隐式续 owner/light。
+Wi-Fi MAC 为身份；IP、显示名、广播仅是发现属性。保持 endpoint token（业务请求）与 device token（claim/OTA等操作）分域。新同步端点必须有有效匹配 owner；owner为空返回 claim_required，由现有显式 POST /claim 建立，不能靠 begin/data/读取隐式占用。BLE开网可沿用现有空闲owner bootstrap例外，但只给网络机会；有效他人owner拒绝。所有命令不隐式续 owner/light。
 
 Profile仍为1–8有序项，全参与循环；保存不发布。同步不自动上传模板/OTA，也不自动把所有排队工作加入批次。Data仍按完整快照和原ACK推进指纹/full_sync_deadline；诊断完成不能替代Data ACK。
 
@@ -62,19 +62,19 @@ Profile仍为1–8有序项，全参与循环；保存不发布。同步不自�
 - 若第15轮同窗收到有效light Plan，复用该Wi-Fi连接作light_enter+periodic，只冻结一次。
 - 同步中收到新正式light Plan可正常接受；先完成旧批次，再执行新light入场义务。Light截止后新计划仍可改变正式计划，同步本身不改变它。
 
-同步功能通过下面的BLE配置显式协商；已登记v2设备升级后由Bridge自动配置，是协议维护，不等于授权模板发布。原sync_enabled控制Data投递，不禁用本专项状态/诊断同步。
+同步功能通过下面的BLE配置显式协商；已登记设备升级后由Bridge自动配置，是协议维护，不等于授权模板发布。原sync_enabled控制Data投递，不禁用本专项状态/诊断同步。当前设备业务协议的一次性统一见 `protocol-unification.md`，本节使用统一后的 wire 字面。
 
 ## 4. 认证、信封与能力
 
-新增能力在认证GET /v2/status及BLE status中报告：
+新增能力在认证GET /api/status及BLE status中报告：
 
 sync_v1=1、diag_format=1、diag_capacity=4096、image_identity=["sha256-running-prefix-v1"]。
 
-旧ROM缺省即不支持。BLE status仅新增紧凑sync对象：v、enabled、rounds、due、retry_skip、pending（布尔）、completed_serial（十进制字符串）；普通BLE不包含诊断页、完整Wi-Fi详情或镜像摘要。
+BLE status仅新增紧凑sync对象：v、enabled、rounds、due、retry_skip、pending（布尔）、completed_serial（十进制字符串）；普通BLE不包含诊断页、完整Wi-Fi详情或镜像摘要。升级窗口内的旧ROM缺此能力，生产切换后不作为可用业务目标。
 
-新HTTP命令共同信封：protocol=2、device_mac（12位大写hex）、bridge_id、session_nonce、request_id（1–64 ASCII字符）、sync_version=1。所有POST的Content-Type为application/json，body最大4096 B。Authorization: Bearer <endpoint token>；复用当前endpoint匹配方法，不接受token查询参数。BLE沿用绑定+加密peer与JSON token核验，并使用同一信封。重启后先status取新nonce；持久操作键不依赖nonce。
+HTTP命令共同信封：device_mac（规范化MAC）、bridge_id、session_nonce、request_id（1–64 ASCII字符）；同步端点另需sync_version=1作为批次格式。所有POST的Content-Type为application/json，body最大4096 B。Authorization: Bearer <endpoint token>；复用当前endpoint匹配方法，不接受token查询参数。BLE沿用绑定+加密peer与JSON token核验，并使用同一身份信封；`rv=2`/`protocol=2` 旧帧须在副作用前拒绝。重启后先status取新nonce；持久操作键不依赖nonce。
 
-SHA256统一为64位小写hex；Base64使用RFC4648标准字母表和padding、无空白。device_mac除规范化入口外必须完全匹配，不按前后缀匹配。所有成功HTTP响应含op（sync_begin/page/ack/complete/arm/image）、result（applied或already_complete）、request_id、device_mac、session_nonce、sync_version=1及端点结果字段；page使用result=applied，ack另含batch_id/acked_offset，complete另含receipt（§5.5字段），arm另含ticket/job_id。未知JSON字段可忽略，但不能影响幂等键；缺必填/类型错/枚举错返回shape。request_id只关联一次请求，batch_id/client_serial才是持久幂等键。
+SHA256统一为64位小写hex；Base64使用RFC4648标准字母表和padding、无空白。device_mac除规范化入口外必须完全匹配，不按前后缀匹配。所有成功HTTP响应含op（sync_begin/page/ack/complete/arm/image）、result（applied或already_complete）、request_id、device_mac、session_nonce、sync_version=1及端点结果字段；page使用result=applied，ack另含batch_id/acked_offset，complete另含receipt（§5.5字段），arm另含ticket/job_id。未知JSON字段可忽略，但退役的平台 `protocol`/`rv` 字段必须拒绝且不能影响幂等键；缺必填/类型错/枚举错返回shape。request_id只关联一次请求，batch_id/client_serial才是持久幂等键。
 
 新命令的检查顺序：token→JSON/尺寸→MAC及信封→owner→能力/参数→幂等/状态→副作用。旧端点的错误顺序不改。错误统一result=rejected、error=<code>、op、request_id；已通过身份检查的响应包含device_mac/session_nonce。HTTP码：
 
@@ -102,18 +102,18 @@ light入/离场复用已授权Wi-Fi会话。OTA重启使用§9预先持久arm；
 
 ### 4.2 HTTP端点
 
-全部方向为Bridge→设备。GET /v2/status保留旧形状并增同步摘要。完整详情只由以下begin冻结，避免普通BLE增肥。
+全部方向为Bridge→设备。GET /api/status保留旧形状并增同步摘要。完整详情只由以下begin冻结，避免普通BLE增肥。
 
 | 端点 | 参数（除共同信封） | 结果 |
 |---|---|---|
-| POST /v2/sync/begin | client_serial:string，reasons:[枚举] | 冻结/恢复批次manifest |
-| POST /v2/sync/page | batch_id、offset:uint32、limit:uint16 | 原始冻结文件字节页 |
-| POST /v2/sync/ack | batch_id、offset:uint32、prefix_sha256 | Bridge已持久连续前缀确认 |
-| POST /v2/sync/complete | batch_id、bytes:uint32、sha256 | Bridge整批持久确认，设备原子收据 |
-| POST /v2/sync/arm | job_id、kind=ota、image_bytes:uint32、file_sha256 | 持久化一次OTA后确认授权，返回ticket |
-| POST /v2/sync/image | image_bytes:uint32 | 当前运行分区前N字节SHA256，见§9 |
+| POST /api/sync/begin | client_serial:string，reasons:[枚举] | 冻结/恢复批次manifest |
+| POST /api/sync/page | batch_id、offset:uint32、limit:uint16 | 原始冻结文件字节页 |
+| POST /api/sync/ack | batch_id、offset:uint32、prefix_sha256 | Bridge已持久连续前缀确认 |
+| POST /api/sync/complete | batch_id、bytes:uint32、sha256 | Bridge整批持久确认，设备原子收据 |
+| POST /api/sync/arm | job_id、kind=ota、image_bytes:uint32、file_sha256 | 持久化一次OTA后确认授权，返回ticket |
+| POST /api/sync/image | image_bytes:uint32 | 当前运行分区前N字节SHA256，见§9 |
 
-GET /v2/status新增sync详情：enabled、phase、rounds、due、baseline、pending_batch（manifest或null）、last_completed（收据或null）、last_error、retry_skip、confirmation_pending。HTTP可完整；BLE只发前述轻量投影。
+GET /api/status新增sync详情：enabled、phase、rounds、due、baseline、pending_batch（manifest或null）、last_completed（收据或null）、last_error、retry_skip、confirmation_pending。HTTP可完整；BLE只发前述轻量投影。
 
 ## 5. 冻结文件、序号、页面与持久ACK
 
@@ -257,11 +257,11 @@ BLE只更新实际包含的轻量组字段；不刷新整个Wi-Fi组年龄。字
 
 失败更新last_attempt，不改last_success/原时间。wall倒退标clock_anomaly，超时用单调时间；无可信wall只显示收到于/本次启动采样。公开status/ARP只作候选，不覆盖认证缓存。界面读本地快照，不为绘制页面隐式开Wi-Fi或续计划。设备页删Codex余量；模板归属只声明，数据页布局不动。
 
-## 11. 兼容、恢复与能力升级
+## 11. 一次性切换、恢复与能力
 
-新ROM默认sync disabled；旧Bridge不配置，保持旧业务。新Bridge对无sync_v1旧ROM继续旧BLE history，不声称第15轮已实现；对新ROM配置成功后停止history_sync_ms与BLE history拉取。混合能力按MAC处理。
+新ROM默认sync disabled；旧Bridge与新ROM错版只允许发生在两台设备逐台OTA的受控窗口。旧HTTP业务路径不存在，旧BLE的 `rv`/`protocol` 帧被拒绝；旧Bridge可继续给尚未升级的另一台设备服务，不把新设备的暂时不可管理状态当同步成功。两台新ROM均经身份/版本观察后才切换生产Bridge。新Bridge只使用当前 `/api/*`，认证能力不满足即拒绝管理，不恢复旧BLE history业务。切换与回退次序见 `protocol-unification.md`。
 
-已启用设备被旧Bridge接管时，必须新owner重新配置；同owner回退旧Bridge可能无法complete，90s无进展保证异常退出，pending不丢；回退操作说明应先sync_config disabled。不会无限在线，不把异常当成功。配置disabled保留已冻结数据供未来恢复，旧Bridge不用它。
+已启用设备遇同owner旧Bridge时，90s无进展保证异常退出，pending不丢；Bridge回退需逐台回退旧ROM后才恢复旧业务。新owner必须重新配置。配置disabled保留已冻结数据供未来恢复，不借兼容路径泄露给旧Bridge。
 
 RTC使用独立diag magic/schema，不修改其它RTC保留域的magic。旧history整体结束为旧代际；无法证明恢复的记录报告migration_gap，不解释成新格式。旧JSONL留为legacy只读归档；新流不再写它。新增持久字段带默认值，不删除设备/Profile/contexts/plans/keys；不得删target/debug/data。
 
@@ -269,9 +269,11 @@ RTC使用独立diag magic/schema，不修改其它RTC保留域的magic。旧hist
 
 ## 12. Fake ROM主验收与明确限制
 
-已有真实同源C++ v2业务、V2Connection loopback、分片和独立时钟；D/E/F历史出口不是新功能证据。device-sim目前power.light才开放HTTP、timer窗口模型固定5s，runner只对light做HTTP且BLE失败直接终止，必须补接sync phase、预期故障、未来I/O事件和跨deep诊断。
+已有真实同源C++设备业务、DeviceConnection loopback、分片和独立时钟；D/E/F历史出口不是新功能证据。device-sim目前power.light才开放HTTP、timer窗口模型固定5s，runner只对light做HTTP且BLE失败直接终止，必须补接sync phase、预期故障、未来I/O事件和跨deep诊断。
 
 新增决定由固件/宿主共享小切片，不在Rust复制状态机；读取Flash/RTC/无线的宿主适配可模拟。控制面只注入环境和校验真相，Bridge只走设备面。所有u64串、文件字节、CRC/容量、序号及错误顺序同源对拍。
+
+**生产与 Fake ROM 的边界（主代理 2026-09-28 核对）：** `v2_sync` 的诊断环、轮数及完成状态和 `v2_sync_store` 的冻结存储已适合两端共用；冻结文件格式以及 begin/page/ack/complete 的状态、幂等和错误判定也必须经同一个生产 C++ 协议入口。固件 HTTP handler 留下 WebServer、token/owner/session、真实快照、随机源与无线操作；Fake ROM 留下 HTTP/BLE loopback、虚拟时钟和物理可达性、按目录存储与故障注入，不另写协议结果。当前生产 `src/main.cpp` 与 `bridge/crates/render/src/sim_sync.cpp` 对这些协议决定各有一份实现，是实施中需要收敛的现场，不是已验收能力。每个 Fake ROM 进程只模拟一台设备时，现有进程全局 `v2_sync_store` 可保留，但必须在同步存储初始化前显式绑定该设备 `dataDir` 并证明多设备进程互不串目录；无需为此先引入多实例存储框架。`SimPower` 与 runner 的环境调度可以保留，不得另算 sync 的 rounds/due/retry/complete。核心单测不能替代经真实 Bridge 客户端与 Fake ROM HTTP/BLE 路径的集成证据。
 
 主要出口是task.md S01–S14及双target可重放虚拟24h场景；至少一次Bridge和设备真实进程kill/restart。实机只验RF/GATT、真实RTC/Flash/分区/bootloader、物理按键/面板和必要电池端积分；软件通过不冒充硬件。
 

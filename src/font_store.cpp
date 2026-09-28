@@ -192,6 +192,9 @@ bool fontStoreWrite(const uint8_t *bytes, size_t len, FontAssetInfo &info,
     fontStoreUsage(used, count);
     if (count >= FONT_STORE_MAX_PER_PROFILE) { err = "font_cap_count"; return false; }
     if (used + len > FONT_STORE_MAX_BYTES) { err = "font_cap_bytes"; return false; }
+    if (LittleFS.totalBytes() - LittleFS.usedBytes() < len + 40960) {
+        err = "font_space"; return false;
+    }
 
     String tmp = fontPath(info.id) + ".tmp";
     String dst = fontPath(info.id);

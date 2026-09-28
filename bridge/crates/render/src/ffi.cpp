@@ -10,6 +10,8 @@
 #include "v2_claim_command.h"
 #include "v2_command_envelope.h"
 #include "v2_status_snapshot.h"
+#include "v2_sync.h"
+#include "v2_sync_store.h"
 #include "bundle_store.h"
 #include "font_asset.h"
 #include "font_store.h"
@@ -20,6 +22,7 @@
 
 #include <cstring>
 #include <cstdio>
+#include <string>
 #include <vector>
 
 SerialClass Serial;
@@ -157,6 +160,76 @@ void writeBundleRx(JsonObject out, const V2BundleRx &rx) {
 
 extern "C" {
 
+int codex_sync_core_check() {
+    SyncRtc rtc{};
+    uint8_t generation[16] = {1};
+    if (syncRecover(rtc, generation) || rtc.rounds != 15) return 1;
+    uint8_t digest[32];
+    char hex[65];
+    syncSha256((const uint8_t *)"abc", 3, digest);
+    syncHex(digest, 32, hex);
+    if (strcmp(hex, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")) return 2;
+    uint8_t payload[96] = {};
+    for (int i = 0; i < 50; ++i)
+        if (!syncAppend(rtc, SYNC_TEXT, 0, 7, i, payload, sizeof(payload))) return 3;
+    SyncRecord first;
+    uint16_t next = 0;
+    if (!syncReadAt(rtc, 0, first, next) || first.seq != syncEarliestSeq(rtc) || first.seq <= 1) return 4;
+    syncComplete(rtc, 9, rtc.nextSeq - 1, 0);
+    for (int i = 0; i < 14; ++i) syncCountDeepRendezvous(rtc);
+    if (rtc.rounds != 14 || (rtc.flags & 1)) return 5;
+    syncCountDeepRendezvous(rtc);
+    if (rtc.rounds != 15 || !(rtc.flags & 1)) return 6;
+    syncComplete(rtc, 9, rtc.nextSeq - 1, 0);
+    if (rtc.rounds != 15 || !syncRecover(rtc, generation)) return 7;
+    rtc.headerCrc ^= 1;
+    if (syncRecover(rtc, generation) || rtc.rounds != 15) return 8;
+    char clean[97]; uint8_t flags = 0;
+    if (syncSanitizeText("[sync] token=PRIVATE", 20, clean, flags) != 10 ||
+        strcmp(clean, "[redacted]") || !syncDiagnosticText(clean)) return 9;
+    std::string longText = "[sync] " + std::string(100, 'x');
+    flags = 0;
+    if (syncSanitizeText(longText.c_str(), longText.size(), clean, flags) > 96 ||
+        !(flags & SYNC_TEXT_TRUNCATED)) return 10;
+    return 0;
+}
+
+int codex_sync_store_check() {
+    LittleFS.files.clear();
+    LittleFS.dirs.clear();
+    LittleFS.root.clear();
+    LittleFS.capacity = 1024 * 1024;
+    LittleFS.writeBudget = -1;
+    if (!syncStoreBegin()) return 1;
+    uint64_t serial = 0;
+    if (!syncStoreAdvanceSerial(serial) || serial != 1) return 2;
+    const uint8_t bytes[] = "{\"format\":\"device-sync-1\",\"records_b64\":\"\"}";
+    SyncStoreBatch batch{};
+    strcpy(batch.batchId, "1-aabbccddeeff00112233445566778899");
+    strcpy(batch.owner, "bridge-a");
+    batch.clientSerial = batch.deviceSerial = 1;
+    batch.bytes = sizeof(bytes) - 1;
+    syncSha256(bytes, batch.bytes, batch.sha256);
+    if (!syncStoreFreeze(bytes, batch.bytes, batch)) return 3;
+    SyncStoreBatch loaded;
+    if (!syncStoreBegin() || !syncStoreActive(loaded) ||
+        strcmp(loaded.batchId, batch.batchId)) return 4;
+    uint8_t page[1024];
+    size_t got = 0;
+    if (!syncStorePage(0, 1024, page, got) || got != batch.bytes ||
+        memcmp(page, bytes, got)) return 5;
+    if (!syncStoreAck(batch.bytes, batch.sha256) || syncStoreAckedOffset() != batch.bytes)
+        return 6;
+    if (!syncStoreComplete(batch) || !syncStoreBegin() ||
+        syncStoreActive(loaded) || !syncStoreReceipt(loaded) ||
+        strcmp(loaded.batchId, batch.batchId)) return 7;
+    if (syncStoreComplete(batch)) return 8;
+    if (syncStoreHighestClientSerial() != 1 || !syncStoreChangeOwner() ||
+        syncStoreReceipt(loaded) || syncStoreHighestClientSerial() != 0 ||
+        !syncStoreAdvanceSerial(serial) || serial != 2) return 9;
+    return 0;
+}
+
 void *codex_sim_bundle_new(const char *data_dir, const char *target,
                            uint64_t boot_id, const char *wake_cause) {
     if (!data_dir || !target || !wake_cause) return nullptr;
@@ -265,7 +338,8 @@ int codex_sim_store_budget(void *p, long long budget) {
 
 int codex_sim_store_crash_after_sync(void *p, const char *kind, int count) {
     if (!p || !kind || count < 1 || count > 100 ||
-        (strcmp(kind, "slot") && strcmp(kind, "meta"))) return 0;
+        (strcmp(kind, "slot") && strcmp(kind, "meta") &&
+         strcmp(kind, "sync_blob") && strcmp(kind, "sync_meta"))) return 0;
     LittleFS.crashAfterSyncKind = kind;
     LittleFS.crashAfterSyncCount = count;
     return 1;

@@ -1,4 +1,4 @@
-//! Application-service front end for the four UI pages and MCP (v2 §2/§11).
+//! Application-service front end for the four UI pages and MCP (platform design §2/§11).
 //!
 //! Both interfaces call these functions; there is no second business model.
 //! Saving never publishes, publishing never auto-enables sync, and every device
@@ -9,7 +9,7 @@ use std::sync::Arc;
 use bridge_core::coordinator::DeliveryKind;
 use bridge_core::platform::model::{DeviceCapabilities, DeviceIdentity, FamilyProfile, Profile};
 use bridge_core::platform::service::PlatformService;
-use bridge_core::v2_client;
+use bridge_core::device_client;
 use serde_json::{json, Value};
 use std::time::Duration;
 
@@ -17,8 +17,11 @@ use crate::AppCtx;
 
 #[path = "wake_history.rs"]
 mod wake_history;
+#[path = "sync_diagnostics.rs"]
+mod sync_diagnostics;
 
 /// Resolved per-device transport facts (token from the cached device token).
+#[derive(Clone)]
 pub struct DeviceLink {
     pub mac: String,
     pub ip: String,
@@ -110,7 +113,7 @@ fn parse_device_endpoint(value: &str) -> Result<String, String> {
 fn registered_device_facts(
     requested_mac: &str,
     status: &Value,
-    v2_status: &Value,
+    device_status: &Value,
 ) -> Result<(DeviceCapabilities, String), String> {
     let requested_mac = DeviceIdentity::normalized_mac(requested_mac)
         .ok_or_else(|| "invalid device MAC".to_string())?;
@@ -125,14 +128,14 @@ fn registered_device_facts(
         ));
     }
     let capabilities = caps_from_status(status)?;
-    let authenticated_mac = v2_status
+    let authenticated_mac = device_status
         .get("device_mac")
         .and_then(Value::as_str)
         .and_then(DeviceIdentity::normalized_mac)
-        .ok_or_else(|| "authenticated /v2/status missing valid device_mac".to_string())?;
+        .ok_or_else(|| "authenticated /api/status missing valid device_mac".to_string())?;
     if authenticated_mac != requested_mac || authenticated_mac != status_mac {
         return Err(format!(
-            "authenticated /v2/status reports MAC {authenticated_mac}, expected {requested_mac}"
+            "authenticated /api/status reports MAC {authenticated_mac}, expected {requested_mac}"
         ));
     }
     Ok((capabilities, requested_mac))
@@ -146,7 +149,7 @@ fn registration_identity(mac: &str, endpoint: &str, name: &str) -> Result<Device
     Ok(identity)
 }
 
-async fn register_device_v2(ctx: &AppCtx, args: &Value) -> Result<Value, String> {
+async fn register_device(ctx: &AppCtx, args: &Value) -> Result<Value, String> {
     let mac = args
         .get("mac")
         .and_then(Value::as_str)
@@ -157,19 +160,19 @@ async fn register_device_v2(ctx: &AppCtx, args: &Value) -> Result<Value, String>
             .and_then(Value::as_str)
             .ok_or("missing endpoint")?,
     )?;
-    let (endpoint_status, endpoint_v2_status, token) =
+    let (endpoint_status, endpoint_device_status, token) =
         (endpoint.clone(), endpoint.clone(), ctx.config.token.clone());
-    let (status, v2_status) = blocking(move || {
+    let (status, device_status) = blocking(move || {
         let status = bridge_core::device::fetch(&endpoint_status, timeout())
             .map_err(err_text)?
             .raw
             .ok_or_else(|| "endpoint did not return structured /status.json".to_string())?;
-        let v2_status =
-            v2_client::status(&endpoint_v2_status, &token, timeout()).map_err(err_text)?;
-        Ok((status, v2_status))
+        let device_status =
+            device_client::status(&endpoint_device_status, &token, timeout()).map_err(err_text)?;
+        Ok((status, device_status))
     })
     .await?;
-    let (capabilities, mac) = registered_device_facts(&mac, &status, &v2_status)?;
+    let (capabilities, mac) = registered_device_facts(&mac, &status, &device_status)?;
     let name = args
         .get("name")
         .and_then(Value::as_str)
@@ -189,9 +192,9 @@ async fn register_device_v2(ctx: &AppCtx, args: &Value) -> Result<Value, String>
         .ok_or_else(|| "registered device record unavailable".into())
 }
 
-/// Verify and update one already-registered v2 device's endpoint from UDP.
+/// Verify and update one already-registered device's endpoint from UDP.
 /// The service upsert keeps its Profile, sync setting, and observations.
-pub(super) async fn revalidate_registered_v2_endpoint(
+pub(super) async fn revalidate_registered_device_endpoint(
     ctx: &AppCtx,
     requested_mac: &str,
     endpoint: &str,
@@ -208,18 +211,18 @@ pub(super) async fn revalidate_registered_v2_endpoint(
         return Ok(false);
     }
 
-    let (status_endpoint, v2_endpoint, token) =
+    let (status_endpoint, device_endpoint, token) =
         (endpoint.clone(), endpoint.clone(), ctx.config.token.clone());
-    let (status, v2_status) = blocking(move || {
+    let (status, device_status) = blocking(move || {
         let status = bridge_core::device::fetch(&status_endpoint, timeout())
             .map_err(err_text)?
             .raw
             .ok_or_else(|| "endpoint did not return structured /status.json".to_string())?;
-        let v2_status = v2_client::status(&v2_endpoint, &token, timeout()).map_err(err_text)?;
-        Ok((status, v2_status))
+        let device_status = device_client::status(&device_endpoint, &token, timeout()).map_err(err_text)?;
+        Ok((status, device_status))
     })
     .await?;
-    let (capabilities, mac) = registered_device_facts(&mac, &status, &v2_status)?;
+    let (capabilities, mac) = registered_device_facts(&mac, &status, &device_status)?;
 
     // Another address update or rename may have landed while HTTP was in flight.
     let Some(current) = service(ctx).device_get(&mac) else {
@@ -258,7 +261,7 @@ mod registration_tests {
         })
     }
 
-    fn v2_status(mac: &str) -> Value {
+    fn device_status(mac: &str) -> Value {
         json!({"device_mac": mac})
     }
 
@@ -291,7 +294,7 @@ mod registration_tests {
     #[test]
     fn registration_requires_both_status_documents_to_match_requested_mac() {
         let (caps, mac) =
-            registered_device_facts("aa-bb-cc-dd-ee-ff", &status(), &v2_status("AABBCCDDEEFF"))
+            registered_device_facts("aa-bb-cc-dd-ee-ff", &status(), &device_status("AABBCCDDEEFF"))
                 .unwrap();
         assert_eq!(mac, "AABBCCDDEEFF");
         assert_eq!(caps.max_templates, 8);
@@ -299,13 +302,13 @@ mod registration_tests {
         assert!(registered_device_facts(
             "00:00:00:00:00:01",
             &status(),
-            &v2_status("AABBCCDDEEFF")
+            &device_status("AABBCCDDEEFF")
         )
         .is_err());
         assert!(registered_device_facts(
             "AABBCCDDEEFF",
             &json!({"fw_target":"codex-status-154g"}),
-            &v2_status("AABBCCDDEEFF")
+            &device_status("AABBCCDDEEFF")
         )
         .is_err());
         assert!(registered_device_facts(
@@ -315,26 +318,26 @@ mod registration_tests {
                 "fw_target": "codex-status-154g",
                 "render_target": "epd-ssd1681-200x200-1bpp"
             }),
-            &v2_status("AABBCCDDEEFF")
+            &device_status("AABBCCDDEEFF")
         )
         .is_err());
         assert!(registered_device_facts(
             "AABBCCDDEEFF",
             &status(),
-            &v2_status("00:00:00:00:00:01")
+            &device_status("00:00:00:00:00:01")
         )
         .is_err());
         assert!(registered_device_facts(
             "AABBCCDDEEFF",
             &json!({"mac":"AABBCCDDEEFF"}),
-            &v2_status("AABBCCDDEEFF")
+            &device_status("AABBCCDDEEFF")
         )
         .unwrap_err()
-        .contains("v2 capabilities missing"));
+        .contains("device capabilities missing"));
         assert!(registered_device_facts(
             "AABBCCDDEEFF",
             &json!({"mac":"AABBCCDDEEFF", "fw_target":"zectrix-note4-400x300", "render_target":"epd-ssd2683-400x300-1bpp"}),
-            &v2_status("AABBCCDDEEFF")
+            &device_status("AABBCCDDEEFF")
         )
         .unwrap_err()
         .contains("missing width"));
@@ -370,6 +373,30 @@ where
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|e| e.to_string())?
+}
+
+async fn sync_http_inner(ctx: &AppCtx, mac: &str) {
+    let Some(link) = device_link_for_mac(ctx, mac) else { return; };
+    let root = bridge_core::paths::data_root();
+    match blocking(move || {
+        let mut last = json!({"result":"idle"});
+        for _ in 0..3 {
+            last = sync_diagnostics::transfer(&root, &link).map_err(err_text)?;
+            if last["result"] != "complete" { break; }
+        }
+        Ok(last)
+    }).await {
+        Ok(value) if value["result"] == "complete" =>
+            tracing::info!(device_mac = %mac, result = %value["result"], "sync-v1 transfer complete"),
+        Ok(_) => {},
+        Err(error) => tracing::warn!(device_mac = %mac, error = %error, "sync-v1 transfer pending"),
+    }
+}
+
+async fn sync_http(ctx: &AppCtx, mac: &str) {
+    let lock = delivery_lock(ctx, mac);
+    let _delivery = lock.lock().await;
+    sync_http_inner(ctx, mac).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -678,13 +705,13 @@ pub async fn deliver(ctx: &AppCtx, mac: &str) -> Value {
                 (link.ip.clone(), link.token.clone(), link.bridge_id.clone());
             let expected_mac = link.mac.clone();
             match blocking(move || {
-                v2_client::install_bundle(
+                device_client::install_bundle(
                     &ip,
                     &token,
                     &expected_mac,
                     &bridge_id,
                     &payload,
-                    v2_client::BUNDLE_CHUNK_BYTES,
+                    device_client::BUNDLE_CHUNK_BYTES,
                     Duration::from_secs(60),
                 )
                 .map_err(|e| format!("{e:#}"))
@@ -721,7 +748,7 @@ pub async fn deliver(ctx: &AppCtx, mac: &str) -> Value {
                 .to_owned();
             let expected_mac = link.mac.clone();
             match blocking(move || {
-                v2_client::activate(
+                device_client::activate(
                     &ip,
                     &token,
                     &expected_mac,
@@ -756,10 +783,10 @@ pub async fn deliver(ctx: &AppCtx, mac: &str) -> Value {
             }
             let (ip, token, expected_mac) = (link.ip.clone(), link.token.clone(), link.mac.clone());
             let sent = payload.clone();
-            tracing::info!(event = "send", device_mac = %mac, operation = "/v2/data",
-                seq = body["seq"].as_u64().unwrap_or(0), "v2 data send");
+            tracing::info!(event = "send", device_mac = %mac, operation = "/api/data",
+                seq = body["seq"].as_u64().unwrap_or(0), "device data send");
             match blocking(move || {
-                v2_client::data(&ip, &token, &expected_mac, &sent, timeout()).map_err(err_text)
+                device_client::data(&ip, &token, &expected_mac, &sent, timeout()).map_err(err_text)
             })
             .await
             {
@@ -795,14 +822,14 @@ pub async fn deliver(ctx: &AppCtx, mac: &str) -> Value {
                         error_category = ack_category,
                         outcome = outcome["outcome"].as_str().unwrap_or("unknown"),
                         transport = "http",
-                        "v2 data acknowledgement"
+                        "device data acknowledgement"
                     );
                     json!({"result": "data", "transport": "http", "ack": ack, "confirmation": outcome})
                 }
                 Err(e) => {
-                    tracing::warn!(event = "result", device_mac = %mac, operation = "/v2/data",
+                    tracing::warn!(event = "result", device_mac = %mac, operation = "/api/data",
                         seq = body["seq"].as_u64().unwrap_or(0), error_category = safe_protocol_error_category(&e),
-                        "v2 data send failed");
+                        "device data send failed");
                     json!({"result": "deferred", "error": e})
                 }
             }
@@ -839,10 +866,10 @@ pub async fn send_plan(
     }
     let (ip, token, expected_mac) = (link.ip.clone(), link.token.clone(), link.mac.clone());
     let sent = body.clone();
-    tracing::info!(event = "send", device_mac = %mac, operation = "/v2/plan",
-        plan_id = plan.plan_id, "v2 PowerPlan send");
+    tracing::info!(event = "send", device_mac = %mac, operation = "/api/plan",
+        plan_id = plan.plan_id, "device PowerPlan send");
     match blocking(move || {
-        v2_client::plan(&ip, &token, &expected_mac, &sent, timeout()).map_err(err_text)
+        device_client::plan(&ip, &token, &expected_mac, &sent, timeout()).map_err(err_text)
     })
     .await
     {
@@ -870,13 +897,13 @@ pub async fn send_plan(
                 ack_plan_id = ack["plan_id"].as_u64().unwrap_or(0),
                 accepted_remaining_s = ack["accepted_remaining_s"].as_u64().unwrap_or(0),
                 error_category = ack_category,
-                transport = "http", "v2 PowerPlan acknowledgement");
+                transport = "http", "device PowerPlan acknowledgement");
             json!({"result": "plan", "plan": plan, "ack": ack, "accepted": accepted})
         }
         Err(e) => {
-            tracing::warn!(event = "result", device_mac = %mac, operation = "/v2/plan",
+            tracing::warn!(event = "result", device_mac = %mac, operation = "/api/plan",
                 plan_id = plan.plan_id, error_category = safe_protocol_error_category(&e),
-                "v2 PowerPlan send failed");
+                "device PowerPlan send failed");
             json!({"result": "deferred", "error": e})
         }
     }
@@ -908,10 +935,10 @@ pub async fn request_light(ctx: &AppCtx, mac: &str) -> Value {
     let mut body = serde_json::to_value(&plan).unwrap_or(Value::Null);
     body["bridge_id"] = json!(link.bridge_id);
     let (ip, token, expected_mac) = (link.ip, link.token, link.mac);
-    tracing::info!(event = "send", device_mac = %mac, operation = "/v2/plan",
-        plan_id = plan.plan_id, "v2 PowerPlan send");
+    tracing::info!(event = "send", device_mac = %mac, operation = "/api/plan",
+        plan_id = plan.plan_id, "device PowerPlan send");
     match blocking(move || {
-        v2_client::plan(&ip, &token, &expected_mac, &body, timeout()).map_err(err_text)
+        device_client::plan(&ip, &token, &expected_mac, &body, timeout()).map_err(err_text)
     })
     .await
     {
@@ -925,7 +952,7 @@ pub async fn request_light(ctx: &AppCtx, mac: &str) -> Value {
                 accepted_remaining_s = remaining,
                 error_category = if ack["plan_id"].as_u64().is_some_and(|id| id != plan.plan_id) { "ack_mismatch" } else { "none" },
                 transport = "http",
-                "v2 PowerPlan acknowledgement");
+                "device PowerPlan acknowledgement");
             json!({"result": "applied", "transport": "http", "plan": plan,
                 "already_pending": already_pending, "ack": ack, "confirmation": confirmation})
         }
@@ -935,14 +962,14 @@ pub async fn request_light(ctx: &AppCtx, mac: &str) -> Value {
                 ack_plan_id = ack["plan_id"].as_u64().unwrap_or(0),
                 accepted_remaining_s = ack["accepted_remaining_s"].as_u64().unwrap_or(0),
                 error_category = if ack["result"] == "applied" { "none" } else { "ack_rejected" },
-                error_category = "ack_rejected", transport = "http", "v2 PowerPlan rejected");
+                error_category = "ack_rejected", transport = "http", "device PowerPlan rejected");
             json!({"result": "queued", "transport": "ble_rendezvous",
                 "plan": plan, "already_pending": already_pending, "ack": ack})
         }
         Err(error) => {
-            tracing::warn!(event = "result", device_mac = %mac, operation = "/v2/plan",
+            tracing::warn!(event = "result", device_mac = %mac, operation = "/api/plan",
                 plan_id = plan.plan_id, error_category = safe_protocol_error_category(&error),
-                "v2 PowerPlan send failed");
+                "device PowerPlan send failed");
             json!({"result": "queued", "transport": "ble_rendezvous",
                 "plan": plan, "already_pending": already_pending, "ack": null, "http_error": error})
         }
@@ -965,8 +992,8 @@ fn safe_protocol_error_category(error: &str) -> &'static str {
 /// Refresh the bridge-side view from the device's authenticated status.
 pub async fn refresh_status(ctx: &AppCtx, mac: &str) -> Value {
     let Some(link) = device_link_for_mac(ctx, mac) else {
-        crate::update_v2_status_cache(
-            &mut ctx.v2_status_cache.lock().unwrap(),
+        crate::update_device_status_cache(
+            &mut ctx.device_status_cache.lock().unwrap(),
             mac,
             false,
             None,
@@ -975,7 +1002,7 @@ pub async fn refresh_status(ctx: &AppCtx, mac: &str) -> Value {
         return json!({"result": "waiting_for_link"});
     };
     let (ip, token, expected_mac) = (link.ip.clone(), link.token.clone(), link.mac.clone());
-    match blocking(move || v2_client::status(&ip, &token, timeout()).map_err(err_text)).await {
+    match blocking(move || device_client::status(&ip, &token, timeout()).map_err(err_text)).await {
         Ok(status) => {
             let matches_target = status["device_mac"]
                 .as_str()
@@ -984,8 +1011,8 @@ pub async fn refresh_status(ctx: &AppCtx, mac: &str) -> Value {
                 .is_some_and(|(actual, expected)| actual == expected);
             if !matches_target {
                 let _ = service(ctx).note_status_attempt(mac, "mac_mismatch", Some("authenticated response named another MAC"));
-                crate::update_v2_status_cache(
-                    &mut ctx.v2_status_cache.lock().unwrap(),
+                crate::update_device_status_cache(
+                    &mut ctx.device_status_cache.lock().unwrap(),
                     mac,
                     false,
                     None,
@@ -998,8 +1025,34 @@ pub async fn refresh_status(ctx: &AppCtx, mac: &str) -> Value {
                 return json!({"result": "error", "error": format!("persist authenticated status: {e}")});
             }
             let _ = service(ctx).ota_note_authenticated_version(mac, &status);
-            crate::update_v2_status_cache(
-                &mut ctx.v2_status_cache.lock().unwrap(),
+            if let Some(job) = service(ctx).ota_job(mac).filter(|job|
+                job.state == "awaiting_confirmation" && job.upload_ack &&
+                status["fw"] == job.expected_version &&
+                status["image_identity"].as_array().is_some_and(|items|
+                    items.iter().any(|item| item == "sha256-running-prefix-v1"))) {
+                if let Some(nonce) = status["session_nonce"].as_str() {
+                    for attempt in 0..3 {
+                        let image_link = link.clone();
+                        let nonce = nonce.to_owned();
+                        let fields = json!({"image_bytes": job.size});
+                        let id = format!("ota-image-{}-{attempt}", job.job_id);
+                        match blocking(move || device_client::sync(&image_link.ip, &image_link.token,
+                            &image_link.mac, &image_link.bridge_id, &nonce, "image", &id,
+                            &fields, Duration::from_secs(15)).map_err(err_text)).await {
+                            Ok(image) => {
+                                if let Err(error) = service(ctx).ota_note_running_image(mac, &image) {
+                                    tracing::warn!(device_mac = %mac, error = %error, "OTA image proof rejected");
+                                }
+                                break;
+                            }
+                            Err(error) if error.contains("401") || error.contains("409") => break,
+                            Err(_) => continue,
+                        }
+                    }
+                }
+            }
+            crate::update_device_status_cache(
+                &mut ctx.device_status_cache.lock().unwrap(),
                 mac,
                 true,
                 Some(status.clone()),
@@ -1012,8 +1065,8 @@ pub async fn refresh_status(ctx: &AppCtx, mac: &str) -> Value {
                 "blocked"
             } else { "offline" };
             let _ = service(ctx).note_status_attempt(mac, outcome, Some(&e));
-            crate::update_v2_status_cache(
-                &mut ctx.v2_status_cache.lock().unwrap(),
+            crate::update_device_status_cache(
+                &mut ctx.device_status_cache.lock().unwrap(),
                 mac,
                 false,
                 None,
@@ -1068,7 +1121,7 @@ pub async fn post_ota_window(ctx: &AppCtx, requested_mac: &str, secs: u32) {
     let (ip, token, expected_mac) = (link.ip.clone(), link.token.clone(), link.mac.clone());
     let sent = body.clone();
     match blocking(move || {
-        v2_client::plan(&ip, &token, &expected_mac, &sent, timeout()).map_err(err_text)
+        device_client::plan(&ip, &token, &expected_mac, &sent, timeout()).map_err(err_text)
     })
     .await
     {
@@ -1180,11 +1233,11 @@ pub fn recovery(ctx: &AppCtx, requested_mac: &str, digest: &Value) -> Result<Val
 // ---------------------------------------------------------------------------
 
 /// Capabilities from a `/status.json` document. Firmware that does not report
-/// `fw_target` does not speak v2 and is refused.
+/// `fw_target` is refused because the device contract cannot be verified.
 pub fn caps_from_status(raw: &Value) -> Result<DeviceCapabilities, String> {
     let fw_target = raw.get("fw_target").and_then(|v| v.as_str());
     let Some(fw_target) = fw_target else {
-        return Err("v2 capabilities missing: device reports a legacy protocol".into());
+        return Err("device capabilities missing: device reports a legacy protocol".into());
     };
     let render_target = raw
         .get("render_target")
@@ -1368,7 +1421,7 @@ mod capability_tests {
     }
 }
 
-/// Register/refresh one device in the platform service. Only v2 firmware
+/// Register/refresh one device in the platform service. Only device firmware
 /// reaches this point; the capability contract is enforced upstream. The
 /// identity written is exactly the `mac` the authenticated status reported.
 pub fn ensure_device(
@@ -1390,17 +1443,17 @@ pub fn ensure_device(
     }
 }
 
-/// True when the selected device is registered in the v2 platform store: the
+/// True when the selected device is registered in the platform store: the
 /// single-device Wi-Fi push channel must then stay quiet (one device, one data
-/// channel). Every registered device speaks v2.
-pub fn is_v2_device(ctx: &AppCtx) -> bool {
+/// channel). Every registered device speaks device.
+pub fn is_registered_device(ctx: &AppCtx) -> bool {
     let Some(mac) = crate::selected_mac(ctx) else {
         return false;
     };
     service(ctx).device_get(&mac).is_some()
 }
 
-/// Outcome of one v2 BLE scan and, when connected, its rendezvous.
+/// Outcome of one device BLE scan and, when connected, its rendezvous.
 #[derive(Debug)]
 pub enum BleOpportunity {
     /// None of the registered candidates was advertising.
@@ -1413,7 +1466,7 @@ pub enum BleOpportunity {
 /// acknowledged. The short budget keeps diagnostics from extending the wake
 /// window or changing the result of a healthy plan/data exchange.
 async fn sync_wake_history(
-    link: &mut bridge_ble::V2Connection,
+    link: &mut bridge_ble::DeviceConnection,
     mac: &str,
     status: &Value,
 ) {
@@ -1531,7 +1584,7 @@ fn is_history_unsupported(text: &str) -> bool {
         || text.contains("not found")
 }
 
-async fn cache_device_token_if_missing(link: &bridge_ble::V2Connection, mac: &str) {
+async fn cache_device_token_if_missing(link: &bridge_ble::DeviceConnection, mac: &str) {
     if bridge_mcp::load_runtime_device_token(mac).is_some() {
         return;
     }
@@ -1554,8 +1607,8 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
     if candidates.is_empty() {
         return Ok(BleOpportunity::NoDevice);
     }
-    let _delivery = ctx.v2_delivery.lock().await;
-    let (mac, mut link) = match bridge_ble::V2Connection::connect_any(
+    let _delivery = ctx.device_delivery.lock().await;
+    let (mac, mut link) = match bridge_ble::DeviceConnection::connect_any(
         candidates,
         &ctx.config.token,
         &ctx.bridge_id,
@@ -1580,7 +1633,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
     }
     let work = async {
         if !still_registered {
-            return Err(format!("connected BLE device {mac} is no longer registered as v2"));
+            return Err(format!("connected BLE device {mac} is no longer registered for device protocol"));
         }
         link.write_endpoint(&bridge_ble::lan_ip(), ctx.config.port, &ctx.config.token)
             .await
@@ -1593,6 +1646,13 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             .note_device_status(&mac, &state)
             .map_err(err_text)?;
         service(ctx).note_ble_contact(&mac).map_err(err_text)?;
+        let sync_capable = state["sync"]["v"] == 1;
+        let mut sync_enabled = state["sync"]["enabled"] == true;
+        if sync_capable && !sync_enabled {
+            if let Ok(reply) = link.command("sync_config", json!({"enabled":true})).await {
+                sync_enabled = reply["result"] == "applied";
+            }
+        }
         let decision = service(ctx).next_delivery(&mac, true, device_now(&mac));
         if decision["decision"] == "ble_data" {
             if let Some(body) = service(ctx).data_message_body(&mac) {
@@ -1625,7 +1685,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
                     error_category = ack_category,
                     outcome = outcome["outcome"].as_str().unwrap_or("unknown"),
                     transport = "ble",
-                    "v2 data acknowledgement"
+                    "device data acknowledgement"
                 );
             }
         }
@@ -1645,7 +1705,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             )
             .map_err(err_text)?;
         let mut plan_body = serde_json::to_value(&plan).map_err(err_text)?;
-        if wake_history_sync_due(&mac, &state) {
+        if !sync_enabled && wake_history_sync_due(&mac, &state) {
             plan_body["history_sync_ms"] = json!(2500);
         }
         let ack = link
@@ -1665,7 +1725,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
                 result = ack["result"].as_str().unwrap_or("unknown"),
                 ack_plan_id = ack["plan_id"].as_u64().unwrap_or(0),
                 accepted_remaining_s = ack["accepted_remaining_s"].as_u64().unwrap_or(0),
-                error_category = ack_category, transport = "ble", "v2 PowerPlan rejected");
+                error_category = ack_category, transport = "ble", "device PowerPlan rejected");
             return Err("BLE PowerPlan rejected (ack_rejected)".to_owned());
         }
         let confirmation = service(ctx).note_plan_ack(
@@ -1685,26 +1745,45 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             error_category = ack_category,
             confirmation = confirmation["outcome"].as_str().unwrap_or("unknown"),
             transport = "ble",
-            "v2 PowerPlan acknowledgement"
+            "device PowerPlan acknowledgement"
         );
-        Ok(state)
+        let mut sync_opened = false;
+        let should_open = sync_enabled && state["sync"]["retry_skip"] == 0 &&
+            (state["sync"]["due"] == true || state["sync"]["pending"] == true);
+        if should_open {
+            let reason = if state["sync"]["rounds"] == 15 &&
+                state["sync"]["pending"] != true { "periodic" } else { "retry" };
+            let open = link.command("sync_open", json!({
+                "reason":reason,
+                "open_id":uuid::Uuid::new_v4().simple().to_string(),
+                "wake_generation":state["wake_generation"],
+                "wake_seq":state["wake_seq"],
+            })).await.map_err(err_text)?;
+            sync_opened = open["result"] == "applied";
+            if !sync_opened { return Err(format!("sync_open rejected: {}", open["error"])); }
+        }
+        let light_plan = ack["accepted_remaining_s"].as_u64().unwrap_or(0) > 0;
+        Ok((state, sync_enabled, sync_opened, light_plan))
     };
     let normal_result = tokio::time::timeout(Duration::from_secs(10), work)
         .await
         .map_err(|_| "BLE rendezvous timed out".to_owned())
         .and_then(|r| r);
-    if let Ok(state) = &normal_result {
+    if let Ok((state, enabled, _, _)) = &normal_result {
         // Keep diagnostics outside the normal rendezvous deadline: a history
         // timeout can never turn a successful status/data/plan exchange into
         // a failed contact.
-        sync_wake_history(&mut link, &mac, state).await;
+        if !enabled { sync_wake_history(&mut link, &mac, state).await; }
     }
+    let sync_opened = normal_result.as_ref().is_ok_and(|(_, enabled, opened, light)|
+        *opened || (*enabled && *light));
     let result = normal_result.map(|_| ());
     link.close().await;
+    if sync_opened { sync_http_inner(ctx, &mac).await; }
     Ok(BleOpportunity::Connected { mac, result })
 }
 
-/// Run one coordinator cycle for a registered v2 device.
+/// Run one coordinator cycle for a registered device.
 pub async fn cycle(ctx: &AppCtx, mac: &str, refresh: bool, deliver_now: bool) {
     let Some(mac) = DeviceIdentity::normalized_mac(mac) else {
         return;
@@ -1717,9 +1796,21 @@ pub async fn cycle(ctx: &AppCtx, mac: &str, refresh: bool, deliver_now: bool) {
             return;
         }
     }
-    if !matches!(crate::v2_occupancy_gate(ctx, &mac).await, crate::Occupancy::Owned) {
-        return;
+    match crate::device_occupancy_gate(ctx, &mac).await {
+        crate::Occupancy::Owned => {}
+        crate::Occupancy::Yielded => return,
+        crate::Occupancy::Other(owner) => {
+            tracing::debug!(device_mac = %mac, owner_id = owner["id"].as_str().unwrap_or("?"),
+                "device is occupied");
+            return;
+        }
+        crate::Occupancy::Failed(error) => {
+            tracing::debug!(device_mac = %mac,
+                error_category = safe_protocol_error_category(&error), "device claim unavailable");
+            return;
+        }
     }
+    if refresh { sync_http(ctx, &mac).await; }
     let ota = service(ctx).ota_job(&mac);
     let publish = service(ctx).job(&mac);
     if ota.as_ref().is_some_and(|j| j.blocks_following_work()) {
@@ -1758,6 +1849,7 @@ pub async fn cycle(ctx: &AppCtx, mac: &str, refresh: bool, deliver_now: bool) {
         };
         ota_window = plan_result["accepted"] == true
             && plan_result["ack"]["accepted_remaining_s"].as_u64().unwrap_or(0) >= 120;
+        if plan_result["accepted"] == true { sync_http(ctx, &mac).await; }
     }
     if deliver_now {
         if ota_first {
@@ -1788,7 +1880,7 @@ pub fn enqueue_ota(ctx: &AppCtx, mac: &str, args: &Value) -> Result<Value, Strin
 async fn deliver_ota(ctx: &AppCtx, mac: &str) -> Value {
     let lock = delivery_lock(ctx, mac);
     let _delivery = lock.lock().await;
-    if !matches!(crate::v2_occupancy_gate(ctx, mac).await, crate::Occupancy::Owned) {
+    if !matches!(crate::device_occupancy_gate(ctx, mac).await, crate::Occupancy::Owned) {
         return json!({"result": "blocked", "reason": "not authenticated owner"});
     }
     let Some(job) = service(ctx).ota_job(mac) else { return json!({"result": "idle"}); };
@@ -1803,7 +1895,37 @@ async fn deliver_ota(ctx: &AppCtx, mac: &str) -> Value {
         Ok(None) => return json!({"result": "idle"}),
         Err(e) => return json!({"result": "failed", "error": e.to_string()}),
     };
-    let result = bridge_mcp::firmware_upload(&cfg, &path, &link.ip, mac, &job.firmware_target).await;
+    let arm_link = link.clone();
+    let arm_job = job.clone();
+    let ticket = match blocking(move || {
+        let status = device_client::status(&arm_link.ip, &arm_link.token, timeout()).map_err(err_text)?;
+        if status["device_mac"] != arm_link.mac { return Err("OTA preflight MAC mismatch".into()); }
+        if status["sync_v1"] != 1 { return Ok(None); }
+        if status["sync"]["enabled"] != true { return Err("sync-v1 is not configured".into()); }
+        let nonce = status["session_nonce"].as_str().ok_or("OTA session nonce missing")?;
+        let fields = json!({"job_id": arm_job.job_id, "kind":"ota",
+            "image_bytes": arm_job.size, "file_sha256": arm_job.sha256});
+        let reply = device_client::sync(&arm_link.ip, &arm_link.token, &arm_link.mac,
+            &arm_link.bridge_id, nonce, "arm", &format!("ota-arm-{}", arm_job.job_id),
+            &fields, timeout()).map_err(err_text)?;
+        let ticket = reply["ticket"].as_str().ok_or("OTA arm ticket missing")?;
+        if ticket.len() != 32 || !ticket.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("OTA arm ticket invalid".into());
+        }
+        Ok(Some(ticket.to_owned()))
+    }).await {
+        Ok(ticket) => ticket,
+        Err(error) => {
+            let _ = service(ctx).ota_preflight_failed(mac, &error, false);
+            return json!({"result":"queued","error":error});
+        }
+    };
+    let result = if let Some(ticket) = ticket {
+        bridge_mcp::firmware_upload_with_ticket(&cfg, &path, &link.ip, mac,
+            &job.firmware_target, &ticket).await
+    } else {
+        bridge_mcp::firmware_upload(&cfg, &path, &link.ip, mac, &job.firmware_target).await
+    };
     if let Err(error) = &result {
         let terminal = error.contains("UPDATE FAILED") || error.contains("ROM") || error.contains("read ");
         let before_upload = terminal || error.contains("not reachable")
@@ -1845,10 +1967,10 @@ fn json_arg(args: &Value) -> Result<Value, String> {
 /// MCP-tool adapter: same service calls as the UI commands.
 pub async fn tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, String> {
     let value = match name {
-        "platform_device_register_v2" => register_device_v2(ctx, args).await?,
+        "platform_device_register" => register_device(ctx, args).await?,
         "platform_overview" => overview(ctx),
-        "template_list" => templates(ctx),
-        "template_get_v2" => {
+        "platform_template_list" => templates(ctx),
+        "platform_template_get" => {
             let id = args
                 .get("id")
                 .and_then(|v| v.as_str())
@@ -1856,7 +1978,7 @@ pub async fn tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, Stri
             let target = args.get("render_target").and_then(|v| v.as_str());
             template_get(ctx, id, target)?
         }
-        "template_save_v2" => {
+        "platform_template_save" => {
             let id = args
                 .get("id")
                 .and_then(|v| v.as_str())
@@ -1868,24 +1990,24 @@ pub async fn tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, Stri
             let source = json_arg(args)?;
             template_save(ctx, id, target, &source)?
         }
-        "template_validate_v2" => template_validate(&json_arg(args)?),
-        "profile_get_v2" => profile_get(ctx),
-        "profile_save_v2" => {
+        "platform_template_validate" => template_validate(&json_arg(args)?),
+        "platform_profile_get" => profile_get(ctx),
+        "platform_profile_save" => {
             let profile: Profile =
                 serde_json::from_value(args.get("profile").cloned().ok_or("missing profile")?)
                     .map_err(err_text)?;
             profile_save(ctx, profile)?
         }
-        "family_profiles_v2" => {
+        "platform_family_profiles" => {
             family_profiles(ctx, args.get("render_target").and_then(Value::as_str))
         }
-        "family_profile_save_v2" => {
+        "family_platform_profile_save" => {
             let profile: FamilyProfile =
                 serde_json::from_value(args.get("profile").cloned().ok_or("missing profile")?)
                     .map_err(err_text)?;
             family_profile_save(ctx, profile)?
         }
-        "family_profile_delete_v2" => {
+        "platform_family_profile_delete" => {
             let render_target = args
                 .get("render_target")
                 .and_then(Value::as_str)
@@ -1893,7 +2015,7 @@ pub async fn tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, Stri
             let id = args.get("id").and_then(Value::as_str).ok_or("missing id")?;
             family_profile_delete(ctx, render_target, id)?
         }
-        "family_profile_copy_v2" => {
+        "platform_family_profile_copy" => {
             let mac = args
                 .get("mac")
                 .and_then(Value::as_str)
@@ -1942,7 +2064,7 @@ pub async fn tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, Stri
             let mac = target_mac(ctx, args)?;
             service(ctx).ota_cancel(&mac).map_err(err_text)?
         }
-        "template_activate" => {
+        "platform_template_activate" => {
             let mac = target_mac(ctx, args)?;
             let id = args
                 .get("id")
@@ -1950,19 +2072,19 @@ pub async fn tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, Stri
                 .ok_or("missing id")?;
             activate(ctx, &mac, id).await?
         }
-        "data_sources_v2" => data_sources(ctx),
-        "data_source_save_v2" => {
+        "platform_data_sources" => data_sources(ctx),
+        "platform_data_source_save" => {
             let source = args.get("source").cloned().ok_or("missing source")?;
             data_source_save(ctx, source)?
         }
-        "data_probe_v2" => {
+        "platform_data_probe" => {
             let id = args
                 .get("source_id")
                 .and_then(|v| v.as_str())
                 .ok_or("missing source_id")?;
             data_probe(ctx, id)?
         }
-        "power_view_v2" => {
+        "platform_power_view" => {
             let mac = target_mac(ctx, args)?;
             power_view(ctx, &mac)
         }
@@ -1989,7 +2111,7 @@ pub async fn tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, Stri
                         (link.ip.clone(), link.token.clone(), link.mac.clone());
                     let sent = body.clone();
                     let ack = blocking(move || {
-                        v2_client::plan(&ip, &token, &expected_mac, &sent, timeout())
+                        device_client::plan(&ip, &token, &expected_mac, &sent, timeout())
                             .map_err(err_text)
                     })
                     .await?;

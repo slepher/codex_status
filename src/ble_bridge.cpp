@@ -8,13 +8,9 @@
 #include <algorithm>
 #include <atomic>
 
-static UsageJsonHandler    usageHandler    = nullptr;
 static EndpointJsonHandler endpointHandler = nullptr;
-static TemplateCtrlHandler tplCtrlHandler  = nullptr;
-static TemplateDataHandler tplDataHandler  = nullptr;
-static TemplateResetHandler tplResetHandler = nullptr;
 static AuthJsonHandler     authHandler     = nullptr;
-static V2CtrlHandler       v2CtrlHandler   = nullptr;
+static DeviceCommandHandler commandHandler = nullptr;
 
 static bool     connected      = false;
 static bool     peerBonded     = false;
@@ -24,7 +20,6 @@ static uint16_t peerConnHandle = BLE_HS_CONN_HANDLE_NONE;
 static String   peerAddress;
 static uint32_t pairingUntil   = 0;
 static bool     advertising    = false;
-static String   usageBuf;
 static String   endpointBuf;
 static String   tplCtrlBuf;
 static String   authBuf;
@@ -59,11 +54,9 @@ static bool jsonComplete(const String &s) {
 }
 
 static void clearReceiveBuffers() {
-    usageBuf = "";
     endpointBuf = "";
     tplCtrlBuf = "";
     authBuf = "";
-    if (tplResetHandler) tplResetHandler();
 }
 
 // NimBLE-Arduino 1.x exposes connection info as ble_gap_conn_desc*; 2.x as
@@ -107,25 +100,11 @@ static bool writeAllowed(PeerRef peer) {
     return false;
 }
 
-// v2 compatibility split (design §5.1): only a control JSON that explicitly
-// declares `rv>=2` goes to the rendezvous handler; everything else keeps the
-// legacy template transfer path byte-for-byte. With no v2 handler registered
-// (stage 1/2) the frame gets a bounded NACK instead of an old-path parse.
+// Template Control is the stable GATT characteristic for the device command
+// channel. Its UUID stays fixed across the one-time protocol cutover.
 static void dispatchTemplateCtrl(const String &json) {
-    JsonDocument doc;
-    if (deserializeJson(doc, json) == DeserializationError::Ok) {
-        int rv = doc["rv"] | 0;
-        if (rv >= 2) {
-            if (v2CtrlHandler) {
-                v2CtrlHandler(json);
-            } else {
-                DevLog.println("[ble] v2 control rejected: handler not ready");
-                bleNotifyStatusQuiet("{\"ack\":\"v2\",\"ok\":false,\"err\":\"not_ready\"}");
-            }
-            return;
-        }
-    }
-    if (tplCtrlHandler) tplCtrlHandler(json);
+    if (commandHandler) commandHandler(json);
+    else bleNotifyStatusQuiet("{\"ack\":\"command\",\"ok\":false,\"err\":\"not_ready\"}");
 }
 
 static bool appendJson(String &buf, const std::string &value, size_t limit,
@@ -133,7 +112,6 @@ static bool appendJson(String &buf, const std::string &value, size_t limit,
     if (buf.length() + value.size() > limit) {
         DevLog.printf("[ble] %s JSON overflow, buffer cleared\n", name);
         buf = "";
-        if (!strcmp(name, "template-control") && tplResetHandler) tplResetHandler();
         return false;
     }
     for (size_t i = 0; i < value.size(); i++) buf += value[i];
@@ -142,7 +120,6 @@ static bool appendJson(String &buf, const std::string &value, size_t limit,
     if (deserializeJson(doc, buf)) {
         DevLog.printf("[ble] malformed %s JSON, buffer cleared\n", name);
         buf = "";
-        if (!strcmp(name, "template-control") && tplResetHandler) tplResetHandler();
         return false;
     }
     String complete = buf;
@@ -154,7 +131,7 @@ static bool appendJson(String &buf, const std::string &value, size_t limit,
 static void refreshInfo() {
     if (!infoChr) return;
     String info = "{\"schema\":1,\"model\":\"ESP32-S3-ePaper-1.54-BW\",\"fw\":\"" + fwVersion +
-                  "\",\"proto\":1";
+                  "\"";
     if (infoExtra.length()) info += "," + infoExtra;
     info += ",\"pairingWindow\":" + String(blePairingWindowOpen() ? "true" : "false") +
             ",\"peerBonded\":" + String(peerBonded ? "true" : "false") +
@@ -254,10 +231,8 @@ class EndpointCallbacks : public NimBLECharacteristicCallbacks {
 
 class UsageCallbacks : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic *c, PEER_ARG) override {
+        (void)c;
         if (!writeAllowed(desc)) return;
-        std::string v = c->getValue();
-        appendJson(usageBuf, v, 4096, "usage",
-                   [](const String &json) { if (usageHandler) usageHandler(json); });
     }
 };
 
@@ -272,10 +247,8 @@ class TplCtrlCallbacks : public NimBLECharacteristicCallbacks {
 
 class TplDataCallbacks : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic *c, PEER_ARG) override {
+        (void)c;
         if (!writeAllowed(desc)) return;
-        if (!tplDataHandler) return;
-        std::string v = c->getValue();
-        tplDataHandler((const uint8_t *)v.data(), v.size());
     }
 };
 
@@ -400,24 +373,16 @@ void bleAdvertiseStop() {
     DevLog.println("[ble] advertising stop");
 }
 
-void bleSetHandlers(UsageJsonHandler onUsage, EndpointJsonHandler onEndpoint) {
-    usageHandler = onUsage;
+void bleSetEndpointHandler(EndpointJsonHandler onEndpoint) {
     endpointHandler = onEndpoint;
-}
-
-void bleSetTemplateHandlers(TemplateCtrlHandler onCtrl, TemplateDataHandler onData,
-                            TemplateResetHandler onReset) {
-    tplCtrlHandler = onCtrl;
-    tplDataHandler = onData;
-    tplResetHandler = onReset;
 }
 
 void bleSetAuthHandler(AuthJsonHandler onAuth) {
     authHandler = onAuth;
 }
 
-void bleSetV2Handler(V2CtrlHandler onV2) {
-    v2CtrlHandler = onV2;
+void bleSetCommandHandler(DeviceCommandHandler onCommand) {
+    commandHandler = onCommand;
 }
 
 void bleSetInfoExtra(const String &json) {

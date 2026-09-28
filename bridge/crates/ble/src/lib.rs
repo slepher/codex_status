@@ -1,12 +1,10 @@
-//! BLE central (btleplug) that mirrors the Wi-Fi channel for the device:
-//! on connect it writes the LAN endpoint+token, pushes the current usage
-//! envelope and pushes the template library (begin / chunks / end / activate).
+//! BLE central for device discovery, endpoint handoff, and authenticated commands.
 
 use std::collections::HashSet;
 use std::future::Future;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -16,7 +14,6 @@ use btleplug::api::{
 use btleplug::platform::{Adapter, Manager, Peripheral};
 use futures::StreamExt;
 use serde_json::json;
-use tokio::sync::RwLock;
 use uuid::Uuid;
 
 static NEXT_SCAN_ID: AtomicU64 = AtomicU64::new(1);
@@ -124,8 +121,6 @@ fn classify_advertisement(name: &str, matches_target: bool) -> AdvertisementDeci
     }
 }
 
-use bridge_core::template::{encode_chunks, template_hash, Library};
-
 pub const SVC_UUID: &str = "e7f1a000-4b2a-4c9e-9a11-3c0d5e9a0000";
 pub const CHR_INFO: &str = "e7f1a001-4b2a-4c9e-9a11-3c0d5e9a0000";
 pub const CHR_ENDPOINT: &str = "e7f1a002-4b2a-4c9e-9a11-3c0d5e9a0000";
@@ -136,7 +131,6 @@ pub const CHR_TPL_DATA: &str = "e7f1a006-4b2a-4c9e-9a11-3c0d5e9a0000";
 pub const CHR_AUTH: &str = "e7f1a007-4b2a-4c9e-9a11-3c0d5e9a0000";
 
 pub const JSON_WRITE_LIMIT: usize = 180;
-pub const CHUNK_PAYLOAD: usize = JSON_WRITE_LIMIT - 2;
 
 #[derive(Debug, Clone)]
 pub struct BleConfig {
@@ -144,12 +138,6 @@ pub struct BleConfig {
     pub host: String,
     pub port: u16,
     pub token: String,
-    /// Empty = push every template in the library.
-    /// `None` pushes every template (explicit full sync), `Some(vec![])` pushes
-    /// none (periodic sync), `Some(list)` pushes exactly those.
-    pub template_ids: Option<Vec<String>>,
-    /// Template to activate after an explicit push (profile's active choice).
-    pub activate: Option<String>,
     /// Scan window per cycle. Long for one-shot tools, short (5 s) for the
     /// low-duty tray loop.
     pub scan_timeout_ms: u64,
@@ -169,19 +157,11 @@ pub fn lan_ip() -> String {
 
 pub struct Pusher {
     cfg: BleConfig,
-    library: Arc<RwLock<Library>>,
-    upstream: String,
-    client: reqwest::Client,
 }
 
 impl Pusher {
-    pub fn new(cfg: BleConfig, library: Arc<RwLock<Library>>, upstream: String) -> Self {
-        Self {
-            cfg,
-            library,
-            upstream,
-            client: reqwest::Client::new(),
-        }
+    pub fn new(cfg: BleConfig) -> Self {
+        Self { cfg }
     }
 
     fn uuid(s: &str) -> Uuid {
@@ -564,21 +544,6 @@ impl Pusher {
         Ok(info)
     }
 
-    async fn fetch_usage(&self) -> Result<serde_json::Value> {
-        let url = format!("{}/usage", self.upstream.trim_end_matches('/'));
-        let resp = self
-            .client
-            .get(&url)
-            .bearer_auth(&self.cfg.token)
-            .send()
-            .await
-            .context("GET upstream /usage")?;
-        if !resp.status().is_success() {
-            bail!("upstream /usage -> {}", resp.status());
-        }
-        Ok(resp.json().await?)
-    }
-
     async fn write_char(peripheral: &Peripheral, uuid: &str, data: &[u8]) -> Result<()> {
         let target = peripheral
             .characteristics()
@@ -685,119 +650,6 @@ impl Pusher {
         .into_bytes()
     }
 
-    async fn push_usage(&self, peripheral: &Peripheral) -> Result<()> {
-        match self.fetch_usage().await {
-            Ok(usage) => {
-                Self::write_json(peripheral, CHR_USAGE, usage.to_string().as_bytes()).await?;
-                tracing::info!("usage pushed over BLE");
-                Ok(())
-            }
-            Err(e) => {
-                tracing::warn!("usage fetch failed ({e}); pushing templates only");
-                Ok(())
-            }
-        }
-    }
-
-    async fn push_template(
-        &self,
-        peripheral: &Peripheral,
-        id: &str,
-        bytes: &[u8],
-        version: u64,
-        activate: bool,
-    ) -> Result<()> {
-        let crc = crc32fast::hash(bytes);
-        let hash = template_hash(bytes);
-        let begin = json!({
-            "op": "begin",
-            "id": id,
-            "version": version,
-            "hash": hash,
-            "len": bytes.len(),
-            "crc": crc,
-        });
-        Self::write_json(peripheral, CHR_TPL_CTRL, begin.to_string().as_bytes()).await?;
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        for chunk in encode_chunks(bytes, CHUNK_PAYLOAD) {
-            Self::write_char(peripheral, CHR_TPL_DATA, &chunk).await?;
-            tokio::time::sleep(Duration::from_millis(30)).await;
-        }
-        Self::write_json(peripheral, CHR_TPL_CTRL, br#"{"op":"end"}"#).await?;
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        if activate {
-            let activate = json!({"op": "activate", "id": id});
-            Self::write_json(peripheral, CHR_TPL_CTRL, activate.to_string().as_bytes()).await?;
-            tracing::info!("template {id} pushed and activated ({} bytes)", bytes.len());
-        } else {
-            tracing::info!(
-                "template {id} pushed, not activated ({} bytes)",
-                bytes.len()
-            );
-        }
-        Ok(())
-    }
-
-    async fn push_templates(
-        &self,
-        peripheral: &Peripheral,
-        info: &serde_json::Value,
-    ) -> Result<()> {
-        if matches!(&self.cfg.template_ids, Some(list) if list.is_empty()) {
-            tracing::info!("no template push requested; templates left untouched");
-            return Ok(());
-        }
-        let items: Vec<(String, Vec<u8>, u64)> = {
-            let library = self.library.read().await;
-            let ids: Vec<String> = match &self.cfg.template_ids {
-                None => library.ids(),
-                Some(list) => list.clone(),
-            };
-            ids.into_iter()
-                .filter_map(|id| {
-                    library
-                        .get(&id)
-                        .map(|e| (id.clone(), e.bytes.clone(), e.version))
-                })
-                .collect()
-        };
-        let device = info.get("templates").and_then(|v| v.as_array());
-        let mut pushed: Vec<String> = Vec::new();
-        for (id, bytes, version) in items {
-            let hash = template_hash(&bytes);
-            let up_to_date = device
-                .map(|arr| {
-                    arr.iter().any(|t| {
-                        t.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
-                            && t.get("hash").and_then(|v| v.as_str()) == Some(hash.as_str())
-                    })
-                })
-                .unwrap_or(false);
-            if up_to_date {
-                tracing::info!("template {id} up to date ({hash}); skip");
-                continue;
-            }
-            if let Err(e) = self
-                .push_template(peripheral, &id, &bytes, version, false)
-                .await
-            {
-                tracing::warn!("push template {id}: {e}");
-                continue;
-            }
-            pushed.push(id);
-        }
-        // Template pushes are explicit user/agent actions: show the profile's
-        // chosen template (or the last pushed one).
-        if let Some(target) = self.cfg.activate.clone().or_else(|| pushed.last().cloned()) {
-            let activate = json!({"op": "activate", "id": target});
-            Self::write_json(peripheral, CHR_TPL_CTRL, activate.to_string().as_bytes()).await?;
-            tracing::info!("activated template {target}");
-        } else {
-            tracing::info!("no template changes to push; device left as-is");
-        }
-        Ok(())
-    }
-
     /// Connect to an advertising device and read its info JSON
     /// (`{schema,model,fw,proto,mac,ip,http_port,templates,...}`). Used by the
     /// explicit `device_discover via=ble` fallback; no usage/template writes.
@@ -887,7 +739,7 @@ impl Pusher {
         token
     }
 
-    /// One connect → push → disconnect cycle. Returns the device info JSON so
+    /// One connect → endpoint handoff → disconnect cycle. Returns the device info JSON so
     /// the caller can adopt its identity (mac/ip) when needed.
     pub async fn cycle_once(&self, adapter: &Adapter) -> Result<serde_json::Value> {
         let scan = Duration::from_millis(self.cfg.scan_timeout_ms.max(1000));
@@ -917,19 +769,7 @@ impl Pusher {
 
         let notify_handle = Self::log_notifications(&peripheral).await.ok();
 
-        let result = async {
-            self.push_endpoint(&peripheral).await?;
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            if info["v2_bundle"] != true {
-                self.push_usage(&peripheral).await?;
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            if info["v2_bundle"] != true {
-                self.push_templates(&peripheral, &info).await?;
-            }
-            Ok::<_, anyhow::Error>(())
-        }
-        .await;
+        let result = self.push_endpoint(&peripheral).await;
 
         tokio::time::sleep(Duration::from_secs(1)).await;
         if let Some(handle) = notify_handle {
@@ -961,9 +801,9 @@ fn stamp_clock(body: &mut serde_json::Value, mac: &str) {
     body["tz_offset_min"] = json!(bridge_core::local_offset_minutes());
 }
 
-/// Authenticated v2 opportunity on the existing GATT table. The status value
+/// Authenticated device opportunity on the existing GATT table. The status value
 /// is read as a long attribute, so an ACK is not lost to notification MTU cuts.
-pub struct V2Connection {
+pub struct DeviceConnection {
     peripheral: Option<Peripheral>,
     fake_url: Option<String>,
     token: String,
@@ -1005,7 +845,7 @@ fn identity_text(identity: Option<WakeIdentity>) -> (String, String) {
     )
 }
 
-impl V2Connection {
+impl DeviceConnection {
     /// `Ok(None)` = the device was not *freshly* advertising (rendezvous window
     /// closed or stale scan entry): no connection was attempted and the caller
     /// may scan again immediately.
@@ -1049,7 +889,7 @@ impl V2Connection {
                 let info: serde_json::Value = response.error_for_status()?.json().await?;
                 let authorized_mac = info_authorized_target(&info, &targets)
                     .context("fake BLE device identity mismatch")?;
-                if authorized_mac != *mac || info["rendezvous_v"].as_u64().unwrap_or(0) < 2 {
+                if authorized_mac != *mac || info["rendezvous"] != true {
                     bail!("fake BLE rendezvous identity/version mismatch");
                 }
                 let device_mac = authorized_mac.as_bytes().chunks(2)
@@ -1164,11 +1004,11 @@ impl V2Connection {
             association_basis = "authenticated_info",
             "BLE device identity verified and wake contact associated"
         );
-        if info["rendezvous_v"].as_u64().unwrap_or(0) < 2 {
+        if info["rendezvous"] != true {
             let _ = peripheral.disconnect().await;
             bail!("device BLE rendezvous is disabled");
         }
-        tracing::debug!(?timings, "v2 link ready");
+        tracing::debug!(?timings, "device link ready");
         let device_mac = authorized_mac
             .as_bytes()
             .chunks(2)
@@ -1233,8 +1073,6 @@ impl V2Connection {
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_nanos()
         );
-        body["rv"] = json!(2);
-        body["protocol"] = json!(2);
         body["op"] = json!(op);
         body["request_id"] = json!(id);
         body["session_nonce"] = json!(self.nonce);
@@ -1244,7 +1082,7 @@ impl V2Connection {
         stamp_clock(&mut body, &self.device_mac);
         let bytes = serde_json::to_vec(&body)?;
         if bytes.len() > 8192 {
-            bail!("v2 BLE command exceeds 8192 bytes");
+            bail!("device BLE command exceeds 8192 bytes");
         }
         if let Some(url) = &self.fake_url {
             let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?;
@@ -1259,7 +1097,7 @@ impl V2Connection {
                     bail!("fake BLE fragment was not accepted");
                 }
             }
-            if reply["ack"] != "v2" || reply["request_id"] != id {
+            if reply["ack"] != "command" || reply["request_id"] != id {
                 bail!("fake BLE ACK identity mismatch");
             }
             if op == "status" && reply["result"] == "applied" {
@@ -1312,16 +1150,16 @@ impl V2Connection {
                 Ok(Err(_)) => {
                     self.log_failure(&id, op, "ack", "read_failed");
                     tracing::warn!(device_mac = %self.device_mac, op, request_id = %id, stage = "ack", category = "read_failed", duration_ms = started.elapsed().as_millis(), "BLE command ACK read failed");
-                    return Err(anyhow!("v2 BLE ACK read failed"));
+                    return Err(anyhow!("device BLE ACK read failed"));
                 }
                 Err(_) => {
                     self.log_failure(&id, op, "ack", "timeout");
                     tracing::warn!(device_mac = %self.device_mac, op, request_id = %id, stage = "ack", category = error_category("ack"), duration_ms = started.elapsed().as_millis(), "BLE command ACK failed");
-                    return Err(anyhow!("v2 BLE ACK timed out"));
+                    return Err(anyhow!("device BLE ACK timed out"));
                 }
             };
             if let Ok(reply) = serde_json::from_slice::<serde_json::Value>(&raw) {
-                if reply["ack"] == "v2" && reply["request_id"] == id {
+                if reply["ack"] == "command" && reply["request_id"] == id {
                     let ack_identity = wake_identity(&reply);
                     if let (Some(expected), Some(actual)) = (self.wake_identity, ack_identity) {
                         if expected != actual {
@@ -1377,7 +1215,7 @@ impl V2Connection {
             if tokio::time::Instant::now() >= deadline {
                 self.log_failure(&id, op, "ack", "timeout");
                 tracing::warn!(device_mac = %self.device_mac, op, request_id = %id, stage = "ack", category = error_category("ack"), duration_ms = started.elapsed().as_millis(), "BLE command ACK failed");
-                bail!("v2 BLE ACK timed out");
+                bail!("device BLE ACK timed out");
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -1411,7 +1249,7 @@ impl V2Connection {
         if let Some(peripheral) = self.peripheral {
             let _ = peripheral.disconnect().await;
         }
-        tracing::debug!(timings = ?self.timings, "v2 rendezvous link closed");
+        tracing::debug!(timings = ?self.timings, "device rendezvous link closed");
     }
 }
 

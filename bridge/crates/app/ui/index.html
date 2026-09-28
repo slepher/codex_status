@@ -291,7 +291,7 @@
       <div class="card">
         <h2>平台运行状态</h2>
         <div class="bar">
-          <div class="status" id="pt-device-state">v2 平台状态</div>
+          <div class="status" id="pt-device-state">设备平台状态</div>
           <div class="menus">
             <button onclick="refreshPlatformDevice()">刷新</button>
             <button onclick="refreshPlatformStatus()">从设备读取</button>
@@ -349,7 +349,7 @@
       </div>
       <div class="card">
         <div class="bar">
-          <div class="status" id="pt-power-state">正式 PowerPlan（v2，Bridge 唯一决策）</div>
+          <div class="status" id="pt-power-state">正式 PowerPlan（Bridge 唯一决策）</div>
           <div class="menus"><button onclick="refreshPlatformPower()">刷新</button></div>
         </div>
         <div class="row"><span>当前 plan / 模式</span><span id="pt-plan" class="muted">--</span></div>
@@ -1079,15 +1079,17 @@
       const publicRecent = !!d.public_online;
       const snapshot = d.last_success?.body || {};
       const sampled = d.last_success?.observed_at;
+      const contactTransport = ['http', 'http_v2'].includes(d.last_authenticated_transport)
+        ? 'HTTP' : d.last_authenticated_transport || '未知通道';
       $('device-state').textContent = sampled
         ? `${d.reachability === 'blocked' ? '认证/占用受阻' : d.reachability === 'recently_authenticated' ? '最近已认证' : d.reachability === 'expected_sleep' ? '预计休眠' : '等待下次联系'} · 上次完整认证快照 ${new Date(sampled * 1000).toLocaleString()}（${d.clock_anomaly ? '本机时钟异常' : fmtDuration(d.age_s || 0) + '前'}）`
         : (d.last_authenticated_contact_at
-            ? `上次认证联系 ${new Date(d.last_authenticated_contact_at * 1000).toLocaleString()}（${d.last_authenticated_transport || '未知通道'}） · 尚无完整状态快照`
+            ? `上次认证联系 ${new Date(d.last_authenticated_contact_at * 1000).toLocaleString()}（${contactTransport}） · 尚无完整状态快照`
             : d.record_observed?.active_template_id
                 ? '尚无完整认证快照 · 历史状态采样时间未知 · 等待设备联系'
                 : '尚无成功认证通信记录 · 等待设备联系');
       if (sampled && d.last_authenticated_contact_at > sampled) {
-        $('device-state').textContent += ` · 最近认证联系 ${new Date(d.last_authenticated_contact_at * 1000).toLocaleString()}（${d.last_authenticated_transport}）`;
+        $('device-state').textContent += ` · 最近认证联系 ${new Date(d.last_authenticated_contact_at * 1000).toLocaleString()}（${contactTransport}）`;
       }
       if (d.reachability === 'blocked' && d.last_attempt?.error) {
         $('device-state').textContent += ` · 最近尝试：${d.last_attempt.error}`;
@@ -1251,7 +1253,7 @@
     navigator.clipboard.writeText(text || '');
   }
 
-  /* ---------- v2 platform pages (same application service as MCP) ---------- */
+  /* ---------- platform pages (same application service as MCP) ---------- */
 
   /* The device page selects its own device and every operation carries that MAC
      explicitly; the Bridge never switches a global device behind the user. */
@@ -1330,7 +1332,7 @@
     const device = platformDevices.find(d => d.device_mac === mac);
     openModal(`<h3>切换当前设备</h3>
       <div>设备页将切换到 <b>${escapeHtml(device?.name || mac)}</b> · <code>${escapeHtml(mac)}</code>。</div>
-      <div class="muted">身份、实况、v2 状态、功耗、占用与恢复读取都会按它刷新。切换不会向任何设备推送，模板页的族选择也不受影响；当前设备未保存的 Profile 草稿会被丢弃。</div>
+      <div class="muted">身份、实况、设备状态、功耗、占用与恢复读取都会按它刷新。切换不会向任何设备推送，模板页的族选择也不受影响；当前设备未保存的 Profile 草稿会被丢弃。</div>
       <div class="foot"><button onclick="closeModal()">取消</button>
       <button class="primary" onclick="applyDeviceSelection('${escapeAttr(mac)}')">切换</button></div>`);
   }
@@ -1355,8 +1357,8 @@
       platformDevice = device || null;
       if (!device) {
         $('pt-device-state').textContent = platformDevices.length > 1
-          ? 'v2 平台状态：请先在上方选择设备'
-          : 'v2 平台状态：尚未学习到设备 MAC';
+          ? '设备平台状态：请先在上方选择设备'
+          : '设备平台状态：尚未学习到设备 MAC';
         $('pt-targets').textContent = '--';
         $('pt-active').textContent = '--';
         $('pt-jobinfo').textContent = '--';
@@ -1367,7 +1369,7 @@
       }
       const caps = device.capabilities || {};
       $('pt-device-state').innerHTML =
-        `v2 平台状态 ${device.hardware_verified === false ? platformStateBadge('unverified') : ''}`;
+        `设备平台状态 ${device.hardware_verified === false ? platformStateBadge('unverified') : ''}`;
       $('pt-targets').textContent =
         `${caps.firmware_target || '--'} / ${caps.render_target || '--'} · abi ${caps.compiler_abi || '--'}`;
       $('pt-active').textContent =

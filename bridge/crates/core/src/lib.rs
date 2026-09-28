@@ -11,7 +11,7 @@ pub mod paths;
 pub mod platform;
 pub mod runtime;
 pub mod template;
-pub mod v2_client;
+pub mod device_client;
 
 /// Deterministic short id used for `bridge.hostId`.
 pub fn short_id(input: &str) -> String {

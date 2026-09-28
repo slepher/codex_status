@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use bridge_ble::{lan_ip, Pusher};
-use bridge_core::template::{template_hash, Library};
+use bridge_core::template::Library;
 use serde_json::{json, Value};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
@@ -337,6 +337,7 @@ async fn post_firmware(
     bytes: Vec<u8>,
     filename: &str,
     target: Option<&str>,
+    sync_ticket: Option<&str>,
 ) -> reqwest::Result<reqwest::Response> {
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -348,11 +349,9 @@ async fn post_firmware(
     let form = reqwest::multipart::Form::new().part("firmware", part);
     let url = format!("http://{ip}/doUpdate?token={token}{}",
         target.map(|t| format!("&target={t}")).unwrap_or_default());
-    client
-        .post(url)
-        .multipart(form)
-        .send()
-        .await
+    let mut request = client.post(url).multipart(form);
+    if let Some(ticket) = sync_ticket { request = request.header("X-Codex-Sync-Ticket", ticket); }
+    request.send().await
 }
 
 static OTA_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -370,6 +369,7 @@ async fn firmware_ota_inner(cfg: &McpConfig, args: &Value) -> Result<Vec<Value>,
     let upload_only = args.get("_upload_only").and_then(Value::as_bool).unwrap_or(false);
     let rom = require_str(args, "rom")?;
     let declared_target = args.get("firmware_target").and_then(Value::as_str);
+    let sync_ticket = args.get("_sync_ticket").and_then(Value::as_str);
     if upload_only && declared_target.is_none() {
         return Err("queued OTA requires firmware_target".into());
     }
@@ -452,14 +452,14 @@ async fn firmware_ota_inner(cfg: &McpConfig, args: &Value) -> Result<Vec<Value>,
         let _ = client.post(&abort_url).send().await;
     }
 
-    let mut upload = post_firmware(&ip, token.as_deref().unwrap(), bytes.clone(), filename, declared_target).await;
+    let mut upload = post_firmware(&ip, token.as_deref().unwrap(), bytes.clone(), filename, declared_target, sync_ticket).await;
     if !upload_only && matches!(&upload, Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED) {
         tracing::warn!("device token rejected; re-requesting over BLE");
         let fresh = fetch_device_token(cfg, &target_mac).await.map_err(|e| {
             format!("device token rejected and re-fetch failed ({e}); click BOOT on the device, then retry")
         })?;
         token = Some(fresh);
-        upload = post_firmware(&ip, token.as_deref().unwrap(), bytes.clone(), filename, declared_target).await;
+        upload = post_firmware(&ip, token.as_deref().unwrap(), bytes.clone(), filename, declared_target, sync_ticket).await;
     }
     match upload {
         Ok(resp) if !resp.status().is_success() => {
@@ -511,6 +511,13 @@ async fn firmware_ota_inner(cfg: &McpConfig, args: &Value) -> Result<Vec<Value>,
 pub async fn firmware_upload(cfg: &McpConfig, rom: &Path, ip: &str, mac: &str, target: &str) -> Result<(), String> {
     let args = serde_json::json!({"rom": rom, "device_ip": ip, "device_mac": mac,
         "firmware_target": target, "_upload_only": true});
+    firmware_ota_inner(cfg, &args).await.map(|_| ())
+}
+
+pub async fn firmware_upload_with_ticket(cfg: &McpConfig, rom: &Path, ip: &str, mac: &str,
+                                         target: &str, ticket: &str) -> Result<(), String> {
+    let args = serde_json::json!({"rom": rom, "device_ip": ip, "device_mac": mac,
+        "firmware_target": target, "_upload_only": true, "_sync_ticket": ticket});
     firmware_ota_inner(cfg, &args).await.map(|_| ())
 }
 
@@ -606,38 +613,13 @@ fn tool_definitions() -> Value {
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
         },
         {
-            "name": "template_get",
-            "title": "读取模板 JSON",
-            "description": "读取某个模板的完整 JSON",
-            "annotations": {"readOnlyHint": true},
-            "inputSchema": {
-                "type": "object",
-                "properties": {"id": {"type": "string"}},
-                "required": ["id"],
-                "additionalProperties": false
-            }
-        },
-        {
-            "name": "template_validate",
-            "title": "校验模板",
-            "description": "用固件同源引擎校验模板 JSON，返回通过或具体错误",
-            "annotations": {"readOnlyHint": true},
-            "inputSchema": {
-                "type": "object",
-                "properties": {"json": {"type": "string"}},
-                "required": ["json"],
-                "additionalProperties": false
-            }
-        },
-        {
             "name": "template_render",
             "title": "渲染预览",
-            "description": "用固件同源引擎按模板画布渲染预览（返回 PNG 图像与文件路径）。usage 省略时取桥的实时数据；也可传 id 或 json。改模板后应先渲染给用户确认",
+            "description": "用固件同源引擎渲染传入的模板 JSON（返回 PNG 图像与文件路径）。usage 省略时取桥的实时数据。先用 platform_template_get 读取已存模板，改模板后渲染给用户确认",
             "annotations": {"readOnlyHint": true},
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "id": {"type": "string"},
                     "json": {"type": "string"},
                     "usage": {"type": "string"},
                     "channel": {"type": "string"},
@@ -647,21 +629,7 @@ fn tool_definitions() -> Value {
                     "state": {"type": "string", "description": "设备状态字：AP / BLE ON / BLE OFF / WIFI OFF"},
                     "offline_mins": {"type": "integer", "description": "距上次成功同步的分钟数；负数表示未知（隐藏）"}
                 },
-                "additionalProperties": false
-            }
-        },
-        {
-            "name": "template_save",
-            "title": "保存模板",
-            "description": "校验并保存模板 JSON 到模板目录（只落盘，不会推送；旧版自动备份）。保存后会返回固件引擎渲染的预览图，供支持图形显示的客户端直接展示。推送请使用 platform_publish",
-            "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false},
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string"},
-                    "json": {"type": "string"}
-                },
-                "required": ["id", "json"],
+                "required": ["json"],
                 "additionalProperties": false
             }
         },
@@ -760,46 +728,8 @@ fn tool_definitions() -> Value {
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
         },
         {
-            "name": "device_sleep",
-            "title": "让设备进深睡（调试）",
-            "description": "调试辅助：强推 mode=deep 并让后续 pull 响应也保持 deep（跳过 10 分钟安静迟滞），设备 60s 宽限后进深睡；用 device_mode auto 恢复",
-            "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true},
-            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
-        },
-        {
-            "name": "device_wake",
-            "title": "请求设备回 light（调试）",
-            "description": "调试辅助：pull 响应固定返回 light（设备保持在线可读状态/日志）并推 mode=light；设备在 deep 时需等它下一个 pull 生效（可先用 device_contact_s 缩短间隔），用 device_mode auto 恢复",
-            "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true},
-            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
-        },
-        {
-            "name": "device_mode",
-            "title": "调试模式覆盖（调试）",
-            "description": "调试辅助：把 pull 响应/推送信封的 mode 固定为 auto|deep|light，绕过安静迟滞，便于秒级驱动 deep↔light 循环",
-            "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true},
-            "inputSchema": {
-                "type": "object",
-                "properties": {"mode": {"type": "string", "description": "auto|deep|light"}},
-                "required": ["mode"],
-                "additionalProperties": false
-            }
-        },
-        {
-            "name": "device_contact_s",
-            "title": "调试拉取间隔（调试）",
-            "description": "调试辅助：覆盖桥在 pull 响应里下发的 next_contact_s（秒，30–3600；0 恢复自动：活跃 60/安静 900），用于加快 deep↔light 循环",
-            "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true},
-            "inputSchema": {
-                "type": "object",
-                "properties": {"s": {"type": "integer", "description": "间隔秒数（30–3600），0 恢复自动"}},
-                "required": ["s"],
-                "additionalProperties": false
-            }
-        },
-        {
-            "name": "platform_device_register_v2",
-            "description": "Explicitly register or update one v2 device endpoint by MAC after verifying its structured status and authenticated v2 status. Does not claim or publish. Available only in bridge-app.",
+            "name": "platform_device_register",
+            "description": "Explicitly register or update one device endpoint by MAC after verifying its structured and authenticated status. Does not claim or publish. Available only in bridge-app.",
             "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true},
             "inputSchema": {
                 "type": "object",
@@ -814,18 +744,18 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "platform_overview",
-            "description": "v2 platform overview: templates (latest per id+render_target), devices (MAC/profile/count), data sources, pending states. Same application service as the UI.",
+            "description": "Platform overview: templates (latest per id+render_target), devices (MAC/profile/count), data sources, pending states. Same application service as the UI.",
             "annotations": {"readOnlyHint": true},
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
         },
         {
-            "name": "template_list",
+            "name": "platform_template_list",
             "description": "List saved templates with their render target, CRCs, sizes and referencing devices (read-only).",
             "annotations": {"readOnlyHint": true},
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
         },
         {
-            "name": "template_get_v2",
+            "name": "platform_template_get",
             "description": "Read a saved template source + compiled plan by id (optional render_target).",
             "annotations": {"readOnlyHint": true},
             "inputSchema": {
@@ -836,7 +766,7 @@ fn tool_definitions() -> Value {
             }
         },
         {
-            "name": "template_validate_v2",
+            "name": "platform_template_validate",
             "description": "Compile/validate template JSON with the firmware-equivalent engine (no save).",
             "annotations": {"readOnlyHint": true},
             "inputSchema": {
@@ -847,7 +777,7 @@ fn tool_definitions() -> Value {
             }
         },
         {
-            "name": "template_save_v2",
+            "name": "platform_template_save",
             "description": "Save a template (latest per id+render_target) WITHOUT publishing; replacement is explicit.",
             "annotations": {"readOnlyHint": false, "destructiveHint": false},
             "inputSchema": {
@@ -862,13 +792,13 @@ fn tool_definitions() -> Value {
             }
         },
         {
-            "name": "profile_get_v2",
+            "name": "platform_profile_get",
             "description": "Per-device Profile (1-8 ordered template ids, initial active, bindings, sync flag).",
             "annotations": {"readOnlyHint": true},
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
         },
         {
-            "name": "profile_save_v2",
+            "name": "platform_profile_save",
             "description": "Save a Profile (1-8 ordered ids) WITHOUT publishing.",
             "annotations": {"readOnlyHint": false},
             "inputSchema": {
@@ -879,8 +809,8 @@ fn tool_definitions() -> Value {
             }
         },
         {
-            "name": "family_profiles_v2",
-            "description": "List supported render target families and their reusable v2 Profile drafts.",
+            "name": "platform_family_profiles",
+            "description": "List supported render target families and their reusable Profile drafts.",
             "annotations": {"readOnlyHint": true},
             "inputSchema": {
                 "type": "object",
@@ -889,7 +819,7 @@ fn tool_definitions() -> Value {
             }
         },
         {
-            "name": "family_profile_save_v2",
+            "name": "family_platform_profile_save",
             "description": "Save a family Profile draft without changing a device or publishing.",
             "annotations": {"readOnlyHint": false, "destructiveHint": false},
             "inputSchema": {
@@ -900,7 +830,7 @@ fn tool_definitions() -> Value {
             }
         },
         {
-            "name": "family_profile_delete_v2",
+            "name": "platform_family_profile_delete",
             "description": "Delete a family Profile draft only.",
             "annotations": {"readOnlyHint": false, "destructiveHint": false},
             "inputSchema": {
@@ -914,7 +844,7 @@ fn tool_definitions() -> Value {
             }
         },
         {
-            "name": "family_profile_copy_v2",
+            "name": "platform_family_profile_copy",
             "description": "Copy one explicitly selected device Profile into a new family draft.",
             "annotations": {"readOnlyHint": false, "destructiveHint": false},
             "inputSchema": {
@@ -959,7 +889,7 @@ fn tool_definitions() -> Value {
             "inputSchema": {"type": "object", "properties": {"mac": {"type": "string", "description": "Optional target device Wi-Fi MAC"}}, "additionalProperties": false}
         },
         {
-            "name": "template_activate",
+            "name": "platform_template_activate",
             "description": "Explicit remote activation of an installed template (creates a new device context).",
             "annotations": {"readOnlyHint": false},
             "inputSchema": {
@@ -970,13 +900,13 @@ fn tool_definitions() -> Value {
             }
         },
         {
-            "name": "data_sources_v2",
+            "name": "platform_data_sources",
             "description": "DataSource list with latest SourceSnapshot, push/pull triggers, quality and validity.",
             "annotations": {"readOnlyHint": true},
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
         },
                 {
-            "name": "data_source_save_v2",
+            "name": "platform_data_source_save",
             "description": "Create/replace a DataSource (Codex or Static JSON). Saving never triggers a device push.",
             "annotations": {"readOnlyHint": false},
             "inputSchema": {
@@ -987,7 +917,7 @@ fn tool_definitions() -> Value {
             }
         },
         {
-            "name": "data_probe_v2",
+            "name": "platform_data_probe",
             "description": "Collect once from a DataSource and report the resulting snapshot.",
             "annotations": {"readOnlyHint": false, "idempotentHint": true},
             "inputSchema": {
@@ -998,14 +928,14 @@ fn tool_definitions() -> Value {
             }
         },
         {
-            "name": "power_view_v2",
+            "name": "platform_power_view",
             "description": "Current PowerPlan/provisional/remaining/rendezvous state (read-only; a read never extends the light deadline).",
             "annotations": {"readOnlyHint": true},
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
         },
         {
             "name": "power_plan",
-            "description": "Explicit formal PowerPlan: light is queued durably for the next authenticated BLE rendezvous when offline; power_view_v2 reports its ACK. sleep requests sleep immediately.",
+            "description": "Explicit formal PowerPlan: light is queued durably for the next authenticated BLE rendezvous when offline; platform_power_view reports its ACK. sleep requests sleep immediately.",
             "annotations": {"readOnlyHint": false},
             "inputSchema": {
                 "type": "object",
@@ -1038,6 +968,28 @@ fn tool_definitions() -> Value {
             }
         }
     ])
+}
+
+#[cfg(test)]
+mod platform_tool_contract_tests {
+    use super::tool_definitions;
+    use std::collections::HashSet;
+
+    #[test]
+    fn current_platform_tools_have_unique_unversioned_names() {
+        let definitions = tool_definitions();
+        let names: Vec<&str> = definitions.as_array().unwrap().iter()
+            .map(|tool| tool["name"].as_str().unwrap()).collect();
+        assert_eq!(names.len(), names.iter().copied().collect::<HashSet<_>>().len());
+        for name in ["platform_template_get", "platform_template_validate",
+            "platform_template_save", "platform_profile_get", "platform_power_view"] {
+            assert!(names.contains(&name), "missing {name}");
+        }
+        assert!(!names.iter().any(|name| name.ends_with("_v2") ||
+            ["template_get", "template_validate", "template_save",
+                "device_sleep", "device_wake", "device_mode", "device_contact_s"]
+                .contains(name)));
+    }
 }
 
 async fn call_tool(cfg: &McpConfig, name: &str, args: &Value) -> Result<Vec<Value>, String> {
@@ -1098,35 +1050,9 @@ async fn call_tool(cfg: &McpConfig, name: &str, args: &Value) -> Result<Vec<Valu
                 .to_string(),
             )])
         }
-        "template_get" => {
-            let id = require_str(args, "id")?;
-            let library = load_library(cfg).map_err(|e| e.to_string())?;
-            let entry = library.get(&id).ok_or_else(|| format!("template not found: {id}"))?;
-            let text = String::from_utf8(entry.bytes.clone()).map_err(|e| e.to_string())?;
-            Ok(vec![text_block(text)])
-        }
-        "template_validate" => {
-            let body = require_str(args, "json")?;
-            match bridge_render::validate(&body) {
-                Ok(()) => Ok(vec![text_block("valid: 固件引擎校验通过")]),
-                Err(err) => Err(format!("invalid: {err}")),
-            }
-        }
         "template_render" => {
-            let (template, label) = if let Some(body) = args.get("json").and_then(|v| v.as_str()) {
-                (body.to_string(), "inline".to_string())
-            } else {
-                let id = args
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| "provide id or json".to_string())?;
-                let library = load_library(cfg).map_err(|e| e.to_string())?;
-                let entry = library.get(id).ok_or_else(|| format!("template not found: {id}"))?;
-                (
-                    String::from_utf8(entry.bytes.clone()).map_err(|e| e.to_string())?,
-                    id.to_string(),
-                )
-            };
+            let template = require_str(args, "json")?;
+            let label = "inline";
             bridge_render::validate(&template).map_err(|e| format!("invalid: {e}"))?;
             let usage = args
                 .get("usage")
@@ -1153,48 +1079,6 @@ async fn call_tool(cfg: &McpConfig, name: &str, args: &Value) -> Result<Vec<Valu
                 image_block(&png),
             ])
         }
-        "template_save" => {
-            let id = require_str(args, "id")?;
-            let body = require_str(args, "json")?;
-            if !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
-                return Err("invalid id: use [a-z0-9_-]".to_string());
-            }
-            let doc: Value = serde_json::from_str(&body).map_err(|e| format!("json: {e}"))?;
-            let file = cfg.templates.join(format!("{id}.json"));
-            if file.exists() {
-                let backup_dir = cfg.data_root.join("template-backups");
-                std::fs::create_dir_all(&backup_dir).map_err(|e| e.to_string())?;
-                let backup = backup_dir.join(format!("{id}-{}.json", now_secs()));
-                std::fs::copy(&file, &backup).map_err(|e| e.to_string())?;
-            }
-            let pretty = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
-            bridge_render::validate(&pretty).map_err(|e| format!("invalid: {e}"))?;
-            std::fs::write(&file, &pretty).map_err(|e| e.to_string())?;
-            let hash = template_hash(pretty.as_bytes());
-            let mut content = vec![text_block(format!(
-                "saved {} ({} bytes, hash {hash}); 仅落盘，推送请用 platform_publish",
-                file.display(),
-                pretty.len()
-            ))];
-            // Return the rendered result so graphical MCP clients can show it.
-            let usage = fetch_live_usage(cfg).unwrap_or_else(|| "{}".to_string());
-            let ip = lan_ip();
-            let sync = local_hhmm();
-            let env = bridge_render::Env {
-                channel: "WIFI",
-                ip: &ip,
-                sync_hhmm: &sync,
-                battery: bridge_render::DEFAULT_BATTERY,
-                ..Default::default()
-            };
-            if let Ok(bits) = bridge_render::render_bits(&pretty, &usage, &env) {
-                let (w, h) = bridge_render::canvas_size(&pretty).unwrap_or((200, 200));
-                if let Ok(png) = bridge_render::bits_to_png_size(&bits, w, h) {
-                    content.push(image_block(&png));
-                }
-            }
-            Ok(content)
-        }
         "firmware_ota" => firmware_ota(cfg, args).await,
         "pm_stats" => {
             let ip = args
@@ -1212,20 +1096,19 @@ async fn call_tool(cfg: &McpConfig, name: &str, args: &Value) -> Result<Vec<Valu
             Ok(vec![text_block(text)])
         }
         "device_rename" | "device_discover" | "device_owner" | "device_claim"
-        | "device_release" | "device_sleep" | "device_wake" | "device_mode"
-        | "device_contact_s" => {
+        | "device_release" => {
             // Implemented in bridge-app (live identity/occupancy state); this
             // library copy has no running app to mutate.
             Err("device tools are only available in the tray app (bridge-app)".to_string())
         }
-        // v2 platform tools share the app's application service; without a
+        // Platform tools share the app's application service; without a
         // running app there is no live state to read or change.
-        "platform_device_register_v2" | "platform_overview" | "template_list" | "template_get_v2" | "template_save_v2"
-        | "template_validate_v2" | "profile_get_v2" | "profile_save_v2"
-        | "family_profiles_v2" | "family_profile_save_v2"
-        | "family_profile_delete_v2" | "family_profile_copy_v2"
-        | "platform_publish" | "platform_publish_preview" | "platform_font_list" | "platform_font_import" | "platform_publish_cancel" | "template_activate"
-        | "data_sources_v2" | "data_source_save_v2" | "data_probe_v2" | "power_view_v2" | "power_plan"
+        "platform_device_register" | "platform_overview" | "platform_template_list" | "platform_template_get" | "platform_template_save"
+        | "platform_template_validate" | "platform_profile_get" | "platform_profile_save"
+        | "platform_family_profiles" | "family_platform_profile_save"
+        | "platform_family_profile_delete" | "platform_family_profile_copy"
+        | "platform_publish" | "platform_publish_preview" | "platform_font_list" | "platform_font_import" | "platform_publish_cancel" | "platform_template_activate"
+        | "platform_data_sources" | "platform_data_source_save" | "platform_data_probe" | "platform_power_view" | "power_plan"
         | "platform_status_refresh" | "platform_push_now" | "platform_recovery" => {
             Err("platform tools are only available in the tray app (bridge-app)".to_string())
         }
@@ -1258,7 +1141,7 @@ pub async fn handle_request(cfg: &McpConfig, request: &Value) -> Option<Value> {
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "codex-status", "version": env!("CARGO_PKG_VERSION")},
-                "instructions": "模板编辑工具：先 template_get 读取现状，template_render 用固件同源引擎出图给用户确认。模板保存只落盘；推送到设备是用户显式动作，用 platform_publish（显式发布该设备 Profile 的完整 Bundle）。不要跳过渲染确认，也不要在用户未同意时推送。设备功耗/light sleep 诊断用 pm_stats（只读，勿高频）。设备身份/发现/占用：bridge_status/device_owner 只读；device_rename、device_discover、device_claim(force)、device_release 会改变桥或设备状态，需用户明确要求。调试四件套：device_sleep（推 deep 并保持 deep）、device_wake（pull 固定 light，回在线读日志）、device_mode（auto|deep|light，绕过 10 分钟安静迟滞）、device_contact_s（覆盖 pull 间隔，加速循环）。"
+                "instructions": "模板编辑工具：先 platform_template_get 读取现状，platform_template_validate 校验，template_render 用固件同源引擎出图给用户确认。platform_template_save 只落盘；推送到设备是用户显式动作，用 platform_publish（显式发布该设备 Profile 的完整 Bundle）。不要跳过渲染确认，也不要在用户未同意时推送。设备功耗/light sleep 诊断用 pm_stats（只读，勿高频）。设备身份/发现/占用：bridge_status/device_owner 只读；device_rename、device_discover、device_claim(force)、device_release 会改变桥或设备状态，需用户明确要求。"
             }),
         )),
         "notifications/initialized" => None,

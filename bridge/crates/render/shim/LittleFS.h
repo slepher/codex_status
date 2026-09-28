@@ -73,8 +73,13 @@ public:
         if (!out.good()) return false;
         const bool slot = path == "/bundle/a.bin" || path == "/bundle/b.bin";
         const bool meta = path == "/bundle/m0.bin" || path == "/bundle/m1.bin";
+        const bool syncBlob = path == "/sync/b0.bin" || path == "/sync/b1.bin";
+        const bool syncMeta = path == "/sync/m0.bin" || path == "/sync/m1.bin";
         if (((crashAfterSyncKind == "slot" && slot) ||
-             (crashAfterSyncKind == "meta" && meta)) && --crashAfterSyncCount == 0)
+             (crashAfterSyncKind == "meta" && meta) ||
+             (crashAfterSyncKind == "sync_blob" && syncBlob) ||
+             (crashAfterSyncKind == "sync_meta" && syncMeta)) &&
+            --crashAfterSyncCount == 0)
             std::_Exit(77);
         return true;
     }

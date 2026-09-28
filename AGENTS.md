@@ -2,7 +2,7 @@
 
 ## 项目概览
 
-便携墨水屏显示本机 Codex 余量：ESP32-S3（Waveshare 1.54" 200×200 B/W，SSD1681，局刷 ~300ms）本地渲染；Rust 桥接（Tauri v2 托盘进程）通过 `codex app-server` JSON-RPC 取数，经 Wi-Fi HTTP（主通道）或 BLE GATT（备选）下发 usage 与模板。换样式只换模板 JSON，不刷固件。2026-09-26 两台实机认证状态分别已见 Note4 `0.18.25-note4-b` 与 1.54 `0.18.25-bw`（v2 通用平台：每设备 Profile 1–8 全按键循环、CompiledTemplate、完整 A/B Bundle、单一 active context、Bridge 生成 PowerPlan、Codex 只是 DataSource；关 mDNS；设备身份 = Wi-Fi MAC + 可编辑显示名；显式 claim/lease 占用，桥按空闲自动占用）。设计见 `docs/generic-display-platform-design-v2.md`。旧版 ≤3 槽通道与桥侧 legacy profile 存储已删除（2026-09-25），桥只服务 v2 固件；不得把 8 项静默裁剪成 3 项。
+便携墨水屏显示本机 Codex 余量：ESP32-S3（Waveshare 1.54" 200×200 B/W，SSD1681，局刷 ~300ms）本地渲染；Rust 桥接（Tauri v2 托盘进程）通过 `codex app-server` JSON-RPC 取数，经 Wi-Fi HTTP（主通道）或 BLE GATT（备选）下发 usage 与模板。换样式只换模板 JSON，不刷固件。现行通用平台：每设备 Profile 1–8 全按键循环、CompiledTemplate、完整 A/B Bundle、单一 active context、Bridge 生成 PowerPlan、Codex 只是 DataSource；关 mDNS；设备身份 = Wi-Fi MAC + 可编辑显示名；显式 claim/lease 占用，桥按空闲自动占用。设计见 `docs/generic-display-platform-design.md`。旧版 ≤3 槽通道与桥侧 legacy profile 存储已删除（2026-09-25）；不得把 8 项静默裁剪成 3 项。工作树中的 `/api/*` 一次性协议改名尚未部署，实机/运行 Bridge 版本以 `PROGRESS.md` 最新节为准。
 
 先读 `PROGRESS.md` 最新一节（权威交接文档，只保留最新现场，含设备现场、ROM SHA256）；待办的**唯一事实来源**是 `docs/roadmap/backlog.md`。文档导航见 `docs/README.md`。历史背景见 `docs/history/request.md`、`docs/device-setup-experience.md`；早期讨论见 `docs/history/discussion-summary.md`（历史资料）；已结项专项见 `docs/roadmap/archive-digest-legacy.md` / `-recent.md`，原件在 `docs/history/workflow/`。
 
@@ -10,11 +10,11 @@
 
 | 路径 | 内容 |
 |---|---|
-| `src/` | 固件（PlatformIO/Arduino）。入口 `main.cpp`；`template_engine/template_xfer/template_store`（模板）、`ble_bridge`、`usage_client`、`EPD_SSD1681`、`GUI_Paint`、`dev_log`、`bridge_store`、`owner_store`（claim/lease） |
-| `bridge/crates/core` | app-server 客户端、usage 信封、模板库（canonical JSON + CRC32）、LAN HTTP `/usage` `/template` |
-| `bridge/crates/ble` | btleplug central：endpoint/usage/模板推送 |
+| `src/` | 固件（PlatformIO/Arduino）。入口 `main.cpp`；`template_engine/template_xfer/template_store`（模板）、`ble_bridge`、`EPD_SSD1681`、`GUI_Paint`、`dev_log`、`bridge_store`、`owner_store`（claim/lease） |
+| `bridge/crates/core` | app-server 客户端、usage 信封、模板库（canonical JSON + CRC32）、设备 `/api/*` HTTP 客户端 |
+| `bridge/crates/ble` | btleplug central：endpoint 身份、认证命令与会合 |
 | `bridge/crates/render` | 把固件同一份 C++ 引擎编进宿主，像素级预览/离线对拍 |
-| `bridge/crates/mcp` | MCP 工具（单设备工具：bridge_status/template_get/template_validate/template_render/template_save/firmware_ota/pm_stats/device_*；v2：platform_overview/template_list/template_get_v2/template_validate_v2/template_save_v2/profile_get_v2/profile_save_v2/platform_publish(_cancel)/template_activate/data_sources_v2/data_probe_v2/power_view_v2/power_plan/platform_status_refresh/platform_recovery），由托盘内建 HTTP 端点 `http://127.0.0.1:8766/mcp` 提供（见 `opencode.jsonc`；设备类与 v2 平台工具由 app 侧实现，与 UI 共用 application service） |
+| `bridge/crates/mcp` | MCP 工具：bridge_status/template_render/firmware_ota/pm_stats/device_* 及 platform_*（模板、Profile、数据源、PowerPlan、发布、状态与恢复）；由托盘内建 HTTP 端点 `http://127.0.0.1:8766/mcp` 提供（见 `opencode.jsonc`；平台工具由 app 侧实现，与 UI 共用 application service） |
 | `bridge/crates/app` | 生产形态：单实例托盘 + 内建 HTTP/BLE/MCP，运行数据在 `<exe>/data/`；`src/discovery.rs` 为 ARP 发现回退；身份/发现/占用见 `docs/power-state.md` §9.1/§9.2 |
 | `tools/test-bridge` | Python 测试桥（`start.ps1`/`stop.ps1`）、模板库 `templates/*.json` |
 | `tools/device-auth` | `request_token.py`：经已绑定 BLE 链路协商 Wi-Fi 操作 token |
@@ -51,8 +51,8 @@ Rust 桥（`bridge/` 目录；Windows 才能跑 BLE/Tauri）：
 ```powershell
 cargo test
 cargo run -p bridge-core -- --once          # 拉一次真实数据并打印信封
-cargo run -p bridge-core                    # 起 HTTP :8765（--templates 指向模板目录）
-cargo run -p bridge-ble -- --once           # 单次 BLE 推送
+cargo run -p bridge-core                    # 独立数据源进程，HTTP :8765 只提供 /health
+cargo run -p bridge-ble -- --once           # 单次 BLE endpoint 交接；业务数据走当前设备协议
 cargo run -p bridge-app                     # 托盘应用（生产形态，进程内含 HTTP+BLE+MCP）
 cargo run -p bridge-render -- --template <json> --out <png>   # 离线渲染对拍
 ```
@@ -78,12 +78,12 @@ git diff --check                   # 提交前必查
 - 所有绘制文本先做 ASCII 净化（防字库越界）。
 - `/update`、`/doUpdate`、ArduinoOTA、`POST /claim` 必须携带设备 token（开机自动签发并存于 NVS，仅经绑定 BLE 链路取用/轮换）；无/错 token 返回 401，不要绕过或放宽。
 - 设备身份 = Wi-Fi MAC（学习并持久化），显示名可改但非主键；UDP/HTTP/BLE 通告 MAC 不符即拒绝。发现链：属性 IP → UDP → ARP（Windows）→ BLE（手动兜底）；mDNS 已关，勿再依赖 `.local`。
-- 占用只走显式 `POST /claim`：`usage`/`template` 永不创建/转移 owner（仅刷新匹配 id 的 `last_seen`）；owner 有效且 `bridge.hostId`（template 用 `bridge_id`）不符一律 409，`activate` 无旁路；lease 到期只清空。桥空闲自动 claim、60s 续约、他人占用不推送；推送仍是用户显式动作（claim 是协议行为，不等于推送模板）。
+- 占用只走显式 `POST /claim`：`/api/data`、`/api/plan`、`/api/bundle/*`、`/api/activate` 永不创建/转移 owner（仅刷新匹配 id 的 `last_seen`）；owner 有效且命令 `bridge_id` 不符一律 409，`activate` 无旁路；lease 到期只清空。桥空闲自动 claim、60s 续约、他人占用不推送；模板发布仍是用户显式动作（claim 是协议行为，不等于发布）。
 - 改 GATT 特征表后 Windows 会缓存旧属性，需解除配对再重配（或后续评估 Service Changed）。
 - 便携数据布局：运行数据 `<exe>/data/`，种子 `<exe>/seed/`（开发回退 `tools/test-bridge/`）；程序不写仓库。⚠️ **`<exe>/data/` 就在 `bridge/target/debug/data/` 里**——`cargo` 报 `os error 5`（`target/debug/.fingerprint/...` 这类沙箱旧文件缺能力 ACE，`Set-Acl` 也改不动）而想"删 `target/debug` 重建"时，**先把 `data/` 备份出去**：它装着 `state.json`（设备登记/Profile/jobs/contexts/plans）、模板库、`device-token-*.json`、`bridge-app.json`（endpoint token）。2026-09-25 有一次真实事故（见 `PROGRESS.md`「桥：契约刷新修复 + ACL 闸门绕过」节）：删目录连带删掉运行时数据，靠写回配置 + 从 `tools/test-bridge/` 与仓库夹具重导模板 + 重新登记设备/重建 Profile 才恢复。**更安全的做法是 `cargo build/test --target-dir <仓库内新目录>`**，完全不碰现有 `target/debug`。
-- 推送是用户显式动作：v2 下 Profile = 1–8 个有序模板（全部参与按键循环，无 enabled 子集），显式发布冻结一个完整 Bundle；保存模板/Profile、MCP save、UI save 都只落盘，不得自动发布。旧版 ≤3 槽通道与 `profiles.json` 存储已删除（2026-09-25），桥只服务 v2 设备。
-- v2 数据语义：字段仅在 Bridge 绑定合同中分 push/pull；push 可见值/缺失/质量变化发送完整最新快照，pull-only 变化只更新缓存、不推送、不改 PowerPlan；只有成功 ACK 才更新确认指纹与 full_sync_deadline。设备不接收 push/pull 分类。
-- v2 电源：只有 Bridge 的正式 PowerPlan 改变 light deadline；读取/传输/claim/owner renew 都不隐式续租；BOOT provisional 300s 从物理唤醒起算，timer wake 不获得。
+- 推送是用户显式动作：Profile = 1–8 个有序模板（全部参与按键循环，无 enabled 子集），显式发布冻结一个完整 Bundle；保存模板/Profile、MCP save、UI save 都只落盘，不得自动发布。旧版 ≤3 槽通道与 `profiles.json` 存储已删除（2026-09-25），桥只服务现行平台设备。
+- 数据语义：字段仅在 Bridge 绑定合同中分 push/pull；push 可见值/缺失/质量变化发送完整最新快照，pull-only 变化只更新缓存、不推送、不改 PowerPlan；只有成功 ACK 才更新确认指纹与 full_sync_deadline。设备不接收 push/pull 分类。
+- 电源：只有 Bridge 的正式 PowerPlan 改变 light deadline；读取/传输/claim/owner renew 都不隐式续租；BOOT provisional 300s 从物理唤醒起算，timer wake 不获得。
 - 版本号 `FW_VERSION` 在 `src/main.cpp`；固件发布后在 `PROGRESS.md` 记录 ROM 路径与 SHA256。
 - 显示规则：配额/账号缺失的表现是**模板属性**，由各变体自己的 `when` 分支决定，不用全局规则统一。已实现的两种：200×200 `quad` 在 5h 桶不存在时显示静态 `100` 并隐藏其重置时间；400×300 `codex-status-a` 在 5h 桶不存在时隐藏 5h 块并把 weekly 提升到主位。共享的数据侧约定：桥在 `resetCredits.availableCount<=0` 时不下发该字段，模板按 `exists` 隐藏 RC 行；`bridge.label` 取不到用户名时模板不绘制该行。新增变体按该 target 的产品意图选择分支，并同步更新本行。
 
@@ -110,7 +110,7 @@ git diff --check                   # 提交前必查
 - ✅ 已核实（2026-09-25）：设备 `/status.json` + ARP 实测 1.54 就是 `70041DD7A340` @ `192.168.3.163`，与本表及 `state.json` 登记一致。本文旧版写的 `192.168.1.50` 与 `70:04:1D:AA:BB:CC` **作废**，不要再引用。1.54 于 2026-09-25 OTA 到 `0.18.23-bw`；2026-09-26 经按 MAC 排队 OTA 后认证状态已见 **`0.18.25-bw`**。Note4 同法已见 **`0.18.25-note4-b`**；精确运行镜像哈希仍未由设备证明，见 `PROGRESS.md` 顶节。
 - USB 串口 COM 口动态（COM3/COM4/COM5）；用户常拔 USB（无串口时靠 Wi-Fi `/status.json`、`/log`）。**打开串口会复位板子**，所以不要为了看日志而丢掉一次按键唤醒的现场。
 - OTA：上传成功后延迟 1.5s 重启，HTTP 先返回 `UPDATE OK`（客户端超时属既有现象）；双槽 ota_0/ota_1 轮换。
-- 状态可读：`GET /status.json`（fw/槽位/重置原因/RSSI/电量/heap 等）、`GET /log`（4KB RAM 环形日志）与 `GET /pmstats`（PM light-sleep 统计/锁，0.13.0+，只读免 token）；桥**只读 `/status.json`**——旧 HTML 状态页回退与 `claim_unsupported`（固件 <0.13.4）已随 legacy 通道一并删除（2026-09-25），非 v2 固件会被直接拒绝注册。
+- 状态可读：`GET /status.json`（恢复/现场视图）、认证 `GET /api/status`（业务状态）、`GET /log`（统一诊断流视图）与 `GET /pmstats`（PM light-sleep 统计/锁，0.13.0+，只读免 token）。Bridge 注册须核对结构化状态和认证状态的 MAC；旧 HTML 状态页回退与 `claim_unsupported`（固件 <0.13.4）已删除。
 - `cargo test --workspace` 可能因运行中的 `bridge-core.exe` 锁定 `target/debug` 失败（不是逻辑失败）；改用隔离 `CARGO_TARGET_DIR` 复测，或核实进程后由用户决定是否停桥。
 - Windows 控制台为 GBK：Python 桥启动时设 `PYTHONIOENCODING=utf-8`，避免 status notify 打印异常。
 - BLE 写入须按 MTU 分片（usage/模板），单次超 MTU 会 `Invalid Attribute Value Length`。

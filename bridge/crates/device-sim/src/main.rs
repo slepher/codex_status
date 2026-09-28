@@ -8,7 +8,7 @@ use axum::{
     Json, Router,
 };
 use sha2::{Digest, Sha256};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     env, fs,
@@ -22,9 +22,10 @@ use std::{
 const BODY_LIMIT: usize = 64 * 1024;
 const MAX_RATE_PPM: u64 = 1_000_000_000;
 const MAX_STEP_MS: u64 = 86_400_000;
-const CAPABILITIES: &[&str] = &["v2_status", "clock_control", "claim", "plan_state",
+const CAPABILITIES: &[&str] = &["device_status", "clock_control", "claim", "plan_state",
     "bundle_transfer", "bundle_persistence", "data_render", "activate",
-    "power_sleep_http", "power_lifecycle", "button_cycle", "ota_catalog", "fake_ble_rendezvous"];
+    "power_sleep_http", "power_lifecycle", "button_cycle", "ota_catalog", "fake_ble_rendezvous",
+    "sync_v1"];
 const UNSUPPORTED: &[&str] = &[
     "physical_ble",
     "physical_display",
@@ -45,6 +46,7 @@ struct SimState {
     owner: Arc<Mutex<OwnerStore>>,
     plan: Arc<Mutex<bridge_render::SimulatorPlan>>,
     bundle: Arc<Mutex<bridge_render::SimulatorBundle>>,
+    sync: Arc<Mutex<bridge_render::SimulatorSync>>,
     ota: Arc<Mutex<OtaStore>>,
     ota_running: Arc<AtomicBool>,
     power: Arc<Mutex<SimPower>>,
@@ -80,6 +82,10 @@ struct SimPower {
     ble_window_until_ms: Option<u64>,
     wake_count: u64,
     last_sleep_reason: String,
+    sync_open: bool,
+    sync_open_id: String,
+    sync_last_progress_ms: u64,
+    sync_visible_skip: u8,
 }
 
 impl SimPower {
@@ -88,9 +94,13 @@ impl SimPower {
             configured, light: true, plugged: false, deep_on_usb: false,
             manual_ble_hold: false, battery_pct: 75, boot_ms: 0,
             provisional: wake_cause == "button",
-            safety_deadline_ms: if configured { 600_000 } else { 0 },
+            safety_deadline_ms: 600_000,
             next_contact_ms: None, ble_window_until_ms: None, wake_count: 0,
             last_sleep_reason: String::new(),
+            sync_open: false,
+            sync_open_id: String::new(),
+            sync_last_progress_ms: 0,
+            sync_visible_skip: 0,
         }
     }
 
@@ -100,6 +110,8 @@ impl SimPower {
         self.next_contact_ms = Some(at_ms.saturating_add(60_000));
         self.ble_window_until_ms = None;
         self.last_sleep_reason = reason.to_owned();
+        self.sync_open = false;
+        self.sync_open_id.clear();
     }
 
     fn json(&self, now_ms: u64) -> serde_json::Value {
@@ -112,6 +124,9 @@ impl SimPower {
             "ble_window_until_ms":self.ble_window_until_ms,
             "wake_count":self.wake_count,
             "last_sleep_reason":self.last_sleep_reason,
+            "sync_open":self.sync_open,
+            "sync_last_progress_ms":self.sync_last_progress_ms,
+            "sync_visible_skip":self.sync_visible_skip,
             "now_ms":now_ms})
     }
 }
@@ -737,6 +752,9 @@ fn reboot_device(state: &SimState, cause: &str) -> Result<SimSession> {
     let bundle = bridge_render::SimulatorBundle::new(&state.data_dir, &state.target,
         session.boot_id, cause)?;
     *state.bundle.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = bundle;
+    let sync = bridge_render::SimulatorSync::new(&state.data_dir, &state.mac,
+        &state.target, state.seed, session.boot_id, cause)?;
+    *state.sync.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = sync;
     *state.plan.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
         bridge_render::SimulatorPlan::new()?;
     Ok(session)
@@ -756,6 +774,15 @@ fn reset_power_after_reboot(state: &SimState, now_ms: u64, cause: &str) -> Resul
     power.next_contact_ms = None;
     power.ble_window_until_ms = None;
     power.wake_count += 1;
+    power.sync_open = false;
+    power.sync_open_id.clear();
+    power.sync_visible_skip = 0;
+    if cause == "deep" {
+        let mut sync = state.sync.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        sync.deep_round(power.wake_count as u32, 0)?;
+        power.sync_visible_skip = sync.status()?["retry_skip"].as_u64().unwrap_or(0) as u8;
+        if power.sync_visible_skip != 0 { sync.consume_skip()?; }
+    }
     drop(power);
     state.owner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).on_boot();
     Ok(())
@@ -774,18 +801,25 @@ fn reconcile_power(state: &SimState, now_ms: u64) -> Result<SimPower> {
         .status()?["configured"] == true;
     let before = state.power.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
     let local_now = now_ms.saturating_sub(before.boot_ms);
-    let (reason, plan_deadline) = {
+    let (reason, plan_deadline, plan_was_light) = {
         let plan = state.plan.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_, mode, _, granted_s, accepted_at_ms) = plan.status_fields();
-        (plan.sleep_reason(configured, before.light, before.plugged,
+        // PowerPlan now governs devices awaiting their first Bundle too.
+        (plan.sleep_reason(true, before.light, before.plugged,
             before.deep_on_usb, before.manual_ble_hold,
             before.provisional, 0,
             before.safety_deadline_ms.saturating_sub(before.boot_ms), local_now),
          if mode == "light" {before.boot_ms.saturating_add(accepted_at_ms)
              .saturating_add(u64::from(granted_s) * 1000)}
-         else {now_ms})
+         else {now_ms}, mode == "light")
     };
     let mut power = state.power.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if power.sync_open &&
+        now_ms.saturating_sub(power.sync_last_progress_ms) >= 90_000 {
+        state.sync.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .fail(now_ms.saturating_sub(power.boot_ms) as u32)?;
+        power.enter_deep(now_ms, "sync incomplete");
+    }
     if configured && !power.configured {
         power.configured = true;
         power.safety_deadline_ms = now_ms.saturating_add(600_000);
@@ -798,12 +832,29 @@ fn reconcile_power(state: &SimState, now_ms: u64) -> Result<SimPower> {
             return Ok(power.clone());
         }
         let transition = match reason {
-            1 => Some((plan_deadline, "v2 plan")),
-            2 => Some((power.boot_ms.saturating_add(300_000), "v2 provisional")),
-            3 => Some((power.safety_deadline_ms, "v2 safety")),
+            1 => Some((plan_deadline, "plan")),
+            2 => Some((power.boot_ms.saturating_add(300_000), "provisional")),
+            3 => Some((power.safety_deadline_ms, "safety")),
             _ => None,
         };
-        if let Some((at, why)) = transition { power.enter_deep(at, why); }
+        if let Some((at, why)) = transition {
+            let light_exit_sync = reason == 1 && plan_was_light && state.sync.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .status()?["enabled"] == true;
+            if light_exit_sync {
+                state.sync.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .add_reason(2, local_now as u32)?;
+                power.light = false;
+                power.sync_open = true;
+                power.sync_open_id = "light-exit".into();
+                power.sync_last_progress_ms = now_ms;
+                power.next_contact_ms = None;
+                power.ble_window_until_ms = None;
+                power.last_sleep_reason = "sync light_exit".into();
+            } else {
+                power.enter_deep(at, why);
+            }
+        }
     }
     if power.ble_window_until_ms.is_some_and(|until| now_ms >= until) {
         power.ble_window_until_ms = None;
@@ -837,7 +888,7 @@ async fn device_gate(state: &SimState) -> Option<Response> {
         return Some(StatusCode::INTERNAL_SERVER_ERROR.into_response());
     };
     match reconcile_power(state, clock.monotonic_ms) {
-        Ok(power) if power.light => None,
+        Ok(power) if power.light || power.sync_open => None,
         Ok(_) => {
             // The device surface stalls past the Bridge's I/O timeout while the
             // simulator control surface remains usable.
@@ -1006,7 +1057,8 @@ async fn public_status(State(state): State<SimState>) -> Response {
         "uptime_s": clock.monotonic_ms.saturating_sub(boot_ms) / 1000,
         "mode": "light",
         "battery": power.battery_pct,
-        "v2_bundle": bundle["configured"],
+        "bundle_configured": bundle["configured"],
+        "template_count": bundle["template_ids"].as_array().map_or(0, Vec::len),
         "commit_seq": bundle["commit_seq"],
         "active_context_id": bundle["context"],
         "active_template_id": bundle["active_template_id"],
@@ -1021,6 +1073,105 @@ async fn public_status(State(state): State<SimState>) -> Response {
 
 async fn status(State(state): State<SimState>, request: Request<Body>) -> Response {
     status_impl(state, request, true).await
+}
+
+async fn sync_endpoint(state: SimState, request: Request<Body>, op: &'static str) -> Response {
+    if let Some(response) = device_gate(&state).await { return response; }
+    if !bearer(&request, &state.endpoint_token) { return unauthorized(); }
+    let body = match to_bytes(request.into_body(), 4096).await {
+        Ok(body) => body,
+        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    };
+    let Ok(message) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let nonce = session_snapshot(&state).nonce;
+    let bridge = message["bridge_id"].as_str().unwrap_or("");
+    let id = message["request_id"].as_str().unwrap_or("");
+    let reject = |error: &str, status: StatusCode| {
+        (status, Json(json!({"op":op,"result":"rejected","error":error,
+            "request_id":id,"device_mac":state.mac,"session_nonce":nonce,
+            "sync_version":1}))).into_response()
+    };
+    if message.get("protocol").is_some() || message.get("rv").is_some() ||
+        message["sync_version"] != 1 ||
+        message["device_mac"] != state.mac || bridge.is_empty() || id.is_empty() || id.len() > 64 {
+        return reject("shape", StatusCode::BAD_REQUEST);
+    }
+    if message["session_nonce"] != nonce {
+        return reject("session", StatusCode::BAD_REQUEST);
+    }
+    let Some(clock) = clock_snapshot(&state) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let owner = match state.owner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_valid(now_seconds(&state, clock)) {
+        Ok(owner) => owner,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    if owner.is_none() { return reject("claim_required", StatusCode::CONFLICT); }
+    if owner.as_ref().is_some_and(|owner| owner.id != bridge) {
+        return reject("occupied", StatusCode::CONFLICT);
+    }
+    let bundle = match state.bundle.lock().unwrap_or_else(std::sync::PoisonError::into_inner).status() {
+        Ok(bundle) => bundle,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let power = state.power.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    let fw = state.ota.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        .active_version().fw.clone();
+    let snapshot = json!({"target":state.target,"fw":fw,"slot":"ota_0",
+        "reset_reason":0,"active_context_id":bundle["context"],
+        "active_template_id":bundle["active_template_id"],
+        "committed_job_id":bundle["job_id"],"commit_seq":bundle["commit_seq"],
+        "display_state":bundle["display_state_code"],"applied_seq":bundle["applied_seq"],
+        "heap_free":0,"battery":power.battery_pct,"plan_id":0,
+        "plan_remaining_s":0,"rounds":state.sync.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner).status()
+            .unwrap_or(serde_json::Value::Null)["rounds"],
+        "owner_id":bridge});
+    let before_ack = state.sync.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        .status().unwrap_or(Value::Null)["pending_batch"]["acked_offset"]
+        .as_u64().unwrap_or(0);
+    let result = state.sync.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        .command(op, &message.to_string(), &snapshot);
+    let Ok(mut reply) = result else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let status = reply["http_status"].as_u64()
+        .and_then(|n| StatusCode::from_u16(n as u16).ok())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    reply.as_object_mut().map(|object| object.remove("http_status"));
+    reply["session_nonce"] = json!(nonce);
+    if reply["result"] == "applied" && (op == "sync_begin" ||
+        (op == "sync_ack" && reply["acked_offset"].as_u64().unwrap_or(0) > before_ack)) {
+        state.power.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sync_last_progress_ms = clock.monotonic_ms;
+    }
+    if op == "sync_complete" && reply["result"] == "applied" {
+        let sync = state.sync.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .status().unwrap_or(serde_json::Value::Null);
+        if sync["due"] != true && sync["pending_batch"].is_null() {
+            let mut power = state.power.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            power.sync_open = false;
+            power.sync_open_id.clear();
+            if !power.light { power.enter_deep(clock.monotonic_ms, "sync complete"); }
+        }
+    }
+    (status, Json(reply)).into_response()
+}
+
+async fn sync_begin(State(state): State<SimState>, request: Request<Body>) -> Response {
+    sync_endpoint(state, request, "sync_begin").await
+}
+async fn sync_page(State(state): State<SimState>, request: Request<Body>) -> Response {
+    sync_endpoint(state, request, "sync_page").await
+}
+async fn sync_ack(State(state): State<SimState>, request: Request<Body>) -> Response {
+    sync_endpoint(state, request, "sync_ack").await
+}
+async fn sync_complete(State(state): State<SimState>, request: Request<Body>) -> Response {
+    sync_endpoint(state, request, "sync_complete").await
 }
 
 async fn status_impl(state: SimState, request: Request<Body>, gate: bool) -> Response {
@@ -1079,7 +1230,38 @@ async fn status_impl(state: SimState, request: Request<Body>, gate: bool) -> Res
             .battery_pct
     });
     match bridge_render::simulator_status_snapshot(&input) {
-        Ok(status) => Json(status).into_response(),
+        Ok(mut status) => {
+            let mut sync = match state.sync.lock().unwrap_or_else(std::sync::PoisonError::into_inner).status() {
+                Ok(sync) => sync,
+                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            };
+            let owner = match state.owner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get_valid(now_seconds(&state, clock)) {
+                Ok(owner) => owner,
+                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            };
+            sync["enabled"] = json!(sync["enabled"] == true &&
+                owner.as_ref().is_some_and(|owner|
+                    sync["config_owner"].as_str() == Some(owner.id.as_str())));
+            sync.as_object_mut().map(|object| object.remove("config_owner"));
+            status["sync_v1"] = json!(1);
+            status["diag_format"] = json!(1);
+            status["diag_capacity"] = json!(4096);
+            status["firmware_target"] = json!(state.target);
+            status["boot_id"] = json!(session_snapshot(&state).boot_id.to_string());
+            status["uptime_ms"] = json!(device_uptime_ms(&state, clock));
+            status["heap_free"] = json!(0);
+            status["heap_min"] = json!(0);
+            status["radio"] = json!({"wifi_connected":true,"rssi":0,
+                "ble_connected":power.ble_window_until_ms.is_some()});
+            status["display"] = json!({"epd_writes":bundle["display_writes"],
+                "epd_busy_fails":0});
+            status["image_identity"] = json!([]);
+            status["sync"] = sync;
+            status["sync"]["phase"] = json!(if power.sync_open {"WIFI_SYNC_ONCE"}
+                else if power.light {"WIFI_LIGHT"} else {"DEEP"});
+            Json(status).into_response()
+        },
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error":"status_builder_failed"})),
@@ -1138,6 +1320,8 @@ async fn sim_state(State(state): State<SimState>, request: Request<Body>) -> Res
     let bundle = state.bundle.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
         .status().unwrap_or(serde_json::Value::Null);
     let ota = state.ota.lock().unwrap_or_else(std::sync::PoisonError::into_inner).state_json();
+    let sync = state.sync.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        .status().unwrap_or(serde_json::Value::Null);
     Json(json!({
         "mac": state.mac,
         "target": state.target,
@@ -1150,6 +1334,7 @@ async fn sim_state(State(state): State<SimState>, request: Request<Body>) -> Res
         "owner": owner_json(owner.as_ref(), now_s),
         "bundle": bundle,
         "ota": ota,
+        "sync": sync,
         "fault": {"stall_ack_after":state.stall_ack_after.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref().map(|fault| fault.operation.clone())},
@@ -1168,6 +1353,48 @@ async fn sim_frame(State(state): State<SimState>, request: Request<Body>) -> Res
         Ok(bits) if !bits.is_empty() =>
             ([(header::CONTENT_TYPE, "application/octet-stream")], bits).into_response(),
         Ok(_) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn sim_diagnostics(State(state): State<SimState>, request: Request<Body>) -> Response {
+    if !bearer(&request, &state.control_token) { return unauthorized(); }
+    let body = match to_bytes(request.into_body(), 8192).await {
+        Ok(body) => body,
+        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&body) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(object) = value.as_object() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let operation = match value["op"].as_str() {
+        Some("append_text") if object.len() == 2 =>
+            value["text"].as_str().filter(|text| text.len() <= 4096)
+                .map(|text| (0, text.to_owned(), 0)),
+        Some("corrupt_record") if object.len() == 2 =>
+            value["seq"].as_str().and_then(|seq| seq.parse::<u64>().ok())
+                .map(|seq| (1, String::new(), seq)),
+        Some("corrupt_header") if object.len() == 1 =>
+            Some((2, String::new(), 0)),
+        _ => None,
+    };
+    let Some((kind, text, seq)) = operation else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(clock) = clock_snapshot(&state) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let mut sync = state.sync.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let result = match kind {
+        0 => sync.append_text(&text, device_uptime_ms(&state, clock) as u32),
+        1 => sync.corrupt(false, seq),
+        _ => sync.corrupt(true, 0),
+    };
+    if result.is_err() { return StatusCode::BAD_REQUEST.into_response(); }
+    match sync.status() {
+        Ok(status) => Json(status).into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -1914,7 +2141,7 @@ async fn sim_ble_info(State(state): State<SimState>, request: Request<Body>) -> 
     if !power.light && power.ble_window_until_ms.is_none() {
         return StatusCode::NOT_FOUND.into_response();
     }
-    Json(json!({"mac":state.mac,"rendezvous_v":2,"bonded":true,"encrypted":true,
+    Json(json!({"mac":state.mac,"rendezvous":true,"bonded":true,"encrypted":true,
         "wake_generation":session_snapshot(&state).boot_id,"wake_seq":power.wake_count,
         "wake_cause":if power.ble_window_until_ms.is_some() {"timer"} else {"light"}}))
         .into_response()
@@ -1960,24 +2187,81 @@ async fn sim_ble_command(State(state): State<SimState>, request: Request<Body>) 
     };
     let request_id = message["request_id"].clone();
     if !request_id.is_string() { return StatusCode::BAD_REQUEST.into_response(); }
+    if message.get("protocol").is_some() || message.get("rv").is_some() {
+        return Json(json!({"ack":"command","op":op,"request_id":request_id,
+            "result":"rejected","error":"retired_protocol"})).into_response();
+    }
     let response = match op {
         "status" => {
-            let request = Request::builder().uri("/v2/status")
+            let request = Request::builder().uri("/api/status")
                 .header(header::AUTHORIZATION, format!("Bearer {}", state.endpoint_token))
                 .body(Body::empty()).unwrap();
             status_impl(state.clone(), request, false).await
         }
         "plan" => {
-            let request = Request::builder().uri("/v2/plan")
+            let request = Request::builder().uri("/api/plan")
                 .header(header::AUTHORIZATION, format!("Bearer {}", state.endpoint_token))
                 .body(Body::from(body.to_vec())).unwrap();
             plan_impl(state.clone(), request, false).await
         }
         "data" => {
-            let request = Request::builder().uri("/v2/data")
+            let request = Request::builder().uri("/api/data")
                 .header(header::AUTHORIZATION, format!("Bearer {}", state.endpoint_token))
                 .body(Body::from(body.to_vec())).unwrap();
             device_command_impl(state.clone(), request, "data", false).await
+        }
+        "sync_config" | "sync_open" => {
+            let now_s = now_seconds(&state, clock);
+            let owner = match state.owner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get_valid(now_s) {
+                Ok(owner) => owner,
+                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            };
+            let bridge = message["bridge_id"].as_str().unwrap_or("");
+            let current_nonce = session_snapshot(&state).nonce;
+            let error = if message["device_mac"].as_str() != Some(state.mac.as_str()) ||
+                message["session_nonce"].as_str() != Some(current_nonce.as_str()) {
+                Some("session")
+            } else if owner.as_ref().is_none() { Some("claim_required") }
+            else if owner.as_ref().is_some_and(|owner| owner.id != bridge) { Some("occupied") }
+            else { None };
+            if let Some(error) = error {
+                Json(json!({"op":op,"result":"rejected","error":error})).into_response()
+            } else if op == "sync_config" {
+                let enabled = message["enabled"].as_bool();
+                match enabled.and_then(|enabled| state.sync.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .set_owner(bridge, enabled).ok().map(|_| enabled)) {
+                    Some(enabled) => Json(json!({"op":op,"result":"applied",
+                        "enabled":enabled})).into_response(),
+                    None => Json(json!({"op":op,"result":"rejected","error":"storage"}))
+                        .into_response(),
+                }
+            } else {
+                let sync = state.sync.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .status().unwrap_or(serde_json::Value::Null);
+                let reason = message["reason"].as_str().unwrap_or("");
+                let open_id = message["open_id"].as_str().unwrap_or("");
+                let valid = sync["enabled"] == true && sync["retry_skip"] == 0 &&
+                    !open_id.is_empty() && open_id.len() <= 64 &&
+                    message["wake_generation"] == session_snapshot(&state).boot_id &&
+                    message["wake_seq"] == power.wake_count &&
+                    ((reason == "periodic" && sync["rounds"] == 15 && sync["due"] == true) ||
+                     (reason == "retry" && (sync["due"] == true ||
+                       !sync["pending_batch"].is_null())));
+                let mut live = state.power.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let valid = valid && live.sync_visible_skip == 0 &&
+                    (!live.sync_open || live.sync_open_id == open_id);
+                if valid {
+                    if !live.sync_open { live.sync_last_progress_ms = clock.monotonic_ms; }
+                    live.sync_open = true;
+                    live.sync_open_id = open_id.to_owned();
+                    live.next_contact_ms = None;
+                    Json(json!({"op":op,"result":"applied","wifi_open":true})).into_response()
+                } else {
+                    Json(json!({"op":op,"result":"rejected","error":"range"})).into_response()
+                }
+            }
         }
         _ => Json(json!({"result":"http_required"})).into_response(),
     };
@@ -1988,8 +2272,13 @@ async fn sim_ble_command(State(state): State<SimState>, request: Request<Body>) 
     let Ok(mut ack) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
-    if op == "status" { ack["result"] = "applied".into(); }
-    ack["ack"] = "v2".into();
+    if op == "status" {
+        ack["result"] = "applied".into();
+        ack["sync"]["v"] = json!(1);
+        ack["sync"]["pending"] = json!(!ack["sync"]["pending_batch"].is_null());
+        ack["sync"]["retry_skip"] = json!(power.sync_visible_skip);
+    }
+    ack["ack"] = "command".into();
     ack["request_id"] = request_id;
     ack["wake_generation"] = session_snapshot(&state).boot_id.into();
     ack["wake_seq"] = power.wake_count.into();
@@ -2001,9 +2290,19 @@ async fn sim_ble_command(State(state): State<SimState>, request: Request<Body>) 
         if light_plan {
             let mut power = state.power.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let was_light = power.light;
             power.light = true;
             power.ble_window_until_ms = None;
             power.next_contact_ms = None;
+            drop(power);
+            if !was_light && state.sync.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .status().is_ok_and(|sync| sync["enabled"] == true) {
+                if state.sync.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .add_reason(1, device_uptime_ms(&state, clock) as u32).is_err() {
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            }
         }
     }
     Json(ack).into_response()
@@ -2253,9 +2552,14 @@ async fn claim(State(state): State<SimState>, request: Request<Body>) -> Respons
 fn app(state: SimState) -> Router {
     Router::new()
         .route("/status.json", get(public_status))
-        .route("/v2/status", get(status))
+        .route("/api/status", get(status))
+        .route("/api/sync/begin", post(sync_begin))
+        .route("/api/sync/page", post(sync_page))
+        .route("/api/sync/ack", post(sync_ack))
+        .route("/api/sync/complete", post(sync_complete))
         .route("/sim/state", get(sim_state))
         .route("/sim/frame", get(sim_frame))
+        .route("/sim/diagnostics", post(sim_diagnostics))
         .route("/sim/time", get(sim_time_get).post(sim_time_post))
         .route("/sim/wake", post(sim_wake))
         .route("/sim/display", post(sim_display))
@@ -2271,12 +2575,12 @@ fn app(state: SimState) -> Router {
         .route("/update", get(ota_token_route))
         .route("/diag", post(ota_token_route))
         .route("/doUpdate", post(ota_upload))
-        .route("/v2/data", post(data))
-        .route("/v2/plan", post(plan))
-        .route("/v2/activate", post(activate))
-        .route("/v2/bundle/begin", post(bundle_begin))
-        .route("/v2/bundle/chunk", post(bundle_chunk))
-        .route("/v2/bundle/commit", post(bundle_commit))
+        .route("/api/data", post(data))
+        .route("/api/plan", post(plan))
+        .route("/api/activate", post(activate))
+        .route("/api/bundle/begin", post(bundle_begin))
+        .route("/api/bundle/chunk", post(bundle_chunk))
+        .route("/api/bundle/commit", post(bundle_commit))
         .route("/claim", post(claim))
         .layer(DefaultBodyLimit::max(0x30_0000 + 65536))
         .with_state(state)
@@ -2307,6 +2611,8 @@ async fn main() -> Result<()> {
     let plan = bridge_render::SimulatorPlan::new()?;
     let bundle = bridge_render::SimulatorBundle::new(&options.data_dir, &options.target,
         boot_id, &options.wake_cause)?;
+    let sync = bridge_render::SimulatorSync::new(&options.data_dir, &options.mac,
+        &options.target, options.seed, boot_id, &options.wake_cause)?;
     let ota = OtaStore::load(&options.data_dir, &options.target, options.catalog_path.as_deref())?;
     let mut power = SimPower::new(bundle.status()?["configured"] == true, &options.wake_cause);
     power.boot_ms = boot_ms;
@@ -2327,6 +2633,7 @@ async fn main() -> Result<()> {
         owner: Arc::new(Mutex::new(owner)),
         plan: Arc::new(Mutex::new(plan)),
         bundle: Arc::new(Mutex::new(bundle)),
+        sync: Arc::new(Mutex::new(sync)),
         ota: Arc::new(Mutex::new(ota)),
         ota_running: Arc::new(AtomicBool::new(false)),
         power: Arc::new(Mutex::new(power)),

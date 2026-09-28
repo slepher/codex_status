@@ -10,9 +10,6 @@
 #include <WebServer.h>
 #include <Update.h>
 #include <ArduinoOTA.h>
-#ifdef CODEX_DEEPPULL_TEST
-#include <HTTPClient.h>
-#endif
 #include <Preferences.h>
 #include <LittleFS.h>
 #include <ESPmDNS.h>
@@ -21,10 +18,14 @@
 #include <sys/time.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <ctype.h>
 #include <vector>
+#include <algorithm>
 #include <esp_sleep.h>
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
+#include <mbedtls/sha256.h>
 #include <esp_system.h>
 #include <esp_pm.h>
 #if defined(CODEX_NOTE4_ROM_B) || (!defined(CODEX_TARGET_NOTE4) && !defined(CODEX_TARGET_GRAY4))
@@ -48,7 +49,6 @@
 #include "ble_bridge.h"
 #include "bridge_store.h"
 #include "owner_store.h"
-#include "usage_client.h"
 #include "template_store.h"
 #include "template_engine.h"
 #include "template_xfer.h"
@@ -62,6 +62,9 @@
 #include "v2_claim_command.h"
 #include "v2_command_envelope.h"
 #include "v2_status_snapshot.h"
+#include "v2_sync.h"
+#include "v2_sync_store.h"
+#include "v2_sync_protocol.h"
 #include "bundle_store.h"
 
 // v2 platform targets (src/platform_target.h): the render/firmware target
@@ -77,18 +80,16 @@
 #endif
 static bool targetUnverified = false;
 
-#ifdef CODEX_DEEPPULL_TEST
-#define FW_VERSION    "0.13.9-dptest2"
-#elif defined(CODEX_CLK_WINDOW_TEST)
+#if defined(CODEX_CLK_WINDOW_TEST)
 #define FW_VERSION    "0.13.9-clkwin"
 #elif defined(CODEX_TARGET_NOTE4)
 #ifdef CODEX_NOTE4_ROM_B
-#define FW_VERSION    "0.18.31-note4-b-b46-rf1"
+#define FW_VERSION    "0.18.32-note4-b-sync1"
 #else
 #define FW_VERSION    "0.18.19-note4-a"
 #endif
 #else
-#define FW_VERSION    "0.18.31-bw-b46"
+#define FW_VERSION    "0.18.32-bw-sync1"
 #endif
 // Bridge OTA queue checks this exact build identity before freezing an image.
 static const char OTA_IMAGE_IDENTITY[] __attribute__((used)) =
@@ -326,12 +327,8 @@ static uint16_t wifiBlinkMs = WIFI_BLINK_MS;
 static uint32_t blinkTicks = 0;
 static bool     rfnBlink = false;
 
-// BLE rendezvous protocol v2 gate (design §10). New installs default to v2;
-// persisted in NVS `pm/rv2` so a rollback survives OTA/reboot and can be
-// toggled at runtime with POST /diag?rv2=0|1. `rendezvous_v` in INFO reflects
-// this gate; the GATT table itself never changes (no Windows re-pairing).
-static uint8_t  rv2Enabled = 0;
-static const uint8_t RV2_SUPPORTED = 2;
+// Keep the GATT table stable across the single-protocol rollout so existing
+// Windows bonds can continue to use the control characteristic.
 
 // v0.12 runtime state (docs/power-state.md §3-§6)
 static bool     plugged = false;          // PC USB host present (SOF)
@@ -571,13 +568,15 @@ struct __attribute__((packed)) WakeTraceRec {
     uint32_t crc;
 };
 static_assert(sizeof(WakeTraceRec) == 48, "wake trace record must stay 48 bytes");
-RTC_DATA_ATTR static WakeTraceRec histRing[HIST_CAP];
+RTC_DATA_ATTR SyncRtc syncRtc;
+uint32_t syncLogWakeSeq = 0;
+bool syncLogReady = false;
 RTC_DATA_ATTR static uint32_t histCount = 0;   // records ever written
 RTC_DATA_ATTR static uint16_t histHead = 0;    // next write slot
 RTC_DATA_ATTR static uint32_t rtcTraceMagic = 0;
 RTC_DATA_ATTR static uint32_t rtcWakeGeneration = 0;
 RTC_DATA_ATTR static uint32_t rtcTraceCurrentSeq = 0;
-RTC_DATA_ATTR static uint16_t rtcTraceCurrentSlot = 0xFFFF;
+RTC_DATA_ATTR static bool rtcTraceActive = false;
 RTC_DATA_ATTR static WakeTraceRec rtcTraceShadow = {};
 RTC_DATA_ATTR static uint32_t rtcTraceShadowSeq = 0;
 static uint32_t traceStartMs = 0;
@@ -597,7 +596,7 @@ static bool traceValid(const WakeTraceRec &r) {
            r.crc == traceCrc(r);
 }
 static WakeTraceRec *traceCurrent() {
-    return rtcTraceCurrentSlot < HIST_CAP ? &histRing[rtcTraceCurrentSlot] : nullptr;
+    return rtcTraceActive ? &rtcTraceShadow : nullptr;
 }
 static void traceCommit(WakeTraceRec &r) {
     r.valid_end = TRACE_VALID_END;
@@ -731,27 +730,31 @@ static void traceMarkThin() {
 static void traceFinishInterrupted() {
     WakeTraceRec *r = traceCurrent();
     if (!r) return;
-    if (!traceValid(*r) && traceValid(rtcTraceShadow) &&
-        rtcTraceShadow.seq == rtcTraceCurrentSeq) {
-        *r = rtcTraceShadow;
-    }
     tracePrepare(*r);
     r->valid_end = 0;
     r->result = TRACE_RESULT_INTERRUPTED;
     if (!r->error) r->error = TRACE_ERR_RESET;
     traceCommit(*r);
-    rtcTraceCurrentSlot = 0xFFFF;
+    syncAppend(syncRtc, SYNC_WAKE_SUMMARY, 0, r->seq, r->awake_ms,
+               reinterpret_cast<const uint8_t *>(r), sizeof(*r));
+    rtcTraceActive = false;
 }
 static void traceBegin(esp_sleep_wakeup_cause_t cause) {
+    uint8_t diagGeneration[16];
+    for (uint8_t i = 0; i < 16; i += 4) {
+        uint32_t word = esp_random();
+        memcpy(diagGeneration + i, &word, 4);
+    }
+    syncRecover(syncRtc, diagGeneration);
+    syncLogReady = true;
     if (rtcTraceMagic != TRACE_MAGIC) {
-        memset(histRing, 0, sizeof(histRing));
         histCount = 0;
         histHead = 0;
         rtcWakeGeneration = esp_random();
         if (!rtcWakeGeneration) rtcWakeGeneration = 1;
         rtcTraceMagic = TRACE_MAGIC;
         rtcTraceCurrentSeq = 0;
-        rtcTraceCurrentSlot = 0xFFFF;
+        rtcTraceActive = false;
     } else if (traceCurrent()) {
         // A reset can interrupt the small validity-marker update itself; the
         // slot is still the best available evidence and is finalized as such.
@@ -761,8 +764,7 @@ static void traceBegin(esp_sleep_wakeup_cause_t cause) {
         rtcWakeGeneration = esp_random();
         if (!rtcWakeGeneration) rtcWakeGeneration = 1;
     }
-    const uint16_t slot = histHead < HIST_CAP ? histHead : 0;
-    WakeTraceRec &r = histRing[slot];
+    WakeTraceRec &r = rtcTraceShadow;
     memset(&r, 0, sizeof(r));
     r.wake_generation = rtcWakeGeneration;
     r.seq = ++histCount;
@@ -772,9 +774,10 @@ static void traceBegin(esp_sleep_wakeup_cause_t cause) {
     r.valid_start = TRACE_VALID_START;
     r.result = TRACE_RESULT_ACTIVE;
     traceStartMs = millis();
-    histHead = (uint16_t)((slot + 1) % HIST_CAP);
-    rtcTraceCurrentSlot = slot;
+    histHead = (uint16_t)((histHead + 1) % HIST_CAP);
+    rtcTraceActive = true;
     rtcTraceCurrentSeq = r.seq;
+    syncLogWakeSeq = r.seq;
     traceBleConnectedSeen = false;
     traceCommit(r);
 }
@@ -801,7 +804,9 @@ static void traceFinishSleep() {
         r->awake_ms = millis() - traceStartMs;
         traceCommit(*r);
     }
-    rtcTraceCurrentSlot = 0xFFFF;
+    if (r) syncAppend(syncRtc, SYNC_WAKE_SUMMARY, 0, r->seq, r->awake_ms,
+                      reinterpret_cast<const uint8_t *>(r), sizeof(*r));
+    rtcTraceActive = false;
 }
 static void tracePollConnection() {
     const bool connected = bleIsConnected();
@@ -971,18 +976,6 @@ static bool adoptServerTimeForce(JsonDocument &doc) {
     return adoptTzOffset(doc);
 }
 
-// Push envelopes carry the bridge's mode decision (the light-phase fallback
-// channel): `deep` schedules a sleep after a short grace period, `light`
-// cancels a pending descent. The pull response uses the same field.
-static void applyBridgeModeHint(JsonDocument &doc) {
-    const char *mode = doc["mode"] | "";
-    if (!strcmp(mode, "deep")) {
-        if (!forceDeepAtMs) forceDeepAtMs = millis() + 60000;
-    } else if (!strcmp(mode, "light")) {
-        forceDeepAtMs = 0;
-    }
-}
-
 static bool usageCacheLoad(String &out) {
     Preferences p;
     p.begin("ucache", true);
@@ -1009,30 +1002,6 @@ static void usageCacheSave(const String &json) {
 // A sync is accepted from any bridge while there is no active bridge, from the
 // active bridge itself, after the active hold window, or when the active
 // endpoint's BSSID no longer matches the current one.
-static bool usageAccepted(const String &mac, bool explicitActivate) {
-    if (explicitActivate) return true;
-    if (!rtcActiveMac[0] || rtcActiveAt == 0) return true;
-    if (mac.length() && mac == rtcActiveMac) return true;
-    if (timeKnown() && rtcActiveAt > 1600000000 &&
-        (time_t)time(nullptr) - (time_t)rtcActiveAt >= (time_t)activeHoldSec) {
-        return true;
-    }
-    String bssid = WiFi.BSSIDstr();
-    for (int i = 0; i < storeCount(); i++) {
-        EndpointRec r;
-        if (!storeGet(i, r)) continue;
-        if (r.mac == String(rtcActiveMac)) {
-            if (r.bssid.length() && bssid.length() && r.bssid != bssid) return true;
-            break;
-        }
-    }
-    return false;
-}
-
-static volatile bool pendingUsageReady = false;
-static String        pendingUsage;
-static String        pendingChannel;
-static volatile bool pendingEndpoint = false;
 static volatile bool pendingTplChanged = false;
 
 static String activeTplJson;
@@ -1109,8 +1078,7 @@ static uint16_t rfnDirty = 0;
 static bool     forceCleanRefresh = false;
 static uint16_t rfnLastMs = 0;       // duration of the last epdFlush waveform
 // task-10 known issue: the timer pull path draws the wake frame inside
-// deepNetworkCycle and startNormalMode drew it a second time (two full
-// flashes). Set when the deep pull already removed the sleep glyph.
+// Avoid drawing the wake baseline twice after a rendezvous frame.
 static bool     wakeBaselineDrawn = false;
 
 static void screen(const std::vector<String> &lines, UBYTE color = BLACK);
@@ -1124,14 +1092,12 @@ static void otaUploadCleanup(const char *reason);
 static void enterBleOn(bool userInitiated);
 static void bleOff(const char *reason);
 static void requestAnnounce(bool bleFlag);
-static void handleBleUsage(const String &json);
 static void handleBleEndpoint(const String &json);
 static void handleBleAuth(const String &json);
 static String fmtEpoch(long long ts, const char *fmt);
 static void powerOff();
 static bool configureWifiPowerSave();
 static void noteActivity(const char *reason);
-static void saveApInfo();
 static void sleepToNextEvent();
 static void enterDeep(const char *reason);
 
@@ -1991,14 +1957,13 @@ static uint32_t traceEarliestComplete();
 
 static void updateInfoExtra() {
     String items = "\"mac\":\"" + macText() + "\",\"ip\":\"" + ipText() +
-                   "\",\"http_port\":80,\"rendezvous_v\":" + String((unsigned)(rv2Enabled ? RV2_SUPPORTED : 0)) +
-                   ",\"rv_max\":" + String((unsigned)RV2_SUPPORTED) +
+                   "\",\"http_port\":80,\"rendezvous\":true" +
                    ",\"wake_generation\":" + String((unsigned long)rtcWakeGeneration) +
                    ",\"wake_seq\":" + String((unsigned long)rtcTraceCurrentSeq) +
                    ",\"wake_stage\":\"" +
                    (traceCurrent() ? traceStageName(traceCurrent()->furthest) : "none") +
                    "\",\"wake_cause\":\"" + wakeCauseName(bootWakeCause) + "\"" +
-                   ",\"v2_bundle\":" + String(v2BundleReady ? "true" : "false") + ",\"templates\":[";
+                   ",\"bundle_configured\":" + String(v2BundleReady ? "true" : "false") + ",\"templates\":[";
     String active = tplStoreActive();
     for (int i = 0; i < tplStoreCount(); i++) {
         TplMeta m;
@@ -2047,7 +2012,7 @@ static bool v2ActiveLoad() {
     if (!v2BundleReady) { v2CtValid = false; return false; }
     String err;
     if (!bsLoadCompiled(v2Profile.initial, v2Ct, err)) {
-        DevLog.printf("[v2] active load failed: %s\n", err.c_str());
+        DevLog.printf("[platform] active load failed: %s\n", err.c_str());
         v2CtValid = false;
         return false;
     }
@@ -2074,7 +2039,7 @@ static bool v2SwitchActive(uint8_t index) {
     snprintf(ctx, sizeof(ctx), "%08x%08x", v2CtxGen.next(), (unsigned)esp_random());
     String err;
     if (!bsSetActive(index, ctx, err)) {
-        DevLog.printf("[v2] activate failed: %s\n", err.c_str());
+        DevLog.printf("[platform] activate failed: %s\n", err.c_str());
         return false;
     }
     bsProfile(v2Profile);
@@ -2083,7 +2048,7 @@ static bool v2SwitchActive(uint8_t index) {
     if (!v2ActiveLoad()) {
         return false;
     }
-    DevLog.printf("[v2] active=%s ctx=%s\n", activeTplId.c_str(), v2Profile.contextId);
+    DevLog.printf("[platform] active=%s ctx=%s\n", activeTplId.c_str(), v2Profile.contextId);
     return true;
 }
 
@@ -2145,7 +2110,7 @@ static void nextTemplate() {
         v2SwitchActive(next);
         pendingTplChanged = true;
         noteActivity("template-switch");
-        DevLog.printf("[v2] local switch -> %s\n", v2Profile.ids[v2Profile.initial]);
+        DevLog.printf("[platform] local switch -> %s\n", v2Profile.ids[v2Profile.initial]);
         return;
     }
     int n = tplStoreCount();
@@ -2182,109 +2147,7 @@ static void factoryReset() {
     ESP.restart();
 }
 
-// Envelope metadata (docs/power-state.md §9): active-hold tuning plus endpoint
-// self-heal. The bridge advertises its own host/port; the endpoint MAC comes
-// from the authenticated sender, so only a known bridge can update its record.
-static void applyEnvelopeMeta(JsonDocument &doc, const String &mac) {
-    long long hold = doc["active_hold_seconds"] | 0LL;
-    if (hold >= 60 && hold <= 86400) activeHoldSec = (uint32_t)hold;
-    JsonObject bridge = doc["bridge"].as<JsonObject>();
-    const char *host = bridge["host"] | "";
-    int port = bridge["port"] | 0;
-    if (!mac.length() || !strlen(host) || port <= 0 || port > 65535) return;
-    for (int i = 0; i < storeCount(); i++) {
-        EndpointRec rec;
-        if (!storeGet(i, rec)) continue;
-        if (rec.mac != mac) continue;
-        if (rec.host != host || rec.port != (uint16_t)port) {
-            storeUpsert(rec.mac, host, (uint16_t)port, rec.token);
-            DevLog.printf("[brg] endpoint self-heal %s:%d\n", host, port);
-        }
-        return;
-    }
-}
-
-// Endpoint selection: when the active bridge synced recently, only try its
-// endpoint; otherwise try same-BSSID endpoints first (MRU), then the rest.
-// Per-endpoint timeout is 2 s.
-static bool tryWifiUsage() {
-    if (v2BundleReady) return false;
-    if (WiFi.status() != WL_CONNECTED) return false;
-    int n = storeCount();
-    if (n <= 0) return false;
-
-    String bssid = WiFi.BSSIDstr();
-    bool activeFresh = rtcActiveMac[0] && rtcActiveAt > 0 && timeKnown() &&
-                       (time_t)time(nullptr) - (time_t)rtcActiveAt < (time_t)activeHoldSec;
-    int order[STORE_MAX_LOCAL];
-    int count = 0;
-    bool used[STORE_MAX_LOCAL] = {false};
-
-    if (activeFresh) {
-        for (int i = 0; i < n; i++) {
-            EndpointRec r;
-            if (storeGet(i, r) && r.mac == String(rtcActiveMac)) { order[count++] = i; used[i] = true; break; }
-        }
-    }
-    for (int pass = 0; pass < 2; pass++) {
-        while (count < n) {
-            int idx = -1;
-            uint32_t mx = 0;
-            for (int i = 0; i < n; i++) {
-                if (used[i]) continue;
-                EndpointRec r;
-                if (!storeGet(i, r)) { used[i] = true; continue; }
-                bool same = bssid.length() && r.bssid.length() && r.bssid == bssid;
-                if ((pass == 0) != same) continue;
-                if (idx < 0 || r.mru > mx) { idx = i; mx = r.mru; }
-            }
-            if (idx < 0) break;
-            used[idx] = true;
-            order[count++] = idx;
-        }
-        if (!bssid.length()) break;   // no BSSID known: single MRU pass
-    }
-
-    for (int k = 0; k < count; k++) {
-        EndpointRec rec;
-        if (!storeGet(order[k], rec)) continue;
-        String out, err;
-        if (!usageHttpGet(rec, out, err, 2000)) {
-            DevLog.printf("[wifi] %s:%u failed: %s\n", rec.host.c_str(), rec.port, err.c_str());
-            continue;
-        }
-        JsonDocument parsed;
-        if (deserializeJson(parsed, out) || parsed.as<JsonObject>().isNull()) {
-            DevLog.println("[wifi] usage rejected: invalid JSON");
-            continue;
-        }
-        adoptServerTime(parsed);
-        applyEnvelopeMeta(parsed, rec.mac);
-        applyBridgeModeHint(parsed);
-        bool explicitActivate = parsed["activate"] | false;
-        bool accepted = usageAccepted(rec.mac, explicitActivate);
-        storeTouch(rec.mac);
-        if (bssid.length()) storeSetBssid(rec.mac, bssid);
-        markSynced();
-        DevLog.printf("[wifi] usage from %s:%u accepted=%d\n",
-                      rec.host.c_str(), rec.port, accepted ? 1 : 0);
-        bleNotifyStatus("{\"ack\":\"wifi-usage\",\"ok\":true}");
-        lastUsage = out;
-        lastChannel = "WIFI";
-        usageCacheSave(out);
-        if (accepted) {
-            setActiveMac(rec.mac);
-            rtcActiveAt = timeKnown() ? (uint32_t)time(nullptr) : 0;
-            noteActivity("pull");
-            renderActiveUsage(lastUsage, "WIFI");
-        }
-        return true;
-    }
-    return false;
-}
-
-// POST /usage from the bridge. Auth uses the endpoint token that the bridge
-// itself wrote over BLE; the matching record identifies the bridge MAC.
+// Business HTTP requests use the endpoint token provisioned over bonded BLE.
 static bool endpointTokenAuthorized(String &mac) {
     String header = server.header("Authorization");
     if (!header.startsWith("Bearer ")) return false;
@@ -2300,141 +2163,6 @@ static bool endpointTokenAuthorized(String &mac) {
         }
     }
     return false;
-}
-
-static void handleUsagePost() {
-    String mac;
-    if (!endpointTokenAuthorized(mac)) {
-        server.send(401, "application/json", "{\"accepted\":false}");
-        return;
-    }
-    String body = server.arg("plain");
-    JsonDocument parsed;
-    if (deserializeJson(parsed, body) || parsed.as<JsonObject>().isNull()) {
-        server.send(400, "application/json", "{\"accepted\":false}");
-        return;
-    }
-    // Occupancy layer (task-4): only the owner may write; no exceptions (an
-    // `activate` flag or a matching endpoint token is not a bypass). With no
-    // valid owner the legacy behavior applies and no owner is ever created.
-    String bridgeId = parsed["bridge"]["hostId"] | "";
-    if (!ownerAllows(bridgeId)) {
-        DevLog.printf("[owner] usage push rejected (occupied, id=%s)\n", bridgeId.c_str());
-        server.send(409, "application/json",
-                    String("{\"accepted\":false,\"error\":\"occupied\",\"owner\":") +
-                        ownerJson() + "}");
-        return;
-    }
-    if (v2BundleReady) {
-        server.send(409, "application/json", "{\"accepted\":false,\"error\":\"v2_required\"}");
-        return;
-    }
-    adoptServerTime(parsed);
-    applyEnvelopeMeta(parsed, mac);
-    applyBridgeModeHint(parsed);
-    bool explicitActivate = parsed["activate"] | false;
-    bool accepted = usageAccepted(mac, explicitActivate);
-    markSynced();
-    usageCacheSave(body);
-    // Heartbeat pushes repeat the same `usage_rev`; they must not reset the
-    // local 10-minute idle fallback (design §6), or the device could never go
-    // deep while the bridge keeps a 5-minute heartbeat. A missing rev (older
-    // bridge) is treated as a change to stay conservative.
-    bool hasRev = !parsed["usage_rev"].isNull();
-    uint32_t pushRev = (uint32_t)(parsed["usage_rev"] | 0L);
-    bool usageChanged = !hasRev || pushRev != rtcUsageRev;
-    if (hasRev) rtcUsageRev = pushRev;
-    if (accepted) {
-        setActiveMac(mac);
-        rtcActiveAt = timeKnown() ? (uint32_t)time(nullptr) : 0;
-        lastUsage = body;
-        lastChannel = "PUSH";
-        if (usageChanged) noteActivity("push");
-        renderActiveUsage(lastUsage, "PUSH");
-    } else {
-        DevLog.printf("[wifi] push ignored (active=%s)\n", rtcActiveMac);
-    }
-    server.send(200, "application/json",
-                accepted ? "{\"accepted\":true}" : "{\"accepted\":false}");
-}
-
-static bool tplIdValid(const String &id) {
-    if (id.length() == 0 || id.length() > 16) return false;
-    for (size_t i = 0; i < id.length(); i++) {
-        char c = id[i];
-        if (!isalnum((unsigned char)c) && c != '_' && c != '-') return false;
-    }
-    return true;
-}
-
-// POST /template (docs/power-state.md §5/§9): templates travel over HTTP as an
-// explicit user/agent action; BLE only carries identity (pairing, endpoint,
-// tokens). Gated by the endpoint token the bridge wrote over BLE; `hash` in the
-// query is the CRC32 of the raw body, validated together with min_fw/dry-run by
-// tplValidateForStorage (never partially rendered).
-static void handleTemplatePost() {
-    String mac;
-    if (!endpointTokenAuthorized(mac)) {
-        server.send(401, "application/json", "{\"saved\":false,\"err\":\"unauthorized\"}");
-        return;
-    }
-    // Occupancy layer (task-4): template writes carry `bridge_id` (= hostId);
-    // non-owners are rejected with the current owner, `activate` is no bypass.
-    String bridgeId = server.arg("bridge_id");
-    if (!bridgeId.length()) bridgeId = server.header("X-Bridge-Id");
-    if (!ownerAllows(bridgeId)) {
-        DevLog.printf("[owner] template rejected (occupied, id=%s)\n", bridgeId.c_str());
-        server.send(409, "application/json",
-                    String("{\"saved\":false,\"err\":\"occupied\",\"owner\":") +
-                        ownerJson() + "}");
-        return;
-    }
-    if (server.clientContentLength() > 32768) {
-        server.send(413, "application/json", "{\"saved\":false,\"err\":\"too_large\"}");
-        return;
-    }
-    String id = server.arg("id");
-    String hash = server.arg("hash");
-    uint32_t version = server.arg("version").toInt();
-    bool activate = server.hasArg("activate") && server.arg("activate") != "0";
-    String body = server.arg("plain");
-    if (!tplIdValid(id) || !body.length()) {
-        server.send(400, "application/json", "{\"saved\":false,\"err\":\"args\"}");
-        return;
-    }
-    String err;
-    if (!tplValidateForStorage(body, hash, FW_VERSION, err)) {
-        DevLog.printf("[tpl] http reject %s: %s\n", id.c_str(), err.c_str());
-        server.send(400, "application/json",
-                    String("{\"saved\":false,\"err\":\"") + err + "\"}");
-        return;
-    }
-    TplMeta existing;
-    bool unchanged = tplStoreFind(id, existing) && existing.hash == hash;
-    if (!unchanged &&
-        !tplStoreSave(id, version, hash, (const uint8_t *)body.c_str(), body.length())) {
-        server.send(500, "application/json", "{\"saved\":false,\"err\":\"save\"}");
-        return;
-    }
-    bool activated = false;
-    if (activate) {
-        tplStoreSetActive(id);
-        tplStoreTouch(id);
-        activated = true;
-    }
-    if (!unchanged || activated) {
-        activeTplId = "";
-        updateInfoExtra();
-        noteActivity("template");
-        renderCurrent();
-    }
-    DevLog.printf("[tpl] http %s id=%s hash=%s%s\n",
-                  unchanged ? "unchanged" : "saved", id.c_str(), hash.c_str(),
-                  activated ? " (activated)" : "");
-    server.send(200, "application/json",
-                String("{\"saved\":true,\"activated\":") + (activated ? "true" : "false") +
-                    ",\"unchanged\":" + (unchanged ? "true" : "false") +
-                    ",\"id\":\"" + id + "\"}");
 }
 
 // Deep-sleep wake sources: RTC timer plus BOOT (GPIO0) and PWR (GPIO18),
@@ -2534,26 +2262,6 @@ static void deepSleepFor(uint32_t sec) {
     deepSleepRaw(sec);
 }
 
-static void handleBleUsage(const String &json) {
-    if (v2BundleReady) {
-        bleNotifyStatusQuiet("{\"ack\":\"usage\",\"ok\":false,\"err\":\"v2_required\"}");
-        return;
-    }
-
-    JsonDocument parsed;
-    if (deserializeJson(parsed, json) || parsed.as<JsonObject>().isNull()) {
-        bleNotifyStatus("{\"ack\":\"usage\",\"ok\":false}");
-        return;
-    }
-    pendingUsage = json;
-    pendingChannel = "BLE";
-    pendingUsageReady = true;
-    traceSetTransport(1);
-    traceSetStage(TRACE_STAGE_COMMAND);
-    traceSetStage(TRACE_STAGE_REPLY);
-    bleNotifyStatus("{\"ack\":\"usage\",\"ok\":true}");
-}
-
 static void handleBleEndpoint(const String &json) {
     JsonDocument doc;
     if (deserializeJson(doc, json)) {
@@ -2574,7 +2282,6 @@ static void handleBleEndpoint(const String &json) {
     traceSetStage(TRACE_STAGE_COMMAND);
     traceSetStage(TRACE_STAGE_REPLY);
     bleNotifyStatus("{\"ack\":\"endpoint\",\"ok\":true}");
-    pendingEndpoint = true;
 }
 
 static int countWifiSlots() {
@@ -2642,7 +2349,7 @@ static bool connectBest(bool showProgress = true) {
     prefs.end();
     if (!wifiSsid.length()) return false;
     if (showProgress) screen({"CODEX STATUS", FW_VERSION, "", "Connecting:", wifiSsid});
-    DevLog.printf("[wifi] slot %d (%s) rssi=%d\n", bestSlot, wifiSsid.c_str(), bestRssi);
+    DevLog.printf("[wifi] slot %d rssi=%d\n", bestSlot, bestRssi);
     WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
     uint32_t t0 = millis();
     uint32_t lastBlink = t0;
@@ -2683,14 +2390,14 @@ static bool connectBest(bool showProgress = true) {
     prefs.begin("wifi", false);
     prefs.putUChar("last", (uint8_t)bestSlot);
     prefs.end();
-    DevLog.printf("[wifi] connected: %s ip=%s bssid=%s\n", wifiSsid.c_str(),
+    DevLog.printf("[wifi] connected: ip=%s bssid=%s\n",
                   WiFi.localIP().toString().c_str(), WiFi.BSSIDstr().c_str());
     return true;
 }
 
 static bool retryWifi() {
     if (!wifiSsid.length()) return false;
-    DevLog.printf("[wifi] retry %s\n", wifiSsid.c_str());
+    DevLog.println("[wifi] retry");
     WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
     return true;
 }
@@ -2745,7 +2452,7 @@ static void startConfigMode() {
     WiFi.mode(WIFI_AP);
     apSsid = "CodexStatus-" + macSuffix();
     WiFi.softAP(apSsid.c_str(), AP_PASSWORD);
-    DevLog.printf("[config] AP=%s pass=%s url=http://192.168.4.1\n", apSsid.c_str(), AP_PASSWORD);
+    DevLog.println("[config] setup AP ready at http://192.168.4.1");
     screen({"WIFI SETUP", "", "AP:   " + apSsid, "PASS: " AP_PASSWORD, "", "Open http://", "192.168.4.1"});
     server.on("/", HTTP_GET, handleConfigRoot);
     server.on("/save", HTTP_POST, handleConfigSave);
@@ -2912,8 +2619,6 @@ static void handleStatusJson() {
     doc["nvs_stage_boot"] = nvsStageAtBoot;
     doc["deep_usb"] = rtcDeepOnUsb;
     doc["frame_capture"] = rtcFrameCapture;
-    doc["rv2"] = rv2Enabled;
-    doc["rv_max"] = RV2_SUPPORTED;
     doc["tz"] = deviceTz;
     doc["hist_count"] = histCount;
     doc["hist_head"] = histHead;
@@ -2961,7 +2666,7 @@ static void handleStatusJson() {
     doc["max_templates"] = 8;
     doc["max_bundle_bytes"] = BS_MAX_BUNDLE_BYTES;
     doc["asset_publish_protocol"] = 0; // Existing complete Bundle path only.
-    doc["v2_bundle"] = v2BundleReady;
+    doc["bundle_configured"] = v2BundleReady;
     doc["commit_seq"] = (unsigned)bsCommitSeq();
     doc["active_context_id"] = v2Profile.contextId;
     doc["active_template_id"] = (v2BundleReady && v2Profile.count)
@@ -2975,7 +2680,7 @@ static void handleStatusJson() {
                           : v2DisplayState == 2 ? "pending"
                           : v2DisplayState == 3 ? "failed"
                                                 : "unchanged";
-    doc["v2_templates"] = v2Profile.count;
+    doc["template_count"] = v2Profile.count;
     {
         JsonObject power = doc["power"].to<JsonObject>();
         power["mode"] = (rtcMode == MODE_DEEP) ? "sleep" : "light";
@@ -3052,33 +2757,47 @@ static void handleLog() {
 }
 
 static bool traceGetComplete(uint32_t seq, WakeTraceRec &out) {
-    if (!seq || !histCount || seq > histCount) return false;
-    const uint32_t first = histCount > HIST_CAP ? histCount - HIST_CAP + 1 : 1;
-    if (seq < first) return false;
-    const WakeTraceRec &r = histRing[(seq - 1) % HIST_CAP];
-    if (r.seq != seq || !traceValid(r)) return false;
-    out = r;
-    if (seq == rtcTraceCurrentSeq && traceCurrent() && traceCurrent()->seq == seq)
+    if (!seq || seq > histCount) return false;
+    if (traceCurrent() && rtcTraceShadow.seq == seq && traceValid(rtcTraceShadow)) {
+        out = rtcTraceShadow;
         out.awake_ms = millis() - traceStartMs;
-    return true;
+        return true;
+    }
+    for (uint16_t offset = 0, next = 0; offset < syncRtc.used; offset = next) {
+        SyncRecord record;
+        if (!syncReadAt(syncRtc, offset, record, next)) break;
+        if (record.kind != SYNC_WAKE_SUMMARY || record.payloadLen != sizeof(out)) continue;
+        memcpy(&out, record.payload, sizeof(out));
+        if (out.seq == seq && traceValid(out)) return true;
+    }
+    return false;
 }
 
 static uint32_t traceEarliestComplete() {
-    const uint32_t first = histCount > HIST_CAP ? histCount - HIST_CAP + 1 : 1;
-    for (uint32_t seq = first; seq <= histCount; ++seq) {
-        WakeTraceRec r;
-        if (traceGetComplete(seq, r)) return seq;
+    for (uint16_t offset = 0, next = 0; offset < syncRtc.used; offset = next) {
+        SyncRecord record;
+        if (!syncReadAt(syncRtc, offset, record, next)) break;
+        if (record.kind != SYNC_WAKE_SUMMARY || record.payloadLen != sizeof(WakeTraceRec)) continue;
+        WakeTraceRec wake;
+        memcpy(&wake, record.payload, sizeof(wake));
+        if (traceValid(wake)) return wake.seq;
     }
+    if (traceCurrent() && traceValid(rtcTraceShadow)) return rtcTraceShadow.seq;
     return 0;
 }
 
 static uint32_t traceLatestComplete() {
-    for (uint32_t seq = histCount; seq; --seq) {
-        WakeTraceRec r;
-        if (traceGetComplete(seq, r)) return seq;
-        if (seq == 1) break;
+    if (traceCurrent() && traceValid(rtcTraceShadow)) return rtcTraceShadow.seq;
+    uint32_t latest = 0;
+    for (uint16_t offset = 0, next = 0; offset < syncRtc.used; offset = next) {
+        SyncRecord record;
+        if (!syncReadAt(syncRtc, offset, record, next)) break;
+        if (record.kind != SYNC_WAKE_SUMMARY || record.payloadLen != sizeof(WakeTraceRec)) continue;
+        WakeTraceRec wake;
+        memcpy(&wake, record.payload, sizeof(wake));
+        if (traceValid(wake)) latest = wake.seq;
     }
-    return 0;
+    return latest;
 }
 
 static bool traceRecordActive(uint32_t seq) {
@@ -3445,18 +3164,6 @@ static void handleDiag() {
         rtcFrameCapture = server.arg("frame_capture").toInt() ? 1 : 0;
         DevLog.printf("[diag] frame_capture=%u\n", (unsigned)rtcFrameCapture);
     }
-    // BLE rendezvous v2 gate (design §10): persisted rollback switch. Off by
-    // a diagnostic rollback; enabling advertises `rendezvous_v` once the transaction
-    // layer exists (stage 3+).
-    if (server.hasArg("rv2")) {
-        rv2Enabled = server.arg("rv2").toInt() ? 1 : 0;
-        Preferences p;
-        p.begin("pm", false);
-        p.putUChar("rv2", rv2Enabled);
-        p.end();
-        updateInfoExtra();
-        DevLog.printf("[diag] rv2=%u\n", (unsigned)rv2Enabled);
-    }
     // Display-safety layer controls (design §8).
     if (server.hasArg("policy")) {
         rgnPolicyOn = strcmp(server.arg("policy").c_str(), "off") != 0;
@@ -3577,7 +3284,6 @@ static void handleDiag() {
                                           String((unsigned)rtcDeepOnUsb) + ", deep_now=" +
                                           String(deepNow ? 1 : 0) + ", tz=" + deviceTz +
                                           ", frame_capture=" + String((unsigned)rtcFrameCapture) +
-                                          ", rv2=" + String((unsigned)rv2Enabled) +
                                           ", blink_ms=" + String((unsigned)wifiBlinkMs) +
 #if defined(CODEX_TARGET_NOTE4)
                                           ", panel_power=" + String(note4KeepPanelPower ? "keep" : "off_cache") +
@@ -3811,14 +3517,14 @@ static void serviceLed() {
 }
 
 static void enterBleOn(bool userInitiated) {
-    if (!wifiUp && !(rv2Enabled && v2BundleReady)) return;
+    // An unconfigured device must still advertise on a timer wake so the
+    // bridge can issue a formal light plan and install its first Bundle.
     if (!v2BleQueue) v2BleQueue = xQueueCreate(2, sizeof(V2BleMessage *));
     if (!bleInitialized()) {
         bleBegin("CodexStatus-" + macSuffix(), FW_VERSION);
-        bleSetHandlers(handleBleUsage, handleBleEndpoint);
-        bleSetTemplateHandlers(tplXferHandleCtrl, tplXferHandleChunk, tplXferReset);
+        bleSetEndpointHandler(handleBleEndpoint);
         bleSetAuthHandler(handleBleAuth);
-        bleSetV2Handler(handleBleV2Ctrl);
+        bleSetCommandHandler(handleBleV2Ctrl);
     }
     updateInfoExtra();
     if (!bleOn) {
@@ -3917,7 +3623,6 @@ static void pollWifi() {
     if (wifiReconfiguring) {
         if (nowUp) {
             wifiReconfiguring = false;
-            if (wifiUp && storeCount() > 0) tryWifiUsage();
         } else if ((int32_t)(millis() - wifiReconfigDeadline) < 0) {
             return;   // deliberate power-save reassociation in progress
         } else {
@@ -4032,11 +3737,73 @@ static void otaUploadCleanup(const char *reason) {
 // carry it there (the query/form fallback exists for simple curl tests).
 static bool v2ReplyOverBle = false;
 static String v2RequestId;
+static bool syncEnabled = false;
+static String syncOwner;
+static bool syncOpenThisWake = false;
+static uint32_t syncLastProgressMs = 0;
+static uint32_t syncExitAtMs = 0;
+static uint64_t syncOpenAnsweredAt = 0;
+static String syncOpenId, syncOpenReason;
+static bool syncSkippedThisWake = false;
+static uint8_t syncVisibleSkip = 0;
+static uint16_t syncBlockedError = 0;
+struct SyncOtaArm {
+    uint32_t magic;
+    char owner[65];
+    char jobId[65];
+    char ticket[33];
+    uint32_t imageBytes;
+    uint8_t fileHash[32];
+    uint8_t state; // 1 armed, 2 upload accepted and awaiting reboot confirmation
+    uint8_t reserved[3];
+    uint32_t crc;
+};
+static constexpr uint32_t SYNC_OTA_MAGIC = 0x31544f53;
+static SyncOtaArm syncOtaArm = {};
+static mbedtls_sha256_context syncOtaHash;
+static bool syncOtaHashStarted = false;
+static uint32_t syncOtaBytes = 0;
+static bool syncOtaTicketValid = false;
+static bool syncOtaImageVerified = false;
+static bool syncOtaSave() {
+    syncOtaArm.crc = syncCrc32((const uint8_t *)&syncOtaArm, offsetof(SyncOtaArm, crc));
+    Preferences p;
+    if (!p.begin("sync-ota", false)) return false;
+    bool ok = p.putBytes("arm", &syncOtaArm, sizeof(syncOtaArm)) == sizeof(syncOtaArm);
+    p.end();
+    return ok;
+}
+static void syncOtaClear() {
+    memset(&syncOtaArm, 0, sizeof(syncOtaArm));
+    syncOtaImageVerified = false;
+    Preferences p;
+    if (p.begin("sync-ota", false)) { p.remove("arm"); p.end(); }
+}
+static void syncOtaLoad() {
+    Preferences p;
+    if (!p.begin("sync-ota", true)) return;
+    bool valid = p.getBytesLength("arm") == sizeof(syncOtaArm) &&
+                 p.getBytes("arm", &syncOtaArm, sizeof(syncOtaArm)) == sizeof(syncOtaArm);
+    p.end();
+    if (!valid || syncOtaArm.magic != SYNC_OTA_MAGIC ||
+        syncOtaArm.crc != syncCrc32((const uint8_t *)&syncOtaArm, offsetof(SyncOtaArm, crc))) {
+        syncOtaClear(); return;
+    }
+    if (syncOtaArm.state == 1) syncOtaClear();
+    else if (syncOtaArm.state == 2) syncAddReason(syncRtc, 1u << 3);
+}
+static void syncRecordOutcome(uint8_t result, uint16_t error, uint64_t serial = 0) {
+    syncAppendResult(syncRtc, syncLogWakeSeq, millis(), result,
+                     (uint8_t)((syncRtc.flags & 1 ? 1 : 0) | syncRtc.reasonBits),
+                     error, serial);
+    int32_t args[] = {(int32_t)result, (int32_t)error};
+    syncAppendEvent(syncRtc, syncLogWakeSeq, millis(), 10, args, 2);
+}
 static void v2Response(int status, const String &body) {
     if (!v2ReplyOverBle) { server.send(status, "application/json", body); return; }
     JsonDocument doc;
     if (deserializeJson(doc, body)) return;
-    doc["ack"] = "v2";
+    doc["ack"] = "command";
     doc["request_id"] = v2RequestId;
     doc["wake_generation"] = rtcWakeGeneration;
     doc["wake_seq"] = rtcTraceCurrentSeq;
@@ -4064,7 +3831,7 @@ static bool v2OwnerOk(const char *bridgeId) {
         v2Response(409,
                     String("{\"result\":\"rejected\",\"error\":\"occupied\",\"owner\":") +
                         ownerJson() + "}");
-        DevLog.printf("[v2] rejected: owner conflict id=%s\n", bridgeId ? bridgeId : "?");
+        DevLog.printf("[platform] rejected: owner conflict id=%s\n", bridgeId ? bridgeId : "?");
         return false;
     }
     return true;
@@ -4113,11 +3880,114 @@ static bool v2Command(const String &body, JsonDocument &doc) {
     return true;
 }
 
-// GET /v2/status: authenticated authoritative state (the beacon only points).
+static String syncNumber(uint64_t value) {
+    char text[24];
+    snprintf(text, sizeof(text), "%llu", (unsigned long long)value);
+    return String(text);
+}
+
+static bool syncParseNumber(const char *text, uint64_t &value) {
+    if (!text || !*text) return false;
+    value = 0;
+    for (const char *p = text; *p; ++p) {
+        if (*p < '0' || *p > '9' || value > (UINT64_MAX - (*p - '0')) / 10) return false;
+        value = value * 10 + (*p - '0');
+    }
+    return true;
+}
+
+static bool syncParseHash(const char *text, uint8_t out[32]) {
+    if (!text || strlen(text) != 64) return false;
+    for (int i = 0; i < 32; ++i) {
+        int a = text[2*i] >= '0' && text[2*i] <= '9' ? text[2*i] - '0'
+              : text[2*i] >= 'a' && text[2*i] <= 'f' ? text[2*i] - 'a' + 10 : -1;
+        int b = text[2*i+1] >= '0' && text[2*i+1] <= '9' ? text[2*i+1] - '0'
+              : text[2*i+1] >= 'a' && text[2*i+1] <= 'f' ? text[2*i+1] - 'a' + 10 : -1;
+        if (a < 0 || b < 0) return false;
+        out[i] = (uint8_t)((a << 4) | b);
+    }
+    return true;
+}
+
+static void syncReply(const char *op, const char *result, const char *error,
+                      int httpStatus, JsonDocument *extra = nullptr) {
+    if (syncOpenThisWake && !syncBlockedError && error) {
+        uint16_t blocked = !strcmp(error, "unauthorized") ? 4 :
+                           !strcmp(error, "occupied") ? 5 :
+                           !strcmp(error, "owner_changed") ? 10 :
+                           !strcmp(error, "disabled") ? 11 : 0;
+        if (blocked) {
+            syncBlockedError = blocked;
+            syncRecordOutcome(2, blocked);
+            syncExitAtMs = millis() + 200;
+        }
+    }
+    JsonDocument doc;
+    doc["op"] = op;
+    doc["result"] = result;
+    if (error) doc["error"] = error;
+    doc["request_id"] = v2RequestId;
+    if (httpStatus != 401) {
+        doc["device_mac"] = macText();
+        doc["session_nonce"] = v2Nonce();
+    }
+    doc["sync_version"] = 1;
+    if (extra) {
+        for (JsonPair field : extra->as<JsonObject>()) doc[field.key()] = field.value();
+    }
+    String out;
+    serializeJson(doc, out);
+    v2Response(httpStatus, out);
+}
+
+static bool syncCommand(const char *op, JsonDocument &doc) {
+    String endpoint;
+    if (!endpointTokenAuthorized(endpoint)) {
+        syncReply(op, "rejected", "unauthorized", 401); return false;
+    }
+    String body = server.arg("plain");
+    if (body.length() > 4096) {
+        syncReply(op, "rejected", "body_limit", 413); return false;
+    }
+    if (deserializeJson(doc, body)) {
+        syncReply(op, "rejected", "json", 400); return false;
+    }
+    v2RequestId = doc["request_id"] | "";
+    const char *bridge = doc["bridge_id"] | "";
+    if (!doc["protocol"].isNull() || !doc["rv"].isNull() ||
+        (doc["sync_version"] | 0) != 1 ||
+        !*bridge || !v2RequestId.length() || v2RequestId.length() > 64 ||
+        String(doc["device_mac"] | "") != macText()) {
+        syncReply(op, "rejected", "shape", 400); return false;
+    }
+    if (String(doc["session_nonce"] | "") != v2Nonce()) {
+        syncReply(op, "rejected", "session", 400); return false;
+    }
+    OwnerRec owner;
+    if (!ownerGet(owner)) {
+        syncReply(op, "rejected", "claim_required", 409); return false;
+    }
+    if (owner.id != bridge) {
+        syncReply(op, "rejected", "occupied", 409); return false;
+    }
+    if (!syncStoreAvailable()) {
+        syncReply(op, "rejected", "storage", 503); return false;
+    }
+    if (!syncEnabled || syncOwner != bridge) {
+        syncReply(op, "rejected", "disabled", 409); return false;
+    }
+    return true;
+}
+
+static void syncBatchFields(JsonDocument &doc, const SyncStoreBatch &batch) {
+    syncProtocolBatchFields(doc.to<JsonObject>(), batch);
+}
+
+// GET /api/status: authenticated authoritative state (the beacon only points).
 // Business channel auth = endpoint token (same trust as /usage and /template);
 // the device operation token keeps gating /claim, /update, /doUpdate, /diag.
 static void handleV2Status() {
-    DevLog.printf("[v2] req status heap=%u", (unsigned)ESP.getFreeHeap());
+    DevLog.printf("[platform] req status heap=%u", (unsigned)ESP.getFreeHeap());
     String mac;
     if (!endpointTokenAuthorized(mac)) {
         traceMarkHttp(false, 401);
@@ -4151,10 +4021,222 @@ static void handleV2Status() {
     wake.stage = traceCurrent() ? traceStageName(traceCurrent()->furthest) : "none";
     wake.cause = wakeCauseName(bootWakeCause);
     snapshot.wake = &wake;
-    server.send(200, "application/json", v2BuildStatusSnapshot(snapshot));
+    JsonDocument doc;
+    deserializeJson(doc, v2BuildStatusSnapshot(snapshot));
+    const esp_partition_t *currentPartition = esp_ota_get_running_partition();
+    doc["firmware_target"] = FW_TARGET_ID;
+    doc["running_slot"] = currentPartition ? currentPartition->label : nullptr;
+    doc["reset_reason"] = (int)esp_reset_reason();
+    doc["boot_id"] = v2Nonce();
+    doc["uptime_ms"] = millis();
+    if (timeKnown()) doc["sampled_wall"] = (int64_t)time(nullptr);
+    else doc["sampled_wall"] = nullptr;
+    doc["heap_free"] = ESP.getFreeHeap();
+    doc["heap_min"] = ESP.getMinFreeHeap();
+    JsonObject radio = doc["radio"].to<JsonObject>();
+    radio["wifi_connected"] = WiFi.status() == WL_CONNECTED;
+    radio["rssi"] = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0;
+    radio["ble_connected"] = bleIsConnected();
+    JsonObject display = doc["display"].to<JsonObject>();
+    display["epd_writes"] = epdWriteCount;
+    display["epd_busy_fails"] = rtcEpdBusyFails;
+    if (syncStoreAvailable()) {
+        doc["sync_v1"] = 1;
+        doc["diag_format"] = 1;
+        doc["diag_capacity"] = 4096;
+        doc["image_identity"].to<JsonArray>().add("sha256-running-prefix-v1");
+    }
+    JsonObject sync = doc["sync"].to<JsonObject>();
+    OwnerRec owner;
+    sync["enabled"] = syncEnabled && ownerGet(owner) && owner.id == syncOwner;
+    sync["phase"] = syncOpenThisWake ? "WIFI_SYNC_ONCE" :
+                    rtcMode == MODE_LIGHT ? "WIFI_LIGHT" : "DEEP";
+    sync["rounds"] = syncRtc.rounds;
+    sync["due"] = (syncRtc.flags & 1) != 0;
+    sync["retry_skip"] = syncRtc.retrySkip;
+    sync["baseline"] = (syncRtc.flags & 2) ? "known" : "unknown";
+    sync["diag_earliest_seq"] = syncNumber(syncEarliestSeq(syncRtc));
+    sync["diag_next_seq"] = syncNumber(syncRtc.nextSeq);
+    JsonArray pendingReasons = sync["reasons"].to<JsonArray>();
+    const char *reasonNames[5] = {"periodic", "light_enter", "light_exit", "ota_confirm", "bundle_confirm"};
+    for (uint8_t i = 1; i < 5; ++i)
+        if ((syncRtc.reasonBits & (1u << i)) &&
+            (i != 3 || (syncRtc.flags & 1))) pendingReasons.add(reasonNames[i]);
+    SyncStoreBatch batch;
+    if (syncStoreActive(batch)) {
+        if (syncStoreLost()) { syncReply("sync_begin", "rejected", "batch_lost", 503); return; }
+        JsonDocument fields;
+        syncBatchFields(fields, batch);
+        sync["pending_batch"] = fields.as<JsonVariantConst>();
+    } else sync["pending_batch"] = nullptr;
+    if (syncStoreReceipt(batch)) {
+        JsonDocument fields;
+        syncBatchFields(fields, batch);
+        sync["last_completed"] = fields.as<JsonVariantConst>();
+    } else sync["last_completed"] = nullptr;
+    sync["last_error"] = syncStoreLost() ? "batch_lost" : nullptr;
+    sync["confirmation_pending"] = syncOtaArm.magic == SYNC_OTA_MAGIC && syncOtaArm.state == 2;
+    String out;
+    serializeJson(doc, out);
+    server.send(200, "application/json", out);
 }
 
-// POST /v2/data: atomic complete snapshot inside the current context.
+static JsonDocument syncFrozenSnapshot() {
+    JsonDocument doc;
+    JsonObject snapshot = doc["snapshot"].to<JsonObject>();
+    snapshot["target"] = FW_TARGET_ID;
+    snapshot["fw"] = FW_VERSION;
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    snapshot["slot"] = running ? running->label : nullptr;
+    snapshot["reset_reason"] = (int)esp_reset_reason();
+    snapshot["active_context_id"] = v2Profile.contextId;
+    snapshot["active_template_id"] = v2Profile.count ? v2Profile.ids[v2Profile.initial] : "";
+    snapshot["committed_job_id"] = v2Profile.jobId;
+    snapshot["commit_seq"] = bsCommitSeq();
+    snapshot["display_state"] = v2DisplayState;
+    snapshot["applied_seq"] = v2DataSeq.appliedSeq();
+    snapshot["heap_free"] = ESP.getFreeHeap();
+    snapshot["battery"] = batteryPercent();
+    snapshot["plan_id"] = v2Plan.acceptedId();
+    snapshot["plan_remaining_s"] = v2Plan.remainingS(v2NowMs());
+    snapshot["rounds"] = syncRtc.rounds;
+    OwnerRec owner;
+    snapshot["owner_id"] = ownerGet(owner) ? owner.id : "";
+    JsonObject confirmations = doc["confirmation_observations"].to<JsonObject>();
+    if (syncOtaArm.magic == SYNC_OTA_MAGIC && syncOtaArm.state == 2) {
+        JsonObject ota = confirmations["ota"].to<JsonObject>();
+        ota["job_id"] = syncOtaArm.jobId;
+        ota["stage"] = syncOtaImageVerified ? "image_verified" : "pending_identity";
+        ota["running_slot"] = running ? running->label : nullptr;
+        ota["fw"] = FW_VERSION;
+    }
+    return doc;
+}
+
+static void handleSyncTransfer(const char *op) {
+    JsonDocument request;
+    if (!syncCommand(op, request)) return;
+    JsonDocument snapshot = syncFrozenSnapshot();
+    uint8_t randomBytes[16];
+    for (uint8_t i = 0; i < 16; i += 4) {
+        uint32_t word = esp_random();
+        memcpy(randomBytes + i, &word, 4);
+    }
+    char suffix[33];
+    syncHex(randomBytes, 16, suffix);
+    String mac = macText();
+    SyncProtocolInput input{syncRtc, mac.c_str(),
+                            request["bridge_id"] | "", suffix,
+                            syncLogWakeSeq, millis(), syncOtaImageVerified,
+                            snapshot["snapshot"].as<JsonVariantConst>()};
+    JsonDocument fields;
+    uint32_t before = syncStoreAckedOffset();
+    SyncProtocolResult result = syncProtocolRun(input, op, request, fields);
+    if (result.status == 200 && String(fields["result"] | "") == "applied") {
+        if (!strcmp(op, "sync_begin") ||
+            (!strcmp(op, "sync_ack") && syncStoreAckedOffset() > before))
+            syncLastProgressMs = millis();
+    }
+    if (result.completed) {
+        if (result.otaConfirmed) syncOtaClear();
+        if (syncOpenThisWake && !(syncRtc.flags & 1)) syncExitAtMs = millis() + 200;
+    }
+    syncReply(op, fields["result"] | "rejected",
+              fields["error"] | nullptr, result.status, &fields);
+}
+
+static void handleSyncBegin() { handleSyncTransfer("sync_begin"); }
+static void handleSyncPage() { handleSyncTransfer("sync_page"); }
+static void handleSyncAck() { handleSyncTransfer("sync_ack"); }
+static void handleSyncComplete() { handleSyncTransfer("sync_complete"); }
+
+static void handleSyncArm() {
+    JsonDocument request;
+    if (!syncCommand("sync_arm", request)) return;
+    const char *job = request["job_id"] | "";
+    uint8_t hash[32];
+    if (strcmp(request["kind"] | "", "ota") || !*job || strlen(job) > 64 ||
+        !request["image_bytes"].is<uint32_t>() || !request["image_bytes"].as<uint32_t>() ||
+        !syncParseHash(request["file_sha256"] | "", hash)) {
+        syncReply("sync_arm", "rejected", "shape", 400); return;
+    }
+    uint32_t length = request["image_bytes"].as<uint32_t>();
+    const esp_partition_t *next = esp_ota_get_next_update_partition(nullptr);
+    if (!next || length > next->size) {
+        syncReply("sync_arm", "rejected", "range", 400); return;
+    }
+    if (syncOtaArm.magic == SYNC_OTA_MAGIC) {
+        if (syncOtaArm.state == 1 && !strcmp(syncOtaArm.owner, request["bridge_id"] | "") &&
+            !strcmp(syncOtaArm.jobId, job) && syncOtaArm.imageBytes == length &&
+            !memcmp(syncOtaArm.fileHash, hash, 32)) {
+            JsonDocument fields;
+            fields["ticket"] = syncOtaArm.ticket;
+            fields["job_id"] = job;
+            syncReply("sync_arm", "applied", nullptr, 200, &fields);
+            return;
+        }
+        syncReply("sync_arm", "rejected", "batch_conflict", 409); return;
+    }
+    memset(&syncOtaArm, 0, sizeof(syncOtaArm));
+    syncOtaArm.magic = SYNC_OTA_MAGIC;
+    strlcpy(syncOtaArm.owner, request["bridge_id"] | "", sizeof(syncOtaArm.owner));
+    strlcpy(syncOtaArm.jobId, job, sizeof(syncOtaArm.jobId));
+    randomHex(syncOtaArm.ticket, 16);
+    syncOtaArm.imageBytes = length;
+    memcpy(syncOtaArm.fileHash, hash, 32);
+    syncOtaArm.state = 1;
+    if (!syncOtaSave()) {
+        memset(&syncOtaArm, 0, sizeof(syncOtaArm));
+        syncReply("sync_arm", "rejected", "storage", 503); return;
+    }
+    int32_t args[] = {0, 0};
+    syncAppendEvent(syncRtc, syncLogWakeSeq, millis(), 8, args, 2);
+    JsonDocument fields;
+    fields["ticket"] = syncOtaArm.ticket;
+    fields["job_id"] = job;
+    syncReply("sync_arm", "applied", nullptr, 200, &fields);
+}
+
+static void handleSyncImage() {
+    JsonDocument request;
+    if (!syncCommand("sync_image", request)) return;
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (!running || !request["image_bytes"].is<uint32_t>()) {
+        syncReply("sync_image", "rejected", "shape", 400); return;
+    }
+    uint32_t length = request["image_bytes"].as<uint32_t>();
+    if (!length || length > running->size) {
+        syncReply("sync_image", "rejected", "range", 400); return;
+    }
+    mbedtls_sha256_context sha;
+    mbedtls_sha256_init(&sha);
+    mbedtls_sha256_starts(&sha, 0);
+    uint8_t block[4096], hash[32];
+    bool okay = true;
+    for (uint32_t offset = 0; offset < length; offset += sizeof(block)) {
+        size_t count = std::min((size_t)(length - offset), sizeof(block));
+        if (esp_partition_read(running, offset, block, count) != ESP_OK) { okay = false; break; }
+        mbedtls_sha256_update(&sha, block, count);
+    }
+    if (okay) mbedtls_sha256_finish(&sha, hash);
+    mbedtls_sha256_free(&sha);
+    if (!okay) { syncReply("sync_image", "rejected", "storage", 503); return; }
+    char hex[65];
+    syncHex(hash, 32, hex);
+    if (syncOtaArm.magic == SYNC_OTA_MAGIC && syncOtaArm.state == 2 &&
+        syncOtaArm.imageBytes == length && !memcmp(hash, syncOtaArm.fileHash, 32))
+        syncOtaImageVerified = true;
+    JsonDocument fields;
+    fields["algorithm"] = "sha256-running-prefix-v1";
+    fields["image_bytes"] = length;
+    fields["sha256"] = hex;
+    fields["running_slot"] = running->label;
+    fields["fw_target"] = FW_TARGET_ID;
+    fields["fw"] = FW_VERSION;
+    syncReply("sync_image", "applied", nullptr, 200, &fields);
+}
+
+// POST /api/data: atomic complete snapshot inside the current context.
 static void applyV2Data(const String &body) {
     JsonDocument peek;
     if (!v2Command(body, peek)) return;
@@ -4206,7 +4288,7 @@ static void applyV2Data(const String &body) {
 }
 
 static void handleV2Data() {
-    DevLog.printf("[v2] req data heap=%u", (unsigned)ESP.getFreeHeap());
+    DevLog.printf("[platform] req data heap=%u", (unsigned)ESP.getFreeHeap());
     String mac;
     if (!endpointTokenAuthorized(mac)) {
         server.send(401, "application/json", "{\"result\":\"unauthorized\"}");
@@ -4216,7 +4298,7 @@ static void handleV2Data() {
     applyV2Data(server.arg("plain"));
 }
 
-// POST /v2/plan: the only way to change the light deadline.
+// POST /api/plan: the only way to change the light deadline.
 static void applyV2Plan(const String &body) {
     JsonDocument doc;
     if (!v2Command(body, doc)) return;
@@ -4241,15 +4323,16 @@ static void applyV2Plan(const String &body) {
         v2LightDeadlineMs = v2Plan.deadlineMs();
         v2Provisional = false;
         if (rtcMode != MODE_LIGHT) {
+            if (syncEnabled) syncAddReason(syncRtc, 1u << 1);
             rtcMode = MODE_LIGHT;
             persistMode();
         }
-        DevLog.printf("[v2] plan %lu light %us\n", (unsigned long)plan.planId,
+        DevLog.printf("[platform] plan %lu light %us\n", (unsigned long)plan.planId,
                       (unsigned)v2Plan.grantedS());
     } else {
         v2LightDeadlineMs = 0;
         v2Provisional = false;
-        DevLog.printf("[v2] plan %lu sleep\n", (unsigned long)plan.planId);
+        DevLog.printf("[platform] plan %lu sleep\n", (unsigned long)plan.planId);
     }
     if (v2ReplyOverBle && v2HistorySyncMs) {
         v2HistorySyncUntilMs = v2NowMs() + v2HistorySyncMs;
@@ -4260,7 +4343,7 @@ static void applyV2Plan(const String &body) {
 }
 
 static void handleV2Plan() {
-    DevLog.printf("[v2] req plan heap=%u", (unsigned)ESP.getFreeHeap());
+    DevLog.printf("[platform] req plan heap=%u", (unsigned)ESP.getFreeHeap());
     String mac;
     if (!endpointTokenAuthorized(mac)) {
         server.send(401, "application/json", "{\"result\":\"unauthorized\"}");
@@ -4509,8 +4592,16 @@ static void handleV2BundleCommit() {
     v2DataSeq.beginContext(v2NowMs(), 1);
     v2AppliedFields = "";
     v2ActiveLoad();
+    uint32_t busyBefore = rtcEpdBusyFails;
     renderCurrent();
-    v2Ack("bundle", "applied", "displayed", "flash", nullptr, -1, 0, v2Profile.contextId,
+    v2DisplayState = rtcEpdBusyFails != busyBefore ? 3 : 1;
+    if (syncEnabled) {
+        syncAddReason(syncRtc, 1u << 4);
+        int32_t args[] = {0, (int32_t)bsCommitSeq()};
+        syncAppendEvent(syncRtc, syncLogWakeSeq, millis(), 7, args, 2);
+    }
+    v2Ack("bundle", "applied", v2DisplayState == 3 ? "failed" : "displayed",
+          "flash", nullptr, -1, 0, v2Profile.contextId,
           UINT32_MAX);
 }
 
@@ -4534,9 +4625,14 @@ static void serviceV2Ble() {
         }
     }
     v2ReplyOverBle = true;
-    if (!authenticated || !rv2Enabled) {
+    if (!doc["protocol"].isNull() || !doc["rv"].isNull()) {
         v2Ack("command", "rejected", "unchanged", "ram",
-              authenticated ? "disabled" : "unauthorized", -1, 0, nullptr, UINT32_MAX);
+              "retired_protocol", -1, 0, nullptr, UINT32_MAX);
+        return;
+    }
+    if (!authenticated) {
+        v2Ack("command", "rejected", "unchanged", "ram",
+              "unauthorized", -1, 0, nullptr, UINT32_MAX);
     } else {
         traceSetTransport(1);
         traceSetRequest(doc["request_id"] | "");
@@ -4546,9 +4642,7 @@ static void serviceV2Ble() {
         // renders or replies. Missing fields keep the local RTC fallback.
         if (!doc["server_time"].isNull()) adoptServerTimeForce(doc);
         // An authenticated rendezvous command is a successful bridge contact:
-        // refresh the sync timestamp that drives the offline_mins row. The v2
-        // channel never went through the legacy HTTP markSynced() paths, so
-        // rv2 devices used to show a stale "offline N hours" while in contact.
+        // refresh the sync timestamp that drives the offline_mins row.
         markSynced();
         const char *op = doc["op"] | "";
         if (!strcmp(op, "status")) {
@@ -4567,9 +4661,89 @@ static void serviceV2Ble() {
             state["power"]["provisional_remaining_s"] = v2Provisional ?
                 V2PlanState::bootProvisionalRemaining(v2BootMs, v2NowMs()) : 0;
             state["power"]["manual_ble_hold_remaining_s"] = v2ManualBleHoldRemainingS();
+            if (syncStoreAvailable()) {
+                OwnerRec current;
+                JsonObject sync = state["sync"].to<JsonObject>();
+                sync["v"] = 1;
+                sync["enabled"] = syncEnabled && ownerGet(current) && current.id == syncOwner;
+                sync["rounds"] = syncRtc.rounds;
+                sync["due"] = (syncRtc.flags & 1) != 0;
+                sync["retry_skip"] = syncSkippedThisWake ? syncVisibleSkip : syncRtc.retrySkip;
+                SyncStoreBatch batch;
+                sync["pending"] = syncStoreActive(batch);
+                sync["completed_serial"] = syncStoreReceipt(batch)
+                    ? syncNumber(batch.clientSerial) : String("0");
+            }
             String out;
             serializeJson(state, out);
             v2Response(200, out);
+        } else if (!strcmp(op, "sync_config")) {
+            OwnerRec current;
+            V2CommandSessionDecision session = v2CheckCommandSession(doc, macText(), &v2Nonce());
+            if (!session.accepted || !doc["enabled"].is<bool>() || !ownerGet(current) ||
+                current.id != (doc["bridge_id"] | "") || !syncStoreAvailable()) {
+                v2Ack("sync_config", "rejected", "unchanged", "ram", "shape", -1, 0,
+                      nullptr, UINT32_MAX);
+            } else {
+                bool changedOwner = syncOwner.length() && syncOwner != current.id;
+                bool ready = !changedOwner || syncStoreChangeOwner();
+                if (ready && changedOwner) {
+                    syncOtaClear();
+                    syncAddReason(syncRtc, 1u);
+                }
+                Preferences p;
+                bool saved = ready && p.begin("sync-v1", false);
+                if (saved) {
+                    saved = p.putBool("enabled", doc["enabled"].as<bool>()) == 1 &&
+                            p.putString("owner", current.id) == current.id.length();
+                    p.end();
+                }
+                if (saved) {
+                    syncEnabled = doc["enabled"].as<bool>();
+                    syncOwner = current.id;
+                }
+                v2Ack("sync_config", saved ? "applied" : "rejected", "unchanged",
+                      saved ? "flash" : "ram", saved ? nullptr : "storage", -1, 0,
+                      nullptr, UINT32_MAX);
+            }
+        } else if (!strcmp(op, "sync_open")) {
+            OwnerRec current;
+            V2CommandSessionDecision session = v2CheckCommandSession(doc, macText(), &v2Nonce());
+            String openId = doc["open_id"] | "";
+            String reason = doc["reason"] | "";
+            bool idValid = openId.length() == 32;
+            for (size_t i = 0; i < openId.length(); ++i)
+                if (!isxdigit((unsigned char)openId[i])) idValid = false;
+            bool wakeValid = (doc["wake_generation"] | 0u) == rtcWakeGeneration &&
+                             (doc["wake_seq"] | 0u) == rtcTraceCurrentSeq;
+            SyncStoreBatch pending;
+            bool retry = reason == "retry" &&
+                         (syncStoreActive(pending) || (syncRtc.flags & 4) || syncRtc.reasonBits);
+            bool periodic = reason == "periodic" && syncRtc.rounds == 15 && (syncRtc.flags & 1);
+            const char *error = !session.accepted || !idValid || !wakeValid ? "session" :
+                                !ownerGet(current) ? "claim_required" :
+                                current.id != (doc["bridge_id"] | "") ? "occupied" :
+                                !syncEnabled || syncOwner != current.id ? "disabled" :
+                                v2BatteryPowerOff(plugged, batteryPercent()) ? "low_battery" :
+                                syncSkippedThisWake || syncRtc.retrySkip || (!periodic && !retry) ? "range" :
+                                syncOpenThisWake &&
+                                (openId != syncOpenId || reason != syncOpenReason) ? "batch_conflict" : nullptr;
+            if (error) {
+                if (!strcmp(error, "low_battery")) syncRecordOutcome(2, 7);
+                v2Ack("sync_open", "rejected", "unchanged", "ram", error, -1, 0,
+                      nullptr, UINT32_MAX);
+            } else {
+                if (!syncOpenThisWake) {
+                    syncOpenThisWake = true;
+                    syncBlockedError = 0;
+                    syncOpenId = openId;
+                    syncOpenReason = reason;
+                    syncLastProgressMs = millis();
+                    syncOpenAnsweredAt = v2NowMs();
+                }
+                v2Ack("sync_open", "applied", "unchanged", "ram", nullptr, -1, 0,
+                      nullptr, UINT32_MAX);
+            }
         } else if (!strcmp(op, "history")) {
             if (v2HistorySyncMs) v2HistorySyncUntilMs = v2NowMs() + v2HistorySyncMs;
             const uint32_t since = doc["since"] | 0u;
@@ -4607,6 +4781,12 @@ static bool v2Rendezvous() {
                   esp_err_to_name(esp_pm_configure(&blePm)));
 #endif
     v2InRendezvous = true;
+    if (syncStoreAvailable()) {
+        syncCountDeepRendezvous(syncRtc);
+        syncSkippedThisWake = syncRtc.retrySkip != 0;
+        syncVisibleSkip = syncRtc.retrySkip;
+        if (syncSkippedThisWake) syncConsumeSkip(syncRtc);
+    }
     v2HistorySyncMs = 0;
     v2HistorySyncUntilMs = 0;
     enterBleOn(false);
@@ -4629,10 +4809,14 @@ static bool v2Rendezvous() {
             // exchange its own bound instead of cutting a working link.
             connectedAt = v2NowMs();
             deadline = connectedAt + V2_RENDEZVOUS_CONNECTED_MS;
-            DevLog.printf("[v2] rendezvous peer connected at %ums\n",
+            DevLog.printf("[platform] rendezvous peer connected at %ums\n",
                           (unsigned)(connectedAt - windowStart));
         }
-        if (v2Plan.accepted()) {
+        if (v2Plan.accepted() || syncOpenThisWake) {
+            if (syncEnabled && (syncRtc.flags & 1) && !syncOpenThisWake &&
+                !syncSkippedThisWake) { delay(10); continue; }
+            if (syncOpenThisWake && syncOpenAnsweredAt > answeredAt)
+                answeredAt = syncOpenAnsweredAt;
             if (!answeredAt) answeredAt = v2NowMs();
             const uint64_t normalUntil = answeredAt + V2_RENDEZVOUS_ACK_GRACE_MS;
             const uint64_t historyUntil = v2HistorySyncUntilMs;
@@ -4646,12 +4830,12 @@ static bool v2Rendezvous() {
     v2InRendezvous = false;
     wakeResult = light ? WAKE_RV_LIGHT : WAKE_RV_SLEEP;
     rtcNetCycles++;
-    DevLog.printf("[v2] rendezvous %s plan=%lu time=%s awake=%ums ble=%ums win=%ums\n",
+    DevLog.printf("[platform] rendezvous %s plan=%lu time=%s awake=%ums ble=%ums win=%ums\n",
                   answeredAt ? "answered" : "timeout", (unsigned long)v2Plan.acceptedId(),
                   timeKnown() ? timeSourceName(timeSource) : "none", (unsigned)millis(),
                   (unsigned)bleRadioMs(), (unsigned)(v2NowMs() - windowStart));
     v2RendezvousRender(light);
-    return light;
+    return light || syncOpenThisWake;
 }
 
 // Plan C: the single wake render, after the BLE window is closed. The reserved
@@ -4660,7 +4844,7 @@ static bool v2Rendezvous() {
 // No clock in the template (or unknown time) -> nothing to draw.
 static void v2RendezvousClockRender() {
     if (!clkR.valid || !activeTplHasNow || !timeKnown()) {
-        DevLog.printf("[v2] rendezvous render skipped (clk=%d now=%d time=%d)\n",
+        DevLog.printf("[platform] rendezvous render skipped (clk=%d now=%d time=%d)\n",
                       clkR.valid ? 1 : 0, activeTplHasNow ? 1 : 0, timeKnown() ? 1 : 0);
         return;
     }
@@ -4672,18 +4856,18 @@ static void v2RendezvousClockRender() {
         forceCleanRefresh = true;
         renderCurrent();
         clkCaptureFromFramebuffer();
-        DevLog.printf("[v2] rendezvous full frame (no clock baseline) in %ums\n",
+        DevLog.printf("[platform] rendezvous full frame (no clock baseline) in %ums\n",
                       (unsigned)(millis() - t0));
         return;
     }
     if (!clockTickWake()) {
-        DevLog.println("[v2] rendezvous clock window failed; full frame");
+        DevLog.println("[platform] rendezvous clock window failed; full frame");
         forceCleanRefresh = true;
         renderCurrent();
         clkCaptureFromFramebuffer();
         return;
     }
-    DevLog.printf("[v2] rendezvous clock rendered in %ums (src=%s)\n",
+    DevLog.printf("[platform] rendezvous clock rendered in %ums (src=%s)\n",
                   (unsigned)(millis() - t0), timeSourceName(timeSource));
 }
 
@@ -4703,21 +4887,21 @@ static void v2RendezvousRender(bool light) {
         v2WakeRenderPending = false;
         clkCaptureFromFramebuffer();
         v2DisplayState = (rtcEpdBusyFails != busyBefore) ? 3 : 1;
-        DevLog.printf("[v2] rendezvous %s frame (data+clock) in %ums\n",
+        DevLog.printf("[platform] rendezvous %s frame (data+clock) in %ums\n",
                       light ? "light" : "sleep", (unsigned)(millis() - t0));
         return;
     }
     if (light) {
         // The clock rides in the light first frame (startNormalMode).
-        DevLog.println("[v2] rendezvous light plan; clock in the first light frame");
+        DevLog.println("[platform] rendezvous light plan; clock in the first light frame");
         return;
     }
     v2RendezvousClockRender();
 }
 
 static void registerHttpRoutes() {
-    const char *bundleHeaders[] = {"X-Request-Id", "X-Session-Nonce", "X-Offset"};
-    server.collectHeaders(bundleHeaders, 3);
+    const char *bundleHeaders[] = {"X-Request-Id", "X-Session-Nonce", "X-Offset", "X-Codex-Sync-Ticket"};
+    server.collectHeaders(bundleHeaders, 4);
     server.on("/", HTTP_GET, handleStatus);
     server.on("/status.json", HTTP_GET, handleStatusJson);
     server.on("/log", HTTP_GET, handleLog);
@@ -4725,19 +4909,23 @@ static void registerHttpRoutes() {
     server.on("/pmstats", HTTP_GET, handlePmStats);
     server.on("/frame", HTTP_GET, handleFrame);
     server.on("/diag", HTTP_POST, handleDiag);
-    server.on("/usage", HTTP_POST, handleUsagePost);
-    server.on("/template", HTTP_POST, handleTemplatePost);
     server.on("/claim", HTTP_POST, handleClaim);
     // v2 platform protocol: authenticated business endpoints (token + owner);
     // none of them extend the light deadline implicitly.
-    server.on("/v2/status", HTTP_GET, handleV2Status);
-    server.on("/v2/data", HTTP_POST, handleV2Data);
-    server.on("/v2/plan", HTTP_POST, handleV2Plan);
-    server.on("/v2/activate", HTTP_POST, handleV2Activate);
+    server.on("/api/status", HTTP_GET, handleV2Status);
+    server.on("/api/sync/begin", HTTP_POST, handleSyncBegin);
+    server.on("/api/sync/page", HTTP_POST, handleSyncPage);
+    server.on("/api/sync/ack", HTTP_POST, handleSyncAck);
+    server.on("/api/sync/complete", HTTP_POST, handleSyncComplete);
+    server.on("/api/sync/arm", HTTP_POST, handleSyncArm);
+    server.on("/api/sync/image", HTTP_POST, handleSyncImage);
+    server.on("/api/data", HTTP_POST, handleV2Data);
+    server.on("/api/plan", HTTP_POST, handleV2Plan);
+    server.on("/api/activate", HTTP_POST, handleV2Activate);
 
-    server.on("/v2/bundle/begin", HTTP_POST, handleV2BundleBegin);
-    server.on("/v2/bundle/chunk", HTTP_POST, handleV2BundleChunk, handleV2BundleChunkRaw);
-    server.on("/v2/bundle/commit", HTTP_POST, handleV2BundleCommit);
+    server.on("/api/bundle/begin", HTTP_POST, handleV2BundleBegin);
+    server.on("/api/bundle/chunk", HTTP_POST, handleV2BundleChunk, handleV2BundleChunkRaw);
+    server.on("/api/bundle/commit", HTTP_POST, handleV2BundleCommit);
     server.on("/update", HTTP_GET, handleUpdatePage);
     server.on("/doUpdate", HTTP_POST,
         []() {
@@ -4766,6 +4954,27 @@ static void registerHttpRoutes() {
                                   server.arg("target").c_str(), FW_TARGET_ID);
                     return;
                 }
+                syncOtaTicketValid = false;
+                if (syncEnabled || syncOtaArm.magic == SYNC_OTA_MAGIC) {
+                    OwnerRec current;
+                    syncOtaTicketValid = syncOtaArm.magic == SYNC_OTA_MAGIC &&
+                        syncOtaArm.state == 1 && ownerGet(current) &&
+                        current.id == syncOtaArm.owner &&
+                        server.header("X-Codex-Sync-Ticket") == syncOtaArm.ticket;
+                    if (!syncOtaTicketValid) {
+                        otaUploadDenied = true;
+                        DevLog.println("[ota] rejected: sync ticket or owner");
+                        return;
+                    }
+                    syncOtaBytes = 0;
+                    mbedtls_sha256_init(&syncOtaHash);
+                    mbedtls_sha256_starts(&syncOtaHash, 0);
+                    syncOtaHashStarted = true;
+                    if (!syncOtaHashStarted) {
+                        otaUploadDenied = true;
+                        return;
+                    }
+                }
                 otaUploadDenied = false;
                 otaInProgress = true;
                 setOtaLock(true);
@@ -4781,14 +4990,47 @@ static void registerHttpRoutes() {
             } else if (up.status == UPLOAD_FILE_WRITE) {
                 if (otaUploadDenied || !otaInProgress) return;
                 otaLastDataMs = millis();
+                if (syncOtaTicketValid) {
+                    syncOtaBytes += up.currentSize;
+                    if (syncOtaBytes > syncOtaArm.imageBytes) {
+                        mbedtls_sha256_free(&syncOtaHash);
+                        syncOtaHashStarted = false;
+                        otaUploadCleanup("sync-size-or-hash");
+                        otaUploadDenied = true;
+                        syncOtaClear();
+                        return;
+                    }
+                    mbedtls_sha256_update(&syncOtaHash, up.buf, up.currentSize);
+                }
                 if (Update.write(up.buf, up.currentSize) != up.currentSize) {
                     DevLog.printf("[ota] write failed: %u\n", (unsigned)Update.getError());
                     otaUploadCleanup("write-failed");
+                    if (syncOtaHashStarted) { mbedtls_sha256_free(&syncOtaHash); syncOtaHashStarted = false; }
+                    syncOtaClear();
+                    otaUploadDenied = true;
                 }
             } else if (up.status == UPLOAD_FILE_END) {
                 otaInProgress = false;
                 if (otaUploadDenied) { setOtaLock(false); return; }
+                if (syncOtaTicketValid) {
+                    uint8_t hash[32];
+                    if (syncOtaHashStarted) mbedtls_sha256_finish(&syncOtaHash, hash);
+                    bool valid = syncOtaHashStarted && syncOtaBytes == syncOtaArm.imageBytes &&
+                                 memcmp(hash, syncOtaArm.fileHash, 32) == 0;
+                    mbedtls_sha256_free(&syncOtaHash);
+                    syncOtaHashStarted = false;
+                    if (!valid) {
+                        otaUploadCleanup("sync-digest-mismatch");
+                        syncOtaClear();
+                        otaUploadDenied = true;
+                        return;
+                    }
+                }
                 if (Update.end(true)) {
+                    if (syncOtaTicketValid) {
+                        syncOtaArm.state = 2;
+                        if (!syncOtaSave()) DevLog.println("[ota] sync receipt storage failed");
+                    }
                     DevLog.printf("[ota] success %u bytes, rebooting shortly\n", (unsigned)up.totalSize);
                     screen({"OTA success", "Rebooting..."});
                     // 5 min light window for the bridge (NVS survives the OTA).
@@ -4801,9 +5043,12 @@ static void registerHttpRoutes() {
                 } else {
                     DevLog.printf("[ota] end failed: %u\n", (unsigned)Update.getError());
                     otaUploadCleanup("end-failed");
+                    if (syncOtaTicketValid) syncOtaClear();
                 }
             } else if (up.status == UPLOAD_FILE_ABORTED) {
                 otaUploadCleanup("aborted");
+                if (syncOtaHashStarted) { mbedtls_sha256_free(&syncOtaHash); syncOtaHashStarted = false; }
+                if (syncOtaTicketValid) syncOtaClear();
             }
         });
 }
@@ -4841,7 +5086,7 @@ static bool configureWifiPowerSave() {
     return WiFi.status() == WL_CONNECTED;
 }
 
-static void startNormalMode(bool skipConnect = false) {
+static void startNormalMode() {
     configMode = false;
     traceSetTransport(2);
     traceSetStage(TRACE_STAGE_WIRELESS);
@@ -4876,12 +5121,7 @@ static void startNormalMode(bool skipConnect = false) {
     const bool cachedColdBoot = !wokeFromDeep && lastUsage.length() > 0;
     if (cachedColdBoot) renderCurrent();
 
-    if (skipConnect && WiFi.status() == WL_CONNECTED) {
-        // Deep pull already fast-connected: no scan, no second association.
-        wifiUp = true;
-    } else {
-        wifiUp = connectBest(!wokeFromDeep && !cachedColdBoot);
-    }
+    wifiUp = connectBest(!wokeFromDeep && !cachedColdBoot);
     registerHttpRoutes();
     server.begin();
 
@@ -4892,7 +5132,6 @@ static void startNormalMode(bool skipConnect = false) {
         lastBattCheck = millis();
         batteryPct = batteryPercent();
         configureWifiPowerSave();
-        saveApInfo();
         loadOrIssueAuthToken();
         ArduinoOTA.setHostname(hostname.c_str());
         ArduinoOTA.onStart([]() {
@@ -4921,7 +5160,6 @@ static void startNormalMode(bool skipConnect = false) {
         // bit0 = the last deep entry actually drew the sleep glyph.
         if (wokeFromDeep && (rtcDeepGlyph & 1)) renderCurrent();
         if (plugged && !rtcDeepOnUsb && batteryPct > BLE_AUTO_PCT) enterBleOn(false);
-        if (!v2BundleReady && !deepWakePath && storeCount() > 0) tryWifiUsage();
         // Cold boot: never leave the boot/connecting page up when the first
         // pull failed. The cached usage (or the built-in status screen) is
         // rendered once the link is up, so the panel is never stale. An
@@ -4938,6 +5176,10 @@ static void startNormalMode(bool skipConnect = false) {
             nextWifiRetry = millis() + WIFI_RETRY_MS;
             DevLog.println("[wifi] no link at boot (plugged): retry every 60s");
         } else {
+            if (syncOpenThisWake) {
+                syncRecordOutcome(1, 1);
+                syncFail(syncRtc);
+            }
             uint32_t delaySec = retryDelaySec(rtcRetryStage);
             if (rtcRetryStage < 7) rtcRetryStage++;
             DevLog.printf("[wifi] no link at boot (battery): deep sleep %us stage=%u\n",
@@ -4955,11 +5197,8 @@ static void startNormalMode(bool skipConnect = false) {
                   deviceStateText(), ipText().c_str(), hostname.c_str(), storeCount());
 }
 
-// ---------------- v0.14 deep mode (docs/power-state.md §13) ----------------
-// deep: minute RTC wake -> clock-window direct write only; every
-// `rtcNextContactS` one network window fast-connects and pulls GET /usage.
-// light: current always-connected behavior. The bridge decides the mode in
-// the pull response; the device falls back to a local idle timer.
+// Deep sleep uses minute clock wakes and a bounded BLE rendezvous on contact
+// windows. A formal PowerPlan controls the light deadline.
 
 static void persistMode() {
     Preferences p;
@@ -5012,81 +5251,6 @@ static bool idleDeepDue() {
     return (long)(time(nullptr) - since) >= (long)idleDeepS;
 }
 
-static void saveApInfo() {
-    if (WiFi.status() != WL_CONNECTED) return;
-    rtcApChannel = (uint8_t)WiFi.channel();
-    strncpy(rtcApBssid, WiFi.BSSIDstr().c_str(), sizeof(rtcApBssid) - 1);
-    rtcApBssid[sizeof(rtcApBssid) - 1] = '\0';
-    prefs.begin("wifi", true);
-    rtcApSlot = prefs.getUChar("last", 0xFF);
-    prefs.end();
-}
-
-static bool parseBssid(const char *s, uint8_t out[6]) {
-    unsigned v[6];
-    if (sscanf(s, "%x:%x:%x:%x:%x:%x", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) {
-        return false;
-    }
-    for (int i = 0; i < 6; i++) out[i] = (uint8_t)v[i];
-    return true;
-}
-
-// Fast connect with the cached BSSID/channel/slot (no scan, ~1.3-1.5 s); falls
-// back to a plain association when the AP moved.
-static bool deepFastConnect() {
-    uint8_t slot = rtcApSlot;
-    prefs.begin("wifi", true);
-    if (slot >= MAX_SLOTS) slot = prefs.getUChar("last", 0);
-    wifiSsid = prefs.getString(("s" + String(slot)).c_str(), "");
-    wifiPass = prefs.getString(("p" + String(slot)).c_str(), "");
-    prefs.end();
-    if (!wifiSsid.length()) return false;
-    WiFi.mode(WIFI_STA);
-    WiFi.setHostname(hostname.c_str());
-    uint8_t bssid[6];
-    bool fast = rtcApChannel > 0 && rtcApBssid[0] && parseBssid(rtcApBssid, bssid);
-    uint32_t t0 = millis();
-    if (fast) WiFi.begin(wifiSsid.c_str(), wifiPass.c_str(), rtcApChannel, bssid);
-    else      WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 6000) delay(50);
-    if (WiFi.status() != WL_CONNECTED && fast) {
-        DevLog.println("[deep] fast connect failed; plain retry");
-        WiFi.disconnect(false);
-        delay(50);
-        WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
-        t0 = millis();
-        while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) delay(50);
-    }
-    bool up = WiFi.status() == WL_CONNECTED;
-    traceSetTransport(2);
-    if (up) traceSetStage(TRACE_STAGE_WIFI_IP);
-    DevLog.printf("[deep] wifi %s fast=%d %ums ip=%s\n", up ? "up" : "fail",
-                  fast ? 1 : 0, (unsigned)(millis() - t0),
-                  up ? WiFi.localIP().toString().c_str() : "-");
-    if (up) saveApInfo();
-    return up;
-}
-
-// Preferred endpoint for a pull: the active bridge when known, else the MRU.
-static bool pickEndpoint(EndpointRec &rec) {
-    int n = storeCount();
-    if (n <= 0) return false;
-    if (rtcActiveMac[0]) {
-        for (int i = 0; i < n; i++) {
-            EndpointRec r;
-            if (storeGet(i, r) && r.mac == String(rtcActiveMac)) { rec = r; return true; }
-        }
-    }
-    int best = -1;
-    uint32_t bestMru = 0;
-    for (int i = 0; i < n; i++) {
-        EndpointRec r;
-        if (!storeGet(i, r)) continue;
-        if (best < 0 || r.mru >= bestMru) { best = i; bestMru = r.mru; }
-    }
-    return best >= 0 && storeGet(best, rec);
-}
-
 static void rememberActiveTemplate() {
     String id = tplStoreActive();
     TplMeta meta;
@@ -5097,13 +5261,6 @@ static void rememberActiveTemplate() {
     rtcTplHash[sizeof(rtcTplHash) - 1] = '\0';
 }
 
-static bool activeTemplateChanged() {
-    String id = tplStoreActive();
-    TplMeta meta;
-    if (!id.length() || !tplStoreFind(id, meta)) return true;
-    return id != String(rtcTplActiveId) || meta.hash != String(rtcTplHash);
-}
-
 // When the next timer wake is due (no net contact planned -> immediate retry).
 static bool deepNetDue() {
     if (!rtcNextNetAt) return true;
@@ -5111,171 +5268,13 @@ static bool deepNetDue() {
     return (time_t)time(nullptr) >= (time_t)rtcNextNetAt;
 }
 
-// One deep network window: fast connect -> GET /usage -> execute the bridge
-// response. Returns 0 stay deep, 1 switch to light, 2 stay awake for `pending`.
-static int deepNetworkCycle() {
-    const time_t before = timeKnown() ? time(nullptr) : 0;
-    setStage(10);
-    traceSetTransport(2);
-    traceSetStage(TRACE_STAGE_WIRELESS);
-    if (!deepFastConnect()) {
-        traceSetError(TRACE_ERR_WIFI);
-        setStage(13);
-        rtcNetFails++;
-        histAdd(HIST_NET_FAIL, 0);
-        if (rtcRetryStage < 7) rtcRetryStage++;
-        uint32_t delaySec = retryDelaySec(rtcRetryStage);
-        rtcNextNetAt = timeKnown() ? (uint32_t)time(nullptr) + delaySec : 0;
-        rtcLastPullCode = 0;
-        DevLog.printf("[deep] pull skipped: no wifi; retry %us stage=%u\n",
-                      (unsigned)delaySec, (unsigned)rtcRetryStage);
-        return 0;
-    }
-    EndpointRec rec;
-    if (!pickEndpoint(rec)) {
-        traceSetError(TRACE_ERR_ENDPOINT);
-        setStage(13);
-        rtcNetFails++;
-        histAdd(HIST_NET_FAIL, 0);
-        rtcNextNetAt = timeKnown() ? (uint32_t)time(nullptr) + 900 : 0;
-        DevLog.println("[deep] pull skipped: no bridge endpoint");
-        return 0;
-    }
-    String path = "/usage?next_contact_s=" + String((unsigned)rtcNextContactS) +
-                  "&mode=deep&usage_rev=" + String((unsigned)rtcUsageRev);
-    String body, err;
-    const uint32_t t0 = millis();
-    bool ok = usageHttpGet(rec, body, err, 4000, path);
-    traceMarkHttp(ok, ok ? 200 : 0);
-    DevLog.printf("[deep] pull %s:%u %lums %s len=%u\n",
-                  rec.host.c_str(), rec.port, (unsigned)(millis() - t0),
-                  ok ? "ok" : err.c_str(), (unsigned)body.length());
-    rtcLastPullCode = ok ? 200 : 255;
-    if (!ok) {
-        setStage(13);
-        rtcNetFails++;
-        histAdd(HIST_NET_FAIL, 0);
-        if (rtcRetryStage < 7) rtcRetryStage++;
-        uint32_t delaySec = retryDelaySec(rtcRetryStage);
-        rtcNextNetAt = timeKnown() ? (uint32_t)time(nullptr) + delaySec : 0;
-        return 0;
-    }
-    JsonDocument doc;
-    if (deserializeJson(doc, body) || doc.as<JsonObject>().isNull()) {
-        traceSetError(TRACE_ERR_JSON);
-        traceSetResult(TRACE_RESULT_HTTP_FAILED, TRACE_ERR_JSON);
-        setStage(13);
-        rtcNetFails++;
-        histAdd(HIST_NET_FAIL, 0);
-        rtcNextNetAt = timeKnown() ? (uint32_t)time(nullptr) + 300 : 0;
-        DevLog.println("[deep] pull rejected: invalid JSON");
-        return 0;
-    }
-    rtcNetCycles++;
-    setStage(12);
-    histAdd(HIST_NET_OK, 200);
-    bool tzChanged = adoptServerTimeForce(doc);   // bridge clock is authoritative on contact
-    markSynced();
-    nvsStageMark(41);
-    bool firstPull = lastUsage.length() == 0;
-    lastUsage = body;
-    lastChannel = "PULL";
-
-    const char *mode = doc["mode"] | "deep";
-    // Decide the mode before rendering: leaving deep must be drawn as a light
-    // frame in the *same* full refresh that erases the Zzz glyph. Rendering
-    // the deep frame first and then a partial over it leaves a Zzz ghost that
-    // looks like the device is still asleep (design §3: the wake frame is a
-    // full baseline).
-    const bool toLight = !strcmp(mode, "light");
-    const bool leavingDeep = toLight && (rtcDeepGlyph & 1);
-    if (toLight) {
-        rtcMode = MODE_LIGHT;
-        persistMode();
-    }
-    long ncs = doc["next_contact_s"] | 0L;
-    if (ncs >= DEEP_CONTACT_MIN_S && ncs <= DEEP_CONTACT_MAX_S) {
-        rtcNextContactS = (uint16_t)ncs;
-    }
-    bool hasRev = !doc["usage_rev"].isNull();
-    uint32_t rev = (uint32_t)(doc["usage_rev"] | 0L);
-    bool usageChanged = true;
-    if (hasRev && rtcUsageRev) usageChanged = rev != rtcUsageRev;
-    if (hasRev) rtcUsageRev = rev;
-    JsonObject pending = doc["pending"].as<JsonObject>();
-    bool pendingOta = pending["ota"] | false;
-    int pendingTpl = (int)pending["templates"].as<JsonArray>().size();
-    nvsStageMark(42);
-
-    if (!frame || usageChanged || firstPull || activeTemplateChanged() ||
-        !clkPixelsValid || tzChanged || rtcClkPartials >= CLK_GHOST_LIMIT ||
-        leavingDeep) {
-        nvsStageMark(43);
-        // setup() already ran epdBegin() on this boot (frame allocated); only
-        // retry on OOM. A second full init used to re-enter
-        // DEV_Module_Init/SPI.beginTransaction and deadlock on the Arduino SPI
-        // paramLock (taken once, never released) -- the 0.14.x battery hang.
-        if (!frame) epdBegin(false);
-        nvsStageMark(44);
-        // The clock budget path and the deep exit request a clean full
-        // waveform even when the pixels are unchanged (design §8.4).
-        if (rtcClkPartials >= CLK_GHOST_LIMIT || !epdBaselineTrusted || leavingDeep) {
-            forceCleanRefresh = true;
-        }
-        renderActiveUsage(body, "PULL");
-        // The Zzz-removing clean baseline is done: startNormalMode must not
-        // request a second full refresh for the same wake frame (task-10).
-        if (leavingDeep) wakeBaselineDrawn = true;
-        nvsStageMark(45);
-        clkCaptureFromFramebuffer();
-        rememberActiveTemplate();
-        rtcClkPartials = 0;
-        // Only persist when the screen content really changed: a rolling
-        // `resetsAt` on a 0%-used window must not wear the NVS.
-        usageCacheSave(body);
-        nvsStageMark(46);
-        captureFrameToFs("pull");
-    }
-    rtcNextNetAt = timeKnown() ? (uint32_t)time(nullptr) + rtcNextContactS : 0;
-    nvsStageMark(47);
-    DevLog.printf("[deep] mode=%s next=%us rev=%u changed=%d pending=%d/%d batt=%u%% t=%lld\n",
-                  mode, (unsigned)rtcNextContactS, (unsigned)rev, usageChanged ? 1 : 0,
-                  pendingOta ? 1 : 0, pendingTpl, (unsigned)batteryPercent(),
-                  (long long)(before ? (long long)(time(nullptr) - before) : 0));
-
-    if (toLight) {
-        setStage(14);
-        histAdd(HIST_TO_LIGHT, 0);
-        return 1;
-    }
-    if (pendingOta || pendingTpl > 0) {
-        setStage(15);
-        return 2;
-    }
-    return 0;
-}
-
-// Light -> deep transition: capture the clock window, notify the bridge, mark
-// the mode and sleep. Never returns (called from loop()/setup()).
+// Light -> deep transition: capture the clock window, mark the mode and sleep.
 static void enterDeep(const char *reason) {
     // Every deep-sleep path must honor the PC USB keep-awake policy.
     if (plugged && !rtcDeepOnUsb) return;
     setStage(19);
     if (clkR.valid && lastDisplayedFrame) clkCaptureFromFramebuffer();
-    if (v2BundleReady && rv2Enabled) rtcNextContactS = V2_RENDEZVOUS_S;
-    else if (!rtcNextContactS) rtcNextContactS = DEEP_CONTACT_DEFAULT_S;
-    if (WiFi.status() == WL_CONNECTED && storeCount() > 0) {
-        EndpointRec rec;
-        if (pickEndpoint(rec)) {
-            String body = String("{\"next_contact_s\":") + rtcNextContactS +
-                          ",\"usage_rev\":" + rtcUsageRev + "}";
-            int code = 0;
-            String out, err;
-            usageHttpPost(rec, "/deep", body, code, out, err, 2000);
-            DevLog.printf("[deep] notify %s:%u /deep -> %d\n",
-                          rec.host.c_str(), rec.port, code);
-        }
-    }
+    rtcNextContactS = V2_RENDEZVOUS_S;
     setStage(21);
     rtcMode = MODE_DEEP;
     rememberActiveTemplate();
@@ -5334,189 +5333,7 @@ static bool deepThinWake() {
     return drew;
 }
 
-// ---------------- deep-pull test rig (CODEX_DEEPPULL_TEST only) ----------------
-// Measures: timer deep-sleep wake -> saved-BSSID fast connect -> GET /usage from
-// the bridge -> light sleep. 5 cycles of RTC-measured timings are kept in RTC RAM
-// (deep sleep wipes the DevLog ring), then the device stays online in light sleep
-// so the original ROM can be OTA'd back. Zero impact on release builds.
-#ifdef CODEX_DEEPPULL_TEST
-#define DP_TEST_CYCLES     5
-#define DP_TEST_DEEP_S     30
-#define DP_TEST_CONNECT_MS 6000
-
-RTC_DATA_ATTR static uint32_t dpDone = 0;
-RTC_DATA_ATTR static uint8_t  dpChannel = 0;
-RTC_DATA_ATTR static char     dpBssid[20] = {0};
-RTC_DATA_ATTR static uint8_t  dpSlot = 0xFF;
-// Per cycle: boot_ms, wifi_ms, http_ms, parse_ms, total_ms, code.
-RTC_DATA_ATTR static uint32_t dpLog[DP_TEST_CYCLES][6] = {};
-// Last cycle's full PM stats text (DevLog.printf truncates at 200 bytes, so it
-// is kept in RTC and dumped in chunks while the device is online).
-RTC_DATA_ATTR static char dpPm[768] = {0};
-static uint64_t dpBootUs = 0;
-
-static bool dpParseBssid(const char *s, uint8_t out[6]) {
-    unsigned v[6];
-    if (sscanf(s, "%x:%x:%x:%x:%x:%x", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) {
-        return false;
-    }
-    for (int i = 0; i < 6; i++) out[i] = (uint8_t)v[i];
-    return true;
-}
-
-static void dpSaveAp() {
-    if (WiFi.status() != WL_CONNECTED) return;
-    dpChannel = (uint8_t)WiFi.channel();
-    strncpy(dpBssid, WiFi.BSSIDstr().c_str(), sizeof(dpBssid) - 1);
-    dpBssid[sizeof(dpBssid) - 1] = '\0';
-    prefs.begin("wifi", true);
-    dpSlot = prefs.getUChar("last", 0xFF);
-    prefs.end();
-    DevLog.printf("[dp] saved ap ch=%u bssid=%s slot=%u\n",
-                  (unsigned)dpChannel, dpBssid, (unsigned)dpSlot);
-}
-
-static bool dpFastConnect(uint32_t &wallMs, bool &fast) {
-    uint8_t slot = dpSlot;
-    prefs.begin("wifi", true);
-    if (slot >= MAX_SLOTS) slot = prefs.getUChar("last", 0);
-    wifiSsid = prefs.getString(("s" + String(slot)).c_str(), "");
-    wifiPass = prefs.getString(("p" + String(slot)).c_str(), "");
-    prefs.end();
-    if (!wifiSsid.length()) return false;
-    WiFi.mode(WIFI_STA);
-    WiFi.setHostname(hostname.c_str());
-    uint8_t bssid[6];
-    fast = dpChannel > 0 && dpParseBssid(dpBssid, bssid);
-    const uint32_t t0 = (uint32_t)(esp_timer_get_time() / 1000);
-    if (fast) WiFi.begin(wifiSsid.c_str(), wifiPass.c_str(), dpChannel, bssid);
-    else      WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
-    while (WiFi.status() != WL_CONNECTED &&
-           (uint32_t)(esp_timer_get_time() / 1000) - t0 < DP_TEST_CONNECT_MS) {
-        delay(50);
-    }
-    wallMs = (uint32_t)(esp_timer_get_time() / 1000) - t0;
-    return WiFi.status() == WL_CONNECTED;
-}
-
-static void dpCycle() {
-    configurePowerManagement();
-    setupOtaPmLock();
-    const uint64_t startUs = esp_timer_get_time();
-    uint32_t wifiMs = 0, httpMs = 0, parseMs = 0;
-    bool fast = false;
-    const bool up = dpFastConnect(wifiMs, fast);
-    int code = -1;
-    if (up) {
-        EndpointRec rec;
-        bool have = false;
-        for (int i = 0; i < storeCount(); i++) {
-            if (storeGet(i, rec) && rec.host.length() && rec.port) { have = true; break; }
-        }
-        if (have) {
-            HTTPClient http;
-            http.setConnectTimeout(2000);
-            http.setTimeout(4000);
-            http.begin("http://" + rec.host + ":" + String(rec.port) + "/usage");
-            http.addHeader("Authorization", "Bearer " + rec.token);
-            const uint32_t h0 = (uint32_t)(esp_timer_get_time() / 1000);
-            code = http.GET();
-            String body;
-            if (code == 200) body = http.getString();
-            httpMs = (uint32_t)(esp_timer_get_time() / 1000) - h0;
-            if (body.length()) {
-                const uint32_t fnv = fnv1a(body);
-                JsonDocument doc;
-                const uint32_t p0 = (uint32_t)(esp_timer_get_time() / 1000);
-                deserializeJson(doc, body);
-                parseMs = (uint32_t)(esp_timer_get_time() / 1000) - p0;
-                DevLog.printf("[dp] pull host=%s:%u code=%d len=%u fnv=%08x\n",
-                              rec.host.c_str(), (unsigned)rec.port, code,
-                              (unsigned)body.length(), (unsigned)fnv);
-            } else {
-                DevLog.printf("[dp] pull host=%s:%u code=%d len=0\n",
-                              rec.host.c_str(), (unsigned)rec.port, code);
-            }
-            http.end();
-        } else {
-            DevLog.println("[dp] no bridge endpoint stored");
-        }
-    }
-    const uint32_t totalMs = (uint32_t)((esp_timer_get_time() - startUs) / 1000);
-    const uint32_t cycle = dpDone;
-    if (cycle < DP_TEST_CYCLES) {
-        dpLog[cycle][0] = (uint32_t)(dpBootUs / 1000);
-        dpLog[cycle][1] = wifiMs;
-        dpLog[cycle][2] = httpMs;
-        dpLog[cycle][3] = parseMs;
-        dpLog[cycle][4] = totalMs;
-        dpLog[cycle][5] = (uint32_t)code;
-    }
-    dpDone = cycle + 1;
-    DevLog.printf("[dp] cyc=%u/%u up=%d fast=%d boot_ms=%u wifi_ms=%u http_ms=%u parse_ms=%u total_ms=%u code=%d batt=%u%%\n",
-                  (unsigned)(cycle + 1), (unsigned)DP_TEST_CYCLES, up ? 1 : 0, fast ? 1 : 0,
-                  (unsigned)(dpBootUs / 1000), (unsigned)wifiMs, (unsigned)httpMs,
-                  (unsigned)parseMs, (unsigned)totalMs, code, (unsigned)batteryPercent());
-    const String pm = pmStatsText();
-    strncpy(dpPm, pm.c_str(), sizeof(dpPm) - 1);
-    dpPm[sizeof(dpPm) - 1] = '\0';
-    DevLog.printf("[dp] pm text captured (%u bytes)\n", (unsigned)strlen(dpPm));
-}
-
-static void dpDump() {
-    for (uint32_t i = 0; i < DP_TEST_CYCLES && i < dpDone; i++) {
-        DevLog.printf("[dp] rec %u: boot_ms=%u wifi_ms=%u http_ms=%u parse_ms=%u total_ms=%u code=%u\n",
-                      (unsigned)i, (unsigned)dpLog[i][0], (unsigned)dpLog[i][1],
-                      (unsigned)dpLog[i][2], (unsigned)dpLog[i][3],
-                      (unsigned)dpLog[i][4], (unsigned)dpLog[i][5]);
-    }
-    const size_t n = strlen(dpPm);
-    if (n) {
-        DevLog.print("[dp] pm dump begin\n");
-        for (size_t off = 0; off < n; off += 180) {
-            const size_t len = (n - off > 180) ? 180 : (n - off);
-            char chunk[181];
-            memcpy(chunk, dpPm + off, len);
-            chunk[len] = '\0';
-            DevLog.print(chunk);
-        }
-        DevLog.print("\n[dp] pm dump end\n");
-    }
-}
-
-// Returns true when this boot was fully handled (armed/cycled/deep-slept).
-static bool dpTestMain(esp_sleep_wakeup_cause_t cause) {
-    if (plugged) { DevLog.println("[dp] USB plugged: skip test, normal mode"); return false; }
-    if (!hasWifiSlots()) return false;
-    if (dpDone >= DP_TEST_CYCLES) return false;
-    if (cause == ESP_SLEEP_WAKEUP_EXT1) return false;   // button wake: normal
-    if (cause == ESP_SLEEP_WAKEUP_TIMER) {
-        dpCycle();
-        if (dpDone >= DP_TEST_CYCLES) {
-            DevLog.println("[dp] done; normal light-sleep mode (rollback OTA window)");
-            dpDump();
-            return false;   // setup() falls through to startNormalMode()
-        }
-        deepSleepFor(DP_TEST_DEEP_S);
-        return true;        // unreachable
-    }
-    // Fresh boot after OTA: connect once to learn the AP channel/BSSID, then cycle.
-    startNormalMode();
-    if (wifiUp) {
-        dpSaveAp();
-        DevLog.printf("[dp] armed: %u cycles x %us deep sleep\n",
-                      (unsigned)DP_TEST_CYCLES, (unsigned)DP_TEST_DEEP_S);
-        deepSleepFor(DP_TEST_DEEP_S);
-        return true;        // unreachable
-    }
-    return false;
-}
-#endif
-
 void setup() {
-#ifdef CODEX_DEEPPULL_TEST
-    dpBootUs = esp_timer_get_time();
-#endif
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
     bootWakeCause = cause;
     traceBegin(cause);
@@ -5530,7 +5347,6 @@ void setup() {
         Preferences p;
         p.begin("pm", true);
         nvsStageAtBoot = p.getUChar("stg", 0xFF);
-        rv2Enabled = p.getUChar("rv2", 1) ? 1 : 0;
 #if defined(CODEX_TARGET_NOTE4)
         note4KeepPanelPower = p.getUChar("panel_pwr", 1) != 0;
 #endif
@@ -5617,7 +5433,7 @@ void setup() {
     }
     lastPersistedSync = rtcLastSyncEpoch;
     // v2: the BOOT provisional window starts at the physical wake instant; a
-    // timer wake never gets this fallback (docs/generic-display-platform-design-v2 §7).
+    // timer wake never gets this fallback (docs/generic-display-platform-design §7).
     v2BootMs = v2NowMs();
     v2Provisional = (cause == ESP_SLEEP_WAKEUP_EXT1);
     if (cause == ESP_SLEEP_WAKEUP_EXT1) {
@@ -5672,9 +5488,19 @@ void setup() {
     // path; without one the legacy store continues to serve templates.
     v2CtxGen.seed(esp_random());
     v2BundleReady = bsBegin();
+    if (!syncStoreBegin()) DevLog.println("[sync] frozen store unavailable");
+    syncOtaLoad();
+    {
+        Preferences p;
+        if (p.begin("sync-v1", true)) {
+            syncEnabled = p.getBool("enabled", false);
+            syncOwner = p.getString("owner", "");
+            p.end();
+        }
+    }
     if (v2BundleReady) {
         bsProfile(v2Profile);
-        DevLog.printf("[v2] bundle job=%s active=%s templates=%u ctx=%s commit=%u\n",
+        DevLog.printf("[platform] bundle job=%s active=%s templates=%u ctx=%s commit=%u\n",
                       v2Profile.jobId, v2Profile.ids[v2Profile.initial],
                       (unsigned)v2Profile.count, v2Profile.contextId,
                       (unsigned)bsCommitSeq());
@@ -5689,16 +5515,15 @@ void setup() {
                 // context so an in-flight old snapshot cannot be mistaken for new.
                 if (!v2SwitchActive(v2Profile.initial)) {
                     v2CtValid = false;
-                    DevLog.println("[v2] cannot rotate unknown-retention context; data disabled");
+                    DevLog.println("[platform] cannot rotate unknown-retention context; data disabled");
                 }
             }
         }
-        v2Provisional = v2Provisional || (cause == ESP_SLEEP_WAKEUP_EXT1);
-        if (!deepClockOnlyBoot) {
-            v2SafetyDeadlineMs = v2NowMs() + (uint64_t)V2_MAX_LIGHT_S * 1000ULL;
-        }
     } else {
-        DevLog.println("[v2] no committed bundle; legacy template store active");
+        DevLog.println("[platform] no committed bundle; awaiting initial publish");
+    }
+    if (!deepClockOnlyBoot) {
+        v2SafetyDeadlineMs = v2NowMs() + (uint64_t)V2_MAX_LIGHT_S * 1000ULL;
     }
     String cached;
     if (usageCacheLoad(cached)) lastUsage = cached;
@@ -5716,12 +5541,9 @@ void setup() {
         sleepToNextEvent();   // no network, owner claim, or data-sequence change
     }
 
-#ifdef CODEX_DEEPPULL_TEST
-    if (dpTestMain(cause)) return;
-#endif
     if (hasWifiSlots()) {
-        if (deepWakePath && v2BundleReady) {
-            if (rv2Enabled && !v2Rendezvous()) {
+        if (deepWakePath) {
+            if (!v2Rendezvous()) {
                 // Plan C: v2Rendezvous already rendered once after the radio
                 // was closed (clock window or deferred data frame); the sleep
                 // plan path only has to schedule the next rendezvous.
@@ -5729,24 +5551,7 @@ void setup() {
                 rtcNextNetAt = timeKnown() ? (uint32_t)time(nullptr) + rtcNextContactS : 0;
                 sleepToNextEvent();
             }
-            if (!rv2Enabled) {
-                // Explicit diagnostic rollback: bounded HTTP opportunity, never
-                // legacy envelope application into a v2 context.
-                v2SafetyDeadlineMs = v2NowMs() + 15000;
-                rtcMode = MODE_LIGHT;
-            }
             startNormalMode();
-        } else if (deepWakePath) {
-            // Network window: pull the envelope, then either go back to sleep
-            // or switch to light / stay awake for a pending push.
-            int r = deepNetworkCycle();
-            if (r == 0) {
-                nvsStageMark(51);
-                sleepToNextEvent();   // never returns
-            }
-            if (r == 2) pendingWindowUntilMs = millis() + DEEP_PENDING_WINDOW_MS;
-            startNormalMode(true);
-            if (activeTplHasMode) renderCurrent();   // hide the sleep glyph
         } else {
             rtcStage = 99;
             startNormalMode();
@@ -5792,7 +5597,7 @@ static void handleSerialCli() {
                 prefs.putString(("p" + String(slot)).c_str(), pass);
                 prefs.putUChar("last", (uint8_t)slot);
                 prefs.end();
-                DevLog.printf("[cli] wifi saved slot %d ssid=%s, rebooting\n", slot, ssid.c_str());
+                DevLog.printf("[cli] wifi saved slot %d, rebooting\n", slot);
                 screen({"Wi-Fi saved via USB:", ssid, "", "Rebooting..."});
                 delay(800);
                 ESP.restart();
@@ -5994,82 +5799,56 @@ void loop() {
         updateInfoExtra();
         renderCurrent();
     }
-    if (pendingEndpoint) {
-        pendingEndpoint = false;
-        if (WiFi.status() == WL_CONNECTED) tryWifiUsage();
-    }
-    if (pendingUsageReady) {
-        pendingUsageReady = false;
-        JsonDocument parsed;
-        if (!deserializeJson(parsed, pendingUsage) && !parsed.as<JsonObject>().isNull()) {
-            String bridgeId = parsed["bridge"]["hostId"] | "";
-            if (!ownerAllows(bridgeId)) {
-                DevLog.printf("[owner] BLE usage ignored (occupied, id=%s)\n", bridgeId.c_str());
-            } else {
-                adoptServerTime(parsed);
-                applyBridgeModeHint(parsed);
-                String mac = blePeerAddress();
-                applyEnvelopeMeta(parsed, mac);
-                bool explicitActivate = parsed["activate"] | false;
-                bool accepted = usageAccepted(mac, explicitActivate);
-                markSynced();
-                usageCacheSave(pendingUsage);
-                if (accepted) {
-                    setActiveMac(mac);
-                    rtcActiveAt = timeKnown() ? (uint32_t)time(nullptr) : 0;
-                    lastUsage = pendingUsage;
-                    lastChannel = pendingChannel;
-                    noteActivity("ble-usage");
-                    renderActiveUsage(lastUsage, lastChannel.c_str());
-                } else {
-                    DevLog.printf("[usage] BLE usage ignored (active=%s)\n", rtcActiveMac);
-                }
-            }
-        } else {
-            DevLog.println("[usage] BLE usage rejected: invalid JSON");
-        }
-    }
-
     pollWifi();
     pollPlug();
     serviceBleSession();
     checkBattery();
+    if (syncOpenThisWake) {
+        if (syncExitAtMs && (int32_t)(millis() - syncExitAtMs) >= 0) {
+            syncOpenThisWake = false;
+            syncExitAtMs = 0;
+            if (!v2Plan.lightActive(v2NowMs())) enterDeep("sync complete");
+        } else if (syncLastProgressMs && (uint32_t)(millis() - syncLastProgressMs) >= 90000) {
+            syncRecordOutcome(1, 3);
+            syncFail(syncRtc);
+            syncOpenThisWake = false;
+            DevLog.println("[sync] no durable progress for 90s");
+            if (!v2Plan.lightActive(v2NowMs())) enterDeep("sync incomplete");
+        }
+    }
     serviceAnnounce();
     serviceLed();
 
     // v2: only a new formal PowerPlan moves the light deadline; reads, data,
     // claims and status polls never do. The BOOT provisional 300 s closes the
     // radio when the Bridge stays unreachable (v2 §7/§12).
-    if (v2BundleReady && rtcMode == MODE_LIGHT && (!plugged || rtcDeepOnUsb)) {
+    if (rtcMode == MODE_LIGHT && !syncOpenThisWake && (!plugged || rtcDeepOnUsb)) {
         switch (v2PowerSleepDecision(true, true, plugged, rtcDeepOnUsb,
                                      v2ManualBleHoldActive(), v2Plan, v2Provisional,
                                      v2BootMs, v2SafetyDeadlineMs, v2NowMs())) {
         case V2_POWER_PLAN_ENDED:
-            DevLog.printf("[v2] formal light window ended (%s)\n", v2PlanReason.c_str());
-            enterDeep("v2 plan");
+            DevLog.printf("[platform] formal light window ended (%s)\n", v2PlanReason.c_str());
+            if (syncEnabled && syncStoreAvailable()) {
+                syncAddReason(syncRtc, 1u << 2);
+                syncOpenThisWake = true;
+                syncLastProgressMs = millis();
+                sendAnnounce(bleOn);
+            } else enterDeep("plan");
             break;
         case V2_POWER_BOOT_ENDED:
-            DevLog.println("[v2] boot provisional 300s expired without a formal plan");
-            enterDeep("v2 provisional");
+            DevLog.println("[platform] boot provisional 300s expired without a formal plan");
+            if (syncEnabled && syncStoreAvailable()) {
+                syncAddReason(syncRtc, 1u << 2);
+                syncOpenThisWake = true;
+                syncLastProgressMs = millis();
+                sendAnnounce(bleOn);
+            } else enterDeep("provisional");
             break;
         case V2_POWER_SAFETY_ENDED:
-            DevLog.println("[v2] no formal plan within the max light lease; sleeping");
-            enterDeep("v2 safety");
+            DevLog.println("[platform] no formal plan within the max light lease; sleeping");
+            enterDeep("safety");
             break;
         default: break;
-        }
-    }
-
-    // v0.14 mode transitions: a pending-window expiry or the local idle timer
-    // (plus a bridge `mode:"deep"` hint) sends the device back to deep sleep.
-    // With a v2 bundle the Bridge-owned plan is authoritative.
-    if (!v2BundleReady) {
-        if (pendingWindowUntilMs && (int32_t)(millis() - pendingWindowUntilMs) >= 0) {
-            pendingWindowUntilMs = 0;
-            enterDeep("pending window");
-        }
-        if (idleDeepDue()) {
-            enterDeep(forceDeepAtMs ? "bridge deep" : "idle");
         }
     }
 

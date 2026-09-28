@@ -162,7 +162,8 @@
 - 前置：C3 的记录格式（否则没有可信的对照口径）。
 
 ### C8. 设备同步与诊断协议（device-sync-diagnostics）
-- `sync-v1` 实施合同已在 `project-workflow/device-sync-diagnostics/design.md` 定稿：沿用现有 Bridge→设备 HTTP；新增端点/鉴权/幂等、完整批次异常、15 轮持久计数、统一日志、OTA 运行镜像身份均已有规范，但当前均未实现。两目标 RTC 空间、Flash 预留/断电恢复和真实分区哈希算法须在实施时过证据门槛，不能静默降级。
+- `sync-v1` 实施合同见 `project-workflow/device-sync-diagnostics/design.md`。生产固件/Bridge 已有部分源码与 Note4 中间构建，状态和未验边界见 `PROGRESS.md` 最新节；Fake ROM S01–S14完整矩阵、设备页及实机尚未完成（无Bundle设备的BLE会合→正式Plan→首个Bundle安装已过Fake ROM，仍需实机），不能把源码或中间 ROM 当发布。1.54 最终构建按用户指示暂缓；Flash 断电恢复与真实分区哈希字节域仍须过证据门槛，不能静默降级。
+- 当前设备协议作为唯一业务协议的一次性统一见 `project-workflow/device-sync-diagnostics/protocol-unification.md`：包括 `/v2/*`、`protocol=2`、BLE `rv=2`/`ack="v2"`、INFO能力、MCP `_v2`、当前文档/UI与固件/Bridge/Fake ROM 调用方；先在软件侧同轮改齐，再继续完整Fake ROM验收和设备Tab。两台现役旧固件需旧Bridge逐台OTA后才切换生产Bridge；1.54最终ROM暂缓期间不做生产Bridge切换，不保留长期双协议兼容。Bridge本地 `state.json` 另作无损格式核查，不凭 wire 更名删除运行数据。
 - 实现每 15 次深睡 BLE 会合的一次性 Wi-Fi 同步，以及正式 light 入口和退出时的 Wi-Fi 同步；成功同步才重置计数。普通 BLE 保持精简，诊断日志按冻结批次经 Wi-Fi 增量同步，未确认内容保留。
 - 合并普通 `/log` 与跨深睡 `/history` 为统一、跨深睡、可分页/确认/报告 gap 的诊断流；OTA/Bundle 执行后以 Wi-Fi 报告分级结果并有限重试。设备页移除 Codex 余量、改善设备详情的采集时间和缺失解释；屏幕内容、模板、字体归模板页仅作归属声明，数据页排版暂不处理。
 - 以 Fake ROM 验证绝大多数协议和故障场景（S01–S14）；实机只验证 RF/GATT、ESP32 Wi-Fi 入网与 HTTP、light/deep 切换、RTC/Flash/bootloader 等模拟器不能证明的部分（H01–H03）。详见 `project-workflow/device-sync-diagnostics/plan.md`。
@@ -184,6 +185,7 @@
 - **脚本坑**：`tools/pio-target.ps1` 在**后台作业**里会假失败——它 `& pio run` 时 cwd 丢失成 `D:\Documents\project`；给 pio 加 `-d <repo>`（或在前台 shell 跑脚本）即可。
 - `next.md §6` 的 `extends` 重构未做。「只构建 Note4」现仍成立，但已明确是**成本**约束。
 - **当前决定：不主动推进**；需要 1.54 固件时（见 A2/B4）用上面已验证的路径。
+- **2026-09-28 回头查**：sync-v1 期间切到 1.54 时虽未见 framework `*** Reinstall ***`，仍出现比预期广的库重编；用户要求暂缓，以 Note4 为准。后续核对实际失效源（源码清单、checksum、时间戳或目标快照）与 `tools/pio-target.ps1` 的零编译/增量复建证据，再构建 1.54 最终 ROM；不把较早源码的成功镜像当成当前版本。
 
 ### C7. 其他单项遗留（已归档专项带出来的、仍然有效的条目）
 

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use bridge_core::codex::locate_codex;
 use bridge_core::envelope::{build_envelope, EnvelopeOptions};
-use bridge_core::http::{serve, AppState};
+use bridge_core::http::serve;
 use bridge_core::runtime::{run_poller, PollerConfig};
 use bridge_core::template::Library;
 use bridge_core::short_id;
@@ -19,8 +19,6 @@ struct Args {
     bind: String,
     #[arg(long, default_value = "8765")]
     port: u16,
-    #[arg(long, default_value = "test-token-123")]
-    token: String,
     #[arg(long, default_value = "tools/test-bridge/templates")]
     templates: PathBuf,
     #[arg(long)]
@@ -93,14 +91,8 @@ async fn main() -> Result<()> {
 
     let addr: SocketAddr = format!("{}:{}", args.bind, args.port).parse()?;
     let activity = Arc::new(bridge_core::activity::Activity::new());
-    let state = AppState {
-        token: Arc::new(args.token.clone()),
-        envelope: envelope.clone(),
-        library: library.clone(),
-        activity: activity.clone(),
-    };
     tokio::spawn(async move {
-        if let Err(e) = serve(addr, state).await {
+        if let Err(e) = serve(addr).await {
             tracing::error!("http server: {e}");
         }
     });

@@ -8,7 +8,7 @@
 1. `AGENTS.md` — 操作约定（固件只构建 `zectrix-note4-b`；后台进程必须分离启动；不提交密钥）。**必须遵守。**
 2. `PROGRESS.md` — 最新现场（只有 ~17 KB）。
 3. `docs/roadmap/backlog.md` §0 与 §2 — 待办与当前设备/产物快照。
-4. 需要协议上下文时再读 `docs/generic-display-platform-design-v2.md` 的相关小节；**不要通读**。
+4. 需要协议上下文时再读 `docs/generic-display-platform-design.md` 的相关小节；**不要通读**。
 5. `docs/history/workflow/` 下的旧专项只在被本文件点名时读。
 
 **默认不提交 git**（用户明确要求才提交）。不要改任何代码——本任务是现场恢复，不是开发。

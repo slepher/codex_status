@@ -5,7 +5,7 @@
 //   /bundle/a.bin, /bundle/b.bin   complete self-contained bundles
 //   /bundle/m0.bin, /bundle/m1.bin commit records (double copies, alternating)
 //
-// Guarantees (docs/generic-display-platform-design-v2.md §9):
+// Guarantees (docs/generic-display-platform-design.md §9):
 //  - the current slot always stays usable; a new bundle is written to the other
 //    slot only;
 //  - a slot is only committed after a full read-back + CRC check;

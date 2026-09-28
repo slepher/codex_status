@@ -50,11 +50,15 @@ fn main() {
         .file(firmware.join("v2_claim_command.cpp"))
         .file(firmware.join("v2_command_envelope.cpp"))
         .file(firmware.join("v2_status_snapshot.cpp"))
+        .file(firmware.join("v2_sync.cpp"))
+        .file(firmware.join("v2_sync_store.cpp"))
+        .file(firmware.join("v2_sync_protocol.cpp"))
         .file(firmware.join("bundle_store.cpp"))
         .file(firmware.join("refresh_policy.cpp"))
         .file(firmware.join("font_asset.cpp"))
         .file(firmware.join("font_store.cpp"))
         .file(firmware.join("GUI_Paint.cpp"))
+        .file(manifest.join("src/sim_sync.cpp"))
         .file(&ffi);
     for name in ["font8", "font12", "font16", "font20", "font24"] {
         build.file(firmware.join(format!("{name}.cpp")));
@@ -74,6 +78,9 @@ fn main() {
                     "v2_claim_command.h", "v2_claim_command.cpp",
                     "v2_command_envelope.h", "v2_command_envelope.cpp",
                     "v2_status_snapshot.h", "v2_status_snapshot.cpp",
+                    "v2_sync.h", "v2_sync.cpp",
+                    "v2_sync_store.h", "v2_sync_store.cpp",
+                    "v2_sync_protocol.h", "v2_sync_protocol.cpp",
                     "bundle_store.h", "bundle_store.cpp", "fonts.h",
                     "font_noto.h", "font_noto_nt16.h", "font_noto_nt30.h",
                     "font_noto_ntthin18.h", "font_noto_ntreg64.h",
@@ -84,5 +91,6 @@ fn main() {
         println!("cargo:rerun-if-changed={}", firmware.join(tracked).display());
     }
     println!("cargo:rerun-if-changed={}", ffi.display());
+    println!("cargo:rerun-if-changed={}", manifest.join("src/sim_sync.cpp").display());
     println!("cargo:rerun-if-changed={}", manifest.join("shim").display());
 }

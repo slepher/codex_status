@@ -10,7 +10,7 @@ V2CommandSessionDecision v2CheckCommandSession(
     JsonDocument &doc, const String &currentMac, const String *sessionNonce) {
     V2CommandSessionDecision decision;
     const char *request = doc["request_id"] | "";
-    if ((doc["protocol"] | 0) != 2 ||
+    if (!doc["protocol"].isNull() || !doc["rv"].isNull() ||
         String(doc["device_mac"] | "") != currentMac ||
         !*request || strlen(request) > 64) return decision;
     if (!sessionNonce) {

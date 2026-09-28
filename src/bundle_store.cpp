@@ -283,7 +283,8 @@ bool bsActiveJobPayload(const char *jobId, uint32_t &payloadCrc) {
 const char *bsLastError() { return g_lastError.c_str(); }
 size_t bsFreeBytes() {
     if (!g_mounted) return 0;
-    return LittleFS.totalBytes() - LittleFS.usedBytes();
+    const size_t free = LittleFS.totalBytes() - LittleFS.usedBytes();
+    return free > 40960 ? free - 40960 : 0; // sync-v1 frozen blob and A/B metadata reserve
 }
 
 namespace {
@@ -430,7 +431,7 @@ static bool bsInstallSource(Input &source, uint32_t expectedPayloadCrc,
     DevLog.printf("[bundle] install total=%u free=%u fs_total=%u fs_used=%u\n",
                   (unsigned)total, (unsigned)freeBytes,
                   (unsigned)LittleFS.totalBytes(), (unsigned)LittleFS.usedBytes());
-    if (g_configured && (uint64_t)freeBytes < (uint64_t)total + 4096) {
+    if ((uint64_t)freeBytes < (uint64_t)total + 4096) {
         err = "space";
         return false;
     }

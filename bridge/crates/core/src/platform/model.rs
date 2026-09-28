@@ -712,7 +712,7 @@ pub struct DeviceRecord {
     /// Last observed device state (authoritative snapshot digest from Status).
     #[serde(default)]
     pub observed: ObservedState,
-    /// Last MAC-checked, endpoint-token authenticated /v2/status response.
+    /// Last MAC-checked, endpoint-token authenticated /api/status response.
     #[serde(default)]
     pub last_authenticated: Option<AuthenticatedStatus>,
     #[serde(default)]

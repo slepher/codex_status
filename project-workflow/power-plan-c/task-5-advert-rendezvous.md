@@ -403,7 +403,7 @@ task-3 的小数据 BLE 验收归 device_first，bridge_first 验收 HTTP 快照
 - `bridge/crates/app/src/platform.rs`：ble_cycle/cycle、occupancy_gate、plan_for_rendezvous/note_ack，共用业务入口。
 - `src/ble_bridge.cpp`：NimBLE server、绑定/加密、原 GATT/广播；扫描/StatusBeacon 尚需实现。
 - `src/main.cpp`：serviceV2Ble/v2Rendezvous/applyV2Plan 与 /v2/*；timer 目前开网依赖正式 plan。
-- `docs/generic-display-platform-design-v2.md` §2、§6–8、§10：身份/owner、正式 PowerPlan、ACK、多设备边界。
+- `docs/generic-display-platform-design.md` §2、§6–8、§10：身份/owner、正式 PowerPlan、ACK、多设备边界。
 
 2026-09-27 本次只读补核：`bridge/crates/core/src/v2_client.rs` 当前使用 TcpStream 主动连设备，
 `src/main.cpp` 的 `handleV2Status`、`v2Command`、`handleClaim` 当前绑定入站 server/已有 BLE 回包路径。

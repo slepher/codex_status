@@ -24,7 +24,7 @@ inline bool v2ParseCrc(const char *text, uint32_t &out) {
     return true;
 }
 
-// v2 design defaults (`docs/generic-display-platform-design-v2.md` §7).
+// v2 design defaults (`docs/generic-display-platform-design.md` §7).
 static const uint32_t V2_BOOT_PROVISIONAL_S = 300;
 static const uint32_t V2_MAX_LIGHT_S = 600;
 static const uint32_t V2_MIN_LIGHT_S = 30;

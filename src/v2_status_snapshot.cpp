@@ -6,7 +6,6 @@ String v2BuildStatusSnapshot(const V2StatusSnapshot &snapshot) {
     const V2DataSeq &dataSeq = *snapshot.dataSeq;
     const V2PlanState &plan = *snapshot.plan;
     doc["result"] = "applied";
-    doc["protocol"] = 2;
     doc["device_mac"] = snapshot.mac;
     if (snapshot.firmwareVersion.length()) doc["fw"] = snapshot.firmwareVersion;
     // Firmware-only wake diagnostics, emitted here so the field order matches the

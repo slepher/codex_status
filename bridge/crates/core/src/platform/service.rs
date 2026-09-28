@@ -1101,6 +1101,33 @@ impl PlatformService {
         Ok(())
     }
 
+    pub fn ota_note_running_image(&self, mac: &str, image: &Value) -> Result<bool> {
+        let mac = mac.to_uppercase();
+        let job = match self.ota_job(&mac) {
+            Some(job) if job.state == "awaiting_confirmation" && job.upload_ack => job,
+            _ => return Ok(false),
+        };
+        if image["algorithm"] != "sha256-running-prefix-v1" ||
+            image["image_bytes"] != job.size || image["fw_target"] != job.firmware_target ||
+            image["fw"] != job.expected_version || image["sha256"] != job.sha256 ||
+            image["device_mac"] != mac {
+            return Ok(false);
+        }
+        let bytes = std::fs::read(self.dir.join(&job.blob)).context("frozen OTA image unavailable")?;
+        if bytes.len() != job.size || format!("{:x}", sha2::Sha256::digest(&bytes)) != job.sha256 {
+            bail!("frozen OTA image changed");
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let current = inner.ota_jobs.get_mut(&mac).context("OTA job vanished")?;
+        if current.job_id != job.job_id || current.state != "awaiting_confirmation" { return Ok(false); }
+        current.confirmation = Some("image_verified".into());
+        current.state = "succeeded".into();
+        current.last_error = None;
+        current.updated_at = crate::device_clock::wall_secs(&mac);
+        Self::persist(&inner, &self.state_path())?;
+        Ok(true)
+    }
+
     pub fn cancel_job(&self, mac: &str, now: u64) {
         let mut inner = self.inner.lock().unwrap();
         if let Some(job) = inner.asset_jobs.get_mut(&mac.to_uppercase()) {
@@ -1427,25 +1454,52 @@ impl PlatformService {
         if serde_json::to_vec(status)?.len() > 16 * 1024 {
             bail!("authenticated status exceeds 16 KiB");
         }
-        let body = json!({
-            "device_mac": status["device_mac"], "fw": status["fw"],
-            "configured": status["configured"], "active_context_id": status["active_context_id"],
-            "active_template_id": status["active_template_id"],
-            "committed_job_id": status["committed_job_id"], "display_state": status["display_state"],
-            "template_ids": status["template_ids"], "power": status["power"],
-            "data_seq": status["data_seq"], "applied_seq": status["applied_seq"],
-            "commit_seq": status["commit_seq"],
-        });
         let mut inner = self.inner.lock().unwrap();
         let record = inner.devices.get_mut(&mac).context("unknown device")?;
         let now = crate::device_clock::wall_secs(&mac);
+        let mut body = record.last_authenticated.as_ref().map(|saved| saved.body.clone())
+            .unwrap_or_else(|| json!({}));
+        let groups: [(&str, &[&str]); 7] = [
+            ("identity", &["device_mac", "configured"]),
+            ("firmware", &["fw", "firmware_target", "running_slot", "reset_reason",
+                "image_identity", "sync_v1", "diag_format", "diag_capacity"]),
+            ("radio", &["radio"]),
+            ("runtime", &["heap_free", "heap_min", "uptime_ms"]),
+            ("display", &["display", "active_context_id", "active_template_id",
+                "template_ids", "display_state"]),
+            ("power", &["power", "sync"]),
+            ("jobs", &["committed_job_id", "commit_seq", "data_seq", "applied_seq"]),
+        ];
+        for (group, fields) in groups {
+            let mut sampled = false;
+            let mut available = false;
+            for key in fields {
+                if let Some(value) = status.get(*key) {
+                    body[*key] = value.clone();
+                    sampled = true;
+                    available |= !value.is_null();
+                }
+            }
+            if sampled {
+                body["groups"][group] = json!({
+                    "received_at": now, "sampled_boot_id": status.get("boot_id"),
+                    "sampled_uptime_ms": status.get("uptime_ms"),
+                    "sampled_wall": status.get("sampled_wall"),
+                    "transport": "http",
+                    "quality": if available { "observed" } else { "unavailable" },
+                });
+            }
+        }
+        if serde_json::to_vec(&body)?.len() > 16 * 1024 {
+            bail!("authenticated cached status exceeds 16 KiB");
+        }
         let previous = (record.last_authenticated.clone(), record.last_status_attempt.clone(),
             record.last_authenticated_contact_at, record.last_authenticated_transport.clone());
         record.last_authenticated = Some(AuthenticatedStatus {
-            observed_at: now, transport: "http_v2".into(), schema_version: 2, body,
+            observed_at: now, transport: "http".into(), schema_version: 2, body,
         });
         record.last_authenticated_contact_at = Some(now);
-        record.last_authenticated_transport = Some("http_v2".into());
+        record.last_authenticated_transport = Some("http".into());
         record.last_status_attempt = Some(StatusAttempt { at: now, outcome: "ok".into(), error: None });
         if let Err(error) = Self::persist(&inner, &self.state_path()) {
             let record = inner.devices.get_mut(&mac).unwrap();
@@ -2321,6 +2375,31 @@ mod tests {
     }
 
     #[test]
+    fn sync_v1_samples_preserve_omitted_groups_and_zero_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = PlatformService::open(dir.path()).unwrap();
+        let mac = "0200000000F1";
+        svc.device_upsert(DeviceIdentity::new(mac, "Fake").unwrap(),
+            DeviceCapabilities::ssd1681_154g()).unwrap();
+        crate::device_clock::configure(mac, 0, 1_000_000, 0).unwrap();
+        svc.note_authenticated_status(mac, &json!({"device_mac":mac, "fw":"a",
+            "boot_id":"boot-a", "uptime_ms":0, "radio":{"wifi_connected":false,
+            "ble_connected":false}, "heap_free":0, "template_ids":[]})).unwrap();
+        let first = svc.device_get(mac).unwrap()["last_authenticated"]["body"].clone();
+        assert_eq!(first["radio"]["wifi_connected"], false);
+        assert_eq!(first["heap_free"], 0);
+        assert_eq!(first["template_ids"], json!([]));
+        crate::device_clock::step(mac, 60_000).unwrap();
+        svc.note_authenticated_status(mac, &json!({"device_mac":mac,"fw":"b",
+            "boot_id":"boot-b","uptime_ms":100})).unwrap();
+        let second = svc.device_get(mac).unwrap()["last_authenticated"]["body"].clone();
+        assert_eq!(second["radio"], first["radio"]);
+        assert_eq!(second["groups"]["radio"], first["groups"]["radio"]);
+        assert_ne!(second["groups"]["firmware"], first["groups"]["firmware"]);
+        crate::device_clock::clear(mac);
+    }
+
+    #[test]
     fn authenticated_timestamps_use_only_the_target_mac_clock() {
         let dir = tempfile::tempdir().unwrap();
         let svc = PlatformService::open(dir.path()).unwrap();
@@ -2388,6 +2467,40 @@ mod tests {
         assert_eq!(next.state, "queued");
         assert_ne!(next.job_id, job.job_id);
         assert!(!resumed.dir.join(job.blob).exists());
+    }
+
+    #[test]
+    fn sync_v1_running_image_proves_exact_frozen_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = PlatformService::open(dir.path()).unwrap();
+        let mac = "AABBCCDDEEFF";
+        svc.device_upsert(DeviceIdentity::new(mac, "Test").unwrap(),
+            DeviceCapabilities::ssd1681_154g()).unwrap();
+        let target = svc.device_get(mac).unwrap()["capabilities"]["firmware_target"]
+            .as_str().unwrap().to_owned();
+        let version = "0.99.0-bw";
+        let mut x = vec![7u8; 2048];
+        x[0] = 0xe9;
+        let marker = format!("codex-status-ota-v1|{target}|{version}\0");
+        x[32..32 + marker.len()].copy_from_slice(marker.as_bytes());
+        let source = dir.path().join("image.bin");
+        std::fs::write(&source, &x).unwrap();
+        let job = svc.queue_ota(mac, "bridge", "request-1", &source, version, &target).unwrap();
+        svc.ota_begin(mac).unwrap();
+        svc.ota_await_confirmation(mac, true, None).unwrap();
+        let mut y = x.clone();
+        let tail = y.len() - 1;
+        y[tail] ^= 1;
+        let wrong = json!({"algorithm":"sha256-running-prefix-v1", "device_mac":mac,
+            "image_bytes":x.len(), "sha256":format!("{:x}", sha2::Sha256::digest(&y)),
+            "fw_target":target, "fw":version});
+        assert!(!svc.ota_note_running_image(mac, &wrong).unwrap());
+        assert_eq!(svc.ota_job(mac).unwrap().confirmation.as_deref(), Some("upload_ack"));
+        let mut exact = wrong;
+        exact["sha256"] = json!(job.sha256);
+        assert!(svc.ota_note_running_image(mac, &exact).unwrap());
+        assert_eq!(svc.ota_job(mac).unwrap().confirmation.as_deref(), Some("image_verified"));
+        assert_eq!(svc.ota_job(mac).unwrap().state, "succeeded");
     }
 
     #[test]

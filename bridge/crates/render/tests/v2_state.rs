@@ -563,7 +563,6 @@ fn shared_command_envelope_checks_session_and_builds_ack_shape() {
 
     let mut message = serde_json::json!({
         "bridge_id": "owner-to-check-outside",
-        "protocol": 2,
         "device_mac": "70:04:1D:AA:BB:CC",
         "request_id": "r",
         "session_nonce": "session-nonce",
@@ -576,9 +575,13 @@ fn shared_command_envelope_checks_session_and_builds_ack_shape() {
     assert_eq!(accepted["accepted"], true);
     assert!(accepted.get("error").is_none());
     assert_eq!(accepted["bridge_id"], "owner-to-check-outside");
-    message["protocol"] = 1.into();
-    assert_eq!(check(&message)["error"], "session");
+    assert!(message.get("protocol").is_none());
     message["protocol"] = 2.into();
+    assert_eq!(check(&message)["error"], "session");
+    message.as_object_mut().unwrap().remove("protocol");
+    message["rv"] = 2.into();
+    assert_eq!(check(&message)["error"], "session");
+    message.as_object_mut().unwrap().remove("rv");
     message["device_mac"] = "70:04:1D:AA:BB:CD".into();
     assert_eq!(check(&message)["error"], "session");
     message["device_mac"] = "70:04:1D:AA:BB:CC".into();
@@ -654,7 +657,7 @@ fn shared_status_snapshot_preserves_fields_time_and_read_only_state() {
     assert_eq!(light, snapshot(input(1, true)), "same nowMs gives same snapshot");
     let status = &light["status"];
     assert_eq!(status["result"], "applied");
-    assert_eq!(status["protocol"], 2);
+    assert!(status.get("protocol").is_none());
     assert_eq!(status["device_mac"], "70:04:1D:AA:BB:CC");
     assert_eq!(status["session_nonce"], "boot-session");
     assert_eq!(status["active_context_id"], "ctx-current");

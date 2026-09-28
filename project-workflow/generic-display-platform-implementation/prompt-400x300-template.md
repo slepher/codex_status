@@ -1,6 +1,6 @@
 # Prompt：为 Note4 设计并交付 400×300 模板
 
-你是 Codex Status 的模板与渲染实现代理。请为 ZecTrix Note4（400×300、1bpp 黑白、SSD2683）设计一份**可验证、可保存的实际模板 JSON**，并生成预览和边界场景证据。交付物不是纯效果图。先读 `AGENTS.md`、`PROGRESS.md` 最新节、`docs/generic-display-platform-design-v2.md` 的模板/target 章节、`project-workflow/generic-display-platform-implementation/status.md`、`tools/test-bridge/templates/quad.json`、`src/template_engine.{h,cpp}`、`bridge/crates/core/src/{template,compile}.rs` 和 `bridge/crates/render` 的预览接口。
+你是 Codex Status 的模板与渲染实现代理。请为 ZecTrix Note4（400×300、1bpp 黑白、SSD2683）设计一份**可验证、可保存的实际模板 JSON**，并生成预览和边界场景证据。交付物不是纯效果图。先读 `AGENTS.md`、`PROGRESS.md` 最新节、`docs/generic-display-platform-design.md` 的模板/target 章节、`project-workflow/generic-display-platform-implementation/status.md`、`tools/test-bridge/templates/quad.json`、`src/template_engine.{h,cpp}`、`bridge/crates/core/src/{template,compile}.rs` 和 `bridge/crates/render` 的预览接口。
 
 ## 目标与布局
 

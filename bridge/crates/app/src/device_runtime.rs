@@ -40,7 +40,6 @@ pub struct DeviceRuntime {
     /// Last owner seen in this device's `/status.json`.
     pub owner: Option<CachedOwner>,
     /// Timestamp of the last successful `/claim` on this device (renew throttle).
-    pub last_claim_at: Option<i64>,
     /// The user released this device: no auto-claim and no pushes until resumed.
     pub yielded: bool,
     /// Consecutive failed `/status.json` reads (ARP trigger threshold).

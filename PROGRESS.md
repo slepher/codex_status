@@ -1,5 +1,13 @@
 # Codex Status 项目进度（交接文档）
 
+## sync-v1 生产路径进行中（2026-09-28，未部署）
+
+- 当前设备协议唯一化实施中，计划见 `project-workflow/device-sync-diagnostics/protocol-unification.md`：业务HTTP为 `/api/*`，不发送 `protocol=2`/`rv=2`，BLE `ack="command"`，MCP当前工具为 `platform_*`；固件/Fake ROM在副作用前拒绝旧帧。Bridge模块改为 `device_client`/`DeviceConnection`，应用缓存/发现名称和运行日志收敛；本地 `state.json` 的 `schema_version=2` 保留，旧 `http_v2` 缓存仅作UI显示映射。旧BLE使用量/模板写入及Bridge旧Wi-Fi使用量推送路径已从运行调度切断；MCP旧模板get/validate/save工具已移除，当前设计移至 `docs/generic-display-platform-design.md`。Bridge core 91/91+集成21/21、app 42/42、MCP 3/3，Bridge→Fake ROM显式归档1/1；Fake ROM bootstrap 43/43（新增无Bundle的Note4定时BLE→正式Plan→首个Bundle安装），render共享信封旧marker拒绝测试通过。Bridge本地8765仅保留 `GET /health`，旧 `GET /usage`/`GET /template`/`POST /deep` 已删除并经路由测试拒绝。固件已移除旧Wi-Fi/BLE usage处理器、`/usage`深睡拉取、`/deep`通知和独立HTTP客户端；未配置设备的timer wake改走BLE会合，取得正式light Plan后才开放当前HTTP Bundle安装路径。此启动路径Fake ROM已验，实机未验；C++私有标识、S01–S14余项与设备Tab仍未完成，生产Bridge/设备均未切换。Note4当前中间ROM `.pio/build/zectrix-note4-b/firmware.bin`，目标 `zectrix-note4-b`，1,652,208 B，SHA256 `6AE97319BB2712E4152C5F5C7570B7C376EE87F928124B1B2A74416F643E7702`，marker `codex-status-ota-v1|zectrix-note4-400x300|0.18.32-note4-b-sync1`，map `.rtc.data=0x1380`/RTC SLOW `0x1e00`（余量2688 B）。因删除源码文件，本次Note4重建了应用和Arduino库对象（76.76s），未见framework重装；不把本次构建当成1.54增量问题的诊断。1.54按用户指示暂缓，旧镜像不是本轮可切换镜像。
+- 当前工作树开始时干净；专项 `plan.md`/`task.md` 与新 `device-tab.md` 由并行文档审查写入，本实施保留其改动。`src/v2_sync.*` 已建立 4096 B RTC 诊断环、逐记录 CRC、代际/序号、15 轮、退避和一次性清零；旧 RTC wake 数组与文字 `/log` 改为同流派生，日志去除 AP 密码和原始 SSID。`src/v2_sync_store.*` 已实现 16 KiB 冻结文件、A/B 元数据和完成收据，Bundle/字体预留 40 KiB；设备端提供 begin/page/ack/complete、BLE sync_config/open、默认关闭的能力协商与受认证约束的 Wi-Fi 开网。Bridge 已有每 MAC 的 `.part`/checkpoint/final 持久传输及 ACK 后续传；普通 BLE 与 light 会话已接线，但仍需 Fake ROM 全链验证。
+- OTA arm/ticket、上传字节 SHA 检查、运行分区前 N 字节 image 接口及 Bridge 精确比对已接入；Bundle commit 写入同步义务并区分显示失败。Bridge 归档有最近 128 批/32 MiB 上限与 retention_floor、跨批同 generation+seq 异字节拒绝、owner 转移旧 part 保留；认证 Wi-Fi 状态按 identity/firmware/radio/runtime/display/power/jobs 分组采样时间，省略字段不抹去旧值，0/false/空数组保留。仍待 Flash 断电切点、完整 confirmation 观察、401/409 与超时故障矩阵、Fake ROM S01–S14 和设备页验证。真实 ESP 分区读取字节域和 OTA 启动仍需 H02，不能把宿主哈希测试当实机证明。设备未刷写、生产 Bridge 未重建/重启；本阶段不得发布。
+- 固件 `src/v2_sync_protocol.*` 已把冻结 JSON、begin/page/ack/complete 与批次字段从 `main.cpp` 抽成生产/宿主同用入口；Fake ROM `sim_sync.cpp` 明确绑定单进程单设备 LittleFS dataDir，仅适配虚拟 RTC、目录与采样。Note4 Fake ROM 已接 BLE sync_config/open 和 HTTP 四端点；同源入口真实 HTTP 最小往返测试通过（冻结、分页、前缀 ACK、SHA、重复 complete），Bridge 真实归档器对 Note4 Fake ROM 的显式集成测试也通过，生成文件并核对身份。测试暴露并修正了空日志批次误判 capacity、返回对象临时字符串失效、Bridge compact MAC 与设备冒号 MAC 不匹配三处问题。仍未完成故障注入、S01–S14、24h 双机回放与设备 Tab；上述最小测试不可代替其验收。
+- Note4 Fake ROM 增加 S01（15轮）、S02（light入/离场）、S03（慢分页跨正式deadline及90s无进展反例）、S04（协议重放/摘要冲突）、S05（超时后的整窗退避）、S07（强退后续传、blob/元数据和ACK丢回复切点）、S08（环溢出/CRC/文本脱敏）、S12（认证/owner/session/低电）具名用例；尚非各场景完整验收。S07揭露设备ACK偏移只存RAM，已改为随每次增加写入A/B元数据，进程强退后从64字节持久偏移恢复。1.54曾构建较早源码，但最终源码切换引发较广库重编，按用户指示暂缓；不能引用旧ROM作为本轮镜像。
+
 ## 设备同步与诊断协议设计（2026-09-28，仅文档）
 
 - 按本轮讨论与 Astra 修订稿建立 `project-workflow/device-sync-diagnostics/design.md`、`plan.md`、`task.md`、`status.md`，并在唯一待办清单 `docs/roadmap/backlog.md` 的 C8 登记。范围：设备页去 Codex 余量，模板/屏幕内容/字体归模板页（布局暂不设计）；普通 BLE 精简；自上次成功 Wi-Fi 同步后 15 次深睡 BLE 会合触发一次性 Wi-Fi 完整批次同步；正式 light 入口/退出各同步且成功即重置计数；OTA/Bundle 应用后经 Wi-Fi 报告；普通 RAM `/log` 与跨深睡 `/history` 统一为可确认诊断流。
@@ -74,7 +82,7 @@
 
 ## bridge_first 候选协议修订（2026-09-27，仅文档）
 
-- 按用户确认更新 `project-workflow/power-plan-c/task-5-advert-rendezvous.md` 与 `docs/generic-display-platform-design-v2.md`：无需开网时设备在有界窗口重复发送同一条认证状态广播，含本窗结果和电量；Bridge 漏收只记未确认，不判离线、不阻止设备休眠。24B 候选空口包以 1B 电量及 1B 保留替换旧 `schedule_hint`，保留短身份、epoch/window 与 64-bit 认证标签。
+- 按用户确认更新 `project-workflow/power-plan-c/task-5-advert-rendezvous.md` 与 `docs/generic-display-platform-design.md`：无需开网时设备在有界窗口重复发送同一条认证状态广播，含本窗结果和电量；Bridge 漏收只记未确认，不判离线、不阻止设备休眠。24B 候选空口包以 1B 电量及 1B 保留替换旧 `schedule_hint`，保留短身份、epoch/window 与 64-bit 认证标签。
 - `OPEN_WIFI` 后改为设备接入局域网并主动请求 Bridge HTTP 服务；新增反向 v2 hello/exchange 候选、双向认证、业务 ACK/幂等与正式 PowerPlan 截止规则。现有 Bridge→设备 HTTP 端点与客户端不能直接视作已实现反向交换；显式 `POST /claim` 的反向封装须单独评审并同步不变量，未协商时 owner 空闲/到期走 `device_first`。默认/恢复策略不变。
 - 补充 Bridge 长期不运行/双方窗口错位的持续恢复：连续错过有效指令或校准检查失败后，设备每轮有界地走 `device_first`，Bridge 重启后不依赖旧窗口锚点扫描；经绑定加密 GATT 重新校准单调时间误差、安装新 epoch 的未来生效窗口并认证确认后才切回。RTC 失效、掉电、ACK 丢失和旧广播重放均有明确收敛/拒绝路径；临时恢复不改持久用户策略或正式电源期限。
 - 已在待办唯一来源 `docs/roadmap/backlog.md` C4 登记剩余 spike、认证/claim 评审、实现和实机验收。本轮不改代码、不构建/发布 ROM、不操作设备；文档定值与功耗结论仍待实测。
