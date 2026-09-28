@@ -53,7 +53,8 @@ struct CachedDevice {
 #[derive(Clone)]
 struct CachedPmStats {
     fetched_at: i64,
-    online: bool,
+    last_attempt_at: i64,
+    last_error: Option<String>,
     ip: String,
     text: String,
 }
@@ -69,6 +70,7 @@ struct Discovery {
 #[derive(Clone)]
 struct CachedOwner {
     owner: Option<Value>,
+    observed_at: i64,
 }
 
 /// Per-device result of the authenticated device status endpoint. Offline updates
@@ -680,6 +682,7 @@ fn set_owner_cache(ctx: &AppCtx, mac: &str, owner: Option<Value>) {
     if let Some(device) = devices(ctx).get_mut(mac) {
         device.owner = Some(CachedOwner {
             owner,
+            observed_at: device_now_secs(mac),
         });
     }
 }
@@ -1568,6 +1571,8 @@ fn device_facts_json(facts: &DeviceFacts) -> Value {
         "discover": facts.discover.as_ref().map(|d| json!({"via": d.via, "at": d.at})),
         "yielded": facts.yielded,
         "owner": facts.owner.as_ref().and_then(|c| c.owner.clone()),
+        "owner_known": facts.owner.is_some(),
+        "owner_observed_at": facts.owner.as_ref().map(|c| c.observed_at),
         "note": facts.note,
     })
 }
@@ -2055,6 +2060,16 @@ async fn platform_status_refresh(
     Ok(platform::refresh_status(&state, &mac).await)
 }
 
+#[tauri::command]
+async fn platform_recovery(
+    state: State<'_, Arc<AppCtx>>,
+    mac: Option<String>,
+    digest: Value,
+) -> Result<Value, String> {
+    let mac = resolve_target_mac(&state, mac.as_deref())?;
+    platform::recovery(&state, &mac, &digest)
+}
+
 /// Last `/status.json` read for one device (the device page's cache).
 #[tauri::command]
 async fn get_device_status(
@@ -2132,50 +2147,69 @@ async fn get_device_status(
     }
 }
 
-/// Read `GET /pmstats` from one device. Cached for 10 s because each read
-/// briefly wakes the device out of light sleep and would skew the counters.
+/// Read `GET /pmstats` from one device after checking the endpoint's public
+/// status MAC. Cached for 10 s because reads briefly wake light-sleep devices.
 #[tauri::command]
 async fn get_pmstats(state: State<'_, Arc<AppCtx>>, mac: Option<String>) -> Result<Value, String> {
     const TTL_SECS: i64 = 10;
     let mac = resolve_target_mac(&state, mac.as_deref())?;
     let facts = ensure_runtime_record(&state, &mac)
         .ok_or_else(|| format!("device {mac} has no runtime record"))?;
+    let now = device_now_secs(&mac);
     if let Some(cached) = facts
         .pmstats
         .as_ref()
-        .filter(|cached| device_now_secs(&mac) - cached.fetched_at < TTL_SECS)
+        .filter(|cached| now >= cached.last_attempt_at && now - cached.last_attempt_at < TTL_SECS)
     {
         return Ok(json!({
-            "online": cached.online,
+            "online": cached.last_error.is_none(),
+            "device_mac": mac,
             "ip": cached.ip,
             "fetched_at": cached.fetched_at,
+            "last_attempt_at": cached.last_attempt_at,
+            "last_error": cached.last_error,
             "text": cached.text,
         }));
     }
     let ip = facts.endpoint();
     let fetch_ip = ip.clone();
+    let expected_mac = mac.clone();
     let result = tokio::task::spawn_blocking(move || {
+        let status = bridge_core::device::fetch(&fetch_ip, Duration::from_secs(5))?;
+        let actual_mac = status.raw.as_ref().and_then(|raw| raw["mac"].as_str())
+            .and_then(bridge_core::platform::model::DeviceIdentity::normalized_mac);
+        if actual_mac.as_deref() != Some(expected_mac.as_str()) {
+            return Err(anyhow::anyhow!("/pmstats endpoint MAC does not match {expected_mac}"));
+        }
         bridge_core::device::fetch_pmstats(&fetch_ip, Duration::from_secs(5))
     })
     .await;
-    let (online, text) = match result {
-        Ok(Ok(text)) => (true, text),
-        Ok(Err(e)) => (false, e.to_string()),
-        Err(e) => (false, e.to_string()),
+    let (text, error) = match result {
+        Ok(Ok(text)) => (Some(text), None),
+        Ok(Err(e)) => (None, Some(e.to_string())),
+        Err(e) => (None, Some(e.to_string())),
     };
-    if let Some(device) = devices(&state).get_mut(&mac) {
-        device.pmstats = Some(CachedPmStats {
-            fetched_at: device_now_secs(&mac),
-            online,
-            ip: ip.clone(),
-            text: text.clone(),
-        });
+    let attempted_at = device_now_secs(&mac);
+    let mut devices = devices(&state);
+    let previous = devices.get(&mac).and_then(|device| device.pmstats.as_ref());
+    let cached = CachedPmStats {
+        fetched_at: if text.is_some() { attempted_at } else { previous.map_or(0, |p| p.fetched_at) },
+        last_attempt_at: attempted_at,
+        last_error: error,
+        ip: if text.is_some() { ip.clone() } else { previous.map_or(ip.clone(), |p| p.ip.clone()) },
+        text: text.unwrap_or_else(|| previous.map_or(String::new(), |p| p.text.clone())),
+    };
+    if let Some(device) = devices.get_mut(&mac) {
+        device.pmstats = Some(cached.clone());
     }
     Ok(json!({
-        "online": online,
-        "ip": ip,
-        "fetched_at": device_now_secs(&mac),
-        "text": text,
+        "online": cached.last_error.is_none(),
+        "device_mac": mac,
+        "ip": cached.ip,
+        "fetched_at": cached.fetched_at,
+        "last_attempt_at": cached.last_attempt_at,
+        "last_error": cached.last_error,
+        "text": cached.text,
     }))
 }
 
@@ -3459,7 +3493,8 @@ fn main() {
             platform_data_probe,
             platform_power,
             platform_plan,
-            platform_status_refresh
+            platform_status_refresh,
+            platform_recovery
         ])
         .setup(move |app| {
             let _ = ctx_setup.app_handle.set(app.handle().clone());

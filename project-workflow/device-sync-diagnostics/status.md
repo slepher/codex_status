@@ -1,5 +1,11 @@
 # 状态与交接
 
+## 2026-09-28：前阶段提交与设备页基础整理（未部署）
+
+前阶段 sync-v1/协议统一源码已按用户要求提交：`c1ab267 Implement Note4 sync diagnostics and unify device protocol`。随后按 `device-tab.md` 开始设备 Tab 实施，已删除设备页 Codex 余量与全局/无效按钮，改为每 MAC 认证快照及分组采样年龄、同步与电源摘要；PM 只在显式采样时请求设备，服务端先核对公开身份 MAC，失败保留同 MAC 最近成功样本。选择代次阻断 A→B→A 旧响应，切换即清屏，Profile 草稿不被刷新覆盖，发布/恢复等冻结目标 MAC。模板/Profile/字体入口仍暂存设备页，归属迁移布局尚未实施。
+
+`node tools/test-device-page.mjs` 的设备页针对性场景、`cargo test -p bridge-app --bin bridge-app` 42/42（另 1 ignored）、`git diff --check` 已过。浏览器安全策略拒绝本地 `file:` 预览且禁止绕过，因此窗口视觉未验；生产 Bridge EXE 及两台设备均未切换。完整 U01–U20、Fake ROM S01–S14、1.54 ROM 与实机证据仍见唯一待办 backlog C8，ROM 精确值见 `PROGRESS.md` 最新节。
+
 ## 2026-09-28：生产协议入口收敛 + Note4 Fake ROM 最小集成（未发布）
 
 生产 `main.cpp` 与宿主 `sim_sync.cpp` 现在都调用 `src/v2_sync_protocol.*` 决定冻结文件格式、begin/page/ack/complete、批次字段及错误；RTC 环与 Flash A/B 存储继续分别共用 `v2_sync.*`、`v2_sync_store.*`。宿主初始化显式 `LittleFS.useDirectory(dataDir)`，不依赖 Bundle FFI 的调用顺序。环境适配仅提供状态采样、虚拟 RTC 持久、随机后缀和 HTTP/BLE 外壳。

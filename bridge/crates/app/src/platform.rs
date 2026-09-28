@@ -1217,6 +1217,14 @@ pub fn power_view(ctx: &AppCtx, requested_mac: &str) -> Value {
 pub fn recovery(ctx: &AppCtx, requested_mac: &str, digest: &Value) -> Result<Value, String> {
     let mac = DeviceIdentity::normalized_mac(requested_mac)
         .ok_or_else(|| "invalid device MAC".to_string())?;
+    if digest["device_mac"]
+        .as_str()
+        .and_then(DeviceIdentity::normalized_mac)
+        .as_deref()
+        != Some(mac.as_str())
+    {
+        return Err("recovery digest MAC does not match requested device".into());
+    }
     let profile = service(ctx)
         .recovery_import(&mac, digest, device_now(&mac))
         .map_err(err_text)?;

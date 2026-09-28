@@ -42,7 +42,7 @@
 | Bridge 休眠设备的状态与延后操作 | S1–S4 已实现；S5 实机主路径通过、故障矩阵待验 | 两台 ROM 已按登记 MAC 顺序自然会合 OTA，各 1 次上传 ACK 且后续认证见新版本；两台完整 Bundle 发布 `succeeded`，1.54 的 waiting 发布跨 Bridge 重启后自然提交。实机发现并修正 OTA 待精确确认时阻塞后续发布、显式 sleep ACK 未记账；Bridge 已重建。剩余：错 IP/401/409 端到端注入、长期 PowerPlan 截止期、Note4 间歇 `display_state=failed` 诊断。当前 ROM 不提供可对照整文件哈希的运行镜像身份，OTA 保留 `awaiting_confirmation` / `version_seen_unproven`，精确 `image_verified` 待后续能力。证据见 `project-workflow/sleep-aware-bridge/`、`PROGRESS.md` 顶节。 |
 | Bridge 多实例 | 已交付（tag `bridge-multi-instance-2026-09-24`） | 无 |
 | Fake ROM 设备模拟器（同源 C++ + 可控实验时钟） | D/E/F 软件验收完成；G 按用户决定取消 | 软件证据见 `PROGRESS.md` 最新节；硬件特有错误仅留 case 文档，不在本项执行 |
-| 设备页、周期 Wi-Fi 与统一诊断流 | 设计草案 | 15 轮冷却、light 入口/退出同步、OTA/Bundle Wi-Fi 结果报告、跨深睡 log/history 合并、设备页字段与归属；见 C8 |
+| 设备页、周期 Wi-Fi 与统一诊断流 | 源码进行中，未部署 | 设备页基础整理及 Note4 中间 ROM 已有源码/软件证据；完整 Fake ROM、视觉/实机验收和 1.54 最终构建仍待完成；见 C8 |
 | 唤醒会合诊断（一次唤醒一条记录） | 仅计划 | 固件与桥两侧都未实现（见 C3） |
 | Bundle v3（manifest + 原始 dense 对象，省 ~71%） | 仅设计 | 未实现（见 C1） |
 | `device_first` / `bridge_first` 双策略会合 | `device_first` 已运行；双策略切换仅设计 + spike | `bridge_first` 及设备主动连接 Bridge 的反向 v2 HTTP 交换均未实现（见 C4） |
@@ -162,8 +162,8 @@
 - 前置：C3 的记录格式（否则没有可信的对照口径）。
 
 ### C8. 设备同步与诊断协议（device-sync-diagnostics）
-- `sync-v1` 实施合同见 `project-workflow/device-sync-diagnostics/design.md`。生产固件/Bridge 已有部分源码与 Note4 中间构建，状态和未验边界见 `PROGRESS.md` 最新节；Fake ROM S01–S14完整矩阵、设备页及实机尚未完成（无Bundle设备的BLE会合→正式Plan→首个Bundle安装已过Fake ROM，仍需实机），不能把源码或中间 ROM 当发布。1.54 最终构建按用户指示暂缓；Flash 断电恢复与真实分区哈希字节域仍须过证据门槛，不能静默降级。
-- 当前设备协议作为唯一业务协议的一次性统一见 `project-workflow/device-sync-diagnostics/protocol-unification.md`：包括 `/v2/*`、`protocol=2`、BLE `rv=2`/`ack="v2"`、INFO能力、MCP `_v2`、当前文档/UI与固件/Bridge/Fake ROM 调用方；先在软件侧同轮改齐，再继续完整Fake ROM验收和设备Tab。两台现役旧固件需旧Bridge逐台OTA后才切换生产Bridge；1.54最终ROM暂缓期间不做生产Bridge切换，不保留长期双协议兼容。Bridge本地 `state.json` 另作无损格式核查，不凭 wire 更名删除运行数据。
+- `sync-v1` 实施合同见 `project-workflow/device-sync-diagnostics/design.md`。生产固件/Bridge 已有源码与 Note4 中间构建；设备页基础整理已入源码，测试覆盖部分 U 项，状态和未验边界见 `PROGRESS.md` 最新节。Fake ROM S01–S14、设备页 U01–U20 完整矩阵、真实窗口视觉和实机尚未完成（无 Bundle 设备的 BLE 会合→正式 Plan→首个 Bundle 安装已过 Fake ROM，仍需实机），不能把源码或中间 ROM 当发布。1.54 最终构建与增量重编问题按用户指示暂缓；Flash 断电恢复与真实分区哈希字节域仍须过证据门槛，不能静默降级。
+- 当前设备协议作为唯一业务协议的一次性统一见 `project-workflow/device-sync-diagnostics/protocol-unification.md`：业务 HTTP 已收敛到 `/api/*`，旧 `protocol=2`、BLE `rv=2`/`ack="v2"` 与 MCP `_v2` 入口已移除；继续完整 Fake ROM 验收和设备 Tab。两台现役旧固件需旧 Bridge 逐台 OTA 后才切换生产 Bridge；1.54 最终 ROM 暂缓期间不做生产 Bridge 切换，不保留长期双协议兼容。Bridge 本地 `state.json` 另作无损格式核查，不凭 wire 更名删除运行数据。
 - 实现每 15 次深睡 BLE 会合的一次性 Wi-Fi 同步，以及正式 light 入口和退出时的 Wi-Fi 同步；成功同步才重置计数。普通 BLE 保持精简，诊断日志按冻结批次经 Wi-Fi 增量同步，未确认内容保留。
 - 合并普通 `/log` 与跨深睡 `/history` 为统一、跨深睡、可分页/确认/报告 gap 的诊断流；OTA/Bundle 执行后以 Wi-Fi 报告分级结果并有限重试。设备页移除 Codex 余量、改善设备详情的采集时间和缺失解释；屏幕内容、模板、字体归模板页仅作归属声明，数据页排版暂不处理。
 - 以 Fake ROM 验证绝大多数协议和故障场景（S01–S14）；实机只验证 RF/GATT、ESP32 Wi-Fi 入网与 HTTP、light/deep 切换、RTC/Flash/bootloader 等模拟器不能证明的部分（H01–H03）。详见 `project-workflow/device-sync-diagnostics/plan.md`。

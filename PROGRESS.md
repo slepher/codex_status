@@ -1,5 +1,12 @@
 # Codex Status 项目进度（交接文档）
 
+## 设备页基础整理（2026-09-28，源码完成，未部署）
+
+- 按用户要求先提交前一阶段，提交为 `c1ab267 Implement Note4 sync diagnostics and unify device protocol`。其 Note4 中间 ROM 的目标、路径、大小、SHA256 与未发布边界仍以下节为准；本轮设备页只改 Bridge，不重新构建固件。1.54 构建及其增量重编问题继续暂缓，以 Note4 为准。
+- 设备 Tab 已去掉 Codex 周余量卡、全局“暂停推送/立即同步”按钮和禁用占位；全局托盘动作仍在。概览从按 MAC 的认证快照读取固件、radio、runtime、display、power、sync 组，显示采样年龄和未提供原因；最近 BLE 联系不刷新旧 Wi-Fi 组。0、false、空模板列表均作为有效值。owner 从未读取时不显示为空闲，lease 剩余标为采样时观察。PowerPlan 的发送与接受分开，电池“下限”纠为采样电量，PM 展开不主动请求设备。
+- 设备选择增加代次/请求序号，A→B→A 的旧结果不得回写；切换立即清除前台指标、PM 原文与锁。Profile 草稿在本地刷新时保留；改名、claim、发布、恢复与 Plan 指定并冻结 MAC，恢复摘要还由 Bridge 核对 MAC。`get_pmstats` 先校验 `/status.json` 自报 MAC，再读取同 IP 的 `/pmstats`；失败保留同 MAC 最近成功采样与单独错误，10s 节流按最近尝试。模板/Profile/字体编辑入口按 `device-tab.md` M07 暂留设备页，具体迁移布局尚未做。
+- 证据：`cargo test -p bridge-app --bin bridge-app` **42 passed、1 ignored**；`node tools/test-device-page.mjs` 覆盖多设备无默认选择、A→B→A 旧响应、0/false/[]、PM被动展开与失败保留、草稿、错 MAC 恢复、无 Plan ACK；脚本语法与 `git diff --check` 通过。浏览器安全策略禁止 `file:` 本地预览且明确不允许绕过，因此 560×680/窄窗口的真实视觉检查未做；已静态检查响应式断点与长文本折行。源码尚未嵌入生产 `bridge-app.exe`、未重启 Bridge、未 OTA/操作设备；完整 U01–U20、Fake ROM S01–S14 与实机仍按 backlog C8 待验。
+
 ## sync-v1 生产路径进行中（2026-09-28，未部署）
 
 - 当前设备协议唯一化实施中，计划见 `project-workflow/device-sync-diagnostics/protocol-unification.md`：业务HTTP为 `/api/*`，不发送 `protocol=2`/`rv=2`，BLE `ack="command"`，MCP当前工具为 `platform_*`；固件/Fake ROM在副作用前拒绝旧帧。Bridge模块改为 `device_client`/`DeviceConnection`，应用缓存/发现名称和运行日志收敛；本地 `state.json` 的 `schema_version=2` 保留，旧 `http_v2` 缓存仅作UI显示映射。旧BLE使用量/模板写入及Bridge旧Wi-Fi使用量推送路径已从运行调度切断；MCP旧模板get/validate/save工具已移除，当前设计移至 `docs/generic-display-platform-design.md`。Bridge core 91/91+集成21/21、app 42/42、MCP 3/3，Bridge→Fake ROM显式归档1/1；Fake ROM bootstrap 43/43（新增无Bundle的Note4定时BLE→正式Plan→首个Bundle安装），render共享信封旧marker拒绝测试通过。Bridge本地8765仅保留 `GET /health`，旧 `GET /usage`/`GET /template`/`POST /deep` 已删除并经路由测试拒绝。固件已移除旧Wi-Fi/BLE usage处理器、`/usage`深睡拉取、`/deep`通知和独立HTTP客户端；未配置设备的timer wake改走BLE会合，取得正式light Plan后才开放当前HTTP Bundle安装路径。此启动路径Fake ROM已验，实机未验；C++私有标识、S01–S14余项与设备Tab仍未完成，生产Bridge/设备均未切换。Note4当前中间ROM `.pio/build/zectrix-note4-b/firmware.bin`，目标 `zectrix-note4-b`，1,652,208 B，SHA256 `6AE97319BB2712E4152C5F5C7570B7C376EE87F928124B1B2A74416F643E7702`，marker `codex-status-ota-v1|zectrix-note4-400x300|0.18.32-note4-b-sync1`，map `.rtc.data=0x1380`/RTC SLOW `0x1e00`（余量2688 B）。因删除源码文件，本次Note4重建了应用和Arduino库对象（76.76s），未见framework重装；不把本次构建当成1.54增量问题的诊断。1.54按用户指示暂缓，旧镜像不是本轮可切换镜像。
