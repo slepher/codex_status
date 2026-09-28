@@ -5,6 +5,8 @@
 #include <Preferences.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
+#include <algorithm>
+#include <atomic>
 
 static UsageJsonHandler    usageHandler    = nullptr;
 static EndpointJsonHandler endpointHandler = nullptr;
@@ -611,5 +613,142 @@ String bleScanJson(uint32_t seconds, uint16_t companyFilter, uint8_t maxRecords)
     esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
     if (wasAdvertising) bleAdvertiseStart();
     if (initHere) bleDeinit();
+    return out;
+}
+
+// RF-only experiment. A/C first listen for the PC's AVAILABLE packet; B starts
+// with a CHALLENGE. Every path then waits for an OFFER. There are no keys,
+// schedule writes, GATT connections, or business effects in this diagnostic.
+namespace {
+constexpr uint16_t kRecoveryTestCompany = 0xFFFF;
+constexpr uint32_t kRecoveryTestDeadlineMs = 6000;
+
+class RecoveryScanCallbacks : public NimBLEScanCallbacks {
+  public:
+    RecoveryScanCallbacks(uint32_t run, uint8_t type) : run_(run), type_(type) {}
+    uint32_t started = 0;
+    uint32_t seen = 0;
+    uint32_t firstMs = 0;
+    int firstRssi = 0;
+    std::atomic<bool> found{false};
+
+    void onResult(const NimBLEAdvertisedDevice *dev) override {
+        seen++;
+        if (!dev->haveManufacturerData()) return;
+        const std::string data = dev->getManufacturerData();
+        if (data.size() < 8 || (uint8_t)data[0] != 0xFF || (uint8_t)data[1] != 0xFF ||
+            (uint8_t)data[2] != 0xE0 || (uint8_t)data[3] != type_) return;
+        uint32_t run = ((uint32_t)(uint8_t)data[4] << 24) |
+                       ((uint32_t)(uint8_t)data[5] << 16) |
+                       ((uint32_t)(uint8_t)data[6] << 8) | (uint8_t)data[7];
+        if (run != run_ || found.load(std::memory_order_relaxed)) return;
+        firstMs = millis() - started;
+        firstRssi = dev->getRSSI();
+        found.store(true, std::memory_order_release);
+    }
+
+  private:
+    uint32_t run_;
+    uint8_t type_;
+};
+
+uint32_t recoveryRemaining(uint32_t start) {
+    uint32_t elapsed = millis() - start;
+    return elapsed >= kRecoveryTestDeadlineMs - 250 ? 0 :
+           kRecoveryTestDeadlineMs - 250 - elapsed;
+}
+
+bool recoveryListen(uint32_t run, uint8_t type, uint32_t requestedMs,
+                    uint32_t start, JsonObject out) {
+    uint32_t duration = std::min(requestedMs, recoveryRemaining(start));
+    if (!duration) return false;
+    NimBLEScan *scan = NimBLEDevice::getScan();
+    scan->setActiveScan(false);
+    scan->setInterval(100);
+    scan->setWindow(80);
+    scan->setDuplicateFilter(0);
+    scan->clearResults();
+    RecoveryScanCallbacks cb(run, type);
+    cb.started = millis();
+    scan->setScanCallbacks(&cb, true);
+    bool ok = scan->start(duration);
+    uint32_t end = cb.started + duration + 100;
+    while (ok && scan->isScanning() && !cb.found.load(std::memory_order_acquire) &&
+           (int32_t)(millis() - end) < 0) delay(10);
+    if (scan->isScanning()) scan->stop();
+    scan->setScanCallbacks(nullptr);
+    out["ok"] = ok;
+    out["duration_ms"] = millis() - cb.started;
+    out["seen"] = cb.seen;
+    const bool hit = cb.found.load(std::memory_order_acquire);
+    out["hit"] = hit;
+    if (hit) {
+        out["first_ms"] = cb.firstMs;
+        out["rssi"] = cb.firstRssi;
+    }
+    return ok && hit;
+}
+
+bool recoveryTransmit(uint32_t run, uint8_t type, uint32_t requestedMs,
+                      uint32_t start, JsonObject out) {
+    uint32_t duration = std::min(requestedMs, recoveryRemaining(start));
+    if (!duration) return false;
+    uint8_t bytes[26] = {0xFF, 0xFF, 0xE0, type,
+                         (uint8_t)(run >> 24), (uint8_t)(run >> 16),
+                         (uint8_t)(run >> 8), (uint8_t)run};
+    NimBLEAdvertisementData data;
+    if (!data.setManufacturerData(bytes, sizeof(bytes))) return false;
+    NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
+    adv->reset();
+    adv->setConnectableMode(BLE_GAP_CONN_MODE_NON);
+    adv->setDiscoverableMode(BLE_GAP_DISC_MODE_NON);
+    adv->enableScanResponse(false);
+    adv->setMinInterval(0x30);
+    adv->setMaxInterval(0x60);
+    if (!adv->setAdvertisementData(data)) return false;
+    uint32_t begun = millis();
+    bool ok = adv->start();
+    if (ok) delay(duration);
+    adv->stop();
+    out["ok"] = ok;
+    out["duration_ms"] = millis() - begun;
+    return ok;
+}
+}  // namespace
+
+String bleRecoveryTrialJson(char variant, uint32_t runId) {
+    JsonDocument doc;
+    doc["rf_only"] = true;
+    doc["run_id"] = runId;
+    doc["variant"] = String(variant);
+    if ((variant != 'a' && variant != 'b' && variant != 'c') ||
+        NimBLEDevice::isInitialized()) {
+        doc["error"] = "invalid_variant_or_ble_busy";
+    } else {
+        wifi_ps_type_t previousPs = WIFI_PS_MAX_MODEM;
+        esp_wifi_get_ps(&previousPs);
+        esp_wifi_set_ps(WIFI_PS_NONE);
+        uint32_t start = millis();
+        NimBLEDevice::init("CodexStatus-rf-test");
+        bool ready = true;
+        if (variant != 'b') {
+            ready = recoveryListen(runId, 0xA0, 1500, start,
+                                   doc["available"].to<JsonObject>());
+        }
+        if (ready) {
+            ready = recoveryTransmit(runId, 0xB1, 800, start,
+                                     doc["challenge"].to<JsonObject>());
+        }
+        if (ready) {
+            recoveryListen(runId, 0xB2, 2500, start,
+                           doc["offer"].to<JsonObject>());
+        }
+        doc["radio_ms"] = millis() - start;
+        doc["deadline_ok"] = (millis() - start) <= kRecoveryTestDeadlineMs;
+        bleDeinit();
+        esp_wifi_set_ps(previousPs);
+    }
+    String out;
+    serializeJson(doc, out);
     return out;
 }

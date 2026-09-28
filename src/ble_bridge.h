@@ -41,6 +41,9 @@ void bleClearBonds();
 // summary with per-advertisement arrival times, RSSI, connectability and raw
 // payload. Blocking; call only while the device is awake.
 String bleScanJson(uint32_t seconds, uint16_t companyFilter, uint8_t maxRecords);
+// Note4 RF experiment only: bounded, unauthenticated A/B/C recovery exchange.
+// Called solely from the token-gated diagnostic endpoint; never installs a plan.
+String bleRecoveryTrialJson(char variant, uint32_t runId);
 
 #define BLE_SVC_UUID   "e7f1a000-4b2a-4c9e-9a11-3c0d5e9a0000"
 #define BLE_CHR_INFO   "e7f1a001-4b2a-4c9e-9a11-3c0d5e9a0000"

@@ -27,6 +27,10 @@
 #include <esp_partition.h>
 #include <esp_system.h>
 #include <esp_pm.h>
+#if defined(CODEX_NOTE4_ROM_B) || (!defined(CODEX_TARGET_NOTE4) && !defined(CODEX_TARGET_GRAY4))
+#define CODEX_BLE_B46 1
+#include <esp_bt.h>
+#endif
 #include <esp_wifi.h>
 #include <esp_mac.h>
 #include <esp_timer.h>
@@ -79,12 +83,12 @@ static bool targetUnverified = false;
 #define FW_VERSION    "0.13.9-clkwin"
 #elif defined(CODEX_TARGET_NOTE4)
 #ifdef CODEX_NOTE4_ROM_B
-#define FW_VERSION    "0.18.25-note4-b"
+#define FW_VERSION    "0.18.31-note4-b-b46-rf1"
 #else
 #define FW_VERSION    "0.18.19-note4-a"
 #endif
 #else
-#define FW_VERSION    "0.18.25-bw"
+#define FW_VERSION    "0.18.31-bw-b46"
 #endif
 // Bridge OTA queue checks this exact build identity before freezing an image.
 static const char OTA_IMAGE_IDENTITY[] __attribute__((used)) =
@@ -128,12 +132,16 @@ static const int EPD_FB_BYTES = (EPD_W / 8) * EPD_H;
 #define CLK_MAX_BYTES          64
 #endif
 
-// Plan C rendezvous timing: the BLE window is a hard 3 s cap for waiting on
+// Plan C rendezvous timing: the BLE window is a hard cap for waiting on
 // the bridge and closes shortly after the bridge's plan ACK. A connected
 // handshake gets its own bounded budget: Windows connect+service discovery
 // often exceeds 3 s before the first command can arrive. The single wake
 // render runs after the radio is off (see v2Rendezvous / v2RendezvousRender).
+#ifdef CODEX_BLE_B46
+#define V2_RENDEZVOUS_WINDOW_MS    4000
+#else
 #define V2_RENDEZVOUS_WINDOW_MS    3000
+#endif
 #define V2_RENDEZVOUS_CONNECTED_MS 6000
 #define V2_RENDEZVOUS_ACK_GRACE_MS 200
 
@@ -3349,6 +3357,22 @@ static void handleDiag() {
         return;
     }
 #if defined(CODEX_TARGET_NOTE4)
+    if (server.hasArg("realign")) {
+        const String variant = server.arg("realign");
+        const long run = server.arg("run_id").toInt();
+        if (variant.length() != 1 || (variant[0] != 'a' && variant[0] != 'b' && variant[0] != 'c') ||
+            run <= 0) {
+            server.send(400, "text/plain", "realign must be a|b|c and run_id positive");
+            return;
+        }
+        if (bleInitialized()) {
+            server.send(409, "text/plain", "BLE busy");
+            return;
+        }
+        const String result = bleRecoveryTrialJson(variant[0], (uint32_t)run);
+        server.send(200, "application/json", result);
+        return;
+    }
     if (server.hasArg("panel_power")) {
         const String mode = server.arg("panel_power");
         if (mode != "keep" && mode != "off_cache") {
@@ -4570,14 +4594,28 @@ static void serviceV2Ble() {
 }
 
 // Timer wakes only open BLE; Wi-Fi requires an accepted light plan.
-// Plan C: hard 3 s window; after a plan ACK it closes 200 ms later. No screen
+// Plan C: bounded window; after a plan ACK it closes 200 ms later. No screen
 // work happens while the radio is on -- the caller renders once afterwards.
 static void v2RendezvousRender(bool light);
 static bool v2Rendezvous() {
+#ifdef CODEX_BLE_B46
+    esp_pm_config_t blePm = {};
+    blePm.max_freq_mhz = 240;
+    blePm.min_freq_mhz = 80;
+    blePm.light_sleep_enable = false;
+    DevLog.printf("[pm] BLE 240/80MHz no light: %s\n",
+                  esp_err_to_name(esp_pm_configure(&blePm)));
+#endif
     v2InRendezvous = true;
     v2HistorySyncMs = 0;
     v2HistorySyncUntilMs = 0;
     enterBleOn(false);
+#ifdef CODEX_BLE_B46
+    if (bleInitialized()) {
+        DevLog.printf("[pm] BT modem sleep: %s\n",
+                      esp_err_to_name(esp_bt_sleep_enable()));
+    }
+#endif
     const uint64_t windowStart = v2NowMs();
     uint64_t deadline = windowStart + V2_RENDEZVOUS_WINDOW_MS;
     uint64_t answeredAt = 0;
