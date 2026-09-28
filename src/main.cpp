@@ -84,13 +84,16 @@ static bool targetUnverified = false;
 #define FW_VERSION    "0.13.9-clkwin"
 #elif defined(CODEX_TARGET_NOTE4)
 #ifdef CODEX_NOTE4_ROM_B
-#define FW_VERSION    "0.18.32-note4-b-sync1"
+#define FW_VERSION    "0.18.35-note4-b-ota1"
 #else
 #define FW_VERSION    "0.18.19-note4-a"
 #endif
 #else
-#define FW_VERSION    "0.18.32-bw-sync1"
+#define FW_VERSION    "0.18.34-bw-ota1"
 #endif
+// WebServer dispatch and filesystem work run in Arduino's loop task.
+// Keep headroom for nested handlers even when an endpoint changes later.
+size_t getArduinoLoopTaskStackSize() { return 12288; }
 // Bridge OTA queue checks this exact build identity before freezing an image.
 static const char OTA_IMAGE_IDENTITY[] __attribute__((used)) =
     "codex-status-ota-v1|" FW_TARGET_ID "|" FW_VERSION;
@@ -3747,51 +3750,6 @@ static String syncOpenId, syncOpenReason;
 static bool syncSkippedThisWake = false;
 static uint8_t syncVisibleSkip = 0;
 static uint16_t syncBlockedError = 0;
-struct SyncOtaArm {
-    uint32_t magic;
-    char owner[65];
-    char jobId[65];
-    char ticket[33];
-    uint32_t imageBytes;
-    uint8_t fileHash[32];
-    uint8_t state; // 1 armed, 2 upload accepted and awaiting reboot confirmation
-    uint8_t reserved[3];
-    uint32_t crc;
-};
-static constexpr uint32_t SYNC_OTA_MAGIC = 0x31544f53;
-static SyncOtaArm syncOtaArm = {};
-static mbedtls_sha256_context syncOtaHash;
-static bool syncOtaHashStarted = false;
-static uint32_t syncOtaBytes = 0;
-static bool syncOtaTicketValid = false;
-static bool syncOtaImageVerified = false;
-static bool syncOtaSave() {
-    syncOtaArm.crc = syncCrc32((const uint8_t *)&syncOtaArm, offsetof(SyncOtaArm, crc));
-    Preferences p;
-    if (!p.begin("sync-ota", false)) return false;
-    bool ok = p.putBytes("arm", &syncOtaArm, sizeof(syncOtaArm)) == sizeof(syncOtaArm);
-    p.end();
-    return ok;
-}
-static void syncOtaClear() {
-    memset(&syncOtaArm, 0, sizeof(syncOtaArm));
-    syncOtaImageVerified = false;
-    Preferences p;
-    if (p.begin("sync-ota", false)) { p.remove("arm"); p.end(); }
-}
-static void syncOtaLoad() {
-    Preferences p;
-    if (!p.begin("sync-ota", true)) return;
-    bool valid = p.getBytesLength("arm") == sizeof(syncOtaArm) &&
-                 p.getBytes("arm", &syncOtaArm, sizeof(syncOtaArm)) == sizeof(syncOtaArm);
-    p.end();
-    if (!valid || syncOtaArm.magic != SYNC_OTA_MAGIC ||
-        syncOtaArm.crc != syncCrc32((const uint8_t *)&syncOtaArm, offsetof(SyncOtaArm, crc))) {
-        syncOtaClear(); return;
-    }
-    if (syncOtaArm.state == 1) syncOtaClear();
-    else if (syncOtaArm.state == 2) syncAddReason(syncRtc, 1u << 3);
-}
 static void syncRecordOutcome(uint8_t result, uint16_t error, uint64_t serial = 0) {
     syncAppendResult(syncRtc, syncLogWakeSeq, millis(), result,
                      (uint8_t)((syncRtc.flags & 1 ? 1 : 0) | syncRtc.reasonBits),
@@ -3799,7 +3757,7 @@ static void syncRecordOutcome(uint8_t result, uint16_t error, uint64_t serial = 
     int32_t args[] = {(int32_t)result, (int32_t)error};
     syncAppendEvent(syncRtc, syncLogWakeSeq, millis(), 10, args, 2);
 }
-static void v2Response(int status, const String &body) {
+static void v2Response(int status, const String &body, bool includeWakeInfo = true) {
     if (!v2ReplyOverBle) { server.send(status, "application/json", body); return; }
     JsonDocument doc;
     if (deserializeJson(doc, body)) return;
@@ -3808,7 +3766,7 @@ static void v2Response(int status, const String &body) {
     doc["wake_generation"] = rtcWakeGeneration;
     doc["wake_seq"] = rtcTraceCurrentSeq;
     const bool historyReply = !doc["records"].isNull();
-    if (!historyReply) {
+    if (!historyReply && includeWakeInfo) {
         doc["wake_stage"] = traceCurrent() ? traceStageName(traceCurrent()->furthest) : "none";
         doc["wake_cause"] = wakeCauseName(bootWakeCause);
     }
@@ -3892,19 +3850,6 @@ static bool syncParseNumber(const char *text, uint64_t &value) {
     for (const char *p = text; *p; ++p) {
         if (*p < '0' || *p > '9' || value > (UINT64_MAX - (*p - '0')) / 10) return false;
         value = value * 10 + (*p - '0');
-    }
-    return true;
-}
-
-static bool syncParseHash(const char *text, uint8_t out[32]) {
-    if (!text || strlen(text) != 64) return false;
-    for (int i = 0; i < 32; ++i) {
-        int a = text[2*i] >= '0' && text[2*i] <= '9' ? text[2*i] - '0'
-              : text[2*i] >= 'a' && text[2*i] <= 'f' ? text[2*i] - 'a' + 10 : -1;
-        int b = text[2*i+1] >= '0' && text[2*i+1] <= '9' ? text[2*i+1] - '0'
-              : text[2*i+1] >= 'a' && text[2*i+1] <= 'f' ? text[2*i+1] - 'a' + 10 : -1;
-        if (a < 0 || b < 0) return false;
-        out[i] = (uint8_t)((a << 4) | b);
     }
     return true;
 }
@@ -4040,11 +3985,12 @@ static void handleV2Status() {
     JsonObject display = doc["display"].to<JsonObject>();
     display["epd_writes"] = epdWriteCount;
     display["epd_busy_fails"] = rtcEpdBusyFails;
+    doc["ota_auth"] = "token";
+    doc["image_identity"].to<JsonArray>().add("sha256-running-prefix-v1");
     if (syncStoreAvailable()) {
         doc["sync_v1"] = 1;
         doc["diag_format"] = 1;
         doc["diag_capacity"] = 4096;
-        doc["image_identity"].to<JsonArray>().add("sha256-running-prefix-v1");
     }
     JsonObject sync = doc["sync"].to<JsonObject>();
     OwnerRec owner;
@@ -4075,7 +4021,7 @@ static void handleV2Status() {
         sync["last_completed"] = fields.as<JsonVariantConst>();
     } else sync["last_completed"] = nullptr;
     sync["last_error"] = syncStoreLost() ? "batch_lost" : nullptr;
-    sync["confirmation_pending"] = syncOtaArm.magic == SYNC_OTA_MAGIC && syncOtaArm.state == 2;
+    sync["confirmation_pending"] = false;
     String out;
     serializeJson(doc, out);
     server.send(200, "application/json", out);
@@ -4102,14 +4048,6 @@ static JsonDocument syncFrozenSnapshot() {
     snapshot["rounds"] = syncRtc.rounds;
     OwnerRec owner;
     snapshot["owner_id"] = ownerGet(owner) ? owner.id : "";
-    JsonObject confirmations = doc["confirmation_observations"].to<JsonObject>();
-    if (syncOtaArm.magic == SYNC_OTA_MAGIC && syncOtaArm.state == 2) {
-        JsonObject ota = confirmations["ota"].to<JsonObject>();
-        ota["job_id"] = syncOtaArm.jobId;
-        ota["stage"] = syncOtaImageVerified ? "image_verified" : "pending_identity";
-        ota["running_slot"] = running ? running->label : nullptr;
-        ota["fw"] = FW_VERSION;
-    }
     return doc;
 }
 
@@ -4127,7 +4065,7 @@ static void handleSyncTransfer(const char *op) {
     String mac = macText();
     SyncProtocolInput input{syncRtc, mac.c_str(),
                             request["bridge_id"] | "", suffix,
-                            syncLogWakeSeq, millis(), syncOtaImageVerified,
+                            syncLogWakeSeq, millis(), false,
                             snapshot["snapshot"].as<JsonVariantConst>()};
     JsonDocument fields;
     uint32_t before = syncStoreAckedOffset();
@@ -4137,10 +4075,8 @@ static void handleSyncTransfer(const char *op) {
             (!strcmp(op, "sync_ack") && syncStoreAckedOffset() > before))
             syncLastProgressMs = millis();
     }
-    if (result.completed) {
-        if (result.otaConfirmed) syncOtaClear();
-        if (syncOpenThisWake && !(syncRtc.flags & 1)) syncExitAtMs = millis() + 200;
-    }
+    if (result.completed && syncOpenThisWake && !(syncRtc.flags & 1))
+        syncExitAtMs = millis() + 200;
     syncReply(op, fields["result"] | "rejected",
               fields["error"] | nullptr, result.status, &fields);
 }
@@ -4150,90 +4086,47 @@ static void handleSyncPage() { handleSyncTransfer("sync_page"); }
 static void handleSyncAck() { handleSyncTransfer("sync_ack"); }
 static void handleSyncComplete() { handleSyncTransfer("sync_complete"); }
 
-static void handleSyncArm() {
-    JsonDocument request;
-    if (!syncCommand("sync_arm", request)) return;
-    const char *job = request["job_id"] | "";
-    uint8_t hash[32];
-    if (strcmp(request["kind"] | "", "ota") || !*job || strlen(job) > 64 ||
-        !request["image_bytes"].is<uint32_t>() || !request["image_bytes"].as<uint32_t>() ||
-        !syncParseHash(request["file_sha256"] | "", hash)) {
-        syncReply("sync_arm", "rejected", "shape", 400); return;
+// Independent of sync diagnostics and claim ownership. The caller chooses the
+// exact prefix length from the frozen ROM; the Bridge compares the returned
+// hash with that file after reboot.
+static void handleOtaImage() {
+    if (!requestAuthorized()) {
+        server.send(401, "application/json", "{\"error\":\"unauthorized\"}"); return;
     }
-    uint32_t length = request["image_bytes"].as<uint32_t>();
-    const esp_partition_t *next = esp_ota_get_next_update_partition(nullptr);
-    if (!next || length > next->size) {
-        syncReply("sync_arm", "rejected", "range", 400); return;
-    }
-    if (syncOtaArm.magic == SYNC_OTA_MAGIC) {
-        if (syncOtaArm.state == 1 && !strcmp(syncOtaArm.owner, request["bridge_id"] | "") &&
-            !strcmp(syncOtaArm.jobId, job) && syncOtaArm.imageBytes == length &&
-            !memcmp(syncOtaArm.fileHash, hash, 32)) {
-            JsonDocument fields;
-            fields["ticket"] = syncOtaArm.ticket;
-            fields["job_id"] = job;
-            syncReply("sync_arm", "applied", nullptr, 200, &fields);
-            return;
-        }
-        syncReply("sync_arm", "rejected", "batch_conflict", 409); return;
-    }
-    memset(&syncOtaArm, 0, sizeof(syncOtaArm));
-    syncOtaArm.magic = SYNC_OTA_MAGIC;
-    strlcpy(syncOtaArm.owner, request["bridge_id"] | "", sizeof(syncOtaArm.owner));
-    strlcpy(syncOtaArm.jobId, job, sizeof(syncOtaArm.jobId));
-    randomHex(syncOtaArm.ticket, 16);
-    syncOtaArm.imageBytes = length;
-    memcpy(syncOtaArm.fileHash, hash, 32);
-    syncOtaArm.state = 1;
-    if (!syncOtaSave()) {
-        memset(&syncOtaArm, 0, sizeof(syncOtaArm));
-        syncReply("sync_arm", "rejected", "storage", 503); return;
-    }
-    int32_t args[] = {0, 0};
-    syncAppendEvent(syncRtc, syncLogWakeSeq, millis(), 8, args, 2);
-    JsonDocument fields;
-    fields["ticket"] = syncOtaArm.ticket;
-    fields["job_id"] = job;
-    syncReply("sync_arm", "applied", nullptr, 200, &fields);
-}
-
-static void handleSyncImage() {
-    JsonDocument request;
-    if (!syncCommand("sync_image", request)) return;
     const esp_partition_t *running = esp_ota_get_running_partition();
-    if (!running || !request["image_bytes"].is<uint32_t>()) {
-        syncReply("sync_image", "rejected", "shape", 400); return;
-    }
-    uint32_t length = request["image_bytes"].as<uint32_t>();
-    if (!length || length > running->size) {
-        syncReply("sync_image", "rejected", "range", 400); return;
+    String sizeText = server.arg("image_bytes");
+    char *end = nullptr;
+    unsigned long length = strtoul(sizeText.c_str(), &end, 10);
+    if (!running || !sizeText.length() || !end || *end || !length || length > running->size) {
+        server.send(400, "application/json", "{\"error\":\"range\"}"); return;
     }
     mbedtls_sha256_context sha;
     mbedtls_sha256_init(&sha);
     mbedtls_sha256_starts(&sha, 0);
-    uint8_t block[4096], hash[32];
+    std::vector<uint8_t> block(4096);
+    uint8_t hash[32];
     bool okay = true;
-    for (uint32_t offset = 0; offset < length; offset += sizeof(block)) {
-        size_t count = std::min((size_t)(length - offset), sizeof(block));
-        if (esp_partition_read(running, offset, block, count) != ESP_OK) { okay = false; break; }
-        mbedtls_sha256_update(&sha, block, count);
+    for (uint32_t offset = 0; offset < length; offset += block.size()) {
+        size_t count = std::min((size_t)(length - offset), block.size());
+        if (esp_partition_read(running, offset, block.data(), count) != ESP_OK) { okay = false; break; }
+        mbedtls_sha256_update(&sha, block.data(), count);
     }
     if (okay) mbedtls_sha256_finish(&sha, hash);
     mbedtls_sha256_free(&sha);
-    if (!okay) { syncReply("sync_image", "rejected", "storage", 503); return; }
+    if (!okay) { server.send(503, "application/json", "{\"error\":\"storage\"}"); return; }
     char hex[65];
     syncHex(hash, 32, hex);
-    if (syncOtaArm.magic == SYNC_OTA_MAGIC && syncOtaArm.state == 2 &&
-        syncOtaArm.imageBytes == length && !memcmp(hash, syncOtaArm.fileHash, 32))
-        syncOtaImageVerified = true;
-    JsonDocument fields;
-    fields["algorithm"] = "sha256-running-prefix-v1";
-    fields["image_bytes"] = length;
-    fields["sha256"] = hex;
-    fields["running_slot"] = running->label;
-    fields["fw_target"] = FW_TARGET_ID;
-    fields["fw"] = FW_VERSION;
-    syncReply("sync_image", "applied", nullptr, 200, &fields);
+    JsonDocument reply;
+    reply["algorithm"] = "sha256-running-prefix-v1";
+    reply["image_bytes"] = length;
+    reply["sha256"] = hex;
+    reply["device_mac"] = macText();
+    reply["running_slot"] = running->label;
+    reply["fw_target"] = FW_TARGET_ID;
+    reply["fw"] = FW_VERSION;
+    String body;
+    serializeJson(reply, body);
+    server.send(200, "application/json", body);
 }
 
 // POST /api/data: atomic complete snapshot inside the current context.
@@ -4654,13 +4547,11 @@ static void serviceV2Ble() {
             state["active_template_id"] = v2Profile.count ? v2Profile.ids[v2Profile.initial] : "";
             state["committed_job_id"] = v2Profile.jobId;
             state["applied_seq"] = v2DataSeq.appliedSeq();
-            state["data_seq"] = v2DataSeq.appliedSeq();
             state["power"]["mode"] = v2Plan.lightActive(v2NowMs()) ? "light" : "sleep";
             state["power"]["plan_id"] = v2Plan.acceptedId();
             state["power"]["remaining_s"] = v2Plan.remainingS(v2NowMs());
             state["power"]["provisional_remaining_s"] = v2Provisional ?
                 V2PlanState::bootProvisionalRemaining(v2BootMs, v2NowMs()) : 0;
-            state["power"]["manual_ble_hold_remaining_s"] = v2ManualBleHoldRemainingS();
             if (syncStoreAvailable()) {
                 OwnerRec current;
                 JsonObject sync = state["sync"].to<JsonObject>();
@@ -4671,12 +4562,10 @@ static void serviceV2Ble() {
                 sync["retry_skip"] = syncSkippedThisWake ? syncVisibleSkip : syncRtc.retrySkip;
                 SyncStoreBatch batch;
                 sync["pending"] = syncStoreActive(batch);
-                sync["completed_serial"] = syncStoreReceipt(batch)
-                    ? syncNumber(batch.clientSerial) : String("0");
             }
             String out;
             serializeJson(state, out);
-            v2Response(200, out);
+            v2Response(200, out, false);
         } else if (!strcmp(op, "sync_config")) {
             OwnerRec current;
             V2CommandSessionDecision session = v2CheckCommandSession(doc, macText(), &v2Nonce());
@@ -4688,7 +4577,6 @@ static void serviceV2Ble() {
                 bool changedOwner = syncOwner.length() && syncOwner != current.id;
                 bool ready = !changedOwner || syncStoreChangeOwner();
                 if (ready && changedOwner) {
-                    syncOtaClear();
                     syncAddReason(syncRtc, 1u);
                 }
                 Preferences p;
@@ -4900,7 +4788,7 @@ static void v2RendezvousRender(bool light) {
 }
 
 static void registerHttpRoutes() {
-    const char *bundleHeaders[] = {"X-Request-Id", "X-Session-Nonce", "X-Offset", "X-Codex-Sync-Ticket"};
+    const char *bundleHeaders[] = {"X-Request-Id", "X-Session-Nonce", "X-Offset", "Authorization"};
     server.collectHeaders(bundleHeaders, 4);
     server.on("/", HTTP_GET, handleStatus);
     server.on("/status.json", HTTP_GET, handleStatusJson);
@@ -4917,8 +4805,7 @@ static void registerHttpRoutes() {
     server.on("/api/sync/page", HTTP_POST, handleSyncPage);
     server.on("/api/sync/ack", HTTP_POST, handleSyncAck);
     server.on("/api/sync/complete", HTTP_POST, handleSyncComplete);
-    server.on("/api/sync/arm", HTTP_POST, handleSyncArm);
-    server.on("/api/sync/image", HTTP_POST, handleSyncImage);
+    server.on("/api/ota/image", HTTP_GET, handleOtaImage);
     server.on("/api/data", HTTP_POST, handleV2Data);
     server.on("/api/plan", HTTP_POST, handleV2Plan);
     server.on("/api/activate", HTTP_POST, handleV2Activate);
@@ -4946,34 +4833,14 @@ static void registerHttpRoutes() {
                     DevLog.println("[ota] rejected: unauthorized");
                     return;
                 }
-                // Dual-side target check: a ROM built for another firmware
-                // target must never be accepted (v2 §5/§9).
+                // Normal Bridge uploads include a target guard. Emergency
+                // token-authenticated uploads may omit it to recover from a
+                // broken Bridge or a ROM without our project marker.
                 if (server.hasArg("target") && server.arg("target") != FW_TARGET_ID) {
                     otaUploadDenied = true;
                     DevLog.printf("[ota] rejected: target %s != %s\n",
                                   server.arg("target").c_str(), FW_TARGET_ID);
                     return;
-                }
-                syncOtaTicketValid = false;
-                if (syncEnabled || syncOtaArm.magic == SYNC_OTA_MAGIC) {
-                    OwnerRec current;
-                    syncOtaTicketValid = syncOtaArm.magic == SYNC_OTA_MAGIC &&
-                        syncOtaArm.state == 1 && ownerGet(current) &&
-                        current.id == syncOtaArm.owner &&
-                        server.header("X-Codex-Sync-Ticket") == syncOtaArm.ticket;
-                    if (!syncOtaTicketValid) {
-                        otaUploadDenied = true;
-                        DevLog.println("[ota] rejected: sync ticket or owner");
-                        return;
-                    }
-                    syncOtaBytes = 0;
-                    mbedtls_sha256_init(&syncOtaHash);
-                    mbedtls_sha256_starts(&syncOtaHash, 0);
-                    syncOtaHashStarted = true;
-                    if (!syncOtaHashStarted) {
-                        otaUploadDenied = true;
-                        return;
-                    }
                 }
                 otaUploadDenied = false;
                 otaInProgress = true;
@@ -4990,47 +4857,15 @@ static void registerHttpRoutes() {
             } else if (up.status == UPLOAD_FILE_WRITE) {
                 if (otaUploadDenied || !otaInProgress) return;
                 otaLastDataMs = millis();
-                if (syncOtaTicketValid) {
-                    syncOtaBytes += up.currentSize;
-                    if (syncOtaBytes > syncOtaArm.imageBytes) {
-                        mbedtls_sha256_free(&syncOtaHash);
-                        syncOtaHashStarted = false;
-                        otaUploadCleanup("sync-size-or-hash");
-                        otaUploadDenied = true;
-                        syncOtaClear();
-                        return;
-                    }
-                    mbedtls_sha256_update(&syncOtaHash, up.buf, up.currentSize);
-                }
                 if (Update.write(up.buf, up.currentSize) != up.currentSize) {
                     DevLog.printf("[ota] write failed: %u\n", (unsigned)Update.getError());
                     otaUploadCleanup("write-failed");
-                    if (syncOtaHashStarted) { mbedtls_sha256_free(&syncOtaHash); syncOtaHashStarted = false; }
-                    syncOtaClear();
                     otaUploadDenied = true;
                 }
             } else if (up.status == UPLOAD_FILE_END) {
                 otaInProgress = false;
                 if (otaUploadDenied) { setOtaLock(false); return; }
-                if (syncOtaTicketValid) {
-                    uint8_t hash[32];
-                    if (syncOtaHashStarted) mbedtls_sha256_finish(&syncOtaHash, hash);
-                    bool valid = syncOtaHashStarted && syncOtaBytes == syncOtaArm.imageBytes &&
-                                 memcmp(hash, syncOtaArm.fileHash, 32) == 0;
-                    mbedtls_sha256_free(&syncOtaHash);
-                    syncOtaHashStarted = false;
-                    if (!valid) {
-                        otaUploadCleanup("sync-digest-mismatch");
-                        syncOtaClear();
-                        otaUploadDenied = true;
-                        return;
-                    }
-                }
                 if (Update.end(true)) {
-                    if (syncOtaTicketValid) {
-                        syncOtaArm.state = 2;
-                        if (!syncOtaSave()) DevLog.println("[ota] sync receipt storage failed");
-                    }
                     DevLog.printf("[ota] success %u bytes, rebooting shortly\n", (unsigned)up.totalSize);
                     screen({"OTA success", "Rebooting..."});
                     // 5 min light window for the bridge (NVS survives the OTA).
@@ -5043,12 +4878,9 @@ static void registerHttpRoutes() {
                 } else {
                     DevLog.printf("[ota] end failed: %u\n", (unsigned)Update.getError());
                     otaUploadCleanup("end-failed");
-                    if (syncOtaTicketValid) syncOtaClear();
                 }
             } else if (up.status == UPLOAD_FILE_ABORTED) {
                 otaUploadCleanup("aborted");
-                if (syncOtaHashStarted) { mbedtls_sha256_free(&syncOtaHash); syncOtaHashStarted = false; }
-                if (syncOtaTicketValid) syncOtaClear();
             }
         });
 }
@@ -5489,7 +5321,13 @@ void setup() {
     v2CtxGen.seed(esp_random());
     v2BundleReady = bsBegin();
     if (!syncStoreBegin()) DevLog.println("[sync] frozen store unavailable");
-    syncOtaLoad();
+    // Old ROMs persisted an OTA arm that could block recovery after A/B rollback.
+    Preferences oldOta;
+    if (oldOta.begin("sync-ota", false)) {
+        if (oldOta.isKey("arm")) oldOta.remove("arm");
+        oldOta.end();
+    }
+    syncRtc.reasonBits &= ~(1u << 3);
     {
         Preferences p;
         if (p.begin("sync-v1", true)) {

@@ -8,18 +8,18 @@
 > 测试结果、实机判据）搬到 `PROGRESS.md` 现场节，并在本文件删除该条。新增需求先入本文件
 > 再开 `project-workflow/<initiative>/`。
 
-## 0. 当前设备与产物快照（2026-09-25 核查）
+## 0. 当前设备与产物快照（2026-09-29；未更新项保留原核查日期）
 
 | 项 | 值 |
 |---|---|
-| 1.54" 设备 | MAC `70041DD7A340`，显示名"书桌屏"，IP `192.168.3.163`，`sync_enabled=true`，Profile `mini,quad` |
+| 1.54" 设备 | MAC `70041DD7A340`，显示名"书桌屏"，IP `192.168.3.163`，Profile 同步启用、按键顺序 `quad,mini`（2026-09-28 运行 state 核对） |
 | Note4 设备 | MAC `7C4FADB93408`，显示名"Note4"，IP `192.168.3.177`，`sync_enabled=true`，Profile `codex-status-a` |
 | 两设备可达性 | **2026-09-25 15:2x 已按键唤醒、实测可达**（`/status.json`+ARP 双证，MAC 与登记一致）；此后注意深睡仍会不可达 |
-| Note4 已装固件 | `0.18.23-note4-b`（09-25 实机核实：`0.18.23-note4-b`，slot `ota_1`，`wake=ext1`；PROGRESS 09-24 节里的 panel-power / 回退修正**未**刷入） |
-| 1.54 已装固件 | **2026-09-25 OTA 到 `0.18.23-bw`**（slot `ota_1`，1,740,576 B，`91937B18…`；此前为 `0.17.10-bw`）|
-| Note4 ROM | `.pio/build/zectrix-note4-b/firmware.bin` 1,758,032 B；**设备在机版本 = SHA256 `42AAF00B…BCF72E`（05:02 构建，已 OTA）**；本地产物因 2026-09-25 晚的构建探测被重编，现为 `6B3C386DFC59798A…5315`（18:10:05，内容等价，IDF 内嵌构建时间导致哈希必变） |
-| 1.54 ROM | `.pio/build/esp32-s3-epaper-154g/firmware.bin` **1,740,576 B，SHA256 `91937B18…85CF`（2026-09-25 15:58 用当前源码重建，`0.18.23-bw`）——当日 16:10 已 OTA 进设备**；旧的合并期产物 1,744,496 B / `E9046F6B…` 已被覆盖 |
-| 桥 | `bridge/target/debug/bridge-app.exe` 2026-09-25 04:43 构建（含唤醒窗口下界修复 + 族同步保留修正）。**2026-09-25 15:13:45 起运行中：PID 21848 + watchdog 41784**（8765/8766/8767 在听）；起桥须用非受限命令（受限沙箱会假失败并回收子进程，见 A1/A2 结论） |
+| Note4 已装固件 | 2026-09-29 认证 `/api/status`：`0.18.35-note4-b-ota1`、target `zectrix-note4-400x300`、最终 slot `ota_0`；新版 token-only 直接 OTA `UPDATE OK`、换槽、软件重启，运行镜像前缀 SHA256 与候选完全相同 |
+| 1.54 已装固件 | 2026-09-29 COM4 USB 刷入 `0.18.34-bw-ota1`，串口自报新版本；运行分区前 1,631,488 字节回读与候选逐字节一致。Bridge BLE 数据/Plan 已 ACK；旧诊断 checkpoint 返回 409，见 A0 |
+| Note4 ROM | `artifacts/rollout-20260928/note4-0.18.35-ota1.bin`，1,648,624 B，SHA256 `41882149824B917D252046721474684BFF6193C520625A4C1D0A3B6A7AF505E4`；旧→新及新版 token-only OTA 各一次，最终 `ota_0`，精确运行镜像哈希已核对 |
+| 1.54 ROM | `artifacts/rollout-20260928/154g-0.18.34-ota1.bin`，1,631,488 B，SHA256 `DDEE1ECAEB94714165E639CCD98C0327AFA5B3A46328153028C013B666249E1D`；USB 写入与整段哈希读回校验通过。`0.18.25-bw` 回退 ROM 保留；故障 `0.18.32-bw-sync1` 禁止再次上机 |
+| 桥 | `bridge/target/debug/bridge-app.exe`，SHA256 `74C6228946D3749A67035F9FFD9B9E9260EBBAFC418E9B54D88BD0353624FDB1`；2026-09-29 计划任务 Running、主 PID 10760、8765/8766 监听，运行 data 保留；书桌屏诊断旧 checkpoint 待恢复 |
 | 1.54 队列/模板 | **已解决（2026-09-25）**：`bundle_jobs` 为空；job `2bfc710c` = `succeeded`，设备 `committed_job_id=2bfc710c`、`v2_templates=2`(`mini,quad`)、`active=quad` 并已渲染。残留：数据帧被拒 `incomplete` → **见 A7** |
 | Note4 正常 | 最新 job `1b4500ad` = `succeeded`；2026-09-25 实机 `data_seq=applied_seq=63`，`committed_job_id=1b4500ad`/`commit_seq=267` |
 
@@ -42,7 +42,7 @@
 | Bridge 休眠设备的状态与延后操作 | S1–S4 已实现；S5 实机主路径通过、故障矩阵待验 | 两台 ROM 已按登记 MAC 顺序自然会合 OTA，各 1 次上传 ACK 且后续认证见新版本；两台完整 Bundle 发布 `succeeded`，1.54 的 waiting 发布跨 Bridge 重启后自然提交。实机发现并修正 OTA 待精确确认时阻塞后续发布、显式 sleep ACK 未记账；Bridge 已重建。剩余：错 IP/401/409 端到端注入、长期 PowerPlan 截止期、Note4 间歇 `display_state=failed` 诊断。当前 ROM 不提供可对照整文件哈希的运行镜像身份，OTA 保留 `awaiting_confirmation` / `version_seen_unproven`，精确 `image_verified` 待后续能力。证据见 `project-workflow/sleep-aware-bridge/`、`PROGRESS.md` 顶节。 |
 | Bridge 多实例 | 已交付（tag `bridge-multi-instance-2026-09-24`） | 无 |
 | Fake ROM 设备模拟器（同源 C++ + 可控实验时钟） | D/E/F 软件验收完成；G 按用户决定取消 | 软件证据见 `PROGRESS.md` 最新节；硬件特有错误仅留 case 文档，不在本项执行 |
-| 设备页、周期 Wi-Fi 与统一诊断流 | 源码进行中，未部署 | 设备页基础整理及 Note4 中间 ROM 已有源码/软件证据；完整 Fake ROM、视觉/实机验收和 1.54 最终构建仍待完成；见 C8 |
+| 设备页、周期 Wi-Fi 与统一诊断流 | Note4 与新版 Bridge 已部署；1.54 的新版 ROM 因 panic 已回退 | 先完成 A0，再做设备页真实窗口视觉、完整 Fake ROM 与实机故障矩阵；见 C8 |
 | 唤醒会合诊断（一次唤醒一条记录） | 仅计划 | 固件与桥两侧都未实现（见 C3） |
 | Bundle v3（manifest + 原始 dense 对象，省 ~71%） | 仅设计 | 未实现（见 C1） |
 | `device_first` / `bridge_first` 双策略会合 | `device_first` 已运行；双策略切换仅设计 + spike | `bridge_first` 及设备主动连接 Bridge 的反向 v2 HTTP 交换均未实现（见 C4） |
@@ -50,6 +50,11 @@
 | Bridge 独立于 Codex 生命周期 | 已改为按需 Windows 计划任务启动，待跨会话验收 | 退出 Codex 后确认 `CodexStatusBridge` 仍为 Running、Bridge 8765/8766 仍监听；本会话进程父级已核实为任务计划程序的 `svchost.exe`，见 `PROGRESS.md` 2026-09-27 节 |
 
 ## 2. 紧急（A 级：先做这些）
+
+### A0. 恢复书桌屏旧诊断 checkpoint 的同步确认
+
+- 双设备栈修复 ROM 已上机；Note4 的旧 3725 B 诊断批次在新 ROM 上完成，证明分页/ACK/complete 主路径可运行，详情见 `PROGRESS.md` 顶节。书桌屏 USB 恢复后，Bridge 本地 `diagnostics/70041DD7A340/checkpoint.json` 仍在等待旧批次 `1-cc96959b5a75e68e9559837e5eada4fd` 的设备 ACK，但设备已清空旧批次；重试 `sync_complete` 返回 409 `batch_conflict`。旧归档 JSON 已保存，不能把设备未确认伪写成已确认。
+- 设计并验证安全的 checkpoint 退役/重建路径：保留旧归档和失败原因，严格核对 MAC、归档 SHA、设备当前/最近批次及 client serial，再使书桌屏开始新批次；恢复后验证 `sync_begin/page/ack/complete`、后续会合和设备页。Note4 若再次自报 panic，因无 flash coredump 分区，需要 USB 串口实时抓取；当前新 ROM 短时运行和多批归档未复现。历史故障 ROM `0.18.32-bw-sync1` 不得重传。
 
 ### A1. 让桥恢复运行并恢复两台设备的可达性 — 阻塞几乎所有实机任务
 - **为什么紧急**：桥进程当前不在运行；两台设备 ping 不通。不解决则 A2/A3/B1/B3/B4 全部无法验证。
@@ -162,8 +167,8 @@
 - 前置：C3 的记录格式（否则没有可信的对照口径）。
 
 ### C8. 设备同步与诊断协议（device-sync-diagnostics）
-- `sync-v1` 实施合同见 `project-workflow/device-sync-diagnostics/design.md`。生产固件/Bridge 已有源码与 Note4 中间构建；设备页基础整理已入源码，测试覆盖部分 U 项，状态和未验边界见 `PROGRESS.md` 最新节。Fake ROM S01–S14、设备页 U01–U20 完整矩阵、真实窗口视觉和实机尚未完成（无 Bundle 设备的 BLE 会合→正式 Plan→首个 Bundle 安装已过 Fake ROM，仍需实机），不能把源码或中间 ROM 当发布。1.54 最终构建与增量重编问题按用户指示暂缓；Flash 断电恢复与真实分区哈希字节域仍须过证据门槛，不能静默降级。
-- 当前设备协议作为唯一业务协议的一次性统一见 `project-workflow/device-sync-diagnostics/protocol-unification.md`：业务 HTTP 已收敛到 `/api/*`，旧 `protocol=2`、BLE `rv=2`/`ack="v2"` 与 MCP `_v2` 入口已移除；继续完整 Fake ROM 验收和设备 Tab。两台现役旧固件需旧 Bridge 逐台 OTA 后才切换生产 Bridge；1.54 最终 ROM 暂缓期间不做生产 Bridge 切换，不保留长期双协议兼容。Bridge 本地 `state.json` 另作无损格式核查，不凭 wire 更名删除运行数据。
+- `sync-v1` 实施合同见 `project-workflow/device-sync-diagnostics/design.md`。Note4 `0.18.33-note4-b-sync1`、1.54 `0.18.32-bw-sync1` 与含设备页的新版 Bridge 已部署；两台自动 BLE 会合中的 status/config/plan/open ACK、受认证再次 OTA 上传 ACK 与重启换槽均实机验证，1.54 HTTP 数据 seq 124 `applied/displayed`，见 `PROGRESS.md` 最新节。两台同版本回归任务保留 `version_seen_unproven`，均无精确在机镜像 SHA256 证明。Fake ROM S01–S14、设备页 U01–U20 完整矩阵、真实窗口视觉及其他实机故障矩阵仍未完成（无 Bundle 设备的 BLE 会合→正式 Plan→首个 Bundle 安装已过 Fake ROM，仍需实机）。Flash 断电恢复与真实分区哈希字节域仍须过证据门槛。
+- 当前设备协议作为唯一业务协议的一次性统一见 `project-workflow/device-sync-diagnostics/protocol-unification.md`：业务 HTTP 已收敛到 `/api/*`，旧 `protocol=2`、BLE `rv=2`/`ack="v2"` 与 MCP `_v2` 入口已移除。两台设备现已升级，临时旧 Bridge 已停、新版默认实例已恢复。1.54 的增量缓存复核已完成，结论与四次构建日志见 `PROGRESS.md` 顶节；不并行运行两个 Bridge，也不保留长期双协议兼容。Bridge 本地 `state.json` 无损保留，不凭 wire 更名删除运行数据。
 - 实现每 15 次深睡 BLE 会合的一次性 Wi-Fi 同步，以及正式 light 入口和退出时的 Wi-Fi 同步；成功同步才重置计数。普通 BLE 保持精简，诊断日志按冻结批次经 Wi-Fi 增量同步，未确认内容保留。
 - 合并普通 `/log` 与跨深睡 `/history` 为统一、跨深睡、可分页/确认/报告 gap 的诊断流；OTA/Bundle 执行后以 Wi-Fi 报告分级结果并有限重试。设备页移除 Codex 余量、改善设备详情的采集时间和缺失解释；屏幕内容、模板、字体归模板页仅作归属声明，数据页排版暂不处理。
 - 以 Fake ROM 验证绝大多数协议和故障场景（S01–S14）；实机只验证 RF/GATT、ESP32 Wi-Fi 入网与 HTTP、light/deep 切换、RTC/Flash/bootloader 等模拟器不能证明的部分（H01–H03）。详见 `project-workflow/device-sync-diagnostics/plan.md`。
@@ -184,8 +189,7 @@
 - **重装在受限沙箱里跑不完**：uv 要写 `%LOCALAPPDATA%\uv\cache`（工作区外）→ `os error 5 拒绝访问` → `Failed to create a proper virtual environment`；`UV_CACHE_DIR` 指到工作区内可解这一条，但 `tool-esptoolpy` 的 editable 安装仍因写 junction 指向的共享包目录报 `Cannot update time stamp of directory 'esptool.egg-info'`（非致命警告）。要完整跑通需提权或把这两条路径纳入工作区。
 - **脚本坑**：`tools/pio-target.ps1` 在**后台作业**里会假失败——它 `& pio run` 时 cwd 丢失成 `D:\Documents\project`；给 pio 加 `-d <repo>`（或在前台 shell 跑脚本）即可。
 - `next.md §6` 的 `extends` 重构未做。「只构建 Note4」现仍成立，但已明确是**成本**约束。
-- **当前决定：不主动推进**；需要 1.54 固件时（见 A2/B4）用上面已验证的路径。
-- **2026-09-28 回头查**：sync-v1 期间切到 1.54 时虽未见 framework `*** Reinstall ***`，仍出现比预期广的库重编；用户要求暂缓，以 Note4 为准。后续核对实际失效源（源码清单、checksum、时间戳或目标快照）与 `tools/pio-target.ps1` 的零编译/增量复建证据，再构建 1.54 最终 ROM；不把较早源码的成功镜像当成当前版本。
+- **2026-09-28 回头查已完成**：在 Note4/Bridge OTA 闸门通过后才构建 1.54。此前 1.54 的 `.pio/build` 对象目录已不存在；PlatformIO 的全项目 `project.checksum` 纳入源码文件清单，结构变化使整个构建目录失效。重新建立缓存的首次 154g 构建 318 个对象、无 framework/IDF 库重编；其后 154g→Note4→154g 三次均零编译、ROM 哈希不变。详细证据见 `PROGRESS.md` 顶节及 `project-workflow/target-build-cache/plan.md`。`extends` 重构仍未做，但不影响已验证的目标切换；没有必要为避免正当的结构失效而伪造 checksum。
 
 ### C7. 其他单项遗留（已归档专项带出来的、仍然有效的条目）
 

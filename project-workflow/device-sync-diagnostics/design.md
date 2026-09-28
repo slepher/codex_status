@@ -219,6 +219,8 @@ owner过期时暂停业务，允许token保护显式claim；90s无进展仍生�
 
 ## 9. OTA/Bundle确认与真实镜像证明
 
+> 2026-09-29 OTA 修订：下述 `sync/arm`、ticket 与持久 `confirmation_pending` 是已部署旧 ROM 的过渡合同，不再适用于 `ota_auth=token` 新 ROM。新 ROM 只要求 BLE 签发的设备操作 token，直接调用 `/doUpdate`；`/api/ota/image` 仅凭该 token 返回运行分区前缀 SHA256，不依赖 sync owner/诊断批次。Bridge 对旧 ROM 保留 arm 路径直到升级完成，对新 ROM 直接上传并独立验证运行镜像。设备端不要求项目 marker；正常 Bridge 的 MAC/目标/marker/SHA256 预检继续保留。完整变更与部署证据见 `ota-recovery.md`、`PROGRESS.md` 最新节。
+
 ### OTA授权及回报
 
 Bridge在已获BLE light计划的Wi-Fi会话、上传前调用sync/arm，保存job_id、image_bytes、file_sha256及当前owner；设备持久返回ticket（32hex）。新协议OTA上传附X-Codex-Sync-Ticket，仍需原device token、target及owner门控；无/错token保持401。ticket只能绑定本次owner/job/长度/hash，不是写权限凭证。

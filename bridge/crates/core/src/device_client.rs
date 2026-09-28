@@ -255,6 +255,20 @@ pub fn status(ip: &str, token: &str, timeout: Duration) -> Result<Value> {
     Ok(serde_json::from_str(&body).context("device status json")?)
 }
 
+/// Running OTA partition hash, authorized by the device operation token alone.
+pub fn ota_image(ip: &str, token: &str, mac: &str, image_bytes: usize, timeout: Duration) -> Result<Value> {
+    let expected_mac = DeviceIdentity::normalized_mac(mac).context("invalid OTA target MAC")?;
+    let path = format!("/api/ota/image?image_bytes={image_bytes}");
+    let (status, body) = request(ip, "GET", &path, token, None, &[], timeout)?;
+    if status != 200 { bail!("device /api/ota/image HTTP {status}"); }
+    let mut image: Value = serde_json::from_str(&body).context("OTA image JSON")?;
+    let reported_mac = image["device_mac"].as_str()
+        .and_then(DeviceIdentity::normalized_mac).context("OTA image MAC missing")?;
+    if reported_mac != expected_mac { bail!("OTA image MAC mismatch"); }
+    image["device_mac"] = json!(reported_mac);
+    Ok(image)
+}
+
 /// sync-v1 keeps the device's precise error code (notably claim_required,
 /// digest_mismatch and batch_lost) and validates every response identity.
 pub fn sync(
@@ -268,8 +282,11 @@ pub fn sync(
     };
     let mut body = fields.clone();
     if !body.is_object() { bail!("sync fields must be an object"); }
+    let expected_mac = DeviceIdentity::normalized_mac(mac).context("invalid sync target MAC")?;
+    let wire_mac = format!("{}:{}:{}:{}:{}:{}", &expected_mac[0..2], &expected_mac[2..4],
+        &expected_mac[4..6], &expected_mac[6..8], &expected_mac[8..10], &expected_mac[10..12]);
     body["sync_version"] = json!(1);
-    body["device_mac"] = json!(mac);
+    body["device_mac"] = json!(wire_mac);
     body["bridge_id"] = json!(bridge_id);
     body["session_nonce"] = json!(nonce);
     body["request_id"] = json!(request_id);
@@ -278,7 +295,8 @@ pub fn sync(
     let (status, text) = request(ip, "POST", &path, token, Some(&bytes), &[], timeout)?;
     let reply: Value = serde_json::from_str(&text).context("sync response JSON")?;
     if status == 401 { bail!("sync unauthorized (401)"); }
-    if reply["device_mac"] != mac || reply["session_nonce"] != nonce ||
+    if reply["device_mac"].as_str().and_then(DeviceIdentity::normalized_mac).as_deref()
+            != Some(expected_mac.as_str()) || reply["session_nonce"] != nonce ||
         reply["request_id"] != request_id || reply["sync_version"] != 1 ||
         reply["op"] != format!("sync_{op}") {
         bail!("sync response identity mismatch");
@@ -552,5 +570,28 @@ mod tests {
             safe_error_category(&anyhow!(failed)),
             "transport_or_protocol"
         );
+    }
+
+    #[test]
+    fn ota_image_uses_token_without_sync_owner_and_checks_device_mac() {
+        for (reported, accepted) in [("AA:BB:CC:DD:EE:FF", true), ("11:22:33:44:55:66", false)] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap().to_string();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0u8; 1024];
+                let count = stream.read(&mut buffer).unwrap();
+                let request = String::from_utf8_lossy(&buffer[..count]);
+                assert!(request.starts_with("GET /api/ota/image?image_bytes=1024 HTTP/1.1"));
+                assert!(request.contains("Authorization: Bearer secret-token\r\n"));
+                let body = format!(r#"{{"device_mac":"{reported}","image_bytes":1024,"sha256":"abc"}}"#);
+                let reply = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                stream.write_all(reply.as_bytes()).unwrap();
+            });
+            let result = ota_image(&address, "secret-token", "AABBCCDDEEFF", 1024, Duration::from_secs(2));
+            server.join().unwrap();
+            if accepted { assert_eq!(result.unwrap()["device_mac"], "AABBCCDDEEFF"); }
+            else { assert!(result.unwrap_err().to_string().contains("MAC mismatch")); }
+        }
     }
 }

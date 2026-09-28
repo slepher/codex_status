@@ -1030,7 +1030,21 @@ pub async fn refresh_status(ctx: &AppCtx, mac: &str) -> Value {
                 status["fw"] == job.expected_version &&
                 status["image_identity"].as_array().is_some_and(|items|
                     items.iter().any(|item| item == "sha256-running-prefix-v1"))) {
-                if let Some(nonce) = status["session_nonce"].as_str() {
+                if status["ota_auth"] == "token" {
+                    let image_link = link.clone();
+                    let image_bytes = job.size;
+                    if let Some(operation_token) = bridge_mcp::load_device_token_at(
+                        &crate::mcp_config(ctx).data_root, mac) {
+                        let result = blocking(move || device_client::ota_image(
+                            &image_link.ip, &operation_token, &image_link.mac,
+                            image_bytes, Duration::from_secs(15)).map_err(err_text)).await;
+                        if let Ok(image) = result {
+                            if let Err(error) = service(ctx).ota_note_running_image(mac, &image) {
+                                tracing::warn!(device_mac = %mac, error = %error, "OTA image proof rejected");
+                            }
+                        }
+                    }
+                } else if let Some(nonce) = status["session_nonce"].as_str() {
                     for attempt in 0..3 {
                         let image_link = link.clone();
                         let nonce = nonce.to_owned();
@@ -1818,7 +1832,6 @@ pub async fn cycle(ctx: &AppCtx, mac: &str, refresh: bool, deliver_now: bool) {
             return;
         }
     }
-    if refresh { sync_http(ctx, &mac).await; }
     let ota = service(ctx).ota_job(&mac);
     let publish = service(ctx).job(&mac);
     if ota.as_ref().is_some_and(|j| j.blocks_following_work()) {
@@ -1831,6 +1844,9 @@ pub async fn cycle(ctx: &AppCtx, mac: &str, refresh: bool, deliver_now: bool) {
         && publish.as_ref().filter(|j| matches!(j["state"].as_str(), Some("waiting" | "sending" | "unknown")))
             .and_then(|j| j["created_at"].as_u64())
             .is_none_or(|created| ota.as_ref().unwrap().created_at <= created);
+    // A queued OTA has a bounded online window. A slow diagnostics transfer
+    // must not consume the status freshness budget before its claim check.
+    if refresh && !(ota_first && deliver_now) { sync_http(ctx, &mac).await; }
     if ota_first && bridge_mcp::load_device_token_at(&crate::mcp_config(ctx).data_root, &mac).is_none() {
         return;
     }
@@ -1857,7 +1873,9 @@ pub async fn cycle(ctx: &AppCtx, mac: &str, refresh: bool, deliver_now: bool) {
         };
         ota_window = plan_result["accepted"] == true
             && plan_result["ack"]["accepted_remaining_s"].as_u64().unwrap_or(0) >= 120;
-        if plan_result["accepted"] == true { sync_http(ctx, &mac).await; }
+        if plan_result["accepted"] == true && !(ota_first && deliver_now) {
+            sync_http(ctx, &mac).await;
+        }
     }
     if deliver_now {
         if ota_first {
@@ -1907,8 +1925,9 @@ async fn deliver_ota(ctx: &AppCtx, mac: &str) -> Value {
     let arm_job = job.clone();
     let ticket = match blocking(move || {
         let status = device_client::status(&arm_link.ip, &arm_link.token, timeout()).map_err(err_text)?;
-        if status["device_mac"] != arm_link.mac { return Err("OTA preflight MAC mismatch".into()); }
-        if status["sync_v1"] != 1 { return Ok(None); }
+        if status["device_mac"].as_str().and_then(DeviceIdentity::normalized_mac).as_deref()
+            != Some(arm_link.mac.as_str()) { return Err("OTA preflight MAC mismatch".into()); }
+        if status["ota_auth"] == "token" || status["sync_v1"] != 1 { return Ok(None); }
         if status["sync"]["enabled"] != true { return Err("sync-v1 is not configured".into()); }
         let nonce = status["session_nonce"].as_str().ok_or("OTA session nonce missing")?;
         let fields = json!({"job_id": arm_job.job_id, "kind":"ota",

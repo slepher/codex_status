@@ -461,7 +461,7 @@ async fn firmware_ota_inner(cfg: &McpConfig, args: &Value) -> Result<Vec<Value>,
         token = Some(fresh);
         upload = post_firmware(&ip, token.as_deref().unwrap(), bytes.clone(), filename, declared_target, sync_ticket).await;
     }
-    match upload {
+    let upload_ack = match upload {
         Ok(resp) if !resp.status().is_success() => {
             return Err(format!("doUpdate -> HTTP {}", resp.status()));
         }
@@ -478,6 +478,10 @@ async fn firmware_ota_inner(cfg: &McpConfig, args: &Value) -> Result<Vec<Value>,
                 }
                 return Err("OTA upload response had no UPDATE OK; result unknown".into());
             }
+            if !body.contains("UPDATE OK") {
+                return Err("OTA upload response had no UPDATE OK; result unknown".into());
+            }
+            true
         }
         Err(e) => {
             if upload_only {
@@ -487,8 +491,9 @@ async fn firmware_ota_inner(cfg: &McpConfig, args: &Value) -> Result<Vec<Value>,
             // A reset mid-response can also mean the device already rebooted,
             // so fall through to the version check before declaring failure.
             tracing::warn!("doUpdate transport error (details omitted to protect token)");
+            false
         }
-    }
+    };
 
     match wait_for_new_firmware(&ip, Some(before.as_str()), Duration::from_secs(60)).await {
         Some(fw) => {
@@ -499,10 +504,11 @@ async fn firmware_ota_inner(cfg: &McpConfig, args: &Value) -> Result<Vec<Value>,
                 path.display()
             ))])
         }
-        None => Err(
-            "upload finished but the device version did not change within 60 s; check the device /log"
-                .to_string(),
-        ),
+        None if upload_ack => Ok(vec![text_block(format!(
+            "firmware upload accepted ({} bytes from {}); rebooted image not verified because its version did not change or the device is offline",
+            bytes.len(), path.display()
+        ))]),
+        None => Err("OTA upload result unknown and rebooted image was not observed".into()),
     }
 }
 

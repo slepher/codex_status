@@ -212,16 +212,18 @@ SyncProtocolResult syncProtocolRun(const SyncProtocolInput &input,
             uint16_t limit = request["limit"] | 1024;
             if (!limit || limit > 1024 || offset > batch.bytes)
                 return answer(response, "rejected", "range", 400);
-            uint8_t bytes[1024]; size_t length = 0;
-            if (!syncStorePage(offset, limit, bytes, length))
+            std::vector<uint8_t> bytes(1024);
+            size_t length = 0;
+            if (!syncStorePage(offset, limit, bytes.data(), length))
                 return answer(response, "rejected", "storage", 503);
-            char encoded[1369], hash[65]; uint8_t digest[32];
-            syncBase64(bytes, length, encoded, sizeof(encoded));
-            syncSha256(bytes, length, digest); syncHex(digest, 32, hash);
+            std::vector<char> encoded(1369);
+            char hash[65]; uint8_t digest[32];
+            syncBase64(bytes.data(), length, encoded.data(), encoded.size());
+            syncSha256(bytes.data(), length, digest); syncHex(digest, 32, hash);
             response["batch_id"] = std::string(batch.batchId);
             response["offset"] = offset;
             response["next_offset"] = offset + length;
-            response["data_b64"] = encoded;
+            response["data_b64"] = encoded.data();
             response["chunk_sha256"] = hash;
             response["more"] = offset + length < batch.bytes;
             return answer(response, "applied");
