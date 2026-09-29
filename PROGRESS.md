@@ -1,5 +1,12 @@
 # Codex Status 项目进度（交接文档）
 
+## Note4 Profile 字体资产与显示结果修正（2026-09-30 香港时间）
+
+- 用户最终选定纯拉丁 Noto Serif ExtraLight 200、18 px。Bridge Profile 的 `ntthin18` 槽位选择 CSFN `81d583bc`（2492 B，SHA256 `DD75FED034D91BA8B8A5F342D9B787F58AAA632D167D6E832C3DA3DC1EE773F5`）；设备 Profile 与 400×300 默认家族 Profile 均已保存该选择。模板 JSON 布局及主余量数字未改。此前 Light 300 Bundle job `39e4084f` 已成功（commit 354），不能把发布瞬间的 `waiting` 误报为最终未送达；ExtraLight 200 Bundle job `5d798bd9` 也已 `succeeded`，设备认证报告 `commit_seq=355`、active=`codex-status-a`。当前缺实机照片确认字形；同源宿主预览在 `artifacts/previews/note4-extralight200-profile-bundle.png`，JSON/Compiled/回环像素差均 0。
+- 字体资产通过现有完整 A/B Bundle 冻结与提交：Bridge 校验设备 `bundle_font_protocol=1`，固件提交前验证 CSFN 字节、ID、名称、目标与数量，开机从已提交 Bundle 恢复字形覆盖。宿主 Bundle 安装、重启恢复、坏资产拒绝且活动槽保持的测试通过。**这不是**尚未定稿的独立 manifest 增量字体协议。最终默认 Bridge 已更新，`bridge/target/debug/bridge-app.exe` SHA256 `BA066990D60CCF2E8AAA86BC23D8B1D888C66433249893109DD052012C60F163`；计划任务 Running、8765/8766 均由主 PID 62348 监听（PID 仅为当时现场），运行 `data/` 保留。此版本设备页在可见时每 3 秒读取 Bridge 本地缓存及展开的升级历史，不需要手动刷新整页；MCP 直接读相同服务状态。
+- Note4 字体支持 ROM `0.18.39-note4-b-font1` 的 OTA job `def36c70` 已 `succeeded/image_verified`，设备认证运行镜像前 1,654,256 B SHA256 与发布文件 `6D555E7508B020680C3E5F6669AE89571A742601D3859ED42769727A950` 相同。此版仍将“局刷失败后整刷成功”误判为 `display_state=failed`。显示结果修正版 `0.18.40-note4-b-display1` 只构建目标 `zectrix-note4-b` 成功，ROM `artifacts/rollout-20260928/note4-0.18.40-display1.bin`，1,654,368 B，SHA256 `CCE4EE46C8E09BF34359DA4E6A5012FD255A5F3E5D9AE4156DA747A635104F16`，marker `codex-status-ota-v1|zectrix-note4-400x300|0.18.40-note4-b-display1`；OTA job `10ec4b37` 已 `succeeded/image_verified`，认证运行镜像的长度及 SHA256 与文件匹配。设备最新 `commit_seq=356`、active=`codex-status-a`、`display_state=displayed`、`epd_writes=8`、`epd_busy_fails=0`；Bridge 设备投影显示“屏幕已显示”。源码以成功写入优先于局刷失败计数，保留失败计数用于诊断；同源宿主测试覆盖回退整刷成功/真正未写入失败。面板实体字形仍待用户目视确认。
+- 最终 `cargo test -p bridge-app -p bridge-core -p bridge-render --target-dir target/rollout-20260928` 通过（app 45/1 ignored、core 96、render 各测试含 20 项状态测试），`node tools/test-device-page.mjs`、`git diff --check` 通过。剩余：实体屏幕字形目视确认；A3 真实局刷失败根因与长期残影仍在 backlog。
+
 ## Note4 休眠唤醒保留 Bridge 图标状态（2026-09-29 香港时间）
 
 - 用户纠正：休眠转唤醒、Wi-Fi 尚在扫描/关联时 Bridge 图标保持休眠前的 ON/OFF，连接尝试实际失败后才切 OFF；这是 ROM 状态逻辑，模板只负责按 `device.offline_mins` 显示两种图标。本轮未改模板或重新发布 Bundle。固件在 RTC 的 `rtcDeepGlyph` bit3 保留上次 Bridge OFF 状态，深睡时钟唤醒及 Wi-Fi 连接期沿用；连接结束后仍用现有 Wi-Fi/Bridge 联系判定刷新。无保存网络/空 SSID 的提前失败路径也立即落 OFF。

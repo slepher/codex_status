@@ -297,7 +297,7 @@
       <details class="card" ontoggle="if(this.open) loadDeviceDetail('runtime_display')">
         <summary>运行与显示详细信息</summary><div class="card" id="detail-runtime_display">展开时读取本地缓存…</div>
       </details>
-      <details class="card" ontoggle="if(this.open) loadDeviceDetail('upgrade_history')">
+      <details class="card" id="details-upgrade_history" ontoggle="if(this.open) loadDeviceDetail('upgrade_history')">
         <summary>升级与发布历史归档</summary><div class="card" id="detail-upgrade_history">展开时读取本地缓存…</div>
       </details>
       <details class="card" ontoggle="if(this.open) loadDeviceDetail('sync_diagnostics')">
@@ -507,10 +507,11 @@
   }
 
   async function familyTemplatePng(renderTarget, id) {
-    const key = `${renderTarget}\u0000${id}`;
+    const fontIds = familyProfile?.font_ids || {};
+    const key = `${renderTarget}\u0000${id}\u0000${JSON.stringify(fontIds)}`;
     if (familyThumbCache.has(key)) return familyThumbCache.get(key);
     const template = await invoke('platform_template_get', { id, renderTarget });
-    const preview = await invoke('platform_template_preview', { json: template.source });
+    const preview = await invoke('platform_template_preview', { json: template.source, fontIds });
     familyThumbCache.set(key, preview.png_base64);
     return preview.png_base64;
   }
@@ -893,7 +894,7 @@
   async function previewFamilyTemplate(id, renderTarget = selectedRenderTarget) {
     try {
       const template = await invoke('platform_template_get', { id, renderTarget });
-      const preview = await invoke('platform_template_preview', { json: template.source });
+      const preview = await invoke('platform_template_preview', { json: template.source, fontIds: familyProfile?.font_ids || {} });
       openModal(`<h3>预览 ${escapeHtml(id)}</h3><img style="max-width:400px;max-height:400px;image-rendering:pixelated;border:1px solid var(--line)" src="data:image/png;base64,${preview.png_base64}"><div class="foot"><button onclick="closeModal()">关闭</button></div>`);
     } catch (e) { familyProfileError('预览', e); }
   }
@@ -915,10 +916,6 @@
       $('sub').textContent = `LAN ${s.lan_ip}:${s.http.split(':').pop()} · 轮询 ${s.interval_secs}s · BLE ${s.ble_interval_secs}s`;
       paused = !!s.paused;
       $('dot').className = 'dot ' + (s.last_error ? 'err' : (s.last_sync ? 'ok' : 'warn'));
-      if (document.querySelector('.tabs button[data-tab="device"]').classList.contains('on')
-          && selectedDeviceMac && Date.now() - (lastDeviceFetch.get(selectedDeviceMac) || 0) > 15000) {
-        refreshDevice();
-      }
     } catch (e) {
       $('sub').textContent = '读取失败：' + e;
     }
@@ -932,7 +929,6 @@
     });
   }
 
-  const lastDeviceFetch = new Map();
   let deviceSelectionGeneration = 0;
   let deviceStatusRequest = 0;
   let platformDeviceRequest = 0;
@@ -1064,11 +1060,17 @@
     await Promise.all([refreshPlatformDevice(), refreshDevice()]);
   }
 
+  function refreshVisibleDevice() {
+    if (!selectedDeviceMac || !document.querySelector('.tabs button[data-tab="device"]').classList.contains('on')) return;
+    const update = refreshDevice(); // Bridge cache only; this never wakes or contacts the device.
+    if ($('details-upgrade_history').open) loadDeviceDetail('upgrade_history');
+    return update;
+  }
+
   async function refreshDevice() {
     if (!selectedDeviceMac) return;
     const mac = selectedDeviceMac, generation = deviceSelectionGeneration;
     const request = ++deviceStatusRequest;
-    lastDeviceFetch.set(mac, Date.now());
     try {
       const result = await invoke('platform_device_view', { mac });
       if (!isCurrentDevice(mac, generation) || request !== deviceStatusRequest) return;
@@ -1581,7 +1583,7 @@
   // Resolve the selected device before painting the device-dependent cards.
   refreshPlatformDevice().then(() => { refresh(); refreshDevice(); refreshPlatformPower(); });
   refreshPlatformData();
-  setInterval(refresh, 3000);
+  setInterval(() => { refresh(); refreshVisibleDevice(); }, 3000);
 </script>
 </body>
 </html>

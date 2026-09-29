@@ -15,13 +15,13 @@
 | 1.54" 设备 | MAC `70041DD7A340`，显示名"书桌屏"，IP `192.168.3.163`，Profile 同步启用、按键顺序 `quad,mini`（2026-09-28 运行 state 核对） |
 | Note4 设备 | MAC `7C4FADB93408`，显示名"Note4"，IP `192.168.3.177`，`sync_enabled=true`，Profile `codex-status-a` |
 | 两设备可达性 | **2026-09-25 15:2x 已按键唤醒、实测可达**（`/status.json`+ARP 双证，MAC 与登记一致）；此后注意深睡仍会不可达 |
-| Note4 已装固件 | 2026-09-29 OTA job `5c8fa176`：`0.18.38-note4-b-bridge2`、target `zectrix-note4-400x300`，认证 `image_verified` |
+| Note4 已装固件 | 2026-09-30 OTA job `10ec4b37`：`0.18.40-note4-b-display1`、target `zectrix-note4-400x300`，认证 `image_verified` |
 | 1.54 已装固件 | 2026-09-29 COM4 USB 刷入 `0.18.34-bw-ota1`，串口自报新版本；运行分区前 1,631,488 字节回读与候选逐字节一致。Bridge BLE 数据/Plan 已 ACK；旧诊断 checkpoint 返回 409，见 A0 |
-| Note4 ROM | `artifacts/rollout-20260928/note4-0.18.38-bridge2.bin`，1,649,984 B，SHA256 `F26B41F2115B682CA10426BE22C84C6B4BE2E12FDE4D8DE9F2EF97AB808DF7EB`；OTA job `5c8fa176` 已 `image_verified` |
+| Note4 ROM | `artifacts/rollout-20260928/note4-0.18.40-display1.bin`，1,654,368 B，SHA256 `CCE4EE46C8E09BF34359DA4E6A5012FD255A5F3E5D9AE4156DA747A635104F16`；OTA job `10ec4b37` 已 `image_verified` |
 | 1.54 ROM | `artifacts/rollout-20260928/154g-0.18.34-ota1.bin`，1,631,488 B，SHA256 `DDEE1ECAEB94714165E639CCD98C0327AFA5B3A46328153028C013B666249E1D`；USB 写入与整段哈希读回校验通过。`0.18.25-bw` 回退 ROM 保留；故障 `0.18.32-bw-sync1` 禁止再次上机 |
-| 桥 | `bridge/target/debug/bridge-app.exe`，SHA256 `DB6A8F95A699B763E738B06ADE6042EBCC18B8C4A405F563FEB2D093E7C8A5AA`；2026-09-29 计划任务 Running、8765/8766 监听，运行 data 保留；含已部署 Note4 模板支持与设备页时间收束 |
+| 桥 | `bridge/target/debug/bridge-app.exe`，SHA256 `BA066990D60CCF2E8AAA86BC23D8B1D888C66433249893109DD052012C60F163`；2026-09-30 计划任务 Running、8765/8766 监听，运行 data 保留；含 Profile 字体资产发布与设备页自动刷新 |
 | 1.54 队列/模板 | **已解决（2026-09-25）**：`bundle_jobs` 为空；job `2bfc710c` = `succeeded`，设备 `committed_job_id=2bfc710c`、`v2_templates=2`(`mini,quad`)、`active=quad` 并已渲染。残留：数据帧被拒 `incomplete` → **见 A7** |
-| Note4 正常 | 最新 Bundle job `6820d9a0` = `succeeded`；2026-09-29 实机 `committed_job_id=6820d9a0` / `commit_seq=351`，用户确认数字布局正常；`display_state=failed` 的局刷/整刷判定问题见 A3 |
+| Note4 正常 | ExtraLight 200 字体 Bundle job `5d798bd9` = `succeeded`；新 ROM `0.18.40` 实机 `commit_seq=356` / active=`codex-status-a` / `display_state=displayed`；屏幕实体字形仍待目视确认，局刷失败根因见 A3 |
 
 ## 1. 产品需求 → 实现状态
 
@@ -36,7 +36,7 @@
 | 两台设备离线深睡时钟准度 | 整秒锚点已修、双 ROM 已顺序 OTA，准度待验 | Note4 原约慢 15 分钟/天、1.54 约慢 8 分钟/天；两台认证版本已变为 0.18.25。1.54 最近电量 12%，需先确保离线测试不会被低电保护中断；各自离线 24 h 复测后，再判断内部 RC 剩余漂移。证据见 `PROGRESS.md` 最新节 |
 | 深睡功耗与电池续航 | 部分交付 | panel-power 双模式已实现但未刷入；bench 电流/残影/重复唤醒**从未测量**（见 D1） |
 | 1.54 设备时钟局刷与全刷交替 | 源码已修 | 未刷机、未实机验收（见 B4） |
-| 字体引擎化（CSFN 容器 + 设备字体库 + manifest 增量发布） | 引擎已实现，协议未定稿 | `note4-bridge-publish/protocol.md` 仍是**待双方确认草案**，设备侧无增量端点（见 D3） |
+| 字体引擎化（CSFN 容器 + Profile 内版本选择） | 完整 A/B Bundle 路径已实机安装 ExtraLight 200 | manifest 增量发布仍待定稿，设备侧无增量端点（见 C5） |
 | Bridge 多设备界面 + 按 MAC 推送 | 已交付 | 单设备全局身份已换成按 MAC 运行记录；UI 与 MCP 的设备类操作要求显式 MAC，多设备缺 MAC 一律要求选择（2026-09-25 两台实机自检，见 `PROGRESS.md` 顶部节）；剩余见 C7 的 `bridge-multi-device-ui` 行 |
 | Bridge 界面视觉与信息层级 | 第一版已重建并运行 | 四个 Tab 已统一视觉；设备/数据/MCP 内容已重排。待打开窗口肉眼验收，并按第一版反馈细化（见 `project-workflow/bridge-ui-redesign/`） |
 | Bridge 休眠设备的状态与延后操作 | S1–S4 已实现；S5 实机主路径通过、故障矩阵待验 | 两台 ROM 已按登记 MAC 顺序自然会合 OTA，各 1 次上传 ACK 且后续认证见新版本；两台完整 Bundle 发布 `succeeded`，1.54 的 waiting 发布跨 Bridge 重启后自然提交。实机发现并修正 OTA 待精确确认时阻塞后续发布、显式 sleep ACK 未记账；Bridge 已重建。剩余：错 IP/401/409 端到端注入、长期 PowerPlan 截止期、Note4 间歇 `display_state=failed` 诊断。当前 ROM 不提供可对照整文件哈希的运行镜像身份，OTA 保留 `awaiting_confirmation` / `version_seen_unproven`，精确 `image_verified` 待后续能力。证据见 `project-workflow/sleep-aware-bridge/`、`PROGRESS.md` 顶节。 |
@@ -89,7 +89,7 @@
 - **仍待做**：按一次 1.54 按键本地切到 `quad`，现场确认契约会跟着刷新（单测已覆盖逻辑）。
 
 ### A3. 修掉 Note4 深睡时钟残影（唯一影响日常观感的显示缺陷）
-- **2026-09-29 新诊断**：Note4 新模板 Bundle job `6820d9a0` 已成功且实机布局正常，但 `display_state=failed`。统一诊断批次 49/50 有三次 `[epd] partial failed; escalating to full refresh`；`epd_busy_fails=3`，后来 `epd_trusted=true`、`epd_writes=10`。`main.cpp` 用渲染期间失败计数是否增加判断最终显示状态，成功整刷也被记为 failed。待将局刷失败原因分型（影子帧、分配、BUSY/阶段），让最终状态按实际落屏结果报告，并确认有无硬件侧间歇 BUSY 故障；不要把当前 failed 当作模板提交失败。
+- **2026-09-30 进展**：ExtraLight 200 Bundle job `5d798bd9` 已成功；`0.18.40-note4-b-display1` OTA job `10ec4b37` 已认证 `image_verified`，设备新回报 `display_state=displayed`、`epd_busy_fails=0`。源码以成功写入计数优先于局刷失败计数，宿主覆盖“局刷失败后整刷成功”及真正未写入失败。仍需将局刷失败原因分型（影子帧、分配、BUSY/阶段）并确认有无硬件侧间歇 BUSY 故障；旧 `failed` 不能当作模板提交失败。
 - **现象**：deep 期间只写时钟窗口，残影累积；`SYNC`/用量属整帧元素所以停在最后一次整帧（现场曾被读成 `04:64`）。
 - **根因（已用代码核实，2026-09-25）**：**v2 设备上时钟窗口的 ghost 预算根本没有被评估**。预算判定只在 `deepNetworkCycle()`（`main.cpp:5166` 渲染门 / `5177` 强制清影），而它唯一的调用点在 `main.cpp:5697`，进入条件是 `!(deepWakePath && v2BundleReady)`（`main.cpp:5678`）。Note4 有已提交 v2 Bundle → 走 `5678-5693` → `deepNetworkCycle()` 从不被调用 → `rtcClkPartials >= CLK_GHOST_LIMIT` **永不成立**，计数器只增不减。v2 会合真正走的 `v2RendezvousClockRender()`（`main.cpp:4617`）只检查 `clkR.valid`/`activeTplHasNow`/`timeKnown()`/`clkPixelsValid`，**无预算检查**。
 - ⚠️ **曾经写错、此处纠正**：上一版这里写过「已过时，rtcClkPartials 现已覆盖两条路径」——那是错的，更早的 `PROGRESS.md:37` 才对。落笔前请自己复核 `main.cpp:5678` 的分支条件。
@@ -176,7 +176,7 @@
 - 以 Fake ROM 验证绝大多数协议和故障场景（S01–S14）；实机只验证 RF/GATT、ESP32 Wi-Fi 入网与 HTTP、light/deep 切换、RTC/Flash/bootloader 等模拟器不能证明的部分（H01–H03）。详见 `project-workflow/device-sync-diagnostics/plan.md`。
 
 ### C5. 字体资产增量发布
-- 引擎侧已交付（单一字体注册表 + CSFN 容器 + 设备字体库），整包 Bundle 可发布。
+- 单一字体注册表 + CSFN 容器已交付；Profile 版本选择经完整 A/B Bundle 发布与重启恢复，Note4 已安装 18 px ExtraLight 200（job `5d798bd9`、commit 355）。Bridge 模板页预览使用 Profile 资产；实体字形待目视核对。
 - 未定稿：`docs/history/workflow/note4-bridge-publish/protocol.md`（manifest/CSFN 增量发布合同）仍是**待双方确认草案**；设备侧无增量端点、仍是 ABI 1 时代的 48 KiB/8 字体实现。
 - 结论：在 C1（Bundle v3）定案前不要启动，否则两套编码器要一起改。
 

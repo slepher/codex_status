@@ -9,6 +9,7 @@
 #include "GUI_Paint.h"
 #include "fonts.h"
 #include "font_noto.h"
+#include "font_asset.h"
 
 // Canvas size is a target property (v2 §5): set once at boot (or by the host
 // harness) instead of being compiled in, so one engine serves 200x200 and
@@ -568,6 +569,26 @@ static const TplFontEntry TPL_FONTS[] = {
 #endif
 };
 
+static Note4PropFont sAssetFonts[sizeof(TPL_FONTS) / sizeof(TPL_FONTS[0])];
+static bool sAssetBound[sizeof(TPL_FONTS) / sizeof(TPL_FONTS[0])] = {};
+
+void tplFontClearAssets() {
+    memset(sAssetBound, 0, sizeof(sAssetBound));
+}
+
+bool tplFontBindAsset(const uint8_t *bytes, size_t len) {
+    FontAssetInfo info;
+    String err;
+    if (!fontAssetValidate(bytes, len, info, err) ||
+        !fontAssetMatchesTarget(info, err)) return false;
+    int index = tplFontIndexByName(info.name);
+    if (index < 0 || TPL_FONTS[index].kind != FONT_KIND_PROP ||
+        sAssetBound[index]) return false;
+    if (!fontAssetView(bytes, len, info, sAssetFonts[index])) return false;
+    sAssetBound[index] = true;
+    return true;
+}
+
 int tplFontCount() {
     return (int)(sizeof(TPL_FONTS) / sizeof(TPL_FONTS[0]));
 }
@@ -606,7 +627,8 @@ static sFONT *fontByIndex(int idx) {
 // The proportional large-display family; index >= tplFontFixedCount().
 static const Note4PropFont *propFontByIndex(int idx) {
     const TplFontEntry *e = fontEntry(idx);
-    return (e && e->kind == FONT_KIND_PROP) ? e->prop : nullptr;
+    return (e && e->kind == FONT_KIND_PROP)
+        ? (sAssetBound[idx] ? &sAssetFonts[idx] : e->prop) : nullptr;
 }
 
 bool tplFontCellByName(const char *name, int &cellW, int &cellH) {

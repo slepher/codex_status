@@ -861,6 +861,7 @@ pub fn template_preview(
     id: Option<&str>,
     source: Option<&Value>,
     usage: Option<&str>,
+    font_ids: Option<&std::collections::BTreeMap<String, String>>,
 ) -> Result<Value, String> {
     let source = match source {
         Some(s) => s.clone(),
@@ -883,7 +884,14 @@ pub fn template_preview(
             .and_then(|envelope| serde_json::to_string(&envelope).ok())
             .unwrap_or_default(),
     };
-    let bits = bridge_render::render_bits(&text, &usage, &bridge_render::Env::default())
+    let fonts = match font_ids {
+        Some(ids) => service(ctx).preview_fonts_by_ids(ids).map_err(err_text)?,
+        None => match crate::selected_mac(ctx) {
+            Some(mac) => service(ctx).profile_preview_fonts(&mac).map_err(err_text)?,
+            None => Vec::new(),
+        },
+    };
+    let bits = bridge_render::render_bits_with_fonts(&text, &usage, &bridge_render::Env::default(), fonts)
         .map_err(err_text)?;
     let (width, height) = bridge_render::canvas_size(&text).ok_or("unsupported canvas")?;
     let png = bridge_render::bits_to_png_size(&bits, width, height).map_err(err_text)?;
@@ -1724,6 +1732,10 @@ pub fn caps_from_status(raw: &Value) -> Result<DeviceCapabilities, String> {
         )?,
         max_templates,
         max_bundle_bytes,
+        bundle_font_protocol: checked_u32(
+            raw.get("bundle_font_protocol").and_then(Value::as_u64).unwrap_or(0),
+            "bundle_font_protocol",
+        )?,
         asset_publish_protocol: checked_u32(
             raw.get("asset_publish_protocol")
                 .and_then(Value::as_u64)

@@ -717,6 +717,13 @@ fn shared_status_snapshot_preserves_fields_time_and_read_only_state() {
 }
 
 #[test]
+fn recovered_partial_refresh_reports_the_final_full_write() {
+    assert_eq!(bridge_render::display_state_after_render(10, 11, 3, 4), 1);
+    assert_eq!(bridge_render::display_state_after_render(10, 10, 3, 4), 3);
+    assert_eq!(bridge_render::display_state_after_render(10, 10, 3, 3), 1);
+}
+
+#[test]
 fn shared_claim_decisions_prepare_text_and_classify_owner_actions() {
     let current = serde_json::json!({
         "id": "held", "name": "Held", "host": "old-host", "port": 7,

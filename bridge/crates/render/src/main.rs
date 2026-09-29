@@ -7,6 +7,7 @@ use bridge_render::{
 
 struct Args {
     template: PathBuf,
+    font: Option<PathBuf>,
     usage: Option<PathBuf>,
     out: Option<PathBuf>,
     diff: Option<PathBuf>,
@@ -25,6 +26,7 @@ struct Args {
 fn parse_args() -> Args {
     let mut args = Args {
         template: PathBuf::new(),
+        font: None,
         usage: None,
         out: None,
         diff: None,
@@ -44,6 +46,7 @@ fn parse_args() -> Args {
         let mut value = || iter.next().expect("missing value");
         match flag.as_str() {
             "--template" => args.template = PathBuf::from(value()),
+            "--font" => args.font = Some(PathBuf::from(value())),
             "--usage" => args.usage = Some(PathBuf::from(value())),
             "--out" => args.out = Some(PathBuf::from(value())),
             "--diff" => args.diff = Some(PathBuf::from(value())),
@@ -82,6 +85,11 @@ fn bit_diff(a: &[u8], b: &[u8], width: u32, height: u32) -> anyhow::Result<usize
 fn main() -> anyhow::Result<()> {
     let args = parse_args();
     let template = std::fs::read_to_string(&args.template)?;
+    let font_bytes = args.font.as_ref().map(std::fs::read).transpose()?;
+    bridge_render::font_clear_assets();
+    if let Some(bytes) = &font_bytes {
+        anyhow::ensure!(bridge_render::font_bind_asset(bytes), "font asset cannot bind to template font slot");
+    }
     let usage = match &args.usage {
         Some(path) => std::fs::read_to_string(path)?,
         None => String::new(),

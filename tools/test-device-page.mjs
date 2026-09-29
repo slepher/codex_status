@@ -9,6 +9,7 @@ assert(!html.includes('id="pt-fonts"'));
 assert(!html.includes('屏幕内容与发布'));
 const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
 assert(script);
+assert(script.includes('setInterval(() => { refresh(); refreshVisibleDevice(); }, 3000)'));
 for (const [, id] of script.matchAll(/\$\('([^']+)'\)/g))
   assert(html.includes('id="' + id + '"'), 'missing DOM id ' + id);
 const source = script.slice(0, script.lastIndexOf('\n  renderFamilyMenu();'));
@@ -23,12 +24,14 @@ const element = id => {
 };
 const calls = [];
 const handlers = {};
+let deviceTabOn = false;
 const context = vm.createContext({
   window: { __TAURI__: { core: { invoke: (name, args) => {
     calls.push({ name, args });
     return Promise.resolve(handlers[name]?.(args) ?? {});
   } } } },
-  document: { getElementById: element, querySelectorAll: () => [], addEventListener() {} },
+  document: { getElementById: element, querySelectorAll: () => [],
+    querySelector: () => ({ classList: { contains: () => deviceTabOn } }), addEventListener() {} },
   localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
   setInterval() {}, structuredClone,
 });
@@ -93,6 +96,14 @@ sameWifi.device.contact = { ...sameWifi.device.contact, transport: 'http', last_
 handlers.platform_device_view = () => sameWifi;
 await run('refreshDevice()');
 assert.equal(element('dev-contact-row').hidden, true);
+deviceTabOn = true;
+handlers.platform_device_view = () => view(macA, 'current');
+await run('refreshVisibleDevice()');
+assert.equal(element('dev-verdict').textContent, '已是最新版');
+deviceTabOn = false;
+const visibleCalls = calls.length;
+run('refreshVisibleDevice()');
+assert.equal(calls.length, visibleCalls);
 handlers.platform_device_detail = ({ mac, section }) => ({
   device_mac: mac, section, data: { target: 'codex-status-154g', slot: { value: 'ota_0', observed_at: 10 } },
 });

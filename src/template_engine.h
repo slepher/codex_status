@@ -37,6 +37,10 @@ int tplFontCount();
 int tplFontFixedCount();
 int tplFontIndexByName(const char *name);
 const char *tplFontNameByIndex(int idx);
+// Bind validated CSFN bytes to an existing proportional font name for the
+// active Profile. The caller keeps bytes alive until tplFontClearAssets().
+bool tplFontBindAsset(const uint8_t *bytes, size_t len);
+void tplFontClearAssets();
 
 // Conservative text cell for one font: the bitmap family reports its uniform
 // cell, the proportional family the line height and the widest advance.

@@ -353,6 +353,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "bridge-render",
  "chrono",
  "clap",
@@ -389,6 +390,7 @@ name = "bridge-render"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "bridge-core",
  "cc",
  "png 0.17.16",

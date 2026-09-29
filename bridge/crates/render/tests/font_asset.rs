@@ -101,3 +101,20 @@ fn every_emitted_container_has_a_distinct_content_address() {
     // Declared length no longer matches the file: rejected, not silently accepted.
     assert!(bridge_render::font_asset_check(&with_slack).is_err());
 }
+
+#[test]
+fn profile_font_asset_changes_the_shared_engine_pixels() {
+    let extra_light = std::fs::read(repo_root().join(
+        "bridge/assets/fonts/font_ntthin18-extralight200.bin"
+    )).unwrap();
+    let info = bridge_render::font_asset_check(&extra_light).unwrap();
+    assert!(info.contains("name=ntthin18"), "{info}");
+    assert!(info.contains("weight=200"), "{info}");
+    let template = std::fs::read_to_string(repo_root().join(
+        "bridge/crates/core/tests/fixtures/codex-status-a-400x300.json"
+    )).unwrap();
+    let before = bridge_render::render_bits(&template, "", &bridge_render::Env::default()).unwrap();
+    let after = bridge_render::render_bits_with_fonts(&template, "", &bridge_render::Env::default(), vec![extra_light]).unwrap();
+    assert_ne!(before, after);
+    assert_eq!(before, bridge_render::render_bits(&template, "", &bridge_render::Env::default()).unwrap());
+}

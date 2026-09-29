@@ -1,9 +1,11 @@
 #include "bundle_store.h"
 #include "v2_state.h"
 #include "dev_log.h"
+#include "font_asset.h"
 
 #include <ArduinoJson.h>
 #include <LittleFS.h>
+#include <mbedtls/base64.h>
 #include <string.h>
 
 // Bounded diagnostics: bundle-store decisions are rare and must be visible in
@@ -57,6 +59,44 @@ uint32_t g_seq = 0;
 uint8_t g_slot = 0;
 uint8_t g_metaNext = 0;
 String g_lastError;
+uint8_t *g_fontBytes[8] = {};
+uint8_t g_fontCount = 0;
+
+bool decodeBundleFont(JsonObject entry, uint8_t *&bytes, size_t &len, String &err) {
+    bytes = nullptr;
+    len = 0;
+    const char *name = entry["name"] | "";
+    const char *id = entry["font_id"] | "";
+    const char *encoded = entry["data"] | "";
+    size_t chars = strlen(encoded);
+    if (!*name || !*id || chars == 0 || chars > ((FONT_ASSET_MAX_BYTES + 2) / 3) * 4) {
+        err = "font_shape"; return false;
+    }
+    size_t cap = chars / 4 * 3 + 3;
+    bytes = (uint8_t *)malloc(cap);
+    if (!bytes) { err = "font_oom"; return false; }
+    if (mbedtls_base64_decode(bytes, cap, &len,
+                              (const unsigned char *)encoded, chars) != 0) {
+        free(bytes); bytes = nullptr; err = "font_base64"; return false;
+    }
+    FontAssetInfo info;
+    if (!fontAssetValidate(bytes, len, info, err) ||
+        !fontAssetMatchesTarget(info, err) ||
+        strcmp(info.name, name) || strcmp(info.id, id) ||
+        tplFontIndexByName(name) < tplFontFixedCount()) {
+        free(bytes); bytes = nullptr;
+        if (err.length() == 0) err = "font_identity";
+        return false;
+    }
+    return true;
+}
+
+void clearActiveFonts() {
+    tplFontClearAssets();
+    for (uint8_t i = 0; i < g_fontCount; i++) free(g_fontBytes[i]);
+    memset(g_fontBytes, 0, sizeof(g_fontBytes));
+    g_fontCount = 0;
+}
 
 bool writeAll(File &f, const void *data, size_t len) {
     return f.write((const uint8_t *)data, len) == len;
@@ -385,6 +425,9 @@ static bool bsInstallSource(Input &source, uint32_t expectedPayloadCrc,
     filter["templates"][0]["key"]["template_id"] = true;
     filter["templates"][0]["key"]["render_target"] = true;
     filter["templates"][0]["source"] = true;
+    filter["fonts"][0]["name"] = true;
+    filter["fonts"][0]["font_id"] = true;
+    filter["fonts"][0]["data"] = true;
     JsonDocument doc;
     DeserializationError de = parseBundle(source, doc, filter);
     if (de) { err = "json"; return false; }
@@ -402,10 +445,24 @@ static bool bsInstallSource(Input &source, uint32_t expectedPayloadCrc,
     if ((doc["compiler_abi"] | 0) != CT_ABI) { err = "abi"; return false; }
     JsonArray order = doc["profile"]["template_ids"].as<JsonArray>();
     JsonArray templates = doc["templates"].as<JsonArray>();
+    JsonArray fonts = doc["fonts"].as<JsonArray>();
     if (order.isNull() || templates.isNull() || order.size() == 0 ||
         order.size() > BS_MAX_TEMPLATES || order.size() != templates.size()) {
         err = "shape";
         return false;
+    }
+    if (!fonts.isNull() && fonts.size() > 8) { err = "font_count"; return false; }
+    for (size_t i = 0; !fonts.isNull() && i < fonts.size(); i++) {
+        const char *name = fonts[i]["name"] | "";
+        for (size_t j = 0; j < i; j++) {
+            if (!strcmp(name, fonts[j]["name"] | "")) {
+                err = "font_duplicate"; return false;
+            }
+        }
+        uint8_t *bytes = nullptr;
+        size_t len = 0;
+        if (!decodeBundleFont(fonts[i].as<JsonObject>(), bytes, len, err)) return false;
+        free(bytes);
     }
     const char *active = doc["profile"]["initial_active_id"] | "";
     int initial = 0;
@@ -551,9 +608,58 @@ bool bsInstall(File &bundleFile, uint32_t bundleLength, uint32_t bundleCrc,
                            newContextId, err);
 }
 
+static bool loadActiveFonts(String &err) {
+    SlotHeader h;
+    if (!readSlotHeader(g_slot, h) || !(h.flags & 1) ||
+        h.reserved == 0 || h.reserved > BS_MAX_BUNDLE_BYTES) {
+        err = "font_source"; return false;
+    }
+    File f = LittleFS.open(SLOT_PATH[g_slot], "r");
+    if (!f || f.size() < h.reserved + sizeof(h) ||
+        !f.seek(f.size() - h.reserved)) {
+        err = "font_read"; return false;
+    }
+    JsonDocument filter, doc;
+    filter["fonts"][0]["name"] = true;
+    filter["fonts"][0]["font_id"] = true;
+    filter["fonts"][0]["data"] = true;
+#ifdef ARDUINO
+    DeserializationError de = deserializeJson(doc, f, DeserializationOption::Filter(filter));
+#else
+    String payload;
+    while (f.available()) payload += (char)f.read();
+    DeserializationError de = deserializeJson(doc, payload, DeserializationOption::Filter(filter));
+#endif
+    f.close();
+    if (de) { err = "font_json"; return false; }
+    JsonArray fonts = doc["fonts"].as<JsonArray>();
+    if (!fonts.isNull() && fonts.size() > 8) { err = "font_count"; return false; }
+    uint8_t *next[8] = {};
+    size_t lengths[8] = {};
+    uint8_t count = fonts.isNull() ? 0 : (uint8_t)fonts.size();
+    for (uint8_t i = 0; i < count; i++) {
+        if (!decodeBundleFont(fonts[i].as<JsonObject>(), next[i], lengths[i], err)) {
+            for (uint8_t j = 0; j < i; j++) free(next[j]);
+            return false;
+        }
+    }
+    clearActiveFonts();
+    for (uint8_t i = 0; i < count; i++) {
+        if (!tplFontBindAsset(next[i], lengths[i])) {
+            err = "font_bind";
+            for (uint8_t j = i; j < count; j++) free(next[j]);
+            clearActiveFonts();
+            return false;
+        }
+        g_fontBytes[g_fontCount++] = next[i];
+    }
+    return true;
+}
+
 bool bsLoadCompiled(uint8_t index, CtTemplate &out, String &err) {
     if (!g_configured) { err = "unconfigured"; return false; }
     if (index >= g_profile.count) { err = "index"; return false; }
+    if (!loadActiveFonts(err)) return false;
     char id[BS_ID_LEN] = {0};
     uint32_t ctLen = 0, ctOffset = 0;
     if (!slotTemplateAt(g_slot, index, id, ctLen, ctOffset)) { err = "slot"; return false; }

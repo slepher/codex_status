@@ -1904,8 +1904,9 @@ async fn platform_template_preview(
     id: Option<String>,
     json: Option<Value>,
     usage: Option<String>,
+    font_ids: Option<std::collections::BTreeMap<String, String>>,
 ) -> Result<Value, String> {
-    platform::template_preview(&state, id.as_deref(), json.as_ref(), usage.as_deref())
+    platform::template_preview(&state, id.as_deref(), json.as_ref(), usage.as_deref(), font_ids.as_ref())
 }
 
 #[tauri::command]

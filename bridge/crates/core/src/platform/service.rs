@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{bail, Context, Result};
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::Digest;
@@ -15,7 +16,7 @@ use sha2::Digest;
 use crate::coordinator::{AckOutcome, Coordinator, Delivery, DeliveryKind, DEFAULT_FULL_SYNC_S};
 use crate::datasource::{DataSource, DataSourceKind};
 use crate::platform::model::{
-    Binding, Bundle, BundleProfile, BundleResource, DeviceCapabilities, DeviceIdentity,
+    Binding, Bundle, BundleFont, BundleProfile, BundleResource, DeviceCapabilities, DeviceIdentity,
     AuthenticatedStatus, DeviceRecord, FamilyProfile, FieldRequirement, PlanMode, PowerPlan, Profile, PublishState, StatusAttempt,
     SourceSnapshot,
     Template, TemplateKey, PublishJob, MAX_PROFILE_TEMPLATES,
@@ -690,6 +691,19 @@ impl PlatformService {
             .and_then(|d| d.profile.clone())
     }
 
+    /// Assets selected by the device Profile for a pixel-accurate Bridge preview.
+    pub fn profile_preview_fonts(&self, mac: &str) -> Result<Vec<Vec<u8>>> {
+        let Some(profile) = self.profile_get(mac) else { return Ok(Vec::new()) };
+        self.preview_fonts_by_ids(&profile.font_ids)
+    }
+
+    pub fn preview_fonts_by_ids(&self, font_ids: &std::collections::BTreeMap<String, String>) -> Result<Vec<Vec<u8>>> {
+        let library = self.font_library()?;
+        font_ids.values().map(|id| {
+            library.read(id)?.with_context(|| format!("font asset {id} disappeared"))
+        }).collect()
+    }
+
     /// Save a Profile draft (1–8 ordered ids). Saving never publishes.
     pub fn profile_save(&self, mut profile: Profile, now: u64) -> Result<Profile> {
         profile.device_mac = profile.device_mac.to_uppercase();
@@ -805,8 +819,8 @@ impl PlatformService {
             return Ok(json!({"route": "full_bundle", "render_target": profile.render_target,
                 "profile_order": profile.template_ids, "font_dependencies": fonts,
                 "max_bundle_bytes": record.capabilities.max_bundle_bytes.min(256 * 1024),
-                "can_publish_fonts": false,
-                "source_conversion": "unavailable", "note": "CSFN import is available; TTF/OTF conversion and incremental device protocol are not available"}));
+                "can_publish_fonts": record.capabilities.bundle_font_protocol == 1,
+                "source_conversion": "unavailable", "note": "CSFN fonts travel inside the complete A/B Bundle when the device advertises bundle_font_protocol 1"}));
         }
         let templates = profile.template_ids.iter().map(|id| {
             inner.templates.get(&TemplateKey::new(id, &record.capabilities.render_target)).cloned()
@@ -917,9 +931,19 @@ impl PlatformService {
             Self::persist(&inner, &self.state_path())?;
             return Ok(summary);
         }
-        if !font_plan.required.is_empty() {
-            bail!("device does not advertise the versioned asset protocol; selected fonts cannot be published through the old bundle path");
+        if !font_plan.required.is_empty() && caps.bundle_font_protocol != 1 {
+            bail!("device does not advertise bundle_font_protocol 1; selected fonts cannot be published");
         }
+        let library = self.font_library()?;
+        let fonts = font_plan.required.iter().map(|font| {
+            Ok(BundleFont {
+                name: font.name.clone(),
+                font_id: font.id.clone(),
+                data: base64::engine::general_purpose::STANDARD.encode(
+                    library.read(&font.id)?.with_context(|| format!("font asset {} disappeared", font.id))?
+                ),
+            })
+        }).collect::<Result<Vec<_>>>()?;
         let initial = profile
             .initial_active_id
             .clone()
@@ -943,6 +967,7 @@ impl PlatformService {
             },
             templates,
             resources,
+            fonts,
             total_len: 0,
             crc: String::new(),
         }

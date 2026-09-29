@@ -10,6 +10,7 @@
 #include "v2_claim_command.h"
 #include "v2_command_envelope.h"
 #include "v2_status_snapshot.h"
+#include "display_result.h"
 #include "v2_sync.h"
 #include "v2_sync_store.h"
 #include "bundle_store.h"
@@ -27,6 +28,10 @@
 
 SerialClass Serial;
 DevLogger DevLog;
+extern "C" int codex_display_state_after_render(uint32_t writes_before, uint32_t writes_after,
+                                                   uint32_t busy_before, uint32_t busy_after) {
+    return displayStateAfterRender(writes_before, writes_after, busy_before, busy_after);
+}
 // The host engine does not need the device log; the no-op definitions below keep
 // every firmware source that logs (font store, bundle store, engine) linkable.
 void DevLogger::printf(const char *, ...) {}
@@ -602,6 +607,31 @@ int codex_bundle_store_check(const char *json) {
     }
     if (!found || !bsLoadCompiled(0, ct, err)) return 13;
     return 0;
+}
+
+int codex_bundle_font_install(const char *json, int reset) {
+    if (!json) return -1;
+    if (reset) {
+        LittleFS.files.clear(); LittleFS.dirs.clear();
+        LittleFS.capacity = 1024 * 1024; LittleFS.writeBudget = -1;
+        tplFontClearAssets();
+    }
+    bsBegin();
+    tplSetCanvas(400, 300);
+    String err;
+    if (!bsInstall(String(json), "zectrix-note4-400x300",
+                   "epd-ssd2683-400x300-1bpp", "ctx-font", err)) {
+        return 1;
+    }
+    CtTemplate compiled;
+    return bsLoadCompiled(0, compiled, err) ? 0 : 2;
+}
+
+int codex_bundle_font_reboot() {
+    if (!bsBegin()) return 1;
+    CtTemplate compiled;
+    String err;
+    return bsLoadCompiled(0, compiled, err) ? 0 : 2;
 }
 
 int codex_render(const char *tmpl, const char *usage, const char *channel, const char *ip,
@@ -1373,6 +1403,12 @@ int codex_font_asset_check(const uint8_t *bytes, int len, char *out, int cap) {
                   (unsigned)info.hint, (unsigned)info.bytes, viewOk ? 1 : 0);
     return 1;
 }
+
+int codex_font_bind_asset(const uint8_t *bytes, int len) {
+    return bytes && len > 0 && tplFontBindAsset(bytes, (size_t)len) ? 1 : 0;
+}
+
+void codex_font_clear_assets() { tplFontClearAssets(); }
 
 // Font store (font_store.cpp): host tests drive the real device store, including
 // its atomic write path, its inventory and its Profile pruning.

@@ -1342,6 +1342,7 @@ mod tests {
             },
             templates: vec![tpl],
             resources: vec![],
+            fonts: vec![],
             total_len: 0,
             crc: String::new(),
         }
@@ -1395,6 +1396,7 @@ mod tests {
             },
             templates: vec![template.clone()],
             resources: vec![],
+            fonts: vec![],
             total_len: 0,
             crc: String::new(),
         }
@@ -1581,6 +1583,7 @@ mod tests {
                 saved_at: 0,
             }],
             resources: vec![],
+            fonts: vec![],
             total_len: 0,
             crc: String::new(),
         }
@@ -1633,6 +1636,7 @@ mod tests {
                 saved_at: 0,
             }],
             resources: vec![],
+            fonts: vec![],
             total_len: 0,
             crc: String::new(),
         }

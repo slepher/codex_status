@@ -62,6 +62,7 @@
 #include "v2_claim_command.h"
 #include "v2_command_envelope.h"
 #include "v2_status_snapshot.h"
+#include "display_result.h"
 #include "v2_sync.h"
 #include "v2_sync_store.h"
 #include "v2_sync_protocol.h"
@@ -84,7 +85,7 @@ static bool targetUnverified = false;
 #define FW_VERSION    "0.13.9-clkwin"
 #elif defined(CODEX_TARGET_NOTE4)
 #ifdef CODEX_NOTE4_ROM_B
-#define FW_VERSION    "0.18.38-note4-b-bridge2"
+#define FW_VERSION    "0.18.40-note4-b-display1"
 #else
 #define FW_VERSION    "0.18.19-note4-a"
 #endif
@@ -2687,6 +2688,11 @@ static void handleStatusJson() {
     doc["max_templates"] = 8;
     doc["max_bundle_bytes"] = BS_MAX_BUNDLE_BYTES;
     doc["asset_publish_protocol"] = 0; // Existing complete Bundle path only.
+#ifdef CODEX_TARGET_NOTE4
+    doc["bundle_font_protocol"] = 1;
+#else
+    doc["bundle_font_protocol"] = 0;
+#endif
     doc["bundle_configured"] = v2BundleReady;
     doc["commit_seq"] = (unsigned)bsCommitSeq();
     doc["active_context_id"] = v2Profile.contextId;
@@ -4184,14 +4190,11 @@ static void applyV2Data(const String &body) {
         uint32_t before = epdWriteCount;
         uint32_t busyBefore = rtcEpdBusyFails;
         renderActiveUsage(usage, lastChannel.c_str());
-        if (rtcEpdBusyFails != busyBefore) {
-            display = "failed";
-            v2DisplayState = 3;
-        } else if (epdWriteCount != before) {
+        v2DisplayState = displayStateAfterRender(before, epdWriteCount, busyBefore, rtcEpdBusyFails);
+        if (epdWriteCount != before) {
             display = "displayed";
-            v2DisplayState = 1;
-        } else {
-            v2DisplayState = 1;
+        } else if (rtcEpdBusyFails != busyBefore) {
+            display = "failed";
         }
     }
     v2Ack("data", "applied", display, "ram", nullptr, (int64_t)seq, 0, v2Profile.contextId,
@@ -4504,8 +4507,9 @@ static void handleV2BundleCommit() {
     v2AppliedFields = "";
     v2ActiveLoad();
     uint32_t busyBefore = rtcEpdBusyFails;
+    uint32_t writesBefore = epdWriteCount;
     renderCurrent();
-    v2DisplayState = rtcEpdBusyFails != busyBefore ? 3 : 1;
+    v2DisplayState = displayStateAfterRender(writesBefore, epdWriteCount, busyBefore, rtcEpdBusyFails);
     if (syncEnabled) {
         syncAddReason(syncRtc, 1u << 4);
         int32_t args[] = {0, (int32_t)bsCommitSeq()};
@@ -4786,6 +4790,7 @@ static void v2RendezvousRender(bool light) {
     if (v2WakeRenderPending) {
         const uint32_t t0 = millis();
         const uint32_t busyBefore = rtcEpdBusyFails;
+        const uint32_t writesBefore = epdWriteCount;
         // Light: this frame is the Zzz-removing wake baseline, so
         // startNormalMode must not force a second full refresh (task-10).
         if (light) forceCleanRefresh = true;
@@ -4793,7 +4798,7 @@ static void v2RendezvousRender(bool light) {
         if (light) wakeBaselineDrawn = true;
         v2WakeRenderPending = false;
         clkCaptureFromFramebuffer();
-        v2DisplayState = (rtcEpdBusyFails != busyBefore) ? 3 : 1;
+        v2DisplayState = displayStateAfterRender(writesBefore, epdWriteCount, busyBefore, rtcEpdBusyFails);
         DevLog.printf("[platform] rendezvous %s frame (data+clock) in %ums\n",
                       light ? "light" : "sleep", (unsigned)(millis() - t0));
         return;

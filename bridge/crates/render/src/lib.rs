@@ -35,6 +35,7 @@ struct Job {
     offline_mins: i32,
     mode: String,
     blob: Vec<u8>,
+    fonts: Option<Vec<Vec<u8>>>,
     width: u32,
     height: u32,
     reply: Sender<(i32, Vec<u8>, String)>,
@@ -55,10 +56,19 @@ fn engine() -> &'static SyncSender<Job> {
 
 fn engine_loop(rx: Receiver<Job>) {
     for job in rx {
+        if let Some(fonts) = &job.fonts {
+            unsafe { codex_font_clear_assets() };
+            if !fonts.iter().all(|font| unsafe { codex_font_bind_asset(font.as_ptr(), font.len() as c_int) == 1 }) {
+                unsafe { codex_font_clear_assets() };
+                let _ = job.reply.send((-1, Vec::new(), "font asset cannot bind to template font slot".to_string()));
+                continue;
+            }
+        }
         // Large enough for the serialized compiled record; render ops truncate.
         let mut out = vec![0u8; 64 * 1024];
         let mut message = String::new();
         let rc = run_job(&job, &mut out, &mut message);
+        if job.fonts.is_some() { unsafe { codex_font_clear_assets() } }
         unsafe { codex_set_canvas(WIDTH as c_int, HEIGHT as c_int) };
         if matches!(job.op, Op::RenderJson | Op::RenderCompiled) {
             out.truncate(((job.width + 7) / 8 * job.height) as usize);
@@ -253,6 +263,7 @@ fn base_job(template: &str, env: &Env<'_>) -> Job {
         offline_mins: env.offline_mins,
         mode: env.mode.to_string(),
         blob: Vec::new(),
+        fonts: None,
         width,
         height,
         reply: std::sync::mpsc::channel().0,
@@ -465,6 +476,10 @@ extern "C" {
     fn codex_set_panel(w: c_int, h: c_int);
     fn codex_font_asset_check(bytes: *const u8, len: c_int, out: *mut c_char,
         cap: c_int) -> c_int;
+    fn codex_font_bind_asset(bytes: *const u8, len: c_int) -> c_int;
+    fn codex_font_clear_assets();
+    fn codex_display_state_after_render(writes_before: u32, writes_after: u32,
+        busy_before: u32, busy_after: u32) -> c_int;
     fn codex_font_store_reset();
     fn codex_font_store_budget(budget: i64);
     fn codex_font_store_begin(profile: *const c_char) -> c_int;
@@ -1075,6 +1090,19 @@ pub fn font_asset_check(bytes: &[u8]) -> Result<String, String> {
     }
 }
 
+/// The caller must keep `bytes` alive until `font_clear_assets` is called.
+/// Like compiled-template operations, font bindings share global engine state.
+pub fn font_bind_asset(bytes: &[u8]) -> bool {
+    unsafe { codex_font_bind_asset(bytes.as_ptr(), bytes.len() as c_int) == 1 }
+}
+
+pub fn font_clear_assets() { unsafe { codex_font_clear_assets() } }
+
+pub fn display_state_after_render(writes_before: u32, writes_after: u32,
+                                  busy_before: u32, busy_after: u32) -> i32 {
+    unsafe { codex_display_state_after_render(writes_before, writes_after, busy_before, busy_after) }
+}
+
 /// Derive the semantic refresh regions for a template (display-safety layer).
 /// Callers must serialize all `rgn_*` calls (the policy state is global, like
 /// the firmware's). The panel geometry is taken from the template's own canvas,
@@ -1200,8 +1228,18 @@ impl Default for Env<'_> {
 
 /// 1-bit raster in the device framebuffer layout (bit set = white, clear = ink).
 pub fn render_bits(template: &str, usage: &str, env: &Env<'_>) -> anyhow::Result<Vec<u8>> {
+    render_bits_inner(template, usage, env, None)
+}
+
+/// Render one preview with Profile assets on the serialized engine worker.
+pub fn render_bits_with_fonts(template: &str, usage: &str, env: &Env<'_>, fonts: Vec<Vec<u8>>) -> anyhow::Result<Vec<u8>> {
+    render_bits_inner(template, usage, env, Some(fonts))
+}
+
+fn render_bits_inner(template: &str, usage: &str, env: &Env<'_>, fonts: Option<Vec<Vec<u8>>>) -> anyhow::Result<Vec<u8>> {
     let mut job = base_job(template, env);
     job.usage = usage.to_string();
+    job.fonts = fonts;
     let (rc, out, message) = run_engine(Op::RenderJson, template, job)?;
     match rc {
         1 => Ok(out),

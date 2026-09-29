@@ -39,6 +39,8 @@ pub struct DeviceCapabilities {
     pub max_templates: u32,
     pub max_bundle_bytes: u64,
     #[serde(default)]
+    pub bundle_font_protocol: u32,
+    #[serde(default)]
     pub asset_publish_protocol: u32,
     #[serde(default)]
     pub max_object_bytes: u64,
@@ -80,6 +82,7 @@ impl DeviceCapabilities {
             compiler_abi: COMPILER_ABI,
             max_templates: MAX_PROFILE_TEMPLATES as u32,
             max_bundle_bytes: 262_144,
+            bundle_font_protocol: 0,
             asset_publish_protocol: 0,
             max_object_bytes: 0,
             max_manifest_bytes: 0,
@@ -110,6 +113,7 @@ impl DeviceCapabilities {
             compiler_abi: COMPILER_ABI,
             max_templates: MAX_PROFILE_TEMPLATES as u32,
             max_bundle_bytes: 262_144,
+            bundle_font_protocol: 0,
             asset_publish_protocol: 0,
             max_object_bytes: 0,
             max_manifest_bytes: 0,
@@ -148,6 +152,9 @@ impl DeviceCapabilities {
         }
         if self.asset_publish_protocol > 0 && (self.max_object_bytes == 0 || self.max_manifest_bytes == 0 || self.install_peak_bytes == 0 || self.free_bytes == 0) {
             bail!("capabilities: incremental publish limits missing");
+        }
+        if self.bundle_font_protocol > 1 {
+            bail!("capabilities: unsupported bundle_font_protocol");
         }
         if !(1..=COMPILER_ABI).contains(&self.compiler_abi) {
             bail!(
@@ -503,6 +510,8 @@ pub struct Bundle {
     pub templates: Vec<Template>,
     #[serde(default)]
     pub resources: Vec<BundleResource>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fonts: Vec<BundleFont>,
     /// Canonical payload length and CRC (the CRC field itself excluded).
     pub total_len: u32,
     pub crc: String,
@@ -512,6 +521,15 @@ pub struct Bundle {
 pub struct BundleResource {
     pub id: String,
     /// ASCII/base64 payload; embedded so the Bundle has no external references.
+    pub data: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BundleFont {
+    pub name: String,
+    pub font_id: String,
+    /// Complete CSFN container. Stored inside the A/B Bundle so its font and
+    /// template become active or roll back together.
     pub data: String,
 }
 
@@ -576,6 +594,16 @@ impl Bundle {
                 );
             }
         }
+        let mut names = std::collections::BTreeSet::new();
+        for font in &self.fonts {
+            if !names.insert(&font.name) { bail!("duplicate bundle font {}", font.name); }
+            let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &font.data)?;
+            let info = super::fonts::FontLibrary::validate(&bytes)?;
+            if info.name != font.name || info.id != font.font_id {
+                bail!("bundle font {} identity mismatch", font.name);
+            }
+            info.check_target(&self.render_target_pixel_format())?;
+        }
         if !self
             .profile
             .template_ids
@@ -584,6 +612,10 @@ impl Bundle {
             bail!("bundle initial active is not in the profile order");
         }
         Ok(())
+    }
+
+    fn render_target_pixel_format(&self) -> String {
+        if self.render_target == RENDER_TARGET_GRAY4 { "2bpp" } else { "1bpp" }.into()
     }
 
     /// Bounded BEGIN/CHUNK/COMMIT framing used by LAN and BLE transports.
