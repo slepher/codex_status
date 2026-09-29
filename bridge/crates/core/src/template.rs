@@ -273,6 +273,20 @@ fn validate_element(
                     return Err("time_format".into());
                 }
             }
+            if e.get("digit_bind").is_some() || e.get("digit_x").is_some() {
+                let digit_bind = e.get("digit_bind").and_then(Value::as_str).ok_or("digit_bind")?;
+                if !matches!(parse_bind(digit_bind),
+                    Some(BindSpec::Bucket { field: BindField::Remaining | BindField::UsedPercent, .. })
+                    | Some(BindSpec::DeviceBattery))
+                    || !bind.is_empty() || text.is_empty() || e.get("region").is_some()
+                {
+                    return Err("digit_bind".into());
+                }
+                let positions = e.get("digit_x").and_then(Value::as_array).ok_or("digit_x")?;
+                if positions.len() != 3 || positions.iter().any(|v| !matches!(v.as_i64(), Some(x) if (0..canvas_w).contains(&x))) {
+                    return Err("digit_x".into());
+                }
+            }
         }
         "bar" => {
             let bind = e.get("bind").and_then(|v| v.as_str()).ok_or("bind")?;

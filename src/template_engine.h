@@ -109,11 +109,11 @@ struct CtReq {
 // One render operation: fixed width, no pointers.
 struct CtOp {
     uint8_t  type;
-    uint8_t  flags;        // bit0 fill, bit1 has_region, bit2 has_align, bit3 has_timefmt
+    uint8_t  flags;        // bit0 fill, bit1 region, bit2 align, bit3 timefmt, bit4 digit_x
     uint8_t  font;         // index into CT_FONTS (f8,f12,f16,f20,f24,nt16,nt30)
     uint8_t  scale;
     int16_t  x, y, w, h;   // primary rect / text origin
-    int16_t  x2, y2;       // line end
+    int16_t  x2, y2;       // line end; for digit_x: two/three-digit origins
     int16_t  whenEqNum;    // numeric `equals`
     int16_t  maxVal;       // bar max (default 100)
     uint8_t  bindIdx;      // CT_NONE_IDX or requirement index
@@ -121,7 +121,7 @@ struct CtOp {
     uint8_t  whenMode;     // CtWhenMode
     uint8_t  align;        // 0 left, 1 center, 2 right
     uint8_t  timeFormat;   // 0 date, 1 hhmm
-    uint8_t  resourceIdx;  // CT_NONE_IDX or resource index
+    uint8_t  resourceIdx;  // icon resource; for digit_x text: numeric bind index
     uint8_t  color;        // 0 black, 1 white
     uint8_t  bg;           // 0xFF none, else 0/1
     uint8_t  fg;           // bar fg

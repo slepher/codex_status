@@ -4,7 +4,7 @@
 
 use bridge_render::{
     compile, compiled_deserialize, compiled_requirements, compiled_serialize, render_bits,
-    render_compiled_bits, Env,
+    render_compiled_bits, render_compiled_bits_size, Env,
 };
 use serde_json::json;
 
@@ -67,6 +67,45 @@ fn envs() -> Vec<Env<'static>> {
             mode: "deep",
         },
     ]
+}
+
+#[test]
+fn note4_percent_origins_follow_one_two_and_three_digits() {
+    let _guard = SERIAL.lock().unwrap();
+    let source = std::fs::read_to_string(repo_root().join(
+        "bridge/crates/core/tests/fixtures/codex-status-a-400x300.json",
+    )).unwrap();
+    let dynamic: serde_json::Value = serde_json::from_str(&source).unwrap();
+    for (remaining, index) in [(0, 0), (5, 0), (9, 0), (10, 1), (40, 1), (99, 1), (100, 2)] {
+      for five_hour_present in [true, false] {
+        let used = 100 - remaining;
+        let mut data = json!({
+            "schema": 1,
+            "buckets": [{"id": "codex", "windows": [
+                {"windowMins": 300, "usedPercent": used, "resetsAt": 1_700_010_000i64},
+                {"windowMins": 10080, "usedPercent": used, "resetsAt": 1_700_500_000i64}
+            ]}]
+        });
+        if !five_hour_present { data["buckets"][0]["windows"][0] = serde_json::Value::Null; }
+        let data = data.to_string();
+        let mut fixed = dynamic.clone();
+        for element in fixed["elements"].as_array_mut().unwrap() {
+            if element.get("digit_x").is_some() {
+                let x = element["digit_x"][index].clone();
+                element["x"] = x;
+                element.as_object_mut().unwrap().remove("digit_x");
+                element.as_object_mut().unwrap().remove("digit_bind");
+            }
+        }
+        let expected = render_bits(&fixed.to_string(), &data, &Env::default()).unwrap();
+        let json_bits = render_bits(&source, &data, &Env::default()).unwrap();
+        compile(&source).unwrap();
+        let compiled_bits = render_compiled_bits_size(&data, &Env::default(), 400, 300).unwrap();
+        let diff = |actual: &[u8]| actual.iter().zip(&expected).filter(|(a, b)| a != b).count();
+        assert_eq!(diff(&json_bits), 0, "JSON remaining={remaining} five_hour={five_hour_present}");
+        assert_eq!(diff(&compiled_bits), 0, "compiled remaining={remaining} five_hour={five_hour_present}");
+      }
+    }
 }
 
 #[test]

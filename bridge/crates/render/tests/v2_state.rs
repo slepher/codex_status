@@ -1032,7 +1032,7 @@ fn shared_bundle_commit_decision_validates_payload_before_side_effects() {
             "bridge_id": "owner",
             "firmware_target": "codex-status-154g",
             "render_target": "epd-ssd1681-200x200-1bpp",
-            "compiler_abi": 2,
+            "compiler_abi": bridge_core::compile::COMPILER_ABI,
             "profile": {"template_ids": ["quad"], "initial_active_id": "quad"},
             "templates": [{
                 "key": {"template_id": "quad", "render_target": "epd-ssd1681-200x200-1bpp"},

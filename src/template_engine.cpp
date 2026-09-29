@@ -878,6 +878,28 @@ static bool parseElementCompiled(JsonObject e, CtTemplate &ct, CtOp &op) {
         }
         op.x = (int16_t)(e["x"] | 0);
         op.y = (int16_t)(e["y"] | 0);
+        if (e.containsKey("digit_bind") || e.containsKey("digit_x")) {
+            const char *digitBind = e["digit_bind"].as<const char *>();
+            JsonArray positions = e["digit_x"].as<JsonArray>();
+            BindSpec digitSpec;
+            if (strlen(bind) || !strlen(text) || !digitBind ||
+                !parseBind(String(digitBind), digitSpec) ||
+                (digitSpec.kind != B_BUCKET_REMAIN && digitSpec.kind != B_BUCKET_USED &&
+                 digitSpec.kind != B_DEV_BATTERY) ||
+                positions.isNull() || positions.size() != 3 || hasRegion) return false;
+            int idx = ctAddReq(ct, digitSpec, String(digitBind));
+            if (idx < 0) return false;
+            op.flags |= 0x10;
+            op.resourceIdx = (uint8_t)idx;
+            for (int i = 0; i < 3; i++) {
+                if (!positions[i].is<int>()) return false;
+                int x = positions[i].as<int>();
+                if (x < 0 || x >= TPL_W) return false;
+                if (i == 0) op.x = (int16_t)x;
+                else if (i == 1) op.x2 = (int16_t)x;
+                else op.y2 = (int16_t)x;
+            }
+        }
         if (hasRegion) {
             op.flags |= 0x02;
             op.x = (int16_t)rx;
@@ -981,6 +1003,14 @@ static bool drawCtOp(const CtTemplate &ct, const CtOp &op, JsonDocument &usage,
         int scale = op.scale ? op.scale : 1;
         int fg = op.color, bg = op.bg == 0xFF ? 1 : op.bg;
         int x = op.x, y = op.y;
+        if (op.flags & 0x10) {
+            String digits;
+            if (!ctEvalText(ct, op.resourceIdx, TTF_DATE, usage, env, digits) ||
+                digits.length() < 1 || digits.length() > 3) return true;
+            for (size_t i = 0; i < digits.length(); i++)
+                if (digits[i] < '0' || digits[i] > '9') return true;
+            x = digits.length() == 1 ? op.x : digits.length() == 2 ? op.x2 : op.y2;
+        }
         int cellH = prop ? prop->lineHeight : font->Height;
         if (!hasRegion && scale == 1) {
             if (prop) drawPropText(*prop, val, x, y, 1, fg, bg, false, 0, 0, 0, 0);
@@ -1077,7 +1107,12 @@ bool tplValidateCt(const CtTemplate &ct, String &err) {
         if (op.type > CT_ICON) { err = "ct_op_type"; return false; }
         if (op.bindIdx != CT_NONE_IDX && op.bindIdx >= ct.reqCount) { err = "ct_bind"; return false; }
         if (op.whenIdx != CT_NONE_IDX && op.whenIdx >= ct.reqCount) { err = "ct_when"; return false; }
-        if (op.resourceIdx != CT_NONE_IDX && op.resourceIdx >= ct.resCount) { err = "ct_res"; return false; }
+        if ((op.flags & 0x10) && (op.type != CT_TEXT || op.resourceIdx >= ct.reqCount)) {
+            err = "ct_digit_bind"; return false;
+        }
+        if (!(op.flags & 0x10) && op.resourceIdx != CT_NONE_IDX && op.resourceIdx >= ct.resCount) {
+            err = "ct_res"; return false;
+        }
         if (op.type == CT_TEXT && op.font >= tplFontCount()) { err = "ct_font"; return false; }
         if (op.type == CT_TEXT && op.bindIdx == CT_NONE_IDX && op.text[0] == 0) {
             err = "ct_text"; return false;

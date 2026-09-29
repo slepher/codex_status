@@ -1,7 +1,8 @@
 {
   "schema": 1,
   "id": "codex-status-a",
-  "version": 1,
+  "version": 2,
+  "min_fw": "0.18.36-note4-b-layout1",
   "render_target": "epd-ssd2683-400x300-1bpp",
   "canvas": {
     "w": 400,
@@ -234,84 +235,6 @@
     },
     {
       "type": "icon",
-      "x": 296,
-      "y": 8,
-      "w": 10,
-      "h": 20,
-      "bits": "AAAAAAAAP8B/wGAAYABhAGCAYEBggGEAYABgAHAAP8ABwAHAAAAAAA==",
-      "color": "black",
-      "when": {
-        "bind": "device.state",
-        "equals": "WIFI OFF"
-      }
-    },
-    {
-      "type": "icon",
-      "x": 306,
-      "y": 8,
-      "w": 10,
-      "h": 20,
-      "bits": "AAAAAAAA/4D/wADAAMAgwEDAgMBAwCDAAMAAwAHA/4DwAPAAAAAAAA==",
-      "color": "black",
-      "when": {
-        "bind": "device.state",
-        "equals": "WIFI OFF"
-      }
-    },
-    {
-      "type": "icon",
-      "x": 296,
-      "y": 8,
-      "w": 10,
-      "h": 20,
-      "bits": "AAAAAAAAP8B/wGAAYABhAGCAYEBggGEAYABgAHAAP8ABwAHAAAAAAA==",
-      "color": "black",
-      "when": {
-        "bind": "device.state",
-        "equals": "WIFI CONN"
-      }
-    },
-    {
-      "type": "icon",
-      "x": 296,
-      "y": 8,
-      "w": 10,
-      "h": 20,
-      "bits": "AAAAAAAAP8B/wGAAYABhAGCAYEBggGEAYABgAHAAP8ABwAHAAAAAAA==",
-      "color": "black",
-      "when": {
-        "bind": "device.state",
-        "equals": "WIFI BLINK OFF"
-      }
-    },
-    {
-      "type": "icon",
-      "x": 306,
-      "y": 8,
-      "w": 10,
-      "h": 20,
-      "bits": "AAAAAAAA/4D/wADAAMAgwEDAgMBAwCDAAMAAwAHA/4DwAPAAAAAAAA==",
-      "color": "black",
-      "when": {
-        "bind": "device.state",
-        "equals": "WIFI BLINK OFF"
-      }
-    },
-    {
-      "type": "icon",
-      "x": 306,
-      "y": 8,
-      "w": 10,
-      "h": 20,
-      "bits": "AAAAAAAA/4D/wADAAMAgwEDAgMBAwCDAAMAAwAHA/4DwAPAAAAAAAA==",
-      "color": "black",
-      "when": {
-        "bind": "device.state",
-        "equals": "WIFI CONN"
-      }
-    },
-    {
-      "type": "icon",
       "x": 320,
       "y": 8,
       "w": 10,
@@ -401,13 +324,13 @@
     {
       "type": "text",
       "x": 12,
-      "y": 62,
+      "y": 73,
       "font": "ntreg96",
       "color": "black",
       "bind": "buckets[codex].5h.remaining",
       "region": [
         12,
-        62,
+        73,
         176,
         132
       ],
@@ -419,15 +342,21 @@
     },
     {
       "type": "text",
-      "x": 183,
-      "y": 125,
+      "x": 130,
+      "y": 136,
       "font": "ntthin18",
       "color": "black",
       "text": "%",
       "when": {
         "bind": "buckets[codex].5h.remaining",
         "exists": true
-      }
+      },
+      "digit_bind": "buckets[codex].5h.remaining",
+      "digit_x": [
+        130,
+        159,
+        180
+      ]
     },
     {
       "type": "text",
@@ -464,13 +393,13 @@
     {
       "type": "text",
       "x": 212,
-      "y": 62,
+      "y": 73,
       "font": "ntreg96",
       "color": "black",
       "bind": "buckets[codex].weekly.remaining",
       "region": [
         212,
-        62,
+        73,
         176,
         132
       ],
@@ -482,15 +411,21 @@
     },
     {
       "type": "text",
-      "x": 383,
-      "y": 125,
+      "x": 330,
+      "y": 136,
       "font": "ntthin18",
       "color": "black",
       "text": "%",
       "when": {
         "bind": "buckets[codex].5h.remaining",
         "exists": true
-      }
+      },
+      "digit_bind": "buckets[codex].weekly.remaining",
+      "digit_x": [
+        330,
+        359,
+        380
+      ]
     },
     {
       "type": "text",
@@ -526,13 +461,13 @@
     {
       "type": "text",
       "x": 12,
-      "y": 62,
+      "y": 73,
       "font": "ntreg96",
       "color": "black",
       "bind": "buckets[codex].weekly.remaining",
       "region": [
         12,
-        62,
+        73,
         376,
         132
       ],
@@ -544,15 +479,21 @@
     },
     {
       "type": "text",
-      "x": 285,
-      "y": 125,
+      "x": 230,
+      "y": 136,
       "font": "ntthin18",
       "color": "black",
       "text": "%",
       "when": {
         "bind": "buckets[codex].5h.remaining",
         "exists": false
-      }
+      },
+      "digit_bind": "buckets[codex].weekly.remaining",
+      "digit_x": [
+        230,
+        259,
+        280
+      ]
     },
     {
       "type": "text",

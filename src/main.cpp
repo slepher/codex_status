@@ -84,7 +84,7 @@ static bool targetUnverified = false;
 #define FW_VERSION    "0.13.9-clkwin"
 #elif defined(CODEX_TARGET_NOTE4)
 #ifdef CODEX_NOTE4_ROM_B
-#define FW_VERSION    "0.18.35-note4-b-ota1"
+#define FW_VERSION    "0.18.38-note4-b-bridge2"
 #else
 #define FW_VERSION    "0.18.19-note4-a"
 #endif
@@ -229,7 +229,7 @@ static uint32_t postOtaHoldUntilMs = 0;
 // P1 diagnosis: did the light -> deep glyph render run? bit0 set = the
 // `device.mode` template flag was set, bit1 = it was clear, bit2 = render
 // returned. Read via /status.json `deep.glyph`.
-RTC_DATA_ATTR static uint8_t  rtcDeepGlyph = 0;
+RTC_DATA_ATTR static uint8_t  rtcDeepGlyph = 0; // bit 3: last Bridge OFF glyph
 // Debug capture gate: when enabled (see captureFrameToFs), the framebuffer is
 // saved after a pre-sleep refresh; fixed files, overwritten, off by default.
 RTC_DATA_ATTR static uint8_t  rtcFrameCapture = 0;
@@ -2066,12 +2066,20 @@ static void renderActiveUsage(const String &json, const char *channel) {
     env.battery  = batteryPercent();
     env.state    = (rtcMode == MODE_DEEP) ? "DEEP" : templateStateText();
     env.mode     = (rtcMode == MODE_DEEP) ? "deep" : "light";
-    env.offlineMins = -1;
-    if (rtcLastSyncEpoch > 1600000000 && timeKnown()) {
-        long mins = ((long)time(nullptr) - (long)rtcLastSyncEpoch) / 60;
-        // The row means "bridge unreachable": the bridge pushes at least every
-        // 5 minutes, so only expose the value once contact is clearly lost.
-        if (mins > BRIDGE_LOST_MIN) env.offlineMins = (int)mins;
+    // A wake has no Wi-Fi verdict yet. Keep the Bridge glyph from the sleep
+    // frame until the connection attempt finishes; deep clock wakes also keep it.
+    if (wifiConnActive || (rtcMode == MODE_DEEP && !wifiUp && !wifiLostHandled)) {
+        env.offlineMins = (rtcDeepGlyph & 8) ? 0 : -1;
+    } else {
+        env.offlineMins = wifiUp ? -1 : 0;
+        if (wifiUp && rtcLastSyncEpoch > 1600000000 && timeKnown()) {
+            long mins = ((long)time(nullptr) - (long)rtcLastSyncEpoch) / 60;
+            // The row means "bridge unreachable": the bridge pushes at least every
+            // 5 minutes, so only expose the value once contact is clearly lost.
+            if (mins > BRIDGE_LOST_MIN) env.offlineMins = (int)mins;
+        }
+        if (env.offlineMins >= 0) rtcDeepGlyph |= 8;
+        else rtcDeepGlyph &= ~8;
     }
     Paint_SelectImage(frame);
     Paint_Clear(WHITE);
@@ -2305,7 +2313,28 @@ static bool hasWifiSlots() { return countWifiSlots() > 0; }
 static bool connectBest(bool showProgress = true) {
     WiFi.mode(WIFI_STA);
     WiFi.setHostname(hostname.c_str());
-    int n = WiFi.scanNetworks();
+    // The scan can take several seconds. Poll it so the already visible wake
+    // frame can alternate its Wi-Fi cell throughout the whole connect attempt.
+    const bool blinkAllowed = lastUsage.length() > 0 && epdPartialReady && epdBaselineTrusted;
+    uint32_t lastBlink = millis();
+    auto blinkWhileConnecting = [&]() {
+        if (!blinkAllowed || !wifiBlinkMs ||
+            (uint32_t)(millis() - lastBlink) < wifiBlinkMs) return;
+        lastBlink = millis();
+        wifiBlinkOn = !wifiBlinkOn;
+        rfnBlink = true;
+        renderCurrent();
+    };
+    if (!blinkAllowed)
+        DevLog.printf("[wifi] icon blink skipped usage=%d partial=%d trusted=%d\n",
+                      lastUsage.length() > 0, epdPartialReady, epdBaselineTrusted);
+    WiFi.scanNetworks(true);
+    uint32_t scanStarted = millis();
+    while (WiFi.scanComplete() == WIFI_SCAN_RUNNING && millis() - scanStarted < 15000UL) {
+        delay(100);
+        blinkWhileConnecting();
+    }
+    int n = WiFi.scanComplete();
     prefs.begin("wifi", true);
     uint8_t last = prefs.getUChar("last", 0xFF);
     prefs.end();
@@ -2342,6 +2371,9 @@ static bool connectBest(bool showProgress = true) {
         }
         if (bestSlot < 0) {
             DevLog.println("[wifi] no saved network");
+            wifiConnActive = false;
+            wifiBlinkOn = false;
+            if (lastUsage.length()) renderCurrent();
             return false;
         }
         DevLog.printf("[wifi] scan: no saved network visible; trying slot %d\n", bestSlot);
@@ -2350,40 +2382,26 @@ static bool connectBest(bool showProgress = true) {
     wifiSsid = prefs.getString(("s" + String(bestSlot)).c_str(), "");
     wifiPass = prefs.getString(("p" + String(bestSlot)).c_str(), "");
     prefs.end();
-    if (!wifiSsid.length()) return false;
+    if (!wifiSsid.length()) {
+        wifiConnActive = false;
+        wifiBlinkOn = false;
+        if (lastUsage.length()) renderCurrent();
+        return false;
+    }
     if (showProgress) screen({"CODEX STATUS", FW_VERSION, "", "Connecting:", wifiSsid});
     DevLog.printf("[wifi] slot %d rssi=%d\n", bestSlot, bestRssi);
     WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
     uint32_t t0 = millis();
-    uint32_t lastBlink = t0;
-    bool blinkDrew = false;
-    // task-10 B: blink the Wi-Fi icon cell while associating. Only when a
-    // template frame is actually on the panel and its baseline is usable (a
-    // cached usage + stored template, first frame already drawn); otherwise the
-    // Connecting/status page must not be disturbed and an untrusted baseline
-    // would turn every tick into a full flash.
-    const bool blinkAllowed = lastUsage.length() > 0 && epdPartialReady && epdBaselineTrusted;
-    if (blinkAllowed) {
-        wifiConnActive = true;
-        wifiBlinkOn = false;
-    }
     while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_CONNECT_MS) {
         delay(200);
-        if (blinkAllowed && wifiBlinkMs &&
-            (uint32_t)(millis() - lastBlink) >= wifiBlinkMs) {
-            lastBlink = millis();
-            wifiBlinkOn = !wifiBlinkOn;
-            rfnBlink = true;
-            renderCurrent();
-            blinkDrew = true;
-        }
+        blinkWhileConnecting();
         DevLog.print(".");
     }
     wifiConnActive = false;
     wifiBlinkOn = false;
     // A failed attempt must not leave the last blink frame (icon visible) on
     // the panel: settle on the real state, which hides the icon again.
-    if (blinkDrew && WiFi.status() != WL_CONNECTED) renderCurrent();
+    if (lastUsage.length() && WiFi.status() != WL_CONNECTED) renderCurrent();
     DevLog.println();
     if (WiFi.status() != WL_CONNECTED) {
         DevLog.println("[wifi] connect timeout");
@@ -4722,6 +4740,7 @@ static bool v2Rendezvous() {
                   answeredAt ? "answered" : "timeout", (unsigned long)v2Plan.acceptedId(),
                   timeKnown() ? timeSourceName(timeSource) : "none", (unsigned)millis(),
                   (unsigned)bleRadioMs(), (unsigned)(v2NowMs() - windowStart));
+    if (light) { wifiConnActive = true; wifiBlinkOn = true; }
     v2RendezvousRender(light);
     return light || syncOpenThisWake;
 }
@@ -4935,8 +4954,12 @@ static void startNormalMode() {
     setupOtaPmLock();
     announceUdp.begin(0);
 
+    // The first light frame is already the visible phase of Wi-Fi association.
+    wifiConnActive = true;
+    wifiBlinkOn = true;
+
     // Deep wake: leave the sleep frame at once (Zzz gone) so BOOT has instant
-    // feedback; Wi-Fi is not up yet, so the template keeps its icon hidden.
+    // feedback; the Wi-Fi cell starts visible and Bridge keeps its old glyph.
     // This first wake frame is a clean full baseline; a partial here can leave
     // a Zzz ghost that reads as "still asleep". The timer pull path already
     // drew that baseline inside deepNetworkCycle (wakeBaselineDrawn), so it
@@ -4948,12 +4971,13 @@ static void startNormalMode() {
     wakeBaselineDrawn = false;
 
     // task-10 A: cold boot with a cached usage snapshot shows the template at
-    // once (WIFI OFF, no Connecting page) instead of blocking on association.
-    // The link-up render below then adds the Wi-Fi icon with one partial.
+    // once instead of blocking on association.
     const bool cachedColdBoot = !wokeFromDeep && lastUsage.length() > 0;
     if (cachedColdBoot) renderCurrent();
 
     wifiUp = connectBest(!wokeFromDeep && !cachedColdBoot);
+    wifiConnActive = false;
+    wifiBlinkOn = false;
     registerHttpRoutes();
     server.begin();
 
@@ -5116,7 +5140,7 @@ static void enterDeep(const char *reason) {
     // Draw the sleep-state glyph (device.mode -> deep) before sleeping so the
     // screen shows the moon/Zzz immediately instead of at the next contact.
     // Unconditional: the cached flag was suspected of skipping this render.
-    rtcDeepGlyph = activeTplHasMode ? 1 : 2;
+    rtcDeepGlyph = (rtcDeepGlyph & 8) | (activeTplHasMode ? 1 : 2);
     // Force a full refresh for the sleep glyph. Partial refreshes compare
     // against the firmware's `lastDisplayedFrame`, which can drift from the
     // panel's physical image (the thin-wake panel power pulse resets the
@@ -5231,6 +5255,7 @@ void setup() {
         rtcActiveAt = 0;
         rtcActiveMac[0] = 0;
         rtcLastSyncEpoch = 0;
+        rtcDeepGlyph = 0;
         rtcRetryStage = 0;
         rtcUsageHash = 0;
         rtcMode = MODE_LIGHT;
