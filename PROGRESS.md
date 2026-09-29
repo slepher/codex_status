@@ -1,5 +1,53 @@
 # Codex Status 项目进度（交接文档）
 
+## Note4 休眠唤醒保留 Bridge 图标状态（2026-09-29 香港时间）
+
+- 用户纠正：休眠转唤醒、Wi-Fi 尚在扫描/关联时 Bridge 图标保持休眠前的 ON/OFF，连接尝试实际失败后才切 OFF；这是 ROM 状态逻辑，模板只负责按 `device.offline_mins` 显示两种图标。本轮未改模板或重新发布 Bundle。固件在 RTC 的 `rtcDeepGlyph` bit3 保留上次 Bridge OFF 状态，深睡时钟唤醒及 Wi-Fi 连接期沿用；连接结束后仍用现有 Wi-Fi/Bridge 联系判定刷新。无保存网络/空 SSID 的提前失败路径也立即落 OFF。
+- Note4 目标仅 `zectrix-note4-b` 经隔离脚本构建，最终 ROM `artifacts/rollout-20260928/note4-0.18.38-bridge2.bin`，1,649,984 B，SHA256 `F26B41F2115B682CA10426BE22C84C6B4BE2E12FDE4D8DE9F2EF97AB808DF7EB`，marker `codex-status-ota-v1|zectrix-note4-400x300|0.18.38-note4-b-bridge2`、头 `E9070240` 已核对。Bridge 已登记该 target 的最新 ROM；精确 MAC `7C4FADB93408` 的 OTA job `5c8fa176` 一次上传，`succeeded/image_verified`，认证运行镜像前 1,649,984 B SHA256 与产物匹配。此前排队但未上传的 `0.18.37-note4-b-bridge1` job `57b9fad4` 已 `cancelled_before_upload`；该版本不在设备运行。源码回归零编译重建，构建产物 SHA256 与已发布文件一致；`git diff --check` 通过。1.54 未构建、未 OTA。
+- 已验证状态机与镜像身份；休眠前 OFF→唤醒保持 OFF、休眠前 ON→唤醒保持 ON 的**实机图标观测**仍待下一次人工唤醒核对。现有 `deep.glyph` 诊断字节新增 bit3，表示缓存的 Bridge OFF；旧 bit0/bit2 含义不变。Note4 源码已在 `a91877b` 提交。
+- 分批提交前重新运行 `cargo test -p bridge-render --test compiled --target-dir target/rollout-20260928`：7/7 通过，包含此前其他构建现场报告 100 像素差的 `note4_percent_origins_follow_one_two_and_three_digits`；旧失败记录是彼时现场，当前工作区已不能复现。`cargo test -p bridge-core -p bridge-app -p bridge-mcp --target-dir target/rollout-20260928`、`node tools/test-device-page.mjs` 通过；Bridge 后端/设备页界面分别在 `b7897f6` / `480f492` 提交。文档补充作为随后独立提交。
+
+## 设备页与 MCP 时间显示收束已部署（2026-09-29 香港时间）
+
+- 共享 `platform_device_view` / `platform_device_detail` 投影现将同一次认证 Wi-Fi `/api/status` 的固件、电量、无线、运行、安装与显示字段合并到一个公共回报时间；同次字段不再各带 `observed_at`。较新的 BLE 精简摘要只给实际携带的 active/applied 等字段另记来源与时间，不把旧 Wi-Fi 固件、电量或显示结果变新。HTTP 摘要和完整回报共用一个接收时刻；owner 标公开状态观察来源。设备页普通读数不重复时间，未来时间显示绝对值并标异常；PM 成功样本整块共用一次采样时间，失败尝试另记。PowerPlan 当前只证明生成与 ACK 时间，UI/MCP 以 `prepared_at` 命名生成事件，**未声称有独立的真实发送时间**。新完成的诊断 checkpoint 在持久 complete 时记 `completed_at`，旧归档缺此字段时显示时间未记录。模板 Tab、数据 Tab、普通 BLE 字段及固件/OTA 流程未由本项改动。
+- 为不覆盖并行完成的 Note4 `digit_x` Bridge 支持，最终候选在独立 managed worktree 的私有 target 构建，纳入当时已部署的模板校验/宿主渲染与 `min_fw` 发布门槛，ABI 保持 2；未复制 `src/main.cpp`，本项未构建固件或写设备。最终 `bridge/target/debug/bridge-app.exe` 为 34,511,872 B，SHA256 `DB6A8F95A699B763E738B06ADE6042EBCC18B8C4A405F563FEB2D093E7C8A5AA`；安装前仅按确切 EXE/8765/8766 校验并依次停 watchdog、计划任务，复制期间 `bridge/target/debug/data/platform/state.json` 哈希保持 `53F3E85188F8734368F291F3AC7D69B9975FCBE757BCE9169295F1F7F8465812`。默认任务 Running，主 PID 15936、watchdog 24612，8765/8766 均由主 PID 监听（PID 仅是当时现场）。并行 Note4 版 EXE `DA337055…` 已另存 ignored `artifacts/rollout-20260928/bridge-app-note4-layout1-20260929.exe`；本项中间版与更早默认版也各有 ignored 备份。
+- 设备现场沿用前一节已核 ROM 证据：Note4 `0.18.36-note4-b-layout1` / `artifacts/rollout-20260928/note4-0.18.36-layout1.bin`，1,649,888 B，SHA256 `42392504657D66ACA38C4F446BCEFACE7AF5ED34B40425431D85513FDA45C748`，此前 OTA job `a7c50a49` 已 `image_verified`；书桌屏 `0.18.34-bw-ota1` / `artifacts/rollout-20260928/154g-0.18.34-ota1.bin`，1,631,488 B，SHA256 `DDEE1ECAEB94714165E639CCD98C0327AFA5B3A46328153028C013B666249E1D`，此前 USB 整段回读一致。这些均非本轮新写入或重新量测的 ROM。
+- 隔离 `cargo test -q -p bridge-core -p bridge-app -p bridge-mcp` 通过（core 96、app 45 通过/1 ignored、MCP 3，另有集成测试）；`node tools/test-device-page.mjs`、`git diff --check` 通过。最终运行 MCP：无 MAC 列出两台；`70041DD7A340` 与 `7C4FADB93408` 的主视图及各七个折叠栏目按 MAC 返回，同次 Wi-Fi 读数无重复时间；Note4 已存 `digit_x` 模板只读验证 `valid=true`、ABI 2。此轮未显式读 PM，运行缓存返回 `not_sampled`；重启后 owner 尚无新公开观察，来源保持未知。完整 U01–U20、最终 Tauri 窗口视觉、PM 跨 boot 身份仍待验。
+- 并行 Note4 工作树新增的宿主测试 `note4_percent_origins_follow_one_two_and_three_digits` 在 `remaining=10, five_hour=true` 的 JSON 路径报 100 个像素差；其后同进程两例因测试 mutex 被污染而失败。此项不属于设备页时间逻辑，本轮未改 Note4 固件/渲染代码；已在 backlog 的 Note4 模板项记待查。旧 `PROGRESS.md` 章节中的 EXE 哈希与“仅文档/待实施”描述均是各自当时现场，以本节与 backlog 当前快照为准。
+
+## Note4 布局、Wi-Fi 连接闪烁与显示状态诊断（2026-09-29 香港时间）
+
+- 用户确认 Note4 实机余量数字与 `%` 布局已正常；Wi-Fi / Bridge 图标尚未目视确认。单份 `codex-status-a` 模板 v2 已保存到默认 Bridge（source CRC `bc559df9`、compiled CRC `aad5a4ce`），按余量 1/2/3 位选择各自 `%` 横坐标，数字下移；Bridge ON/OFF 条件互斥，稳定 Wi-Fi OFF 的斜杠图标已恢复。1/2/3 位、weekly-only 及图标帧的同源宿主预览在 ignored `artifacts/previews/note4-layout-*.png`，JSON/Compiled/回环逐像素一致。此前发布的 `3fbf20f6` 版本未含数字布局且错误隐藏稳定 Wi-Fi OFF；以下记录取代它作为当前现场。
+- Note4 ROM `artifacts/rollout-20260928/note4-0.18.36-layout1.bin`，1,649,888 B，SHA256 `42392504657D66ACA38C4F446BCEFACE7AF5ED34B40425431D85513FDA45C748`，marker `codex-status-ota-v1|zectrix-note4-400x300|0.18.36-note4-b-layout1`。按 MAC `7C4FADB93408` OTA job `a7c50a49` 已 `image_verified`，运行 `ota_1`；其后显式 Bundle job `6820d9a0` 已 `succeeded`，设备自报 `committed_job_id=6820d9a0`、`commit_seq=351`。默认 Bridge EXE `bridge/target/debug/bridge-app.exe` SHA256 `DA337055B890BA125CDE46848F27BA92CF9395AAE084A1B57239226FE0FFBA41`，计划任务重启，原 `data/` 保留。模板新 `digit_x` 使用 ABI 2 已有文字操作字段，并由 Bridge `min_fw` 阻止旧 ROM 接收；未构建或 OTA 1.54。
+- 固件在 Wi-Fi 扫描和关联整个连接窗口每 1000 ms 切换 Wi-Fi 亮/空白，连接后停止。设备 `/status.json` 曾读到 `blink_ms=1000`、`blink_ticks=4`、`wifi_conn=false`、`epd_trusted=true`；`blink_ticks` 只在成功的局刷后增加，因此至少 4 次连接图标局刷已由设备计数证明，实际图标仍待用户目视确认。Bridge OFF 的独立模板预览无叠画。
+- 最新诊断批次 `49-acf197561a4666c909ed9e9ebcbeb03d`（bundle_confirm）含两次 `[epd] partial failed; escalating to full refresh`；批次 50（light_exit）再含一次。设备 `epd_busy_fails=3`、`display_state=failed`，但模板作业成功、用户见正确布局，设备稍后报告 `epd_trusted=true`、`epd_writes=10`。源码 `src/main.cpp` 只因一次渲染前后 `rtcEpdBusyFails` 增加就报 failed，即使随后整刷成功；所以此状态表示局刷尝试曾失败，不足以证明最终画面失败。现有日志未记录失败发生在影子帧校验、内存分配或 SSD2683 BUSY 阶段，具体低层原因尚未定位；见 backlog A3/显示状态项。设备现在已休眠，直接只读 HTTP 超时。旧版历史也有间歇 `display_state=failed`，不是新模板独有。
+- `cargo test -p bridge-core -p bridge-render -p bridge-app -p bridge-mcp --target-dir target/rollout-20260928` 分组通过；`node tools/test-device-page.mjs` 通过；Note4 隔离构建通过。`git diff --check` 通过。当前源码/文档改动未提交。
+
+## 设备页时间显示收束文档（2026-09-29 香港时间）
+
+- 用户纠正：设备一次认证 Wi-Fi 状态回报中的固件、电量、无线、安装/显示等字段共用一次回报时间；BLE 精简会合仅另记最近联系，显式 PM 读取整块共用一次采样时间；OTA/Bundle、发布登记、占用和 PowerPlan 使用事件/观察时间，不按 UI 栏目人为制造采样时间。Astra 只读核对源码后，新增 `project-workflow/device-sync-diagnostics/device-page-time-plan.md`，并修订同目录设备页与 MCP 合同；唯一待办入口为 `docs/roadmap/backlog.md` C8。**本轮只改文档，时间去重尚未实施、未构建、未部署，未联系其他执行线程。**此前已部署的主视图/MCP 仍以以下运行版记录为准。
+
+## Note4 Bridge Wi-Fi 模板实改并发布（2026-09-29 香港时间）
+
+- 用户再次明确要求实际更新 Bridge 模板并推送。默认 Bridge 模板库 `codex-status-a` 从 source CRC `aa5284a8` 改为 `3fbf20f6`、compiled CRC `74c7044b`：删去 `device.state=WIFI OFF` 时 x=272/282 的两半 Wi-Fi 斜杠图标，使连接亮帧 `WIFI CONN` 显示 Wi-Fi，灭帧 `WIFI BLINK OFF` 与普通 `WIFI OFF` 的 Wi-Fi 格均为空白；旁边 Bridge 图标保持。固件现有 `WIFI_BLINK_MS=1000` 负责每 1 秒切换一次，模板 JSON 不设定时序。此变更也让**稳定 Wi-Fi 离线**不再绘制原斜杠 Wi-Fi 图标，是模板条件无法区分闪烁灭帧和普通 `WIFI OFF` 时的明确视觉结果；未纳入先前的数字/% 离线样稿。
+- 使用运行中 Bridge 的 `platform_template_validate` 得 `valid=true`、ABI 2、12 资源；固件同源宿主对 `WIFI CONN`/`WIFI BLINK OFF`/`WIFI OFF` 三态逐像素 JSON/Compiled/序列化回环差均为 0。Wi-Fi 格黑像素为 96/0/0，Bridge 格各为 131。经 `platform_template_save` 保存后，`platform_publish` 对精确 MAC `7C4FADB93408`、target `zectrix-note4-400x300` 冻结完整 Bundle CRC `d596d9f2`，作业 `e7d15b8d` 等待认证联系后发送成功；设备认证回报 `committed_job_id=e7d15b8d`、`active_template_id=codex-status-a`、`display_state=displayed`、`commit_seq=349`。本轮未构建固件/OTA，1 秒闪烁仍待实机逐秒观察。
+
+## Note4 Wi-Fi 闪烁模板重发（2026-09-29 香港时间）
+
+- 用户明确要求更新 Bridge 模板并推送。核对默认 Bridge 模板库 `codex-status-a`（source CRC `aa5284a8`）与已登记 Note4 `7C4FADB93408`：`WIFI CONN` 绘制 Wi-Fi 图标，`WIFI BLINK OFF` 对应的 Wi-Fi 区域为空白；宿主同源渲染该区域分别为 96/0 黑像素，稳定 `WIFI OFF` 仍保留独立斜杠图标。固件 `WIFI_BLINK_MS=1000`，每 1 秒切换亮/空白；模板 JSON 不控制计时。Bridge 当前源已满足需求，因此没有改写同内容模板，也未把尚属离线样稿的数字布局混入本次发布。
+- 通过默认 Bridge `platform_publish` 显式向上述 MAC、目标 `zectrix-note4-400x300` 发布完整 Profile（仅 `codex-status-a`）：job `983465c2`、冻结 Bundle CRC `a9236fdd`，先等待认证联系，随后发送成功。Bridge 作业记录为 `succeeded`、无错误；设备认证状态回报 `committed_job_id=983465c2`、`active_template_id=codex-status-a`、`display_state=displayed`、`commit_seq=348`。本轮未构建固件或 OTA；1 秒闪烁时序尚未用实机视频/日志逐秒复核。
+
+## 设备页主视图／MCP 对等已部署（2026-09-29 香港时间）
+
+- 在原有未提交 OTA/设备页工作上完成共享 application service 投影：`platform_device_view` 无 MAC 仅列出登记设备简况，带 MAC 返回设备页默认主视图；`platform_device_detail(mac, section)` 只返回指定折叠栏目（firmware、connection、runtime_display、sync_diagnostics、power、upgrade_history、maintenance）。两者只读本地记录，均不隐式联系设备、claim、发布或改 PowerPlan；页面只有展开详情时取对应栏目，显式“从设备读取”仍独立调用 `platform_status_refresh`。主区按身份/联系、当前与最新固件及判断、相关失败、设备实际显示、电量与投递许可、连接占用排列；历史任务和诊断移入折叠。模板 Tab 未增加迁移布局，数据 Tab 排版未动。
+- 按 target 显式发布当前两份已核 ROM 到默认 Bridge 的本地最新固件目录，**未 OTA/未写真实设备**：Note4 `0.18.35-note4-b-ota1` / `41882149824B917D252046721474684BFF6193C520625A4C1D0A3B6A7AF505E4`，书桌屏 `0.18.34-bw-ota1` / `DDEE1ECAEB94714165E639CCD98C0327AFA5B3A46328153028C013B666249E1D`；登记前逐一核对 ROM 大小、SHA256 和嵌入 target/version marker。运行 MCP 对两个 MAC 均返回当前版本=最新登记版、`current`，七个详情栏目逐项按 MAC 返回，主视图不带历史/镜像哈希/原始 owner/模板 ID。当前 Bridge 缓存中两台 `running_image` 均为空，因此此轮“已是最新版”基于认证版本相同；Note4 过去的独立运行镜像证明和书桌屏 USB 回读见下文，不能把本次缓存查询写成新的精确镜像证明。
+- 最终隔离构建 `bridge/target/rollout-20260928/debug/bridge-app.exe` 已安装到默认 `bridge/target/debug/bridge-app.exe`，两者 SHA256 `E4DE926C7495E03DE55AAFD9F8F3AEA1DDCB63515AAD9CF12775AA05E1DD885A`。旧版按 watchdog→计划任务顺序停止，仅替换同路径 exe，`data/` 保留；默认计划任务 Running，主 PID 35320、watchdog 38988，8765/8766 均由主进程监听（PID 为当时现场，复查须重新核对）。安装前各旧 exe 已另存 ignored `artifacts/rollout-20260928/bridge-app-pre-device-mcp*.exe`；运行 state.json 存在，末次核对 161346 B。
+- `cargo test -p bridge-app -p bridge-core -p bridge-mcp --target-dir target/rollout-20260928` 全通过（app 44 通过/1 ignored，core lib 95、MCP 3，另有集成测试）；`node tools/test-device-page.mjs`、`git diff --check` 通过。同步方案完整 S01–S14、设备页 U01–U20 全矩阵、Tauri 最终窗口视觉、1.54 运行分区独立哈希及硬件长时出口仍未验收；本次未构建固件、未触发 OTA 或其他实机写入。唯一待办见 backlog C8。
+
+## 设备页／MCP 读取对等需求记录（2026-09-29）
+
+- 按本轮对话仅整理文档：`project-workflow/device-sync-diagnostics/device-page-content-contract.md` 固定设备页的内容、顺序、OTA 结果与历史归档、详情及采样语义；同目录 `device-page-mcp-contract.md` 固定 MCP 主视图对等、折叠栏目按 MAC 独立只读查询、缓存读取与显式设备采样分离。待办入口为 `docs/roadmap/backlog.md` C8。本次未修改代码、未运行测试、未重建/重启 Bridge，也未交办执行；已有工作树改动和默认运行版保持原状。
+
 ## 无桌面干扰的软件回放（2026-09-29 香港时间）
 
 - 用户要求继续可在后台完成的验证。新增 `tools/run-sync-headless.mjs`，在 ignored 目录启动两个隐藏 Fake ROM 和一个命名隔离 Bridge（独立 loopback 端口、实例 data、模拟 MAC），真实 Bridge 客户端经 BLE/HTTP 与设备协作；`tools/fake-rom-runner.mjs` 计入一次性 sync 开网、可排正式 light Plan。测试夹具为首轮 HTTP 基线在**隔离实例**预置已知假设备操作 token；该步骤不是 DeviceConnection 取 token 的验证。所有测试进程完成后退出；未操作桌面、默认 Bridge 或真实设备。最终测试候选 `bridge/target/rollout-20260928/debug/bridge-app.exe` SHA256 `BD7462B4F91327FF378F7387AA229B7D1A3CA63A6D76EEA6F8E85BFD95BC11C5`；默认 EXE 仍为下节的 `D049C281…`，主 PID 18332/watchdog 28596、计划任务 Running、8765/8766 均正常（测试前后只读核对）。

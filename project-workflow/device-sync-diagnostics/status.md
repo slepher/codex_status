@@ -1,5 +1,19 @@
 # 状态与交接
 
+## 2026-09-29：设备页时间投影与 MCP 对等（已部署，完整矩阵待验）
+
+一次认证 Wi-Fi 回报共用公共时间；BLE 只更新实际携带的精简字段及联系时间；PM 整块共用显式成功采样时间，失败尝试另记；公开 owner 与任务/发布/归档保留各自事件来源。页面普通读数已去重，未来时间显示异常而非“刚刚”。新归档 complete 记录真实持久提交时间，旧记录继续显示时间未记录。默认 Bridge EXE SHA256 `DB6A8F95A699B763E738B06ADE6042EBCC18B8C4A405F563FEB2D093E7C8A5AA`；两台 MAC 主视图与各七个只读详情运行核验通过，已保存的 Note4 模板只读验证为 ABI 2 且有效。当前测试结果与旧渲染失败记录的区别见 `PROGRESS.md` 最新节。剩余出口以 backlog C8 为准：U01–U20、Tauri 最终窗口、PM 跨 boot 身份和真实 Plan 发送时刻。
+
+## 2026-09-29：设备页主视图与 MCP 读取对等（已部署，完整矩阵待验）
+
+设备页与 MCP 共用 `bridge/crates/app/src/platform.rs` 的按 MAC 主视图和折叠详情投影；默认 `platform_device_view` 只返回主区，`platform_device_detail` 按单个栏目只读本地缓存。旧 OTA 任务和 Bundle 任务保留在独立历史，最新版本只由显式发布目录判断。默认 Bridge 已安装 SHA256 `E4DE926C…`，现行双 ROM 已按 target 登记为本地最新可用版；两 MAC 运行 MCP 主视图和七栏目通过。测试与未验边界见 `PROGRESS.md` 最新节；U01–U20 完整矩阵和 Tauri 窗口视觉仍待验，不能记作完成。
+
+## 2026-09-29：旧 OTA 任务生命周期收束（执行中）
+
+**产品/数据合同。** 设备页主视图只显示该 MAC 最近一次认证设备快照的当前版本及采样时间、按 firmware target 显式登记且冻结字节的最新可用版本、两者比较结论。未登记发布版或未采样当前设备时明确未知；有两侧精确镜像哈希时优先比较运行分区前发布镜像字节数的 SHA256，同版本不同字节不得显示“最新版”。不同显示升级提示；相同显示最新版；不同且最近针对该设备/目标版的真实推送失败，补最近失败原因。发布目录不是最近 OTA job、工作区 bin 或版本字符串排序；只由显式校验 target/marker/大小/SHA 后登记替换。设备页独立历史栏保留原 job、上传 ACK、精确镜像观察、旧错误与关闭原因，主视图不出现 arm/upload_ack/version_seen_unproven/awaiting_confirmation。
+
+现场两个历史任务仍占每 MAC 的唯一 `ota_jobs` 槽：书桌屏 `ff8a3dc9` 为 `awaiting_confirmation`、无上传 ACK、已请求取消、旧 sync arm 409；Note4 `bde8e156` 有上传 ACK 但仅 `version_seen_unproven`，目前设备已运行另一镜像。隔离实现目标：① 已请求取消的无 ACK 任务退出活跃槽，原记录/错误/冻结身份与关闭原因进入有界持久历史；② 有 ACK 的任务只通过同 MAC/target 的认证运行分区前 N 字节 SHA 判定指定镜像现在是否运行，精确不同的后续镜像使旧目标退出活跃槽，旧安装结果不伪造成功/失败；③ 同版本未证任务在有界认证机会内查询，不自动重刷；④ 新任务替换旧槽前保存唯一历史，幂等 request ID 不重新排队。用户目标是最终运行镜像是否匹配，不要求证明由本次上传造成切换。测试覆盖重启、取消、旧任务不重传/不阻塞、精确哈希同/异、发布目录 target 隔离及 UI。
+
 ## 2026-09-29：后台隔离回放证据（部分出口）
 
 不占用桌面的隔离测试已完成：双 Fake ROM + 真实 Bridge 客户端虚拟 24h 共 2,785 事件，两台各连续完成 serial 1–97、都达到第 15 轮，归档 checkpoint 与 SHA 核对通过；另有正式 light 入/离场、Bridge 进程重启、Fake ROM 进程重启的独立烟测。同 seed 两次独立 1h trace 原始 SHA 一致、10 份归档按实例 Bridge ID 归一化后内容/记录字节一致。命令为提权执行 `node tools/run-sync-headless.mjs 86400000`、`1500000 light`、`1200000 restart`、`1200000 device-restart` 和两次 `3600000 periodic`；隔离证据路径和限定范围见 `PROGRESS.md` 最新节。候选 EXE 含一次性 Wi-Fi 完成后的续传修正，默认 EXE 未更新。

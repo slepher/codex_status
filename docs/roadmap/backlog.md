@@ -15,13 +15,13 @@
 | 1.54" 设备 | MAC `70041DD7A340`，显示名"书桌屏"，IP `192.168.3.163`，Profile 同步启用、按键顺序 `quad,mini`（2026-09-28 运行 state 核对） |
 | Note4 设备 | MAC `7C4FADB93408`，显示名"Note4"，IP `192.168.3.177`，`sync_enabled=true`，Profile `codex-status-a` |
 | 两设备可达性 | **2026-09-25 15:2x 已按键唤醒、实测可达**（`/status.json`+ARP 双证，MAC 与登记一致）；此后注意深睡仍会不可达 |
-| Note4 已装固件 | 2026-09-29 认证 `/api/status`：`0.18.35-note4-b-ota1`、target `zectrix-note4-400x300`、最终 slot `ota_0`；新版 token-only 直接 OTA `UPDATE OK`、换槽、软件重启，运行镜像前缀 SHA256 与候选完全相同 |
+| Note4 已装固件 | 2026-09-29 OTA job `5c8fa176`：`0.18.38-note4-b-bridge2`、target `zectrix-note4-400x300`，认证 `image_verified` |
 | 1.54 已装固件 | 2026-09-29 COM4 USB 刷入 `0.18.34-bw-ota1`，串口自报新版本；运行分区前 1,631,488 字节回读与候选逐字节一致。Bridge BLE 数据/Plan 已 ACK；旧诊断 checkpoint 返回 409，见 A0 |
-| Note4 ROM | `artifacts/rollout-20260928/note4-0.18.35-ota1.bin`，1,648,624 B，SHA256 `41882149824B917D252046721474684BFF6193C520625A4C1D0A3B6A7AF505E4`；旧→新及新版 token-only OTA 各一次，最终 `ota_0`，精确运行镜像哈希已核对 |
+| Note4 ROM | `artifacts/rollout-20260928/note4-0.18.38-bridge2.bin`，1,649,984 B，SHA256 `F26B41F2115B682CA10426BE22C84C6B4BE2E12FDE4D8DE9F2EF97AB808DF7EB`；OTA job `5c8fa176` 已 `image_verified` |
 | 1.54 ROM | `artifacts/rollout-20260928/154g-0.18.34-ota1.bin`，1,631,488 B，SHA256 `DDEE1ECAEB94714165E639CCD98C0327AFA5B3A46328153028C013B666249E1D`；USB 写入与整段哈希读回校验通过。`0.18.25-bw` 回退 ROM 保留；故障 `0.18.32-bw-sync1` 禁止再次上机 |
-| 桥 | `bridge/target/debug/bridge-app.exe`，SHA256 `74C6228946D3749A67035F9FFD9B9E9260EBBAFC418E9B54D88BD0353624FDB1`；2026-09-29 计划任务 Running、主 PID 10760、8765/8766 监听，运行 data 保留；书桌屏诊断旧 checkpoint 待恢复 |
+| 桥 | `bridge/target/debug/bridge-app.exe`，SHA256 `DB6A8F95A699B763E738B06ADE6042EBCC18B8C4A405F563FEB2D093E7C8A5AA`；2026-09-29 计划任务 Running、8765/8766 监听，运行 data 保留；含已部署 Note4 模板支持与设备页时间收束 |
 | 1.54 队列/模板 | **已解决（2026-09-25）**：`bundle_jobs` 为空；job `2bfc710c` = `succeeded`，设备 `committed_job_id=2bfc710c`、`v2_templates=2`(`mini,quad`)、`active=quad` 并已渲染。残留：数据帧被拒 `incomplete` → **见 A7** |
-| Note4 正常 | 最新 job `1b4500ad` = `succeeded`；2026-09-25 实机 `data_seq=applied_seq=63`，`committed_job_id=1b4500ad`/`commit_seq=267` |
+| Note4 正常 | 最新 Bundle job `6820d9a0` = `succeeded`；2026-09-29 实机 `committed_job_id=6820d9a0` / `commit_seq=351`，用户确认数字布局正常；`display_state=failed` 的局刷/整刷判定问题见 A3 |
 
 ## 1. 产品需求 → 实现状态
 
@@ -31,7 +31,7 @@
 | v2 通用平台：Profile 1–8、CompiledTemplate、完整 A/B Bundle、单一 active context、Bridge 生成 PowerPlan | 已交付并实机跑通 | Bundle v3 压缩（见 C1） |
 | 显式 claim/lease 占用、MAC 为身份、显示名可改 | 已交付 | 无 |
 | 端口鉴权 token（`/update`、`/doUpdate`、OTA、`POST /claim`） | 已交付 | 无 |
-| Note4 400×300 模板 `codex-status-a` | 已交付并实机显示 | 图标校正版（`note4-icon-correction`）**未保存到桥、未发布**（见 A2） |
+| Note4 400×300 模板 `codex-status-a` | v2 已保存并发布、实机数字布局正常；宿主 `compiled` 7/7 通过 | Wi-Fi 连接时亮/空白图标有设备局刷计数，尚待目视确认；ROM `0.18.38` 已部署休眠前 Bridge ON/OFF 延续逻辑，两种起点仍待实机目视确认。Bridge OFF 独立 glyph 已做同源预览 |
 | Note4 时钟每分钟局刷（不做整屏全刷） | 部分交付 | v2 会合路径的 ghost 预算**已补齐**；Note4 深睡断电导致基线丢失仍会回退全刷，需实机验收 |
 | 两台设备离线深睡时钟准度 | 整秒锚点已修、双 ROM 已顺序 OTA，准度待验 | Note4 原约慢 15 分钟/天、1.54 约慢 8 分钟/天；两台认证版本已变为 0.18.25。1.54 最近电量 12%，需先确保离线测试不会被低电保护中断；各自离线 24 h 复测后，再判断内部 RC 剩余漂移。证据见 `PROGRESS.md` 最新节 |
 | 深睡功耗与电池续航 | 部分交付 | panel-power 双模式已实现但未刷入；bench 电流/残影/重复唤醒**从未测量**（见 D1） |
@@ -89,6 +89,7 @@
 - **仍待做**：按一次 1.54 按键本地切到 `quad`，现场确认契约会跟着刷新（单测已覆盖逻辑）。
 
 ### A3. 修掉 Note4 深睡时钟残影（唯一影响日常观感的显示缺陷）
+- **2026-09-29 新诊断**：Note4 新模板 Bundle job `6820d9a0` 已成功且实机布局正常，但 `display_state=failed`。统一诊断批次 49/50 有三次 `[epd] partial failed; escalating to full refresh`；`epd_busy_fails=3`，后来 `epd_trusted=true`、`epd_writes=10`。`main.cpp` 用渲染期间失败计数是否增加判断最终显示状态，成功整刷也被记为 failed。待将局刷失败原因分型（影子帧、分配、BUSY/阶段），让最终状态按实际落屏结果报告，并确认有无硬件侧间歇 BUSY 故障；不要把当前 failed 当作模板提交失败。
 - **现象**：deep 期间只写时钟窗口，残影累积；`SYNC`/用量属整帧元素所以停在最后一次整帧（现场曾被读成 `04:64`）。
 - **根因（已用代码核实，2026-09-25）**：**v2 设备上时钟窗口的 ghost 预算根本没有被评估**。预算判定只在 `deepNetworkCycle()`（`main.cpp:5166` 渲染门 / `5177` 强制清影），而它唯一的调用点在 `main.cpp:5697`，进入条件是 `!(deepWakePath && v2BundleReady)`（`main.cpp:5678`）。Note4 有已提交 v2 Bundle → 走 `5678-5693` → `deepNetworkCycle()` 从不被调用 → `rtcClkPartials >= CLK_GHOST_LIMIT` **永不成立**，计数器只增不减。v2 会合真正走的 `v2RendezvousClockRender()`（`main.cpp:4617`）只检查 `clkR.valid`/`activeTplHasNow`/`timeKnown()`/`clkPixelsValid`，**无预算检查**。
 - ⚠️ **曾经写错、此处纠正**：上一版这里写过「已过时，rtcClkPartials 现已覆盖两条路径」——那是错的，更早的 `PROGRESS.md:37` 才对。落笔前请自己复核 `main.cpp:5678` 的分支条件。
@@ -167,10 +168,11 @@
 - 前置：C3 的记录格式（否则没有可信的对照口径）。
 
 ### C8. 设备同步与诊断协议（device-sync-diagnostics）
-- `sync-v1` 实施合同见 `project-workflow/device-sync-diagnostics/design.md`。当前默认 Bridge 与双设备现场见 `PROGRESS.md` 最新节：Note4 `0.18.35-note4-b-ota1` 的运行分区前缀 SHA256 已由认证接口与候选 ROM 精确匹配；1.54 `0.18.34-bw-ota1` 已做 USB 写入后逐字节回读，运行分区的独立认证哈希仍待验。双设备 BLE status/config/plan/open、OTA 上传与重启换槽等先前实机证据保留。2026-09-29 后台隔离双 Fake ROM + 候选 Bridge 虚拟 24h 达到各 97 个连续批次和第 15 轮；独立 light 入/离场、进程重启及同 seed 1h 回放烟测通过，详见 `PROGRESS.md` 顶节。候选 Bridge 的一次性 Wi-Fi 续传修正未部署默认实例。Fake ROM S01–S14、设备页 U01–U20 完整矩阵、F3 延迟页/同磁盘快照回放、页中途强退、真实窗口视觉及其他实机故障矩阵仍未完成；Flash 断电恢复和 1.54 运行分区哈希证据仍须过门槛。
+- `sync-v1` 实施合同见 `project-workflow/device-sync-diagnostics/design.md`。当前默认 Bridge 与双设备现场见 `PROGRESS.md` 最新节：Note4 `0.18.38-note4-b-bridge2` 的运行分区前缀 SHA256 已由认证接口与候选 ROM 精确匹配；1.54 `0.18.34-bw-ota1` 已做 USB 写入后逐字节回读，运行分区的独立认证哈希仍待验。双设备 BLE status/config/plan/open、OTA 上传与重启换槽等先前实机证据保留。2026-09-29 后台隔离双 Fake ROM + 候选 Bridge 虚拟 24h 达到各 97 个连续批次和第 15 轮；独立 light 入/离场、进程重启及同 seed 1h 回放烟测通过，详见 `PROGRESS.md`。一次性 Wi-Fi 续传修正及设备页/MCP 对等版已部署默认实例。Fake ROM S01–S14、设备页 U01–U20 完整矩阵、F3 延迟页/同磁盘快照回放、页中途强退、真实窗口视觉及其他实机故障矩阵仍未完成；Flash 断电恢复和 1.54 运行分区哈希证据仍须过门槛。
 - 当前设备协议作为唯一业务协议的一次性统一见 `project-workflow/device-sync-diagnostics/protocol-unification.md`：业务 HTTP 已收敛到 `/api/*`，旧 `protocol=2`、BLE `rv=2`/`ack="v2"` 与 MCP `_v2` 入口已移除。两台设备现已升级，临时旧 Bridge 已停、新版默认实例已恢复。1.54 的增量缓存复核已完成，结论与四次构建日志见 `PROGRESS.md` 顶节；不并行运行两个 Bridge，也不保留长期双协议兼容。Bridge 本地 `state.json` 无损保留，不凭 wire 更名删除运行数据。
 - 实现每 15 次深睡 BLE 会合的一次性 Wi-Fi 同步，以及正式 light 入口和退出时的 Wi-Fi 同步；成功同步才重置计数。普通 BLE 保持精简，诊断日志按冻结批次经 Wi-Fi 增量同步，未确认内容保留。
-- 合并普通 `/log` 与跨深睡 `/history` 为统一、跨深睡、可分页/确认/报告 gap 的诊断流；OTA/Bundle 执行后以 Wi-Fi 报告分级结果并有限重试。设备页移除 Codex 余量和屏幕内容、模板/Profile 编排、字体管理编辑界面；保留只读实际 active/已安装/任务及设备级数据投递许可。模板 Tab 暂不增加对应界面或设计迁移布局，数据页排版不动。继续完成设备详情的采集时间和缺失原因。
+- 合并普通 `/log` 与跨深睡 `/history` 为统一、跨深睡、可分页/确认/报告 gap 的诊断流；OTA/Bundle 执行后以 Wi-Fi 报告分级结果并有限重试。设备页移除 Codex 余量和屏幕内容、模板/Profile 编排、字体管理编辑界面；保留只读实际 active/已安装/任务及设备级数据投递许可。模板 Tab 暂不增加对应界面或设计迁移布局，数据页排版不动。详情时间与缺失原因已收束，完整 U 矩阵仍待验。
+- 设备页内容与信息层级见 `project-workflow/device-sync-diagnostics/device-page-content-contract.md`，MCP 读取对等要求见同目录 `device-page-mcp-contract.md`。共享投影、默认主视图和七个按 MAC 折叠栏目已部署；版本结论依各设备缓存与显式发布目录判断。时间显示按同目录 `device-page-time-plan.md` 收束并完成两 MAC、七栏目运行 MCP 核验：完整 Wi-Fi 回报共用一个时间，较新的 BLE 联系单列，PM 整块共用一次成功采样时间，任务和占用使用事件/观察时间；UI 与 MCP 同源。剩余：真实 Plan 发送时刻尚未单独持久化（现显示生成与 ACK）、PM 样本跨 boot 身份、U01–U20 完整矩阵、最终 Tauri 窗口视觉及折叠诊断产品验收；详情见 `PROGRESS.md` 最新节。
 - 以 Fake ROM 验证绝大多数协议和故障场景（S01–S14）；实机只验证 RF/GATT、ESP32 Wi-Fi 入网与 HTTP、light/deep 切换、RTC/Flash/bootloader 等模拟器不能证明的部分（H01–H03）。详见 `project-workflow/device-sync-diagnostics/plan.md`。
 
 ### C5. 字体资产增量发布
