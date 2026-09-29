@@ -745,13 +745,25 @@ pub struct StatusAttempt {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ObservedState {
+    #[serde(default)]
+    pub observed_at: Option<u64>,
+    #[serde(default)]
+    pub transport: Option<String>,
+    #[serde(default)]
+    pub fw: Option<String>,
+    #[serde(default)]
+    pub boot_id: Option<String>,
     pub active_context_id: Option<String>,
     pub active_template_id: Option<String>,
     pub committed_job_id: Option<String>,
     pub data_seq: Option<u64>,
     pub applied_seq: Option<u64>,
     pub last_acked_at: Option<u64>,
-    pub power: Option<ObservedPower>,
+    pub power: Option<Value>,
+    #[serde(default)]
+    pub power_observed_at: Option<u64>,
+    #[serde(default)]
+    pub power_transport: Option<String>,
     pub display_state: Option<String>,
     pub last_error: Option<String>,
 }

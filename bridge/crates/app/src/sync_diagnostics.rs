@@ -28,6 +28,8 @@ struct Checkpoint {
     durable_offset: usize,
     prefix_sha256: String,
     phase: String,
+    #[serde(default)]
+    completed_at: Option<u64>,
 }
 
 pub struct Store {
@@ -54,6 +56,7 @@ pub fn summary(data_root: &Path, mac: &str) -> Value {
     json!({"available":true, "phase":checkpoint.phase, "batch_id":checkpoint.batch_id,
         "gap_count":gaps.as_ref().map(Vec::len),
         "last_full_success":last_full_success,
+        "completed_at":if checkpoint.phase == "complete" { checkpoint.completed_at } else { None },
         "retired_unconfirmed":retired_unconfirmed})
 }
 
@@ -219,7 +222,7 @@ impl Store {
         } else {
             Checkpoint { mac: mac.into(), bridge_id: bridge_id.into(), client_serial: 0,
                 batch_id: None, bytes: 0, sha256: String::new(), durable_offset: 0,
-                prefix_sha256: digest(&[]), phase: "idle".into() }
+                prefix_sha256: digest(&[]), phase: "idle".into(), completed_at: None }
         };
         if checkpoint.mac != mac { bail!("diagnostic MAC mismatch"); }
         if checkpoint.bridge_id != bridge_id {
@@ -227,7 +230,7 @@ impl Store {
             write_checkpoint(&retired, &checkpoint)?;
             checkpoint = Checkpoint { mac: mac.into(), bridge_id: bridge_id.into(), client_serial: 0,
                 batch_id: None, bytes: 0, sha256: String::new(), durable_offset: 0,
-                prefix_sha256: digest(&[]), phase: "idle".into() };
+                prefix_sha256: digest(&[]), phase: "idle".into(), completed_at: None };
             write_checkpoint(&checkpoint_path, &checkpoint)?;
         }
         if let Some(id) = &checkpoint.batch_id {
@@ -267,6 +270,7 @@ impl Store {
             self.checkpoint.client_serial = self.checkpoint.client_serial.checked_add(1)
                 .context("diagnostic client serial overflow")?;
             self.checkpoint.batch_id = None;
+            self.checkpoint.completed_at = None;
             self.checkpoint.phase = "starting".into();
             self.save()?;
         }
@@ -314,6 +318,7 @@ impl Store {
         self.checkpoint.durable_offset = 0;
         self.checkpoint.prefix_sha256 = digest(&[]);
         self.checkpoint.phase = "idle".into();
+        self.checkpoint.completed_at = None;
         self.save()?;
         Ok(true)
     }
@@ -397,6 +402,7 @@ impl Store {
     pub fn mark_complete(&mut self) -> Result<()> {
         if !self.awaiting_ack() { bail!("diagnostic completion not pending"); }
         self.checkpoint.phase = "complete".into();
+        self.checkpoint.completed_at = Some(bridge_core::device_clock::wall_secs(&self.checkpoint.mac));
         self.save()?;
         retain_archives(&self.root)
     }
@@ -598,7 +604,9 @@ mod tests {
         let pending = Store::open(dir.path(), "0200000000A1", "bridge-a").unwrap();
         assert!(pending.awaiting_ack());
         resumed.mark_complete().unwrap();
+        assert!(summary(dir.path(), "0200000000A1")["completed_at"].as_u64().is_some());
         assert_eq!(Store::open(dir.path(), "0200000000A1", "bridge-a").unwrap().serial().unwrap(), 2);
+        assert!(summary(dir.path(), "0200000000A1")["completed_at"].is_null());
     }
 
     #[test]

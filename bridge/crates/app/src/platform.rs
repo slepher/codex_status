@@ -458,6 +458,344 @@ pub fn device_rows(ctx: &AppCtx) -> Value {
     })
 }
 
+fn reading(body: &Value, key: &str, group: &str) -> Value {
+    let value = body.pointer(&format!("/{}", key.replace('.', "/"))).cloned().unwrap_or(Value::Null);
+    let sample = &body["field_samples"][key];
+    let group_sample = &body["groups"][group];
+    let observed_at = sample["received_at"].as_u64()
+        .or_else(|| group_sample["received_at"].as_u64());
+    let exception_at = observed_at.filter(|at| Some(*at) != body["received_at"].as_u64());
+    let with_time = |mut reading: Value| {
+        if let Some(at) = exception_at {
+            reading["observed_at"] = json!(at);
+            reading["source"] = json!(sample["transport"].as_str()
+                .or_else(|| group_sample["transport"].as_str()).unwrap_or("unknown"));
+        }
+        reading
+    };
+    let sampled_boot = sample["sampled_boot_id"].as_str()
+        .or_else(|| group_sample["sampled_boot_id"].as_str());
+    let current_boot = body["boot_id"].as_str();
+    if sampled_boot.is_some() && current_boot.is_some() && sampled_boot != current_boot {
+        return with_time(json!({"value":null,"reason":"stale_boot","previous":value}));
+    }
+    if value.is_null() {
+        return with_time(json!({"value":null,"reason":"not_sampled"}));
+    }
+    if value.get("reason").is_some() && value["value"].is_null() {
+        return with_time(json!({"value":null,"reason":value["reason"],"previous":value["previous"]}));
+    }
+    with_time(json!({"value":value}))
+}
+
+fn prefer_observed(wifi: Value, observed: &Value, key: &str, wifi_at: u64) -> Value {
+    let observed_at = observed["observed_at"].as_u64();
+    if observed["transport"] == "ble" && !observed[key].is_null()
+        && observed_at.is_some_and(|at| at >= wifi_at) {
+        json!({"value":observed[key],"observed_at":observed_at,"source":"ble_digest"})
+    } else { wifi }
+}
+
+fn upgrade_failure_label(error: &str) -> &'static str {
+    let error = error.to_ascii_lowercase();
+    if error.contains("401") || error.contains("unauthorized") { "设备认证失败" }
+    else if error.contains("occupied") || error.contains("claim") { "设备被其他 Bridge 占用" }
+    else if error.contains("target") || error.contains("mac mismatch") { "固件与设备身份不匹配" }
+    else if error.contains("timeout") || error.contains("connect") { "联系设备超时，等待下次唤醒" }
+    else { "升级任务失败，详情见历史归档" }
+}
+
+fn project_device(raw: &Value, identity: &Value, now: u64) -> Value {
+    let mac = &raw["device_mac"];
+    let observed = &raw["record_observed"];
+    let mut status_body = raw["last_authenticated"]["body"].clone();
+    status_body["received_at"] = raw["last_authenticated"]["observed_at"].clone();
+    if !observed["boot_id"].is_null() && observed["observed_at"].as_u64().unwrap_or(0)
+        >= raw["last_authenticated"]["observed_at"].as_u64().unwrap_or(0) {
+        status_body["boot_id"] = observed["boot_id"].clone();
+    }
+    let body = &status_body;
+    let wifi_at = raw["last_authenticated"]["observed_at"].as_u64().unwrap_or(0);
+    let contact_at = raw["last_authenticated_contact_at"].as_u64();
+    let attempt = &raw["last_status_attempt"];
+    let blocked = matches!(attempt["outcome"].as_str(), Some("blocked" | "mac_mismatch"))
+        && attempt["at"].as_u64().unwrap_or(0) >= contact_at.unwrap_or(0);
+    let recent = contact_at.is_some_and(|at| at <= now && now - at <= 30);
+    let expected_sleep = body["power"]["mode"] == "sleep"
+        || raw["record_observed"]["power"]["mode"] == "sleep";
+    let contact_state = if blocked { "blocked" } else if recent { "recently_authenticated" }
+        else if expected_sleep { "expected_sleep" } else { "waiting" };
+    let contact_label = match contact_state {
+        "blocked" => "认证或占用受阻", "recently_authenticated" => "最近已认证",
+        "expected_sleep" => "预计休眠", _ => "等待下次联系",
+    };
+    let current = reading(body, "fw", "firmware");
+    let target = raw["capabilities"]["firmware_target"].as_str().unwrap_or("");
+    let release = &raw["latest_firmware"];
+    let latest = if release.is_null() { json!({"value":null,"reason":"no_release"}) }
+        else { json!({"value":release["version"],"published_at":release["published_at"]}) };
+    let image = &raw["running_image"];
+    let current_boot = &body["boot_id"];
+    let comparable = image["fw_target"] == target && image["fw"] == current["value"]
+        && image["image_bytes"] == release["size"]
+        && image["boot_id"] == *current_boot && !image["sha256"].is_null();
+    let verdict = if current["value"].is_null() || release.is_null() { "unknown" }
+        else if current["value"] != latest["value"] { "upgrade_available" }
+        else if comparable && image["sha256"] != release["sha256"] { "different_image" }
+        else { "current" };
+    let verdict_label = match verdict {
+        "current" => "已是最新版", "upgrade_available" => "可升级",
+        "different_image" => "同版本但运行镜像不同", _ => "无法判断",
+    };
+    let mut related = Vec::new();
+    if !release.is_null() {
+        if let Some(job) = raw.get("ota_job").filter(|v| !v.is_null()) {
+            related.push((job["updated_at"].as_u64().unwrap_or(0), job.clone()));
+        }
+        if let Some(entries) = raw["ota_history"].as_array() {
+            related.extend(entries.iter().map(|entry| (entry["closed_at"].as_u64().unwrap_or(0),
+                entry["job"].clone())));
+        }
+    }
+    let latest_job = related.into_iter().filter(|(_, job)|
+        job["firmware_target"] == target && job["sha256"] == release["sha256"])
+        .max_by_key(|(at, _)| *at);
+    let upgrade_failure = if matches!(verdict, "upgrade_available" | "different_image") {
+        latest_job.and_then(|(at, job)| (job["state"] == "failed").then(|| json!({
+            "at":at,"reason":upgrade_failure_label(job["last_error"].as_str().unwrap_or("")),
+            "label":"最近升级失败"})))
+    } else { None };
+    let mut installed = reading(body, "template_ids", "display");
+    if let Some(ids) = installed["value"].as_array() { installed["value"] = json!(ids.len()); }
+    if let Some(ids) = installed["previous"].as_array() { installed["previous"] = json!(ids.len()); }
+    let mut active_template = prefer_observed(reading(body, "active_template_id", "display"), observed, "active_template_id", wifi_at);
+    if let Some(id) = active_template["value"].as_str() { active_template["value"] = json!(!id.is_empty()); }
+    if let Some(id) = active_template["previous"].as_str() { active_template["previous"] = json!(!id.is_empty()); }
+    let mut applied = prefer_observed(reading(body, "applied_seq", "jobs"), observed, "applied_seq", wifi_at);
+    if let Some(seq) = applied["value"].as_u64() { applied["value"] = json!(seq > 0); }
+    if let Some(seq) = applied["previous"].as_u64() { applied["previous"] = json!(seq > 0); }
+    let wifi_display = reading(body, "display_state", "display");
+    let display_state = if observed["display_state"] == "unchanged" &&
+        !wifi_display["value"].is_null() { wifi_display }
+        else { prefer_observed(wifi_display, observed, "display_state", wifi_at) };
+    let screen_label = match display_state["value"].as_str() {
+        Some("displayed") => "屏幕已显示", Some("failed") => "显示失败",
+        Some("pending") => "等待屏幕显示", Some("unchanged") => "显示状态未改变",
+        _ => "尚无屏幕结果",
+    };
+    let owner_state = if identity["yielded"] == true { "yielded" }
+        else if identity["owner_known"] != true { "unknown" }
+        else if identity["owner"].is_null() { "free" } else { "occupied" };
+    let owner_label = match owner_state {
+        "yielded" => "已释放并在本地让步", "free" => "上次观察为空闲",
+        "occupied" => "上次观察为已占用", _ => "尚未读取占用状态",
+    };
+    let mut attention = Vec::new();
+    if matches!(verdict, "upgrade_available" | "different_image") { attention.push("firmware_upgrade"); }
+    if upgrade_failure.is_some() { attention.push("upgrade_failed"); }
+    if display_state["value"] == "failed" { attention.push("display_failed"); }
+    if blocked { attention.push("contact_blocked"); }
+    json!({
+        "device_mac":mac,
+        "identity":{"name":identity["name"].as_str().filter(|name| !name.is_empty())
+            .unwrap_or_else(|| raw["name"].as_str().unwrap_or("")),"model":match target {
+            "zectrix-note4-400x300" => "Note4 400×300",
+            "codex-status-154g" => "书桌屏 200×200", _ => target},
+            "source":"bridge_registration"},
+        "contact":{"state":contact_state,"label":contact_label,"last_authenticated_at":contact_at,
+            "transport":raw["last_authenticated_transport"],
+            "wifi_sampled_at":raw["last_authenticated"]["observed_at"],
+            "last_attempt_at":attempt["at"]},
+        "firmware":{"current":current,"latest":latest,"verdict":verdict,"label":verdict_label,
+            "image_observed_at":image["observed_at"]},
+        "upgrade_failure":upgrade_failure,
+        "display":{"installed":installed,"active_template":active_template,
+            "data_applied":applied,"screen_state":display_state,"label":screen_label},
+        "battery":reading(body,"power.battery","power"),
+        "delivery":{"enabled":raw["sync_enabled"],"source":"bridge_setting"},
+        "occupancy":{"state":owner_state,"label":owner_label,"observed_at":identity["owner_observed_at"],
+            "owner_name":identity["owner"]["name"],"source":identity["owner_source"]},
+        "attention":attention,
+    })
+}
+
+#[cfg(test)]
+mod device_view_tests {
+    use super::*;
+
+    #[test]
+    fn firmware_and_screen_conclusions_follow_device_evidence() {
+        let identity = json!({"owner_known":false});
+        let mut raw = json!({
+            "device_mac":"0200000000A1", "name":"A", "sync_enabled":false,
+            "capabilities":{"firmware_target":"codex-status-154g"},
+            "last_authenticated_contact_at":80,"last_authenticated_transport":"ble",
+            "last_authenticated":{"observed_at":50,"body":{
+                "boot_id":"boot-a", "fw":"1.0", "display_state":"failed",
+                "template_ids":["quad"], "active_template_id":"quad", "applied_seq":0,
+                "power":{"battery":0,"mode":"sleep"},
+                "groups":{"firmware":{"received_at":50,"sampled_boot_id":"boot-a"},
+                    "display":{"received_at":50,"sampled_boot_id":"boot-a"},
+                    "power":{"received_at":50,"sampled_boot_id":"boot-a"},
+                    "jobs":{"received_at":50,"sampled_boot_id":"boot-a"}}}},
+            "latest_firmware":{"version":"1.0","sha256":"expected","size":1000,"published_at":70},
+            "running_image":{"fw_target":"codex-status-154g","fw":"1.0",
+                "boot_id":"boot-a","image_bytes":1000,"sha256":"other"},
+            "ota_history":[{"closed_at":30,"job":{"firmware_target":"codex-status-154g",
+                "sha256":"expected","state":"failed","last_error":"old failure"}}]
+        });
+        let view = project_device(&raw, &identity, 100);
+        assert_eq!(view["firmware"]["verdict"], "different_image");
+        assert_eq!(view["upgrade_failure"]["reason"], "升级任务失败，详情见历史归档");
+        assert_eq!(view["display"]["label"], "显示失败");
+        assert_eq!(view["display"]["installed"]["value"], 1);
+        assert_eq!(view["display"]["active_template"]["value"], true);
+        assert_eq!(view["display"]["data_applied"]["value"], false);
+        assert!(!view.to_string().contains("quad"));
+        assert_eq!(view["battery"]["value"], 0);
+        assert_eq!(view["contact"]["wifi_sampled_at"], 50);
+        raw["running_image"]["sha256"] = json!("expected");
+        let current = project_device(&raw, &identity, 100);
+        assert_eq!(current["firmware"]["verdict"], "current");
+        assert!(current["upgrade_failure"].is_null());
+        raw["latest_firmware"] = Value::Null;
+        assert_eq!(project_device(&raw, &identity, 100)["firmware"]["verdict"], "unknown");
+        raw["latest_firmware"] = json!({"version":"2.0","sha256":"new","size":1000});
+        assert_eq!(project_device(&raw, &identity, 100)["firmware"]["verdict"], "upgrade_available");
+        raw["last_authenticated"]["body"]["boot_id"] = json!("boot-b");
+        assert_eq!(project_device(&raw, &identity, 100)["firmware"]["verdict"], "unknown");
+        raw["record_observed"] = json!({"observed_at":100,"transport":"ble","boot_id":"boot-c","fw":"2.0",
+            "display_state":"failed"});
+        let fresh_ble = project_device(&raw, &identity, 100);
+        assert_eq!(fresh_ble["firmware"]["verdict"], "unknown");
+        assert_eq!(fresh_ble["battery"]["reason"], "stale_boot");
+        assert_eq!(fresh_ble["display"]["installed"]["reason"], "stale_boot");
+    }
+
+    #[test]
+    fn wifi_receipt_is_shared_and_ble_only_updates_carried_fields() {
+        let identity = json!({"owner_known":true,"owner":null,
+            "owner_observed_at":90,"owner_source":"public_status"});
+        let mut raw = json!({"device_mac":"0200000000A1","name":"A",
+            "capabilities":{"firmware_target":"codex-status-154g"},
+            "last_authenticated_contact_at":50,"last_authenticated_transport":"http",
+            "last_authenticated":{"observed_at":50,"body":{"boot_id":"a","fw":"1.0",
+                "power":{"battery":0},"template_ids":[],"active_template_id":"quad",
+                "applied_seq":0,"display_state":"displayed",
+                "groups":{"firmware":{"received_at":50},"power":{"received_at":50},
+                    "display":{"received_at":50},"jobs":{"received_at":50}}}},
+            "latest_firmware":{"version":"1.0","published_at":40}});
+        let wifi = project_device(&raw, &identity, 100);
+        assert!(wifi["firmware"]["current"]["observed_at"].is_null());
+        assert!(wifi["battery"]["observed_at"].is_null());
+        assert!(wifi["battery"].get("observed_at").is_none());
+        assert!(wifi["display"]["screen_state"]["observed_at"].is_null());
+        assert_eq!(wifi["display"]["installed"]["value"], 0);
+        raw["last_authenticated_contact_at"] = json!(90);
+        raw["last_authenticated_transport"] = json!("ble");
+        raw["record_observed"] = json!({"observed_at":90,"transport":"ble",
+            "active_template_id":"other","applied_seq":1});
+        let ble = project_device(&raw, &identity, 100);
+        assert_eq!(ble["contact"]["wifi_sampled_at"], 50);
+        assert_eq!(ble["firmware"]["current"]["value"], "1.0");
+        assert!(ble["firmware"]["current"]["observed_at"].is_null());
+        assert!(ble["battery"]["observed_at"].is_null());
+        assert!(ble["display"]["screen_state"]["observed_at"].is_null());
+        assert_eq!(ble["display"]["active_template"]["source"], "ble_digest");
+        assert_eq!(ble["display"]["data_applied"]["observed_at"], 90);
+        assert_eq!(ble["occupancy"]["source"], "public_status");
+    }
+}
+
+/// Passive, MAC-scoped projection shared by the panel and MCP.
+pub fn device_view(ctx: &AppCtx, requested_mac: Option<&str>) -> Result<Value, String> {
+    let mac = requested_mac.map(|mac| DeviceIdentity::normalized_mac(mac).ok_or("invalid MAC"))
+        .transpose()?;
+    let rows = service(ctx).devices();
+    if mac.as_ref().is_some_and(|mac| !rows.iter().any(|row| row["device_mac"] == *mac)) {
+        return Err("unknown device MAC".into());
+    }
+    let views: Vec<Value> = rows.iter().map(|row| {
+        let device_mac = row["device_mac"].as_str().unwrap_or("");
+        let identity = crate::device_facts_for(ctx, device_mac)
+            .map(|facts| crate::device_facts_json(&facts)).unwrap_or(Value::Null);
+        project_device(row, &identity, device_now(device_mac))
+    }).collect();
+    let devices: Vec<Value> = views.iter().map(|view| json!({
+        "device_mac":view["device_mac"],"name":view["identity"]["name"],
+        "model":view["identity"]["model"],"status":view["contact"]["label"],
+        "attention":view["attention"]})).collect();
+    let device = mac.as_ref().and_then(|mac| views.into_iter()
+        .find(|view| view["device_mac"] == *mac));
+    Ok(json!({"devices":devices,"device":device}))
+}
+
+/// One collapsed section from local state. No device contact or implicit action.
+pub fn device_detail(ctx: &AppCtx, requested_mac: &str, section: &str) -> Result<Value, String> {
+    let mac = DeviceIdentity::normalized_mac(requested_mac).ok_or("invalid MAC")?;
+    let row = service(ctx).device_get(&mac).ok_or("unknown device MAC")?;
+    let mut status_body = row["last_authenticated"]["body"].clone();
+    status_body["received_at"] = row["last_authenticated"]["observed_at"].clone();
+    let observed = &row["record_observed"];
+    if !observed["boot_id"].is_null() && observed["observed_at"].as_u64().unwrap_or(0)
+        >= row["last_authenticated"]["observed_at"].as_u64().unwrap_or(0) {
+        status_body["boot_id"] = observed["boot_id"].clone();
+    }
+    let body = &status_body;
+    let identity = crate::device_facts_for(ctx, &mac)
+        .map(|facts| crate::device_facts_json(&facts)).unwrap_or(Value::Null);
+    let data = match section {
+        "firmware" => json!({"target":row["capabilities"]["firmware_target"],
+            "render_target":row["capabilities"]["render_target"],
+            "compiler_abi":row["capabilities"]["compiler_abi"],
+            "slot":reading(body,"running_slot","firmware"),
+            "reset_reason":reading(body,"reset_reason","firmware"),
+            "running_image":if row["running_image"].is_null() {
+                json!({"value":null,"reason":"not_sampled"})
+            } else { json!({"value":row["running_image"],
+                "observed_at":row["running_image"]["observed_at"]}) }}),
+        "connection" => json!({"device_mac":mac,"ip":row["ip"],
+            "discovered_via":row["discovered_via"],"last_seen_at":row["last_seen_at"],
+            "wifi_connected":reading(body,"radio.wifi_connected","radio"),
+            "rssi":reading(body,"radio.rssi","radio"),
+            "ble_connected":reading(body,"radio.ble_connected","radio"),
+            "owner":identity["owner"],
+            "owner_known":identity["owner_known"],"owner_observed_at":identity["owner_observed_at"],
+            "owner_source":identity["owner_source"]}),
+        "runtime_display" => json!({"heap_free":reading(body,"heap_free","runtime"),
+            "heap_min":reading(body,"heap_min","runtime"),
+            "uptime_ms":reading(body,"uptime_ms","runtime"),
+            "epd_writes":reading(body,"display.epd_writes","display"),
+            "epd_busy_fails":reading(body,"display.epd_busy_fails","display"),
+            "template_ids":reading(body,"template_ids","display"),
+            "active_template_id":reading(body,"active_template_id","display"),
+            "active_context_id":reading(body,"active_context_id","display"),
+            "commit_seq":reading(body,"commit_seq","jobs"),
+            "display_state":reading(body,"display_state","display")}),
+        "sync_diagnostics" => json!({"sync":reading(body,"sync","power"),
+            "archive":sync_diagnostics::summary(&crate::mcp_config(ctx).data_root,&mac)}),
+        "power" => {
+            let pm = crate::device_facts_for(ctx, &mac).and_then(|facts| facts.pmstats)
+                .map(|sample| json!({"fetched_at":sample.fetched_at,"text":sample.text,
+                    "last_attempt_at":sample.last_attempt_at,"last_error":sample.last_error}))
+                .unwrap_or_else(|| json!({"fetched_at":null,"last_attempt_at":null,
+                    "last_error":null,"reason":"not_sampled"}));
+            json!({"plan":row["power"],"device_power":reading(body,"power","power"),
+                "pm_stats":pm,"pm_sampling":"explicit get_pmstats only",
+                "wifi_sampled_at":row["last_authenticated"]["observed_at"]})
+        },
+        "upgrade_history" => json!({"ota_current":row["ota_job"],
+            "ota_history":row["ota_history"],
+            "bundle_current":row["job"],
+            "bundle_history":service(ctx).bundle_history(&mac)}),
+        "maintenance" => json!({"profile_present":!row["profile"].is_null(),
+            "last_authenticated_at":row["last_authenticated_contact_at"],
+            "recovery_requires_explicit_refresh":true}),
+        _ => return Err("unknown device section".into()),
+    };
+    Ok(json!({"device_mac":mac,"section":section,"data":data}))
+}
+
 pub fn templates(ctx: &AppCtx) -> Value {
     json!({
         "templates": service(ctx).templates(),
@@ -1047,17 +1385,19 @@ pub async fn refresh_status(ctx: &AppCtx, mac: &str) -> Value {
                 );
                 return json!({"result": "error", "error": format!("authenticated status MAC {} does not match target MAC {}", status["device_mac"].as_str().unwrap_or("<missing>"), expected_mac)});
             }
-            let _ = service(ctx).note_device_status(mac, &status);
-            if let Err(e) = service(ctx).note_authenticated_status(mac, &status) {
+            let received_at = device_now(mac);
+            let _ = service(ctx).note_device_status_at(mac, &status, "http", received_at);
+            if let Err(e) = service(ctx).note_authenticated_status_at(mac, &status, received_at) {
                 return json!({"result": "error", "error": format!("persist authenticated status: {e}")});
             }
             let _ = service(ctx).ota_note_authenticated_version(mac, &status);
             if let Some(job) = service(ctx).ota_job(mac).filter(|job|
-                job.state == "awaiting_confirmation" && job.upload_ack &&
-                status["fw"] == job.expected_version &&
-                status["image_identity"].as_array().is_some_and(|items|
-                    items.iter().any(|item| item == "sha256-running-prefix-v1"))) {
-                if status["ota_auth"] == "token" {
+                job.state == "awaiting_confirmation") {
+                let can_check_image = job.upload_ack &&
+                    status["image_identity"].as_array().is_some_and(|items|
+                        items.iter().any(|item| item == "sha256-running-prefix-v1"));
+                let mut checked_image = false;
+                if can_check_image && status["ota_auth"] == "token" {
                     let image_link = link.clone();
                     let image_bytes = job.size;
                     if let Some(operation_token) = bridge_mcp::load_device_token_at(
@@ -1066,12 +1406,14 @@ pub async fn refresh_status(ctx: &AppCtx, mac: &str) -> Value {
                             &image_link.ip, &operation_token, &image_link.mac,
                             image_bytes, Duration::from_secs(15)).map_err(err_text)).await;
                         if let Ok(image) = result {
+                            checked_image = true;
+                            let _ = service(ctx).note_running_image(mac, &status, &image);
                             if let Err(error) = service(ctx).ota_note_running_image(mac, &image) {
                                 tracing::warn!(device_mac = %mac, error = %error, "OTA image proof rejected");
                             }
                         }
                     }
-                } else if let Some(nonce) = status["session_nonce"].as_str() {
+                } else if let Some(nonce) = status["session_nonce"].as_str().filter(|_| can_check_image) {
                     for attempt in 0..3 {
                         let image_link = link.clone();
                         let nonce = nonce.to_owned();
@@ -1081,6 +1423,8 @@ pub async fn refresh_status(ctx: &AppCtx, mac: &str) -> Value {
                             &image_link.mac, &image_link.bridge_id, &nonce, "image", &id,
                             &fields, Duration::from_secs(15)).map_err(err_text)).await {
                             Ok(image) => {
+                                checked_image = true;
+                                let _ = service(ctx).note_running_image(mac, &status, &image);
                                 if let Err(error) = service(ctx).ota_note_running_image(mac, &image) {
                                     tracing::warn!(device_mac = %mac, error = %error, "OTA image proof rejected");
                                 }
@@ -1088,6 +1432,31 @@ pub async fn refresh_status(ctx: &AppCtx, mac: &str) -> Value {
                             }
                             Err(error) if error.contains("401") || error.contains("409") => break,
                             Err(_) => continue,
+                        }
+                    }
+                }
+                if !checked_image {
+                    let _ = service(ctx).ota_note_confirmation_miss(mac);
+                }
+            }
+            if let Some(release) = status["firmware_target"].as_str()
+                .and_then(|target| service(ctx).latest_firmware(target)) {
+                let observed = service(ctx).running_image(mac);
+                let current_boot = status["boot_id"].as_str();
+                let needs_check = observed.as_ref().is_none_or(|image|
+                    image["image_bytes"] != release.size ||
+                    image["boot_id"].as_str() != current_boot ||
+                    image["fw_target"] != release.firmware_target);
+                if needs_check && status["ota_auth"] == "token" &&
+                    status["image_identity"].as_array().is_some_and(|items|
+                        items.iter().any(|item| item == "sha256-running-prefix-v1")) {
+                    if let Some(token) = bridge_mcp::load_device_token_at(
+                        &crate::mcp_config(ctx).data_root, mac) {
+                        let image_link = link.clone();
+                        if let Ok(image) = blocking(move || device_client::ota_image(
+                            &image_link.ip, &token, &image_link.mac,
+                            release.size, Duration::from_secs(15)).map_err(err_text)).await {
+                            let _ = service(ctx).note_running_image(mac, &status, &image);
                         }
                     }
                 }
@@ -1691,10 +2060,11 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
         if state["result"] != "applied" {
             return Err("BLE status rejected".to_owned());
         }
+        let received_at = device_now(&mac);
         service(ctx)
-            .note_device_status(&mac, &state)
+            .note_device_status_at(&mac, &state, "ble", received_at)
             .map_err(err_text)?;
-        service(ctx).note_ble_contact(&mac).map_err(err_text)?;
+        service(ctx).note_ble_contact_at(&mac, received_at).map_err(err_text)?;
         let sync_capable = state["sync"]["v"] == 1;
         let mut sync_enabled = state["sync"]["enabled"] == true;
         if sync_capable && !sync_enabled {
@@ -2030,6 +2400,10 @@ pub async fn tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, Stri
     let value = match name {
         "platform_device_register" => register_device(ctx, args).await?,
         "platform_overview" => overview(ctx),
+        "platform_device_view" => device_view(ctx, args.get("mac").and_then(Value::as_str))?,
+        "platform_device_detail" => device_detail(ctx,
+            args.get("mac").and_then(Value::as_str).ok_or("missing mac")?,
+            args.get("section").and_then(Value::as_str).ok_or("missing section")?)?,
         "platform_template_list" => templates(ctx),
         "platform_template_get" => {
             let id = args
@@ -2063,6 +2437,16 @@ pub async fn tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, Stri
             let mac = args.get("mac").and_then(Value::as_str).ok_or("missing mac")?;
             let enabled = args.get("enabled").and_then(Value::as_bool).ok_or("missing enabled")?;
             data_sync_save(ctx, mac, enabled)?
+        }
+        "platform_firmware_release_publish" => {
+            let rom = args.get("rom").and_then(Value::as_str).ok_or("missing rom")?;
+            let version = args.get("version").and_then(Value::as_str).ok_or("missing version")?;
+            let target = args.get("firmware_target").and_then(Value::as_str)
+                .ok_or("missing firmware_target")?;
+            let path = std::path::Path::new(rom);
+            let path = if path.is_absolute() { path.to_path_buf() } else { ctx.root.join(path) };
+            json!({"release": service(ctx).publish_firmware_release(&path, version, target)
+                .map_err(err_text)?})
         }
         "platform_family_profiles" => {
             family_profiles(ctx, args.get("render_target").and_then(Value::as_str))

@@ -995,6 +995,8 @@ async fn mcp_handler(
         if matches!(
             name,
             "platform_overview"
+                | "platform_device_view"
+                | "platform_device_detail"
                 | "platform_device_register"
                 | "platform_template_list"
                 | "platform_template_get"
@@ -1003,6 +1005,7 @@ async fn mcp_handler(
                 | "platform_profile_get"
                 | "platform_profile_save"
                 | "platform_data_sync_save"
+                | "platform_firmware_release_publish"
                 | "platform_family_profiles"
                 | "family_platform_profile_save"
                 | "platform_family_profile_delete"
@@ -1574,6 +1577,7 @@ fn device_facts_json(facts: &DeviceFacts) -> Value {
         "owner": facts.owner.as_ref().and_then(|c| c.owner.clone()),
         "owner_known": facts.owner.is_some(),
         "owner_observed_at": facts.owner.as_ref().map(|c| c.observed_at),
+        "owner_source": facts.owner.as_ref().map(|_| "public_status"),
         "note": facts.note,
     })
 }
@@ -1725,7 +1729,12 @@ async fn device_tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, S
                 return Err("name must not be empty".to_string());
             }
             let mac = resolve_target_mac(ctx, args.get("mac").and_then(Value::as_str))?;
+            ensure_runtime_record(ctx, &mac)
+                .ok_or_else(|| format!("device {mac} has no runtime record"))?;
             let selected = selected_mac(ctx).as_deref() == Some(mac.as_str());
+            if platform::service(ctx).device_get(&mac).is_some() {
+                platform::service(ctx).device_rename(&mac, &name).map_err(|e| e.to_string())?;
+            }
             {
                 let mut registry = devices(ctx);
                 let device = registry
@@ -1859,6 +1868,16 @@ async fn platform_templates(state: State<'_, Arc<AppCtx>>) -> Result<Value, Stri
 #[tauri::command]
 async fn platform_devices(state: State<'_, Arc<AppCtx>>) -> Result<Value, String> {
     Ok(platform::device_rows(&state))
+}
+
+#[tauri::command]
+async fn platform_device_view(state: State<'_, Arc<AppCtx>>, mac: Option<String>) -> Result<Value, String> {
+    platform::device_view(&state, mac.as_deref())
+}
+
+#[tauri::command]
+async fn platform_device_detail(state: State<'_, Arc<AppCtx>>, mac: String, section: String) -> Result<Value, String> {
+    platform::device_detail(&state, &mac, &section)
 }
 
 #[tauri::command]
@@ -3482,6 +3501,8 @@ fn main() {
             platform_overview,
             platform_templates,
             platform_devices,
+            platform_device_view,
+            platform_device_detail,
             platform_template_get,
             platform_template_validate,
             platform_template_preview,

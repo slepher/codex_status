@@ -755,6 +755,18 @@ fn tool_definitions() -> Value {
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
         },
         {
+            "name": "platform_device_view",
+            "description": "Read the same passive, MAC-scoped main device view as the device page. Without mac, list registered devices only. Never contacts a device.",
+            "annotations": {"readOnlyHint": true},
+            "inputSchema": {"type":"object", "properties":{"mac":{"type":"string"}}, "additionalProperties":false}
+        },
+        {
+            "name": "platform_device_detail",
+            "description": "Read one collapsed device-page section from local state. Never contacts a device or changes its plan.",
+            "annotations": {"readOnlyHint": true},
+            "inputSchema": {"type":"object", "properties":{"mac":{"type":"string"},"section":{"type":"string","enum":["firmware","connection","runtime_display","sync_diagnostics","power","upgrade_history","maintenance"]}},"required":["mac","section"],"additionalProperties":false}
+        },
+        {
             "name": "platform_template_list",
             "description": "List saved templates with their render target, CRCs, sizes and referencing devices (read-only).",
             "annotations": {"readOnlyHint": true},
@@ -822,6 +834,18 @@ fn tool_definitions() -> Value {
                 "type": "object",
                 "properties": {"mac": {"type": "string"}, "enabled": {"type": "boolean"}},
                 "required": ["mac", "enabled"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "platform_firmware_release_publish",
+            "description": "Explicitly publish a validated, frozen ROM as the latest available release for its exact firmware target. Does not queue OTA.",
+            "annotations": {"readOnlyHint": false},
+            "inputSchema": {
+                "type": "object",
+                "properties": {"rom": {"type": "string"}, "version": {"type": "string"},
+                    "firmware_target": {"type": "string"}},
+                "required": ["rom", "version", "firmware_target"],
                 "additionalProperties": false
             }
         },
@@ -1120,8 +1144,9 @@ async fn call_tool(cfg: &McpConfig, name: &str, args: &Value) -> Result<Vec<Valu
         }
         // Platform tools share the app's application service; without a
         // running app there is no live state to read or change.
-        "platform_device_register" | "platform_overview" | "platform_template_list" | "platform_template_get" | "platform_template_save"
+        "platform_device_register" | "platform_overview" | "platform_device_view" | "platform_device_detail" | "platform_template_list" | "platform_template_get" | "platform_template_save"
         | "platform_template_validate" | "platform_profile_get" | "platform_profile_save" | "platform_data_sync_save"
+        | "platform_firmware_release_publish"
         | "platform_family_profiles" | "family_platform_profile_save"
         | "platform_family_profile_delete" | "platform_family_profile_copy"
         | "platform_publish" | "platform_publish_preview" | "platform_font_list" | "platform_font_import" | "platform_publish_cancel" | "platform_template_activate"

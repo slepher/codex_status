@@ -58,6 +58,31 @@ pub struct OtaJob {
     #[serde(default)]
     pub last_attempt_at: Option<u64>,
     pub cancel_requested: bool,
+    #[serde(default)]
+    pub confirmation_checks: u8,
+    #[serde(default)]
+    pub confirmation_note: Option<String>,
+    #[serde(default)]
+    pub last_running_image: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OtaHistoryEntry {
+    pub job: OtaJob,
+    pub outcome: String,
+    pub closed_at: u64,
+    #[serde(default)]
+    pub running_image: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FirmwareRelease {
+    pub firmware_target: String,
+    pub version: String,
+    pub sha256: String,
+    pub size: usize,
+    pub blob: String,
+    pub published_at: u64,
 }
 
 impl OtaJob {
@@ -107,6 +132,12 @@ pub struct PersistedState {
     pub bundle_jobs: BTreeMap<String, PublishJob>,
     #[serde(default)]
     pub ota_jobs: BTreeMap<String, OtaJob>,
+    #[serde(default)]
+    pub ota_history: Vec<OtaHistoryEntry>,
+    #[serde(default)]
+    pub firmware_releases: BTreeMap<String, FirmwareRelease>,
+    #[serde(default)]
+    pub running_images: BTreeMap<String, Value>,
     /// Per-device next data_seq high water mark (never blindly restarted at 0).
     #[serde(default)]
     pub next_seq: BTreeMap<String, u64>,
@@ -133,6 +164,9 @@ struct Inner {
     jobs: Vec<Value>,
     asset_jobs: BTreeMap<String, AssetJob>,
     ota_jobs: BTreeMap<String, OtaJob>,
+    ota_history: Vec<OtaHistoryEntry>,
+    firmware_releases: BTreeMap<String, FirmwareRelease>,
+    running_images: BTreeMap<String, Value>,
     /// Bounded checkpoint throttle: the 10 s status poll must not write flash.
     status_persist_at: BTreeMap<String, u64>,
 }
@@ -155,12 +189,33 @@ impl PlatformService {
             asset_jobs: mut persisted_asset_jobs,
             bundle_jobs: persisted_bundle_jobs,
             ota_jobs: mut persisted_ota_jobs,
+            ota_history: mut persisted_ota_history,
+            firmware_releases,
+            running_images,
             next_seq,
             contexts,
             plans,
         } = persisted;
         for job in persisted_ota_jobs.values_mut() {
             if job.state == "transferring" { job.state = "awaiting_confirmation".into(); }
+        }
+        let mut ota_recovered = false;
+        let abandoned: Vec<String> = persisted_ota_jobs.iter()
+            .filter(|(_, job)| job.state == "awaiting_confirmation"
+                && job.cancel_requested && !job.upload_ack)
+            .map(|(mac, _)| mac.clone()).collect();
+        for mac in abandoned {
+            let job = persisted_ota_jobs.remove(&mac).unwrap();
+            persisted_ota_history.push(OtaHistoryEntry {
+                running_image: job.last_running_image.clone(), job,
+                outcome: "cancelled_unconfirmed".into(),
+                closed_at: crate::device_clock::wall_secs(&mac),
+            });
+            ota_recovered = true;
+        }
+        if persisted_ota_history.len() > MAX_JOB_SUMMARIES {
+            let excess = persisted_ota_history.len() - MAX_JOB_SUMMARIES;
+            persisted_ota_history.drain(..excess);
         }
         for job in persisted_asset_jobs.values_mut() {
             if let Err(error) = job.frozen.verify() {
@@ -257,11 +312,14 @@ impl PlatformService {
                 jobs: persisted_jobs,
                 asset_jobs: persisted_asset_jobs,
                 ota_jobs: persisted_ota_jobs,
+                ota_history: persisted_ota_history,
+                firmware_releases,
+                running_images,
                 status_persist_at: BTreeMap::new(),
             }),
         };
         service.refresh_all_contracts()?;
-        if history_recovered {
+        if history_recovered || ota_recovered {
             let inner = service.inner.lock().unwrap();
             Self::persist(&inner, &service.state_path())?;
         }
@@ -332,6 +390,9 @@ impl PlatformService {
             jobs,
             asset_jobs: inner.asset_jobs.clone(),
             ota_jobs: inner.ota_jobs.clone(),
+            ota_history: inner.ota_history.clone(),
+            firmware_releases: inner.firmware_releases.clone(),
+            running_images: inner.running_images.clone(),
             bundle_jobs: inner.coordinators.iter().filter_map(|(mac, c)| {
                 c.job.as_ref().filter(|j| matches!(j.state, PublishState::Waiting | PublishState::Sending | PublishState::Unknown))
                     .map(|j| (mac.clone(), j.clone()))
@@ -806,6 +867,21 @@ impl PlatformService {
                     )
                 })?
                 .clone();
+            if template.source["elements"].as_array().is_some_and(|elements|
+                elements.iter().any(|element| element.get("digit_x").is_some())) {
+                let required = template.compiled.min_fw.as_deref()
+                    .context("digit_x template must declare min_fw")?;
+                let observed = inner.devices[&mac].last_authenticated.as_ref()
+                    .and_then(|status| status.body["fw"].as_str())
+                    .context("device firmware version is unknown; refresh authenticated status before publishing digit_x")?;
+                let revision = |version: &str| -> Result<Vec<u32>> {
+                    version.split('-').next().unwrap_or("").split('.')
+                        .map(|part| part.parse::<u32>().map_err(Into::into)).collect()
+                };
+                if revision(observed)? < revision(required)? {
+                    bail!("template {id} requires firmware {required}; device reports {observed}");
+                }
+            }
             for res in &template.compiled.resources {
                 if !resources.iter().any(|r| r.id == res.id) {
                     resources.push(BundleResource {
@@ -958,6 +1034,94 @@ impl PlatformService {
         self.inner.lock().unwrap().ota_jobs.get(&mac.to_uppercase()).cloned()
     }
 
+    fn archive_ota(inner: &mut Inner, mac: &str, outcome: &str, closed_at: u64) -> Option<OtaHistoryEntry> {
+        let job = inner.ota_jobs.remove(mac)?;
+        let entry = OtaHistoryEntry { running_image: job.last_running_image.clone(),
+            job, outcome: outcome.into(), closed_at };
+        inner.ota_history.push(entry.clone());
+        if inner.ota_history.len() > MAX_JOB_SUMMARIES { inner.ota_history.remove(0); }
+        Some(entry)
+    }
+
+    pub fn ota_history(&self, mac: &str) -> Vec<OtaHistoryEntry> {
+        self.inner.lock().unwrap().ota_history.iter()
+            .filter(|entry| entry.job.device_mac == mac.to_uppercase())
+            .cloned().collect()
+    }
+
+    pub fn bundle_history(&self, mac: &str) -> Vec<Value> {
+        self.inner.lock().unwrap().jobs.iter()
+            .filter(|entry| entry["device_mac"] == mac.to_uppercase())
+            .cloned().collect()
+    }
+
+    /// Explicitly publish one frozen release as the latest for its exact target.
+    /// Version strings and queued OTA jobs never update this catalog.
+    pub fn publish_firmware_release(&self, rom: &Path, version: &str,
+        firmware_target: &str) -> Result<FirmwareRelease> {
+        if version.is_empty() || version.len() > 32 || firmware_target.is_empty()
+            || !firmware_target.bytes().all(|byte|
+                byte.is_ascii_alphanumeric() || byte == b'-') {
+            bail!("invalid firmware release version or target");
+        }
+        let bytes = std::fs::read(rom).with_context(|| format!("read ROM {}", rom.display()))?;
+        if !(1024..=0x30_0000).contains(&bytes.len()) || bytes.first() != Some(&0xe9) {
+            bail!("ROM is not a supported ESP image (size/header)");
+        }
+        let marker = format!("codex-status-ota-v1|{firmware_target}|{version}\0");
+        if !bytes.windows(marker.len()).any(|window| window == marker.as_bytes()) {
+            bail!("ROM lacks a matching embedded OTA target/version identity");
+        }
+        let sha256 = format!("{:x}", sha2::Sha256::digest(&bytes));
+        let blob = format!("release-{firmware_target}-{sha256}.bin");
+        let release = FirmwareRelease { firmware_target: firmware_target.into(),
+            version: version.into(), sha256, size: bytes.len(), blob: blob.clone(),
+            published_at: crate::now_secs() };
+        store::atomic_write(&self.dir.join(&blob), &bytes)?;
+        let mut inner = self.inner.lock().unwrap();
+        let old = inner.firmware_releases.insert(firmware_target.into(), release.clone());
+        if let Err(error) = Self::persist(&inner, &self.state_path()) {
+            if let Some(old) = old { inner.firmware_releases.insert(firmware_target.into(), old); }
+            else { inner.firmware_releases.remove(firmware_target); }
+            return Err(error);
+        }
+        if let Some(old) = old.filter(|old| old.blob != blob) {
+            let _ = std::fs::remove_file(self.dir.join(old.blob));
+        }
+        Ok(release)
+    }
+
+    pub fn latest_firmware(&self, firmware_target: &str) -> Option<FirmwareRelease> {
+        self.inner.lock().unwrap().firmware_releases.get(firmware_target).cloned()
+    }
+
+    pub fn running_image(&self, mac: &str) -> Option<Value> {
+        self.inner.lock().unwrap().running_images.get(&mac.to_uppercase()).cloned()
+    }
+
+    pub fn note_running_image(&self, mac: &str, status: &Value, image: &Value) -> Result<()> {
+        let mac = DeviceIdentity::normalized_mac(mac).context("invalid image MAC")?;
+        let target = status["firmware_target"].as_str().context("status target missing")?;
+        let hash = image["sha256"].as_str().context("image hash missing")?;
+        if status["device_mac"].as_str().and_then(DeviceIdentity::normalized_mac).as_deref()
+                != Some(mac.as_str()) ||
+            image["device_mac"].as_str().and_then(DeviceIdentity::normalized_mac).as_deref()
+                != Some(mac.as_str()) ||
+            image["algorithm"] != "sha256-running-prefix-v1" ||
+            image["fw_target"] != target ||
+            !image["image_bytes"].as_u64().is_some_and(|size| (1024..=0x30_0000).contains(&size)) ||
+            hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            bail!("running image evidence identity or shape mismatch");
+        }
+        let observed = json!({"algorithm":image["algorithm"], "device_mac":mac,
+            "fw_target":target, "fw":image["fw"], "running_slot":image["running_slot"],
+            "image_bytes":image["image_bytes"], "sha256":hash,
+            "boot_id":status["boot_id"], "observed_at":crate::device_clock::wall_secs(&mac)});
+        let mut inner = self.inner.lock().unwrap();
+        inner.running_images.insert(mac, observed);
+        Self::persist(&inner, &self.state_path())
+    }
+
     pub fn queue_ota(&self, mac: &str, bridge_id: &str, request_id: &str,
         rom: &Path, expected_version: &str, firmware_target: &str) -> Result<OtaJob> {
         let mac = DeviceIdentity::normalized_mac(mac).context("invalid device MAC")?;
@@ -965,6 +1129,13 @@ impl PlatformService {
             bail!("request_id and expected_version are required and bounded");
         }
         if let Some(existing) = self.ota_job(&mac).filter(|j| j.request_id == request_id) {
+            if existing.expected_version != expected_version || existing.firmware_target != firmware_target {
+                bail!("request_id reused with different OTA metadata");
+            }
+            if !rom.exists() { return Ok(existing); }
+        }
+        if let Some(existing) = self.ota_history(&mac).into_iter().rev()
+            .find(|entry| entry.job.request_id == request_id).map(|entry| entry.job) {
             if existing.expected_version != expected_version || existing.firmware_target != firmware_target {
                 bail!("request_id reused with different OTA metadata");
             }
@@ -982,6 +1153,12 @@ impl PlatformService {
         let mut inner = self.inner.lock().unwrap();
         let caps = &inner.devices.get(&mac).context("unknown device")?.capabilities;
         if caps.firmware_target != firmware_target { bail!("ROM target does not match registered device"); }
+        if let Some(existing) = inner.ota_history.iter().rev()
+            .find(|entry| entry.job.device_mac == mac && entry.job.request_id == request_id) {
+            if existing.job.sha256 == digest && existing.job.expected_version == expected_version
+                && existing.job.firmware_target == firmware_target { return Ok(existing.job.clone()); }
+            bail!("request_id reused with different OTA content");
+        }
         if let Some(existing) = inner.ota_jobs.get(&mac) {
             if existing.request_id == request_id {
                 if existing.sha256 == digest && existing.expected_version == expected_version && existing.firmware_target == firmware_target {
@@ -1008,12 +1185,22 @@ impl PlatformService {
             sha256: digest, size: bytes.len(), blob,
             last_error: None, upload_ack: false, confirmation: None, attempt_count: 0,
             last_attempt_at: None, cancel_requested: false,
+            confirmation_checks: 0, confirmation_note: None, last_running_image: None,
         };
+        let old_history = inner.ota_history.clone();
         let old = inner.ota_jobs.insert(mac.clone(), job.clone());
         let old_blob = old.as_ref().map(|previous| previous.blob.clone());
+        if let Some(previous) = &old {
+            inner.ota_history.push(OtaHistoryEntry {
+                job: previous.clone(), outcome: "replaced_by_new_request".into(),
+                closed_at: now, running_image: previous.last_running_image.clone(),
+            });
+            if inner.ota_history.len() > MAX_JOB_SUMMARIES { inner.ota_history.remove(0); }
+        }
         if let Err(e) = Self::persist(&inner, &self.state_path()) {
             let reused_blob = old.as_ref().is_some_and(|previous| previous.blob == job.blob);
             if let Some(old) = old { inner.ota_jobs.insert(mac, old); } else { inner.ota_jobs.remove(&mac); }
+            inner.ota_history = old_history;
             if !reused_blob { let _ = std::fs::remove_file(self.dir.join(&job.blob)); }
             return Err(e);
         }
@@ -1024,15 +1211,25 @@ impl PlatformService {
     }
 
     pub fn ota_cancel(&self, mac: &str) -> Result<Value> {
+        let mac = mac.to_uppercase();
         let mut inner = self.inner.lock().unwrap();
-        let job = inner.ota_jobs.get_mut(&mac.to_uppercase()).context("no OTA job")?;
-        if job.state == "queued" { job.state = "cancelled".into(); }
+        let job = inner.ota_jobs.get_mut(&mac).context("no OTA job")?;
+        let queued = job.state == "queued";
+        if queued { job.state = "cancelled".into(); }
         else if job.pending() { job.cancel_requested = true; }
-        job.updated_at = crate::device_clock::wall_secs(&mac);
-        let cleanup = (job.state == "cancelled").then(|| job.blob.clone());
+        let now = crate::device_clock::wall_secs(&mac);
+        job.updated_at = now;
+        let close = if queued { Some("cancelled_before_upload") }
+            else if job.state == "awaiting_confirmation" && !job.upload_ack {
+                Some("cancelled_unconfirmed")
+            } else { None };
+        let cleanup = queued.then(|| job.blob.clone());
+        let result = if let Some(outcome) = close {
+            json!(Self::archive_ota(&mut inner, &mac, outcome, now))
+        } else { json!(inner.ota_jobs.get(&mac)) };
         Self::persist(&inner, &self.state_path())?;
         if let Some(blob) = cleanup { let _ = std::fs::remove_file(self.dir.join(blob)); }
-        Ok(json!(inner.ota_jobs.get(&mac.to_uppercase())))
+        Ok(result)
     }
 
     pub fn ota_begin(&self, mac: &str) -> Result<Option<PathBuf>> {
@@ -1071,13 +1268,18 @@ impl PlatformService {
     }
 
     pub fn ota_await_confirmation(&self, mac: &str, upload_ack: bool, error: Option<&str>) -> Result<()> {
+        let mac = mac.to_uppercase();
         let mut inner = self.inner.lock().unwrap();
-        let job = inner.ota_jobs.get_mut(&mac.to_uppercase()).context("no OTA job")?;
+        let job = inner.ota_jobs.get_mut(&mac).context("no OTA job")?;
         job.state = "awaiting_confirmation".into();
         job.upload_ack = upload_ack;
         if upload_ack { job.confirmation = Some("upload_ack".into()); }
         job.last_error = error.map(str::to_string);
         job.updated_at = crate::device_clock::wall_secs(&mac);
+        if job.cancel_requested && !upload_ack {
+            Self::archive_ota(&mut inner, &mac, "cancelled_unconfirmed",
+                crate::device_clock::wall_secs(&mac));
+        }
         Self::persist(&inner, &self.state_path())
     }
 
@@ -1085,10 +1287,16 @@ impl PlatformService {
         let mut inner = self.inner.lock().unwrap();
         let job = inner.ota_jobs.get_mut(&mac.to_uppercase()).context("no OTA job")?;
         if job.state != "transferring" { bail!("OTA is not transferring"); }
+        let cancelled = job.cancel_requested;
+        let terminal = terminal || job.attempt_count >= 3 || cancelled;
         job.state = if terminal { "failed" } else { "queued" }.into();
         job.last_error = Some(error.chars().take(200).collect());
         job.updated_at = crate::device_clock::wall_secs(&mac);
-        let cleanup = terminal.then(|| job.blob.clone());
+        let cleanup = (terminal && !cancelled).then(|| job.blob.clone());
+        if cancelled {
+            Self::archive_ota(&mut inner, &mac.to_uppercase(), "cancelled_before_upload",
+                crate::device_clock::wall_secs(&mac));
+        }
         Self::persist(&inner, &self.state_path())?;
         if let Some(blob) = cleanup { let _ = std::fs::remove_file(self.dir.join(blob)); }
         Ok(())
@@ -1097,7 +1305,8 @@ impl PlatformService {
     pub fn ota_note_authenticated_version(&self, mac: &str, status: &Value) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
         let Some(job) = inner.ota_jobs.get_mut(&mac.to_uppercase()) else { return Ok(()); };
-        if job.state == "awaiting_confirmation" && status["fw"] == job.expected_version {
+        if job.state == "awaiting_confirmation" && job.upload_ack
+            && status["fw"] == job.expected_version {
             let changed = job.before_version.as_deref().is_some_and(|before| before != job.expected_version);
             let (level, note) = if changed {
                 ("version_observed", "expected version observed; exact running image identity unavailable")
@@ -1105,7 +1314,7 @@ impl PlatformService {
                 ("version_seen_unproven", "expected version reported, but pre-upload version was same or unknown")
             };
             if job.confirmation.as_deref() != Some(level) {
-                job.last_error = Some(note.into());
+                job.confirmation_note = Some(note.into());
                 job.confirmation = Some(level.into());
                 job.updated_at = crate::device_clock::wall_secs(&mac);
                 return Self::persist(&inner, &self.state_path());
@@ -1122,23 +1331,60 @@ impl PlatformService {
         };
         if image["algorithm"] != "sha256-running-prefix-v1" ||
             image["image_bytes"] != job.size || image["fw_target"] != job.firmware_target ||
-            image["fw"] != job.expected_version || image["sha256"] != job.sha256 ||
-            image["device_mac"] != mac {
+            image["device_mac"] != mac ||
+            !image["sha256"].as_str().is_some_and(|hash|
+                hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())) {
             return Ok(false);
         }
-        let bytes = std::fs::read(self.dir.join(&job.blob)).context("frozen OTA image unavailable")?;
-        if bytes.len() != job.size || format!("{:x}", sha2::Sha256::digest(&bytes)) != job.sha256 {
-            bail!("frozen OTA image changed");
+        let matches_target = image["sha256"] == job.sha256;
+        if matches_target {
+            let bytes = std::fs::read(self.dir.join(&job.blob)).context("frozen OTA image unavailable")?;
+            if bytes.len() != job.size || format!("{:x}", sha2::Sha256::digest(&bytes)) != job.sha256 {
+                bail!("frozen OTA image changed");
+            }
         }
+        let observation = json!({"algorithm":image["algorithm"], "device_mac":mac,
+            "image_bytes":image["image_bytes"], "fw_target":image["fw_target"],
+            "fw":image["fw"], "sha256":image["sha256"]});
         let mut inner = self.inner.lock().unwrap();
         let current = inner.ota_jobs.get_mut(&mac).context("OTA job vanished")?;
         if current.job_id != job.job_id || current.state != "awaiting_confirmation" { return Ok(false); }
-        current.confirmation = Some("image_verified".into());
-        current.state = "succeeded".into();
-        current.last_error = None;
+        current.last_running_image = Some(observation);
         current.updated_at = crate::device_clock::wall_secs(&mac);
+        if matches_target {
+            current.confirmation = Some("image_verified".into());
+            current.confirmation_note = Some("specified image is running; upload causation is not claimed".into());
+            current.state = "succeeded".into();
+        } else {
+            current.confirmation_checks = current.confirmation_checks.saturating_add(1);
+            let previously_observed_target = matches!(current.confirmation.as_deref(),
+                Some("version_observed" | "version_seen_unproven"));
+            let different_version = image["fw"] != current.expected_version;
+            if previously_observed_target && different_version || current.confirmation_checks >= 3 {
+                let outcome = if different_version { "superseded_running_image" }
+                    else { "unverified_after_checks" };
+                Self::archive_ota(&mut inner, &mac, outcome,
+                    crate::device_clock::wall_secs(&mac));
+            }
+        }
         Self::persist(&inner, &self.state_path())?;
-        Ok(true)
+        Ok(matches_target)
+    }
+
+    pub fn ota_note_confirmation_miss(&self, mac: &str) -> Result<()> {
+        let mac = mac.to_uppercase();
+        let mut inner = self.inner.lock().unwrap();
+        let Some(job) = inner.ota_jobs.get_mut(&mac) else { return Ok(()); };
+        if job.state != "awaiting_confirmation" { return Ok(()); }
+        job.confirmation_checks = job.confirmation_checks.saturating_add(1);
+        job.updated_at = crate::device_clock::wall_secs(&mac);
+        if job.confirmation_checks >= 3 {
+            let outcome = if job.upload_ack { "unverified_after_checks" }
+                else { "upload_unacknowledged" };
+            Self::archive_ota(&mut inner, &mac, outcome,
+                crate::device_clock::wall_secs(&mac));
+        }
+        Self::persist(&inner, &self.state_path())
     }
 
     pub fn cancel_job(&self, mac: &str, now: u64) {
@@ -1392,6 +1638,11 @@ impl PlatformService {
                     "job": inner.asset_jobs.get(mac).map(AssetJob::summary)
                         .or_else(|| coordinator.and_then(|c| c.job_snapshot())),
                     "ota_job": inner.ota_jobs.get(mac),
+                    "ota_history": inner.ota_history.iter().rev()
+                        .filter(|entry| entry.job.device_mac == mac.as_str())
+                        .collect::<Vec<_>>(),
+                    "latest_firmware": inner.firmware_releases.get(&d.capabilities.firmware_target),
+                    "running_image": inner.running_images.get(mac),
                     "data": coordinator.map(|c| json!({
                         "push_dirty": c.data.push_dirty,
                         "pull_only_change": c.pull_only_change(),
@@ -1402,9 +1653,13 @@ impl PlatformService {
                     })),
                     "power": coordinator.map(|c| json!({
                         "plan": c.plan.last_sent,
+                        "prepared_at": (c.plan.last_sent_at != 0).then_some(c.plan.last_sent_at),
                         "accepted_plan_id": c.plan.last_accepted_id,
                         "accepted_remaining_s": c.plan.last_accepted_remaining_s,
-                        "observed": c.session.power,
+                        "accepted_at": (c.plan.last_accepted_at != 0).then_some(c.plan.last_accepted_at),
+                        "observed": d.observed.power,
+                        "observed_at": d.observed.power_observed_at,
+                        "observed_transport": d.observed.power_transport,
                     })),
                     "observed": coordinator.map(|c| c.session.clone()),
                     "last_authenticated": d.last_authenticated,
@@ -1460,6 +1715,10 @@ impl PlatformService {
     /// The caller must have verified the endpoint token and returned MAC.
     /// Bound the saved document so a malformed peer cannot grow state.json forever.
     pub fn note_authenticated_status(&self, mac: &str, status: &Value) -> Result<()> {
+        self.note_authenticated_status_at(mac, status, crate::device_clock::wall_secs(mac))
+    }
+
+    pub fn note_authenticated_status_at(&self, mac: &str, status: &Value, now: u64) -> Result<()> {
         fn merge_field(previous: &Value, fresh: &Value, path: &str, now: u64,
                        boot: &Value, samples: &mut serde_json::Map<String, Value>) -> Value {
             if let Some(map) = fresh.as_object() {
@@ -1495,9 +1754,9 @@ impl PlatformService {
         }
         let mut inner = self.inner.lock().unwrap();
         let record = inner.devices.get_mut(&mac).context("unknown device")?;
-        let now = crate::device_clock::wall_secs(&mac);
         let mut body = record.last_authenticated.as_ref().map(|saved| saved.body.clone())
             .unwrap_or_else(|| json!({}));
+        body["boot_id"] = status["boot_id"].clone();
         let mut field_samples = body["field_samples"].as_object().cloned().unwrap_or_default();
         let groups: [(&str, &[&str]); 7] = [
             ("identity", &["device_mac", "configured"]),
@@ -1532,6 +1791,7 @@ impl PlatformService {
             }
         }
         body["field_samples"] = Value::Object(field_samples);
+        body["received_at"] = json!(now);
         if serde_json::to_vec(&body)?.len() > 16 * 1024 {
             bail!("authenticated cached status exceeds 16 KiB");
         }
@@ -1580,16 +1840,23 @@ impl PlatformService {
 
     /// Authenticated Status digest; the device is authoritative for its context.
     pub fn note_device_status(&self, mac: &str, status: &Value) -> Result<()> {
+        self.note_device_status_at(mac, status, "unknown", crate::device_clock::wall_secs(mac))
+    }
+
+    pub fn note_device_status_at(&self, mac: &str, status: &Value, transport: &str, now: u64) -> Result<()> {
         let mac = mac.to_uppercase();
         if status.get("device_mac").and_then(Value::as_str)
             .and_then(DeviceIdentity::normalized_mac)
             .is_some_and(|reported| reported != mac) {
             bail!("status MAC does not match {mac}");
         }
-        let now = crate::device_clock::wall_secs(&mac);
         let mut inner = self.inner.lock().unwrap();
         if let Some(record) = inner.devices.get_mut(&mac) {
             record.last_authenticated_contact_at = Some(now);
+            record.observed.observed_at = Some(now);
+            record.observed.transport = Some(transport.into());
+            record.observed.fw = status.get("fw").and_then(Value::as_str).map(str::to_string);
+            record.observed.boot_id = status.get("boot_id").and_then(Value::as_str).map(str::to_string);
             record.observed.active_context_id = status
                 .get("active_context_id")
                 .and_then(|v| v.as_str())
@@ -1608,6 +1875,11 @@ impl PlatformService {
                 .get("last_acked_at")
                 .and_then(|v| v.as_u64())
                 .or(Some(now));
+            if status["power"].as_object().is_some_and(|power| !power.is_empty()) {
+                record.observed.power = Some(status["power"].clone());
+                record.observed.power_observed_at = Some(now);
+                record.observed.power_transport = Some(transport.into());
+            }
             record.observed.display_state = status
                 .get("display_state")
                 .and_then(|v| v.as_str())
@@ -1738,9 +2010,13 @@ impl PlatformService {
     }
 
     pub fn note_ble_contact(&self, mac: &str) -> Result<()> {
+        self.note_ble_contact_at(mac, crate::device_clock::wall_secs(mac))
+    }
+
+    pub fn note_ble_contact_at(&self, mac: &str, at: u64) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
         let record = inner.devices.get_mut(&mac.to_uppercase()).context("unknown device")?;
-        record.last_authenticated_contact_at = Some(crate::device_clock::wall_secs(&mac));
+        record.last_authenticated_contact_at = Some(at);
         record.last_authenticated_transport = Some("ble".into());
         Self::persist(&inner, &self.state_path())
     }
@@ -2417,6 +2693,38 @@ mod tests {
     }
 
     #[test]
+    fn http_receipt_and_digest_share_time_ble_keeps_wifi_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = PlatformService::open(dir.path()).unwrap();
+        let mac = "AABBCCDDEEFF";
+        svc.device_upsert(DeviceIdentity::new(mac, "Test").unwrap(),
+            DeviceCapabilities::ssd1681_154g()).unwrap();
+        let status = json!({"device_mac":mac,"fw":"1.0","power":{"battery":0},
+            "active_template_id":"quad"});
+        svc.note_device_status_at(mac, &status, "http", 100).unwrap();
+        svc.note_authenticated_status_at(mac, &status, 100).unwrap();
+        let wifi = svc.device_get(mac).unwrap();
+        assert_eq!(wifi["last_authenticated"]["observed_at"], 100);
+        assert_eq!(wifi["last_authenticated"]["body"]["field_samples"]["fw"]["received_at"], 100);
+        assert_eq!(wifi["record_observed"]["transport"], "http");
+        assert_eq!(wifi["power"]["observed_at"], 100);
+        svc.note_device_status_at(mac, &json!({"device_mac":mac,
+            "active_template_id":"other"}), "ble", 101).unwrap();
+        svc.note_ble_contact_at(mac, 101).unwrap();
+        let ble = svc.device_get(mac).unwrap();
+        assert_eq!(ble["last_authenticated"], wifi["last_authenticated"]);
+        assert_eq!(ble["record_observed"]["transport"], "ble");
+        assert_eq!(ble["record_observed"]["fw"], Value::Null);
+        assert_eq!(ble["last_authenticated_contact_at"], 101);
+        assert_eq!(ble["power"]["observed_at"], 100);
+        svc.note_device_status_at(mac, &json!({"device_mac":mac,
+            "power":{"mode":"light","remaining_s":30}}), "ble", 102).unwrap();
+        let powered = svc.device_get(mac).unwrap();
+        assert_eq!(powered["power"]["observed_at"], 102);
+        assert_eq!(powered["power"]["observed_transport"], "ble");
+    }
+
+    #[test]
     fn sync_v1_samples_preserve_omitted_groups_and_zero_values() {
         let dir = tempfile::tempdir().unwrap();
         let svc = PlatformService::open(dir.path()).unwrap();
@@ -2535,6 +2843,8 @@ mod tests {
         assert!(resumed.ota_job(mac).unwrap().blocks_following_work());
         assert!(resumed.ota_begin(mac).unwrap().is_none());
         assert_eq!(resumed.ota_job(mac).unwrap().sha256, job.sha256);
+        resumed.ota_note_authenticated_version(mac, &json!({"fw": version})).unwrap();
+        assert!(resumed.ota_job(mac).unwrap().confirmation.is_none());
         resumed.ota_await_confirmation(mac, true, None).unwrap();
         assert!(resumed.ota_job(mac).unwrap().blocks_following_work());
         resumed.ota_note_authenticated_version(mac, &json!({"fw": "unexpected"})).unwrap();
@@ -2552,6 +2862,38 @@ mod tests {
         assert_eq!(next.state, "queued");
         assert_ne!(next.job_id, job.job_id);
         assert!(!resumed.dir.join(job.blob).exists());
+    }
+
+    #[test]
+    fn cancelled_unacked_ota_stays_unconfirmed_and_is_not_rescheduled() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = PlatformService::open(dir.path()).unwrap();
+        let mac = "AABBCCDDEEFF";
+        svc.device_upsert(DeviceIdentity::new(mac, "Test").unwrap(),
+            DeviceCapabilities::ssd1681_154g()).unwrap();
+        let target = svc.device_get(mac).unwrap()["capabilities"]["firmware_target"]
+            .as_str().unwrap().to_owned();
+        let version = "0.99.0-bw";
+        let mut bytes = vec![0u8; 2048];
+        bytes[0] = 0xe9;
+        let marker = format!("codex-status-ota-v1|{target}|{version}\0");
+        bytes[32..32 + marker.len()].copy_from_slice(marker.as_bytes());
+        let source = dir.path().join("candidate.bin");
+        std::fs::write(&source, bytes).unwrap();
+        svc.queue_ota(mac, "bridge", "request-1", &source, version, &target).unwrap();
+        svc.ota_begin(mac).unwrap();
+        svc.ota_await_confirmation(mac, false, Some("sync arm HTTP 409: batch_conflict")).unwrap();
+        svc.ota_cancel(mac).unwrap();
+        drop(svc);
+
+        let resumed = PlatformService::open(dir.path()).unwrap();
+        resumed.ota_note_authenticated_version(mac, &json!({"fw": version})).unwrap();
+        assert!(resumed.ota_job(mac).is_none());
+        let entry = resumed.ota_history(mac).pop().unwrap();
+        assert_eq!(entry.outcome, "cancelled_unconfirmed");
+        assert!(!entry.job.upload_ack && entry.job.cancel_requested && entry.job.confirmation.is_none());
+        assert!(resumed.ota_begin(mac).unwrap().is_none());
+        assert_eq!(resumed.queue_ota(mac, "bridge", "request-2", &source, version, &target).unwrap().state, "queued");
     }
 
     #[test]
@@ -2634,7 +2976,8 @@ mod tests {
         let job = svc.queue_ota(mac, "bridge", "request-1", &source, "v1", &target).unwrap();
         assert!(svc.dir.join(&job.blob).exists());
         svc.ota_cancel(mac).unwrap();
-        assert_eq!(svc.ota_job(mac).unwrap().state, "cancelled");
+        assert!(svc.ota_job(mac).is_none());
+        assert_eq!(svc.ota_history(mac).pop().unwrap().outcome, "cancelled_before_upload");
         assert!(!svc.dir.join(&job.blob).exists());
     }
 
@@ -3050,12 +3393,18 @@ mod tests {
         profile.template_ids = vec!["codex-status-a".into()];
         profile.initial_active_id = Some("codex-status-a".into());
         svc.profile_save(profile, 1000).unwrap();
+        assert!(svc.publish("7C4FADB93408", 1001).unwrap_err().to_string().contains("version is unknown"));
+        svc.inner.lock().unwrap().devices.get_mut("7C4FADB93408").unwrap().last_authenticated = Some(
+            crate::platform::model::AuthenticatedStatus { observed_at: 1000, transport: "wifi".into(), schema_version: 1,
+                body: json!({"fw":"0.18.35-note4-b-ota1"}) });
+        assert!(svc.publish("7C4FADB93408", 1001).unwrap_err().to_string().contains("requires firmware"));
+        svc.inner.lock().unwrap().devices.get_mut("7C4FADB93408").unwrap().last_authenticated.as_mut().unwrap().body["fw"] = json!("0.18.36-note4-b-layout1");
         let job = svc.publish("7C4FADB93408", 1001).unwrap();
         assert_eq!(job["state"], "waiting");
         let inner = svc.inner.lock().unwrap();
         let bundle = &inner.coordinators["7C4FADB93408"].job.as_ref().unwrap().frozen_bundle;
         assert_eq!(bundle.render_target, crate::platform::model::RENDER_TARGET_NOTE4);
-        assert_eq!(bundle.compiler_abi, 2);
+        assert_eq!(bundle.compiler_abi, crate::compile::COMPILER_ABI);
         assert!(bundle.total_len <= 262_144);
         assert_eq!(bundle.profile.template_ids, ["codex-status-a"]);
         bundle.verify().unwrap();
