@@ -248,88 +248,65 @@
         <div id="registered-devices" class="plist muted">加载中…</div>
       </div>
       <div class="card">
-        <div class="bar">
-          <div class="status" id="device-state">读取中…</div>
-          <div class="menus">
-            <button onclick="discoverDevice('auto')">重新发现</button>
-            <button onclick="refreshDeviceCache()">刷新缓存</button>
-          </div>
-        </div>
-        <div class="metric-grid" style="margin-top:14px">
-          <div class="metric"><strong id="dev-batt">--</strong><span>设备电量</span><small id="dev-batt-age"></small></div>
-          <div class="metric"><strong id="dev-wifi">--</strong><span>Wi-Fi / RSSI</span><small id="dev-wifi-age"></small></div>
-          <div class="metric"><strong id="dev-sync">尚无快照</strong><span>完整认证快照</span></div>
-        </div>
+        <div class="bar"><div class="status" id="device-state">读取本地缓存中…</div>
+          <div class="menus"><button onclick="refreshDeviceCache()">刷新缓存</button>
+            <button onclick="refreshPlatformStatus()">从设备读取</button></div></div>
+        <div class="row" id="dev-contact-row"><span>最近认证联系</span><span id="dev-contact">尚无</span></div>
+        <div class="sub" id="dev-sample-note">普通缓存读取不会联系设备。</div>
+      </div>
+      <div class="card">
+        <h2>固件与升级</h2>
+        <div class="row"><span>当前运行版本</span><span id="dev-fw">尚未读取</span></div>
+        <div class="row"><span>最新可用版本</span><span id="dev-latest">尚未登记</span></div>
+        <div class="row"><span>升级结论</span><strong id="dev-verdict">无法判断</strong></div>
+        <div class="row" id="dev-upgrade-failure-row" hidden><span>最近相关升级失败</span><span id="dev-upgrade-failure"></span></div>
+      </div>
+      <div class="card">
+        <h2>屏幕实际结果</h2>
+        <div class="row"><span>已安装内容</span><span id="dev-installed">尚未读取</span></div>
+        <div class="row"><span>当前内容</span><span id="dev-active">尚未读取</span></div>
+        <div class="row"><span>数据已应用</span><span id="dev-applied">尚未读取</span></div>
+        <div class="row"><span>屏幕显示</span><strong id="dev-display">尚无屏幕结果</strong></div>
+      </div>
+      <div class="card">
+        <h2>电量与数据投递</h2>
+        <div class="row"><span>设备电量</span><span id="dev-batt">尚未读取</span></div>
+        <div class="toolbar"><label class="muted"><input type="checkbox" id="pt-sync"> 允许向此设备投递业务数据</label>
+          <button onclick="saveDeviceDataSync()">保存许可</button></div>
+        <div class="sub" id="pt-device-state">状态和诊断同步不受此许可影响；保存不发布 Bundle。</div>
       </div>
       <div class="card">
         <h2>连接与占用</h2>
         <div class="row"><span>显示名称</span><span class="device-name" id="dev-name" onclick="modalRenameDevice()" title="点击重命名">--</span></div>
-        <div class="row"><span>占用状态</span><span id="dev-owner">--</span></div>
-        <div class="row"><span>IP 地址</span><span id="dev-ip" class="muted">--</span></div>
-        <div class="row"><span>最后发现</span><span id="dev-discover" class="muted">--</span></div>
-        <div class="row"><span>MAC</span><span id="dev-mac" class="muted mono">--</span></div>
-        <div class="row"><span>最近认证联系</span><span id="dev-contact" class="muted">尚无</span></div>
+        <div class="row"><span>占用状态</span><span id="dev-owner">尚未读取</span></div>
         <div class="action-strip">
+          <button onclick="discoverDevice('auto')">重新发现</button>
           <button onclick="claimDevice(false)">占用设备</button>
           <button onclick="releaseDevice()">释放</button>
           <button onclick="discoverDevice('ble')">BLE 发现</button>
         </div>
-        <details style="margin-top:12px"><summary>高级占用操作</summary><div class="action-strip"><button class="danger" onclick="claimDevice(true)">强制接管</button></div></details>
+        <details style="margin-top:12px"><summary>高级占用操作</summary><div class="action-strip">
+          <button class="danger" onclick="claimDevice(true)">强制接管所选设备</button></div></details>
       </div>
-      <details class="card">
-        <summary>设备详细信息</summary>
-        <div class="card">
-        <h3>固件</h3>
-        <div class="row"><span>ROM 版本</span><span id="dev-fw">--</span></div>
-        <div class="row"><span>运行槽位</span><span id="dev-slot">--</span></div>
-        <div class="row"><span>重置原因</span><span id="dev-reset">--</span></div>
-        <h3>连接</h3>
-        <div class="row"><span>BLE 连接</span><span id="dev-ble">--</span></div>
-        <h3>运行</h3>
-        <div class="row"><span>空闲 / 最低 heap</span><span id="dev-heap">--</span></div>
-        <h3>显示</h3>
-        <div class="row"><span>模板</span><span id="dev-templates">--</span></div>
-        <div class="row"><span>EPD 写入 / busy 失败</span><span id="dev-epd">--</span></div>
-        <div class="row"><span>同步状态</span><span id="dev-sync-state">当前快照未提供</span></div>
-        <div class="row"><span>诊断批次 / 完成收据</span><span id="dev-sync-batch">当前快照未提供</span></div>
-        <div class="row"><span>诊断缺口 / 最近完整成功</span><span id="dev-sync-gap">当前快照未提供</span></div>
-        <div class="sub" id="dev-sample-note">各值显示上次认证 Wi-Fi 采样，可能已过时。</div>
-        </div>
+      <details class="card" ontoggle="if(this.open) loadDeviceDetail('firmware')">
+        <summary>设备详细信息 · 固件</summary><div class="card" id="detail-firmware">展开时读取本地缓存…</div>
       </details>
-      <div class="card">
-        <h2>设备实际显示</h2>
-        <div class="bar">
-          <div class="status" id="pt-device-state">设备平台状态</div>
-          <div class="menus">
-            <button onclick="refreshPlatformDevice()">刷新缓存</button>
-            <button onclick="refreshPlatformStatus()">从设备读取</button>
-          </div>
-        </div>
-        <div class="row"><span>固件 target / render target</span><span id="pt-targets" class="muted">--</span></div>
-        <div class="row"><span>active 模板 / context</span><span id="pt-active" class="muted">--</span></div>
-        <div class="row"><span>设备已提交 / 显示结果</span><span id="pt-committed" class="muted">--</span></div>
-        <div class="sub" id="pt-expect"></div>
-      </div>
-      <div class="card">
-        <h2>Bundle / OTA 任务</h2>
-        <div class="row"><span>Bundle / OTA 任务</span><span id="pt-jobinfo" class="muted">--</span></div>
-      </div>
-      <div class="card">
-        <h2>数据投递许可</h2>
-        <div class="toolbar">
-          <label class="muted"><input type="checkbox" id="pt-sync"> 允许向此设备投递数据（不影响状态诊断同步）</label>
-          <span class="muted" id="pt-full-sync">完整数据投递周期：未配置</span>
-          <button onclick="saveDeviceDataSync()">保存许可</button>
-        </div>
-        <div class="sub">仅更改所选设备的数据投递许可；不改模板配置，也不发布。</div>
-      </div>
-      <details class="card">
-        <summary>恢复与维护</summary>
-        <div class="card">
-          <h2>从设备恢复 Profile</h2>
-          <div class="sub">从设备摘要导入，不自动唤醒、占用或发布；恢复出的 Profile 默认关闭同步。</div>
-          <div class="action-strip"><button onclick="recoverPlatform()">从设备摘要导入</button></div>
-        </div>
+      <details class="card" ontoggle="if(this.open) loadDeviceDetail('connection')">
+        <summary>连接详细信息</summary><div class="card" id="detail-connection">展开时读取本地缓存…</div>
+      </details>
+      <details class="card" ontoggle="if(this.open) loadDeviceDetail('runtime_display')">
+        <summary>运行与显示详细信息</summary><div class="card" id="detail-runtime_display">展开时读取本地缓存…</div>
+      </details>
+      <details class="card" ontoggle="if(this.open) loadDeviceDetail('upgrade_history')">
+        <summary>升级与发布历史归档</summary><div class="card" id="detail-upgrade_history">展开时读取本地缓存…</div>
+      </details>
+      <details class="card" ontoggle="if(this.open) loadDeviceDetail('sync_diagnostics')">
+        <summary>同步与诊断</summary><div class="card" id="detail-sync_diagnostics">展开时读取本地缓存…</div>
+      </details>
+      <details class="card" ontoggle="if(this.open) loadDeviceDetail('maintenance')">
+        <summary>恢复与维护</summary><div class="card"><div id="detail-maintenance">展开时读取本地缓存…</div>
+          <div class="sub">恢复会先显式读取设备，再由用户操作导入；不会因展开执行。</div>
+          <div class="action-strip"><button onclick="recoverPlatform()">从设备摘要导入 Profile</button></div></div>
       </details>
       <details class="card" id="device-power" ontoggle="if(this.open){showPmStatsCache();refreshPlatformPower();}">
         <summary>功耗与同步计划</summary>
@@ -345,7 +322,7 @@
           <div class="status" id="pt-power-state">正式 PowerPlan（Bridge 唯一决策）</div>
           <div class="menus"><button onclick="refreshPlatformPower()">刷新</button></div>
         </div>
-        <div class="row"><span>桥已发送 plan / 模式</span><span id="pt-plan" class="muted">--</span></div>
+        <div class="row"><span>Bridge 已生成 plan / 模式</span><span id="pt-plan" class="muted">--</span></div>
         <div class="row"><span>设备已接受 / 上次报告剩余 / 会合周期</span><span id="pt-plan-remaining" class="muted">--</span></div>
         <div class="row"><span>provisional（BOOT 300s）</span><span id="pt-provisional" class="muted">--</span></div>
         <div class="row"><span>采样电量</span><span id="pt-batt" class="muted">--</span></div>
@@ -356,7 +333,7 @@
         <div class="sub">读取、数据传输、claim/owner 续约都不会隐式续租；只有新的正式 PowerPlan 改变 deadline。</div>
       </div>
       <div class="card">
-        <h2>本次启动的 light sleep 概览</h2>
+        <h2>上次 PM 采样的 light sleep 概览（boot 未核验）</h2>
         <div class="rings">
           <div class="ring"><b id="pm-sleep-pct">--</b><small>休眠占比</small></div>
           <div class="ring"><b id="pm-wakes">--</b><small>light sleep 次数</small></div>
@@ -477,7 +454,8 @@
 
   function relTime(ts) {
     if (!ts) return '从未';
-    const diff = Math.max(0, Math.floor(Date.now() / 1000) - ts);
+    const diff = Math.floor(Date.now() / 1000) - ts;
+    if (diff < 0) return new Date(ts * 1000).toLocaleString() + '（未来时间）';
     if (diff < 60) return '刚刚';
     if (diff < 3600) return Math.floor(diff / 60) + ' 分钟前';
     return Math.floor(diff / 3600) + ' 小时前';
@@ -969,63 +947,28 @@
   }
 
   function clearDeviceView() {
-    for (const id of ['dev-batt', 'dev-wifi', 'dev-fw', 'dev-slot', 'dev-reset', 'dev-ble',
-      'dev-templates', 'dev-epd', 'dev-heap', 'dev-sync-gap', 'pt-targets', 'pt-active', 'pt-jobinfo',
-      'pt-committed', 'pt-plan', 'pt-plan-remaining', 'pt-provisional', 'pt-batt']) $(id).textContent = '尚未读取';
-    $('dev-batt-age').textContent = '';
-    $('dev-wifi-age').textContent = '';
-    $('dev-sync').textContent = '尚无快照';
-    $('dev-contact').textContent = '尚无';
-    $('dev-sync-state').textContent = '当前快照未提供';
-    $('dev-sync-batch').textContent = '当前快照未提供';
-    $('pt-full-sync').textContent = '完整数据投递周期：未配置';
-    $('pt-sync').checked = false;
-    $('dev-sample-note').textContent = '';
+    for (const id of ['dev-contact','dev-fw','dev-latest','dev-verdict','dev-installed',
+      'dev-active','dev-applied','dev-display','dev-batt','dev-owner','dev-name']) $(id).textContent = '尚未读取';
+    $('dev-upgrade-failure-row').hidden = true;
+    $('dev-contact-row').hidden = false;
+    $('dev-sample-note').textContent = '普通缓存读取不会联系设备。';
     $('device-state').textContent = selectedDeviceMac ? '正在读取本地缓存…' : '请先选择设备';
-    $('pt-device-state').textContent = selectedDeviceMac ? '读取中…' : '请先选择设备';
-    $('pt-power-state').textContent = '本地 PowerPlan 缓存';
-    $('pt-expect').textContent = '';
+    $('pt-device-state').textContent = '';
+    $('pt-sync').checked = false;
+    for (const section of ['firmware','connection','runtime_display','upgrade_history',
+      'sync_diagnostics','maintenance']) $('detail-' + section).textContent = '展开时读取本地缓存…';
     $('pm-state').textContent = '尚无本机功耗采样';
     $('pm-raw').value = '';
-    for (const id of ['pm-sleep-pct', 'pm-wakes', 'pm-sleep-time', 'pm-avg', 'pm-reject', 'pm-awake']) $(id).textContent = '--';
+    for (const id of ['pm-sleep-pct','pm-wakes','pm-sleep-time','pm-avg','pm-reject','pm-awake']) $(id).textContent = '--';
     $('pm-modes').innerHTML = '';
     $('pm-legend').innerHTML = '';
     $('pm-locks').textContent = '尚无采样';
-    renderDeviceIdentity(null);
-    document.querySelectorAll('#tab-device button').forEach(button => {
-      const action = button.getAttribute('onclick') || '';
-      button.disabled = !selectedDeviceMac && !action.startsWith("discoverDevice('auto'");
-    });
   }
 
   function fallbackDeviceName(device) {
     if (device?.name) return device.name;
     const hex = (device?.mac || '').replace(/[^0-9a-fA-F]/g, '').toUpperCase();
     return hex.length >= 6 ? 'CodexStatus-' + hex.slice(-6) : (device?.ip || '--');
-  }
-
-  function renderDeviceIdentity(device) {
-    if (!device) {
-      for (const id of ['dev-name', 'dev-mac', 'dev-ip', 'dev-discover', 'dev-owner']) $(id).textContent = '--';
-      return;
-    }
-    $('dev-name').textContent = fallbackDeviceName(device);
-    $('dev-mac').textContent = device.mac || '未学习（等待 UDP/BLE 通告）';
-    $('dev-ip').textContent = device.ip || '--';
-    const d = device.discover;
-    $('dev-discover').textContent = d ? `${d.via} · ${relTime(d.at)}` : '--';
-    const owner = device.owner;
-    if (owner) {
-      const who = owner.name || owner.id || '?';
-      const left = owner.expires_in_s != null ? `（采样时剩余 ${owner.expires_in_s}s）` : '';
-      $('dev-owner').textContent = `${who}@${owner.host || '?'}:${owner.port || '?'}${left} · 观察于 ${relTime(device.owner_observed_at)}`;
-    } else if (device.yielded) {
-      $('dev-owner').textContent = '已释放（本地让步，点“占用设备”重新参与）';
-    } else if (!device.owner_known) {
-      $('dev-owner').textContent = '尚未读取设备占用状态';
-    } else {
-      $('dev-owner').textContent = `采样时空闲 · ${relTime(device.owner_observed_at)}`;
-    }
   }
 
   function modalRenameDevice() {
@@ -1045,9 +988,9 @@
     const name = $('modal-device-name').value.trim();
     const mac = renameTargetMac;
     try {
-      const device = await invoke('rename_device', { name, mac });
+      await invoke('rename_device', { name, mac });
       closeModal();
-      if (mac === selectedDeviceMac) renderDeviceIdentity(device);
+      if (mac === selectedDeviceMac) await refreshDeviceCache();
     } catch (e) {
       $('device-state').textContent = '重命名失败：' + e;
       closeModal();
@@ -1060,8 +1003,8 @@
     try {
       const device = await invoke('device_discover', { via, mac });
       if (!isCurrentDevice(mac, generation)) return;
-      renderDeviceIdentity(device);
-      $('device-state').textContent = `发现成功 · ${device.ip}（仅连接线索，尚未证明认证或占用）`;
+      await refreshDeviceCache();
+      $('pt-device-state').textContent = `发现成功 · ${device.ip}（仅连接线索，尚未证明认证或占用）`;
     } catch (e) {
       if (isCurrentDevice(mac, generation)) $('device-state').textContent = '发现失败：' + e;
     }
@@ -1084,10 +1027,10 @@
     const generation = deviceSelectionGeneration;
     $('device-state').textContent = force ? '正在强制接管…' : '正在占用…';
     try {
-      const r = await invoke('claim_device', { force, mac });
+      await invoke('claim_device', { force, mac });
       if (!isCurrentDevice(mac, generation)) return;
-      renderDeviceIdentity(r.device);
-      $('device-state').textContent = '占用完成';
+      await refreshDevice();
+      $('pt-device-state').textContent = '占用完成';
     } catch (e) {
       if (isCurrentDevice(mac, generation)) $('device-state').textContent = '占用失败：' + e;
     }
@@ -1098,66 +1041,27 @@
     const generation = deviceSelectionGeneration;
     $('device-state').textContent = '正在释放…';
     try {
-      const r = await invoke('release_device', { mac });
+      await invoke('release_device', { mac });
       if (!isCurrentDevice(mac, generation)) return;
-      renderDeviceIdentity(r.device);
-      $('device-state').textContent = '已释放（不再自动占用）';
+      await refreshDevice();
+      $('pt-device-state').textContent = '已释放（不再自动占用）';
     } catch (e) {
       if (isCurrentDevice(mac, generation)) $('device-state').textContent = '释放失败：' + e;
     }
   }
 
-  function groupStamp(snapshot, group, path) {
-    const metadata = (path && snapshot.field_samples?.[path]) || snapshot.groups?.[group];
-    if (!metadata?.received_at) return '采样时间未知';
-    if (metadata.received_at > Date.now() / 1000) {
-      return `本机时钟异常 · 收到于 ${new Date(metadata.received_at * 1000).toLocaleString()}`;
+  function showReading(reading, format = value => String(value)) {
+    if (!reading || reading.value == null) {
+      const label = ({not_sampled:'尚未读取',unsupported:'固件不支持',not_applicable:'不适用',
+        read_error:'本次读取失败',stale_boot:'旧启动的采样',no_release:'尚未登记发布版'})[reading?.reason] || '尚未读取';
+      return reading?.previous == null ? label : `${label} · 上次 ${format(reading.previous)}${reading.observed_at ? ' · 上次观察于 ' + relTime(reading.observed_at) : ''}`;
     }
-    const age = Math.max(0, Math.floor(Date.now() / 1000) - metadata.received_at);
-    const latestBoot = snapshot.groups?.firmware?.sampled_boot_id;
-    const changedBoot = latestBoot && metadata.sampled_boot_id && latestBoot !== metadata.sampled_boot_id;
-    const stale = (age > 120 && ['radio', 'runtime', 'power'].includes(group)) ||
-      (changedBoot && ['radio', 'runtime'].includes(group));
-    return `${stale ? '旧值 · ' : ''}${relTime(metadata.received_at)} · ${metadata.transport || 'HTTP'}`;
+    return `${format(reading.value)}${reading.observed_at ? ' · 上次观察于 ' + relTime(reading.observed_at) : ''}`;
   }
-
-  function sampledField(snapshot, group, value, format = String, path) {
-    const reason = value && typeof value === 'object' && !Array.isArray(value) ? value.reason : null;
-    if (reason) {
-      const prior = value.previous;
-      const label = ({not_sampled:'尚未读取', unsupported:'固件不支持此项',
-        not_applicable:'不适用', read_error:'本次读取失败'})[reason] || '当前快照未提供';
-      return prior == null ? label : `${label} · 上次 ${format(prior)}（${groupStamp(snapshot, group, path)}）`;
-    }
-    if (value === undefined) return snapshot.groups?.[group] ? '本次未采样' : '尚未读取';
-    if (value === null) return '当前快照未提供';
-    return `${format(value)}（${groupStamp(snapshot, group, path)}）`;
-  }
-
-  function metricReading(snapshot, group, value, format, path) {
-    const reason = value && typeof value === 'object' && !Array.isArray(value) ? value.reason : null;
-    if (reason) {
-      const label = ({not_sampled:'尚未读取', unsupported:'固件不支持',
-        not_applicable:'不适用', read_error:'读取失败'})[reason] || '未提供';
-      return value.previous == null
-        ? { value: label, age: '' }
-        : { value: format(value.previous), age: `${label} · 上次 ${groupStamp(snapshot, group, path)}` };
-    }
-    if (value == null) return { value: value === undefined ? '尚未读取' : '未提供', age: '' };
-    return { value: format(value), age: groupStamp(snapshot, group, path) };
-  }
-
-  function renderSyncArchive(diag, completed) {
-    if (!diag?.available) return;
-    const gap = diag.gap_count == null ? '归档缺口未取得' : `当前归档 ${diag.gap_count} 个缺口`;
-    const success = completed?.batch_id || diag.last_full_success;
-    $('dev-sync-gap').textContent = `${gap} · ${success ? '最近完整成功 ' + success : '尚无完整成功证据'}` +
-      (diag.phase === 'awaiting_device_ack' ? ' · 归档等待设备确认' : '') +
-      (diag.retired_unconfirmed ? ' · 存在未确认旧归档的退役记录' : '');
-  }
+  const eventTime = ts => ts ? relTime(ts) : '时间未记录';
 
   async function refreshDeviceCache() {
-    await Promise.all([refreshDevice(), refreshPlatformDevice(), refreshPlatformPower()]);
+    await Promise.all([refreshPlatformDevice(), refreshDevice()]);
   }
 
   async function refreshDevice() {
@@ -1166,63 +1070,96 @@
     const request = ++deviceStatusRequest;
     lastDeviceFetch.set(mac, Date.now());
     try {
-      const d = await invoke('get_device_status', { mac });
+      const result = await invoke('platform_device_view', { mac });
       if (!isCurrentDevice(mac, generation) || request !== deviceStatusRequest) return;
-      if (d.device?.mac && d.device.mac.replace(/[^0-9a-fA-F]/g, '').toUpperCase() !== mac) throw new Error('设备身份与所选 MAC 不符');
-      renderDeviceIdentity(d.device);
-      const snapshot = d.last_success?.body || {};
-      const sampled = d.last_success?.observed_at;
-      const contact = d.last_authenticated_contact_at;
-      const transport = d.last_authenticated_transport || '认证通道';
-      $('device-state').textContent = sampled
-        ? `${d.reachability === 'blocked' ? '认证/占用受阻' : d.reachability === 'recently_authenticated' ? '最近已认证' : d.reachability === 'expected_sleep' ? '预计休眠' : '等待下次联系'} · 完整快照 ${new Date(sampled * 1000).toLocaleString()}${d.clock_anomaly ? ' · 本机时钟异常' : ''}`
-        : contact ? '最近有认证联系，尚无完整 Wi-Fi 快照' : '尚无认证观察，等待设备联系';
-      if (d.last_attempt?.error) $('device-state').textContent += ` · 最近尝试：${d.last_attempt.error}`;
-      $('dev-sync').textContent = sampled ? relTime(sampled) : '尚无快照';
-      $('dev-contact').textContent = contact ? `${new Date(contact * 1000).toLocaleString()} · ${transport}` : '尚无';
-      $('dev-fw').textContent = sampledField(snapshot, 'firmware', snapshot.fw, String, 'fw');
-      $('dev-slot').textContent = sampledField(snapshot, 'firmware', snapshot.running_slot ?? snapshot.slot, String, 'running_slot');
-      $('dev-reset').textContent = sampledField(snapshot, 'firmware', snapshot.reset_reason, String, 'reset_reason');
-      const battery = metricReading(snapshot, 'power', snapshot.power?.battery, n => `${n}%`, 'power.battery');
-      $('dev-batt').textContent = battery.value;
-      $('dev-batt-age').textContent = battery.age;
-      $('pt-batt').textContent = sampledField(snapshot, 'power', snapshot.power?.battery, n => `${n}%`, 'power.battery');
-      const radio = snapshot.radio;
-      const wifi = metricReading(snapshot, 'radio', radio?.wifi_connected,
-        connected => connected ? '已连接' : '未连接', 'radio.wifi_connected');
-      $('dev-wifi').textContent = wifi.value;
-      $('dev-wifi-age').textContent = `${radio?.wifi_connected === true ? `RSSI ${radio.rssi ?? '未提供'} dBm · ` : ''}${wifi.age}`;
-      $('dev-ble').textContent = sampledField(snapshot, 'radio', radio?.ble_connected, v => v ? '采样时已连接' : '采样时未连接', 'radio.ble_connected');
-      $('dev-templates').textContent = sampledField(snapshot, 'display', snapshot.template_ids,
-        ids => Array.isArray(ids) ? (ids.length ? ids.join(', ') : '未安装模板') : String(ids), 'template_ids');
-      $('dev-epd').textContent = sampledField(snapshot, 'display', snapshot.display?.epd_writes,
-        n => `${n} / ${snapshot.display?.epd_busy_fails ?? '未提供'}`, 'display.epd_writes');
-      $('dev-heap').textContent = sampledField(snapshot, 'runtime', snapshot.heap_free,
-        n => `${n} / ${snapshot.heap_min ?? '未提供'} B`, 'heap_free');
-      const sync = snapshot.sync;
-      $('dev-sync-state').textContent = snapshot.sync_v1 && sync
-        ? sampledField(snapshot, 'power', sync.rounds,
-            n => `${sync.enabled ? '状态诊断同步开启' : '状态诊断同步未开启'} · ${n}/15 轮 · ${sync.due ? '已到期等待认证开网' : '未到期'} · ${sync.phase || '阶段未提供'}`, 'sync.rounds')
-        : '当前快照未提供 sync-v1 能力';
-      $('dev-sync-batch').textContent = snapshot.sync_v1 && sync
-        ? `${sync.pending_batch
-            ? `进行中 ${sync.pending_batch.batch_id || 'ID未提供'} · ACK ${sync.pending_batch.acked_offset ?? '未提供'}/${sync.pending_batch.bytes ?? '未提供'} B`
-            : '无进行中批次'} / ${sync.last_completed?.batch_id || '无完成收据'}` +
-          `${Array.isArray(sync.reasons) && sync.reasons.length ? ' · 原因 ' + sync.reasons.join(', ') : ''}` +
-          `${sync.last_error ? ' · 错误 ' + sync.last_error : ''}（${groupStamp(snapshot, 'power')}）`
-        : '当前快照未提供';
-      const completed = sync?.last_completed;
-      $('dev-sync-gap').textContent = snapshot.sync_v1 && sync
-        ? `${Array.isArray(sync.gaps) ? sync.gaps.length + ' 个缺口' : '缺口未报告'} · ` +
-          (completed?.batch_id ? `最近设备完成 ${completed.batch_id}（${groupStamp(snapshot, 'power')}）`
-            : '尚无设备完成收据')
-        : '当前快照未提供';
-      renderSyncArchive(platformDevice?.diagnostics, completed);
-      $('dev-sample-note').textContent = sampled
-        ? '各值保留原组的采样时间；BLE 联系不刷新 Wi-Fi 采样年龄。0、未连接与空模板列表均为有效观察。'
-        : '登记信息来自 Bridge；设备指标尚未取得认证 Wi-Fi 快照。';
+      const d = result.device;
+      if (!d || d.device_mac !== mac) throw new Error('设备身份与所选 MAC 不符');
+      $('dev-name').textContent = d.identity.name || mac;
+      $('device-state').textContent = d.contact.label;
+      const separateContact = d.contact.last_authenticated_at &&
+        (d.contact.transport === 'ble' || !d.contact.wifi_sampled_at);
+      $('dev-contact-row').hidden = !!d.contact.wifi_sampled_at && !separateContact;
+      $('dev-contact').textContent = separateContact
+        ? `${eventTime(d.contact.last_authenticated_at)} · ${d.contact.transport === 'ble' ? 'BLE' : '认证通道未记录'}`
+        : '尚无独立联系';
+      $('dev-sample-note').textContent = d.contact.wifi_sampled_at
+        ? `上次完整状态回报：${eventTime(d.contact.wifi_sampled_at)} · Wi-Fi`
+        : '尚无完整 Wi-Fi 状态回报；普通缓存读取不会联系设备。';
+      $('dev-fw').textContent = showReading(d.firmware.current);
+      $('dev-latest').textContent = d.firmware.latest?.value
+        ? `${d.firmware.latest.value} · 登记于 ${eventTime(d.firmware.latest.published_at)}`
+        : showReading(d.firmware.latest);
+      $('dev-verdict').textContent = d.firmware.label;
+      $('dev-upgrade-failure-row').hidden = !d.upgrade_failure;
+      $('dev-upgrade-failure').textContent = d.upgrade_failure
+        ? `${d.upgrade_failure.reason} · 失败于 ${eventTime(d.upgrade_failure.at)}` : '';
+      $('dev-installed').textContent = showReading(d.display.installed,
+        count => count ? `已安装 ${count} 项` : '未安装内容');
+      $('dev-active').textContent = showReading(d.display.active_template,
+        active => active ? '已选择当前内容' : '无 active 内容');
+      $('dev-applied').textContent = showReading(d.display.data_applied, applied => applied ? '已有数据应用' : '尚无数据应用');
+      $('dev-display').textContent = `${d.display.label}${d.display.screen_state?.observed_at
+        ? ' · 上次观察于 ' + relTime(d.display.screen_state.observed_at) : ''}`;
+      $('dev-batt').textContent = showReading(d.battery, n => `${n}%`);
+      $('pt-sync').checked = !!d.delivery.enabled;
+      $('dev-owner').textContent = `${d.occupancy.label}${d.occupancy.owner_name ? ' · ' + d.occupancy.owner_name : ''}${d.occupancy.observed_at
+        ? ' · ' + (d.occupancy.source === 'public_status' ? '公开状态观察于 ' : '观察来源未记录 · ') + relTime(d.occupancy.observed_at) : ''}`;
     } catch (e) {
-      if (isCurrentDevice(mac, generation) && request === deviceStatusRequest) $('device-state').textContent = '本地缓存读取失败：' + e;
+      if (isCurrentDevice(mac, generation) && request === deviceStatusRequest)
+        $('device-state').textContent = '本地缓存读取失败：' + e;
+    }
+  }
+
+  const DETAIL_LABELS = {
+    target:'固件 target',render_target:'渲染 target',compiler_abi:'编译 ABI',slot:'运行槽位',
+    reset_reason:'重置原因',running_image:'运行镜像证据',device_mac:'MAC',ip:'IP',
+    discovered_via:'发现方式',last_seen_at:'最后发现',radio:'采样时无线状态',
+    owner:'设备占用',owner_known:'占用已采样',owner_observed_at:'占用观察时间',
+    heap_free:'空闲 heap',heap_min:'最低 heap',uptime_ms:'本次启动时长',
+    epd_writes:'EPD 写入',epd_busy_fails:'EPD busy 失败',template_ids:'已安装模板',
+    active_template_id:'active 模板',active_context_id:'active context',
+    commit_seq:'提交序号',display_state:'屏幕结果',sync:'设备同步状态',
+    archive:'Bridge 诊断归档',plan:'PowerPlan',device_power:'设备电源快照',
+    pm_stats:'PM 采样说明',profile_present:'Bridge 有 Profile',
+    last_authenticated_at:'最近认证联系',recovery_requires_explicit_refresh:'恢复需显式采样'
+  };
+  function detailText(value) {
+    if (value?.value !== undefined) return showReading(value, v => typeof v === 'object' ? JSON.stringify(v) : String(v));
+    if (value == null) return '尚未读取';
+    return typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value);
+  }
+  async function loadDeviceDetail(section) {
+    if (!selectedDeviceMac) return;
+    const mac = selectedDeviceMac, generation = deviceSelectionGeneration;
+    const target = $('detail-' + section);
+    target.textContent = '读取本地缓存中…';
+    try {
+      const result = await invoke('platform_device_detail', { mac, section });
+      if (!isCurrentDevice(mac, generation) || result.device_mac !== mac) return;
+      const data = result.data || {};
+      if (section === 'upgrade_history') {
+        const ota = (data.ota_history || []).slice().reverse();
+        const bundles = (data.bundle_history || []).slice().reverse();
+        const items = [
+          ...(data.ota_current ? [`当前 OTA：${data.ota_current.expected_version || '版本未知'} · ${data.ota_current.state} · 更新于 ${eventTime(data.ota_current.updated_at)}`] : []),
+          ...ota.map(entry => `OTA ${entry.job?.expected_version || '版本未知'} · ${entry.outcome} · 关闭于 ${eventTime(entry.closed_at)}`),
+          ...(data.bundle_current ? [`当前 Bundle：${data.bundle_current.state || '状态未知'} · 更新于 ${eventTime(data.bundle_current.updated_at)}`] : []),
+          ...bundles.map(entry => `Bundle ${entry.job_id || ''} · ${entry.state || '状态未知'} · 更新于 ${eventTime(entry.updated_at)}`)
+        ];
+        target.innerHTML = (items.length ? items : ['尚无历史任务']).map(item =>
+          `<div class="row"><span>${escapeHtml(item)}</span></div>`).join('') +
+          `<details><summary>查看任务原始证据</summary><pre class="mono" style="white-space:pre-wrap;overflow-wrap:anywhere">${escapeHtml(JSON.stringify(data, null, 2))}</pre></details>`;
+      } else if (section === 'sync_diagnostics') {
+        const archive = data.archive || {};
+        target.innerHTML = `<div class="field-row"><b>设备同步状态</b><span class="field-value">${escapeHtml(detailText(data.sync))}</span></div>
+          <div class="field-row"><b>最近完整归档</b><span class="field-value">${escapeHtml(archive.last_full_success || '尚无')} · 完成于 ${escapeHtml(eventTime(archive.completed_at))}</span></div>
+          <div class="field-row"><b>归档阶段 / gap</b><span class="field-value">${escapeHtml(`${archive.phase || '未记录'} / ${archive.gap_count ?? '未记录'}`)}</span></div>`;
+      } else {
+        target.innerHTML = Object.entries(data).map(([key, value]) =>
+          `<div class="field-row"><b>${escapeHtml(DETAIL_LABELS[key] || key)}</b><span class="field-value">${escapeHtml(detailText(value))}</span></div>`).join('');
+      }
+    } catch (e) {
+      if (isCurrentDevice(mac, generation)) target.textContent = '本地详情读取失败：' + e;
     }
   }
 
@@ -1243,8 +1180,8 @@
 
   function showPmStatsCache() {
     const r = selectedDeviceMac && pmStatsCache.get(selectedDeviceMac);
-    if (r?.text) renderPmStats(r);
-    else $('pm-state').textContent = `该设备尚无本机功耗采样；按“采样”显式读取${r?.last_error ? ' · 最近尝试失败：' + r.last_error : ''}`;
+    if (r?.fetched_at) renderPmStats(r);
+    else $('pm-state').textContent = `该设备尚无本机功耗采样；按“采样”显式读取${r?.last_error ? ' · 最近尝试失败于 ' + eventTime(r.last_attempt_at) + '：' + r.last_error : ''}`;
   }
 
   async function refreshPmStats() {
@@ -1252,9 +1189,8 @@
     const generation = deviceSelectionGeneration;
     $('pm-state').textContent = '读取中…';
     try {
-      const r = await invoke('get_pmstats', { mac });
-      pmStatsCache.set(mac, r);
-      if (isCurrentDevice(mac, generation)) showPmStatsCache();
+      await invoke('get_pmstats', { mac });
+      if (isCurrentDevice(mac, generation)) await refreshPlatformPower();
     } catch (e) {
       if (isCurrentDevice(mac, generation)) {
         showPmStatsCache();
@@ -1267,8 +1203,8 @@
     const text = r.text || '';
     $('pm-raw').value = text;
     $('pm-state').textContent = r.fetched_at
-      ? `${r.online ? '采样成功' : '等待设备联系 · 保留上次成功采样'} · ${r.device_mac || selectedDeviceMac} · ${r.ip || '地址未知'} · ${new Date(r.fetched_at * 1000).toLocaleString()}${r.last_error ? ` · 最近尝试失败：${r.last_error}` : ''}`
-      : `尚无成功采样${r.last_error ? ` · 最近尝试失败：${r.last_error}` : ''}`;
+      ? `PM 采样：${eventTime(r.fetched_at)}${r.last_error ? ` · 最近尝试失败于 ${eventTime(r.last_attempt_at)}：${r.last_error}` : ''}`
+      : `尚无成功 PM 采样${r.last_error ? ` · 最近尝试失败于 ${eventTime(r.last_attempt_at)}：${r.last_error}` : ''}`;
 
     const modes = [];
     const modeRe = /^(SLEEP|APB_MIN|APB_MAX|CPU_MAX)\s+.+?\s+(\d+)\s+(\d+)\s*%/gm;
@@ -1386,7 +1322,6 @@
   const DEVICE_MAC_KEY = 'codex-status-device-mac';
   let selectedDeviceMac = localStorage.getItem(DEVICE_MAC_KEY) || null;
   let platformDevices = [];
-  let platformDevice = null;
   let platformTemplates = [];
 
   function platformStateBadge(kind) {
@@ -1442,7 +1377,7 @@
           const on = d.device_mac === selected;
           return `<div class="prow pick${on ? ' current' : ''}" onclick="pickDevice('${escapeAttr(d.device_mac)}')">` +
             `<span class="name"><b>${escapeHtml(d.name || fallbackDeviceName(d))}</b>` +
-            `<small>${escapeHtml(d.device_mac)} · ${escapeHtml(d.ip || 'IP 未知')} · ${escapeHtml(d.job?.state || '无发布任务')}</small></span>` +
+            `<small>${escapeHtml(d.model || '型号未知')} · ${escapeHtml(d.device_mac.slice(-6))} · ${escapeHtml(d.status || '尚无认证联系')}${d.attention?.length ? ' · 待处理 ' + d.attention.length + ' 项' : ''}</small></span>` +
             `<span class="ctl">${on ? '<span class="badge">当前</span>' : ''}</span></div>`;
         }).join('')
       : '<div class="todo" style="padding:10px">尚无已登记设备；先按键唤醒设备并重新发现。</div>';
@@ -1462,7 +1397,6 @@
     if (!platformDevices.some(d => d.device_mac === mac)) return;
     selectedDeviceMac = mac;
     deviceSelectionGeneration++;
-    platformDevice = null;
     localStorage.setItem(DEVICE_MAC_KEY, mac);
     closeModal();
     clearDeviceView();
@@ -1473,59 +1407,19 @@
     const mac = selectedDeviceMac, generation = deviceSelectionGeneration;
     const request = ++platformDeviceRequest;
     try {
-      const data = await invoke('platform_devices');
+      const view = await invoke('platform_device_view', {});
       if (!isCurrentDevice(mac, generation) || request !== platformDeviceRequest) return;
-      platformDevices = data.devices || [];
+      platformDevices = view.devices || [];
       const selected = resolveSelectedDevice();
       if (selected !== mac) {
         deviceSelectionGeneration++;
         clearDeviceView();
-        if (selected) { refreshDevice(); refreshPlatformPower(); }
+        if (selected) refreshDevice();
       }
       renderRegisteredDevices(selected);
-      const device = platformDevices.find(d => d.device_mac === selected);
-      platformDevice = device || null;
-      if (!device) {
-        $('pt-device-state').textContent = platformDevices.length > 1
-          ? '设备平台状态：请先在上方选择设备'
-          : '设备平台状态：尚未学习到设备 MAC';
-        $('pt-targets').textContent = '--';
-        $('pt-active').textContent = '--';
-        $('pt-jobinfo').textContent = '--';
-        $('pt-expect').textContent = '';
-        $('pt-sync').checked = false;
-        return;
-      }
-      const caps = device.capabilities || {};
-      $('pt-device-state').innerHTML =
-        `设备平台状态 ${device.hardware_verified === false ? platformStateBadge('unverified') : ''}`;
-      $('pt-targets').textContent =
-        `${caps.firmware_target || '--'} / ${caps.render_target || '--'} · abi ${caps.compiler_abi || '--'}`;
-      const body = device.last_authenticated?.body || {};
-      renderSyncArchive(device.diagnostics, body.sync?.last_completed);
-      const observed = device.observed || {};
-      $('pt-active').textContent =
-        `${body.active_template_id ?? observed.active_template_id ?? '未观察'} / ${body.active_context_id ?? observed.active_context_id ?? '未观察'} · ${body.groups?.display?.received_at ? 'Wi-Fi ' + relTime(body.groups.display.received_at) : '轻量状态'}`;
-      $('pt-committed').textContent =
-        `${body.committed_job_id ?? observed.committed_job_id ?? '未观察'} / ${body.display_state ?? observed.display_state ?? '未观察'}`;
-      const job = device.job || {};
-      $('pt-jobinfo').textContent = `${job.job_id || '--'}（${job.state || '无任务'}）` +
-        (job.transport ? ` · ${job.transport}` : '') +
-        (job.bytes != null ? ` · ${job.transferred_bytes || 0}/${job.bytes} B` : '') +
-        (job.last_error ? ` · ${job.last_error}` : '') +
-        (job.ack ? ` · ACK ${job.ack}` : '');
-      if (device.ota_job) {
-        const ota = device.ota_job;
-        $('pt-jobinfo').textContent += ` · OTA ${ota.job_id}（${ota.state}）` +
-          (ota.confirmation ? ` · 证据 ${ota.confirmation}` : '') +
-          (ota.last_error ? `：${ota.last_error}` : '');
-      }
-      $('pt-expect').textContent = platformDevices.length > 1
-        ? '多设备：每台独立协调器，不做跨设备原子发布；上面的操作只作用于选中设备。' : '';
-      $('pt-sync').checked = !!device.sync_enabled;
-      $('pt-full-sync').textContent = `完整数据投递周期：${device.profile?.full_sync_s ?? 3600}s（设备配置）`;
     } catch (e) {
-      if (isCurrentDevice(mac, generation) && request === platformDeviceRequest) $('pt-device-state').textContent = '平台状态读取失败：' + String(e);
+      if (isCurrentDevice(mac, generation) && request === platformDeviceRequest)
+        $('pt-device-state').textContent = '设备列表读取失败：' + String(e);
     }
   }
 
@@ -1538,9 +1432,12 @@
       await invoke('platform_data_sync_save', { mac, enabled });
       if (!isCurrentDevice(mac, generation)) return;
       $('pt-device-state').textContent = `数据投递许可已保存：${enabled ? '允许' : '关闭'}；未发布模板`;
-      await refreshPlatformDevice();
+      await refreshDeviceCache();
     } catch (e) {
-      if (isCurrentDevice(mac, generation)) $('pt-device-state').textContent = '保存数据投递许可失败：' + e;
+      if (isCurrentDevice(mac, generation)) {
+        $('pt-device-state').textContent = '保存数据投递许可失败：' + e;
+        await refreshDevice();
+      }
     }
   }
   async function refreshPlatformStatus() {
@@ -1554,9 +1451,10 @@
         $('device-state').textContent = '已读取认证状态；数据已保存到本地缓存';
         await refreshDeviceCache();
       } else {
-        $('device-state').textContent = `${result.result === 'waiting_for_link' ? '等待设备 Wi-Fi 联系' : '本次未取得认证状态'}：${result.error || '设备可能处于 deep sleep'}`;
+        $('pt-device-state').textContent = `${result.result === 'waiting_for_link' ? '等待设备 Wi-Fi 联系' : '本次未取得认证状态'}：${result.error || '设备可能处于 deep sleep'}`;
+        await refreshDevice();
       }
-    } catch (e) { if (isCurrentDevice(mac, generation)) $('device-state').textContent = '读取失败：' + e; }
+    } catch (e) { if (isCurrentDevice(mac, generation)) $('pt-device-state').textContent = '读取失败：' + e; }
   }
 
   async function recoverPlatform() {
@@ -1586,18 +1484,28 @@
     if (!selectedDeviceMac) return;
     const mac = selectedDeviceMac, generation = deviceSelectionGeneration;
     try {
-      const data = await invoke('platform_power', { mac });
+      const result = await invoke('platform_device_detail', { mac, section: 'power' });
       if (!isCurrentDevice(mac, generation)) return;
-      const summary = data.coordinator || {};
-      const plan = summary.plan || {};
-      const sent = plan.last_sent || {};
+      const data = result.data || {};
+      const plan = data.plan || {};
+      const sent = plan.plan || {};
       $('pt-plan').textContent = sent.plan_id
-        ? `#${sent.plan_id} ${sent.mode}` : '未见桥已发送的正式计划';
+        ? `#${sent.plan_id} ${sent.mode} · Bridge 生成于 ${eventTime(plan.prepared_at)}` : '未见 Bridge 生成的正式计划';
       $('pt-plan-remaining').textContent =
-        `${!plan.last_accepted_id ? '未见 ACK' : '#' + plan.last_accepted_id} / ${!plan.last_accepted_id ? '未报告' : plan.last_accepted_remaining_s + 's（上次 ACK）'} / ${sent.rendezvous_period_s == null ? '未提供' : sent.rendezvous_period_s + 's'}`;
-      const provisional = (summary.session || {}).power || {};
+        `${!plan.accepted_plan_id ? '未见 ACK' : '#' + plan.accepted_plan_id} / ${!plan.accepted_plan_id ? '未报告' : plan.accepted_remaining_s + 's（ACK 于 ' + eventTime(plan.accepted_at) + '）'} / ${sent.rendezvous_period_s == null ? '未提供' : sent.rendezvous_period_s + 's'}`;
+      const provisional = plan.observed || {};
+      const planObservation = plan.observed_at
+        ? `${plan.observed_transport === 'ble' ? 'BLE 摘要' : plan.observed_transport === 'http' ? 'Wi-Fi 摘要' : '来源未记录'}观察于 ${eventTime(plan.observed_at)}`
+        : '观察时间未记录';
       $('pt-provisional').textContent = provisional.provisional
-        ? `是（上次报告剩余 ${provisional.remaining_s ?? '未提供'}s）` : provisional.provisional === false ? '否（上次观察）' : '未报告';
+        ? `是（上次报告剩余 ${provisional.remaining_s ?? '未提供'}s；${planObservation}）` : provisional.provisional === false ? `否（${planObservation}）` : '未报告';
+      $('pt-batt').textContent = showReading(data.device_power?.value?.battery == null
+        ? { value: null, reason: data.device_power?.reason }
+        : { value: data.device_power.value.battery, observed_at: data.device_power.observed_at }, n => `${n}%`);
+      pmStatsCache.set(mac, data.pm_stats && data.pm_stats.fetched_at
+        ? { ...data.pm_stats, device_mac: mac, online: !data.pm_stats.last_error }
+        : data.pm_stats);
+      showPmStatsCache();
     } catch (e) {
       if (isCurrentDevice(mac, generation)) $('pt-power-state').textContent = 'PowerPlan 读取失败：' + String(e);
     }
