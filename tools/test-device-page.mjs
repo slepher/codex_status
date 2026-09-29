@@ -5,6 +5,9 @@ import vm from 'node:vm';
 const html = readFileSync(new URL('../bridge/crates/app/ui/index.html', import.meta.url), 'utf8');
 assert(!html.includes('id="ring-week"'));
 assert(!html.includes('id="btn-pause"'));
+assert(!html.includes('id="pt-profile"'));
+assert(!html.includes('id="pt-fonts"'));
+assert(!html.includes('屏幕内容与发布'));
 const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
 assert(script);
 for (const [, id] of script.matchAll(/\$\('([^']+)'\)/g)) {
@@ -65,7 +68,10 @@ await b;
 assert.match(element('dev-fw').textContent, /^B/);
 assert.match(element('dev-templates').textContent, /未安装模板/);
 assert.match(element('dev-heap').textContent, /^0 \/ 0 B/);
-assert.match(element('dev-wifi').textContent, /采样时未连接/);
+assert.equal(element('dev-wifi').textContent, '未连接');
+assert.match(element('dev-wifi-age').textContent, /旧值/);
+assert.equal(element('dev-batt').textContent, '0%');
+assert.match(element('dev-batt-age').textContent, /旧值/);
 assert.match(element('dev-owner').textContent, /尚未读取/);
 assert.match(element('dev-sync-state').textContent, /0\/15 轮/);
 assert.match(element('dev-sync-batch').textContent, /ACK 0\/100 B/);
@@ -91,15 +97,15 @@ assert.match(element('pm-state').textContent, /保留上次成功采样.*timeout
 
 handlers.platform_devices = () => ({ devices: [{ device_mac: macB,
   capabilities: { render_target: 'epd-ssd1681-200x200-1bpp' },
-  profile: { device_mac: macB, template_ids: ['saved'], sync_enabled: false },
+  profile: { device_mac: macB, template_ids: ['saved'], sync_enabled: false }, sync_enabled: false,
 }], selected_device_mac: macB });
-handlers.platform_font_list = () => ({ fonts: [] });
-handlers.platform_template_get = () => ({ source: {} });
-run('platformDraftDirty = false');
 await run('refreshPlatformDevice()');
-run("platformProfile.template_ids = ['draft']; markPlatformDraft()");
-await run('refreshPlatformDevice()');
-assert.equal(run('platformProfile.template_ids[0]'), 'draft');
+assert.equal(element('pt-sync').checked, false);
+element('pt-sync').checked = true;
+handlers.platform_data_sync_save = () => ({ device_mac: macB, sync_enabled: true, published: false });
+await run('saveDeviceDataSync()');
+assert(calls.some(call => call.name === 'platform_data_sync_save' && call.args.mac === macB && call.args.enabled));
+assert(!calls.some(call => call.name === 'platform_profile_save' || call.name === 'platform_publish'));
 
 handlers.platform_status_refresh = () => ({ result: 'ok', status: { device_mac: macA, template_ids: ['wrong'] } });
 await run('recoverPlatform()');
@@ -120,11 +126,14 @@ await run('submitRenameDevice()');
 assert.equal(calls.at(-1).name, 'rename_device');
 assert.equal(calls.at(-1).args.mac, macA);
 
-select(macA);
-handlers.platform_publish_preview = () => ({ target_id: 'frozen-A' });
-await run('publishPlatform()');
-select(macB);
-await run('confirmPlatformPublish()');
-assert(!calls.some(call => call.name === 'platform_publish'));
+const oldTime = Date.now;
+Date.now = () => 200_000;
+assert(!run("groupStamp({groups:{firmware:{received_at:10,transport:'http'}}},'firmware')").includes('旧值'));
+assert(run("groupStamp({groups:{radio:{received_at:10,transport:'http'}}},'radio')").includes('旧值'));
+Date.now = oldTime;
+for (const [reason, label] of [['not_sampled','尚未读取'], ['unsupported','固件不支持'],
+  ['not_applicable','不适用'], ['read_error','本次读取失败']]) {
+  assert(run(`sampledField({}, 'runtime', {value:null,reason:'${reason}'})`).includes(label));
+}
 await wait();
-console.log('device page: MAC isolation, stale response, zero/false/empty values, passive PM, draft, frozen actions, recovery and Plan ACK guard OK');
+console.log('device page: MAC isolation, stale response, zero/false/empty values, passive PM, data permission, null reasons, firmware age, recovery and Plan ACK guard OK');

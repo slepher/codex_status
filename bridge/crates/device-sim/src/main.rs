@@ -169,6 +169,8 @@ struct OtaFile {
     pending: Option<String>,
     source: String,
     event_seq: u64,
+    #[serde(default)]
+    slot: u8,
 }
 
 struct OtaStore {
@@ -649,7 +651,9 @@ impl OtaStore {
         ensure!(catalog.versions.iter().any(|v| v.id == catalog.initial),
             "OTA initial version is absent");
         for (index, version) in catalog.versions.iter().enumerate() {
-            ensure!(!version.id.is_empty() && !version.fw.is_empty() && version.target == target,
+            ensure!(!version.id.is_empty() && version.id.bytes().all(|b|
+                b.is_ascii_alphanumeric() || b == b'-') &&
+                !version.fw.is_empty() && version.target == target,
                 "OTA catalog version target/id invalid");
             ensure!((1024..=0x30_0000).contains(&version.size),
                 "OTA catalog version size invalid");
@@ -676,11 +680,19 @@ impl OtaStore {
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => OtaFile {
                 schema: 1, catalog_sha256, active: catalog.initial.clone(),
-                pending: None, source: "initial".into(), event_seq: 0,
+                pending: None, source: "initial".into(), event_seq: 0, slot: 0,
             },
             Err(error) => return Err(error).context("cannot read simulator OTA state"),
         };
         let mut store = Self { dir: dir.to_owned(), catalog, file };
+        let active = store.active_version();
+        let fixture = default_rom_bytes(target, &active.fw);
+        if fixture.len() as u64 == active.size && sha256_hex(&fixture) == active.sha256 &&
+            !store.rom_path(&active.id).exists() {
+            let mut file = fs::File::create(store.rom_path(&active.id))?;
+            file.write_all(&fixture)?;
+            file.sync_all()?;
+        }
         if store.file.pending.is_some() { store.commit_pending()?; }
         else { store.persist()?; }
         Ok(store)
@@ -696,6 +708,16 @@ impl OtaStore {
             .expect("validated OTA active version")
     }
 
+    fn rom_path(&self, id: &str) -> PathBuf { self.dir.join(format!("sim-rom-{id}.bin")) }
+
+    fn active_bytes(&self) -> Result<Vec<u8>> {
+        let version = self.active_version();
+        let bytes = fs::read(self.rom_path(&version.id))?;
+        ensure!(bytes.len() as u64 == version.size && sha256_hex(&bytes) == version.sha256,
+            "active ROM bytes do not match catalog");
+        Ok(bytes)
+    }
+
     fn state_json(&self) -> serde_json::Value {
         json!({"active":self.file.active,"pending":self.file.pending,
             "source":self.file.source,"event_seq":self.file.event_seq,
@@ -707,6 +729,17 @@ impl OtaStore {
         let version = self.catalog.versions.iter().find(|v|
             v.size == size && v.sha256.eq_ignore_ascii_case(sha256));
         let Some(version) = version else { return Ok(None); };
+        let destination = self.rom_path(&version.id);
+        let upload = self.dir.join("sim-upload.tmp");
+        if destination.exists() {
+            let existing = fs::read(&destination)?;
+            ensure!(existing.len() as u64 == size && sha256_hex(&existing) == sha256,
+                "catalogued ROM bytes conflict");
+            fs::remove_file(&upload)?;
+        } else {
+            fs::rename(&upload, &destination)?;
+            fs::OpenOptions::new().write(true).open(&destination)?.sync_all()?;
+        }
         self.file.pending = Some(version.id.clone());
         self.file.event_seq += 1;
         self.persist()?;
@@ -714,8 +747,14 @@ impl OtaStore {
     }
 
     fn commit_pending(&mut self) -> Result<bool> {
-        let Some(pending) = self.file.pending.take() else { return Ok(false); };
+        let Some(pending) = self.file.pending.clone() else { return Ok(false); };
+        let version = self.catalog.versions.iter().find(|v| v.id == pending).context("pending ROM absent")?;
+        let bytes = fs::read(self.rom_path(&pending))?;
+        ensure!(bytes.len() as u64 == version.size && sha256_hex(&bytes) == version.sha256,
+            "pending ROM bytes do not match catalog");
+        self.file.pending = None;
         self.file.active = pending;
+        self.file.slot ^= 1;
         self.file.source = "ota_upload".into();
         self.file.event_seq += 1;
         self.persist()?;
@@ -1256,7 +1295,11 @@ async fn status_impl(state: SimState, request: Request<Body>, gate: bool) -> Res
                 "ble_connected":power.ble_window_until_ms.is_some()});
             status["display"] = json!({"epd_writes":bundle["display_writes"],
                 "epd_busy_fails":0});
-            status["image_identity"] = json!([]);
+            let ota = state.ota.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            status["running_slot"] = json!(format!("ota_{}", ota.file.slot));
+            status["image_identity"] = json!(if ota.active_bytes().is_ok() {
+                vec!["sha256-running-prefix-v1"]
+            } else { vec![] });
             status["sync"] = sync;
             status["sync"]["phase"] = json!(if power.sync_open {"WIFI_SYNC_ONCE"}
                 else if power.light {"WIFI_LIGHT"} else {"DEEP"});
@@ -1781,16 +1824,17 @@ async fn ota_upload(State(state): State<SimState>, request: Request<Body>) -> Re
     }
     let _guard = OtaUploadGuard(state.ota_running.clone());
     let received = receive_ota(&state, request).await;
-    let _ = fs::remove_file(state.data_dir.join("sim-upload.tmp"));
     let (size, sha256) = match received {
         Ok(received) => received,
         Err(error) => {
+            let _ = fs::remove_file(state.data_dir.join("sim-upload.tmp"));
             eprintln!("sim OTA upload rejected: {error:#}");
             return (StatusCode::OK, "UPDATE FAILED").into_response();
         }
     };
     let accepted = state.ota.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
         .queue_upload(size, &sha256);
+    let _ = fs::remove_file(state.data_dir.join("sim-upload.tmp"));
     match accepted {
         Ok(Some(_)) => {
             let reboot_state = state.clone();
@@ -1814,8 +1858,31 @@ async fn ota_upload(State(state): State<SimState>, request: Request<Body>) -> Re
             eprintln!("sim OTA upload is outside the version catalog: {size} bytes, SHA256 {sha256}");
             (StatusCode::OK, "UPDATE FAILED").into_response()
         }
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "UPDATE FAILED").into_response(),
+        Err(error) => {
+            eprintln!("sim OTA storage failed: {error:#}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "UPDATE FAILED").into_response()
+        },
     }
+}
+
+async fn ota_image(State(state): State<SimState>, request: Request<Body>) -> Response {
+    if let Some(response) = device_gate(&state).await { return response; }
+    if !bearer(&request, &state.device_token) { return unauthorized(); }
+    let args = query_args(&request);
+    let Some(length) = args.get("image_bytes").and_then(|s| s.parse::<usize>().ok()) else {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error":"range"}))).into_response();
+    };
+    let ota = state.ota.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Ok(bytes) = ota.active_bytes() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"storage"}))).into_response();
+    };
+    if length == 0 || length > bytes.len() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error":"range"}))).into_response();
+    }
+    Json(json!({"algorithm":"sha256-running-prefix-v1", "image_bytes":length,
+        "sha256":sha256_hex(&bytes[..length]), "device_mac":state.mac,
+        "running_slot":format!("ota_{}", ota.file.slot), "fw_target":state.target,
+        "fw":ota.active_version().fw})).into_response()
 }
 
 async fn device_command(State(state): State<SimState>, request: Request<Body>, operation: &str) -> Response {
@@ -2575,6 +2642,7 @@ fn app(state: SimState) -> Router {
         .route("/update", get(ota_token_route))
         .route("/diag", post(ota_token_route))
         .route("/doUpdate", post(ota_upload))
+        .route("/api/ota/image", get(ota_image))
         .route("/api/data", post(data))
         .route("/api/plan", post(plan))
         .route("/api/activate", post(activate))

@@ -25,6 +25,9 @@
   .row { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px dashed var(--line); }
   .row:last-child { border-bottom: 0; }
   .row span:first-child { color: var(--muted); }
+  #tab-device .row { gap: 12px; }
+  #tab-device .row span:first-child { flex: 0 0 38%; }
+  #tab-device .row span:last-child { min-width: 0; text-align: right; overflow-wrap: anywhere; }
   .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
   select, input { padding: 5px 8px; border-radius: 8px; border: 1px solid var(--line); background: transparent; color: inherit; }
   canvas.big { width: 340px; height: 340px; image-rendering: pixelated; border: 1px solid var(--line); border-radius: 6px; background: #fff; }
@@ -170,6 +173,7 @@
   .metric { min-width: 0; padding: 13px 11px; border: 1px solid var(--line); border-radius: 10px; background: #f8faf7; }
   .metric strong { display: block; overflow-wrap: anywhere; font-size: 17px; line-height: 1.25; }
   .metric span { display: block; margin-top: 5px; color: var(--muted); font-size: 11px; }
+  .metric small { display: block; margin-top: 5px; color: var(--muted); font-size: 11px; line-height: 1.3; overflow-wrap: anywhere; }
   .action-strip { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 14px; }
   .mono { font-family: ui-monospace, Consolas, monospace; font-size: 11px; }
   .device-name { font-weight: 700; color: var(--accent); cursor: pointer; }
@@ -238,7 +242,7 @@
     </section>
 
     <section class="panel" id="tab-device">
-      <div class="page-heading"><h2>设备</h2><p>先看当前屏幕的状态，再处理配置与发布。</p></div>
+      <div class="page-heading"><h2>设备</h2><p>查看设备实际状态、连接与任务。</p></div>
       <div class="card">
         <h2>当前屏幕</h2>
         <div id="registered-devices" class="plist muted">加载中…</div>
@@ -252,8 +256,8 @@
           </div>
         </div>
         <div class="metric-grid" style="margin-top:14px">
-          <div class="metric"><strong id="dev-batt">--</strong><span>设备电量</span></div>
-          <div class="metric"><strong id="dev-wifi">--</strong><span>Wi-Fi / RSSI</span></div>
+          <div class="metric"><strong id="dev-batt">--</strong><span>设备电量</span><small id="dev-batt-age"></small></div>
+          <div class="metric"><strong id="dev-wifi">--</strong><span>Wi-Fi / RSSI</span><small id="dev-wifi-age"></small></div>
           <div class="metric"><strong id="dev-sync">尚无快照</strong><span>完整认证快照</span></div>
         </div>
       </div>
@@ -275,20 +279,25 @@
       <details class="card">
         <summary>设备详细信息</summary>
         <div class="card">
+        <h3>固件</h3>
         <div class="row"><span>ROM 版本</span><span id="dev-fw">--</span></div>
         <div class="row"><span>运行槽位</span><span id="dev-slot">--</span></div>
         <div class="row"><span>重置原因</span><span id="dev-reset">--</span></div>
+        <h3>连接</h3>
         <div class="row"><span>BLE 连接</span><span id="dev-ble">--</span></div>
+        <h3>运行</h3>
+        <div class="row"><span>空闲 / 最低 heap</span><span id="dev-heap">--</span></div>
+        <h3>显示</h3>
         <div class="row"><span>模板</span><span id="dev-templates">--</span></div>
         <div class="row"><span>EPD 写入 / busy 失败</span><span id="dev-epd">--</span></div>
-        <div class="row"><span>空闲 / 最低 heap</span><span id="dev-heap">--</span></div>
         <div class="row"><span>同步状态</span><span id="dev-sync-state">当前快照未提供</span></div>
         <div class="row"><span>诊断批次 / 完成收据</span><span id="dev-sync-batch">当前快照未提供</span></div>
+        <div class="row"><span>诊断缺口 / 最近完整成功</span><span id="dev-sync-gap">当前快照未提供</span></div>
         <div class="sub" id="dev-sample-note">各值显示上次认证 Wi-Fi 采样，可能已过时。</div>
         </div>
       </details>
       <div class="card">
-        <h2>平台运行状态</h2>
+        <h2>设备实际显示</h2>
         <div class="bar">
           <div class="status" id="pt-device-state">设备平台状态</div>
           <div class="menus">
@@ -299,37 +308,20 @@
         <div class="row"><span>固件 target / render target</span><span id="pt-targets" class="muted">--</span></div>
         <div class="row"><span>active 模板 / context</span><span id="pt-active" class="muted">--</span></div>
         <div class="row"><span>设备已提交 / 显示结果</span><span id="pt-committed" class="muted">--</span></div>
-        <div class="row"><span>Bundle / OTA 任务</span><span id="pt-jobinfo" class="muted">--</span></div>
         <div class="sub" id="pt-expect"></div>
       </div>
       <div class="card">
-        <h2>屏幕内容与发布</h2>
-        <p class="section-note">Profile 最多 8 项；这里的顺序就是设备按键切换顺序。</p>
-        <div id="pt-profile" class="plist todo">加载中…</div>
-        <div class="toolbar" style="margin-top:8px">
-          <label>绑定目标 <select id="pt-render-target" onchange="markPlatformDraft();renderPlatformOrder();refreshPlatformFonts()">
-            <option value="epd-ssd1681-200x200-1bpp">200×200 BW / SSD1681</option>
-            <option value="epd-ssd2683-400x300-1bpp">400×300 BW / Note4 SSD2683</option>
-            <option value="epd-200x200-2bpp-gray4">200×200 gray4</option>
-          </select></label>
-          <label>添加模板 <select id="pt-add-template"></select></label>
-          <button onclick="addPlatformTemplate()">添加</button>
-        </div>
-        <div id="pt-fonts" class="plist muted">字体版本加载中…</div>
-        <div class="toolbar" style="margin-top:8px">
-          <input id="pt-font-path" style="min-width:260px" placeholder="CSFN .bin 本机路径">
-          <button onclick="importPlatformFont()">导入 CSFN</button>
-        </div>
-        <div class="sub">源字体 TTF/OTF 转换尚未在 Bridge 生产版提供；请先导入设备可读的 CSFN .bin。</div>
-        <div class="toolbar" style="margin-top:8px">
-          <label class="muted"><input type="checkbox" id="pt-sync" onchange="markPlatformDraft()"> 允许数据投递（不影响状态诊断同步）</label>
+        <h2>Bundle / OTA 任务</h2>
+        <div class="row"><span>Bundle / OTA 任务</span><span id="pt-jobinfo" class="muted">--</span></div>
+      </div>
+      <div class="card">
+        <h2>数据投递许可</h2>
+        <div class="toolbar">
+          <label class="muted"><input type="checkbox" id="pt-sync"> 允许向此设备投递数据（不影响状态诊断同步）</label>
           <span class="muted" id="pt-full-sync">完整数据投递周期：未配置</span>
-          <button onclick="savePlatformProfile()">保存 Profile</button>
-          <button onclick="previewPlatformPublish()">发布预检</button>
-          <button class="primary" onclick="publishPlatform()">显式发布</button>
-          <button onclick="cancelPlatformPublish()">取消未开始发布</button>
+          <button onclick="saveDeviceDataSync()">保存许可</button>
         </div>
-        <div class="sub">全部已安装模板参与循环。改顺序、初始项、目标或字体后先保存；目标必须与设备当前 ROM 一致。发布冻结当时内容，之后编辑不漂移。</div>
+        <div class="sub">仅更改所选设备的数据投递许可；不改模板配置，也不发布。</div>
       </div>
       <details class="card">
         <summary>恢复与维护</summary>
@@ -978,13 +970,16 @@
 
   function clearDeviceView() {
     for (const id of ['dev-batt', 'dev-wifi', 'dev-fw', 'dev-slot', 'dev-reset', 'dev-ble',
-      'dev-templates', 'dev-epd', 'dev-heap', 'pt-targets', 'pt-active', 'pt-jobinfo',
+      'dev-templates', 'dev-epd', 'dev-heap', 'dev-sync-gap', 'pt-targets', 'pt-active', 'pt-jobinfo',
       'pt-committed', 'pt-plan', 'pt-plan-remaining', 'pt-provisional', 'pt-batt']) $(id).textContent = '尚未读取';
+    $('dev-batt-age').textContent = '';
+    $('dev-wifi-age').textContent = '';
     $('dev-sync').textContent = '尚无快照';
     $('dev-contact').textContent = '尚无';
     $('dev-sync-state').textContent = '当前快照未提供';
     $('dev-sync-batch').textContent = '当前快照未提供';
     $('pt-full-sync').textContent = '完整数据投递周期：未配置';
+    $('pt-sync').checked = false;
     $('dev-sample-note').textContent = '';
     $('device-state').textContent = selectedDeviceMac ? '正在读取本地缓存…' : '请先选择设备';
     $('pt-device-state').textContent = selectedDeviceMac ? '读取中…' : '请先选择设备';
@@ -1112,20 +1107,53 @@
     }
   }
 
-  function groupStamp(snapshot, group) {
-    const metadata = snapshot.groups?.[group];
+  function groupStamp(snapshot, group, path) {
+    const metadata = (path && snapshot.field_samples?.[path]) || snapshot.groups?.[group];
     if (!metadata?.received_at) return '采样时间未知';
+    if (metadata.received_at > Date.now() / 1000) {
+      return `本机时钟异常 · 收到于 ${new Date(metadata.received_at * 1000).toLocaleString()}`;
+    }
     const age = Math.max(0, Math.floor(Date.now() / 1000) - metadata.received_at);
     const latestBoot = snapshot.groups?.firmware?.sampled_boot_id;
     const changedBoot = latestBoot && metadata.sampled_boot_id && latestBoot !== metadata.sampled_boot_id;
-    const stale = age > 120 || (changedBoot && ['radio', 'runtime', 'power'].includes(group));
+    const stale = (age > 120 && ['radio', 'runtime', 'power'].includes(group)) ||
+      (changedBoot && ['radio', 'runtime'].includes(group));
     return `${stale ? '旧值 · ' : ''}${relTime(metadata.received_at)} · ${metadata.transport || 'HTTP'}`;
   }
 
-  function sampledField(snapshot, group, value, format = String) {
-    if (value === undefined) return snapshot.groups?.[group] ? '当前快照未提供' : '尚未读取';
+  function sampledField(snapshot, group, value, format = String, path) {
+    const reason = value && typeof value === 'object' && !Array.isArray(value) ? value.reason : null;
+    if (reason) {
+      const prior = value.previous;
+      const label = ({not_sampled:'尚未读取', unsupported:'固件不支持此项',
+        not_applicable:'不适用', read_error:'本次读取失败'})[reason] || '当前快照未提供';
+      return prior == null ? label : `${label} · 上次 ${format(prior)}（${groupStamp(snapshot, group, path)}）`;
+    }
+    if (value === undefined) return snapshot.groups?.[group] ? '本次未采样' : '尚未读取';
     if (value === null) return '当前快照未提供';
-    return `${format(value)}（${groupStamp(snapshot, group)}）`;
+    return `${format(value)}（${groupStamp(snapshot, group, path)}）`;
+  }
+
+  function metricReading(snapshot, group, value, format, path) {
+    const reason = value && typeof value === 'object' && !Array.isArray(value) ? value.reason : null;
+    if (reason) {
+      const label = ({not_sampled:'尚未读取', unsupported:'固件不支持',
+        not_applicable:'不适用', read_error:'读取失败'})[reason] || '未提供';
+      return value.previous == null
+        ? { value: label, age: '' }
+        : { value: format(value.previous), age: `${label} · 上次 ${groupStamp(snapshot, group, path)}` };
+    }
+    if (value == null) return { value: value === undefined ? '尚未读取' : '未提供', age: '' };
+    return { value: format(value), age: groupStamp(snapshot, group, path) };
+  }
+
+  function renderSyncArchive(diag, completed) {
+    if (!diag?.available) return;
+    const gap = diag.gap_count == null ? '归档缺口未取得' : `当前归档 ${diag.gap_count} 个缺口`;
+    const success = completed?.batch_id || diag.last_full_success;
+    $('dev-sync-gap').textContent = `${gap} · ${success ? '最近完整成功 ' + success : '尚无完整成功证据'}` +
+      (diag.phase === 'awaiting_device_ack' ? ' · 归档等待设备确认' : '') +
+      (diag.retired_unconfirmed ? ' · 存在未确认旧归档的退役记录' : '');
   }
 
   async function refreshDeviceCache() {
@@ -1152,25 +1180,29 @@
       if (d.last_attempt?.error) $('device-state').textContent += ` · 最近尝试：${d.last_attempt.error}`;
       $('dev-sync').textContent = sampled ? relTime(sampled) : '尚无快照';
       $('dev-contact').textContent = contact ? `${new Date(contact * 1000).toLocaleString()} · ${transport}` : '尚无';
-      $('dev-fw').textContent = sampledField(snapshot, 'firmware', snapshot.fw);
-      $('dev-slot').textContent = sampledField(snapshot, 'firmware', snapshot.running_slot ?? snapshot.slot);
-      $('dev-reset').textContent = sampledField(snapshot, 'firmware', snapshot.reset_reason);
-      $('dev-batt').textContent = sampledField(snapshot, 'power', snapshot.power?.battery, n => `${n}%`);
-      $('pt-batt').textContent = $('dev-batt').textContent;
+      $('dev-fw').textContent = sampledField(snapshot, 'firmware', snapshot.fw, String, 'fw');
+      $('dev-slot').textContent = sampledField(snapshot, 'firmware', snapshot.running_slot ?? snapshot.slot, String, 'running_slot');
+      $('dev-reset').textContent = sampledField(snapshot, 'firmware', snapshot.reset_reason, String, 'reset_reason');
+      const battery = metricReading(snapshot, 'power', snapshot.power?.battery, n => `${n}%`, 'power.battery');
+      $('dev-batt').textContent = battery.value;
+      $('dev-batt-age').textContent = battery.age;
+      $('pt-batt').textContent = sampledField(snapshot, 'power', snapshot.power?.battery, n => `${n}%`, 'power.battery');
       const radio = snapshot.radio;
-      $('dev-wifi').textContent = sampledField(snapshot, 'radio', radio?.wifi_connected,
-        connected => connected ? `采样时已连接 · RSSI ${radio.rssi ?? '未提供'} dBm` : '采样时未连接');
-      $('dev-ble').textContent = sampledField(snapshot, 'radio', radio?.ble_connected, v => v ? '采样时已连接' : '采样时未连接');
+      const wifi = metricReading(snapshot, 'radio', radio?.wifi_connected,
+        connected => connected ? '已连接' : '未连接', 'radio.wifi_connected');
+      $('dev-wifi').textContent = wifi.value;
+      $('dev-wifi-age').textContent = `${radio?.wifi_connected === true ? `RSSI ${radio.rssi ?? '未提供'} dBm · ` : ''}${wifi.age}`;
+      $('dev-ble').textContent = sampledField(snapshot, 'radio', radio?.ble_connected, v => v ? '采样时已连接' : '采样时未连接', 'radio.ble_connected');
       $('dev-templates').textContent = sampledField(snapshot, 'display', snapshot.template_ids,
-        ids => Array.isArray(ids) ? (ids.length ? ids.join(', ') : '未安装模板') : String(ids));
+        ids => Array.isArray(ids) ? (ids.length ? ids.join(', ') : '未安装模板') : String(ids), 'template_ids');
       $('dev-epd').textContent = sampledField(snapshot, 'display', snapshot.display?.epd_writes,
-        n => `${n} / ${snapshot.display?.epd_busy_fails ?? '未提供'}`);
+        n => `${n} / ${snapshot.display?.epd_busy_fails ?? '未提供'}`, 'display.epd_writes');
       $('dev-heap').textContent = sampledField(snapshot, 'runtime', snapshot.heap_free,
-        n => `${n} / ${snapshot.heap_min ?? '未提供'} B`);
+        n => `${n} / ${snapshot.heap_min ?? '未提供'} B`, 'heap_free');
       const sync = snapshot.sync;
       $('dev-sync-state').textContent = snapshot.sync_v1 && sync
         ? sampledField(snapshot, 'power', sync.rounds,
-            n => `${sync.enabled ? '状态诊断同步开启' : '状态诊断同步未开启'} · ${n}/15 轮 · ${sync.due ? '已到期等待认证开网' : '未到期'} · ${sync.phase || '阶段未提供'}`)
+            n => `${sync.enabled ? '状态诊断同步开启' : '状态诊断同步未开启'} · ${n}/15 轮 · ${sync.due ? '已到期等待认证开网' : '未到期'} · ${sync.phase || '阶段未提供'}`, 'sync.rounds')
         : '当前快照未提供 sync-v1 能力';
       $('dev-sync-batch').textContent = snapshot.sync_v1 && sync
         ? `${sync.pending_batch
@@ -1179,6 +1211,13 @@
           `${Array.isArray(sync.reasons) && sync.reasons.length ? ' · 原因 ' + sync.reasons.join(', ') : ''}` +
           `${sync.last_error ? ' · 错误 ' + sync.last_error : ''}（${groupStamp(snapshot, 'power')}）`
         : '当前快照未提供';
+      const completed = sync?.last_completed;
+      $('dev-sync-gap').textContent = snapshot.sync_v1 && sync
+        ? `${Array.isArray(sync.gaps) ? sync.gaps.length + ' 个缺口' : '缺口未报告'} · ` +
+          (completed?.batch_id ? `最近设备完成 ${completed.batch_id}（${groupStamp(snapshot, 'power')}）`
+            : '尚无设备完成收据')
+        : '当前快照未提供';
+      renderSyncArchive(platformDevice?.diagnostics, completed);
       $('dev-sample-note').textContent = sampled
         ? '各值保留原组的采样时间；BLE 联系不刷新 Wi-Fi 采样年龄。0、未连接与空模板列表均为有效观察。'
         : '登记信息来自 Bridge；设备指标尚未取得认证 Wi-Fi 快照。';
@@ -1348,13 +1387,7 @@
   let selectedDeviceMac = localStorage.getItem(DEVICE_MAC_KEY) || null;
   let platformDevices = [];
   let platformDevice = null;
-  let platformProfile = null;
   let platformTemplates = [];
-  let platformPreviewTargetId = null;
-  let platformPreviewMac = null;
-  let platformDraftDirty = false;
-  let platformDraftRevision = 0;
-  function markPlatformDraft() { platformDraftDirty = true; platformDraftRevision++; }
 
   function platformStateBadge(kind) {
     const text = {
@@ -1386,7 +1419,6 @@
     try {
       const data = await invoke('platform_templates');
       platformTemplates = data.templates || [];
-      if (platformDevice) renderPlatformOrder();
       renderProfileRows();
     } catch (e) { /* templates are loaded for family selection and validation */ }
   }
@@ -1421,7 +1453,7 @@
     const device = platformDevices.find(d => d.device_mac === mac);
     openModal(`<h3>切换当前设备</h3>
       <div>设备页将切换到 <b>${escapeHtml(device?.name || mac)}</b> · <code>${escapeHtml(mac)}</code>。</div>
-      <div class="muted">身份、实况、设备状态、功耗、占用与恢复读取都会按它刷新。切换不会向任何设备推送，模板页的族选择也不受影响；当前设备未保存的 Profile 草稿会被丢弃。</div>
+      <div class="muted">身份、实况、设备状态、功耗、占用与恢复读取都会按它刷新。切换不会向任何设备推送，模板页的族选择也不受影响。</div>
       <div class="foot"><button onclick="closeModal()">取消</button>
       <button class="primary" onclick="applyDeviceSelection('${escapeAttr(mac)}')">切换</button></div>`);
   }
@@ -1430,9 +1462,6 @@
     if (!platformDevices.some(d => d.device_mac === mac)) return;
     selectedDeviceMac = mac;
     deviceSelectionGeneration++;
-    platformDraftDirty = false;
-    platformDraftRevision++;
-    platformProfile = null;
     platformDevice = null;
     localStorage.setItem(DEVICE_MAC_KEY, mac);
     closeModal();
@@ -1464,9 +1493,7 @@
         $('pt-active').textContent = '--';
         $('pt-jobinfo').textContent = '--';
         $('pt-expect').textContent = '';
-        platformProfile = null;
-        platformDraftDirty = false;
-        renderPlatformOrder();
+        $('pt-sync').checked = false;
         return;
       }
       const caps = device.capabilities || {};
@@ -1475,6 +1502,7 @@
       $('pt-targets').textContent =
         `${caps.firmware_target || '--'} / ${caps.render_target || '--'} · abi ${caps.compiler_abi || '--'}`;
       const body = device.last_authenticated?.body || {};
+      renderSyncArchive(device.diagnostics, body.sync?.last_completed);
       const observed = device.observed || {};
       $('pt-active').textContent =
         `${body.active_template_id ?? observed.active_template_id ?? '未观察'} / ${body.active_context_id ?? observed.active_context_id ?? '未观察'} · ${body.groups?.display?.received_at ? 'Wi-Fi ' + relTime(body.groups.display.received_at) : '轻量状态'}`;
@@ -1494,187 +1522,27 @@
       }
       $('pt-expect').textContent = platformDevices.length > 1
         ? '多设备：每台独立协调器，不做跨设备原子发布；上面的操作只作用于选中设备。' : '';
-      const profile = device.profile;
-      if (!platformDraftDirty) {
-        platformProfile = profile ? structuredClone(profile) : null;
-        $('pt-render-target').value = (profile && profile.render_target) || caps.render_target || '';
-        $('pt-sync').checked = !!(profile && profile.sync_enabled);
-      }
-      $('pt-full-sync').textContent = `完整数据投递周期：${platformProfile?.full_sync_s ?? 3600}s（Profile）`;
-      renderPlatformOrder();
-      await refreshPlatformFonts();
+      $('pt-sync').checked = !!device.sync_enabled;
+      $('pt-full-sync').textContent = `完整数据投递周期：${device.profile?.full_sync_s ?? 3600}s（设备配置）`;
     } catch (e) {
       if (isCurrentDevice(mac, generation) && request === platformDeviceRequest) $('pt-device-state').textContent = '平台状态读取失败：' + String(e);
     }
   }
 
-  function editablePlatformProfile() {
-    if (!platformProfile) platformProfile = {template_ids: [], font_ids: {}, bindings: []};
-    return platformProfile;
-  }
-
-  function renderPlatformOrder() {
-    const profile = editablePlatformProfile();
-    const target = $('pt-render-target').value || (platformDevice?.capabilities || {}).render_target;
-    const variants = platformTemplates.filter(t => t.render_target === target && !profile.template_ids.includes(t.template_id));
-    $('pt-add-template').innerHTML = variants.map(t => `<option value="${escapeAttr(t.template_id)}">${escapeHtml(t.template_id)}</option>`).join('');
-    $('pt-profile').innerHTML = profile.template_ids.length ? profile.template_ids.map((id, i) => `
-      <div class="prow"><div class="pmeta"><b>${i + 1}. ${escapeHtml(id)}</b>
-      ${profile.initial_active_id === id ? '<small>初始 active</small>' : ''}</div>
-      <div class="pactions"><button onclick="movePlatformTemplate(${i}, -1)" ${i === 0 ? 'disabled' : ''}>↑</button>
-      <button onclick="movePlatformTemplate(${i}, 1)" ${i + 1 === profile.template_ids.length ? 'disabled' : ''}>↓</button>
-      <button onclick="setPlatformInitial(${i})">设为初始</button>
-      <button onclick="removePlatformTemplate(${i})">移除</button></div></div>`).join('')
-      : '<div class="muted">空草稿可保存，但不能发布。</div>';
-  }
-
-  function addPlatformTemplate() {
-    const id = $('pt-add-template').value;
-    const p = editablePlatformProfile();
-    if (id && p.template_ids.length < 8 && !p.template_ids.includes(id)) {
-      p.template_ids.push(id);
-      p.initial_active_id ||= id;
-      markPlatformDraft();
-      renderPlatformOrder(); refreshPlatformFonts();
-    }
-  }
-  function movePlatformTemplate(i, delta) {
-    const p = editablePlatformProfile(), j = i + delta;
-    if (j < 0 || j >= p.template_ids.length) return;
-    [p.template_ids[i], p.template_ids[j]] = [p.template_ids[j], p.template_ids[i]];
-    markPlatformDraft();
-    renderPlatformOrder();
-  }
-  function setPlatformInitial(i) { editablePlatformProfile().initial_active_id = platformProfile.template_ids[i]; markPlatformDraft(); renderPlatformOrder(); }
-  function removePlatformTemplate(i) {
-    const p = editablePlatformProfile(); p.template_ids.splice(i, 1);
-    if (!p.template_ids.includes(p.initial_active_id)) p.initial_active_id = p.template_ids[0] || null;
-    markPlatformDraft();
-    renderPlatformOrder(); refreshPlatformFonts();
-  }
-
-  async function refreshPlatformFonts() {
-    const mac = selectedDeviceMac, generation = deviceSelectionGeneration;
-    const revision = platformDraftRevision;
-    try {
-      const p = editablePlatformProfile();
-      const target = $('pt-render-target').value;
-      const library = (await invoke('platform_font_list')).fonts || [];
-      const names = new Set();
-      const collect = value => { if (!value || typeof value !== 'object') return;
-        if (typeof value.font === 'string') names.add(value.font);
-        Object.values(value).forEach(collect); };
-      for (const id of p.template_ids) {
-        const t = await invoke('platform_template_get', {id, renderTarget: target});
-        collect(t.source);
-      }
-      if (!isCurrentDevice(mac, generation) || revision !== platformDraftRevision) return;
-      $('pt-fonts').innerHTML = [...names].sort().map(name => {
-        const versions = library.filter(f => f.name === name);
-        if (!versions.length) return `<div class="row"><span>${escapeHtml(name)}</span><span>固件内置</span></div>`;
-        const current = (p.font_ids || {})[name] || '';
-        return `<div class="row"><span>${escapeHtml(name)}</span><select onchange="selectPlatformFont('${escapeAttr(name)}', this.value)">
-          <option value="">请选择 CSFN 版本</option>${versions.map(f => `<option value="${escapeAttr(f.id)}" ${f.id === current ? 'selected' : ''}>${escapeHtml(f.id)} · ${f.size_px}px / ${f.weight} · ${f.bytes}B</option>`).join('')}</select></div>`;
-      }).join('') || '<div class="muted">所选模板未引用字体。</div>';
-    } catch (e) { if (isCurrentDevice(mac, generation) && revision === platformDraftRevision) $('pt-fonts').textContent = '字体依赖读取失败：' + String(e); }
-  }
-  function selectPlatformFont(name, id) {
-    const p = editablePlatformProfile(); p.font_ids ||= {};
-    if (id) p.font_ids[name] = id; else delete p.font_ids[name];
-    markPlatformDraft();
-  }
-  async function importPlatformFont() {
-    try {
-      const result = await invoke('platform_font_import', {path: $('pt-font-path').value});
-      await refreshPlatformFonts();
-      openModal(`<h3>CSFN 已导入</h3><pre>${escapeHtml(JSON.stringify(result, null, 2))}</pre><div class="foot"><button onclick="closeModal()">关闭</button></div>`);
-    } catch (e) { openModal(`<h3>导入失败</h3><div>${escapeHtml(String(e))}</div><div class="foot"><button onclick="closeModal()">关闭</button></div>`); }
-  }
-
-  async function savePlatformProfile() {
+  async function saveDeviceDataSync() {
     let mac; try { mac = selectedTarget(); } catch (e) { $('pt-device-state').textContent = String(e); return; }
     const generation = deviceSelectionGeneration;
-    const revision = platformDraftRevision;
+    const enabled = $('pt-sync').checked;
+    $('pt-device-state').textContent = '正在保存数据投递许可…';
     try {
-      const profile = platformProfile || {};
-      const body = {
-        device_mac: mac,
-        template_ids: profile.template_ids || [],
-        render_target: $('pt-render-target').value || null,
-        font_ids: profile.font_ids || {},
-        initial_active_id: profile.initial_active_id || (profile.template_ids || [])[0] || null,
-        bindings: profile.bindings || [],
-        sync_enabled: $('pt-sync').checked,
-        full_sync_s: profile.full_sync_s ?? 3600,
-        updated_at: 0,
-      };
-      await invoke('platform_profile_save', { profile: body });
-      if (isCurrentDevice(mac, generation)) {
-        if (revision === platformDraftRevision) {
-          platformDraftDirty = false;
-          await refreshPlatformDevice();
-        } else {
-          $('pt-device-state').textContent = '较早草稿已保存；当前编辑尚未保存';
-        }
-      }
-    } catch (e) {
-      openModal(`<h3>Profile 保存失败</h3><div>${escapeHtml(String(e))}</div>
-        <div class="foot"><button onclick="closeModal()">关闭</button></div>`);
-    }
-  }
-
-  async function publishPlatform() {
-    let mac; try { mac = selectedTarget(); } catch (e) { $('pt-device-state').textContent = String(e); return; }
-    const generation = deviceSelectionGeneration;
-    try {
-      const preview = await invoke('platform_publish_preview', { mac });
+      await invoke('platform_data_sync_save', { mac, enabled });
       if (!isCurrentDevice(mac, generation)) return;
-      platformPreviewTargetId = preview.target_id || null;
-      platformPreviewMac = mac;
-      openModal(`<h3>确认发布目标</h3>
-        <div class="muted">目标 MAC：${escapeHtml(mac)}</div>
-        <pre style="white-space:pre-wrap;font-size:12px">${escapeHtml(JSON.stringify(preview, null, 2))}</pre>
-        <div class="foot"><button onclick="closeModal()">取消</button><button class="primary" onclick="confirmPlatformPublish()">显式发布此目标</button></div>`);
+      $('pt-device-state').textContent = `数据投递许可已保存：${enabled ? '允许' : '关闭'}；未发布模板`;
+      await refreshPlatformDevice();
     } catch (e) {
-      openModal(`<h3>发布预检失败</h3><div>${escapeHtml(String(e))}</div>
-        <div class="foot"><button onclick="closeModal()">关闭</button></div>`);
+      if (isCurrentDevice(mac, generation)) $('pt-device-state').textContent = '保存数据投递许可失败：' + e;
     }
   }
-
-  async function previewPlatformPublish() {
-    let mac; try { mac = selectedTarget(); } catch (e) { $('pt-device-state').textContent = String(e); return; }
-    const generation = deviceSelectionGeneration;
-    try { const result = await invoke('platform_publish_preview', { mac });
-      if (!isCurrentDevice(mac, generation)) return;
-      openModal(`<h3>发布预检 · ${escapeHtml(mac)}</h3><pre style="white-space:pre-wrap;font-size:12px">${escapeHtml(JSON.stringify(result, null, 2))}</pre><div class="foot"><button onclick="closeModal()">关闭</button></div>`);
-    } catch (e) { openModal(`<h3>预检失败</h3><div>${escapeHtml(String(e))}</div><div class="foot"><button onclick="closeModal()">关闭</button></div>`); }
-  }
-
-  async function confirmPlatformPublish() {
-    const mac = platformPreviewMac, targetId = platformPreviewTargetId;
-    if (!mac || mac !== selectedDeviceMac) { closeModal(); return; }
-    try {
-      const result = await invoke('platform_publish', {expectedTargetId: targetId, mac});
-      openModal(`<h3>发布已排队</h3>
-        <pre style="white-space:pre-wrap;font-size:12px">${escapeHtml(JSON.stringify(result, null, 2))}</pre>
-        <div class="sub">发布冻结当前内容；等待设备会合/唤醒后提交。保存不会自动发布。</div>
-        <div class="foot"><button onclick="closeModal()">关闭</button></div>`);
-      if (mac === selectedDeviceMac) await refreshPlatformDevice();
-    } catch (e) {
-      openModal(`<h3>发布失败</h3><div>${escapeHtml(String(e))}</div>
-        <div class="foot"><button onclick="closeModal()">关闭</button></div>`);
-    }
-  }
-
-  async function cancelPlatformPublish() {
-    let mac; try { mac = selectedTarget(); } catch (e) { $('pt-device-state').textContent = String(e); return; }
-    try {
-      const result = await invoke('platform_publish_cancel', { mac });
-      if (mac === selectedDeviceMac) await refreshPlatformDevice();
-      openModal(`<h3>取消结果 · ${escapeHtml(mac)}</h3><pre>${escapeHtml(JSON.stringify(result, null, 2))}</pre><div class="foot"><button onclick="closeModal()">关闭</button></div>`);
-    } catch (e) { $('pt-device-state').textContent = '取消失败：' + e; }
-  }
-
   async function refreshPlatformStatus() {
     let mac; try { mac = selectedTarget(); } catch (e) { $('device-state').textContent = String(e); return; }
     const generation = deviceSelectionGeneration;
@@ -1703,7 +1571,6 @@
         throw new Error('摘要 MAC 与所选设备不符');
       const result = await invoke('platform_recovery', { mac, digest });
       if (!isCurrentDevice(mac, generation)) return;
-      platformDraftDirty = false;
       await refreshPlatformDevice();
       openModal(`<h3>恢复导入 · ${escapeHtml(mac)}</h3>
         <pre style="white-space:pre-wrap;font-size:12px">${escapeHtml(JSON.stringify(result, null, 2))}</pre>

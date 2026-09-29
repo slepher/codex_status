@@ -717,6 +717,19 @@ impl PlatformService {
         Ok(profile)
     }
 
+    /// Device data permission only; never edits template order or publishes.
+    pub fn set_data_sync(&self, mac: &str, enabled: bool) -> Result<()> {
+        let mac = mac.to_uppercase();
+        let mut inner = self.inner.lock().unwrap();
+        let record = inner.devices.get_mut(&mac).context("unknown device")?;
+        record.sync_enabled = enabled;
+        if let Some(profile) = record.profile.as_mut() { profile.sync_enabled = enabled; }
+        if let Some(coordinator) = inner.coordinators.get_mut(&mac) {
+            coordinator.sync_enabled = enabled;
+        }
+        Self::persist(&inner, &self.state_path())
+    }
+
     // ---- Explicit publish ------------------------------------------------
 
     /// Read-only preflight. Reuse is unknown until an authenticated versioned
@@ -1374,7 +1387,7 @@ impl PlatformService {
                     "owner": coordinator.map(|c| c.session.clone()),
                     "profile": d.profile,
                     "profile_count": d.profile.as_ref().map(|p| p.template_ids.len()).unwrap_or(0),
-                    "sync_enabled": d.profile.as_ref().map(|p| p.sync_enabled).unwrap_or(false),
+                    "sync_enabled": d.sync_enabled,
                     "active_template_id": coordinator.and_then(|c| c.active_template_id.clone()),
                     "job": inner.asset_jobs.get(mac).map(AssetJob::summary)
                         .or_else(|| coordinator.and_then(|c| c.job_snapshot())),
@@ -1447,6 +1460,32 @@ impl PlatformService {
     /// The caller must have verified the endpoint token and returned MAC.
     /// Bound the saved document so a malformed peer cannot grow state.json forever.
     pub fn note_authenticated_status(&self, mac: &str, status: &Value) -> Result<()> {
+        fn merge_field(previous: &Value, fresh: &Value, path: &str, now: u64,
+                       boot: &Value, samples: &mut serde_json::Map<String, Value>) -> Value {
+            if let Some(map) = fresh.as_object() {
+                if fresh["value"].is_null() && map.contains_key("value") &&
+                   matches!(fresh["reason"].as_str(), Some("not_sampled" | "unsupported" |
+                       "not_applicable" | "read_error")) {
+                    let old = if previous.get("reason").is_some() {
+                        &previous["previous"]
+                    } else { previous };
+                    return json!({"value":null, "reason":fresh["reason"],
+                        "previous":if old.is_null() { Value::Null } else { old.clone() }});
+                }
+                let mut merged = previous.as_object().cloned().unwrap_or_default();
+                for (key, value) in map {
+                    let child = format!("{path}.{key}");
+                    merged.insert(key.clone(), merge_field(previous.get(key).unwrap_or(&Value::Null),
+                        value, &child, now, boot, samples));
+                }
+                return Value::Object(merged);
+            }
+            if !fresh.is_null() {
+                samples.insert(path.into(), json!({"received_at":now,
+                    "sampled_boot_id":boot, "transport":"http"}));
+            }
+            fresh.clone()
+        }
         let mac = mac.to_uppercase();
         if status["device_mac"].as_str().and_then(DeviceIdentity::normalized_mac).as_deref() != Some(mac.as_str()) {
             bail!("authenticated status MAC does not match {mac}");
@@ -1459,6 +1498,7 @@ impl PlatformService {
         let now = crate::device_clock::wall_secs(&mac);
         let mut body = record.last_authenticated.as_ref().map(|saved| saved.body.clone())
             .unwrap_or_else(|| json!({}));
+        let mut field_samples = body["field_samples"].as_object().cloned().unwrap_or_default();
         let groups: [(&str, &[&str]); 7] = [
             ("identity", &["device_mac", "configured"]),
             ("firmware", &["fw", "firmware_target", "running_slot", "reset_reason",
@@ -1475,7 +1515,8 @@ impl PlatformService {
             let mut available = false;
             for key in fields {
                 if let Some(value) = status.get(*key) {
-                    body[*key] = value.clone();
+                    body[*key] = merge_field(&body[*key], value, key, now, &status["boot_id"],
+                        &mut field_samples);
                     sampled = true;
                     available |= !value.is_null();
                 }
@@ -1490,6 +1531,7 @@ impl PlatformService {
                 });
             }
         }
+        body["field_samples"] = Value::Object(field_samples);
         if serde_json::to_vec(&body)?.len() > 16 * 1024 {
             bail!("authenticated cached status exceeds 16 KiB");
         }
@@ -2396,6 +2438,49 @@ mod tests {
         assert_eq!(second["radio"], first["radio"]);
         assert_eq!(second["groups"]["radio"], first["groups"]["radio"]);
         assert_ne!(second["groups"]["firmware"], first["groups"]["firmware"]);
+        crate::device_clock::clear(mac);
+    }
+
+    #[test]
+    fn data_sync_permission_keeps_profile_order_and_does_not_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = PlatformService::open(dir.path()).unwrap();
+        let mac = "0200000000F2";
+        svc.device_upsert(DeviceIdentity::new(mac, "Fake").unwrap(),
+            DeviceCapabilities::ssd1681_154g()).unwrap();
+        let before = svc.device_get(mac).unwrap();
+        svc.set_data_sync(mac, true).unwrap();
+        let after = svc.device_get(mac).unwrap();
+        assert_eq!(after["sync_enabled"], true);
+        assert_eq!(after["profile"], before["profile"]);
+        assert_eq!(after["job"], before["job"]);
+        drop(svc);
+        let resumed = PlatformService::open(dir.path()).unwrap();
+        assert_eq!(resumed.device_get(mac).unwrap()["sync_enabled"], true);
+    }
+
+    #[test]
+    fn null_reason_keeps_last_value_and_its_original_sample_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = PlatformService::open(dir.path()).unwrap();
+        let mac = "0200000000F3";
+        svc.device_upsert(DeviceIdentity::new(mac, "Fake").unwrap(),
+            DeviceCapabilities::ssd1681_154g()).unwrap();
+        crate::device_clock::configure(mac, 0, 1_000_000, 0).unwrap();
+        svc.note_authenticated_status(mac, &json!({"device_mac":mac,"boot_id":"boot-a",
+            "fw":"v1", "heap_free":0,"power":{"battery":75}})).unwrap();
+        let first = svc.device_get(mac).unwrap()["last_authenticated"]["body"].clone();
+        crate::device_clock::step(mac, 60_000).unwrap();
+        svc.note_authenticated_status(mac, &json!({"device_mac":mac,"boot_id":"boot-b",
+            "fw":"v2","heap_free":{"value":null,"reason":"read_error"},
+            "power":{"battery":{"value":null,"reason":"unsupported"}}})).unwrap();
+        let second = svc.device_get(mac).unwrap()["last_authenticated"]["body"].clone();
+        assert_eq!(second["heap_free"]["reason"], "read_error");
+        assert_eq!(second["heap_free"]["previous"], 0);
+        assert_eq!(second["power"]["battery"]["previous"], 75);
+        assert_eq!(second["field_samples"]["heap_free"], first["field_samples"]["heap_free"]);
+        assert_eq!(second["field_samples"]["power.battery"], first["field_samples"]["power.battery"]);
+        assert_ne!(second["field_samples"]["fw"], first["field_samples"]["fw"]);
         crate::device_clock::clear(mac);
     }
 

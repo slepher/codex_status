@@ -167,10 +167,10 @@
 - 前置：C3 的记录格式（否则没有可信的对照口径）。
 
 ### C8. 设备同步与诊断协议（device-sync-diagnostics）
-- `sync-v1` 实施合同见 `project-workflow/device-sync-diagnostics/design.md`。Note4 `0.18.33-note4-b-sync1`、1.54 `0.18.32-bw-sync1` 与含设备页的新版 Bridge 已部署；两台自动 BLE 会合中的 status/config/plan/open ACK、受认证再次 OTA 上传 ACK 与重启换槽均实机验证，1.54 HTTP 数据 seq 124 `applied/displayed`，见 `PROGRESS.md` 最新节。两台同版本回归任务保留 `version_seen_unproven`，均无精确在机镜像 SHA256 证明。Fake ROM S01–S14、设备页 U01–U20 完整矩阵、真实窗口视觉及其他实机故障矩阵仍未完成（无 Bundle 设备的 BLE 会合→正式 Plan→首个 Bundle 安装已过 Fake ROM，仍需实机）。Flash 断电恢复与真实分区哈希字节域仍须过证据门槛。
+- `sync-v1` 实施合同见 `project-workflow/device-sync-diagnostics/design.md`。当前默认 Bridge 与双设备现场见 `PROGRESS.md` 最新节：Note4 `0.18.35-note4-b-ota1` 的运行分区前缀 SHA256 已由认证接口与候选 ROM 精确匹配；1.54 `0.18.34-bw-ota1` 已做 USB 写入后逐字节回读，运行分区的独立认证哈希仍待验。双设备 BLE status/config/plan/open、OTA 上传与重启换槽等先前实机证据保留。2026-09-29 后台隔离双 Fake ROM + 候选 Bridge 虚拟 24h 达到各 97 个连续批次和第 15 轮；独立 light 入/离场、进程重启及同 seed 1h 回放烟测通过，详见 `PROGRESS.md` 顶节。候选 Bridge 的一次性 Wi-Fi 续传修正未部署默认实例。Fake ROM S01–S14、设备页 U01–U20 完整矩阵、F3 延迟页/同磁盘快照回放、页中途强退、真实窗口视觉及其他实机故障矩阵仍未完成；Flash 断电恢复和 1.54 运行分区哈希证据仍须过门槛。
 - 当前设备协议作为唯一业务协议的一次性统一见 `project-workflow/device-sync-diagnostics/protocol-unification.md`：业务 HTTP 已收敛到 `/api/*`，旧 `protocol=2`、BLE `rv=2`/`ack="v2"` 与 MCP `_v2` 入口已移除。两台设备现已升级，临时旧 Bridge 已停、新版默认实例已恢复。1.54 的增量缓存复核已完成，结论与四次构建日志见 `PROGRESS.md` 顶节；不并行运行两个 Bridge，也不保留长期双协议兼容。Bridge 本地 `state.json` 无损保留，不凭 wire 更名删除运行数据。
 - 实现每 15 次深睡 BLE 会合的一次性 Wi-Fi 同步，以及正式 light 入口和退出时的 Wi-Fi 同步；成功同步才重置计数。普通 BLE 保持精简，诊断日志按冻结批次经 Wi-Fi 增量同步，未确认内容保留。
-- 合并普通 `/log` 与跨深睡 `/history` 为统一、跨深睡、可分页/确认/报告 gap 的诊断流；OTA/Bundle 执行后以 Wi-Fi 报告分级结果并有限重试。设备页移除 Codex 余量、改善设备详情的采集时间和缺失解释；屏幕内容、模板、字体归模板页仅作归属声明，数据页排版暂不处理。
+- 合并普通 `/log` 与跨深睡 `/history` 为统一、跨深睡、可分页/确认/报告 gap 的诊断流；OTA/Bundle 执行后以 Wi-Fi 报告分级结果并有限重试。设备页移除 Codex 余量和屏幕内容、模板/Profile 编排、字体管理编辑界面；保留只读实际 active/已安装/任务及设备级数据投递许可。模板 Tab 暂不增加对应界面或设计迁移布局，数据页排版不动。继续完成设备详情的采集时间和缺失原因。
 - 以 Fake ROM 验证绝大多数协议和故障场景（S01–S14）；实机只验证 RF/GATT、ESP32 Wi-Fi 入网与 HTTP、light/deep 切换、RTC/Flash/bootloader 等模拟器不能证明的部分（H01–H03）。详见 `project-workflow/device-sync-diagnostics/plan.md`。
 
 ### C5. 字体资产增量发布

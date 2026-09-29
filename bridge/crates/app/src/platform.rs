@@ -375,14 +375,29 @@ where
         .map_err(|e| e.to_string())?
 }
 
-async fn sync_http_inner(ctx: &AppCtx, mac: &str) {
+async fn sync_http_inner(ctx: &AppCtx, mac: &str, may_continue: bool) {
     let Some(link) = device_link_for_mac(ctx, mac) else { return; };
     let root = bridge_core::paths::data_root();
     match blocking(move || {
         let mut last = json!({"result":"idle"});
-        for _ in 0..3 {
+        for attempt in 0..3 {
             last = sync_diagnostics::transfer(&root, &link).map_err(err_text)?;
             if last["result"] != "complete" { break; }
+            if !may_continue || attempt == 2 { break; }
+            // A completed one-shot batch can close Wi-Fi immediately. Probe
+            // briefly before attempting another batch; a full retry here
+            // waits through association timeouts after every normal sync.
+            let next = match device_client::status(&link.ip, &link.token, Duration::from_secs(1)) {
+                Ok(status) => status,
+                Err(_) => break,
+            };
+            if next["device_mac"].as_str().and_then(DeviceIdentity::normalized_mac)
+                .as_deref() != Some(link.mac.as_str()) {
+                return Err("sync continuation status MAC mismatch".to_string());
+            }
+            let sync = &next["sync"];
+            if sync["due"] != true && sync["pending_batch"].is_null() &&
+                sync["reasons"].as_array().is_none_or(Vec::is_empty) { break; }
         }
         Ok(last)
     }).await {
@@ -393,10 +408,10 @@ async fn sync_http_inner(ctx: &AppCtx, mac: &str) {
     }
 }
 
-async fn sync_http(ctx: &AppCtx, mac: &str) {
+async fn sync_http(ctx: &AppCtx, mac: &str, may_continue: bool) {
     let lock = delivery_lock(ctx, mac);
     let _delivery = lock.lock().await;
-    sync_http_inner(ctx, mac).await;
+    sync_http_inner(ctx, mac, may_continue).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -429,9 +444,16 @@ fn device_summary(ctx: &AppCtx) -> Value {
 }
 
 pub fn device_rows(ctx: &AppCtx) -> Value {
+    let root = crate::mcp_config(ctx).data_root;
+    let devices: Vec<Value> = service(ctx).devices().into_iter().map(|mut device| {
+        if let Some(mac) = device["device_mac"].as_str() {
+            device["diagnostics"] = sync_diagnostics::summary(&root, mac);
+        }
+        device
+    }).collect();
     json!({
         "selected_device_mac": crate::selected_mac(ctx),
-        "devices": service(ctx).devices(),
+        "devices": devices,
         "templates": service(ctx).templates(),
     })
 }
@@ -584,6 +606,11 @@ pub fn profile_save(ctx: &AppCtx, profile: Profile) -> Result<Value, String> {
         "sync_enabled": saved.sync_enabled,
         "note": "profile saved only; publish is a separate explicit action",
     }))
+}
+
+pub fn data_sync_save(ctx: &AppCtx, mac: &str, enabled: bool) -> Result<Value, String> {
+    service(ctx).set_data_sync(mac, enabled).map_err(err_text)?;
+    Ok(json!({"device_mac":mac.to_uppercase(), "sync_enabled":enabled, "published":false}))
 }
 
 pub fn family_profiles(ctx: &AppCtx, render_target: Option<&str>) -> Value {
@@ -1799,9 +1826,10 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
     }
     let sync_opened = normal_result.as_ref().is_ok_and(|(_, enabled, opened, light)|
         *opened || (*enabled && *light));
+    let may_continue = normal_result.as_ref().is_ok_and(|(_, _, _, light)| *light);
     let result = normal_result.map(|_| ());
     link.close().await;
-    if sync_opened { sync_http_inner(ctx, &mac).await; }
+    if sync_opened { sync_http_inner(ctx, &mac, may_continue).await; }
     Ok(BleOpportunity::Connected { mac, result })
 }
 
@@ -1846,7 +1874,7 @@ pub async fn cycle(ctx: &AppCtx, mac: &str, refresh: bool, deliver_now: bool) {
             .is_none_or(|created| ota.as_ref().unwrap().created_at <= created);
     // A queued OTA has a bounded online window. A slow diagnostics transfer
     // must not consume the status freshness budget before its claim check.
-    if refresh && !(ota_first && deliver_now) { sync_http(ctx, &mac).await; }
+    if refresh && !(ota_first && deliver_now) { sync_http(ctx, &mac, true).await; }
     if ota_first && bridge_mcp::load_device_token_at(&crate::mcp_config(ctx).data_root, &mac).is_none() {
         return;
     }
@@ -1863,6 +1891,9 @@ pub async fn cycle(ctx: &AppCtx, mac: &str, refresh: bool, deliver_now: bool) {
         let provisional = status["session"]["power"]["provisional"]
             .as_bool()
             .unwrap_or(false);
+        let was_formal_light = status["session"]["power"]["mode"] == "light"
+            && status["session"]["power"]["plan_id"].as_u64().unwrap_or(0) > 0
+            && !provisional;
         let remaining = status["session"]["power"]["provisional_remaining_s"]
             .as_u64()
             .unwrap_or(0) as u32;
@@ -1873,8 +1904,11 @@ pub async fn cycle(ctx: &AppCtx, mac: &str, refresh: bool, deliver_now: bool) {
         };
         ota_window = plan_result["accepted"] == true
             && plan_result["ack"]["accepted_remaining_s"].as_u64().unwrap_or(0) >= 120;
-        if plan_result["accepted"] == true && !(ota_first && deliver_now) {
-            sync_http(ctx, &mac).await;
+        if plan_result["accepted"] == true && !(ota_first && deliver_now) &&
+            (plan_result["ack"]["accepted_remaining_s"].as_u64().unwrap_or(0) > 0 ||
+                was_formal_light) {
+            sync_http(ctx, &mac,
+                plan_result["ack"]["accepted_remaining_s"].as_u64().unwrap_or(0) > 0).await;
         }
     }
     if deliver_now {
@@ -2024,6 +2058,11 @@ pub async fn tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, Stri
                 serde_json::from_value(args.get("profile").cloned().ok_or("missing profile")?)
                     .map_err(err_text)?;
             profile_save(ctx, profile)?
+        }
+        "platform_data_sync_save" => {
+            let mac = args.get("mac").and_then(Value::as_str).ok_or("missing mac")?;
+            let enabled = args.get("enabled").and_then(Value::as_bool).ok_or("missing enabled")?;
+            data_sync_save(ctx, mac, enabled)?
         }
         "platform_family_profiles" => {
             family_profiles(ctx, args.get("render_target").and_then(Value::as_str))

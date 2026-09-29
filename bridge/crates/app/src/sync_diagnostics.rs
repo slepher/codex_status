@@ -35,9 +35,31 @@ pub struct Store {
     checkpoint: Checkpoint,
 }
 
+/// Read-only local archive summary for the device page. Missing files are
+/// reported as unknown, never as an empty diagnostic stream.
+pub fn summary(data_root: &Path, mac: &str) -> Value {
+    let root = data_root.join("platform/diagnostics").join(mac);
+    let checkpoint: Option<Checkpoint> = fs::read(root.join("checkpoint.json")).ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    let Some(checkpoint) = checkpoint else { return json!({"available":false}); };
+    let gaps = checkpoint.batch_id.as_ref().and_then(|id| {
+        fs::read(root.join(format!("{id}.json"))).ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|body| body["diag"]["gaps"].as_array().cloned())
+    });
+    let retired_unconfirmed = fs::read_dir(&root).ok().into_iter().flatten()
+        .filter_map(|entry| entry.ok()).any(|entry| entry.file_name().to_string_lossy()
+            .starts_with("retired-lost-"));
+    let last_full_success = if checkpoint.phase == "complete" { checkpoint.batch_id.clone() } else { None };
+    json!({"available":true, "phase":checkpoint.phase, "batch_id":checkpoint.batch_id,
+        "gap_count":gaps.as_ref().map(Vec::len),
+        "last_full_success":last_full_success,
+        "retired_unconfirmed":retired_unconfirmed})
+}
+
 fn digest(bytes: &[u8]) -> String { format!("{:x}", Sha256::digest(bytes)) }
 
-fn write_checkpoint(path: &Path, value: &Checkpoint) -> Result<()> {
+fn write_checkpoint(path: &Path, value: &impl Serialize) -> Result<()> {
     let bytes = serde_json::to_vec(value)?;
     let temp = path.with_extension("json.tmp");
     let mut file = File::create(&temp)?;
@@ -255,6 +277,47 @@ impl Store {
     pub fn offset(&self) -> usize { self.checkpoint.durable_offset }
     pub fn awaiting_ack(&self) -> bool { self.checkpoint.phase == "awaiting_device_ack" }
 
+    /// A device that lost its frozen batch cannot confirm an already archived file.
+    /// Keep the archive and an explicit loss record before reserving a new serial.
+    fn retire_lost_ack(&mut self, status: &Value) -> Result<bool> {
+        if !self.awaiting_ack() { return Ok(false); }
+        let id = self.batch_id().context("missing archived batch ID")?;
+        let pending = &status["sync"]["pending_batch"];
+        let completed = &status["sync"]["last_completed"];
+        if pending["batch_id"] == id || completed["batch_id"] == id { return Ok(false); }
+        if !pending.is_null() { bail!("diagnostic device has a different active batch"); }
+        let archive = fs::read(self.root.join(format!("{id}.json")))?;
+        if digest(&archive) != self.checkpoint.sha256 || archive.len() != self.checkpoint.bytes {
+            bail!("archive_lost: unconfirmed diagnostic archive changed");
+        }
+        let body: Value = serde_json::from_slice(&archive)?;
+        if body["device_mac"].as_str().and_then(DeviceIdentity::normalized_mac)
+                .as_deref() != Some(self.checkpoint.mac.as_str()) ||
+            body["bridge_id"] != self.checkpoint.bridge_id || body["batch_id"] != id ||
+            body["client_serial"] != self.checkpoint.client_serial.to_string() {
+            bail!("unconfirmed diagnostic archive identity mismatch");
+        }
+        validate_diag(&body)?;
+        let device_serial = completed["client_serial"].as_str()
+            .and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        let retirement = self.root.join(format!("retired-lost-{id}.json"));
+        if retirement.exists() { bail!("diagnostic retirement record already exists"); }
+        write_checkpoint(&retirement, &json!({
+            "reason":"device_batch_lost_without_ack", "checkpoint":self.checkpoint,
+            "device_pending_batch":null, "device_last_completed":completed,
+            "archive_sha256":digest(&archive),
+        }))?;
+        self.checkpoint.client_serial = self.checkpoint.client_serial.max(device_serial);
+        self.checkpoint.batch_id = None;
+        self.checkpoint.bytes = 0;
+        self.checkpoint.sha256.clear();
+        self.checkpoint.durable_offset = 0;
+        self.checkpoint.prefix_sha256 = digest(&[]);
+        self.checkpoint.phase = "idle".into();
+        self.save()?;
+        Ok(true)
+    }
+
     pub fn begin(&mut self, id: &str, bytes: usize, sha256: &str) -> Result<()> {
         if !safe_id(id) || bytes == 0 || bytes > 16384 || sha256.len() != 64 ||
             !sha256.bytes().all(|b| b.is_ascii_hexdigit()) { bail!("invalid diagnostic manifest"); }
@@ -368,6 +431,7 @@ pub fn transfer(data_root: &Path, link: &DeviceLink) -> Result<Value> {
     }
     let nonce = status["session_nonce"].as_str().context("sync session nonce missing")?;
     let mut store = Store::open(data_root, &compact_mac, &link.bridge_id)?;
+    store.retire_lost_ack(&status)?;
     let mut request = 0u32;
     let mut call = |op: &str, fields: Value| -> Result<Value> {
         request += 1;
@@ -535,6 +599,29 @@ mod tests {
         assert!(pending.awaiting_ack());
         resumed.mark_complete().unwrap();
         assert_eq!(Store::open(dir.path(), "0200000000A1", "bridge-a").unwrap().serial().unwrap(), 2);
+    }
+
+    #[test]
+    fn lost_device_batch_retires_archive_without_forging_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path(), "0200000000A1", "bridge-a").unwrap();
+        assert_eq!(store.serial().unwrap(), 1);
+        let body = br#"{"format":"device-sync-1","device_mac":"0200000000A1","bridge_id":"bridge-a","batch_id":"1-abc","client_serial":"1","diag":{"generation":"00000000000000000000000000000001","from_seq":"1","through_seq":"0","records_b64":"","gaps":[]}}"#;
+        store.begin("1-abc", body.len(), &digest(body)).unwrap();
+        store.append_page(0, body).unwrap();
+        store.finish().unwrap();
+        assert!(store.retire_lost_ack(&json!({"sync":{"pending_batch":{"batch_id":"2-other"}}})).is_err());
+        assert!(store.awaiting_ack());
+        assert!(!store.retire_lost_ack(&json!({"sync":{"pending_batch":null,
+            "last_completed":{"batch_id":"1-abc"}}})).unwrap());
+        assert!(store.retire_lost_ack(&json!({"sync":{"pending_batch":null,
+            "last_completed":null}})).unwrap());
+        assert_eq!(store.serial().unwrap(), 2);
+        assert!(store.root.join("1-abc.json").exists());
+        let record: Value = serde_json::from_slice(&fs::read(store.root.join("retired-lost-1-abc.json")).unwrap()).unwrap();
+        assert_eq!(record["reason"], "device_batch_lost_without_ack");
+        assert_eq!(record["checkpoint"]["phase"], "awaiting_device_ack");
+        assert_eq!(record["archive_sha256"], digest(body));
     }
 
     #[test]

@@ -1,5 +1,15 @@
 # 状态与交接
 
+## 2026-09-29：后台隔离回放证据（部分出口）
+
+不占用桌面的隔离测试已完成：双 Fake ROM + 真实 Bridge 客户端虚拟 24h 共 2,785 事件，两台各连续完成 serial 1–97、都达到第 15 轮，归档 checkpoint 与 SHA 核对通过；另有正式 light 入/离场、Bridge 进程重启、Fake ROM 进程重启的独立烟测。同 seed 两次独立 1h trace 原始 SHA 一致、10 份归档按实例 Bridge ID 归一化后内容/记录字节一致。命令为提权执行 `node tools/run-sync-headless.mjs 86400000`、`1500000 light`、`1200000 restart`、`1200000 device-restart` 和两次 `3600000 periodic`；隔离证据路径和限定范围见 `PROGRESS.md` 最新节。候选 EXE 含一次性 Wi-Fi 完成后的续传修正，默认 EXE 未更新。
+
+未通过的完整出口仍包括 F3 异步等待/延迟页、同一磁盘快照回放、S01–S14 全矩阵及页/完成意图中途强退、U01–U20 全矩阵、最终 Tauri 窗口视觉和必要硬件烟测。不能把上述烟测写成这些出口通过。后续待办只在 backlog C8 维护。
+
+## 2026-09-29：恢复与设备页收束计划（执行中）
+
+以 `PROGRESS.md` 最新节及实际运行数据为准。先对 A0 旧归档 checkpoint 做 MAC、归档字节 SHA、设备 pending/last_completed、client serial 核验；只在确证设备已丢旧批次且归档完整时记带原因的退役记录、原子推进 checkpoint，再由生产 Bridge 开新批次。不伪造设备 ACK，不改旧归档。随后按用户澄清删除设备 Tab 的模板/Profile/字体编辑 UI，另留设备级数据投递许可并只改 `sync_enabled`；修四组详情、null reason、年龄、同步摘要和任务分区。最后完成能运行的 S/U 代表用例、双 target 软件长场景和真实窗口/EXE 检查，逐项记证据与边界。底层服务及显式发布不改；模板 Tab 与数据 Tab 布局不动。此节是计划，不是通过记录。
+
 ## 2026-09-28：前阶段提交与设备页基础整理（未部署）
 
 前阶段 sync-v1/协议统一源码已按用户要求提交：`c1ab267 Implement Note4 sync diagnostics and unify device protocol`。随后按 `device-tab.md` 开始设备 Tab 实施，已删除设备页 Codex 余量与全局/无效按钮，改为每 MAC 认证快照及分组采样年龄、同步与电源摘要；PM 只在显式采样时请求设备，服务端先核对公开身份 MAC，失败保留同 MAC 最近成功样本。选择代次阻断 A→B→A 旧响应，切换即清屏，Profile 草稿不被刷新覆盖，发布/恢复等冻结目标 MAC。模板/Profile/字体入口仍暂存设备页，归属迁移布局尚未实施。

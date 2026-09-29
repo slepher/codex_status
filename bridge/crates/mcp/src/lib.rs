@@ -815,6 +815,17 @@ fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "platform_data_sync_save",
+            "description": "Set one device's data delivery permission without changing its Profile or publishing.",
+            "annotations": {"readOnlyHint": false},
+            "inputSchema": {
+                "type": "object",
+                "properties": {"mac": {"type": "string"}, "enabled": {"type": "boolean"}},
+                "required": ["mac", "enabled"],
+                "additionalProperties": false
+            }
+        },
+        {
             "name": "platform_family_profiles",
             "description": "List supported render target families and their reusable Profile drafts.",
             "annotations": {"readOnlyHint": true},
@@ -1110,7 +1121,7 @@ async fn call_tool(cfg: &McpConfig, name: &str, args: &Value) -> Result<Vec<Valu
         // Platform tools share the app's application service; without a
         // running app there is no live state to read or change.
         "platform_device_register" | "platform_overview" | "platform_template_list" | "platform_template_get" | "platform_template_save"
-        | "platform_template_validate" | "platform_profile_get" | "platform_profile_save"
+        | "platform_template_validate" | "platform_profile_get" | "platform_profile_save" | "platform_data_sync_save"
         | "platform_family_profiles" | "family_platform_profile_save"
         | "platform_family_profile_delete" | "platform_family_profile_copy"
         | "platform_publish" | "platform_publish_preview" | "platform_font_list" | "platform_font_import" | "platform_publish_cancel" | "platform_template_activate"

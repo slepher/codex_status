@@ -4,11 +4,11 @@
 
 ## 1. 阅读顺序、范围与依据
 
-空白 context 先读 AGENTS.md、PROGRESS.md 最新节、本文、plan.md、task.md，再定位源码。保留当前工作区已有 RF1 和其它未提交工作，不凭历史文档判断运行版本。本专项不授权构建、启动服务、OTA、访问实机或提交。
+空白 context 先读 AGENTS.md、PROGRESS.md 最新节、本文、plan.md、task.md，再定位源码。保留当前工作区已有 RF1 和其它未提交工作，不凭历史文档判断运行版本。早期仅文档阶段的授权边界已由后续用户指令更新；构建、运行和实机访问以当前会话授权及 PROGRESS.md 现场为准，未经要求不提交。
 
 用户确定的范围：
 
-- 设备页移除 Codex 余量；屏幕内容、模板及字体归模板页，本专项只声明归属，不设计或执行其搬迁布局；数据页排版不改。
+- 设备页移除 Codex 余量及屏幕内容、模板/Profile、字体编辑入口，保留只读设备实际显示和独立的数据投递许可；模板 Tab 本专项不增加对应编辑界面，也不设计迁移布局；数据页排版不改。
 - 普通 deep BLE 会合精简；成功 Wi-Fi 同步后第 15 次 deep BLE 会合安排一次性 Wi-Fi，完整冻结批次经 Bridge 持久确认后回 deep，不建立正式 light。
 - light 入口与退出各同步，任一次完整成功都清零计数。
 - OTA 重启及 Bundle commit 后优先 Wi-Fi 确认，少量有界重试。
@@ -257,7 +257,7 @@ commit后沿现有Wi-Fi读取认证committed_job_id、commit_seq、active_contex
 
 BLE只更新实际包含的轻量组字段；不刷新整个Wi-Fi组年龄。字段缺省=本响应未采样，显式null+reason=本次不可用；reason为not_sampled|unsupported|not_applicable|read_error。无历史值显示对应原因；有历史值保留原时间。0/false/空数组有效。quality=observed|stale|unavailable；没有统一TTL把所有值清空：radio/runtime/power年龄>120s标stale，firmware/identity不自动过期但始终显示采样时间；已知新boot使旧runtime/radio立即stale。
 
-失败更新last_attempt，不改last_success/原时间。wall倒退标clock_anomaly，超时用单调时间；无可信wall只显示收到于/本次启动采样。公开status/ARP只作候选，不覆盖认证缓存。界面读本地快照，不为绘制页面隐式开Wi-Fi或续计划。设备页删Codex余量；模板归属只声明，数据页布局不动。
+失败更新last_attempt，不改last_success/原时间。wall倒退标clock_anomaly，超时用单调时间；无可信wall只显示收到于/本次启动采样。公开status/ARP只作候选，不覆盖认证缓存。界面读本地快照，不为绘制页面隐式开Wi-Fi或续计划。设备页删Codex余量及屏幕内容、模板/Profile、字体编辑入口，保留实际显示只读信息与设备级数据投递许可；模板 Tab 暂不增加对应界面，数据页布局不动。
 
 ## 11. 一次性切换、恢复与能力
 

@@ -943,6 +943,47 @@ fn ota_switches_only_after_a_complete_catalogued_upload_or_explicit_override() {
 }
 
 #[test]
+fn sync_v1_s10_running_image_hash_uses_active_bytes_not_version_label() {
+    let sha256_hex = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
+    let dir = temp_data_dir();
+    fs::create_dir_all(&dir).unwrap();
+    let target = "codex-status-154g";
+    let fw = "same-version";
+    let x = inert_rom(target, fw);
+    let mut y = x.clone();
+    y[1023] = 7;
+    let catalog = dir.join("catalog.json");
+    fs::write(&catalog, serde_json::to_vec(&serde_json::json!({"initial":"x","versions":[
+        {"id":"x","fw":fw,"target":target,"size":x.len(),"sha256":sha256_hex(&x)},
+        {"id":"y","fw":fw,"target":target,"size":y.len(),"sha256":sha256_hex(&y)},
+    ]})).unwrap()).unwrap();
+    let mut sim = Simulator::start_with_dir("02:00:00:00:00:A1", &[
+        "--catalog", catalog.to_str().unwrap()], dir, true);
+    let image = |n: usize, token| request(sim.address(), "GET",
+        &format!("/api/ota/image?image_bytes={n}"), token, b"");
+    assert_eq!(image(1024, None).0, 401);
+    assert_eq!(image(1025, Some(DEVICE)).0, 400);
+    let before = json_body(&image(1024, Some(DEVICE)).1);
+    assert_eq!(before["sha256"], sha256_hex(&x));
+    assert_eq!(before["running_slot"], "ota_0");
+    assert_eq!(json_body(&request(sim.address(), "GET", "/api/status", Some(ENDPOINT), b"").1)["fw"], fw);
+    let upload = ota_request(&sim, "/doUpdate?token=device-test-secret", &y);
+    if !upload.1.contains("UPDATE OK") {
+        let mut child = sim.child.take().unwrap();
+        let _ = child.kill(); let _ = child.wait();
+        let mut stderr = String::new();
+        child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
+        panic!("{upload:?}: {stderr}");
+    }
+    std::thread::sleep(Duration::from_millis(1700));
+    let after = json_body(&image(1024, Some(DEVICE)).1);
+    assert_eq!(after["sha256"], sha256_hex(&y));
+    assert_eq!(after["running_slot"], "ota_1");
+    assert_eq!(after["fw"], fw);
+    assert_ne!(after["sha256"], before["sha256"]);
+}
+
+#[test]
 fn ota_upload_can_commit_after_its_ack_is_lost() {
     let mut sim = Simulator::start("02:00:00:00:00:37", &[]);
     assert_eq!(request(sim.address(), "POST", "/sim/fault", Some(CONTROL),

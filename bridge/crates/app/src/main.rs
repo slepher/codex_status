@@ -1002,6 +1002,7 @@ async fn mcp_handler(
                 | "platform_template_validate"
                 | "platform_profile_get"
                 | "platform_profile_save"
+                | "platform_data_sync_save"
                 | "platform_family_profiles"
                 | "family_platform_profile_save"
                 | "platform_family_profile_delete"
@@ -1916,6 +1917,15 @@ async fn platform_profile_save(
     let parsed: bridge_core::platform::model::Profile =
         serde_json::from_value(profile).map_err(|e| e.to_string())?;
     platform::profile_save(&state, parsed)
+}
+
+#[tauri::command]
+async fn platform_data_sync_save(
+    state: State<'_, Arc<AppCtx>>,
+    mac: String,
+    enabled: bool,
+) -> Result<Value, String> {
+    platform::data_sync_save(&state, &mac, enabled)
 }
 
 #[tauri::command]
@@ -3478,6 +3488,7 @@ fn main() {
             platform_template_save,
             platform_profile_get,
             platform_profile_save,
+            platform_data_sync_save,
             platform_family_profiles,
             platform_family_profile_save,
             platform_family_profile_delete,

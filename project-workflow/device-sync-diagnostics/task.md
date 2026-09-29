@@ -117,7 +117,7 @@ A有pending frozen+OTA，B联系100次并多次sync，切UI选择、复用旧IP�
 
 radio/runtime/power>120s标stale；新boot令旧runtime/radio立即stale；firmware值仍保留原时间。wall倒退显示clock_anomaly不移动单调截止。public status错MAC不能覆盖。UI不因刷新页面产生sync_open/Plan。
 
-设备页无Codex配额；屏幕内容/模板/字体仅归属声明、数据页布局未改。哨兵Wi-Fi/AP密码、endpoint/device token注入全部日志生产者，RTC、串口镜像、HTTP兼容视图、batch文件、Bridge归档均搜索不到secret。
+设备页无Codex配额和屏幕内容/模板/Profile/字体编辑入口，保留只读安装/active/任务及设备级数据投递许可；模板 Tab 暂不增加入口或迁移布局，数据页布局未改。哨兵Wi-Fi/AP密码、endpoint/device token注入全部日志生产者，RTC、串口镜像、HTTP兼容视图、batch文件、Bridge归档均搜索不到secret。
 
 ## 软件最终出口与硬件边界
 

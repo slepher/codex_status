@@ -7,17 +7,23 @@ if (!configPath) throw new Error('usage: node tools/fake-rom-runner.mjs <config.
 const config = JSON.parse(readFileSync(configPath, 'utf8'));
 const untilMs = config.until_ms ?? 86_400_000;
 const maxEvents = config.max_events ?? 2000;
+const actions = [...(config.actions ?? [])].sort((a, b) => a.at_ms - b.at_ms);
 if (!Array.isArray(config.devices) || !config.devices.length || maxEvents < 1 || untilMs < 0) {
   throw new Error('devices, until_ms, or max_events invalid');
 }
+if (actions.some(action => !Number.isSafeInteger(action.at_ms) || action.at_ms < 0 ||
+    action.at_ms > untilMs || action.kind !== 'light' ||
+    !config.devices.some(device => device.mac === action.mac))) {
+  throw new Error('invalid runner action');
+}
 
-async function call(endpoint, method, path, body) {
+async function call(endpoint, method, path, body, timeoutMs = 20_000) {
   const response = await fetch(`${endpoint.url}${path}`, {
     method,
     headers: { authorization: `Bearer ${endpoint.token}`,
       ...(body === undefined ? {} : { 'content-type': 'application/json' }) },
     body: body === undefined ? undefined : JSON.stringify(body),
-    signal: AbortSignal.timeout(20_000),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   const text = await response.text();
   if (!response.ok) throw new Error(`${method} ${path} returned ${response.status}: ${text.slice(0, 200)}`);
@@ -30,7 +36,7 @@ const deviceStep = (device, delta) => call(device, 'POST', '/sim/time',
   { op: 'step', delta_ms: delta });
 const bridgeStep = (mac, delta) => call(bridge, 'POST', '/sim/clock',
   { mac, op: 'step', delta_ms: delta });
-const bridgeRun = (mac, kind) => call(bridge, 'POST', '/sim/run', { mac, kind });
+const bridgeRun = (mac, kind) => call(bridge, 'POST', '/sim/run', { mac, kind }, 120_000);
 
 function deadline(state) {
   const power = state.power;
@@ -58,6 +64,7 @@ function eventTime(states, devices) {
 const trace = [];
 let coordinate = 0;
 let exhausted = true;
+let nextAction = 0;
 const carry = config.devices.map(() => 0);
 const bridgeCarry = config.devices.map(() => 0);
 for (const device of config.devices) {
@@ -66,12 +73,22 @@ for (const device of config.devices) {
 }
 
 for (let event = 0; event < maxEvents && coordinate <= untilMs; event++) {
+  while (nextAction < actions.length && actions[nextAction].at_ms === coordinate) {
+    const action = actions[nextAction++];
+    const reply = await call(bridge, 'POST', '/mcp', { jsonrpc: '2.0', id: `action-${nextAction}`,
+      method: 'tools/call', params: { name: 'power_plan',
+        arguments: { mac: action.mac, mode: 'light' } } });
+    if (reply.result?.isError) throw new Error(`light action failed at ${coordinate}ms: ` +
+      JSON.stringify(reply.result.content));
+  }
   const states = await Promise.all(config.devices.map(deviceState));
   for (let index = 0; index < states.length; index++) {
     const device = config.devices[index];
     const state = states[index];
     if (state.power.ble_window_until_ms !== null) {
-      const run = await bridgeRun(device.mac, 'ble');
+      const run = await bridgeRun(device.mac, 'ble').catch(error => {
+        throw new Error(`BLE ${device.mac} at ${coordinate}ms: ${error}`);
+      });
       if (run.outcome?.contact !== true || run.outcome?.error ||
           run.outcome?.result?.Err !== undefined) {
         throw new Error(`BLE rendezvous failed for ${device.mac} at ${coordinate}ms: ` +
@@ -79,7 +96,17 @@ for (let event = 0; event < maxEvents && coordinate <= untilMs; event++) {
       }
     }
     const afterBle = await deviceState(device);
-    if (afterBle.power.mode === 'light') await bridgeRun(device.mac, 'http');
+    if (afterBle.power.mode === 'light' || afterBle.power.sync_open === true) {
+      await bridgeRun(device.mac, 'http');
+      if (afterBle.power.sync_open === true) {
+        const drained = await deviceState(device);
+        if (drained.sync?.pending_batch !== null || drained.sync?.rounds !== 0 ||
+            drained.power.sync_open !== false) {
+          throw new Error(`sync drain incomplete for ${device.mac} at ${coordinate}ms: ` +
+            JSON.stringify(drained.sync));
+        }
+      }
+    }
   }
   const after = await Promise.all(config.devices.map(deviceState));
   trace.push({ t: coordinate, devices: after.map((state, index) => ({
@@ -87,8 +114,15 @@ for (let event = 0; event < maxEvents && coordinate <= untilMs; event++) {
     mode: state.power.mode, wakes: state.power.wake_count,
     job: state.bundle.job_id, seq: state.bundle.applied_seq,
     frame_crc: state.bundle.frame_crc,
+    pre_sync_rounds: states[index].sync?.rounds, pre_sync_due: states[index].sync?.due,
+    sync_rounds: state.sync?.rounds, sync_due: state.sync?.due,
+    sync_serial: state.sync?.last_completed?.client_serial,
   })) });
-  const delta = eventTime(after, config.devices);
+  let delta = eventTime(after, config.devices);
+  if (nextAction < actions.length) {
+    const actionDelta = actions[nextAction].at_ms - coordinate;
+    delta = delta === null ? actionDelta : Math.min(delta, actionDelta);
+  }
   if (delta === null || coordinate >= untilMs) {
     exhausted = false;
     break;

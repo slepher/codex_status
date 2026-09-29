@@ -51,8 +51,8 @@
 | M04 连接与占用 | `device_facts_json` 的名称、MAC、IP、discover、owner、yielded；设备级 | 合并 M02，保留改名/发现/claim/release。明确 owner 的观察时间和本地 yielded；“owner 未读取”不能显示为空闲/已归本桥。剩余 lease 是观察值或有依据的估计，不能显示过期静态值为实时 |
 | M05 设备详细信息 | fw/模板/电池来自认证快照；slot/reset 当前认证快照不含；BLE/EPD/heap/RSSI 仅 public_recent 时填值 | 重组为固件、连接、运行、显示分组，逐字段执行 §4。解决采样缺口依赖 P2 的 Wi-Fi 完整状态，不通过常态扩充 BLE 解决 |
 | M06 平台运行状态 | 登记 capabilities、coordinator session、Bundle job；OTA 字符串附在同一行 | 拆出实际 active/显示摘要和独立任务区。target/render_target/ABI 留详情；context/commit_seq/job ID 留诊断。不得把当前 Bundle job 状态直接冠名“已提交”；显示设备确实观察到的 committed_job_id |
-| M07 屏幕内容与发布 | 每设备 Profile 草稿、库模板、target、font_ids、sync_enabled；字体导入是实例资源库操作 | 声明内容/模板/Profile 编排/字体归模板页；本轮不设计目标布局、不实际迁移或删除可用编辑入口。暂存入口保持原语义；未来迁移完成后设备页保留只读已安装/active摘要和任务结果，不复制第二个编辑器 |
-| M08 同步许可 | `pt-sync` 当前作为 `platform_profile_save` 的一部分；`full_sync_s` 已存在但当前没有编辑控件 | 设备级数据同步许可保留，明确只控制 Data；不关闭 sync-v1 状态/诊断同步。此轮不新增独立保存 API 或阈值编辑器；重组时保留现有保存动作，不能暗改 Profile。完整同步阈值可只读展示现有值并标数据投递口径 |
+| M07 屏幕内容与发布 | 每设备 Profile 草稿、库模板、target、font_ids；字体导入是实例资源库操作 | 本轮从设备 Tab 移除屏幕内容、模板/Profile 编排、字体管理编辑界面；模板 Tab 暂不增加对应界面，也不设计迁移布局。保留服务/API 与显式发布合同，设备 Tab 只读实际 active、已安装和任务观察 |
+| M08 同步许可 | `pt-sync` 当前作为 `platform_profile_save` 的一部分；`full_sync_s` 已存在但当前没有编辑控件 | 设备级数据投递许可保留为独立的设备设置；保存时只更改所选设备的 `sync_enabled`，不改 Profile 模板/字体/顺序，不发布。它不关闭 sync-v1 状态/诊断同步。完整同步阈值只读展示现有值 |
 | M09 恢复与维护 | `recoverPlatform()` 先认证读取，再 `platform_recovery`；目标由摘要 MAC 确定 | 保留高级入口。传入前比对请求目标 MAC 与返回摘要 MAC，不拿错误/空摘要恢复；导入的 Profile 默认关同步，不自动占用、唤醒或发布 |
 | M10 正式 PowerPlan | `platform_power` 的 last_sent/last_accepted/session.power；设备级 | 保留 light/sleep 显式动作，分开“桥已发送”和“设备已接受”。ACK 时剩余值带时间；无当前推算依据时不做实时倒计时。provisional、正式期限、sync 执行阶段分开 |
 | M11 电池下限 | 当前 `pt-batt` 渲染 session.power.battery_percent，实为电量 | 改为“采样电量”，与概览共用来源规则；不得伪造下限。若未来显示保护阈值，必须另有真实配置字段，本轮不加 |
@@ -63,7 +63,7 @@
 | M16 最近错误 | 全局 last_error 加 device_note | 移除全局错误对所选设备状态灯的直接判定；展示此 MAC 的 last_attempt/job/同步原因。必要的全局 Bridge 错误保留明确全局标签，不复用设备故障色 |
 | M17 sync-v1 同步/诊断摘要（待实现） | P2/P3 的设备组、批次、checkpoint、complete 收据；设备级 | 在能力启用后展示 rounds/due、phase/radio_reason、上次完整成功、当前批次进度和失败原因。读取本地缓存/归档；普通刷新不能发 sync_open。无能力显示未支持，不显示虚构0/15 |
 
-M07 的暂存不意味着迁移完成。最终报告将“已整理设备状态/已删除无效内容”与“模板归属已声明、布局迁移未实施”分开；不能为了清空设备页先删掉用户仍在使用的配置功能。
+M07 的本轮删除只针对设备页编辑 UI；底层服务和已存配置不删除。模板页布局迁移未实施。
 
 ## 4. 详情大量 `--` 的根因与字段合同
 
@@ -123,7 +123,7 @@ M07 的暂存不意味着迁移完成。最终报告将“已整理设备状态/
 | “占用/恢复”/`claimDevice(false)` | POST claim相关设备用例 | 保留，名称改为清楚的占用含义，避免与恢复Profile混淆；离线/冲突报告原因，不先显示已占用 |
 | “释放”/`releaseDevice` | 释放并记录本地yielded | 保留；显示本地让步状态。不能把释放解释为暂停全局桥或删除Profile |
 | “强制接管”/`claimDevice(true)` | 显式force claim | 保留高级危险操作；冻结并展示目标MAC和已知owner；确认只授权该目标，不扩大为全局接管 |
-| Profile/字体编辑、保存、发布预检/发布 | 本地草稿/实例库，发布需显式冻结目标 | 按M07只声明归属，现阶段保留原入口；保存零publish。取消按钮文案以service允许状态为准，不凭旧“未开始”文案推断能力 |
+| Profile/字体编辑、保存、发布预检/发布 | 本地草稿/实例库，发布需显式冻结目标 | 本轮移除设备页入口；服务/API和已有配置保留，保存零publish、发布需显式动作。模板页暂不增加替代入口 |
 | 从设备摘要导入/`recoverPlatform` | 新认证读取后恢复本地Profile | 保留高级入口；无成功摘要不调用恢复，结果按MAC展示；默认关数据同步 |
 | 展开功耗/`refreshPmStats(false)` | 当前会自动发/pmstats；`refreshPlatformPower`只读本地 | 改为展开只显示该MAC缓存。设备HTTP采样只由显式“采样”触发；文案说明可能扰动light统计、不能唤醒deep |
 | “采样”/`refreshPmStats(true)` | 当前true只绕前端节流，服务仍有10s缓存 | 显示实际fetched_at并说明短缓存；不承诺强制新样本。成功缓存与最近失败尝试分离；失败后保留同MAC上次样本 |
@@ -141,7 +141,7 @@ M07 的暂存不意味着迁移完成。最终报告将“已整理设备状态/
 - [ ] 切换时立即重置所有分组、错误、PM统计/原文/锁、任务及provisional占位，再载入B缓存。不能等请求成功才清A字段。
 - [ ] `lastDeviceFetch`、`lastPmFetch` 等节流按MAC维护或随选择重置；展开PM不能因A刚采样而跳过B缓存装载。B离线时仅保留B历史样本。
 - [ ] `renderDeviceIdentity(null)` 不再静默留下上一台名称/owner。零设备/多设备未选时，清空设备视图并禁用需要目标的写动作。
-- [ ] 自动刷新不覆盖未保存Profile；草稿与观察分离，选择丢弃仍需现有提示。M07迁移前此风险仍在本页。
+- [ ] 设备页不再有 Profile 草稿；数据投递许可保存冻结 MAC，自动刷新不改变用户正在操作的开关。
 - [ ] UI中的selected MAC、后端默认selected MAC和当前任务device_mac分别核对；每个设备动作显式传MAC。全局能力不伪装成设备动作。
 - [ ] 本地缓存/组metadata、同步serial/游标、job、错误、能力按MAC隔离；B的100次联系不得刷新A的年龄或完成A的任务。错误IP返回B时拒绝采纳并保留A旧值。
 
@@ -178,7 +178,7 @@ OTA当前取消仅queued变cancelled，上传后`cancel_requested`不是撤回�
 3. **P3–P5接线后的P6呈现**：展示batch/rounds/due/phase、诊断完整/缺口、OTA/Bundle证据。能力未部署时不露虚假进度；保持当前旧ROM待确认合同。
 4. **软件和实际窗口验收**：执行下表及相关S断言；脚本语法/DOM引用检查和diff检查；在560×680及更窄窗口验证折行/按钮/折叠/无横向溢出。构建和运行版展示按后续授权，未做就明确“视觉/运行版未验”。
 
-M07归属声明独立于上述出口，本轮不设计迁移布局。实施者不能把本文件扩展成四页重做；也不能因未迁移模板而遗漏状态/多设备修复。
+M07 本轮从设备 Tab 删除编辑界面，模板 Tab 暂不增加界面或迁移布局；底层发布服务保留。实施者不能把本文件扩展成四页重做，也不能遗漏状态/多设备修复。
 
 ## 9. 设备页验收矩阵
 
