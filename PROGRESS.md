@@ -1,5 +1,10 @@
 # Codex Status 项目进度（交接文档）
 
+## GitHub README 双板中英文整理（2026-10-01 香港时间）
+
+- 重整 `README.md` 为中文与英文两套对应说明，明确 Waveshare 1.54" 200×200 与 ZecTrix Note4 400×300 的硬件、独立固件目标、模板家族、架构、构建与使用流程。纠正旧版最多三模板、旧推送工具和无环境名构建命令，改为 Profile 1–8、完整 A/B Bundle 显式发布及双板隔离构建；蓝牙 Wi-Fi 初始化标为仅设计，保留源码现行 AP 配网说明。移除过时的自动双板 Release 暗示。
+- 本轮仅文档整理，未构建、重启 Bridge、烧录或发布；设备与 ROM 现场沿用下节记录。README 本地链接与 `git diff --check` 校验通过，既有未提交配网文档改动保留。
+
 ## Note4 Profile 字体资产与显示结果修正（2026-09-30 香港时间）
 
 - 用户最终选定纯拉丁 Noto Serif ExtraLight 200、18 px。Bridge Profile 的 `ntthin18` 槽位选择 CSFN `81d583bc`（2492 B，SHA256 `DD75FED034D91BA8B8A5F342D9B787F58AAA632D167D6E832C3DA3DC1EE773F5`）；设备 Profile 与 400×300 默认家族 Profile 均已保存该选择。模板 JSON 布局及主余量数字未改。此前 Light 300 Bundle job `39e4084f` 已成功（commit 354），不能把发布瞬间的 `waiting` 误报为最终未送达；ExtraLight 200 Bundle job `5d798bd9` 也已 `succeeded`，设备认证报告 `commit_seq=355`、active=`codex-status-a`。当前缺实机照片确认字形；同源宿主预览在 `artifacts/previews/note4-extralight200-profile-bundle.png`，JSON/Compiled/回环像素差均 0。
