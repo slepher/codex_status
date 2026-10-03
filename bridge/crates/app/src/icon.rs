@@ -122,7 +122,11 @@ fn draw_text(px: &mut [u8], text: &str, x: i32, y: i32, scale: i32, c: [u8; 4]) 
 /// Draw the tray icon: status-colored plate with the percent value as digits.
 pub fn render(percent: Option<i32>, state: State, shape: Shape) -> Image<'static> {
     let mut px = vec![0u8; (SIZE * SIZE * 4) as usize];
-    let plate = state.color();
+    let plate = if cfg!(target_os = "macos") {
+        [0, 0, 0, 255]
+    } else {
+        state.color()
+    };
     for y in 0..SIZE as i32 {
         for x in 0..SIZE as i32 {
             if shape.contains(x, y) {
@@ -138,7 +142,13 @@ pub fn render(percent: Option<i32>, state: State, shape: Shape) -> Image<'static
     let w = text_width(&text, scale);
     let x = (SIZE as i32 - w) / 2;
     let y = (SIZE as i32 - 5 * scale) / 2;
-    draw_text(&mut px, &text, x, y, scale, [0xFF, 0xFF, 0xFF, 0xFF]);
+    // Template images use alpha; opaque white would hide the digits on macOS.
+    let ink = if cfg!(target_os = "macos") {
+        [0, 0, 0, 0]
+    } else {
+        [255, 255, 255, 255]
+    };
+    draw_text(&mut px, &text, x, y, scale, ink);
     Image::new_owned(px, SIZE, SIZE)
 }
 

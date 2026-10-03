@@ -33,14 +33,27 @@ impl Instance {
             Shape::parse(&env::var("CODEX_STATUS_ICON_SHAPE").unwrap_or_else(|_| "square".into()))
                 .ok_or("CODEX_STATUS_ICON_SHAPE must be square, circle or diamond")?;
         if let Some(value) = &name {
-            let exe = env::current_exe().map_err(|error| error.to_string())?;
-            let data = exe
-                .parent()
-                .ok_or("bridge executable has no parent directory")?
-                .join("instances")
-                .join(value)
-                .join("data");
-            env::set_var("CODEX_STATUS_DATA", data);
+            #[cfg(target_os = "macos")]
+            if env::var_os("CODEX_STATUS_DATA").is_none() {
+                env::set_var(
+                    "CODEX_STATUS_DATA",
+                    bridge_core::paths::macos_support_root()
+                        .join("instances")
+                        .join(value)
+                        .join("data"),
+                );
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let exe = env::current_exe().map_err(|error| error.to_string())?;
+                let data = exe
+                    .parent()
+                    .ok_or("bridge executable has no parent directory")?
+                    .join("instances")
+                    .join(value)
+                    .join("data");
+                env::set_var("CODEX_STATUS_DATA", data);
+            }
         }
         Ok(Self { name, shape })
     }
@@ -59,6 +72,63 @@ impl Instance {
             None => base,
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+pub fn installation_id() -> std::io::Result<String> {
+    use std::io::Write;
+    let root = bridge_core::paths::macos_support_root();
+    std::fs::create_dir_all(&root)?;
+    let path = root.join("installation-id");
+    match std::fs::read_to_string(&path) {
+        Ok(id) => {
+            uuid::Uuid::parse_str(id.trim()).map_err(std::io::Error::other)?;
+            Ok(id.trim().into())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let id = uuid::Uuid::new_v4().to_string();
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)?;
+            file.write_all(id.as_bytes())?;
+            file.sync_all()?;
+            Ok(id)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+pub struct MutexGuard {
+    _file: std::fs::File,
+}
+
+#[cfg(unix)]
+pub fn acquire(_instance: &Instance) -> Result<MutexGuard, String> {
+    acquire_in(&bridge_core::paths::data_root())
+}
+
+#[cfg(unix)]
+fn acquire_in(root: &std::path::Path) -> Result<MutexGuard, String> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::create_dir_all(root).map_err(|error| error.to_string())?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(root.join("bridge.lock"))
+        .map_err(|error| error.to_string())?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(format!(
+            "bridge data directory already locked: {}",
+            root.display()
+        ));
+    }
+    Ok(MutexGuard { _file: file })
 }
 
 #[cfg(windows)]
@@ -101,6 +171,18 @@ impl Drop for MutexGuard {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn data_lock_is_exclusive_and_released_on_drop() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let held = acquire_in(first.path()).unwrap();
+        assert!(acquire_in(first.path()).is_err());
+        assert!(acquire_in(second.path()).is_ok());
+        drop(held);
+        assert!(acquire_in(first.path()).is_ok());
+    }
+
     #[test]
     fn lock_is_scoped_to_instance() {
         assert_eq!(
@@ -132,8 +214,14 @@ mod tests {
 
     #[test]
     fn owner_ids_are_distinct_and_fit_device_claim_limit() {
-        let default = Instance { name: None, shape: Shape::Square };
-        let named = Instance { name: Some("a".repeat(27)), shape: Shape::Circle };
+        let default = Instance {
+            name: None,
+            shape: Shape::Square,
+        };
+        let named = Instance {
+            name: Some("a".repeat(27)),
+            shape: Shape::Circle,
+        };
         assert_ne!(default.bridge_id("host"), named.bridge_id("host"));
         assert_eq!(named.bridge_id("host").len(), 32);
     }

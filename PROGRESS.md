@@ -1,5 +1,65 @@
 # Codex Status 项目进度（交接文档）
 
+## 剩余计划与新窗口交接入口（2026-10-03）
+
+- 用户要求为未完成工作写新的接续 plan。新增 `project-workflow/bridge-macos/remaining-plan.md`，汇总已完成基线、当前应用/ROM 哈希与数据恢复、R0–R7 实施顺序、设备页配网/绑定方案要求、验证边界及可复制新窗口提示。优先 R0–R4：配网合同、BOOT 离线恢复、设备端事务/方案、设备页和主机动态选网，再补 macOS 发现/短会合、常驻恢复和发行验收。已同步 docs 导航、task/status 与 backlog B5/B6；唯一待办来源不变。
+- 本轮仅文档编写，未实现新功能、构建/重启/写设备、启动长时测试或提交。现场沿用已验证 Note4 `7C4FADB93408` @ `192.168.10.101` / `0.18.41-note4-b-fields1`，ROM 1,665,024 B / SHA256 `9B87601138B68047F0AE71A46486944E2050E8A40651453D613C1E953D8B4947`；macOS 应用 SHA256 `E16732894CEDA38BEE162996A2807A9FC7551496BBA15E2558BAF75EBA2D892E`。已有未提交代码与私人运行数据须保留，详细现场见新计划与下方部署节。1.54 不在现场；完整 macOS 对等与 B6 仍未完成。
+
+## BLE 配网与绑定方案统一放在 Bridge 设备页（2026-10-03）
+
+- 用户确认蓝牙配 Wi-Fi 与本机 BLE 绑定的独立 Wi-Fi 方案均在设备页展示和操作；新增离线进入、蓝牙添加设备、网络映射管理、主机当前 Wi-Fi/设备所选网络与试连/持久化结果的规划要求。方案、映射和凭据仍保存在设备，Bridge 读取无密码摘要并动态选择网络 ID。已同步 `wifi-setup-plan.md`、task/status 与 backlog B6，页面和协议仍待实现。
+- 本轮仅需求与计划更新，无代码修改、构建、设备写入或重启。现场沿用下节：Note4 `7C4FADB93408` @ `192.168.10.101`，已验证运行 `0.18.41-note4-b-fields1`，ROM 1,665,024 B / SHA256 `9B87601138B68047F0AE71A46486944E2050E8A40651453D613C1E953D8B4947`。macOS Bridge 应用哈希与真实数据 ACK 见下节；BLE 配网/按 bond 方案/BOOT 离线恢复未完成，1.54 不在现场。
+
+## 设备报告字段合同：Note4 与 macOS Bridge 已部署验证（2026-10-03）
+
+- 用户指出设备页许可与本地模板发布耦合错误；已将运行需求改为设备认证 `/api/status` 的 `data_contract`，由当前已安装 CompiledTemplate 导出索引/路径/类型/missing/local。Bridge 持久化设备合同，无本地模板/Profile 也可按设备级许可组装数据；BLE 沿用 context/active 摘要，同一上下文复用缓存，切换或未知合同通过正式有界 Wi-Fi 读取。未知合同不发送空字段包。重启独立恢复 DeviceRecord 许可，发送序号接续设备 data/applied 序号；本地草稿不改变运行字段表。UI 删除“未发布模板”，显示设备报告的远程字段数量。
+- 本机最终测试 `.app` 二进制为 72,672,496 B、SHA256 `E16732894CEDA38BEE162996A2807A9FC7551496BBA15E2558BAF75EBA2D892E`，已保留原 AppSupport 数据并重启；备份在 ignored `artifacts/bridge-macos/data-before-fields1/`。运行核查 Note4 登记无本地 Profile，设备级许可为 true（本轮未通过 Agent 修改该许可）。MCP/HTTP 正常；新 ROM 已报告 14 个字段，其中 7 个需 Bridge 提供，投递视图 `required_fields=7`、`source=bridge_setting`，无需本地模板或发布。
+- Note4 唯一目标 `zectrix-note4-b` 构建成功。ROM `artifacts/bridge-macos/note4-0.18.41-fields1.bin`，1,665,024 B，SHA256 `9B87601138B68047F0AE71A46486944E2050E8A40651453D613C1E953D8B4947`，marker `codex-status-ota-v1|zectrix-note4-400x300|0.18.41-note4-b-fields1`、头 `E9070240` 已核对。macOS 首次准备 PlatformIO 6.2.0 / pioarduino 55.3.312 / Arduino 3.3.12 / IDF 5.5.5 / Python 3.14.3，共约 21m35s；包与构建缓存保留，完整生成的 sdkconfig 快照在 `.pio-core/sdkconfig.defaults.note4.snapshot`。系统 Rust 仍为全局 1.99.0，未用隔离 Rust。
+- 对 `7C4FADB93408` @ `192.168.10.101` 的认证预检核对旧 FW `0.18.40-note4-b-display1` 与 target 后，经正常 Bridge OTA job `3f2e8154`（请求 `note4-fields-20261003`）升级成功：`succeeded`、`upload_ack=true`、`confirmation=image_verified`。认证运行镜像证明 `sha256-running-prefix-v1` 的前 1,665,024 B SHA256 与上述文件完全匹配，设备自报 `0.18.41-note4-b-fields1` / `ota_1` / `commit_seq=364` / active `codex-status-a`。UTC 04:25:50.269198 的真实 HTTP 数据 ACK 为 `seq=3`、`data_seq=3`、`result=applied`、`display_state=displayed`、`error_category=none`。未操作 1.54、写 Wi-Fi、重新配对或发布 Bundle；设备 ACK 不替代实体屏幕目视验收。
+- 软件回归：app 47 passed / 1 ignored、core 98 passed 加 21 个集成测试、BLE 15 passed、共享 render 状态 21 passed；五包首轮共 225 passed / 1 ignored，后续 app/core 含序号修正通过。Fake ROM bootstrap 44/44 通过（169.54s）；工具环境 HTTP 代理曾把故意不可达 loopback 候选改成 503，测试设置 `NO_PROXY=127.0.0.1,localhost` 后排除；单次虚拟一小时包含 60 次持久化唤醒，在 macOS 超过旧 3s 期限，只将该控制操作期限设为 30s，普通设备 HTTP 仍 3s。临时诊断已移除。证据在 `artifacts/bridge-macos/device-contract-*.log`、`note4-fields-build.log`；设备合同修复已完成，设计与验收见 `project-workflow/bridge-macos/device-contract-plan.md`。macOS 首版 BLE/低功耗对等及按 bond BLE 配网/BOOT 离线恢复仍未完成，继续仅在 backlog B5/B6 跟踪。
+
+## macOS Bridge P0 与 Note4 新环境 USB 配网（2026-10-03）
+
+- 用户已授权“按照计划开始执行”，随后明确要求升级本机 Rust。已修复 Rustup 入口并将全局 stable 升级至 Rust/Cargo 1.99.0，取消并清理此前隔离工具链；仅构建产物使用 `artifacts/bridge-macos/target`。已适配平台条件依赖、菜单栏模板图标、应用数据/种子/CLI 路径、安装身份、Unix 单实例锁和可选登录 plist；BLE 扫描用 CoreBluetooth peripheral ID 去重，业务仍校验完整 Wi-Fi MAC。没有启用实际登录 LaunchAgent，按需监督与崩溃恢复尚未实现。
+- Intel/macOS 14 本地测试包 `artifacts/bridge-macos/Codex Status Bridge.app` 已临时签名并启动，HTTP 8765 / MCP 8766 可达；其中 `Contents/MacOS/bridge-app` 为 72,448,128 B，SHA256 `DA5684E0DA25E7D0F5B387510532E8B36660451986E1B4ADEB9B83E9F4533A7A`。运行数据在 `~/Library/Application Support/dev.codexstatus.bridge/data`，升级须保留。正式测试包通过 BLE 核对 Note4 `7C4FADB93408` 的完整 MAC、绑定与加密；设备配网重启后再次连接仍 `peerBonded=true` / `peerEncrypted=true`。无需重新绑定；系统应用蓝牙访问权限与设备绑定分别管理。
+- 主机当前 Wi-Fi 为 `CMCC-k3v7_5G`，按用户指示，经 `/dev/cu.usbmodem14101` 调用现有 ROM 的 USB `wifi` 命令添加 `CMCC-k3v7`；凭据只发送设备，未写仓库或日志。设备确认保存 legacy slot 1 并重启，旧 slot 0 保留；随后 `/status.json` 同 MAC 确认 IP `192.168.10.101`、`wifi_slots=2`、运行版本 `0.18.40-note4-b-display1`。真实 Bridge 的 BLE INFO 也读回该 IP。USB 监视已结束。正常非 force claim 在旧 lease 结束后获得 HTTP 200，未强制抢占、刷 ROM 或发布 Bundle。
+- **本次联网是 Agent 调用 ROM 已有的 USB 配网能力，不是 BLE 配网。** 当前 ROM 尚无 BLE 写 Wi-Fi 凭据/按 bond 方案接口；新功能需固件负责凭据接收、试连与持久化，Bridge 负责主机 SSID 映射和网络选择。按 bond 方案、5GHz→2.4GHz 动态选择和 BOOT 离线恢复仍未实现。当前运行镜像 SHA256 本次未测，不能将旧发布哈希当作新现场证明；1.54 不在现场，未操作。
+- 首轮 app/core/ble/render/mcp 测试合计 221 passed / 1 ignored；新增锁回归后 app 47 passed / 1 ignored，最新 BLE 测试 15 passed。证据为 `artifacts/bridge-macos/{tests,app-tests,ble-tests,build}.log`。BLE 源码随后增加了加密探测后 INFO 读取的有界超时，测试已通过，但上述运行包尚未包含此最后一处改动。自然 timer 短窗口完整 ACK、低功耗对等、菜单栏目视、其他平台与长时矩阵尚未验收；`bridge_first` 保持废弃。唯一待办为 backlog B5/B6；本地运行说明见 `project-workflow/bridge-macos/run.md`。
+
+## Note4 与当前 Mac BLE 配对重试成功（2026-10-03）
+
+- 按用户“重试”重新通过 `/dev/cu.usbmodem14101` 执行 `status` / `pair`，设备自报 `0.18.40-note4-b-display1`、WIFI OFF、ota_0，并确认 120 秒配对窗口。已有临时 Note4Pair 诊断客户端此次获得系统蓝牙授权，发现 `CodexStatus-B93408`（RSSI -31），GATT INFO 核对完整 MAC `7C4FADB93408` 与固件版本匹配。
+- UTC 02:57:23 首连 INFO 报 `peerBonded=false` / `peerEncrypted=false`；访问加密 AUTH 特征的无业务副作用 `pair_probe` 后，02:57:27 获写 ACK，INFO 报两者均 true，USB 同时报 `[ble] authenticated bonded peer`。主动断开并于 02:57:29 重连，INFO 再报 `peerBonded=true` / `peerEncrypted=true`，客户端以 `SUCCESS_BOND_ENCRYPTION_RECONNECT_VERIFIED` 成功退出；USB 第二次连接报 `bonded=1`。因此当前 Mac 的 BLE 绑定、加密及本次断开重连均已实证；未测试设备重启后的绑定恢复或定时短窗口会合。
+- 证据在 `/tmp/codex-note4-pair-root` 指向目录的 `ble-pair-retry.log` / `usb-pair-retry.log`。诊断客户端成功退出，已核实并结束本轮 USB 监视进程、释放串口；配对窗口仍按固件自身时限结束。未取用/轮换 token、写 Wi-Fi/endpoint/owner/PowerPlan、刷 ROM 或发布 Bundle；Bridge 与 BLE 配网功能仍仅规划。设备仍未连接当前环境 Wi-Fi，运行镜像 SHA256 此次未测。
+
+## Note4 USB 开启蓝牙配对窗口（2026-10-03）
+
+- 用户另行授权通过 USB 激活蓝牙并开始配对；此授权不改变 Bridge/macOS 与 BLE 配网功能仍仅规划的范围。打开 `/dev/cu.usbmodem14101` 后，`status` 自报 `fw=0.18.40-note4-b-display1`、`WIFI OFF`、`ip=-`、运行槽 `ota_0`。执行现有 `pair` 命令，设备确认 `[ble] advertising as CodexStatus-B93408` / `[cli] BLE session on, pairing window 120s`；准备客户端期间重新打开一次窗口。未写 Wi-Fi、修改 PowerPlan/owner、刷固件或发布 Bundle。
+- 为开始 macOS 配对，在系统临时目录生成并启动单次 CoreBluetooth 诊断 `.app`（Note4Pair），包含蓝牙用途声明，准备读取完整 MAC `7C4FADB93408` 后访问加密 GATT、检查绑定/加密并断开重连。探测命令为不签发 token 的 `pair_probe`，不写 endpoint 或业务数据。客户端记录 START 后 105 秒 TIMEOUT 退出，系统日志停在 `TCCAccessRequest()` 蓝牙权限请求，未收到中央状态/扫描回调；已请求用户处理系统弹窗，尚无扫描、完整 MAC 读回、绑定或加密成功证据，不能报告配对完成。USB 监视已在 110 秒后关闭；配对窗口为有界 120 秒，完成系统授权后需重新打开并重试客户端。
+- 临时证据目录由 `/tmp/codex-note4-pair-root` 指向，内含 `usb-pair.log` / `ble-pair.log`，未保存凭据。运行版本是串口自报；此次未测运行镜像 SHA256，之前 ROM 哈希不因此成为新 USB 实测证据。
+
+## BLE 绑定 Wi-Fi 方案与主机网络映射需求确认（2026-10-03）
+
+- 用户确认每个 BLE 绑定关系对应一套设备端 Wi-Fi 方案；允许 Bridge 连接 5GHz SSID，设备使用对应的不同 SSID 2.4GHz 网络。设备保存各绑定方案的网络名称、映射与密码；Bridge 读取无密码摘要，根据主机当前 Wi-Fi 动态选择并下发网络 ID。已修订 `project-workflow/bridge-macos/wifi-setup-plan.md` 与 backlog B6，增加绑定隔离、主机 SSID权限/无映射、换网竞态、deep 等下一 BLE 会合、业务 owner 协调与持久化验收。
+- 本轮仅需求确认与文档修订，未请求定位权限、读取实际主机 SSID、打开串口、绑定或发送设备命令，未实现/构建/部署。当前仍只有 Note4 在现场；设备身份、运行 ROM 与按键行为未读回，USB 与蓝牙硬件现场沿用下面只读核查记录。
+
+## Note4 新环境离线 BLE 配网规划与 USB 现场（2026-10-03）
+
+- 用户提出换环境后旧 Wi-Fi 不可用，需 BLE 配 Wi-Fi 和正常/断网状态的物理按键开蓝牙；继续仅规划。源码确认 `handleBootClick()` 在 WIFI OFF 分支仅插 PC USB 时重试 Wi-Fi，然后返回，不打开 BLE；电池 startup 连接失败可在按键 loop 前再次睡眠，AP 分支也跳过 BOOT 处理。旧电源文档明确 WIFI OFF 不开 BLE；这是现有规则与新需求冲突，未实机复现。当前 BLE endpoint 只写 Bridge host/port/token，未实现 SSID/密码配置。新增 `project-workflow/bridge-macos/wifi-setup-plan.md`，待办唯一入口 backlog B6，并作为 macOS 首版接入前置关联 B5。
+- 只读 USB/串口枚举见一台 Espressif `USB JTAG/serial debug unit`、VID/PID `303A:1001`，路径 `/dev/cu.usbmodem14101`；未打开串口，避免复位。用户确认当前仅携带 Note4，1.54 不在现场，硬件规划/后续现场验收已收束到 Note4；候选设备 MAC、运行固件及 BOOT 行为尚未读回，既有 ROM SHA256 不当作当前 USB 设备自证。
+- 本轮仅源码读取、USB 只读枚举与文档更新，未编译、启动服务、配对、读串口、写 Wi-Fi、刷 ROM 或发布 Bundle。规划要求离线物理有界恢复入口、绑定加密授权、异步试连、失败保留旧凭据及无隐式 owner/PowerPlan 变更；1.54 实机另标未验，未来共享代码仍须软件回归。
+
+## 本机蓝牙硬件只读核查（2026-10-03）
+
+- 本机 macOS 14.8.9、型号 `MacBookPro15,2`；内建控制器 `BCM_4364B0`、UART、固件 `v122 c4439`，蓝牙开启，支持服务列表包含 GATT。受限 system_profiler 未读到控制器，改用获准的沙箱外只读查询后取得报告。该型号对应 2018/2019 四端口 13 英寸 MacBook Pro，Apple 两份官方规格均标注 Bluetooth 5.0；这是型号规格核对，本次系统报告未直接提供 HCI/LMP 版本或详细 LE feature。
+- 证据与官方链接已补入 `project-workflow/bridge-macos/plan.md`。未扫描、配对或连接外设，未改蓝牙设置，未构建或运行 Bridge；真实短窗口 BLE 会合尚未验证。设备、Bridge 与 ROM SHA256 沿用既有现场记录，无新产物。
+
+## Bridge macOS 菜单栏支持规划（2026-10-03）
+
+- 用户明确本轮**仅规划，不实施**；首版要求具备 Windows 已运行的 BLE 与低功耗会合能力。已新增 `project-workflow/bridge-macos/plan.md`、`task.md`、`status.md`、`review.md`，待办唯一入口为 `docs/roadmap/backlog.md` B5。方案复用 Tauri 与原 application service，先验证真实 `.app` 权限、首次绑定和短窗口 GATT，再收束菜单栏、运行路径/身份、设备业务、常驻恢复与发行验收。
+- 用户确认 **`bridge_first` 因时序问题已废弃**。backlog 产品状态与 C4 已移除双策略切换、预定 Publisher/设备扫描及其恢复实现待办，取消 A4 策略对照；现行与 macOS 规划只沿用 `device_first`。旧 RF/窗口实验文档和进度节仅作历史证据，不代表继续实施。
+- 只读源码发现 Windows autostart 无条件导入、BLE 地址去重、首次绑定路径、`.app` 数据/seed/CLI 路径、主机身份和后台生命周期等移植边界。当前会话为 macOS 14.8.9 / x86_64；其他架构及权限/实机会合尚未验证。仅修改规划与导航文档，未改实现、构建、启动/停止 Bridge、安装 LaunchAgent、联系设备、烧录或发布；运行 Bridge 与设备/ROM SHA256 沿用下面已有现场记录，无本轮新产物。
+
 ## GitHub README 双板中英文整理（2026-10-01 香港时间）
 
 - 重整 `README.md` 为中文与英文两套对应说明，明确 Waveshare 1.54" 200×200 与 ZecTrix Note4 400×300 的硬件、独立固件目标、模板家族、架构、构建与使用流程。纠正旧版最多三模板、旧推送工具和无环境名构建命令，改为 Profile 1–8、完整 A/B Bundle 显式发布及双板隔离构建；蓝牙 Wi-Fi 初始化标为仅设计，保留源码现行 AP 配网说明。移除过时的自动双板 Release 暗示。

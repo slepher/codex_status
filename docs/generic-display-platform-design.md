@@ -103,6 +103,10 @@ SSD2683 和某个板名不构成已验证面板/引脚/波形合同。第二块�
 
 设备 requirements 只描述需要什么字段、类型和缺失/过期行为，不携带触发语义。采集频率由 DataSource 设置，不能与 BLE 周期、全量同步阈值或局刷频率混成一个 interval。
 
+运行字段需求由设备认证 `/api/status` 的 `data_contract` 报告，直接取当前已安装的 CompiledTemplate：包含模板 ID、compiler ABI、源 CRC，以及字段原始索引、路径、类型、missing/local。Bridge 的模板库、草稿 Profile 和是否曾在这台主机发布，不决定设备需要哪些字段；没有本地模板/Profile 也可按设备级许可投递。Bridge 负责将报告的字段匹配到数据源并决定 push/pull。
+
+Bridge 持久化设备字段表；BLE 沿用已有 context/active 摘要，只有与该缓存对应的同一上下文和 active 才复用。切换、冷启动新上下文或尚未读取合同，先通过正式有界 Wi-Fi 会话读取字段表，不将其扩进短窗口 GATT 状态。未知合同不发送空字段快照。Bridge 发送序号接续设备报告的 data/applied 序号，完整快照指纹仍只由成功 ACK 确认。
+
 Bridge 对当前 active_context 保存：最新完整快照、最新 push/full 指纹、最后确认应用的 push/full 指纹、`full_sync_deadline`、下一 data_seq。指纹以规范化有界字段内容计算，比较发现冲突时可再比较字节；无需把指纹构造成持久资源身份。
 
 ```text

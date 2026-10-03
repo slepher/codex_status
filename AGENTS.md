@@ -46,7 +46,7 @@ pio device monitor
 
 pm env（M3，pioarduino `custom_sdkconfig`）构建：仓库改名后路径无空格，直接在仓库目录运行 `pio run -e zectrix-note4-b` 即可（若路径再含空格，IDF 会拒绝，需用 junction 且让 pio 的真实 cwd 落在 junction 上）。勿用 `-v`（GBK 控制台会 UnicodeEncodeError 挂住构建）。生成物 sdkconfig*/CMakeLists.txt/.dummy 等已 gitignore。构建环境细节与踩坑见 `docs/history/workflow/sleep-battery/task-7.md` §7。⚠️ 下列这条只属于 `esp32-s3-epaper-154g`（1.54" 板；当前不构建，仅保留备查）：闪存必须 40 MHz（`board_build.f_flash` + `tools/bootloader_40m_fix.py`），否则 GD25Q64 在 80 MHz 下 ID 读错、写入失败。
 
-Rust 桥（`bridge/` 目录；Windows 才能跑 BLE/Tauri）：
+Rust 桥（`bridge/` 目录；Windows 为已部署基线，macOS 正在实施/验收）：
 
 ```powershell
 cargo test
@@ -80,9 +80,10 @@ git diff --check                   # 提交前必查
 - 设备身份 = Wi-Fi MAC（学习并持久化），显示名可改但非主键；UDP/HTTP/BLE 通告 MAC 不符即拒绝。发现链：属性 IP → UDP → ARP（Windows）→ BLE（手动兜底）；mDNS 已关，勿再依赖 `.local`。
 - 占用只走显式 `POST /claim`：`/api/data`、`/api/plan`、`/api/bundle/*`、`/api/activate` 永不创建/转移 owner（仅刷新匹配 id 的 `last_seen`）；owner 有效且命令 `bridge_id` 不符一律 409，`activate` 无旁路；lease 到期只清空。桥空闲自动 claim、60s 续约、他人占用不推送；模板发布仍是用户显式动作（claim 是协议行为，不等于发布）。
 - 改 GATT 特征表后 Windows 会缓存旧属性，需解除配对再重配（或后续评估 Service Changed）。
-- 便携数据布局：运行数据 `<exe>/data/`，种子 `<exe>/seed/`（开发回退 `tools/test-bridge/`）；程序不写仓库。⚠️ **`<exe>/data/` 就在 `bridge/target/debug/data/` 里**——`cargo` 报 `os error 5`（`target/debug/.fingerprint/...` 这类沙箱旧文件缺能力 ACE，`Set-Acl` 也改不动）而想"删 `target/debug` 重建"时，**先把 `data/` 备份出去**：它装着 `state.json`（设备登记/Profile/jobs/contexts/plans）、模板库、`device-token-*.json`、`bridge-app.json`（endpoint token）。2026-09-25 有一次真实事故（见 `PROGRESS.md`「桥：契约刷新修复 + ACL 闸门绕过」节）：删目录连带删掉运行时数据，靠写回配置 + 从 `tools/test-bridge/` 与仓库夹具重导模板 + 重新登记设备/重建 Profile 才恢复。**更安全的做法是 `cargo build/test --target-dir <仓库内新目录>`**，完全不碰现有 `target/debug`。
+- 便携数据布局：Windows 运行数据 `<exe>/data/`，种子 `<exe>/seed/`（开发回退 `tools/test-bridge/`）；macOS 数据在 `~/Library/Application Support/dev.codexstatus.bridge/data`，命名实例在同根 `instances/<name>/data`，安装身份在同根 `installation-id`，打包种子在 `.app/Contents/Resources/seed/templates`，显式 `CODEX_STATUS_DATA` 优先。程序不向 `.app` 内写数据。⚠️ **`<exe>/data/` 就在 `bridge/target/debug/data/` 里**——`cargo` 报 `os error 5`（`target/debug/.fingerprint/...` 这类沙箱旧文件缺能力 ACE，`Set-Acl` 也改不动）而想"删 `target/debug` 重建"时，**先把 `data/` 备份出去**：它装着 `state.json`（设备登记/Profile/jobs/contexts/plans）、模板库、`device-token-*.json`、`bridge-app.json`（endpoint token）。2026-09-25 有一次真实事故（见 `PROGRESS.md`「桥：契约刷新修复 + ACL 闸门绕过」节）：删目录连带删掉运行时数据，靠写回配置 + 从 `tools/test-bridge/` 与仓库夹具重导模板 + 重新登记设备/重建 Profile 才恢复。**更安全的做法是 `cargo build/test --target-dir <仓库内新目录>`**，完全不碰现有 `target/debug`。
 - 推送是用户显式动作：Profile = 1–8 个有序模板（全部参与按键循环，无 enabled 子集），显式发布冻结一个完整 Bundle；保存模板/Profile、MCP save、UI save 都只落盘，不得自动发布。旧版 ≤3 槽通道与 `profiles.json` 存储已删除（2026-09-25），桥只服务现行平台设备。
 - 数据语义：字段仅在 Bridge 绑定合同中分 push/pull；push 可见值/缺失/质量变化发送完整最新快照，pull-only 变化只更新缓存、不推送、不改 PowerPlan；只有成功 ACK 才更新确认指纹与 full_sync_deadline。设备不接收 push/pull 分类。
+- 运行字段需求以设备认证 `/api/status` 的 `data_contract` 为准，不从 Bridge 本地模板库或 Profile 推导。BLE 同一 context/active 可复用该设备缓存；切换或未知合同先经有界 Wi-Fi 读取。设备级数据投递许可独立于本地模板/Profile，未报告合同不发空字段包。
 - 电源：只有 Bridge 的正式 PowerPlan 改变 light deadline；读取/传输/claim/owner renew 都不隐式续租；BOOT provisional 300s 从物理唤醒起算，timer wake 不获得。
 - 版本号 `FW_VERSION` 在 `src/main.cpp`；固件发布后在 `PROGRESS.md` 记录 ROM 路径与 SHA256。
 - 显示规则：配额/账号缺失的表现是**模板属性**，由各变体自己的 `when` 分支决定，不用全局规则统一。已实现的两种：200×200 `quad` 在 5h 桶不存在时显示静态 `100` 并隐藏其重置时间；400×300 `codex-status-a` 在 5h 桶不存在时隐藏 5h 块并把 weekly 提升到主位。共享的数据侧约定：桥在 `resetCredits.availableCount<=0` 时不下发该字段，模板按 `exists` 隐藏 RC 行；`bridge.label` 取不到用户名时模板不绘制该行。新增变体按该 target 的产品意图选择分支，并同步更新本行。

@@ -15,6 +15,8 @@
 | 改电源/唤醒/占用 | `docs/power-state.md` + `docs/generic-display-platform-design.md` §7 |
 | 改休眠设备的状态页、模板/OTA 延后投递 | `docs/generic-display-platform-design.md` + `project-workflow/sleep-aware-bridge/design.md` / `task.md` |
 | 改 BLE 会合功耗 | `docs/ble-rendezvous-power-design.md` |
+| 接续 Bridge macOS 菜单栏与 BLE 支持 | `project-workflow/bridge-macos/remaining-plan.md`（新窗口剩余实施入口）→ 按需读原 `plan.md` / `task.md`；已授权实施，`bridge_first` 已废弃，待办见 backlog B5 |
+| 实施设备页离线 BLE 配网、绑定独立方案与 BOOT 恢复 | `project-workflow/bridge-macos/remaining-plan.md` R0–R4 + `wifi-setup-plan.md`；功能尚未实现，当前只携带 Note4，待办见 backlog B6 |
 | 改模拟器/实验时钟 | `docs/fake-rom-simulator-design.md` + `docs/history/workflow/fake-rom-simulator-def/evidence.md`（D/E/F 已结项） |
 | 改字体资产 | `docs/font-asset-format.md` + `project-workflow/note4-bridge-publish/protocol.md`（**草案，未定稿**） |
 | 查缺陷结案 | `docs/history/bugs-2026-09-22.md`（原 `bugs.md`，已结案） |
@@ -57,6 +59,7 @@ Fake ROM D/E/F 已结项并归档；下表只列仍需推进的专项。
 | `clock-window-retention` | 1.54 时钟窗口保留修正已构建但未刷机、未实机复测 |
 | `bridge-multi-device-ui` | 按 MAC 推送与统一族发布菜单未实现 |
 | `sleep-aware-bridge` | S1–S4 已实现，S5 的硬件故障矩阵仍待验证；方案与现场见该目录和 PROGRESS |
+| `bridge-macos` | 仅规划；首版要求 Windows 已运行的 BLE/低功耗 `device_first` 对等，未实施 |
 | `bridge-family-sync-preservation` | 源码已修但未进入运行桥；未部署就有覆盖设备 `sync_enabled` 的风险 |
 | `ble-rendezvous-power` | stage 3–6 全部未实现 |
 | `power-plan-c` / `power-state` / `sleep-battery` | 功耗基线、整机硬件验收、M3 验收未闭环 |

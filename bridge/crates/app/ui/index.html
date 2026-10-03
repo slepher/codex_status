@@ -273,7 +273,8 @@
         <div class="row"><span>设备电量</span><span id="dev-batt">尚未读取</span></div>
         <div class="toolbar"><label class="muted"><input type="checkbox" id="pt-sync"> 允许向此设备投递业务数据</label>
           <button onclick="saveDeviceDataSync()">保存许可</button></div>
-        <div class="sub" id="pt-device-state">状态和诊断同步不受此许可影响；保存不发布 Bundle。</div>
+        <div class="sub" id="dev-data-needs">等待设备报告所需数据字段。</div>
+        <div class="sub" id="pt-device-state">状态和诊断同步不受此许可影响。</div>
       </div>
       <div class="card">
         <h2>连接与占用</h2>
@@ -951,6 +952,7 @@
     $('device-state').textContent = selectedDeviceMac ? '正在读取本地缓存…' : '请先选择设备';
     $('pt-device-state').textContent = '';
     $('pt-sync').checked = false;
+    $('dev-data-needs').textContent = '等待设备报告所需数据字段。';
     for (const section of ['firmware','connection','runtime_display','upgrade_history',
       'sync_diagnostics','maintenance']) $('detail-' + section).textContent = '展开时读取本地缓存…';
     $('pm-state').textContent = '尚无本机功耗采样';
@@ -1104,6 +1106,9 @@
         ? ' · 上次观察于 ' + relTime(d.display.screen_state.observed_at) : ''}`;
       $('dev-batt').textContent = showReading(d.battery, n => `${n}%`);
       $('pt-sync').checked = !!d.delivery.enabled;
+      $('dev-data-needs').textContent = d.delivery.required_fields == null
+        ? '等待设备报告所需数据字段。'
+        : `设备报告需要 ${d.delivery.required_fields} 个数据字段。`;
       $('dev-owner').textContent = `${d.occupancy.label}${d.occupancy.owner_name ? ' · ' + d.occupancy.owner_name : ''}${d.occupancy.observed_at
         ? ' · ' + (d.occupancy.source === 'public_status' ? '公开状态观察于 ' : '观察来源未记录 · ') + relTime(d.occupancy.observed_at) : ''}`;
     } catch (e) {
@@ -1433,8 +1438,9 @@
     try {
       await invoke('platform_data_sync_save', { mac, enabled });
       if (!isCurrentDevice(mac, generation)) return;
-      $('pt-device-state').textContent = `数据投递许可已保存：${enabled ? '允许' : '关闭'}；未发布模板`;
       await refreshDeviceCache();
+      if (isCurrentDevice(mac, generation))
+        $('pt-device-state').textContent = `数据投递许可已保存：${enabled ? '允许' : '关闭'}`;
     } catch (e) {
       if (isCurrentDevice(mac, generation)) {
         $('pt-device-state').textContent = '保存数据投递许可失败：' + e;

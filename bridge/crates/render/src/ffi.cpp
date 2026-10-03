@@ -301,6 +301,9 @@ int codex_sim_bundle_status(void *p, char *out, int cap) {
     SimBundleDevice &device = *(SimBundleDevice *)p;
     JsonDocument doc;
     doc["configured"] = device.configured;
+    if (device.configured && device.compiledValid)
+        v2WriteDataContract(doc["data_contract"].to<JsonObject>(), device.compiled);
+    else doc["data_contract"] = nullptr;
     doc["firmware_target"] = device.firmwareTarget;
     doc["render_target"] = device.renderTarget;
     doc["rx_owner"] = device.rx.owner;
@@ -1219,6 +1222,13 @@ int codex_v2_status_snapshot(const char *input, char *out, int cap) {
     }
     snapshot.profile = &profile;
     snapshot.configured = doc["configured"] | false;
+    CtTemplate compiled;
+    if (doc["template_source"].is<JsonObject>()) {
+        String source, error;
+        serializeJson(doc["template_source"], source);
+        if (!tplCompile(source, compiled, error)) return -5;
+        snapshot.compiled = &compiled;
+    }
     snapshot.activeTemplateId = doc["active_template_id"] | "";
     V2DataSeq dataSeq;
     uint64_t appliedSeq = doc["applied_seq"] | 0ULL;
@@ -1246,6 +1256,10 @@ int codex_v2_status_snapshot(const char *input, char *out, int cap) {
     String status = v2BuildStatusSnapshot(snapshot);
     JsonDocument statusDoc, result;
     if (deserializeJson(statusDoc, status)) return -4;
+    // SimulatorBundle exported this table from its installed CTP1, using the
+    // same helper as firmware; it is not rebuilt from the Bridge template library.
+    if (doc.containsKey("data_contract"))
+        statusDoc["data_contract"] = doc["data_contract"];
     result["status"] = statusDoc.as<JsonVariantConst>();
     result["state_after"]["applied_seq"] = dataSeq.appliedSeq();
     result["state_after"]["next_seq"] = dataSeq.nextSeq();

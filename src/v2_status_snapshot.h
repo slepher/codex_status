@@ -3,6 +3,7 @@
 #include <ArduinoJson.h>
 #include "bundle_store.h"
 #include "v2_state.h"
+#include "template_engine.h"
 
 // Optional firmware-only wake diagnostics. The host preview and the device
 // simulator leave this unbound, so their status document keeps the shared
@@ -33,6 +34,9 @@ struct V2StatusSnapshot {
     uint64_t nowMs = 0;
     uint8_t battery = 0;
     const V2WakeSnapshot *wake = nullptr;
+    const CtTemplate *compiled = nullptr;
 };
 
 String v2BuildStatusSnapshot(const V2StatusSnapshot &snapshot);
+// HTTP carries the bounded field table; BLE keeps its existing context/active digest.
+void v2WriteDataContract(JsonObject out, const CtTemplate &compiled);

@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -756,6 +756,9 @@ pub struct DeviceRecord {
     pub last_status_attempt: Option<StatusAttempt>,
     #[serde(default)]
     pub sync_enabled: bool,
+    /// Cached device-reported field table; never reconstructed from a draft.
+    #[serde(default)]
+    pub data_contract: Option<DeviceDataContract>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -853,6 +856,38 @@ pub struct FieldRequirement {
     pub missing: MissingPolicy,
     /// True when the value is supplied by the device, not a DataSource.
     pub local: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeviceDataContract {
+    pub template_id: String,
+    pub compiler_abi: u32,
+    pub source_crc: String,
+    pub requirements: Vec<FieldRequirement>,
+}
+
+impl DeviceDataContract {
+    pub fn validate(&self, caps: &DeviceCapabilities) -> Result<()> {
+        if self.compiler_abi != caps.compiler_abi ||
+            self.source_crc.len() != 8 ||
+            !self.source_crc.bytes().all(|b| b.is_ascii_hexdigit()) ||
+            self.requirements.len() > caps.max_fields.min(32) as usize {
+            bail!("invalid device data contract identity/size");
+        }
+        let mut indices = std::collections::BTreeSet::new();
+        let mut fields = std::collections::BTreeSet::new();
+        for r in &self.requirements {
+            let spec = crate::template::parse_bind(&r.field)
+                .context("device data contract field")?;
+            if r.index >= 32 || r.field.len() >= 64 || !r.field.is_ascii() ||
+                !indices.insert(r.index) || !fields.insert(&r.field) ||
+                r.kind != crate::compile::field_kind(&spec) ||
+                r.local != r.field.starts_with("device.") || r.missing != MissingPolicy::Hide {
+                bail!("invalid device data contract requirement");
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Normalized field value carried inside a snapshot.

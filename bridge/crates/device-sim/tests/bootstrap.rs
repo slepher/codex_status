@@ -99,9 +99,12 @@ fn request(
     body: &[u8],
 ) -> (u16, Vec<u8>) {
     let mut stream = TcpStream::connect(address).expect("connect simulator");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .unwrap();
+    // Advancing an hour executes 60 persistent reboots synchronously. Keep the
+    // ordinary device deadline at 3s, but give this control operation time to
+    // flush its state on macOS filesystems.
+    let large_step = path == "/sim/time" && serde_json::from_slice::<Value>(body).ok()
+        .and_then(|value| value["delta_ms"].as_u64()).is_some_and(|delta| delta >= 3_600_000);
+    stream.set_read_timeout(Some(Duration::from_secs(if large_step { 30 } else { 3 }))).unwrap();
     write!(stream, "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: {}\r\n", body.len()).unwrap();
     if let Some(token) = token {
         write!(stream, "Authorization: Bearer {token}\r\n").unwrap();

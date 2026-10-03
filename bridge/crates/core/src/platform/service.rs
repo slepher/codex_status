@@ -17,6 +17,7 @@ use crate::coordinator::{AckOutcome, Coordinator, Delivery, DeliveryKind, DEFAUL
 use crate::datasource::{DataSource, DataSourceKind};
 use crate::platform::model::{
     Binding, Bundle, BundleFont, BundleProfile, BundleResource, DeviceCapabilities, DeviceIdentity,
+    DeviceDataContract,
     AuthenticatedStatus, DeviceRecord, FamilyProfile, FieldRequirement, PlanMode, PowerPlan, Profile, PublishState, StatusAttempt,
     SourceSnapshot,
     Template, TemplateKey, PublishJob, MAX_PROFILE_TEMPLATES,
@@ -801,6 +802,7 @@ impl PlatformService {
         if let Some(profile) = record.profile.as_mut() { profile.sync_enabled = enabled; }
         if let Some(coordinator) = inner.coordinators.get_mut(&mac) {
             coordinator.sync_enabled = enabled;
+            coordinator.data.push_dirty = enabled;
         }
         Self::persist(&inner, &self.state_path())
     }
@@ -1503,7 +1505,7 @@ impl PlatformService {
                     .and_then(|p| p.initial_active_id.clone())
             })
             .context("device has no active template")?;
-        let requirements = compiled_requirements(&inner, &mac, &template_id);
+        let requirements = device_requirements(&inner, &mac, &template_id);
         let triggers = triggers_for(&inner, &mac, &template_id);
         let c = inner.coordinators.get_mut(&mac).context("unknown device")?;
         if c.context.as_ref().map(|x| &x.context_id) != Some(&context_id.to_string()) {
@@ -1659,6 +1661,7 @@ impl PlatformService {
                     "profile": d.profile,
                     "profile_count": d.profile.as_ref().map(|p| p.template_ids.len()).unwrap_or(0),
                     "sync_enabled": d.sync_enabled,
+                    "data_contract": d.data_contract,
                     "active_template_id": coordinator.and_then(|c| c.active_template_id.clone()),
                     "job": inner.asset_jobs.get(mac).map(AssetJob::summary)
                         .or_else(|| coordinator.and_then(|c| c.job_snapshot())),
@@ -1726,6 +1729,7 @@ impl PlatformService {
             last_authenticated_transport: existing.as_ref().and_then(|d| d.last_authenticated_transport.clone()),
             last_status_attempt: existing.as_ref().and_then(|d| d.last_status_attempt.clone()),
             sync_enabled: existing.as_ref().map(|d| d.sync_enabled).unwrap_or(false),
+            data_contract: existing.as_ref().and_then(|d| d.data_contract.clone()),
         };
         inner.devices.insert(mac.clone(), record);
         let caps = inner.devices[&mac].capabilities.clone();
@@ -1790,7 +1794,7 @@ impl PlatformService {
             ("radio", &["radio"]),
             ("runtime", &["heap_free", "heap_min", "uptime_ms"]),
             ("display", &["display", "active_context_id", "active_template_id",
-                "template_ids", "display_state"]),
+                "template_ids", "display_state", "data_contract"]),
             ("power", &["power", "sync"]),
             ("jobs", &["committed_job_id", "commit_seq", "data_seq", "applied_seq"]),
         ];
@@ -1876,7 +1880,32 @@ impl PlatformService {
             bail!("status MAC does not match {mac}");
         }
         let mut inner = self.inner.lock().unwrap();
+        let reported = status.get("active_template_id").and_then(Value::as_str).unwrap_or("");
+        let record = inner.devices.get(&mac).context("unknown device")?;
+        let contract = match status.get("data_contract").filter(|value| !value.is_null()) {
+            Some(value) => {
+                let table: DeviceDataContract = serde_json::from_value(value.clone())?;
+                table.validate(&record.capabilities)?;
+                validate_template_id(&table.template_id)?;
+                if table.template_id != reported ||
+                    status["active_context_id"].as_str().is_none_or(str::is_empty) {
+                    bail!("device data contract does not match active status");
+                }
+                Some(table)
+            }
+            // BLE's existing context/active digest identifies the installed
+            // immutable contract. A new context or active requires a fresh HTTP
+            // field table; never guess it from local templates.
+            None if transport == "ble" => record.data_contract.clone().filter(|table|
+                table.template_id == reported &&
+                record.observed.active_context_id.as_deref() ==
+                    status["active_context_id"].as_str()),
+            None => None,
+        };
+        let contract_changed = record.data_contract != contract ||
+            record.observed.active_template_id.as_deref() != Some(reported);
         if let Some(record) = inner.devices.get_mut(&mac) {
+            record.data_contract = contract;
             record.last_authenticated_contact_at = Some(now);
             record.observed.observed_at = Some(now);
             record.observed.transport = Some(transport.into());
@@ -1910,37 +1939,19 @@ impl PlatformService {
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
         }
-        let profile = inner.devices.get(&mac).and_then(|d| d.profile.clone());
         if let Some(c) = inner.coordinators.get_mut(&mac) {
             c.note_status(status, now);
-        }
-        // A template switched ON THE DEVICE (button/local switch) changes which
-        // compiled requirements data frames are validated against, usually
-        // WITHOUT changing the context. Without this refresh the bridge keeps
-        // sending the previous template's field set and the device answers every
-        // frame with `incomplete` (firmware v2_runtime.cpp: fields.size() !=
-        // remoteCount). Only refresh for templates the profile actually installs.
-        let reported = status
-            .get("active_template_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let contract_template = inner
-            .coordinators
-            .get(&mac)
-            .and_then(|c| c.active_template_id.clone());
-        let installed = profile
-            .as_ref()
-            .is_some_and(|p| p.template_ids.iter().any(|t| t == reported));
-        if !reported.is_empty()
-            && contract_template.as_deref() != Some(reported)
-            && installed
-        {
-            let requirements = compiled_requirements(&inner, &mac, reported);
-            let triggers = triggers_for(&inner, &mac, reported);
-            if !requirements.is_empty() {
-                if let Some(c) = inner.coordinators.get_mut(&mac) {
-                    c.set_contract(reported, requirements, triggers);
+            if let Some(seq) = c.session.data_seq.or(c.session.applied_seq) {
+                if let Some(context) = c.context.as_mut() {
+                    context.next_seq = context.next_seq.max(seq.saturating_add(1));
                 }
+            }
+            c.active_template_id = (!reported.is_empty()).then(|| reported.to_owned());
+            if contract_changed {
+                c.data.in_flight = None;
+                c.data.acked_push_fp = None;
+                c.data.acked_full_fp = None;
+                c.data.push_dirty = c.sync_enabled;
             }
         }
         let mut power_reconciled = false;
@@ -1980,32 +1991,19 @@ impl PlatformService {
             let known = c.context.as_ref().map(|x| x.context_id.clone());
             (known.as_deref() != Some(device_ctx.as_str())).then_some((
                 device_ctx,
-                c.session.data_seq.unwrap_or(0),
+                c.session.data_seq.or(c.session.applied_seq).unwrap_or(0),
                 c.context.as_ref().map(|x| x.next_seq).unwrap_or(1),
-                c.active_template_id.clone().unwrap_or_default(),
                 c.full_sync_s,
             ))
         });
         let reconcile_needed = reconcile.is_some();
-        if let Some((device_ctx, device_seq, local_next, template_id, full_sync_s)) = reconcile {
-            let installed = profile
-                .as_ref()
-                .map(|p| p.template_ids.contains(&template_id))
-                .unwrap_or(false);
-            let contract = if !template_id.is_empty() && installed {
-                Some((
-                    compiled_requirements(&inner, &mac, &template_id),
-                    triggers_for(&inner, &mac, &template_id),
-                ))
-            } else {
-                None
-            };
+        if let Some((device_ctx, device_seq, local_next, full_sync_s)) = reconcile {
             let c = inner.coordinators.get_mut(&mac).expect("coordinator");
             c.context = Some(crate::coordinator::ContextState {
                 context_id: device_ctx,
                 created_at: now,
                 reason: "reconciled_from_device".into(),
-                next_seq: local_next.max(device_seq + 1),
+                next_seq: local_next.max(device_seq.saturating_add(1)),
                 acked_push_fp: None,
                 acked_full_fp: None,
                 full_sync_deadline: now + full_sync_s,
@@ -2013,11 +2011,9 @@ impl PlatformService {
                 last_content_crc: None,
             });
             c.data.in_flight = None;
-            if let Some((requirements, triggers)) = contract {
-                c.set_contract(&template_id, requirements, triggers);
-            }
         }
-        if reconcile_needed || job_reconciled || power_reconciled {
+        refresh_contract(&mut inner, &mac)?;
+        if reconcile_needed || job_reconciled || power_reconciled || contract_changed {
             let _ = Self::persist(&inner, &self.state_path());
             inner
                 .status_persist_at
@@ -2060,13 +2056,24 @@ impl PlatformService {
 
     fn delivery_for_transport(&self, mac: &str, reachable: bool, now: u64, ble: bool) -> Value {
         let mut inner = self.inner.lock().unwrap();
-        let Some(c) = inner.coordinators.get_mut(&mac.to_uppercase()) else {
+        let mac = mac.to_uppercase();
+        let contract_known = inner.devices.get(&mac)
+            .is_some_and(|record| record.data_contract.is_some());
+        let Some(c) = inner.coordinators.get_mut(&mac) else {
             return json!({"decision": "unknown_device"});
         };
         let decision = match c.next_delivery(now, reachable) {
             Delivery::BleData(snapshot) if !ble => Delivery::LightData(snapshot),
             other => other,
         };
+        if matches!(decision, Delivery::BleData(_) | Delivery::LightData(_)) {
+            if !contract_known {
+                return json!({"decision":"waiting_for_device_contract"});
+            }
+            if c.requirements.is_empty() {
+                return json!({"decision":"idle"});
+            }
+        }
         let mut out = match &decision {
             Delivery::Idle => json!({"decision": "idle"}),
             Delivery::WaitingForRendezvous { reason } => {
@@ -2177,12 +2184,18 @@ impl PlatformService {
         };
         // Light is only granted for real pending work: sync alone does not keep
         // the radio on (v2 §7). Pending data/jobs/activation do.
-        let work_want_light = inner
+        let contract_known = inner.devices.get(&mac)
+            .is_some_and(|record| record.data_contract.is_some());
+        let contract_needed = inner.devices.get(&mac).is_some_and(|record|
+            record.sync_enabled && !contract_known &&
+            record.observed.active_context_id.as_deref().is_some_and(|id| !id.is_empty()) &&
+            record.observed.active_template_id.as_deref().is_some_and(|id| !id.is_empty()));
+        let work_want_light = contract_needed || inner
             .coordinators
             .get(&mac)
             .map(|c| {
                 now < c.plan.light_hold_until
-                    || (c.sync_enabled && c.data.push_dirty)
+                    || (contract_known && c.sync_enabled && c.data.push_dirty)
                     || c.data.in_flight.is_some()
                     || c.pending_activate.is_some()
                     || c.job
@@ -2525,18 +2538,10 @@ fn validate_template_id(id: &str) -> Result<()> {
     Ok(())
 }
 
-fn compiled_requirements(inner: &Inner, mac: &str, template_id: &str) -> Vec<FieldRequirement> {
-    let Some(record) = inner.devices.get(mac) else {
-        return Vec::new();
-    };
-    inner
-        .templates
-        .get(&TemplateKey::new(
-            template_id,
-            &record.capabilities.render_target,
-        ))
-        .map(|t| t.compiled.requirements.clone())
-        .unwrap_or_default()
+fn device_requirements(inner: &Inner, mac: &str, template_id: &str) -> Vec<FieldRequirement> {
+    inner.devices.get(mac).and_then(|record| record.data_contract.as_ref())
+        .filter(|contract| contract.template_id == template_id)
+        .map(|contract| contract.requirements.clone()).unwrap_or_default()
 }
 
 fn triggers_for(
@@ -2545,7 +2550,7 @@ fn triggers_for(
     template_id: &str,
 ) -> BTreeMap<String, crate::platform::model::FieldTrigger> {
     let mut out = BTreeMap::new();
-    let requirements = compiled_requirements(inner, mac, template_id);
+    let requirements = device_requirements(inner, mac, template_id);
     let profile = inner
         .devices
         .get(mac)
@@ -2558,10 +2563,11 @@ fn triggers_for(
             .find(|b| b.field == r.field)
             .and_then(|b| inner.sources.get(&b.source_id))
             .or_else(|| {
+                let (canonical, _) = crate::datasource::resolve_field(&r.field);
                 inner
                     .sources
                     .values()
-                    .find(|s| s.kind == DataSourceKind::Codex)
+                    .find(|s| s.enabled && source_has_field(s, &canonical))
             });
         if let Some(source) = source {
             let (canonical, _) = crate::datasource::resolve_field(&r.field);
@@ -2573,31 +2579,21 @@ fn triggers_for(
 
 /// Set the active template contract on the coordinator (active-only delivery).
 fn refresh_contract(inner: &mut Inner, mac: &str) -> Result<()> {
-    let sync_enabled = inner
-        .devices
-        .get(mac)
-        .and_then(|d| d.profile.as_ref())
-        .map(|p| p.sync_enabled)
-        .unwrap_or(false);
-    let active_id = inner
-        .coordinators
-        .get(mac)
-        .and_then(|c| c.active_template_id.clone())
-        .or_else(|| {
-            inner
-                .devices
-                .get(mac)
-                .and_then(|d| d.profile.as_ref())
-                .and_then(|p| p.initial_active_id.clone())
-        });
-    let Some(active_id) = active_id else {
-        return Ok(());
-    };
-    let requirements = compiled_requirements(inner, mac, &active_id);
-    let triggers = triggers_for(inner, mac, &active_id);
+    let record = inner.devices.get(mac).context("unknown device")?;
+    let sync_enabled = record.sync_enabled;
+    let active_id = inner.coordinators.get(mac).and_then(|c| c.active_template_id.clone())
+        .or_else(|| record.observed.active_template_id.clone());
+    let requirements = active_id.as_deref().map(|id| device_requirements(inner, mac, id))
+        .unwrap_or_default();
+    let triggers = active_id.as_deref().map(|id| triggers_for(inner, mac, id))
+        .unwrap_or_default();
     if let Some(c) = inner.coordinators.get_mut(mac) {
         c.sync_enabled = sync_enabled;
-        c.set_contract(&active_id, requirements, triggers);
+        let remote: Vec<_> = requirements.iter().filter(|r| !r.local).cloned().collect();
+        if c.requirements != remote || c.triggers != triggers {
+            c.set_contract(active_id.as_deref().unwrap_or(""), requirements, triggers);
+        }
+        c.active_template_id = active_id;
     }
     Ok(())
 }
@@ -2694,6 +2690,82 @@ mod tests {
             "../../../../../tools/test-bridge/templates/mini.json"
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn device_reported_fields_work_without_local_template_or_profile_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = PlatformService::open(dir.path()).unwrap();
+        let mac = "AABBCCDDEEFF";
+        svc.device_upsert(DeviceIdentity::new(mac, "Test").unwrap(),
+            DeviceCapabilities::ssd1681_154g()).unwrap();
+        let requirements = vec![FieldRequirement { index: 3, field: "account.plan".into(),
+            kind: crate::platform::model::FieldKind::Text,
+            missing: crate::platform::model::MissingPolicy::Hide, local: false }];
+        let status = json!({"device_mac":mac, "configured":true,
+            "active_context_id":"device-context", "active_template_id":"device-only",
+            "applied_seq":99,
+            "data_contract":{"template_id":"device-only", "compiler_abi":2,
+                "source_crc":"12345678", "requirements":requirements}});
+        svc.note_device_status(mac, &status).unwrap();
+        svc.set_data_sync(mac, true).unwrap();
+        svc.note_codex_envelope(&json!({"schema":1,"account":{"plan":"plus"}})).unwrap();
+        assert_eq!(svc.inner.lock().unwrap().coordinators[mac].requirements, requirements);
+        drop(svc);
+        let svc = PlatformService::open(dir.path()).unwrap();
+        svc.note_device_status(mac, &status).unwrap();
+        svc.note_codex_envelope(&json!({"schema":1,"account":{"plan":"plus"}})).unwrap();
+        assert!(svc.inner.lock().unwrap().coordinators[mac].sync_enabled);
+        assert!(svc.device_get(mac).unwrap()["profile"].is_null());
+        assert_eq!(svc.next_delivery(mac, true, crate::now_secs())["decision"], "ble_data");
+        let body = svc.data_message_body(mac).unwrap();
+        assert!(body["seq"].as_u64().unwrap() > 99);
+        assert_eq!(body["fields"].as_array().unwrap().len(), 1);
+        assert_eq!(body["fields"][0]["i"], 3);
+        assert_eq!(body["fields"][0]["k"], "account.plan");
+        assert_eq!(body["fields"][0]["v"], "plus");
+    }
+
+    #[test]
+    fn device_contract_ignores_local_drafts_and_expires_on_ble_context_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = PlatformService::open(dir.path()).unwrap();
+        let mac = "AABBCCDDEEFF";
+        svc.device_upsert(DeviceIdentity::new(mac, "Test").unwrap(),
+            DeviceCapabilities::ssd1681_154g()).unwrap();
+        let mut status = json!({"device_mac":mac,"configured":true,
+            "active_context_id":"ctx-a","active_template_id":"quad",
+            "data_contract":{"template_id":"quad","compiler_abi":2,"source_crc":"12345678",
+                "requirements":[{"index":4,"field":"account.plan","kind":"text",
+                    "missing":"hide","local":false}]}});
+        svc.note_device_status_at(mac, &status, "http", 100).unwrap();
+        svc.set_data_sync(mac, true).unwrap();
+        let before = svc.device_get(mac).unwrap()["data_contract"].clone();
+        svc.template_save("quad", crate::platform::model::RENDER_TARGET_154G,
+            &quad_source(), 101).unwrap();
+        let mut profile = Profile::draft(mac);
+        profile.template_ids = vec!["quad".into()];
+        profile.initial_active_id = Some("quad".into());
+        profile.sync_enabled = true;
+        svc.profile_save(profile, 102).unwrap();
+        assert_eq!(svc.device_get(mac).unwrap()["data_contract"], before);
+        assert_eq!(svc.inner.lock().unwrap().coordinators[mac].requirements.len(), 1);
+        let mut invalid = status.clone();
+        invalid["data_contract"]["requirements"][0]["index"] = json!(32);
+        assert!(svc.note_device_status_at(mac, &invalid, "http", 103).is_err());
+        assert_eq!(svc.device_get(mac).unwrap()["data_contract"], before);
+        invalid = status.clone();
+        invalid["data_contract"]["template_id"] = json!("other");
+        assert!(svc.note_device_status_at(mac, &invalid, "http", 103).is_err());
+        assert_eq!(svc.device_get(mac).unwrap()["data_contract"], before);
+        status.as_object_mut().unwrap().remove("data_contract");
+        svc.note_device_status_at(mac, &status, "ble", 104).unwrap();
+        assert_eq!(svc.device_get(mac).unwrap()["data_contract"], before);
+        status["active_context_id"] = json!("ctx-b");
+        svc.note_device_status_at(mac, &status, "ble", 105).unwrap();
+        assert!(svc.device_get(mac).unwrap()["data_contract"].is_null());
+        assert_eq!(svc.next_delivery(mac, true, 105)["decision"], "waiting_for_device_contract");
+        assert_eq!(svc.plan_for_rendezvous(mac, 105, "rendezvous", 0).unwrap().mode, PlanMode::Light);
     }
 
     #[test]
@@ -3021,6 +3093,8 @@ mod tests {
         svc.profile_save(profile, 1002).unwrap();
 
         let status = |template: &str| {
+            let compiled = crate::compile::compile(
+                &if template == "mini" { mini_source() } else { quad_source() }, rt).unwrap();
             json!({
                 "configured": true,
                 "active_context_id": "ctx-1",
@@ -3028,6 +3102,8 @@ mod tests {
                 "committed_job_id": "",
                 "data_seq": 0,
                 "applied_seq": 0,
+                "data_contract":{"template_id":template, "compiler_abi":compiled.compiler_abi,
+                    "source_crc":compiled.source_crc,"requirements":compiled.requirements},
             })
         };
         let fields = |svc: &PlatformService| -> Vec<String> {
@@ -3459,8 +3535,13 @@ mod tests {
         // The device commits the bundle and reports its new context.
         let t = crate::now_secs();
         svc.cancel_job(mac, t);
-        svc.adopt_activation_context(mac, "ctx-ack-test", t)
-            .unwrap();
+        let compiled = crate::compile::compile(&quad_source(),
+            crate::platform::model::RENDER_TARGET_154G).unwrap();
+        svc.note_device_status_at(mac, &json!({"configured":true,
+            "active_context_id":"ctx-ack-test","active_template_id":"quad",
+            "data_contract":{"template_id":"quad","compiler_abi":compiled.compiler_abi,
+                "source_crc":compiled.source_crc,"requirements":compiled.requirements}}),
+            "http", t).unwrap();
         let decision = svc.next_delivery(mac, true, t);
         assert_eq!(decision["decision"], "ble_data");
         let seq = decision["data_seq"].as_u64().unwrap();
@@ -3529,8 +3610,13 @@ mod tests {
         svc.publish("AA:BB:CC:DD:EE:FF", 1000).unwrap();
         svc.cancel_job("AA:BB:CC:DD:EE:FF", 1001);
         let mac = "AA:BB:CC:DD:EE:FF";
-        let a = svc.adopt_activation_context(mac, "ctx-1", 1000).unwrap();
-        let _ = a;
+        let compiled = crate::compile::compile(&quad_source(),
+            crate::platform::model::RENDER_TARGET_154G).unwrap();
+        svc.note_device_status_at(mac, &json!({"configured":true,
+            "active_context_id":"ctx-1","active_template_id":"quad",
+            "data_contract":{"template_id":"quad","compiler_abi":compiled.compiler_abi,
+                "source_crc":compiled.source_crc,"requirements":compiled.requirements}}),
+            "http", 1000).unwrap();
         svc.note_codex_envelope(&json!({
             "account": {"plan": "plus"}, "bridge": {"label": "t", "hostId": "h"},
             "buckets": [{"id": "codex", "windows": [{"kind": "weekly", "usedPercent": 30, "windowMins": 10080}]}],

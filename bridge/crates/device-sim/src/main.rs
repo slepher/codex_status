@@ -1252,6 +1252,7 @@ async fn status_impl(state: SimState, request: Request<Body>, gate: bool) -> Res
         "active_template_id": bundle["active_template_id"],
         "template_ids": bundle["template_ids"],
         "configured": bundle["configured"],
+        "data_contract": bundle["data_contract"],
         "applied_seq": bundle["applied_seq"],
         "data_crc": bundle["data_crc"],
         "display_state_code": bundle["display_state_code"],
@@ -2340,6 +2341,8 @@ async fn sim_ble_command(State(state): State<SimState>, request: Request<Body>) 
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     if op == "status" {
+        // Match the firmware's BLE digest: field tables ride on HTTP only.
+        ack.as_object_mut().map(|object| object.remove("data_contract"));
         ack["result"] = "applied".into();
         ack["sync"]["v"] = json!(1);
         ack["sync"]["pending"] = json!(!ack["sync"]["pending_batch"].is_null());

@@ -39,7 +39,20 @@ pub fn data_root() -> PathBuf {
     if let Ok(explicit) = std::env::var("CODEX_STATUS_DATA") {
         return PathBuf::from(explicit);
     }
-    exe_dir().join("data")
+    #[cfg(target_os = "macos")]
+    {
+        macos_support_root().join("data")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        exe_dir().join("data")
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn macos_support_root() -> PathBuf {
+    PathBuf::from(std::env::var_os("HOME").expect("macOS user home directory"))
+        .join("Library/Application Support/dev.codexstatus.bridge")
 }
 
 /// Seed templates: `<exe>/seed/templates` when bundled, else the repo copy
@@ -47,6 +60,16 @@ pub fn data_root() -> PathBuf {
 pub fn seed_templates() -> PathBuf {
     if let Ok(explicit) = std::env::var("CODEX_STATUS_SEEDS") {
         return PathBuf::from(explicit);
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(contents) = exe_dir()
+        .parent()
+        .filter(|dir| dir.file_name().is_some_and(|name| name == "Contents"))
+    {
+        let bundled = contents.join("Resources/seed/templates");
+        if bundled.is_dir() {
+            return bundled;
+        }
     }
     let bundled = exe_dir().join("seed/templates");
     if bundled.is_dir() {

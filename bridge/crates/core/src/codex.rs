@@ -61,6 +61,16 @@ pub fn candidate_paths(explicit: Option<&Path>) -> Vec<PathBuf> {
                 .join("codex.exe"),
         );
     }
+    #[cfg(target_os = "macos")]
+    {
+        out.push(PathBuf::from("codex"));
+        if let Some(home) = std::env::var_os("HOME") {
+            out.push(PathBuf::from(home).join(".local/bin/codex"));
+        }
+        out.push(PathBuf::from("/opt/homebrew/bin/codex"));
+        out.push(PathBuf::from("/usr/local/bin/codex"));
+    }
+    #[cfg(windows)]
     out.push(PathBuf::from("codex.exe"));
     out.push(PathBuf::from("codex"));
     out

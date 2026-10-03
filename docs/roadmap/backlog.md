@@ -45,7 +45,7 @@
 | 设备页、周期 Wi-Fi 与统一诊断流 | Note4 与新版 Bridge 已部署；1.54 的新版 ROM 因 panic 已回退 | 先完成 A0，再做设备页真实窗口视觉、完整 Fake ROM 与实机故障矩阵；见 C8 |
 | 唤醒会合诊断（一次唤醒一条记录） | 仅计划 | 固件与桥两侧都未实现（见 C3） |
 | Bundle v3（manifest + 原始 dense 对象，省 ~71%） | 仅设计 | 未实现（见 C1） |
-| `device_first` / `bridge_first` 双策略会合 | `device_first` 已运行；双策略切换仅设计 + spike | `bridge_first` 及设备主动连接 Bridge 的反向 v2 HTTP 交换均未实现（见 C4） |
+| `device_first` 低功耗会合 | 已运行；`bridge_first` 因时序问题已废弃（2026-10-03 用户确认） | 现行策略的长期稳定性与整周期电量验收见 C4；不再安排双策略切换 |
 | 功耗基线 A/B（DFS 40/80、BT modem sleep、会合节奏） | Note4 BLE 三臂 PM 驻留已实测 | A/B/C 分别 34/32/34 周期；板级电流、整周期能量及长期稳定性仍待测（见 C4） |
 | Bridge 独立于 Codex 生命周期 | 已改为按需 Windows 计划任务启动，待跨会话验收 | 退出 Codex 后确认 `CodexStatusBridge` 仍为 Running、Bridge 8765/8766 仍监听；本会话进程父级已核实为任务计划程序的 `svchost.exe`，见 `PROGRESS.md` 2026-09-27 节 |
 
@@ -141,6 +141,27 @@
 - **2026-09-25：构建侧与刷机侧都已完成** —— 154g 隔离目录 + 当前源码 ROM 就绪（`91937B18…`，`0.18.23-bw`，含 `ca4022c` 与时钟窗口修复），并已 **OTA 进设备**（`0.17.10-bw → 0.18.23-bw`，54.1 s）；同一次会话里 Bundle 也装成功（A2 关闭）。见 `PROGRESS.md` 顶部两节。
 - 待做：按 `/history` 的每分钟唤醒类型 + `clk_partials` + 可见刷新类型三项对照（**实机验收**）；现在设备跑的是 `0.18.23-bw`，验收条件已具备。
 
+### B5. Bridge macOS 菜单栏支持（2026-10-03 新开）
+
+- 新窗口接续入口：`project-workflow/bridge-macos/remaining-plan.md`，汇总已完成基线、当前产物/数据、R0–R7 剩余实施顺序与验收；本项继续只维护未完成事实，不将已部署基础适配重列为待实现。
+- 2026-10-03 后续用户已授权开始执行；当前进入 P0/T0。本机 Rust 使用默认路径升级，不使用隔离工具链；仅构建产物隔离，保护原运行 data。当前主机网络与设备目标已核对，凭据不记入文档。
+- 用户要求首版达到 Windows **已运行**的 BLE 与低功耗会合能力：菜单栏、现有管理 UI/Codex/Wi-Fi/MCP、绑定加密链路取 token、`device_first` 定时会合、正式 PowerPlan 与延后作业；`bridge_first` 已因时序问题废弃，不纳入本项或后续移植阶段（2026-10-03 用户确认）。
+- P0 已开始：本机 Rust/Cargo 升级，最小 Intel/macOS 14 `.app` 已构建启动，MCP/HTTP 端口可达；正式应用已完成 Note4 GATT 精确 MAC、绑定与加密读取，并在设备配网重启后再验证同一绑定。编译、路径、基础单实例及扫描去重已适配；首次未绑定接入、自然 timer 完整 ACK、生命周期、Windows 对照及长时验收仍未完成。方案与分阶段任务见 `project-workflow/bridge-macos/plan.md` / `task.md`，不标记首版完成。
+- 当前缺口：macOS ARP 发现回退、按需 LaunchAgent 监督/崩溃恢复、主机睡眠与网络/BLE 状态恢复；首次未绑定接入及拒权/撤权恢复的完整产品流程、自然 timer 短窗口 ACK 与 Windows 对照/长时验收尚未完成。Windows 条件依赖、peripheral ID 去重、数据/seed/Codex 路径、稳定安装身份与 Unix 单实例锁已适配，不再列为未实现。
+- 2026-10-03 用户补充新环境无法连接旧 Wi-Fi：首版接入增加 B6 的离线 BLE 配网与不依赖 Wi-Fi 的物理按键开蓝牙前置。该功能需要固件与跨平台 Bridge 一同设计，不能靠 macOS 托盘移植补齐；规划见同目录 `wifi-setup-plan.md`。
+- 2026-10-03 用户确认本环境仅携带 Note4，1.54 不在现场：当前实机验收以 Note4 为范围，保留双设备软件身份回归；Windows 对照、Note4 每平台 ≥30 个自然会合及 macOS ≥24 h soak 按后续可用现场验证。1.54 实机与另一 CPU 架构另标未验，不为本轮要求用户取回设备，也不据 Note4 结果宣称全硬件已验。当前会话为 macOS 14.8.9 / x86_64，macOS 15+ 权限现场尚未验证。
+
+### B6. 离线 BLE 配 Wi-Fi 与 BOOT 蓝牙恢复入口（2026-10-03 新开）
+
+- 剩余实施优先按 `project-workflow/bridge-macos/remaining-plan.md` R0–R4 推进；配网细节见 `wifi-setup-plan.md`，新窗口不以现有 USB 联网或字段合同修复替代 B6 验收。
+- 2026-10-03 后续用户已授权开始执行并提供当前环境网络配置；此前已通过现有 USB `pair` 完成 Note4 与 Mac 的 BLE 绑定/加密及重连验证。按 bond 网络方案、BOOT 恢复与动态映射仍须实现，不能把现有配对成功标记为配网功能完成。
+- 用户提出设备换环境后旧 Wi-Fi 不可用，需通过 Bridge 蓝牙配置新 Wi-Fi，并在正常运行/断网时用物理按键打开蓝牙。已授权实施；当前只完成现有 USB 入口的现场联网恢复，尚未实现按 bond 配网协议/BOOT 恢复。方案、状态矩阵与验收见 `project-workflow/bridge-macos/wifi-setup-plan.md`，与 B5 共用 macOS 首次绑定入口，协议和固件能力应同时服务 Windows。
+- 用户确认网络模型：每个 BLE bond 对应设备上的独立 Wi-Fi 方案，内含“Bridge 当前 SSID → 设备 2.4GHz 网络”的映射，允许 Bridge 连 5GHz、设备连不同 SSID 的 2.4GHz。网络名称、映射与密码均持久化在设备；Bridge 读无密码摘要，根据主机换网动态下发网络 ID，不保存或反复传密码。macOS 主机 SSID读取权限、无映射/有线/读不到 SSID、换网竞态、设备深睡延后与 owner 协调须纳入合同和验收。
+- 用户确认产品入口：蓝牙配 Wi-Fi 与“本机绑定的 Wi-Fi 方案”均在 Bridge 设备页，包含离线蓝牙添加/接入、映射增改删、当前主机网络/所选设备网络及试连/持久化结果。已登记设备离线仍可进入；已有绑定可重连，无需重新配对；方案摘要从设备读取，密码仅输入与加密传输，不回读或落 Bridge 持久存储。详见 `wifi-setup-plan.md` 的设备页入口与展示。
+- 源码确认：`handleBootClick()` 在 `!wifiUp` 时返回，插 PC USB 只重试 Wi-Fi；电池启动连接失败时 `startNormalMode()` 可在进入按键 loop 前重新睡眠；AP 分支提前返回也跳过 BOOT 处理。旧 `docs/power-state.md` §3/§4 明确要求 WIFI OFF 不开 BLE，这是现有设计限制与新需求冲突，尚未实机复现。
+- 蓝牙 Wi-Fi 凭据命令尚未实现；现有 endpoint 是 Bridge 的 host/port/token，不是 SSID/密码。需设计独立物理恢复会话、绑定/加密授权、分片/请求 ID/结果查询、候选网络试连与失败保留旧配置；不隐式 claim、发布或重建 active context，不借 BLE 连接/传输续正式 light deadline。
+- 2026-10-03 当前只有 Note4，USB `/dev/cu.usbmodem14101` 起初读回 `0.18.40-note4-b-display1` 并与 BLE/HTTP MAC `7C4FADB93408` 匹配；通过旧 USB `wifi` 命令把新环境凭据写入空闲槽 1，HTTP `wifi_slots=2`，旧网络保留，当前 IP `192.168.10.101`。随后已 OTA 到字段合同修正版 `0.18.41-note4-b-fields1`，运行镜像验证见 `PROGRESS.md`；本次仍属于 legacy 恢复配置，不是按 bond 方案，也不证明 BOOT 离线入口已修复。1.54 不在现场，仍单列未验。
+
 ## 4. 战略/长线（C 级：需要独立 initiative，不在近期窗口）
 
 ### C1. Bundle v3（manifest + 原始 dense 对象）
@@ -161,10 +182,10 @@
 
 ### C4. 功耗与会合策略（power-plan-c / next-execution-plan）
 - 用户已选 B 方案用于 Note4 与 1.54 B/W：BT modem sleep + main XTAL、BLE 会合期 240/80 MHz DFS 且不启用自动 light sleep；未连接广播最多 4s，已连接等指令最多 6s，成功 ACK 后沿用 200ms 提前收尾。两份干净 ROM 已顺序构建并逐台 OTA，新版本及后续真实 timer BLE ACK 均已观察；1.54 设备日志确认 `esp_bt_sleep_enable()` 返回 `ESP_OK`。仍待两台新版 4s/6s 长期会合率、1.54 BLE 专属频率驻留与整机电池端电量测量。B 的 Note4 3s/6s 旧样本不能当作新版 4s/6s 或 1.54 的成功率。
-- 已做：Note4 BLE 等待 A/B/C 三臂各 ≥30 个 deep 周期，分别为 BMS 关/80 MHz、BMS 开/80 MHz、BMS 开/40 MHz；有效回答 33/34、32/32、30/34。C 的 4 次未答是 3 次 3s 未连接、1 次连接后 6s 无命令。随后同 C 参数仅延长截止到 5s 广播/9s 等命令，实机 **34/34 回答**、平均 BLE 窗口 2.277s（旧 C 2.858s）；两轮在广播后 4.2/4.3s 才建链，说明 5s 上限有实际覆盖，9s 上限收益尚未单独验证。各组约 34 轮且未交错测试，不能把成功率变化归因于窗口或推出净耗电下降；详见 `project-workflow/power-plan-c/task-4-modem-sleep.md`。Bridge 为 15s 实验周期临时缩短同 MAC 冷却到 8s，测后已恢复生产 55s。下一步是电流仪下的 30–60 分钟整周期基线、5s/9s 长时对照与连接回归；BMS 关/40 MHz 第四臂、A5（整分钟对齐导致的 ~2 分钟间隔）、A4（`device_first` vs `bridge_first`）仍待测。
+- 已做：Note4 BLE 等待 A/B/C 三臂各 ≥30 个 deep 周期，分别为 BMS 关/80 MHz、BMS 开/80 MHz、BMS 开/40 MHz；有效回答 33/34、32/32、30/34。C 的 4 次未答是 3 次 3s 未连接、1 次连接后 6s 无命令。随后同 C 参数仅延长截止到 5s 广播/9s 等命令，实机 **34/34 回答**、平均 BLE 窗口 2.277s（旧 C 2.858s）；两轮在广播后 4.2/4.3s 才建链，说明 5s 上限有实际覆盖，9s 上限收益尚未单独验证。各组约 34 轮且未交错测试，不能把成功率变化归因于窗口或推出净耗电下降；详见 `project-workflow/power-plan-c/task-4-modem-sleep.md`。Bridge 为 15s 实验周期临时缩短同 MAC 冷却到 8s，测后已恢复生产 55s。下一步是电流仪下的 30–60 分钟整周期基线、5s/9s 长时对照与连接回归；BMS 关/40 MHz 第四臂、A5（整分钟对齐导致的 ~2 分钟间隔）仍待测。A4（`device_first` vs `bridge_first`）随 `bridge_first` 废弃而取消（2026-10-03 用户确认）。
 - 已列出 Note4 每分钟互斥阶段电量和 BLE 电流敏感度，见 `project-workflow/power-plan-c/energy-budget-per-minute.md`；当前表只给芯片/CPU 参考情景，整机面板、PSRAM、稳压及偶发 Wi-Fi/light 的电池端增量仍待仪器实测，不能把表中合计当续航承诺。
 - A2 Note4 80/40 MHz 旧短测、早启用 DFS 的 80/10 MHz 临时 A/B 已做（2026-09-27/28，见 `PROGRESS.md`）：旧 BLE 等待 141 个 240 MHz **运行点**快照不能代表整窗驻留。早启用 PM 后，80 臂等待 1.723s 中 1.337s 在 80 MHz 档；10 臂等待 2.043s 中 1.589s 仍在 80 MHz 档，**10 MHz 档增量为 0**。随后三臂独立实机测试证明 BMS 开启时 80/40 MHz 最低档分别有 24.9%/38.2% 驻留；C 5s/9s 复测为 35.0% 的 40 MHz 驻留、34/34 回答。**A2/A3 尚未具备生产发布依据**：需整周期电流与长时连接回归；当前 BLE 等待无需继续追 10/20 MHz 下限。
-- `bridge_first` 生产协议/策略切换未实现；`task-5-advert-rendezvous.md` §9 已按用户决定将长期离线/错窗恢复留在 `bridge_first` 内部。Note4 RF P0 双版筛查 A/B/C 各3轮：A 1/3、B 3/3、C 0/3；B独立harness停发再恢复测试通过，详见§9.8，不能算认证重对齐或长期成功率。现有24h Fake ROM只跑device_first GATT，正常bridge_first时间窗口尚无实现/模型验收；几何敏感度与清醒设备短扫描实测见§9.9。下一步须实现Bridge预定Publisher和设备真实deep定时扫描，双端记录启动/首包单调时刻，测不同相位/漂移下的命中率及P95误差；以B另做认证/持久epoch/未来窗口 P1，验证两端重启、ACK丢失、安全/owner。A短扫命中率与C适配器收发竞争需另定时序后复测。业务路径采用设备主动连接 Bridge HTTP、机会性状态/电量广播；反向 v2 HTTP/双向认证/显式 claim 封装、能力协商仍待实现。owner 空闲/到期时不得借未认证广播 claim 或改排期，须先单独评审权限合同。
+- **策略收束（2026-10-03 用户确认）：`bridge_first` 已因时序问题废弃。** 删除其生产协议/双策略切换、预定 Publisher、设备定时扫描、认证重对齐/epoch 及该策略的反向 HTTP 实现待办；不移植到 macOS。后续会合只沿用现行 `device_first`，聚焦短窗口 GATT 稳定性、恢复与真实功耗。此前 RF P0、A/B/C 与窗口模型仅为历史实验，证据留在 `project-workflow/power-plan-c/task-5-advert-rendezvous.md` §9 和 PROGRESS 旧节，不作为仍有效的实施计划。
 - 前置：C3 的记录格式（否则没有可信的对照口径）。
 
 ### C8. 设备同步与诊断协议（device-sync-diagnostics）

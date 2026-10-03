@@ -1,5 +1,9 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+#[cfg(windows)]
+mod autostart;
+#[cfg(not(windows))]
+#[path = "autostart_unix.rs"]
 mod autostart;
 mod config;
 mod device_runtime;
@@ -334,6 +338,15 @@ fn host_label() -> String {
 
 /// Display-friendly host name (Unicode kept); defaults for `bridge_name`.
 fn pc_name() -> String {
+    #[cfg(target_os = "macos")]
+    let raw = std::process::Command::new("/usr/sbin/scutil")
+        .args(["--get", "ComputerName"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .unwrap_or_else(|| "Mac".into());
+    #[cfg(not(target_os = "macos"))]
     let raw = std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "bridge".to_string());
@@ -825,10 +838,16 @@ fn spawn_tray_loop(app: AppHandle, ctx: Arc<AppCtx>) {
 }
 
 fn open_path(path: &Path) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("/usr/bin/open").arg(path).spawn();
+    #[cfg(not(target_os = "macos"))]
     let _ = std::process::Command::new("explorer").arg(path).spawn();
 }
 
 fn open_url(url: &str) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("/usr/bin/open").arg(url).spawn();
+    #[cfg(not(target_os = "macos"))]
     let _ = std::process::Command::new("rundll32")
         .args(["url.dll,FileProtocolHandler", url])
         .spawn();
@@ -908,7 +927,7 @@ fn local_hhmm() -> String {
         return format!("{:02}:{:02}", time.wHour, time.wMinute);
     }
     #[cfg(not(windows))]
-    "--:--".to_string()
+    chrono::Local::now().format("%H:%M").to_string()
 }
 
 fn mcp_config(ctx: &AppCtx) -> bridge_mcp::McpConfig {
@@ -3346,7 +3365,7 @@ fn main() {
     }
 
     let instance = instance::Instance::from_env().unwrap_or_else(|error| panic!("{error}"));
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     let _instance_lock = instance::acquire(&instance).unwrap_or_else(|error| panic!("{error}"));
 
     let root = config::repo_root();
@@ -3393,6 +3412,9 @@ fn main() {
             configured
         }
     };
+    #[cfg(target_os = "macos")]
+    let bridge_id = instance.bridge_id(&instance::installation_id().expect("stable Bridge identity"));
+    #[cfg(not(target_os = "macos"))]
     let bridge_id = instance.bridge_id(&host_label());
 
     // Seed the per-MAC registry from the pre-multi-device single record: a
@@ -3530,6 +3552,8 @@ fn main() {
             platform_recovery
         ])
         .setup(move |app| {
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             let _ = ctx_setup.app_handle.set(app.handle().clone());
             app.manage(ctx_setup.clone());
             tauri::async_runtime::spawn(run_services(ctx_setup.clone()));
@@ -3564,6 +3588,7 @@ fn main() {
 
             let tray = TrayIconBuilder::with_id("bridge-tray")
                 .icon(icon::render(None, IconState::NoData, ctx_setup.instance.shape))
+                .icon_as_template(cfg!(target_os = "macos"))
                 .tooltip(match &ctx_setup.instance.name {
                     Some(name) => format!("Codex Status 桥 [{name}]"),
                     None => "Codex Status 桥".into(),

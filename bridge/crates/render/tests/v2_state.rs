@@ -612,6 +612,30 @@ fn shared_command_envelope_checks_session_and_builds_ack_shape() {
 }
 
 #[test]
+fn device_status_exports_installed_compiled_requirements() {
+    let source: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../tools/test-bridge/templates/quad.json")).unwrap();
+    let input = serde_json::json!({"mac":"AABBCCDDEEFF", "context":"device-context",
+        "configured":true, "active_template_id":"quad", "template_ids":["quad"],
+        "template_source":source});
+    let status = bridge_render::simulator_status_snapshot(&input).unwrap();
+    let contract = &status["data_contract"];
+    assert_eq!(contract["template_id"], "quad");
+    assert_eq!(contract["compiler_abi"], 2);
+    assert_eq!(contract["source_crc"].as_str().unwrap().len(), 8);
+    let fields = contract["requirements"].as_array().unwrap();
+    assert!(!fields.is_empty());
+    for (index, field) in fields.iter().enumerate() {
+        assert_eq!(field["index"], index);
+        assert_eq!(field["missing"], "hide");
+        assert_eq!(field["local"], field["field"].as_str().unwrap().starts_with("device."));
+    }
+    assert!(fields.iter().any(|field| field["field"] == "buckets[codex].weekly.remaining" &&
+        field["kind"] == "number" && field["local"] == false));
+    assert!(fields.iter().any(|field| field["field"] == "bridge.label" && field["kind"] == "text"));
+}
+
+#[test]
 fn shared_status_snapshot_preserves_fields_time_and_read_only_state() {
     let input = |display_state: u8, configured: bool| {
         serde_json::json!({

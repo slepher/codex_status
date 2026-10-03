@@ -361,7 +361,7 @@ impl Pusher {
     where
         F: Fn(&str) -> bool,
     {
-        let address = peripheral.address().to_string();
+        let address = peripheral.id().to_string();
         let properties = match peripheral.properties().await {
             Ok(Some(properties)) => properties,
             _ => {
@@ -389,7 +389,7 @@ impl Pusher {
             first_seen_ms = started.elapsed().as_millis(),
             advertisement = if discovered { "discovered" } else { "updated" },
             name = %name,
-            ble_address = %address,
+            peripheral_id = %address,
             rssi = ?properties.rssi,
             decision = if is_match { "target_candidate" } else { "ignored_non_target" },
             wake_association = "uncertain",
@@ -492,7 +492,7 @@ impl Pusher {
         ) == Some(expected)
     }
 
-    async fn read_info(peripheral: &Peripheral, scan_id: u64) -> Result<serde_json::Value> {
+    async fn read_info_raw(peripheral: &Peripheral, scan_id: u64) -> Result<serde_json::Value> {
         let lookup_start = Instant::now();
         let target = peripheral
             .characteristics()
@@ -538,9 +538,46 @@ impl Pusher {
             "BLE info characteristic read"
         );
         let info: serde_json::Value = serde_json::from_slice(&raw).context("parse device info")?;
+        Ok(info)
+    }
+
+    async fn read_info(peripheral: &Peripheral, scan_id: u64) -> Result<serde_json::Value> {
+        let info = Self::read_info_raw(peripheral, scan_id).await?;
         if !Self::peer_bonded(&info) {
-            bail!("device is not bonded; pair manually in Windows Bluetooth settings: hold BOOT for 2 seconds to open the 120 second pairing window, connect CodexStatus, then retry")
+            bail!("device is not bonded; open its 120 second pairing window using the USB pair command, then pair and retry")
         }
+        Ok(info)
+    }
+
+    #[cfg(any(test, target_os = "macos"))]
+    fn pairing_probe_allowed(info: &serde_json::Value, expected_mac: &str) -> bool {
+        Self::info_matches_mac(info, expected_mac)
+            && (Self::peer_bonded(info) || info["pairingWindow"] == true)
+    }
+
+    async fn token_link_info(peripheral: &Peripheral, scan_id: u64, expected_mac: &str) -> Result<serde_json::Value> {
+        let info = Self::read_info_raw(peripheral, scan_id).await?;
+        if !Self::info_matches_mac(&info, expected_mac) { bail!("BLE device Wi-Fi MAC does not match target"); }
+        #[cfg(target_os = "macos")]
+        if !Self::peer_encrypted_bonded(&info) {
+            if !Self::pairing_probe_allowed(&info, expected_mac) { bail!("open the device pairing window before first pairing"); }
+            // Accessing an encrypted characteristic triggers CoreBluetooth's
+            // system pairing prompt after the complete MAC has been checked.
+            // This probe does not issue tokens or alter the endpoint.
+            tokio::time::timeout(Duration::from_secs(60),
+                Self::write_json(peripheral, CHR_AUTH, br#"{"cmd":"pair_probe"}"#))
+                .await.context("system pairing timed out")??;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let fresh = tokio::time::timeout_at(deadline, Self::read_info_raw(peripheral, scan_id))
+                    .await.context("encrypted link verification timed out")??;
+                if !Self::info_matches_mac(&fresh, expected_mac) { bail!("BLE identity changed during pairing"); }
+                if Self::peer_encrypted_bonded(&fresh) { return Ok(fresh); }
+                if tokio::time::Instant::now() >= deadline { bail!("BLE pairing did not establish a bonded encrypted link"); }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        if !Self::peer_encrypted_bonded(&info) { bail!("BLE device link is not encrypted and bonded"); }
         Ok(info)
     }
 
@@ -708,7 +745,7 @@ impl Pusher {
         }
         Self::log_service_lookup(&peripheral, scan_id);
         let info =
-            match trace_stage(scan_id, "read_info", Self::read_info(&peripheral, scan_id)).await {
+            match trace_stage(scan_id, "read_info", Self::token_link_info(&peripheral, scan_id, expected_mac)).await {
                 Ok((info, _)) => info,
                 Err(e) => {
                     let _ = peripheral.disconnect().await;
@@ -1294,6 +1331,19 @@ mod tests {
     use serde_json::json;
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn pairing_probe_requires_full_identity_and_window_or_existing_bond() {
+        let mut info = json!({"mac":"AA:BB:CC:DD:EE:01", "peerBonded":false, "pairingWindow":true});
+        assert!(Pusher::pairing_probe_allowed(&info, "AABBCCDDEE01"));
+        assert!(!Pusher::pairing_probe_allowed(&info, "AABBCCDDEE02"));
+        info["pairingWindow"] = json!(false);
+        assert!(!Pusher::pairing_probe_allowed(&info, "AABBCCDDEE01"));
+        info["peerBonded"] = json!(true);
+        assert!(Pusher::pairing_probe_allowed(&info, "AABBCCDDEE01"));
+        info.as_object_mut().unwrap().remove("mac");
+        assert!(!Pusher::pairing_probe_allowed(&info, "AABBCCDDEE01"));
+    }
 
     #[test]
     fn scan_sampling_logs_at_the_thirty_second_boundary() {

@@ -612,7 +612,9 @@ fn project_device(raw: &Value, identity: &Value, now: u64) -> Value {
         "display":{"installed":installed,"active_template":active_template,
             "data_applied":applied,"screen_state":display_state,"label":screen_label},
         "battery":reading(body,"power.battery","power"),
-        "delivery":{"enabled":raw["sync_enabled"],"source":"bridge_setting"},
+        "delivery":{"enabled":raw["sync_enabled"],"source":"bridge_setting",
+            "required_fields":raw["data_contract"]["requirements"].as_array().map(|fields|
+                fields.iter().filter(|field| field["local"] == false).count())},
         "occupancy":{"state":owner_state,"label":owner_label,"observed_at":identity["owner_observed_at"],
             "owner_name":identity["owner"]["name"],"source":identity["owner_source"]},
         "attention":attention,
@@ -1394,7 +1396,9 @@ pub async fn refresh_status(ctx: &AppCtx, mac: &str) -> Value {
                 return json!({"result": "error", "error": format!("authenticated status MAC {} does not match target MAC {}", status["device_mac"].as_str().unwrap_or("<missing>"), expected_mac)});
             }
             let received_at = device_now(mac);
-            let _ = service(ctx).note_device_status_at(mac, &status, "http", received_at);
+            if let Err(e) = service(ctx).note_device_status_at(mac, &status, "http", received_at) {
+                return json!({"result":"error", "error":format!("device status contract: {e}")});
+            }
             if let Err(e) = service(ctx).note_authenticated_status_at(mac, &status, received_at) {
                 return json!({"result": "error", "error": format!("persist authenticated status: {e}")});
             }

@@ -85,7 +85,7 @@ static bool targetUnverified = false;
 #define FW_VERSION    "0.13.9-clkwin"
 #elif defined(CODEX_TARGET_NOTE4)
 #ifdef CODEX_NOTE4_ROM_B
-#define FW_VERSION    "0.18.40-note4-b-display1"
+#define FW_VERSION    "0.18.41-note4-b-fields1"
 #else
 #define FW_VERSION    "0.18.19-note4-a"
 #endif
@@ -3971,6 +3971,7 @@ static void handleV2Status() {
     snapshot.sessionNonce = v2Nonce();
     snapshot.profile = &v2Profile;
     snapshot.configured = v2BundleReady;
+    snapshot.compiled = v2CtValid ? &v2Ct : nullptr;
     snapshot.activeTemplateId = (v2BundleReady && v2Profile.count)
         ? v2Profile.ids[v2Profile.initial] : activeTplId;
     snapshot.dataSeq = &v2DataSeq;

@@ -99,7 +99,7 @@ pub fn compiled_crc(t: &CompiledTemplate) -> String {
     format!("{:08x}", crc32fast::hash(&encode(t)))
 }
 
-fn field_kind(spec: &BindSpec) -> crate::platform::model::FieldKind {
+pub(crate) fn field_kind(spec: &BindSpec) -> crate::platform::model::FieldKind {
     use crate::platform::model::FieldKind;
     match spec {
         BindSpec::Plan | BindSpec::Label | BindSpec::HostId | BindSpec::DeviceIp |
