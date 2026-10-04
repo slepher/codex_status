@@ -36,8 +36,8 @@ int main() {
     // compatibility projection; credentials never leave this test/device RAM.
     testNvsBlob.clear(); assert(wifiSchemesBegin());
     WifiNetwork slots[2] = {};
-    strcpy(slots[0].id,"wifi-slot-0"); strcpy(slots[0].ssid,"First-AP"); strcpy(slots[0].password,"first-secret");
-    strcpy(slots[1].id,"wifi-slot-1"); strcpy(slots[1].ssid,"Current-AP"); strcpy(slots[1].password,"current-secret");
+    slots[0].id.set("wifi-slot-0"); slots[0].ssid.set("First-AP"); slots[0].password.set("first-secret");
+    slots[1].id.set("wifi-slot-1"); slots[1].ssid.set("Current-AP"); slots[1].password.set("current-secret");
     auto migration = request("wifi_migrate","slots");
     auto migrateSlots = [&](uint64_t until=121000,bool allowed=true) {
         JsonDocument r; deserializeJson(r,wifiSchemesMigrate(migration,bond,slots,2,"Current-AP",1000,until,allowed)); return r;
@@ -59,42 +59,38 @@ int main() {
     const auto uncertainBlob=testNvsBlob; testNvsReadbackFail=false;
     assert(wifiSchemesBegin() && migrateSlots()["persisted"]==true && testNvsBlob==uncertainBlob);
     assert(wifiStore.revision==1);
-    const WifiStoreV2 uncompressed=wifiStore;
-    testNvsBlob.assign((const uint8_t *)&uncompressed,(const uint8_t *)&uncompressed+sizeof(uncompressed));
-    assert(wifiSchemesBegin()); // read a pre-compact v2 blob without rewriting
-    assert(schemes.find(bond,"wifi-slot-0")>=0 && schemes.find(bond,"wifi-slot-1")>=0);
     String migratedSsid,migratedPassword;
     assert(wifiSchemesCredentials(migratedSsid,migratedPassword) && migratedSsid=="Current-AP" && migratedPassword=="current-secret");
     auto migrationBlob=testNvsBlob;
     assert(wifiSchemesBegin() && migrateSlots()["persisted"]==true && migrationBlob==testNvsBlob);
-    strcpy(slots[0].password,"conflicting-secret");
+    slots[0].password.set("conflicting-secret");
     assert(migrateSlots()["error"]=="migration_conflict" && migrationBlob==testNvsBlob);
     assert(WiFi.begins==initialBegins);
     testNvsBlob.clear(); assert(wifiSchemesBegin());
-    strcpy(slots[0].password,"first-secret"); strcpy(slots[0].ssid,"Current-AP");
+    slots[0].password.set("first-secret"); slots[0].ssid.set("Current-AP");
     assert(migrateSlots()["ok"]==false && testNvsBlob.empty()); // ambiguous mapping, no silent merge
-    strcpy(slots[0].ssid,"First-AP");
+    slots[0].ssid.set("First-AP");
     assert(migrateSlots()["persisted"]==true);
-    WifiNetwork extra = {}; strcpy(extra.id,"wifi-slot-2"); strcpy(extra.ssid,"Third-AP");
+    WifiNetwork extra = {}; extra.id.set("wifi-slot-2"); extra.ssid.set("Third-AP");
     JsonDocument extraResult; deserializeJson(extraResult,wifiSchemesMigrate(migration,bond,&extra,1,"Third-AP",1000,121000,true));
     assert(extraResult["persisted"]==true && wifiSchemesCredentials(migratedSsid,migratedPassword) && migratedSsid=="Current-AP");
     testNvsBlob.clear(); assert(wifiSchemesBegin());
     testNvsByteLimit=1024;
     assert(migrateSlots()["persisted"]==true); // small real data must fit limited NVS
     assert(testNvsBlob.size()<=testNvsByteLimit);
-    std::cout << "NVS two-slot encoding " << sizeof(WifiStoreV2) << " -> " << testNvsBlob.size() << " B\n";
+    std::cout << "NVS two-slot encoding " << sizeof(WifiStore) << " -> " << testNvsBlob.size() << " B\n";
     testNvsByteLimit=SIZE_MAX;testNvsBlob.clear();assert(wifiSchemesBegin());
     // Read-only v1 migration preserves both the blob and active credentials.
-    WifiSchemes old; WifiNetwork previous;
+    WifiLegacySchemes old; WifiLegacyNetwork previous;
     strcpy(previous.bond,other);strcpy(previous.id,"migrated");strcpy(previous.host,"OldHost");strcpy(previous.ssid,"OldDevice");
     assert(!old.put(previous,false));old.seal();
-    testNvsBlob.assign((const uint8_t *)&old,(const uint8_t *)&old+sizeof(old));
-    const auto v1blob=testNvsBlob;assert(wifiSchemesBegin()&&testNvsBlob==v1blob);
+    testNvsLegacyBlob.assign((const uint8_t *)&old,(const uint8_t *)&old+sizeof(old));
+    assert(wifiSchemesBegin()&&testNvsLegacyBlob.empty()&&!testNvsBlob.empty());
     String oldSsid,oldPass;assert(wifiSchemesCredentials(oldSsid,oldPass)&&oldSsid=="OldDevice");
     auto migrateGrant=request("wifi_authorize");JsonDocument migrated;
     deserializeJson(migrated,wifiManagementAuthorize(migrateGrant,bond,1000,121000,0));
     auto migrate=change("migrate",0,migrated["permit"].as<String>());
-    assert(invoke(migrate)["outcome"]=="committed"&&testNvsBlob.size()<sizeof(WifiStoreV2));
+    assert(invoke(migrate)["outcome"]=="committed"&&testNvsLegacyBlob.empty());
     assert(wifiSchemesCredentials(oldSsid,oldPass)&&oldSsid=="OldDevice");
     testNvsBlob.back()^=1;const auto corrupt=testNvsBlob;
     assert(!wifiSchemesBegin()&&testNvsBlob==corrupt); // reject, never erase corruption
@@ -163,13 +159,13 @@ int main() {
     assert(!wifiSetupBusy() && !wifiSetupActivated() && testNvsBlob == blob && WiFi.SSID() == "Device");
     // Production protocol: no HTTP snapshot is needed to match one Bridge row.
     auto match=request("wifi_match",std::string(64,'m').c_str());match["network_id"]="home";
-    const int home=schemes.find(bond,"home");match["metadata_key"]=wifiMetadataKey(schemes.networks[home],wifiStore.labels[home],false);match["open"]=false;
+    const int home=schemes.find(bond,"home");match["metadata_key"]=wifiMetadataKey(schemes.networks[home],schemes.networks[home].label.c_str(),false);match["open"]=false;
     auto matching=[&](){JsonDocument r;assert(!deserializeJson(r,wifiSetupCommand(match,bond,1,2000,0,60000,true)));return r;};
     assert(matching()["matches"]==true&&matching()["active"]==false); // edited, not silently active
     match["metadata_key"]=std::string(64,'0');assert(matching()["matches"]==false);
-    match["metadata_key"]=wifiMetadataKey(schemes.networks[home],wifiStore.labels[home],false);
+    match["metadata_key"]=wifiMetadataKey(schemes.networks[home],schemes.networks[home].label.c_str(),false);
     WiFi.connected=WL_CONNECTED;WiFi.ipReady=true; // old network has recovered after trial
-    auto ordinary=request("wifi_activate","ordinary-connect");ordinary["network_id"]="home";ordinary["version"]=wifiStore.versions[home];
+    auto ordinary=request("wifi_activate","ordinary-connect");ordinary["network_id"]="home";ordinary["version"]=schemes.networks[home].version;
     assert(!deserializeJson(result,wifiSetupCommand(ordinary,bond,1,2000,0,60000,true)));
     assert(result["stage"]=="accepted");const int ordinaryBegins=WiFi.begins;
     wifiSetupPoll(2001,bond,1,true);assert(WiFi.begins>ordinaryBegins&&wifiSetupBusy()); // BLE is still encrypted/live
@@ -204,7 +200,7 @@ int main() {
     assert(invoke(expired,122000)["error"]=="window_required");
     // Conservative durable result retention refuses new writes at capacity;
     // it never silently evicts a transaction whose ACK could have been lost.
-    int free=0;for(const auto &r:wifiStore.receipts)if(!*r.request)++free;
+    int free=8-wifiStore.receipts.size();
     for(int i=0;i<free;++i){auto fill=change(("fill"+std::to_string(i)).c_str(),wifiStore.revision,fresh);assert(invoke(fill,2000)["outcome"]=="committed");}
     auto fullLedger=change("ledger-full",wifiStore.revision,fresh);const auto finalBlob=testNvsBlob;
     assert(invoke(fullLedger,2000)["error"]=="result_capacity"&&finalBlob==testNvsBlob);

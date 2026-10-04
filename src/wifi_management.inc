@@ -70,6 +70,7 @@ static void projectWifiNetwork(JsonArray list, const WifiNetwork &n, const char 
 }
 String wifiManagementCommand(JsonDocument &doc, uint64_t now, const String &legacy) {
     const String op = doc["op"] | "", bridge = doc["bridge_id"] | "";
+    if (wifiStorageUncertain && !running && !wifiSchemesBegin()) return reply(doc, "storage");
     if (!storeReady) return reply(doc, "storage");
     if (!wifiManagementShape(doc)) return reply(doc,"shape");
     if (!identifier(bridge.c_str(), 64)) return reply(doc, "shape");
@@ -86,20 +87,20 @@ String wifiManagementCommand(JsonDocument &doc, uint64_t now, const String &lega
             snapshot["snapshot_id"] = wifiRandomId(); snapshot["complete"] = true;
             snapshot["observed_at"] = 0;
             snapshot["capacity"]["total"] = 12; snapshot["capacity"]["per_bond"] = 4;
-            snapshot["active"]["bond"] = wifiStore.active.bond;
-            snapshot["active"]["network_id"] = wifiStore.active.id;
+            snapshot["active"]["bond"] = wifiStore.active.bond.c_str();
+            snapshot["active"]["network_id"] = wifiStore.active.id.c_str();
             // Active version can differ from the saved version.
             snapshot["active"]["version"] = wifiStore.activeVersion;
             JsonArray list = snapshot["networks"].to<JsonArray>();
-            for (int i = 0; i < 12; ++i) if (*schemes.networks[i].id)
-                projectWifiNetwork(list, schemes.networks[i], wifiStore.labels[i], wifiStore.versions[i],
+            for (size_t i = 0; i < schemes.networks.size(); ++i) if (*schemes.networks[i].id)
+                projectWifiNetwork(list, schemes.networks[i], schemes.networks[i].label, schemes.networks[i].version,
                     permit && permit->peer == schemes.networks[i].bond);
             JsonDocument old;
             if (legacy.length() && !deserializeJson(old, legacy)) for (JsonObject n : old.as<JsonArray>()) {
-                WifiNetwork network; strcpy(network.bond, "legacy");
+                WifiNetwork network; network.bond.set("legacy");
                 String id = n["network_id"] | "", ssid = n["ssid"] | "";
                 if (!identifier(id.c_str(), 32) || !ssidValid(ssid.c_str())) continue;
-                strcpy(network.id, id.c_str()); strcpy(network.host, ssid.c_str()); strcpy(network.ssid, ssid.c_str());
+                network.id.set(id.c_str()); network.host.set(ssid.c_str()); network.ssid.set(ssid.c_str());
                 projectWifiNetwork(list, network, "USB/AP", 0, false);
             }
             fullSnapshot = ""; serializeJson(snapshot, fullSnapshot);
@@ -120,7 +121,7 @@ String wifiManagementCommand(JsonDocument &doc, uint64_t now, const String &lega
         out["outcome"] = "unknown";
         for (const auto &r : wifiStore.receipts) if (bridge == r.bridge && query == r.request && (doc["result_peer"].isNull() || String(doc["result_peer"] | "") == r.bond)) {
             out["outcome"] = *r.error ? "rejected" : "committed"; out["revision"] = r.revision; out["bond"] = String(r.bond);
-            if (*r.error) out["error"] = r.error; break;
+            if (*r.error) out["error"] = r.error.c_str(); break;
         }
     } else if (op == "apply") {
         const char *id = doc["request_id"] | "";
@@ -133,19 +134,19 @@ String wifiManagementCommand(JsonDocument &doc, uint64_t now, const String &lega
         for (const auto &r : wifiStore.receipts) if (bridge == r.bridge && !strcmp(id, r.request)) {
             if ((permit && permit->peer != r.bond) || memcmp(hash, r.hash, sizeof(hash))) return reply(doc, "request_conflict");
             out["outcome"] = *r.error ? "rejected" : "committed"; out["revision"] = r.revision; out["bond"] = String(r.bond);
-            if (*r.error) { out["ok"] = false; out["error"] = r.error; }
+            if (*r.error) { out["ok"] = false; out["error"] = r.error.c_str(); }
             String text; serializeJson(out, text); return text;
         }
         if (!permit || permit->writeUntil <= now) return reply(doc, "window_required");
         if (doc["expected_revision"].as<uint64_t>() != wifiStore.revision) return reply(doc, "revision_conflict");
         if (running) return reply(doc, "busy");
-        int receipt = -1;
-        for (int i = 0; i < 8; ++i) if (!*wifiStore.receipts[i].request) { receipt = i; break; }
-        if (receipt < 0) return reply(doc, "result_capacity");
+        const size_t receipt = wifiStore.receipts.size();
+        if (receipt >= 8) return reply(doc, "result_capacity");
         JsonArray changes = doc["changes"].as<JsonArray>();
         if (!changes.size() || changes.size() > 4 || wifiStore.revision == UINT64_MAX) return reply(doc, "capacity");
-        std::unique_ptr<WifiStoreV2> buffer(new(std::nothrow) WifiStoreV2(wifiStore));
-        if(!buffer)return reply(doc,"memory");
+        std::unique_ptr<WifiStore> buffer(new(std::nothrow) WifiStore(wifiStore));
+        if(!buffer || !buffer->valid())return reply(doc,"memory");
+        buffer->preserveActive();
         auto &next=*buffer;
         const char *failure = nullptr;
         String used;
@@ -156,7 +157,7 @@ String wifiManagementCommand(JsonDocument &doc, uint64_t now, const String &lega
             int slot = next.schemes.find(permit->peer.c_str(), networkId);
             if (change["deleted"] == true) {
                 if (slot < 0) { failure = "not_found"; break; }
-                next.schemes.erase(slot); next.labels[slot][0] = 0; next.versions[slot] = 0; continue;
+                if (!next.schemes.erase(slot)) { failure = "memory"; break; } continue;
             }
             const char *host = change["host_ssid"] | "", *ssid = change["ssid"] | "";
             const char *label = change["label"] | "", *credential = change["credential"] | "";
@@ -168,24 +169,24 @@ String wifiManagementCommand(JsonDocument &doc, uint64_t now, const String &lega
             }
             if (failure) break;
             WifiNetwork network;
-            strcpy(network.bond, permit->peer.c_str()); strcpy(network.id, networkId);
-            strcpy(network.host, host); strcpy(network.ssid, ssid);
+            network.bond.set(permit->peer.c_str()); network.id.set(networkId);
+            network.host.set(host); network.ssid.set(ssid);
             if (!strcmp(credential, "keep") || !strcmp(credential, "device")) {
                 if (slot < 0) { failure = "credentials_required"; break; }
-                strcpy(network.password, next.schemes.networks[slot].password);
+                network.password.set(next.schemes.networks[slot].password);
             } else if (!strcmp(credential, "replace")) {
                 const char *password = change["password"] | "";
                 if (!change["password"].is<const char *>() || !*password || !passwordValid(password)) { failure = "credentials_required"; break; }
-                strcpy(network.password, password);
+                network.password.set(password);
             } else if (strcmp(credential, "open")) { failure = "shape"; break; }
             // v1 put selected as a side effect; restore the saved active reference.
-            char bond[22], selected[33]; strcpy(bond, next.schemes.selectedBond); strcpy(selected, next.schemes.selectedId);
+            WifiText bond = next.schemes.selectedBond, selected = next.schemes.selectedId;
             failure = next.schemes.put(network, slot >= 0);
-            strcpy(next.schemes.selectedBond, bond); strcpy(next.schemes.selectedId, selected);
-            wipe(network.password, sizeof(network.password));
+            next.schemes.selectedBond.set(bond); next.schemes.selectedId.set(selected);
+            network.password.clear();
             if (failure) break;
             slot = next.schemes.find(permit->peer.c_str(), networkId);
-            strcpy(next.labels[slot], label); next.versions[slot] = wifiStore.revision + 1;
+            next.schemes.networks[slot].label.set(label); next.schemes.networks[slot].version = wifiStore.revision + 1;
         }
         // Retire the saved active row only when another own-bond row remains.
         // The live connection/active copy survives until explicit activation.
@@ -198,13 +199,13 @@ String wifiManagementCommand(JsonDocument &doc, uint64_t now, const String &lega
         if (failure) {
             // Persist a deterministic refusal together with the unchanged
             // configuration; never persist the partially validated candidate.
-            wipe((char *)&next, sizeof(next)); next = wifiStore;
+            next = wifiStore;
         } else next.revision++;
-        auto &r = next.receipts[receipt]; strcpy(r.bridge, bridge.c_str()); strcpy(r.request, id);
-        strcpy(r.bond, permit->peer.c_str()); memcpy(r.hash, hash, sizeof(hash)); r.revision = next.revision;
-        if (failure) strncpy(r.error, failure, sizeof(r.error) - 1);
+        if (!next.valid() || !next.receipts.resize(receipt+1)) return reply(doc,"memory");
+        auto &r = next.receipts[receipt]; r.bridge.set(bridge.c_str()); r.request.set(id);
+        r.bond.set(permit->peer.c_str()); memcpy(r.hash, hash, sizeof(hash)); r.revision = next.revision;
+        if (failure) r.error.set(failure);
         if (!saveV2(next)) failure = "storage_unknown";
-        wipe((char *)&next, sizeof(next));
         if (failure) return reply(doc, failure);
         out["outcome"] = "committed"; out["revision"] = wifiStore.revision; out["bond"] = permit->peer;
     } else return reply(doc, "unsupported");

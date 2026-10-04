@@ -83,7 +83,7 @@ fn main() {
                     "v2_activate_command.h", "v2_activate_command.cpp",
                     "v2_claim_command.h", "v2_claim_command.cpp",
                     "v2_command_envelope.h", "v2_command_envelope.cpp",
-                    "ble_wire.h", "ble_wire.cpp", "wifi_scheme.h", "wifi_setup.h", "wifi_setup.cpp", "wifi_management.inc", "wake_trace_projection.h",
+                    "ble_wire.h", "ble_wire.cpp", "wifi_scheme.h", "wifi_legacy.h", "wifi_storage.inc", "wifi_setup.h", "wifi_setup.cpp", "wifi_management.inc", "wake_trace_projection.h",
                     "v2_status_snapshot.h", "v2_status_snapshot.cpp",
                     "v2_sync.h", "v2_sync.cpp",
                     "v2_sync_store.h", "v2_sync_store.cpp",

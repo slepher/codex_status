@@ -1,8 +1,6 @@
 #include "wifi_setup.h"
 #include "wifi_scheme.h"
 #include "ble_wire.h"
-static const char *wifiEncodeStage = "encode";
-static int wifiEncodeStatus = 0;
 #ifdef CODEX_WIFI_SETUP_HOST_TEST
 #include "../tools/wifi-setup-test-hal.h"
 #else
@@ -11,26 +9,6 @@ static int wifiEncodeStatus = 0;
 #include <mbedtls/sha256.h>
 #include <miniz.h>
 #include <esp_heap_caps.h>
-static size_t wifiDeflate(void *out, size_t cap, const void *in, size_t size) {
-    // ROM convenience wrappers may have no allocator. Supply the workspace;
-    // keep the large dictionary off the Arduino loop stack and internal heap.
-    auto *work = (tdefl_compressor *)heap_caps_malloc(sizeof(tdefl_compressor), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!work) work = (tdefl_compressor *)heap_caps_malloc(sizeof(tdefl_compressor), MALLOC_CAP_8BIT);
-    wifiEncodeStage = "workspace"; wifiEncodeStatus = -1;
-    if (!work) return 0;
-    size_t consumed = size, written = cap;
-    wifiEncodeStage = "initialize";
-    wifiEncodeStatus = tdefl_init(work, nullptr, nullptr, TDEFL_WRITE_ZLIB_HEADER | TDEFL_DEFAULT_MAX_PROBES);
-    bool okay = wifiEncodeStatus == TDEFL_STATUS_OKAY;
-    if (okay) {
-        wifiEncodeStage = "compress";
-        wifiEncodeStatus = tdefl_compress(work, in, &consumed, out, &written, TDEFL_FINISH);
-        okay = wifiEncodeStatus == TDEFL_STATUS_DONE && consumed == size;
-    }
-    volatile uint8_t *secret = (volatile uint8_t *)work;
-    for (size_t i = 0; i < sizeof(*work); ++i) secret[i] = 0;
-    heap_caps_free(work); return okay ? written : 0;
-}
 static size_t wifiInflate(void *out, size_t cap, const void *in, size_t size) {
     auto *work = (tinfl_decompressor *)heap_caps_malloc(sizeof(tinfl_decompressor), MALLOC_CAP_8BIT);
     if (!work) return 0;
@@ -47,10 +25,12 @@ static size_t wifiInflate(void *out, size_t cap, const void *in, size_t size) {
 #include <memory>
 #include <new>
 
-static WifiSchemes schemes;
-static WifiStoreV2 wifiStore;
+static WifiStore wifiStore;
+static WifiSchemes &schemes = wifiStore.schemes;
 static bool trialOnly = false;
 static bool storeReady = false;
+static bool wifiStorageUncertain = false;
+static bool wifiOldKeyPresent = false;
 static WifiNetwork candidate;
 static String transactionPeer, requestId, operation, stage, error, resultIp;
 static String oldSsid, oldPassword;
@@ -118,68 +98,24 @@ static void wipeString(String &text) {
     text = "";
 }
 static const char *wifiStorageFailure = "storage_unknown";
-static size_t wifiStorageFree = 0, wifiStorageBytes = 0;
-static bool readWifiStore(Preferences &prefs, WifiStoreV2 &out) {
-    size_t size = prefs.getBytesLength("scheme");
-    if (!size || size > sizeof(WifiStoreV2) + 64) return false;
-    std::unique_ptr<uint8_t[]> bytes(new(std::nothrow) uint8_t[size]);
-    if (!bytes) return false;
-    bool okay = prefs.getBytes("scheme", bytes.get(), size) == size;
-    if (okay && size > 4 && !memcmp(bytes.get(), "WFZ2", 4)) {
-        okay = wifiInflate(&out, sizeof(out), bytes.get()+4, size-4) == sizeof(out) && out.valid();
-    } else if (okay && size == sizeof(WifiStoreV2)) {
-        memcpy(&out, bytes.get(), sizeof(out)); okay = out.valid();
-    } else if (okay && size == sizeof(WifiSchemes)) {
-        // Construct defaults in place: a 5 KiB assignment temporary overflowed loopTask.
-        new (&out) WifiStoreV2{}; memcpy(&out.schemes, bytes.get(), sizeof(WifiSchemes));
-        okay = out.schemes.valid();
-        if (okay) {
-            int active = out.schemes.find(out.schemes.selectedBond, out.schemes.selectedId);
-            if (active >= 0) out.active = out.schemes.networks[active];
-        }
-    } else okay = false;
-    wipe((char *)bytes.get(), size); return okay;
-}
-static bool saveV2(WifiStoreV2 &next) {
-    next.seal();
-    // Fixed empty networks/receipts consumed scarce NVS pages. Keep the exact
-    // CRC-protected structure, but store its zlib encoding as one atomic blob.
-    const size_t capacity = sizeof(next) + 64;
-    std::unique_ptr<uint8_t[]> bytes(new(std::nothrow) uint8_t[capacity]);
-    if (!bytes) { wifiStorageFailure = "storage_encode"; return false; }
-    memcpy(bytes.get(), "WFZ2", 4);
-    size_t compressed = wifiDeflate(bytes.get()+4, capacity-4, &next, sizeof(next));
-    Preferences prefs;
-    bool opened = compressed && prefs.begin("wifi-bonds", false);
-    bool okay = false;
-    wifiStorageBytes = compressed ? compressed + 4 : 0;
-    wifiStorageFailure = compressed ? "storage_open" : "storage_encode";
-    std::unique_ptr<WifiStoreV2> check;
-    if (opened) {
-        wifiStorageFree = prefs.freeEntries();
-        okay = prefs.putBytes("scheme", bytes.get(), wifiStorageBytes) == wifiStorageBytes;
-        wifiStorageFailure = okay ? "storage_readback" : "storage_write";
-        check.reset(new(std::nothrow) WifiStoreV2);
-        okay = okay && check && readWifiStore(prefs, *check) && !memcmp(check.get(), &next, sizeof(next));
-        prefs.end();
-    }
-    if (okay) { wifiStore = next; schemes = next.schemes; }
-    if (check) wipe((char *)check.get(), sizeof(*check));
-    wipe((char *)bytes.get(), capacity); return okay;
-}
+static size_t wifiStorageFree = 0, wifiStorageBytes = 0, wifiVerifiedStorageBytes = 0;
+static bool identifier(const char *, size_t);
+static bool ssidValid(const char *);
+static bool passwordValid(const char *);
+#include "wifi_storage.inc"
 static bool save(WifiSchemes &next) {
-    std::unique_ptr<WifiStoreV2> buffer(new(std::nothrow) WifiStoreV2(wifiStore));
-    if(!buffer)return false;
-    auto &stored=*buffer;
-    stored.schemes = next;
-    stored.revision++;
-    int selected = next.find(next.selectedBond, next.selectedId);
-    stored.active = selected >= 0 ? next.networks[selected] : WifiNetwork{};
-    for (int i = 0; i < 12; ++i) {
-        if (memcmp(&next.networks[i], &schemes.networks[i], sizeof(WifiNetwork))) stored.versions[i] = stored.revision;
+    std::unique_ptr<WifiStore> stored(new(std::nothrow) WifiStore);
+    if (!stored || !next.valid() || wifiStore.revision == UINT64_MAX) return false;
+    stored->receipts = wifiStore.receipts;
+    stored->schemes = std::move(next);
+    stored->revision = wifiStore.revision + 1;
+    for (auto &n : stored->schemes.networks) {
+        int previous = schemes.find(n.bond, n.id);
+        if (previous < 0 || strcmp(n.host, schemes.networks[previous].host) || strcmp(n.ssid, schemes.networks[previous].ssid) || strcmp(n.password, schemes.networks[previous].password) || strcmp(n.label, schemes.networks[previous].label)) n.version = stored->revision;
+        else n.version = schemes.networks[previous].version;
     }
-    stored.activeVersion = selected >= 0 ? stored.versions[selected] : 0;
-    bool okay = saveV2(stored); wipe((char *)&stored, sizeof(stored)); return okay;
+    stored->selectActive(stored->schemes.find(stored->schemes.selectedBond, stored->schemes.selectedId));
+    return saveV2(*stored);
 }
 
 bool wifiSchemesBegin() {
@@ -196,32 +132,44 @@ bool wifiSchemesBegin() {
     }
 #endif
     Preferences prefs;
-    if (!prefs.begin("wifi-bonds", false)) return false;
-    size_t size = prefs.getBytesLength("scheme");
-    storeReady = !size;
-    if (!size) {
-        // Avoid large aggregate temporaries in the startup call chain.
-        new (&schemes) WifiSchemes{};
-        new (&wifiStore) WifiStoreV2{};
-    }
-    else {
-        std::unique_ptr<WifiStoreV2> check(new(std::nothrow) WifiStoreV2);
+    if (!prefs.begin("wifi-bonds", false)) { storeReady = false; return false; }
+    bool old = !prefs.getBytesLength("store3") && prefs.getBytesLength("scheme");
+    if (!prefs.getBytesLength("store3") && !old) {
+        wifiStore = WifiStore{}; storeReady = true;
+    } else {
+        std::unique_ptr<WifiStore> check(new(std::nothrow) WifiStore);
         storeReady = check && readWifiStore(prefs, *check);
-        if (storeReady) { wifiStore = *check; schemes = check->schemes; }
-        if (check) wipe((char *)check.get(), sizeof(*check));
+        if (storeReady) wifiStore = std::move(*check);
+    }
+    wifiOldKeyPresent = prefs.getBytesLength("scheme") != 0;
+    wifiStorageBytes = prefs.getBytesLength("store3");
+    if (storeReady) wifiVerifiedStorageBytes = wifiStorageBytes;
+    if (storeReady && !old && wifiOldKeyPresent) {
+        prefs.remove("scheme");
+        wifiOldKeyPresent = prefs.getBytesLength("scheme") != 0;
     }
     prefs.end();
+    // Never remove the old key until new bytes have been written and verified.
+    if (storeReady && old) storeReady = saveV2(wifiStore);
+    if (storeReady) wifiStorageUncertain = false;
     return storeReady;
 }
 bool wifiSchemesCredentials(String &ssid, String &password) {
     if (running && deferredSelection) {
-        ssid = candidate.ssid; password = candidate.password; return true;
+        ssid = candidate.ssid.c_str(); password = candidate.password.c_str(); return true;
     }
-    int slot = schemes.find(schemes.selectedBond, schemes.selectedId);
-    if (!storeReady || slot < 0) return false;
-    ssid = *wifiStore.active.id ? wifiStore.active.ssid : schemes.networks[slot].ssid;
-    password = *wifiStore.active.id ? wifiStore.active.password : schemes.networks[slot].password;
+    if (!storeReady || !*wifiStore.active.id) return false;
+    const auto *active = wifiStore.activeCredentials();
+    if (!*active->ssid) return false;
+    ssid = active->ssid.c_str(); password = active->password.c_str();
     return true;
+}
+void wifiSchemesStorageStatus(JsonObject out) {
+    out["format"] = "WFS3"; out["ready"] = storeReady; out["uncertain"] = wifiStorageUncertain;
+    out["bytes"] = wifiVerifiedStorageBytes; out["old_key_present"] = wifiOldKeyPresent;
+    out["networks"] = schemes.networks.size(); out["receipts"] = wifiStore.receipts.size();
+    out["ram_requested_bytes"] = sizeof(wifiStore) + wifiStore.heapBytes();
+    out["record_bytes"] = sizeof(WifiNetwork); out["receipt_bytes"] = sizeof(WifiReceipt);
 }
 bool wifiSetupBusy() { return running; }
 bool wifiSetupActivated() { return persisted && !trialOnly; }
@@ -252,7 +200,7 @@ static String reply(JsonDocument &request, const char *failure = nullptr, bool i
     if (failure) out["error"] = failure;
     if (includeResult) {
         out["query_id"] = requestId;
-        out["network_id"] = candidate.id;
+        out["network_id"] = candidate.id.c_str();
         out["stage"] = stage;
         out["persisted"] = persisted;
         out["ip"] = resultIp;
@@ -271,29 +219,28 @@ String wifiSchemesMigrate(JsonDocument &request, const String &peer,
     if (!storeReady) return reply(request, "storage");
     if (running) return reply(request, "busy");
     if (!peer.length() || peer.length() > 21 || count > 3) return reply(request, "shape");
-    std::unique_ptr<WifiStoreV2> next(new(std::nothrow) WifiStoreV2(wifiStore));
-    if (!next) return reply(request, "storage");
+    std::unique_ptr<WifiStore> next(new(std::nothrow) WifiStore(wifiStore));
+    if (!next || !next->valid()) return reply(request, "memory");
     const char *failure = nullptr;
     bool changed = false;
     int selected = -1;
     for (size_t i = 0; i < count && !failure; ++i) {
         WifiNetwork n = slots[i];
-        if (n.id[32] || n.ssid[32] || n.password[64] ||
-            !identifier(n.id, 32) || !ssidValid(n.ssid) || !passwordValid(n.password)) {
+        if (!identifier(n.id, 32) || !ssidValid(n.ssid) || !passwordValid(n.password)) {
             failure = "invalid_old_slot";
         } else {
-            strcpy(n.bond, peer.c_str());
-            strcpy(n.host, n.ssid);
+            n.bond.set(peer.c_str());
+            n.host.set(n.ssid);
             int index = next->schemes.find(n.bond, n.id);
             if (index >= 0) {
-                if (memcmp(&next->schemes.networks[index], &n, sizeof(n))) failure = "migration_conflict";
+                if (strcmp(next->schemes.networks[index].ssid, n.ssid) || strcmp(next->schemes.networks[index].password, n.password) || strcmp(next->schemes.networks[index].host, n.host)) failure = "migration_conflict";
             } else {
                 failure = next->schemes.put(n, false);
                 if (!failure) {
                     changed = true;
                     index = next->schemes.find(n.bond, n.id);
-                    next->versions[index] = wifiStore.revision + 1;
-                    snprintf(next->labels[index], sizeof(next->labels[index]), "Migrated %s", n.id);
+                    next->schemes.networks[index].version = wifiStore.revision + 1;
+                    next->schemes.networks[index].label.set((String("Migrated ") + n.id.c_str()).c_str());
                 }
             }
             if (!failure && preferred == String(n.ssid)) {
@@ -301,19 +248,17 @@ String wifiSchemesMigrate(JsonDocument &request, const String &peer,
                 selected = index;
             }
         }
-        wipe((char *)&n, sizeof(n));
     }
     // put() selects the inserted row. Migration preserves the existing active
     // snapshot, or adopts precisely the old/current connection without WiFi.begin.
-    strcpy(next->schemes.selectedBond, schemes.selectedBond);
-    strcpy(next->schemes.selectedId, schemes.selectedId);
+    next->schemes.selectedBond.set(schemes.selectedBond);
+    next->schemes.selectedId.set(schemes.selectedId);
     if (!failure && !*wifiStore.active.id && count) {
         if (selected < 0) failure = "active_not_found";
         else {
-            next->active = next->schemes.networks[selected];
-            next->activeVersion = next->versions[selected];
-            strcpy(next->schemes.selectedBond, next->active.bond);
-            strcpy(next->schemes.selectedId, next->active.id);
+            next->selectActive(selected);
+            next->schemes.selectedBond.set(next->active.bond);
+            next->schemes.selectedId.set(next->active.id);
             changed = true;
         }
     }
@@ -322,16 +267,12 @@ String wifiSchemesMigrate(JsonDocument &request, const String &peer,
         next->revision = wifiStore.revision + 1;
         if (!saveV2(*next)) failure = "storage_unknown";
     }
-    wipe((char *)next.get(), sizeof(*next));
     if (failure) {
         JsonDocument out; deserializeJson(out, reply(request, failure));
         if (!strcmp(failure, "storage_unknown")) {
             out["storage_stage"] = wifiStorageFailure;
             out["storage_bytes"] = wifiStorageBytes;
-            out["unencoded_bytes"] = sizeof(WifiStoreV2);
-            if (!strcmp(wifiStorageFailure, "storage_encode")) {
-                out["encode_stage"] = wifiEncodeStage; out["encode_status"] = wifiEncodeStatus;
-            }
+            out["unencoded_bytes"] = wifiStorageBytes;
             out["nvs_free_entries"] = wifiStorageFree;
         }
         String text; serializeJson(out, text); return text;
@@ -353,7 +294,7 @@ void wifiSetupAbort(const char *reason) {
     stage = "failed";
     WiFi.disconnect(false);
     if (oldSsid.length()) WiFi.begin(oldSsid.c_str(), oldPassword.c_str());
-    wipe(candidate.password, sizeof(candidate.password));
+    candidate.password.clear();
     wipeString(oldPassword);
 }
 void wifiSetupRadioClosed(const char *reason) {
@@ -390,31 +331,30 @@ void wifiSetupPoll(uint64_t now, const String &peer, uint32_t generation, bool e
         resultIp = WiFi.localIP().toString(); running = false; stage = "trial_complete"; persisted = false;
         WiFi.disconnect(false);
         if (oldSsid.length()) WiFi.begin(oldSsid.c_str(), oldPassword.c_str());
-        wipe(candidate.password, sizeof(candidate.password)); wipeString(oldPassword); return;
+        candidate.password.clear(); wipeString(oldPassword); return;
     }
     WifiSchemes next = schemes;
     const char *failure = nullptr;
     if (operation == "wifi_setup") failure = next.put(candidate, replaceNetwork);
     else {
-        strcpy(next.selectedBond, candidate.bond);
-        strcpy(next.selectedId, candidate.id);
+        next.selectedBond.set(candidate.bond);
+        next.selectedId.set(candidate.id);
     }
     if (!failure && !save(next)) failure = "storage";
-    wipe((char *)&next, sizeof(next));
     if (failure) { wifiSetupAbort(failure); return; }
     resultIp = WiFi.localIP().toString();
     persisted = true;
     running = false;
     stage = "persisted";
     deferredSelection = false;
-    wipe(candidate.password, sizeof(candidate.password));
+    candidate.password.clear();
     wipeString(oldPassword);
 }
 
 // Same length-delimited metadata fingerprint as Bridge; no password bytes.
 static String wifiMetadataKey(const WifiNetwork &network, const char *label, bool open) {
     uint8_t payload[132], hash[32]; size_t size = 0;
-    for (const char *value : {network.host, network.ssid, label}) {
+    for (const char *value : {network.host.c_str(), network.ssid.c_str(), label}) {
         size_t length = strlen(value); memcpy(payload+size,value,length+1); size += length+1;
     }
     payload[size++] = open ? 1 : 0;
@@ -434,6 +374,7 @@ String wifiSetupCommand(JsonDocument &doc, const String &peer, uint32_t generati
         JsonString text = doc[key].as<JsonString>();
         if (!text || text.size() != strlen(text.c_str())) return reply(doc, "shape");
     }
+    if (wifiStorageUncertain && !running && !wifiSchemesBegin()) return reply(doc, "storage");
     if (!storeReady) return reply(doc, "storage");
     if (!strcmp(op, "wifi_save") || !strcmp(op, "wifi_result")) {
         if (!strcmp(op, "wifi_save") && (!doc["changes"].is<JsonArray>() || !doc["changes"].size() || doc["changes"].size() > 4)) return reply(doc, "shape");
@@ -456,10 +397,10 @@ String wifiSetupCommand(JsonDocument &doc, const String &peer, uint32_t generati
         JsonDocument out;
         out["ack"] = "wifi"; out["op"] = "wifi"; out["request_id"] = id;
         out["device_mac"] = doc["device_mac"]; out["ok"] = true; out["network_id"] = networkId;
-        out["version"] = slot < 0 ? 0 : wifiStore.versions[slot];
+        out["version"] = slot < 0 ? 0 : schemes.networks[slot].version;
         if (!doc["open"].is<bool>() || String(doc["metadata_key"] | "").length()!=64) return reply(doc,"shape");
         bool open = doc["open"].as<bool>();
-        bool matches = slot >= 0 && wifiMetadataKey(schemes.networks[slot],wifiStore.labels[slot],open) == (doc["metadata_key"] | "") &&
+        bool matches = slot >= 0 && wifiMetadataKey(schemes.networks[slot],schemes.networks[slot].label.c_str(),open) == (doc["metadata_key"] | "") &&
             (!open || !*schemes.networks[slot].password);
         if(!doc["credential_key"].isNull()) {
             String key=doc["credential_key"] | "";
@@ -474,13 +415,13 @@ String wifiSetupCommand(JsonDocument &doc, const String &peer, uint32_t generati
         }
         out["matches"] = matches;
         bool active = slot >= 0 && peer == wifiStore.active.bond && String(networkId) == wifiStore.active.id &&
-            wifiStore.activeVersion == wifiStore.versions[slot];
+            wifiStore.activeVersion == schemes.networks[slot].version;
         bool connected = active && WiFi.status() == WL_CONNECTED && WiFi.SSID() == String(schemes.networks[slot].ssid) &&
             !(WiFi.localIP() == IPAddress(0,0,0,0));
         out["active"] = active; out["connected"] = connected;
         if (WiFi.status() == WL_CONNECTED) out["actual_ssid"] = WiFi.SSID();
         bool currentAttempt = slot >= 0 && transactionPeer == peer && String(networkId) == candidate.id &&
-            selectionVersion == wifiStore.versions[slot] && (running || error.length());
+            selectionVersion == schemes.networks[slot].version && (running || error.length());
         const char *normalFailure = active && !connected && !currentAttempt && attemptedSsid == String(schemes.networks[slot].ssid) ?
             wifiConnectionFailure(wifiDisconnectReason) : nullptr;
         out["stage"] = connected ? "connected" : currentAttempt ? stage : normalFailure ? "failed" : slot < 0 ? "missing" : "saved";
@@ -492,7 +433,7 @@ String wifiSetupCommand(JsonDocument &doc, const String &peer, uint32_t generati
     if (!strcmp(op, "wifi_active")) {
         JsonDocument out; out["ack"] = "wifi"; out["op"] = "wifi"; out["request_id"] = id;
         out["device_mac"] = doc["device_mac"]; out["ok"] = true;
-        out["network_id"] = wifiStore.active.id; out["version"] = wifiStore.activeVersion;
+        out["network_id"] = wifiStore.active.id.c_str(); out["version"] = wifiStore.activeVersion;
         out["revision"] = wifiStore.revision;
         String text; serializeJson(out, text); return text;
     }
@@ -502,14 +443,14 @@ String wifiSetupCommand(JsonDocument &doc, const String &peer, uint32_t generati
         out["device_mac"] = doc["device_mac"]; out["ok"] = true;
         out["capacity"] = 4; out["wifi_setup_protocol"] = 1;
         out["physical_remaining_s"] = physicalUntil > now ? (physicalUntil - now) / 1000 : 0;
-        out["selected_id"] = peer == schemes.selectedBond ? schemes.selectedId : "";
+        out["selected_id"] = peer == schemes.selectedBond ? schemes.selectedId.c_str() : "";
         JsonArray networks = out["networks"].to<JsonArray>();
         for (const auto &network : schemes.networks) {
             if (!*network.id || peer != network.bond) continue;
             JsonObject n = networks.add<JsonObject>();
-            n["network_id"] = network.id; n["host_ssid"] = network.host; n["ssid"] = network.ssid;
+            n["network_id"] = network.id.c_str(); n["host_ssid"] = network.host.c_str(); n["ssid"] = network.ssid.c_str();
             int index = schemes.find(network.bond, network.id);
-            n["label"] = wifiStore.labels[index]; n["version"] = wifiStore.versions[index];
+            n["label"] = schemes.networks[index].label.c_str(); n["version"] = schemes.networks[index].version;
             n["password"] = String(network.password);
         }
         String text; serializeJson(out, text);
@@ -540,39 +481,41 @@ String wifiSetupCommand(JsonDocument &doc, const String &peer, uint32_t generati
     if (!identifier(networkId, 32)) return reply(doc, "shape");
     int slot = schemes.find(peer.c_str(), networkId);
     WifiNetwork network;
-    if (activate && (!doc["version"].is<uint64_t>() || doc["version"].as<uint64_t>() != wifiStore.versions[slot < 0 ? 0 : slot])) return reply(doc, "revision_conflict");
+    if (activate && (!doc["version"].is<uint64_t>() || doc["version"].as<uint64_t>() != (slot < 0 ? 0 : schemes.networks[slot].version))) return reply(doc, "revision_conflict");
     if (setup) {
         const char *host = doc["host_ssid"] | "", *ssid = doc["ssid"] | "";
         const char *password = doc["password"] | "";
         if (!doc["password"].is<const char *>() || !ssidValid(host) || !ssidValid(ssid) ||
             !passwordValid(password) || !doc["replace"].is<bool>()) return reply(doc, "shape");
-        strcpy(network.bond, peer.c_str()); strcpy(network.id, networkId);
-        strcpy(network.host, host); strcpy(network.ssid, ssid); strcpy(network.password, password);
+        network.bond.set(peer.c_str()); network.id.set(networkId);
+        network.host.set(host); network.ssid.set(ssid); network.password.set(password);
+        if (slot >= 0) { network.label = schemes.networks[slot].label; network.version = schemes.networks[slot].version; }
         WifiSchemes next = schemes;
         const char *failure = trial ? nullptr : next.put(network, doc["replace"].as<bool>());
-        wipe((char *)&next, sizeof(next));
-        if (failure) { wipe(network.password, sizeof(network.password)); return reply(doc, failure); }
+        if (failure) { network.password.clear(); return reply(doc, failure); }
     } else {
         if (slot < 0) return reply(doc, "not_found");
         network = schemes.networks[slot];
     }
     uint64_t until = physicalUntil > now ? physicalUntil : lightUntil;
-    if (!remove && until <= now) { wipe(network.password, sizeof(network.password)); return reply(doc, "window_required"); }
+    if (!network.valid()) return reply(doc, "memory");
+    if (!remove && until <= now) { network.password.clear(); return reply(doc, "window_required"); }
     if (remove) {
         const bool selected = !strcmp(schemes.selectedBond, network.bond) &&
                               !strcmp(schemes.selectedId, network.id);
         WifiSchemes next = schemes;
-        next.erase(slot);
+        if (!next.erase(slot)) return reply(doc, "memory");
         bool saved = save(next);
-        wipe((char *)&next, sizeof(next));
-        wipe(network.password, sizeof(network.password));
+        network.password.clear();
         if (!saved) return reply(doc, "storage");
         if (selected) WiFi.disconnect(false);
     }
     trialOnly = trial;
     transactionPeer = peer; requestId = id; operation = op; transactionGeneration = generation;
-    candidate = network; wipe(network.password, sizeof(network.password));
-    selectionVersion = slot < 0 ? 0 : wifiStore.versions[slot];
+    candidate = network;
+    if (!candidate.valid()) return reply(doc, "memory");
+    network.password.clear();
+    selectionVersion = network.version;
     wifiDisconnectReason = 0;
     memcpy(fingerprint, hash, sizeof(hash));
     error = ""; resultIp = ""; persisted = remove;
@@ -592,7 +535,7 @@ String wifiSetupCommand(JsonDocument &doc, const String &peer, uint32_t generati
             wifiSetupConnectionStarted(String(candidate.ssid));
             WiFi.begin(candidate.ssid, candidate.password);
         }
-    } else wipe(candidate.password, sizeof(candidate.password));
+    } else candidate.password.clear();
     return reply(doc, nullptr, true);
 }
 

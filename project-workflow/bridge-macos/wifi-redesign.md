@@ -1,4 +1,6 @@
 # Wi-Fi 双侧方案、比较与同步设计
+
+存储/本地写入口的2026-10-04新实现与候选边界见 [wifi-variable-storage.md](wifi-variable-storage.md)：WFS3与按需RAM软件验证完成，AP/USB认证事务已收归；.55未部署，实机仍.54，旧兼容读取保留。此前“变长/入口未实施”属于阶段记录。
 ## 2026-10-04 当前会合 Wi-Fi 合同（已实施并配套部署）
 
 权威实施步骤、软件验收及运行镜像证据见 [实施及验收记录](wifi-rendezvous-implementation.md)。Bridge与Note4 .54已配套部署。本节覆盖下文历史 BOOT-only、重复读取/读回确认和 8s/20s 预算条款；历史审计证据保留，不作为现行限制。

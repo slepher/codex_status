@@ -11,6 +11,8 @@ extern "C" int codex_sim_wifi_open(const char *dir) {
     testNvsBlob.clear();
     std::ifstream file(wifiBlobPath, std::ios::binary);
     if (file) testNvsBlob.assign(std::istreambuf_iterator<char>(file), {});
+    testNvsLegacyBlob.clear();
+    if (testNvsBlob.size() && memcmp(testNvsBlob.data(),"WFS3",std::min(size_t(4),testNvsBlob.size()))) testNvsLegacyBlob.swap(testNvsBlob);
     wifiManagementResetSession(); running = false; storeReady = false;
     return wifiSchemesBegin() ? 1 : 0;
 }

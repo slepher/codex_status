@@ -1,5 +1,5 @@
 #include "../src/ble_recovery.h"
-#include "../src/wifi_scheme.h"
+#include "../src/wifi_legacy.h"
 #include <cassert>
 #include <cstdio>
 
@@ -15,8 +15,8 @@ int main() {
     assert(v2PowerSleepDecision(true, true, false, false, false,
                                plan, true, 0, 0, 400000) == V2_POWER_BOOT_ENDED);
     recovery.close(); assert(!recovery.active(1));
-    WifiSchemes schemes;
-    WifiNetwork network;
+    WifiLegacySchemes schemes;
+    WifiLegacyNetwork network;
     strcpy(network.bond, "aa:bb:cc:dd:ee:ff/1");
     strcpy(network.id, "home"); strcpy(network.host, "host-5g"); strcpy(network.ssid, "device-2g");
     assert(!schemes.put(network, false));
@@ -32,7 +32,7 @@ int main() {
     strcpy(network.id, "full"); strcpy(network.host, "full");
     assert(!strcmp(schemes.put(network, false), "capacity"));
     schemes.seal(); assert(schemes.valid());
-    WifiSchemes reboot = schemes; assert(reboot.valid());
+    WifiLegacySchemes reboot = schemes; assert(reboot.valid());
     reboot.networks[0].password[0] = 'x'; assert(!reboot.valid());
     reboot = schemes; reboot.erase(reboot.find(reboot.selectedBond, reboot.selectedId));
     reboot.seal(); assert(reboot.valid() && !*reboot.selectedId);

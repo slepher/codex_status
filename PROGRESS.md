@@ -1,5 +1,18 @@
 # Codex Status 项目进度（交接文档）
 
+## 2026-10-04 Wi-Fi 变长存储与 AP/USB 入口收归软件交付完成；.55 候选未部署
+
+- **实现与计划**：[设计、资源预算及验收](project-workflow/bridge-macos/wifi-variable-storage.md)。WFS3显式magic/version/有效长度/网络与回执实际数量/CRC、小端整数及字段/记录长度；实际record和字符串按需分配，只有一个长期仓库，无空槽/原生struct持久化/压缩新写。标签与版本随record；未编辑活动版本引用保存项，编辑/删除后仅保留旧SSID/密码。setup保存工作集move到堆候选，不增加全量仓库栈副本。
+- **事务与恢复**：单blob原子提交+完整读回；包括NVS已提交index却在退役旧chunk时返回错误的场景，任何put尝试未确认先重新加载，原事务result确认，不用旧RAM修订盲写。12网络/3bond×4与8持久回执上限保留，满容量明拒。WFZ2/raw-v2/raw-v1验证转换后写store3，读回成功或后续独立加载新格式成功才退役scheme；remove失败保留待重试。旧sN/pN读取/物理迁移恢复与兼容代码仍保留，未静默回落旧格式。
+- **AP/USB软件收归**：AP `/save`/`/api/wifi/apply`复用既有HTTP认证与事务，`/api/wifi/result`查原结果；旧裸表单与GET清空退役。USB旧`wifi`只返回退役提示，`wifi-json`要求endpoint token并经过共享MAC/owner及permit/合法窗口/冻结修订/持久回执校验。保存不自动启用/试连/重启，不伪造bond。源码审计确认无sN/pN凭据写入者；原last使用提示保留。真实AP/USB写入未执行，不称实机验收。
+- **资源证据**：空/单条1回执/典型2条2回执/满12条8回执有效字节33/225/387/5036；活动旧凭据独立时最多5134。Xtensa仓库120B、网络56B、回执72B、数组cookie8B；对应常驻存储组件RAM120/433/670/5986B、克隆提交峰值306/1316/2114/22044B，旧活动快照上限22436B。含实际字符串/候选/编码+读回，allocator/JSON/传输/NVS/RF驱动另计，非整机实测峰值。干净NVS entry成本与碎片/GC/原子旧值预算见计划。固件静态RAM125412→117876B（-7536B）。
+- **验证**：生产setup/management/storage ASan+UBSan通过；迁移/所有截断/逐字节损坏/有效CRC非法长度数量版本/原子旧新边界/读回与退役失败/分配故障/commit后错误查询/容量/绑定版本与活动快照覆盖。最终受影响Rust core12/app8/device-sim5通过，旧恢复夹具通过。匹配ELF启动192B/读取240B/提交64B/poll144B/命令624B；可见Wi-Fi/NVS局部链最高2448B≤4096B；.50原5312/5344B仍red，新候选green。仅zectrix-note4-b、无并行pio/clean/分区修改；最终增量37.56s构建，git diff --check通过。
+- **最终候选ROM（未部署）**：`0.18.55-note4-b-wifi-store3` / `zectrix-note4-400x300`，1735744B，`/Users/slepher/project/codex_status/artifacts/bridge-macos/note4-0.18.55-wifi-store3.bin`，SHA256 `3A552561A88B5572FD901FD6ACF2D65E75BD47BE9AF337262CD43065247642FF`；匹配ELF同名。marker/注册MAC/public与认证身份已核对；固件source/source ABI/ROM对应，未提交。
+- **真实运行保持.54**：独立认证MAC7C4FADB93408 / IP192.168.10.101、fw `0.18.54-note4-b-wifi-rv2` / target `zectrix-note4-400x300`，ota_1，1737776B/hash `1923E9B0C9138F5DAF4CF1BFC4A508904990EEA6C2364CE1EA9D63015F122604`。运行ROM仍旧WFZ2/固定RAM，不能把候选说成已运行WFS3。Bridge app路径沿用下节，exe SHA256 `23DFF946FA555849D40E494B0D74B5293A6ACE9F151BD403FECEE7FCB3DD4D87`未变；缓存targets2/networks2，未重新读取完整网络配置或改写实际网络。现有OTA21192869仍是.54 succeeded，无新作业。
+- **备份/部署边界**：私有data和installation-id备份 `/Users/slepher/Library/Application Support/dev.codexstatus.bridge/deployment-backups/wifi-store3-20261004-183948`，0600/0700、身份一致；旧.54 ROM保留。auto-review明确拒绝OTA排队：本次实现/验证请求没有明确授权替换固件并重启设备；未执行、未绕过。用户随后明确授权提交、OTA与部署；下一步先提交源码，再OTA并验证真实旧格式迁移、认证wifi_storage与运行镜像。
+- **保留边界**：系统location/bluetooth权限仍待用户界面授权；真实SSID/错误密码/离线BLE/AP/DHCP/连续RF睡醒/Flash切电/功耗/跨平台与其他硬件、兼容代码最终移除仍B5/B6。新AP/USB行为实机验证与WFS3真实迁移未验，B6不结项。未开串口/清NVS/改钥匙串或TCC。
+- **证据**：`artifacts/bridge-macos/wifi-store3-{rom-manifest,deployment-preflight,current-runtime,resource-budget,entrypoint-audit}.json`，`wifi-store3-layout.s`、`wifi-store3-stack.log`、`wifi-store3-stack-regression-red.log`、`wifi-store3-cpp-final.log`、`wifi-storage-tests.log`、`wifi-store3-recovery.log`、`wifi-store3-rust-final.log`、`wifi-store3-pio-release.log`。
+
 ## 2026-10-04 Wi-Fi 会合修订已实施并配套部署：普通窗口 BLE 同步、按需诊断、页面当前网络保护
 
 - **现行合同与实现**：[实施及验收记录](project-workflow/bridge-macos/wifi-rendezvous-implementation.md)、wifi-protocol/wifi-redesign 顶节已覆盖历史 BOOT-only、重复读配置及分步重开预算。日常已绑定/认证且 owner 允许的配置写入复用已有正式 light/sync 窗口，无额外 BOOT；离线 BLE 支持最多4条整行原子变更，与 HTTP 共用冻结修订/NVS事务/持久回执。BOOT 仍用于首次绑定、物理救援和旧槽迁移。不隐式续租。

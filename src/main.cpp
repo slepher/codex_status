@@ -90,7 +90,7 @@ static bool targetUnverified = false;
 #define FW_VERSION    "0.13.9-clkwin"
 #elif defined(CODEX_TARGET_NOTE4)
 #ifdef CODEX_NOTE4_ROM_B
-#define FW_VERSION    "0.18.54-note4-b-wifi-rv2"
+#define FW_VERSION    "0.18.55-note4-b-wifi-store3"
 #else
 #define FW_VERSION    "0.18.19-note4-a"
 #endif
@@ -1087,6 +1087,8 @@ static void screen(const std::vector<String> &lines, UBYTE color = BLACK);
 static void epdFlush(bool forceFull = false);
 static int  batteryPercent();
 static bool requestAuthorized();
+static void handleWifiManagement(const char *op);
+static String wifiManagementRequest(JsonDocument &request, const char *op);
 static void deepSleepFor(uint32_t sec);
 static void renderCurrent();
 static void persistMode();
@@ -2460,47 +2462,17 @@ static bool retryWifi() {
 
 // ---------------- 配网模式 ----------------
 static void handleConfigRoot() {
-    int16_t n = WiFi.scanNetworks();
-    String html = F("<!DOCTYPE html><html><head><meta charset='utf-8'>"
-                    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                    "<title>Codex Status Setup</title></head><body>");
-    html += F("<h2>Codex Status - Wi-Fi Setup</h2>");
-    html += F("<form action='/save' method='post'>");
-    html += F("<label>Wi-Fi:<br><select name='ssid'>");
-    for (int i = 0; i < n; i++) {
-        html += "<option value='" + WiFi.SSID(i) + "'>" + WiFi.SSID(i) + " (" + String(WiFi.RSSI(i)) + " dBm)</option>";
-    }
-    html += F("</select></label><br><br>");
-    html += F("Or manual SSID:<br><input name='manual' size='32'><br><br>");
-    html += F("Password:<br><input type='password' name='pass' size='32'><br><br>");
-    html += F("<button type='submit'>Save &amp; Reboot</button></form>");
-    html += F("<p><a href='/clear'>Clear all saved Wi-Fi</a></p></body></html>");
-    server.send(200, "text/html", html);
-    WiFi.scanDelete();
+    // AP is a recovery transport for the same bonded transaction protocol.
+    // It cannot invent a bond, overwrite a slot, or bypass a BLE-issued permit.
+    server.send(200, "text/html", R"HTML(<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Wi-Fi recovery</title></head><body>
+<h2>Wi-Fi recovery</h2><p>Use Bridge and the device BOOT button to bind or configure Wi-Fi over Bluetooth. Saving does not activate a network.</p>
+<details><summary>Authenticated transaction</summary><p>Use an endpoint token, a live bonded permit, expected_revision and a stable request_id. If the response is lost, query the same transaction before retrying.</p>
+<label>Endpoint token <input id="token" type="password" autocomplete="off"></label><br>
+<label>Transaction JSON<br><textarea id="body" rows="10" cols="40"></textarea></label><br>
+<button id="save">Save transaction</button><button id="result">Query result</button><pre id="output"></pre></details>
+<script>for(const [id,url] of [['save','/api/wifi/apply'],['result','/api/wifi/result']])document.getElementById(id).onclick=async()=>{try{const r=await fetch(url,{method:'POST',headers:{'Authorization':'Bearer '+document.getElementById('token').value,'Content-Type':'application/json'},body:document.getElementById('body').value});document.getElementById('output').textContent=await r.text()}catch(e){document.getElementById('output').textContent='Response unknown. Query the original transaction.'}};</script></body></html>)HTML");
 }
-
-static void handleConfigSave() {
-    String ssid = (server.hasArg("manual") && server.arg("manual").length()) ? server.arg("manual") : server.arg("ssid");
-    String pass = server.arg("pass");
-    if (!ssid.length()) {
-        server.send(400, "text/plain", "ssid required");
-        return;
-    }
-    prefs.begin("wifi", false);
-    int slot = -1;
-    for (int i = 0; i < MAX_SLOTS; i++) {
-        if (!prefs.getString(("s" + String(i)).c_str(), "").length()) { slot = i; break; }
-    }
-    if (slot < 0) slot = 0;
-    prefs.putString(("s" + String(slot)).c_str(), ssid);
-    prefs.putString(("p" + String(slot)).c_str(), pass);
-    prefs.putUChar("last", (uint8_t)slot);
-    prefs.end();
-    server.send(200, "text/html", "<h3>Saved. Rebooting...</h3>");
-    screen({"Wi-Fi saved:", ssid, "", "Rebooting..."});
-    delay(800);
-    ESP.restart();
-}
+static void handleConfigSave() { handleWifiManagement("apply"); }
 
 static void startConfigMode() {
     if (v2InRendezvous) {
@@ -2516,15 +2488,10 @@ static void startConfigMode() {
     screen({"WIFI SETUP", "", "AP:   " + apSsid, "PASS: " AP_PASSWORD, "", "Open http://", "192.168.4.1"});
     server.on("/", HTTP_GET, handleConfigRoot);
     server.on("/save", HTTP_POST, handleConfigSave);
-    server.on("/clear", HTTP_GET, []() {
-        prefs.begin("wifi", false);
-        prefs.clear();
-        prefs.end();
-        server.send(200, "text/plain", "cleared");
-        screen({"Wi-Fi cleared", "Rebooting..."});
-        delay(600);
-        ESP.restart();
-    });
+    server.on("/api/wifi/apply", HTTP_POST, [] { handleWifiManagement("apply"); });
+    server.on("/api/wifi/result", HTTP_POST, [] { handleWifiManagement("result"); });
+    server.on("/clear", HTTP_GET, [] { server.send(410, "text/plain", "Use authenticated Wi-Fi transactions; GET cannot clear configuration."); });
+    const char *headers[] = {"Authorization"}; server.collectHeaders(headers, 1);
     server.begin();
 }
 
@@ -4002,11 +3969,18 @@ static void handleWifiManagement(const char *op) {
     if (body.length() > 8192 || deserializeJson(request, body) || String(request["device_mac"] | "") != macText()) {
         server.send(400, "application/json", "{\"ok\":false,\"error\":\"shape\"}"); return;
     }
+    String response = wifiManagementRequest(request, op);
+    JsonDocument outcome; deserializeJson(outcome, response);
+    server.send(outcome["error"] == "occupied" ? 409 : 200, "application/json", response);
+}
+
+static String wifiManagementRequest(JsonDocument &request, const char *op) {
+    if (String(request["device_mac"] | "") != macText()) return "{\"ok\":false,\"error\":\"identity\"}";
     request["op"] = op;
     OwnerRec owner;
     if (!strcmp(op,"apply") && ownerGet(owner) && owner.id != (request["bridge_id"] | "")) {
         JsonDocument out;out["device_mac"]=macText();out["ok"]=false;out["error"]="occupied";
-        String text;serializeJson(out,text);server.send(409,"application/json",text);return;
+        String text;serializeJson(out,text);return text;
     }
     JsonDocument old;
     JsonArray list = old.to<JsonArray>();
@@ -4017,7 +3991,7 @@ static void handleWifiManagement(const char *op) {
     }
     prefs.end();
     String legacy; serializeJson(old, legacy);
-    server.send(200, "application/json", wifiManagementCommand(request, v2NowMs(), legacy));
+    return wifiManagementCommand(request, v2NowMs(), legacy);
 }
 
 // GET /api/status: authenticated authoritative state (the beacon only points).
@@ -4129,6 +4103,7 @@ static void handleV2Status() {
     } else sync["last_completed"] = nullptr;
     sync["last_error"] = syncStoreLost() ? "batch_lost" : nullptr;
     sync["confirmation_pending"] = false;
+    wifiSchemesStorageStatus(doc["wifi_storage"].to<JsonObject>());
     String out;
     serializeJson(doc, out);
     server.send(200, "application/json", out);
@@ -4701,17 +4676,17 @@ static void serviceV2Ble() {
                     if (!ssid.length()) continue;
                     String password = oldPrefs.getString(("p" + String(i)).c_str(), "");
                     auto &n = slots[count++];
-                    snprintf(n.id, sizeof(n.id), "wifi-slot-%d", i);
+                    n.id.set((String("wifi-slot-") + String(i)).c_str());
                     // Length errors must reject rather than truncate credentials.
                     if (ssid.length() > 32 || password.length() > 64 ||
-                        strlen(ssid.c_str()) != ssid.length() || strlen(password.c_str()) != password.length()) n.id[0] = 0;
-                    else { strcpy(n.ssid, ssid.c_str()); strcpy(n.password, password.c_str()); }
+                        strlen(ssid.c_str()) != ssid.length() || strlen(password.c_str()) != password.length()) n.id.clear();
+                    else { n.ssid.set(ssid.c_str()); n.password.set(password.c_str()); }
                     if (!preferred.length() && i == last) preferred = ssid;
                     if (password.length()) memset(const_cast<char *>(password.c_str()), 0, password.length());
                 }
                 oldPrefs.end();
             }
-            if (!preferred.length() && count) preferred = slots[0].ssid;
+            if (!preferred.length() && count) preferred = slots[0].ssid.c_str();
             JsonDocument out;
             if (!opened) {
                 out["ack"] = "wifi"; out["request_id"] = doc["request_id"];
@@ -4732,8 +4707,6 @@ static void serviceV2Ble() {
                 out["retired"] = retired;
                 if (!retired) { out["ok"] = false; out["error"] = "retirement_pending"; }
             }
-            volatile uint8_t *secret = (volatile uint8_t *)slots;
-            for (size_t i = 0; i < sizeof(slots); ++i) secret[i] = 0;
             v2BleNotify(out); return;
         }
         String result = wifiSetupCommand(doc, identity, generation, now, bleRecovery.until,
@@ -5703,43 +5676,45 @@ static void dumpPmStats() {
     DevLog.printf("[pm] stats:\n%s", pmStatsText().c_str());
 }
 
-// USB serial provisioning: `wifi <ssid> <pass>` saves to NVS and reboots;
+// USB Wi-Fi writes: `wifi-json <authenticated apply/result JSON>` uses the
+// same transaction/permit/owner gate as HTTP; legacy `wifi` never writes.
 // `status` prints IP/RSSI/heap/state; `batt` prints battery; `pair` opens a
 // BLE session with a pairing window; `pmstats` dumps PM light-sleep counters.
 static void handleSerialCli() {
     static String rx;
+    static bool overflow = false;
     while (Serial.available()) {
         char c = (char)Serial.read();
         if (c == '\r') continue;
         if (c != '\n') {
-            if (rx.length() < 200) rx += c;
+            if (rx.length() < 8204) rx += c; else overflow = true;
             continue;
         }
+        if (overflow) { if (rx.length()) memset(const_cast<char *>(rx.c_str()), 0, rx.length()); rx = ""; overflow = false; Serial.println("Request too long"); continue; }
         String line = rx;
+        if (rx.length()) memset(const_cast<char *>(rx.c_str()), 0, rx.length());
         rx = "";
         line.trim();
-        if (line.startsWith("wifi ")) {
-            int sp = line.indexOf(' ', 5);
-            if (sp > 5) {
-                String ssid = line.substring(5, sp);
-                String pass = line.substring(sp + 1);
-                prefs.begin("wifi", false);
-                int slot = -1;
-                for (int i = 0; i < MAX_SLOTS; i++) {
-                    if (!prefs.getString(("s" + String(i)).c_str(), "").length()) { slot = i; break; }
+        if (line.startsWith("wifi-json ")) {
+            JsonDocument request;
+            String body = line.substring(10);
+            bool authorized = false;
+            if (body.length() <= 8192 && !deserializeJson(request, body)) {
+                const String token = request["token"] | "";
+                for (int i = 0; i < storeCount(); ++i) {
+                    EndpointRec endpoint;
+                    if (storeGet(i, endpoint) && token.length() && token == endpoint.token) authorized = true;
                 }
-                if (slot < 0) slot = 0;
-                prefs.putString(("s" + String(slot)).c_str(), ssid);
-                prefs.putString(("p" + String(slot)).c_str(), pass);
-                prefs.putUChar("last", (uint8_t)slot);
-                prefs.end();
-                DevLog.printf("[cli] wifi saved slot %d, rebooting\n", slot);
-                screen({"Wi-Fi saved via USB:", ssid, "", "Rebooting..."});
-                delay(800);
-                ESP.restart();
-            } else {
-                DevLog.println("[cli] usage: wifi <ssid> <pass>");
             }
+            if (!authorized) Serial.println("{\"ok\":false,\"error\":\"unauthorized\"}");
+            else {
+                const String op = request["op"] | "";
+                if (op != "apply" && op != "result") Serial.println("{\"ok\":false,\"error\":\"shape\"}");
+                else Serial.println(wifiManagementRequest(request, op.c_str()));
+            }
+            if (body.length()) memset(const_cast<char *>(body.c_str()), 0, body.length());
+        } else if (line.startsWith("wifi ")) {
+            Serial.println("Legacy Wi-Fi writes retired. Use Bridge bonded setup or authenticated wifi-json transactions.");
         } else if (line == "status") {
             DevLog.printf("[cli] fw=%s state=%s ip=%s rssi=%d heap=%u\n",
                           FW_VERSION, deviceStateText(), ipText().c_str(),
@@ -5817,8 +5792,9 @@ static void handleSerialCli() {
             DevLog.printf("[pm] %s", taskStatsText().c_str());
             DevLog.printf("[pm] timers:\n%s", timerStatsText().c_str());
         } else if (line.length()) {
-            DevLog.println("[cli] commands: wifi <ssid> <pass> | status | batt | pair | deep | light | deepusb on|off | framecap on|off | pmstats | blescan [1..30] | timers | diag");
+            DevLog.println("[cli] commands: wifi-json <authenticated transaction JSON> | status | batt | pair | deep | light | deepusb on|off | framecap on|off | pmstats | blescan [1..30] | timers | diag");
         }
+        if (line.length()) memset(const_cast<char *>(line.c_str()), 0, line.length());
     }
 }
 

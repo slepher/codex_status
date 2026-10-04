@@ -26,15 +26,20 @@ inline int mbedtls_sha256(const unsigned char *data, size_t size, unsigned char 
     return 0;
 }
 static std::vector<uint8_t> testNvsBlob;
+static std::vector<uint8_t> testNvsLegacyBlob;
 static bool testNvsFail = false;
+static bool testNvsCommitThenFail = false;
 static bool testNvsReadbackFail = false;
+static bool testNvsNewReadbackFail = false;
+static bool testNvsRemoveFail = false;
 static size_t testNvsByteLimit = SIZE_MAX;
 class Preferences {
 public:
     bool begin(const char *, bool) { return true; }
     void end() {}
     size_t freeEntries() { return 300; }
-    size_t getBytesLength(const char *) { return testNvsBlob.size(); }
+    size_t getBytesLength(const char *key) { return !strcmp(key,"scheme") ? testNvsLegacyBlob.size() : testNvsBlob.size(); }
+    bool remove(const char *key) { if (testNvsRemoveFail) return false; if (!strcmp(key,"scheme")) testNvsLegacyBlob.clear(); return true; }
     size_t putBytes(const char *, const void *data, size_t size) {
         if (testNvsFail || size > testNvsByteLimit) return 0;
         auto bytes = (const uint8_t *)data;
@@ -44,11 +49,12 @@ public:
         file.write((const char *)bytes, size); file.close();
         if (!file || std::rename(temporary.c_str(), wifiBlobPath.c_str())) return 0;
 #endif
-        testNvsBlob.assign(bytes, bytes + size); return size;
+        testNvsBlob.assign(bytes, bytes + size); return testNvsCommitThenFail ? 0 : size;
     }
-    size_t getBytes(const char *, void *data, size_t size) {
-        if (testNvsReadbackFail || size < testNvsBlob.size()) return 0;
-        memcpy(data, testNvsBlob.data(), testNvsBlob.size()); return testNvsBlob.size();
+    size_t getBytes(const char *key, void *data, size_t size) {
+        const auto &blob = !strcmp(key,"scheme") ? testNvsLegacyBlob : testNvsBlob;
+        if (testNvsReadbackFail || (testNvsNewReadbackFail && !strcmp(key,"store3")) || size < blob.size()) return 0;
+        memcpy(data, blob.data(), blob.size()); return blob.size();
     }
 };
 class IPAddress {

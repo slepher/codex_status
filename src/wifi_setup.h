@@ -6,6 +6,8 @@
 bool wifiSchemesBegin();
 bool wifiSchemesCredentials(String &ssid, String &password);
 bool wifiSetupBusy();
+// Authenticated diagnostic projection; no credentials or transaction hashes.
+void wifiSchemesStorageStatus(JsonObject out);
 void wifiSetupConnectionStarted(const String &ssid = String());
 // Handles only wifi_*; callers still enforce encrypted bond and full MAC.
 String wifiSetupCommand(JsonDocument &doc, const String &peer, uint32_t generation,
