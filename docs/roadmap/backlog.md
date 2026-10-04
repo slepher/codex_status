@@ -174,7 +174,7 @@
 
 ### B6. 离线 BLE 配 Wi-Fi 与 BOOT 蓝牙恢复入口（2026-10-03 新开）
 
-- **2026-10-04变长存储/AP与USB收归源码已完成，未部署**：[设计与资源验收](../../project-workflow/bridge-macos/wifi-variable-storage.md)。WFS3显式头/字段记录长度/CRC、实际条目与字符串按需RAM、单一仓库及堆候选，活动同版引用/旧凭据最小快照；旧WFZ2/raw-v2/v1验证迁移后退役scheme，保留读取恢复代码。AP/USB不再写sN/pN，认证JSONapply/result共用permit/owner/修订/回执，不伪造bond或保存即激活。生产C++三套内存检查、core12/app8/device-sim5及旧恢复通过；唯一Note4候选.55、栈门禁与资源预算已具备，空/典型两条两回执/满容量格式33/387/5036B，存储峰值组件预算最高22436B。自动审核拒绝OTA（未明确授权固件替换/重启），未执行/无新作业，实机仍.54。下一步明确OTA授权后核验真实迁移/认证状态与镜像；AP/USB真实写入与Flash掉电、RF/功耗/跨平台/兼容代码最终移除独立留项，不结B6。
+- **2026-10-04变长存储/AP与USB收归已提交并部署，真实WFS3迁移已验**：[设计与资源验收](../../project-workflow/bridge-macos/wifi-variable-storage.md)。WFS3显式头/字段记录长度/CRC、实际条目与字符串按需RAM、单一仓库及堆候选，活动同版引用/旧凭据最小快照；旧WFZ2/raw-v2/v1验证迁移后退役scheme，保留读取恢复代码。AP/USB不再写sN/pN，认证JSONapply/result共用permit/owner/修订/回执，不伪造bond或保存即激活。生产C++三套内存检查、core12/app8/device-sim5及旧恢复通过；唯一Note4候选.55、栈门禁与资源预算已具备，空/典型两条两回执/满容量格式33/387/5036B，存储峰值组件预算最高22436B。用户明确授权后源码f8426cb已提交，OTA bfd4e115 succeeded/image_verified；Note4运行.55/ota_0，独立镜像hash匹配3A552561…642FF。真实迁移WFS3 ready/249B/2条/0回执/旧scheme退役，后续深睡启动仍加载；Bridge健康与缓存不变。AP/USB真实写入与Flash掉电、RF/功耗/跨平台/兼容代码最终移除独立留项，不结B6。
 
 - **2026-10-04页面手动同步校验已实现/部署**：仅比较页Bridge→设备同步允许删除原方案，但缓存合并结果须保留当前环境host_ssid→设备2.4GHz映射，否则阻止预览/提交。预览冻结主机网络、本地版本、快照与所选项，服务原子复核；不自动扩大范围/切网/试连。自动配网、程序化MCP同步、本地保存和缓存导入不受此守卫影响。最终范围隔离回归通过；详见[实施及验收记录](../../project-workflow/bridge-macos/wifi-rendezvous-implementation.md)。
 

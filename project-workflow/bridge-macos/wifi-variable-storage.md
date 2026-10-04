@@ -1,6 +1,6 @@
 # Wi-Fi 变长存储与本地写入口收归（2026-10-04）
 
-状态：源码、软件验证与唯一 Note4 候选已完成；未部署。起点94b7036。待办唯一来源backlog B6。用户已明确授权提交，然后OTA部署；先提交已验源码，再部署并记录真实验收。
+状态：源码提交f8426cb，唯一Note4 .55已按用户明确授权OTA部署，真实WFS3迁移与运行镜像已确认。起点94b7036；待办唯一来源backlog B6。
 
 ## 设计与冻结边界
 
@@ -63,10 +63,14 @@ NVS记录成本来自当前IDF源码：32B entry，单chunk最多4000B，每chun
 
 最终候选0.18.55-note4-b-wifi-store3，target zectrix-note4-400x300，1735744B；ROM `artifacts/bridge-macos/note4-0.18.55-wifi-store3.bin`，SHA256 `3A552561A88B5572FD901FD6ACF2D65E75BD47BE9AF337262CD43065247642FF`，匹配ELF同名。marker、注册MAC及public/authenticated身份已核对。
 
-部署状态：auto-review拒绝OTA排队，理由是实现/验证请求未明确授权替换固件并重启设备；**没有执行、没有新OTA作业**。现网独立认证仍.54/ota_1/1737776B/hash1923E9B0…22604，Bridge exe hash23DFF946…D4D87未变；缓存targets2/networks2，未重新读取完整网络配置、未改实际网络、未开串口、未清NVS/TCC/钥匙串。私有data与installation-id备份：`/Users/slepher/Library/Application Support/dev.codexstatus.bridge/deployment-backups/wifi-store3-20261004-183948`，文件0600/目录0700，身份一致。旧ROM .54仍在artifacts保留。
+部署状态：用户明确授权提交、OTA与部署后，OTA bfd4e115 succeeded/image_verified。设备token认证独立读取运行镜像，MAC7C4FADB93408/fw .55/target/1735744B/hash3A552561…642FF全部匹配，ota_0；已登记相同hash为该target最新release。真实旧WFZ2迁移后认证wifi_storage为WFS3/ready=true/uncertain=false/249B/2网络/0回执/old_key_present=false，业务RAM460B（另加数组cookie8B）。后续不同boot_id的深睡唤醒reset_reason=8仍加载249B/2条新仓库并联网；末次heap_free40872/heap_min35200B仅为短时现场，不代表整机峰值或长期矩阵。
+
+Bridge健康204、exe hash23DFF946…D4D87未变，本轮生产Bridge无改动无需重建。与部署前备份比较targets/snapshot/baseline/local_revision全相同；未再读取完整配置、改真实网络、开串口、清NVS、改分区/TCC/钥匙串。私有data和installation-id备份：`/Users/slepher/Library/Application Support/dev.codexstatus.bridge/deployment-backups/wifi-store3-authorized-20261004-190915`，0600/0700；旧.54 ROM保留。此前auto-review未明确授权的拒绝是历史状态，现已明确授权并完成。
 
 证据：wifi-store3-rom-manifest.json、wifi-store3-deployment-preflight.json、wifi-store3-current-runtime.json、wifi-store3-resource-budget.json、wifi-store3-layout.s、wifi-store3-stack.log、wifi-store3-stack-regression-red.log、wifi-store3-entrypoint-audit.json、wifi-store3-cpp-final.log、wifi-storage-tests.log、wifi-store3-recovery.log、wifi-store3-rust-final.log、wifi-store3-pio-release.log，均在artifacts/bridge-macos。
 
 认证wifi_storage的ram_requested_bytes报告业务record/字段请求量，不含数组cookie，资源表已另计cookie。
 
-下一步只待明确OTA授权后核验真实WFZ2迁移、认证wifi_storage（ready/WFS3/bytes/旧key/计数/RAM）与运行镜像；未授权前保留.54现场。真实AP/USB写入、RF/错误密码/连续睡醒/断电、系统权限与其他硬件/跨平台矩阵、兼容代码最终退役仍归B6，不结项。
+真实WFZ2→WFS3迁移、后续启动读取与运行镜像已验；真实AP/USB写入、RF/错误密码/连续睡醒/断电、系统权限与其他硬件/跨平台矩阵、兼容代码最终退役仍归B6，不结项。
+
+部署证据另见wifi-store3-{authorized-preflight,ota-queue,ota-status,deployed-status,running-image,release-published,current-runtime}.json。

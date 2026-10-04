@@ -1,5 +1,14 @@
 # Codex Status 项目进度（交接文档）
 
+## 2026-10-04 Wi-Fi WFS3 已提交并 OTA 部署，真实迁移与运行镜像已确认
+
+- **提交与授权**：用户明确要求“提交，然后ota并部署”；源码提交 `f8426cb`（Implement variable Wi-Fi storage and authenticated recovery writes）。此前OTA审批阻断已由该明确授权解除；不是仍待部署。源码检查/生产C++内存检查、Rust受影响25例与匹配ELF栈证据沿用下节，部署未重编ROM。
+- **Note4实机运行**：登记MAC `7C4FADB93408` / IP `192.168.10.101`，`0.18.55-note4-b-wifi-store3` / `zectrix-note4-400x300`，ota_0，1735744B；ROM `/Users/slepher/project/codex_status/artifacts/bridge-macos/note4-0.18.55-wifi-store3.bin`，SHA256 `3A552561A88B5572FD901FD6ACF2D65E75BD47BE9AF337262CD43065247642FF`，匹配ELF同名。OTA `bfd4e115` succeeded/image_verified；设备token认证独立读取镜像MAC/fw/target/大小/hash全部匹配。已登记该target最新release，同一hash。
+- **真实存储迁移**：认证wifi_storage为WFS3、ready=true、uncertain=false、bytes=249、networks=2、receipts=0、old_key_present=false；业务RAM请求460B（另加数组cookie8B），record56B/receipt72B。迁移已写回验证并退役旧scheme；两次不同boot_id的深睡唤醒（reset_reason=8）仍加载同一249B/2条新仓库且Wi-Fi连接。末次uptime9537ms、heap_free40872/heap_min35200B仅为短时现场，非长期RF或整体峰值验收。
+- **Bridge与备份**：默认Bridge健康204、exe SHA256 `23DFF946FA555849D40E494B0D74B5293A6ACE9F151BD403FECEE7FCB3DD4D87`不变；本轮没有生产Bridge改动，无需重建重启。与部署前备份比较targets/snapshot/baseline/local_revision完全相同，未再次读取完整网络配置或改实际SSID/密码。私有data及installation-id备份 `/Users/slepher/Library/Application Support/dev.codexstatus.bridge/deployment-backups/wifi-store3-authorized-20261004-190915`（0600/0700），旧.54 ROM保留。未开串口/清NVS/改分区/TCC/钥匙串。
+- **待办仍归B6**：真实WFS3迁移/启动读取和运行镜像已验；AP/USB真实写入、错误密码/离线BLE/AP/DHCP/连续RF睡醒/Flash切电/功耗/跨平台/其他硬件及兼容读取代码最终移除仍留项，不结B6。
+- **证据与设计**：[设计与资源验收](project-workflow/bridge-macos/wifi-variable-storage.md)；`artifacts/bridge-macos/wifi-store3-{authorized-preflight,ota-queue,ota-status,deployed-status,running-image,release-published,current-runtime}.json`。交接与backlog已同步，部署记录另提交。
+
 ## 2026-10-04 Wi-Fi 变长存储与 AP/USB 入口收归软件交付完成；.55 候选未部署
 
 - **实现与计划**：[设计、资源预算及验收](project-workflow/bridge-macos/wifi-variable-storage.md)。WFS3显式magic/version/有效长度/网络与回执实际数量/CRC、小端整数及字段/记录长度；实际record和字符串按需分配，只有一个长期仓库，无空槽/原生struct持久化/压缩新写。标签与版本随record；未编辑活动版本引用保存项，编辑/删除后仅保留旧SSID/密码。setup保存工作集move到堆候选，不增加全量仓库栈副本。
