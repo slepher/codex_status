@@ -11,6 +11,8 @@ mod discovery;
 mod icon;
 mod instance;
 mod platform;
+mod host_wifi;
+mod wifi;
 mod watchdog;
 
 use std::collections::HashMap;
@@ -858,6 +860,7 @@ fn show_panel(app: &AppHandle) {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
+        let _ = window.emit("panel-opened", ());
     }
 }
 
@@ -936,7 +939,7 @@ fn mcp_config(ctx: &AppCtx) -> bridge_mcp::McpConfig {
         port: ctx.config.port,
         token: ctx.config.token.clone(),
         templates: ctx.config.templates.clone(),
-        data_root: bridge_core::paths::data_root(),
+        data_root: platform::service(ctx).data_root().to_path_buf(),
         seeds: ctx.config.seeds.clone(),
         device_ip: facts.as_ref().map(|f| f.ip.clone()).unwrap_or_default(),
         device_name: facts.as_ref().map(|f| f.name.clone()).unwrap_or_default(),
@@ -1016,6 +1019,8 @@ async fn mcp_handler(
             "platform_overview"
                 | "platform_device_view"
                 | "platform_device_detail"
+                | "platform_wifi_view"
+                | "platform_wifi_action"
                 | "platform_device_register"
                 | "platform_template_list"
                 | "platform_template_get"
@@ -1641,6 +1646,7 @@ async fn discover_arp(ctx: &AppCtx, mac: &str) -> Result<Value, String> {
 /// record of the MAC the device itself reported. When the caller named a MAC,
 /// the answer must be that device.
 async fn discover_ble(ctx: &AppCtx, expected_mac: Option<&str>) -> Result<Value, String> {
+    host_wifi::require_bluetooth()?;
     let adapter = Pusher::adapter().await.map_err(|e| e.to_string())?;
     let info = Pusher::read_device_info(&adapter, "CodexStatus-", 30000)
         .await
@@ -1897,6 +1903,12 @@ async fn platform_device_view(state: State<'_, Arc<AppCtx>>, mac: Option<String>
 #[tauri::command]
 async fn platform_device_detail(state: State<'_, Arc<AppCtx>>, mac: String, section: String) -> Result<Value, String> {
     platform::device_detail(&state, &mac, &section)
+}
+
+#[tauri::command]
+async fn platform_wifi(state: State<'_, Arc<AppCtx>>, mac: String, op: String, body: Value) -> Result<Value, String> {
+    if op == "view" { wifi::view(&state, &mac, false).await }
+    else { wifi::action(&state, &mac, &op, body).await }
 }
 
 #[tauri::command]
@@ -3210,6 +3222,12 @@ async fn run_services(ctx: Arc<AppCtx>) {
             _ = ctx.force_ble.notified() => {}
             _ = tokio::time::sleep(Duration::from_millis(250)) => {}
         }
+        // Permission prompts belong to the explicit setup button. Keep HTTP
+        // service running while BLE is unavailable; do not construct a central.
+        if host_wifi::require_device_bluetooth().is_err() {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        }
         let udp_request = ctx.udp_ble.swap(false, Ordering::SeqCst);
         let current_is_registered_device = platform::is_registered_device(&ctx);
         let devices = ctx.platform.devices();
@@ -3240,6 +3258,7 @@ async fn run_services(ctx: Arc<AppCtx>) {
             }
             continue;
         }
+        if host_wifi::require_bluetooth().is_err() { continue; }
         let adapter = match Pusher::adapter().await {
             Ok(a) => a,
             Err(e) => {
@@ -3365,6 +3384,8 @@ fn main() {
     }
 
     let instance = instance::Instance::from_env().unwrap_or_else(|error| panic!("{error}"));
+    #[cfg(target_os = "macos")]
+    if argv.iter().any(|arg| arg == "--managed-supervisor") { watchdog::supervise(); }
     #[cfg(any(windows, unix))]
     let _instance_lock = instance::acquire(&instance).unwrap_or_else(|error| panic!("{error}"));
 
@@ -3526,6 +3547,7 @@ fn main() {
             platform_devices,
             platform_device_view,
             platform_device_detail,
+            platform_wifi,
             platform_template_get,
             platform_template_validate,
             platform_template_preview,

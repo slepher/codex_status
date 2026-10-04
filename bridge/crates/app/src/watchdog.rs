@@ -152,3 +152,28 @@ pub fn run(parent_pid: u32) -> ! {
 pub fn run(_parent_pid: u32) -> ! {
     std::process::exit(0);
 }
+
+/// launchd owns this supervisor; it owns exactly one child from the same app.
+#[cfg(target_os = "macos")]
+pub fn supervise() -> ! {
+    use std::process::{Command, Stdio};
+    let exe = std::env::current_exe().expect("supervised app path");
+    loop {
+        let status = Command::new(&exe).arg("--managed-child")
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+            .spawn().and_then(|mut child| child.wait());
+        if status.as_ref().is_ok_and(|status| status.success()) {
+            append_log("managed child exited normally");
+            std::process::exit(0);
+        }
+        let now = now_secs();
+        let count = read_recent_stamps().len() + 1;
+        append_log(&format!("abnormal {now} managed_exit recent={count}"));
+        if count >= MAX_ABNORMAL {
+            append_log("managed restart circuit open");
+            // Successful supervisor exit leaves launchd idle until explicit start.
+            std::process::exit(0);
+        }
+        std::thread::sleep(std::time::Duration::from_secs(10));
+    }
+}

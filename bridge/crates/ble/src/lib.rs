@@ -537,7 +537,7 @@ impl Pusher {
             duration_ms = read_start.elapsed().as_millis(),
             "BLE info characteristic read"
         );
-        let info: serde_json::Value = serde_json::from_slice(&raw).context("parse device info")?;
+        let info = decode_wire(&raw).context("parse device info")?;
         Ok(info)
     }
 
@@ -549,7 +549,7 @@ impl Pusher {
         Ok(info)
     }
 
-    #[cfg(any(test, target_os = "macos"))]
+    #[cfg(any(test, windows, target_os = "macos"))]
     fn pairing_probe_allowed(info: &serde_json::Value, expected_mac: &str) -> bool {
         Self::info_matches_mac(info, expected_mac)
             && (Self::peer_bonded(info) || info["pairingWindow"] == true)
@@ -558,7 +558,7 @@ impl Pusher {
     async fn token_link_info(peripheral: &Peripheral, scan_id: u64, expected_mac: &str) -> Result<serde_json::Value> {
         let info = Self::read_info_raw(peripheral, scan_id).await?;
         if !Self::info_matches_mac(&info, expected_mac) { bail!("BLE device Wi-Fi MAC does not match target"); }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(windows, target_os = "macos"))]
         if !Self::peer_encrypted_bonded(&info) {
             if !Self::pairing_probe_allowed(&info, expected_mac) { bail!("open the device pairing window before first pairing"); }
             // Accessing an encrypted characteristic triggers CoreBluetooth's
@@ -717,6 +717,22 @@ impl Pusher {
         info
     }
 
+    /// Explicit device-page discovery. The unencrypted info is only a hint;
+    /// connect(mac) rechecks the full identity before pairing or writing.
+    pub async fn read_candidate_info() -> Result<serde_json::Value> {
+        let adapter = Self::adapter().await?;
+        let Some((scan_id, peripheral)) = Self::find_device(&adapter, "CodexStatus-", Duration::from_secs(8)).await? else {
+            bail!("no advertising device");
+        };
+        let result = async {
+            tokio::time::timeout(Duration::from_secs(4), peripheral.connect()).await??;
+            tokio::time::timeout(Duration::from_secs(3), peripheral.discover_services()).await??;
+            tokio::time::timeout(Duration::from_secs(3), Self::read_info_raw(&peripheral, scan_id)).await?
+        }.await;
+        let _ = peripheral.disconnect().await;
+        result
+    }
+
     /// Connect to an advertising device (BLE session on, e.g. after a BOOT
     /// click) and request the OTA/Wi-Fi operation token over the bonded auth
     /// characteristic. The token is disclosed only over this encrypted link.
@@ -841,8 +857,10 @@ fn stamp_clock(body: &mut serde_json::Value, mac: &str) {
 /// Authenticated device opportunity on the existing GATT table. The status value
 /// is read as a long attribute, so an ACK is not lost to notification MTU cuts.
 pub struct DeviceConnection {
+    pub info: serde_json::Value,
     peripheral: Option<Peripheral>,
     fake_url: Option<String>,
+    rf_deadline: Option<tokio::time::Instant>,
     token: String,
     bridge_id: String,
     nonce: String,
@@ -882,6 +900,57 @@ fn identity_text(identity: Option<WakeIdentity>) -> (String, String) {
     )
 }
 
+// The only BLE-specific schema translation. Legacy ROMs continue through
+// their bounded reader; capability v1 is explicit and cannot masquerade as it.
+pub fn decode_wire(raw: &[u8]) -> Result<serde_json::Value> {
+    if raw.is_empty() || raw.len() > 512 { bail!("invalid BLE attribute length"); }
+    let mut value: serde_json::Value = serde_json::from_slice(raw)?;
+    let Some(version) = value.get("ble_wire") else { return Ok(value); };
+    if version != 1 { bail!("unsupported BLE wire version"); }
+    fn text(value: &serde_json::Value, max: usize) -> Result<String> {
+        use base64::Engine;
+        let encoded = value.as_str().context("BLE encoded identifier missing")?;
+        let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)?;
+        if bytes.len() > max || bytes.contains(&0) { bail!("invalid BLE identifier"); }
+        Ok(String::from_utf8(bytes)?)
+    }
+    if value.get("f").is_some() { value["fw"] = json!(text(&value["f"], 64)?); }
+    if value.get("rid").is_some() {
+        let request = text(&value["rid"], 64)?;
+        if request.is_empty() { bail!("empty BLE request identity"); }
+        value["request_id"] = json!(request);
+        let wake = value["w"].as_array().context("BLE wake missing")?;
+        if wake.len() != 2 || wake.iter().any(|n| n.as_u64().is_none_or(|n| n > u32::MAX as u64)) {
+            bail!("invalid BLE wake identity");
+        }
+        let wake = wake.clone();
+        value["wake_generation"] = wake[0].clone(); value["wake_seq"] = wake[1].clone();
+    }
+    if value.get("ctx").is_some() { value["active_context_id"] = json!(text(&value["ctx"], 32)?); }
+    if let Some(summary) = value.get("s") {
+        let a = summary.as_array().context("invalid BLE summary")?.clone();
+        if a.len() != 16 { bail!("invalid BLE summary length"); }
+        let nonce = a[0].as_str().context("BLE nonce missing")?;
+        if nonce.len() != 32 || !nonce.bytes().all(|c| c.is_ascii_hexdigit()) { bail!("invalid BLE nonce"); }
+        for i in [4,6,7,8,11,13,15] {
+            let n = a[i].as_u64().context("BLE counter missing")?;
+            let max = if matches!(i, 11 | 13) { u8::MAX as u64 } else if matches!(i, 7 | 8 | 15) { u32::MAX as u64 } else { u64::MAX };
+            if n > max { bail!("invalid BLE counter"); }
+        }
+        for i in [5,9,10,12,14] { if !a[i].is_boolean() { bail!("invalid BLE flag"); } }
+        value["result"] = json!("applied"); value["session_nonce"] = a[0].clone();
+        value["active_context_id"] = json!(text(&a[1], 32)?);
+        value["active_template_id"] = json!(text(&a[2], 16)?);
+        value["committed_job_id"] = json!(text(&a[3], 16)?);
+        value["applied_seq"] = a[4].clone(); value["commit_seq"] = a[15].clone();
+        value["power"] = json!({"mode":if a[5] == true {"light"} else {"sleep"},
+            "plan_id":a[6],"remaining_s":a[7],"provisional_remaining_s":a[8]});
+        if a[9] == true { value["sync"] = json!({"v":1,"enabled":a[10],"rounds":a[11],
+            "due":a[12],"retry_skip":a[13],"pending":a[14]}); }
+    }
+    Ok(value)
+}
+
 impl DeviceConnection {
     /// `Ok(None)` = the device was not *freshly* advertising (rendezvous window
     /// closed or stale scan entry): no connection was attempted and the caller
@@ -914,7 +983,8 @@ impl DeviceConnection {
                     Some("127.0.0.1" | "localhost")) || parsed.port().is_none() {
                     bail!("fake BLE endpoint must be an explicit loopback HTTP address");
                 }
-                let response = match client.get(format!("{}/sim/ble/info", url.trim_end_matches('/')))
+                let info_started = tokio::time::Instant::now();
+                let response = match client.get(format!("{}/sim/ble/info?connect=1", url.trim_end_matches('/')))
                     .bearer_auth(token).send().await {
                     Ok(response) => response,
                     Err(error) => {
@@ -923,7 +993,10 @@ impl DeviceConnection {
                     }
                 };
                 if response.status() == reqwest::StatusCode::NOT_FOUND { continue; }
-                let info: serde_json::Value = response.error_for_status()?.json().await?;
+                let response = response.error_for_status()?;
+                let generation = response.headers().get("x-sim-ble-generation").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok()).context("fake BLE connection generation missing")?;
+                let mut info = decode_wire(&response.bytes().await?)?;
+                info["_sim_generation"] = json!(generation);
                 let authorized_mac = info_authorized_target(&info, &targets)
                     .context("fake BLE device identity mismatch")?;
                 if authorized_mac != *mac || info["rendezvous"] != true {
@@ -933,10 +1006,12 @@ impl DeviceConnection {
                     .map(|p| std::str::from_utf8(p).unwrap())
                     .collect::<Vec<_>>().join(":");
                 return Ok(Some((authorized_mac, Self {
+                    info: info.clone(),
                     peripheral: None, fake_url: Some(url.trim_end_matches('/').to_owned()),
+                    rf_deadline: info["rf_remaining_ms"].as_u64().map(|ms| info_started + Duration::from_millis(ms)),
                     token: token.to_owned(), bridge_id: bridge_id.to_owned(),
                     nonce: String::new(), device_mac,
-                    auth_ready: info["bonded"] == true && info["encrypted"] == true,
+                    auth_ready: Pusher::peer_encrypted_bonded(&info),
                     wake_identity: wake_identity(&info),
                     wake_cause: text_field(&info, &["wake_cause"]).unwrap_or_default(),
                     device_last_stage: "info".into(), timings: vec![],
@@ -955,6 +1030,7 @@ impl DeviceConnection {
         };
         let mut timings: Vec<(String, u128)> =
             vec![("find".to_string(), find_start.elapsed().as_millis())];
+        let info_started = tokio::time::Instant::now();
         let connect_start = Instant::now();
         let mut connected = trace_stage(scan_id, "connect", async {
             tokio::time::timeout(Duration::from_secs(4), peripheral.connect())
@@ -1001,7 +1077,7 @@ impl DeviceConnection {
             let (info, info_ms) = trace_stage(scan_id, "read_info", async {
                 tokio::time::timeout(
                     Duration::from_secs(3),
-                    Pusher::read_info(&peripheral, scan_id),
+                    Pusher::read_info_raw(&peripheral, scan_id),
                 )
                 .await
                 .map_err(|_| anyhow!("info timeout"))
@@ -1012,7 +1088,7 @@ impl DeviceConnection {
             Ok::<_, anyhow::Error>((info, stages))
         }
         .await;
-        let (info, stages) = match setup {
+        let (mut info, stages) = match setup {
             Ok(value) => value,
             Err(error) => {
                 let _ = peripheral.disconnect().await;
@@ -1030,6 +1106,12 @@ impl DeviceConnection {
             );
             bail!("BLE device identity mismatch");
         };
+        if !Pusher::peer_encrypted_bonded(&info) {
+            match Pusher::token_link_info(&peripheral, scan_id, &authorized_mac).await {
+                Ok(verified) => info = verified,
+                Err(error) => { let _ = peripheral.disconnect().await; return Err(error); }
+            }
+        }
         let initial_wake_identity = wake_identity(&info);
         let (wake_generation, wake_seq) = identity_text(initial_wake_identity);
         tracing::info!(
@@ -1055,8 +1137,10 @@ impl DeviceConnection {
         Ok(Some((
             authorized_mac,
             Self {
+                info: info.clone(),
                 peripheral: Some(peripheral),
                 fake_url: None,
+                rf_deadline: info["rf_remaining_ms"].as_u64().map(|ms| info_started + Duration::from_millis(ms)),
                 token: token.to_owned(),
                 bridge_id: bridge_id.to_owned(),
                 nonce: String::new(),
@@ -1072,37 +1156,91 @@ impl DeviceConnection {
         )))
     }
 
+    fn command_deadline(&self) -> tokio::time::Instant {
+        let normal = tokio::time::Instant::now() + Duration::from_secs(5);
+        self.rf_deadline.map_or(normal, |rf| rf.min(normal))
+    }
+
+    /// Refresh only from the same authenticated peripheral/wake. A new phase
+    /// may advertise a larger RF budget; repeated commands alone never renew it.
+    pub async fn refresh_info(&mut self, limit: Duration) -> Result<()> {
+        let started = tokio::time::Instant::now();
+        let info = tokio::time::timeout(limit, async {
+            if let Some(url) = &self.fake_url {
+                let response = reqwest::Client::new().get(format!("{url}/sim/ble/info"))
+                    .header("x-sim-ble-generation", self.info["_sim_generation"].as_u64().unwrap_or(0).to_string())
+                    .bearer_auth(&self.token).send().await?.error_for_status()?;
+                decode_wire(&response.bytes().await?)
+            } else {
+                Pusher::read_info_raw(self.peripheral.as_ref().context("BLE peripheral missing")?, 0).await
+            }
+        }).await.context("BLE info refresh timed out")??;
+        anyhow::ensure!(bridge_core::platform::model::DeviceIdentity::normalized_mac(info["mac"].as_str().unwrap_or(""))
+            == bridge_core::platform::model::DeviceIdentity::normalized_mac(&self.device_mac), "BLE refreshed MAC mismatch");
+        if let Some(expected) = self.wake_identity {
+            anyhow::ensure!(wake_identity(&info) == Some(expected), "BLE refreshed wake mismatch");
+        }
+        let generation = self.info["_sim_generation"].clone();
+        self.info = info;
+        if !generation.is_null() { self.info["_sim_generation"] = generation; }
+        if let Some(ms) = self.info["rf_remaining_ms"].as_u64() {
+            self.rf_deadline = Some(started + Duration::from_millis(ms));
+        }
+        Ok(())
+    }
+
     /// Refresh the endpoint credentials on this already MAC-verified link.
     /// The caller must verify the registered target before invoking this.
     pub async fn write_endpoint(&self, host: &str, port: u16, token: &str) -> Result<()> {
-        if self.fake_url.is_some() { return Ok(()); }
-        Pusher::write_json(
-            self.peripheral.as_ref().unwrap(),
-            CHR_ENDPOINT,
-            &Pusher::endpoint_payload(host, port, token),
-        )
-        .await
+        let deadline = self.command_deadline();
+        if tokio::time::Instant::now() >= deadline { bail!("device BLE RF window expired before endpoint"); }
+        tokio::time::timeout_at(deadline, async {
+            if let Some(url) = &self.fake_url {
+                reqwest::Client::new().post(format!("{url}/sim/ble/endpoint"))
+                    .header("x-sim-ble-generation", self.info["_sim_generation"].as_u64().unwrap().to_string())
+                    .bearer_auth(&self.token).body(Pusher::endpoint_payload(host, port, token))
+                    .send().await?.error_for_status()?;
+                Ok(())
+            } else {
+                Pusher::write_json(self.peripheral.as_ref().unwrap(), CHR_ENDPOINT,
+                    &Pusher::endpoint_payload(host, port, token)).await
+            }
+        }).await.context("device BLE endpoint write timed out")?
     }
 
-    /// Request the device operation token on this already MAC-verified link.
-    /// The link must have reported both a persistent bond and encryption.
+    /// Read token responses as attributes too: lost notification is not lost ACK.
     pub async fn request_device_token(&self) -> Result<String> {
-        if !self.auth_ready {
-            bail!("BLE device link is not encrypted and bonded");
+        if !self.auth_ready { bail!("BLE device link is not encrypted and bonded"); }
+        let deadline = self.command_deadline();
+        if tokio::time::Instant::now() >= deadline { bail!("device BLE RF window expired before auth"); }
+        let status = self.peripheral.as_ref().and_then(|p| p.characteristics().into_iter().find(|c| c.uuid == Pusher::uuid(CHR_STATUS)));
+        tokio::time::timeout_at(deadline, async {
+            if let Some(url) = &self.fake_url {
+                reqwest::Client::new().post(format!("{url}/sim/ble/token"))
+                    .header("x-sim-ble-generation", self.info["_sim_generation"].as_u64().unwrap().to_string())
+                    .bearer_auth(&self.token).body(br#"{"cmd":"token"}"#.to_vec())
+                    .send().await?.error_for_status()?;
+            } else { Pusher::write_json(self.peripheral.as_ref().unwrap(), CHR_AUTH, br#"{"cmd":"token"}"#).await?; }
+            Ok::<(), anyhow::Error>(())
+        }).await.context("device BLE auth write timed out")??;
+        loop {
+            let raw = tokio::time::timeout_at(deadline, self.read_attribute(status.as_ref())).await??;
+            if let Ok(reply) = decode_wire(&raw) {
+                if reply["ack"] == "auth" && reply["ok"] == true {
+                    let token = reply["token"].as_str().context("invalid BLE token response")?;
+                    // Fake seeds are explicit test credentials; real tokens remain hex.
+                    if self.fake_url.is_none() && !Pusher::valid_device_token(token) { bail!("invalid BLE token response"); }
+                    return Ok(token.to_owned());
+                }
+            }
+            tokio::time::sleep_until((tokio::time::Instant::now() + Duration::from_millis(20)).min(deadline)).await;
         }
-        if let Some(url) = &self.fake_url {
-            let reply: serde_json::Value = reqwest::Client::new()
-                .get(format!("{url}/sim/ble/token"))
-                .bearer_auth(&self.token).send().await?.error_for_status()?.json().await?;
-            return Ok(reply["token"].as_str().context("fake BLE token response")?.to_owned());
-        }
-        Pusher::request_token_on_peripheral(self.peripheral.as_ref().unwrap()).await
     }
 
     pub async fn command(
         &mut self,
         op: &str,
-        mut body: serde_json::Value,
+        body: serde_json::Value,
     ) -> Result<serde_json::Value> {
         let id = format!(
             "r{:x}",
@@ -1110,6 +1248,16 @@ impl DeviceConnection {
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_nanos()
         );
+        self.command_with_id(op, body, &id).await
+    }
+
+    pub async fn command_with_id(&mut self, op: &str, mut body: serde_json::Value, id: &str) -> Result<serde_json::Value> {
+        if id.is_empty() || id.len() > 64 || id.contains('\0') { bail!("invalid BLE request identity"); }
+        if op.starts_with("wifi_") && self.nonce.is_empty() {
+            // Obtain the ordinary session before a configuration command.
+            // Physical rescue still works if endpoint auth has not been set up.
+            let _ = Box::pin(self.command("status", json!({}))).await;
+        }
         body["op"] = json!(op);
         body["request_id"] = json!(id);
         body["session_nonce"] = json!(self.nonce);
@@ -1118,42 +1266,20 @@ impl DeviceConnection {
         body["token"] = json!(self.token);
         stamp_clock(&mut body, &self.device_mac);
         let bytes = serde_json::to_vec(&body)?;
+        if op.starts_with("wifi_") && bytes.len() > 4096 { bail!("Wi-Fi BLE command exceeds 4096 bytes"); }
         if bytes.len() > 8192 {
             bail!("device BLE command exceeds 8192 bytes");
-        }
-        if let Some(url) = &self.fake_url {
-            let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?;
-            let mut reply = serde_json::Value::Null;
-            for (index, chunk) in bytes.chunks(180).enumerate() {
-                let final_chunk = (index + 1) * 180 >= bytes.len();
-                reply = client.post(format!("{url}/sim/ble/fragment?offset={}&final={}",
-                    index * 180, u8::from(final_chunk)))
-                    .bearer_auth(&self.token).body(chunk.to_vec()).send().await?
-                    .error_for_status()?.json().await?;
-                if !final_chunk && reply["result"] != "more" {
-                    bail!("fake BLE fragment was not accepted");
-                }
-            }
-            if reply["ack"] != "command" || reply["request_id"] != id {
-                bail!("fake BLE ACK identity mismatch");
-            }
-            if op == "status" && reply["result"] == "applied" {
-                self.nonce = reply["session_nonce"].as_str()
-                    .context("fake BLE session nonce")?.to_owned();
-            }
-            self.timings.push((op.to_owned(), 0));
-            return Ok(reply);
         }
         let lookup_start = Instant::now();
         let status = self
             .peripheral
-            .as_ref().unwrap()
-            .characteristics()
+            .as_ref().map(|p| p.characteristics()).unwrap_or_default()
             .into_iter()
             .find(|c| c.uuid == Pusher::uuid(CHR_STATUS))
             .context("status characteristic");
         let status = match status {
-            Ok(status) => status,
+            Ok(status) => Some(status),
+            Err(_) if self.fake_url.is_some() => None,
             Err(error) => {
                 self.log_failure(&id, op, "status_characteristic", "characteristic_missing");
                 tracing::warn!(device_mac = %self.device_mac, op, stage = "status_characteristic", category = "characteristic_missing", duration_ms = lookup_start.elapsed().as_millis(), "BLE ACK characteristic lookup failed");
@@ -1162,7 +1288,9 @@ impl DeviceConnection {
         };
         tracing::info!(device_mac = %self.device_mac, op, characteristic = "status", duration_ms = lookup_start.elapsed().as_millis(), "BLE ACK characteristic found");
         let write_start = Instant::now();
-        if let Err(error) = Pusher::write_json(self.peripheral.as_ref().unwrap(), CHR_TPL_CTRL, &bytes).await {
+        let deadline = self.command_deadline();
+        if tokio::time::Instant::now() >= deadline { bail!("device BLE RF window expired before write"); }
+        if let Err(error) = tokio::time::timeout_at(deadline, self.write_command(&bytes)).await.context("device BLE write timed out")? {
             self.log_failure(&id, op, "write", "write_failed");
             tracing::warn!(device_mac = %self.device_mac, op, request_id = %id, stage = "write", category = error_category("write"), duration_ms = write_start.elapsed().as_millis(), "BLE command write failed");
             return Err(error);
@@ -1179,10 +1307,10 @@ impl DeviceConnection {
             "BLE command written"
         );
         let started = Instant::now();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
+            if tokio::time::Instant::now() >= deadline { bail!("device BLE ACK timed out"); }
             let raw = match tokio::time::timeout_at(deadline,
-                self.peripheral.as_ref().unwrap().read(&status)).await {
+                self.read_attribute(status.as_ref())).await {
                 Ok(Ok(raw)) => raw,
                 Ok(Err(_)) => {
                     self.log_failure(&id, op, "ack", "read_failed");
@@ -1195,26 +1323,19 @@ impl DeviceConnection {
                     return Err(anyhow!("device BLE ACK timed out"));
                 }
             };
-            if let Ok(reply) = serde_json::from_slice::<serde_json::Value>(&raw) {
-                if reply["ack"] == "command" && reply["request_id"] == id {
+            if let Ok(reply) = decode_wire(&raw) {
+                if reply["ack"] == if op.starts_with("wifi_") { "wifi" } else { "command" } && reply["request_id"] == id {
                     let ack_identity = wake_identity(&reply);
-                    if let (Some(expected), Some(actual)) = (self.wake_identity, ack_identity) {
-                        if expected != actual {
-                            let (expected_generation, expected_seq) = identity_text(Some(expected));
-                            let (actual_generation, actual_seq) = identity_text(Some(actual));
-                            tracing::warn!(
-                                device_mac = %self.device_mac,
-                                op,
-                                request_id = %id,
-                                expected_wake_generation = %expected_generation,
-                                expected_wake_seq = %expected_seq,
-                                ack_wake_generation = %actual_generation,
-                                ack_wake_seq = %actual_seq,
-                                stage = "wake_identity",
-                                category = "mismatch",
-                                "BLE ACK wake identity differs from authenticated INFO"
-                            );
-                        }
+                    let mac_matches = reply["device_mac"].as_str().map_or(!op.starts_with("wifi_"), |mac|
+                        bridge_core::platform::model::DeviceIdentity::normalized_mac(mac) ==
+                        bridge_core::platform::model::DeviceIdentity::normalized_mac(&self.device_mac));
+                    let wake_matches = !self.wake_identity.zip(ack_identity).is_some_and(|(a,b)| a != b);
+                    let version_matches = self.info["ble_wire"] != 1 || (reply["ble_wire"] == 1 && ack_identity.is_some());
+                    let operation_matches = reply["op"].as_str().map_or(true, |actual| actual == op || actual == "command" || (actual == "wifi" && op.starts_with("wifi_")));
+                    let nonce_matches = op == "status" || !reply["session_nonce"].as_str().is_some_and(|n| n != self.nonce);
+                    if !mac_matches || !wake_matches || !version_matches || !nonce_matches || !operation_matches {
+                        tokio::time::sleep_until((tokio::time::Instant::now() + Duration::from_millis(20)).min(deadline)).await;
+                        continue;
                     }
                     if self.wake_identity.is_none() {
                         self.wake_identity = ack_identity;
@@ -1242,7 +1363,7 @@ impl DeviceConnection {
                         result = reply["result"].as_str().unwrap_or("acknowledged"),
                         wake_generation = %wake_generation,
                         wake_seq = %wake_seq,
-                        wake_association = if self.wake_identity.is_some() { "confirmed" } else { "incomplete" },
+                        wake_association = if ack_identity.is_some() { "confirmed" } else { "incomplete" },
                         duration_ms = ms,
                         "BLE command acknowledged"
                     );
@@ -1255,6 +1376,54 @@ impl DeviceConnection {
                 bail!("device BLE ACK timed out");
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn write_command(&self, bytes: &[u8]) -> Result<()> {
+        if let Some(url) = &self.fake_url {
+            let client = reqwest::Client::builder().timeout(Duration::from_secs(3)).build()?;
+            for (index, chunk) in bytes.chunks(180).enumerate() {
+                let final_chunk = (index + 1) * 180 >= bytes.len();
+                let response = client.post(format!("{url}/sim/ble/fragment?offset={}&final={}", index * 180, u8::from(final_chunk)))
+                    .header("x-sim-ble-generation", self.info["_sim_generation"].as_u64().unwrap().to_string())
+                    .bearer_auth(&self.token).body(chunk.to_vec()).send().await?.error_for_status()?;
+                let accepted: serde_json::Value = response.json().await?;
+                if accepted["result"] != if final_chunk { "accepted" } else { "more" } { bail!("fake BLE write was not accepted"); }
+            }
+            Ok(())
+        } else { Pusher::write_json(self.peripheral.as_ref().unwrap(), CHR_TPL_CTRL, bytes).await }
+    }
+    async fn read_attribute(&self, status: Option<&btleplug::api::Characteristic>) -> Result<Vec<u8>> {
+        if let Some(url) = &self.fake_url {
+            Ok(reqwest::Client::new().get(format!("{url}/sim/ble/status"))
+                .header("x-sim-ble-generation", self.info["_sim_generation"].as_u64().unwrap().to_string())
+                .bearer_auth(&self.token).send().await?.error_for_status()?.bytes().await?.to_vec())
+        } else { Ok(self.peripheral.as_ref().unwrap().read(status.context("status characteristic")?).await?) }
+    }
+
+    /// ATT values are limited to 512 bytes. Read frozen Wi-Fi summaries through
+    /// bounded hex pages on the existing Status attribute, without a new GATT table.
+    pub async fn wifi_read(&mut self, op: &str) -> Result<serde_json::Value> {
+        if !matches!(op, "wifi_scheme_get" | "wifi_capabilities") { bail!("invalid Wi-Fi read"); }
+        let mut body = json!({"offset":0});
+        let mut bytes = Vec::new();
+        let mut snapshot = None;
+        loop {
+            let reply = self.command(op, body).await?;
+            if reply["ok"] != true { bail!("Wi-Fi summary read rejected"); }
+            let total = reply["total"].as_u64().context("Wi-Fi summary total")? as usize;
+            let next = reply["next_offset"].as_u64().context("Wi-Fi summary offset")? as usize;
+            let id = reply["snapshot"].as_u64().context("Wi-Fi summary snapshot")?;
+            if snapshot.is_some_and(|previous| previous != id) || total > 4096 { bail!("Wi-Fi summary changed or exceeds limit"); }
+            snapshot = Some(id);
+            let chunk = reply["chunk"].as_str().context("Wi-Fi summary chunk")?;
+            if chunk.is_empty() || chunk.len() > 240 || chunk.len() % 2 != 0 || !chunk.is_ascii() { bail!("invalid Wi-Fi summary chunk"); }
+            for pair in chunk.as_bytes().chunks(2) {
+                bytes.push(u8::from_str_radix(std::str::from_utf8(pair)?, 16)?);
+            }
+            if bytes.len() != next || next > total { bail!("Wi-Fi summary offset mismatch"); }
+            if next == total { return serde_json::from_slice(&bytes).context("Wi-Fi summary JSON"); }
+            body = json!({"offset":next,"snapshot":id});
         }
     }
 
@@ -1283,8 +1452,46 @@ impl DeviceConnection {
     /// btleplug's cached GATT objects, so `discover_services` must run on
     /// every cycle (that is why discovery is not skipped in `connect`).
     pub async fn close(self) {
+        if let Some(url) = &self.fake_url {
+            let _ = reqwest::Client::new().post(format!("{url}/sim/ble/close"))
+                .header("x-sim-ble-generation", self.info["_sim_generation"].as_u64().unwrap().to_string())
+                .bearer_auth(&self.token).send().await;
+        }
         if let Some(peripheral) = self.peripheral {
             let _ = peripheral.disconnect().await;
+        }
+        tracing::debug!(timings = ?self.timings, "device rendezvous link closed");
+    }
+
+    /// Bounded variant of [`Self::close`] for callers that must not be blocked
+    /// by link cleanup. btleplug 0.11.8 on macOS can leave
+    /// `Peripheral::disconnect()` pending forever once the peripheral was
+    /// removed by a natural link loss, and a pending future never returns
+    /// `Err`. On timeout the handle is abandoned (the caller drops the
+    /// connection) and a `close`/`disconnect_timeout` warning is recorded so
+    /// the failure becomes diagnosable instead of silent.
+    ///
+    /// The future is cancelled in place rather than detached with
+    /// `tokio::spawn`: a background disconnect would race the next rendezvous
+    /// while btleplug's cached GATT objects are still alive (see `close`
+    /// above).
+    pub async fn close_bounded(self, limit: Duration) {
+        if let Some(url) = &self.fake_url {
+            let request = reqwest::Client::new().post(format!("{url}/sim/ble/close"))
+                .header("x-sim-ble-generation", self.info["_sim_generation"].as_u64().unwrap().to_string())
+                .bearer_auth(&self.token).send();
+            if tokio::time::timeout(limit, request).await.is_err() {
+                tracing::warn!(device_mac = %self.device_mac, event = "close",
+                    category = "disconnect_timeout", limit_ms = limit.as_millis() as u64,
+                    "BLE link close did not complete; link abandoned");
+            }
+        }
+        if let Some(peripheral) = self.peripheral {
+            if tokio::time::timeout(limit, peripheral.disconnect()).await.is_err() {
+                tracing::warn!(device_mac = %self.device_mac, event = "close",
+                    category = "disconnect_timeout", limit_ms = limit.as_millis() as u64,
+                    "BLE disconnect did not complete; link abandoned");
+            }
         }
         tracing::debug!(timings = ?self.timings, "device rendezvous link closed");
     }
@@ -1562,4 +1769,31 @@ mod tests {
             None
         );
     }
+    #[test]
+    fn ble_decoder_rejects_invalid_versions_attributes_and_correlation() {
+        assert!(super::decode_wire(&vec![b' ';513]).is_err());
+        assert!(super::decode_wire(br#"{"ble_wire":2}"#).is_err());
+        for bytes in [br#"{"ble_wire":1,"rid":"","w":[1,2]}"#.as_slice(),
+            br#"{"ble_wire":1,"rid":"cg==","w":[1,4294967296]}"#.as_slice(),
+            br#"{"ble_wire":1,"rid":"cg==","w":[1,2],"s":[]}"#.as_slice(),
+            br#"{"ble_wire":1,"rid":"AA==","w":[1,2]}"#.as_slice()] {
+            assert!(super::decode_wire(bytes).is_err());
+        }
+    }
+    #[test]
+    fn rf_deadline_is_fixed_for_repeated_commands_and_expired_windows() {
+        let now = tokio::time::Instant::now();
+        let mut link = super::DeviceConnection {
+            info: json!({}), peripheral: None, fake_url: None,
+            rf_deadline: Some(now + Duration::from_secs(1)), token: String::new(),
+            bridge_id: String::new(), nonce: String::new(), device_mac: String::new(),
+            auth_ready: true, wake_identity: None, wake_cause: String::new(),
+            device_last_stage: String::new(), timings: vec![],
+        };
+        assert_eq!(link.command_deadline(), link.rf_deadline.unwrap());
+        assert_eq!(link.command_deadline(), link.rf_deadline.unwrap());
+        link.rf_deadline = Some(now - Duration::from_secs(1));
+        assert!(link.command_deadline() < tokio::time::Instant::now());
+    }
+
 }

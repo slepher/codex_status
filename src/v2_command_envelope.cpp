@@ -9,10 +9,11 @@ const char *v2ParseCommand(const String &body, JsonDocument &doc) {
 V2CommandSessionDecision v2CheckCommandSession(
     JsonDocument &doc, const String &currentMac, const String *sessionNonce) {
     V2CommandSessionDecision decision;
+    JsonString id = doc["request_id"].as<JsonString>();
     const char *request = doc["request_id"] | "";
     if (!doc["protocol"].isNull() || !doc["rv"].isNull() ||
         String(doc["device_mac"] | "") != currentMac ||
-        !*request || strlen(request) > 64) return decision;
+        !id || id.size() != strlen(request) || !*request || strlen(request) > 64) return decision;
     if (!sessionNonce) {
         decision.needsNonce = true;
         decision.error = nullptr;
@@ -27,14 +28,14 @@ V2CommandSessionDecision v2CheckCommandSession(
 String v2BuildAck(const char *op, const char *result, const char *display,
                   const char *retention, const char *error, int64_t seq,
                   uint64_t planId, const char *context,
-                  uint32_t acceptedRemainingS, const char *fwTarget) {
+                  uint32_t acceptedRemainingS, const char *fwTarget, bool fullSeq) {
     JsonDocument doc;
     doc["op"] = op;
     doc["result"] = result;
     doc["display_state"] = display;
     doc["retention"] = retention;
     if (error && *error) doc["error"] = error;
-    if (seq >= 0) doc["data_seq"] = seq;
+    if (seq >= 0 || fullSeq) doc["data_seq"] = (uint64_t)seq;
     if (planId) doc["plan_id"] = planId;
     if (context && *context) doc["active_context_id"] = context;
     if (acceptedRemainingS != UINT32_MAX)

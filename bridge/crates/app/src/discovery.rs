@@ -2,7 +2,9 @@
 //! ARP lookup by MAC on the local /24 (Windows `SendARP` + neighbor table) plus
 //! the shared identity helpers (MAC normalization, default display name).
 
+#[cfg(not(target_os = "macos"))]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(not(target_os = "macos"))]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -59,9 +61,34 @@ pub fn arp_lookup(ip: &str) -> Option<String> {
     ))
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn arp_lookup(_ip: &str) -> Option<String> {
     None
+}
+
+#[cfg(target_os = "macos")]
+pub fn arp_lookup(ip: &str) -> Option<String> {
+    ip_octets(ip)?;
+    let output = std::process::Command::new("/usr/sbin/arp").args(["-n", ip]).output().ok()?;
+    parse_macos_neighbors(&String::from_utf8(output.stdout).ok()?).into_iter()
+        .find(|(address, _)| address == ip).map(|(_, mac)| mac)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_macos_neighbors(text: &str) -> Vec<(String, String)> {
+    text.lines().filter_map(|line| {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        let ip = fields.get(1)?.strip_prefix('(')?.strip_suffix(')')?;
+        ip_octets(ip)?;
+        if fields.get(2)? != &"at" { return None; }
+        let octets: Vec<_> = fields.get(3)?.split(':').collect();
+        if octets.len() != 6 { return None; }
+        let mac = octets.iter().map(|s| {
+            if s.is_empty() || s.len() > 2 { return None; }
+            u8::from_str_radix(s, 16).ok().map(|v| format!("{v:02X}"))
+        }).collect::<Option<Vec<_>>>()?.join("");
+        Some((ip.to_owned(), mac))
+    }).collect()
 }
 
 /// Read the Windows IPv4 neighbor table and map a normalized MAC back to its
@@ -105,13 +132,24 @@ fn neighbor_ip_for_mac(target: &str) -> Option<String> {
     None
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn neighbor_ip_for_mac(_target: &str) -> Option<String> {
     None
 }
 
+#[cfg(target_os = "macos")]
+fn neighbor_ip_for_mac(target: &str) -> Option<String> {
+    let output = std::process::Command::new("/usr/sbin/arp").arg("-an").output().ok()?;
+    parse_macos_neighbors(&String::from_utf8(output.stdout).ok()?).into_iter()
+        .find(|(_, mac)| mac == target).map(|(ip, _)| ip)
+}
+
 /// Parallel `SendARP` pass over the local /24; returns the first matching IP.
 fn sendarp_scan(hosts: &[String], target: &str) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    { let _ = hosts; return neighbor_ip_for_mac(target); }
+    #[cfg(not(target_os = "macos"))]
+    {
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     std::thread::scope(|scope| {
@@ -139,6 +177,7 @@ fn sendarp_scan(hosts: &[String], target: &str) -> Option<String> {
         drop(tx);
         rx.recv_timeout(Duration::from_secs(10)).ok()
     })
+    }
 }
 
 /// Scan the local /24 for `target_mac` and return its IP. Used when the
@@ -188,6 +227,11 @@ pub fn arp_scan_for_mac(local_ip: &str, target_mac: &str, timeout: Duration) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn macos_neighbor_table_pads_octets_and_rejects_incomplete_rows() {
+        let entries = parse_macos_neighbors("? (192.0.2.1) at 7:4:ad:b9:34:8 on en0 ifscope [ethernet]\n? (192.0.2.2) at (incomplete) on en0\n? (999.0.2.2) at 7c:4f:ad:b9:34:08 on en0");
+        assert_eq!(entries, vec![("192.0.2.1".into(), "0704ADB93408".into())]);
+    }
 
     #[test]
     fn identity_helpers_normalize_mac_format() {

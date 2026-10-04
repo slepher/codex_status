@@ -389,6 +389,16 @@ pub const ROW_BYTES: usize = (WIDTH as usize + 7) / 8;
 pub const BUF_LEN: usize = ROW_BYTES * HEIGHT as usize;
 
 extern "C" {
+    fn codex_sim_sync_append_wake(p: *mut std::ffi::c_void, json: *const c_char) -> c_int;
+    fn codex_sim_sync_history(p: *mut std::ffi::c_void, since: u32, limit: u32, out: *mut c_char, cap: c_int) -> c_int;
+
+    fn codex_sim_wifi_legacy(json: *const c_char);
+    fn codex_sim_wifi_open(dir: *const c_char) -> c_int;
+    fn codex_sim_wifi_command(input: *const c_char, peer: *const c_char, generation: u32, now: u64,
+        physical: u64, light: u64, allowed: c_int, out: *mut c_char, cap: c_int) -> c_int;
+    fn codex_sim_wifi_poll(now: u64, peer: *const c_char, generation: u32, encrypted: c_int, outcome: c_int) -> c_int;
+    fn codex_sim_wifi_storage_failure(fail: c_int);
+
     #[cfg(test)]
     fn codex_sync_core_check() -> c_int;
     #[cfg(test)]
@@ -505,6 +515,7 @@ extern "C" {
     fn codex_rgn_on_partial() -> c_int;
     fn codex_rgn_on_full() -> c_int;
     fn codex_rgn_dump(out: *mut c_char, out_len: c_int) -> c_int;
+    fn codex_ble_wire(kind: *const c_char, input: *const c_char, out: *mut c_char, cap: c_int) -> c_int;
     fn codex_v2_status_snapshot(input: *const c_char, out: *mut c_char, cap: c_int) -> c_int;
     fn codex_v2_plan_new() -> *mut std::ffi::c_void;
     fn codex_v2_plan_free(p: *mut std::ffi::c_void);
@@ -627,6 +638,14 @@ impl SimulatorSync {
         simulator_ffi_json(rc, &out, "sync status")
     }
 
+    pub fn append_wake(&mut self, value: &serde_json::Value) -> anyhow::Result<()> {
+        let text=CString::new(value.to_string())?;
+        anyhow::ensure!(unsafe{codex_sim_sync_append_wake(self.state,text.as_ptr())}==1,"wake_fixture_failed");Ok(())
+    }
+    pub fn history(&self, since:u32, limit:u32) -> anyhow::Result<serde_json::Value> {
+        let mut out=vec![0i8;16384];let rc=unsafe{codex_sim_sync_history(self.state,since,limit,out.as_mut_ptr(),out.len() as c_int)};
+        simulator_ffi_json(rc,&out,"history")
+    }
     pub fn command(&mut self, op: &str, message: &str,
                    snapshot: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
         let op = CString::new(op)?;
@@ -770,6 +789,18 @@ impl SimulatorBundle {
 
 impl Drop for SimulatorBundle {
     fn drop(&mut self) { unsafe { codex_sim_bundle_free(self.state) }; }
+}
+
+/// Build a BLE attribute using the SAME firmware encoder. Return its exact
+/// serialized bytes; callers must not parse/serialize before storing them.
+pub fn simulator_ble_wire(kind: &str, input: &serde_json::Value) -> anyhow::Result<Vec<u8>> {
+    let kind = CString::new(kind)?;
+    let input = CString::new(serde_json::to_string(input)?)?;
+    let mut out = vec![0u8; 513];
+    let rc = unsafe { codex_ble_wire(kind.as_ptr(), input.as_ptr(), out.as_mut_ptr().cast(), out.len() as c_int) };
+    anyhow::ensure!(rc > 0 && rc <= 512, "BLE wire builder rejected frame ({rc})");
+    out.truncate(rc as usize);
+    Ok(out)
 }
 
 /// Build the simulator's `/api/status` payload with the firmware's C++ builder.
@@ -1326,4 +1357,53 @@ pub fn png_to_bits_size(png_bytes: &[u8], width: u32, height: u32) -> anyhow::Re
         }
     }
     Ok(bits)
+}
+
+/// One Wi-Fi instance per Fake process, matching the production singleton.
+/// Serialize every call through SimState.wifi; no OS network is touched.
+pub struct SimulatorWifi { dir: std::path::PathBuf }
+impl SimulatorWifi {
+    pub fn new(dir: &std::path::Path) -> anyhow::Result<Self> {
+        let dir = CString::new(dir.to_str().ok_or_else(|| anyhow::anyhow!("wifi_directory"))?)?;
+        anyhow::ensure!(unsafe { codex_sim_wifi_open(dir.as_ptr()) } == 1, "wifi_store_corrupt");
+        let sim = Self { dir: std::path::PathBuf::from(dir.to_str()?) };
+        let legacy=std::fs::read_to_string(sim.dir.join("wifi-legacy.json")).unwrap_or("[]".into());
+        let legacy=CString::new(legacy)?;unsafe { codex_sim_wifi_legacy(legacy.as_ptr()) };Ok(sim)
+    }
+    pub fn legacy(&mut self, value: &serde_json::Value) -> anyhow::Result<()> {
+        let list=value.as_array().ok_or_else(||anyhow::anyhow!("invalid_legacy"))?;
+        anyhow::ensure!(list.len()<=3,"legacy_capacity");
+        for n in list {
+            anyhow::ensure!(n.as_object().is_some_and(|o|o.len()==2)&&n["network_id"].as_str().is_some_and(|s|!s.is_empty()&&s.len()<=32&&s.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'-'||b==b'_'))&&
+                n["ssid"].as_str().is_some_and(|s|!s.is_empty()&&s.len()<=32&&!s.contains('\0')),"invalid_legacy");
+        }
+        let bytes=serde_json::to_vec(value)?;
+        let path=self.dir.join("wifi-legacy.json");let temp=self.dir.join("wifi-legacy.json.tmp");
+        std::fs::write(&temp,&bytes)?;std::fs::rename(&temp,&path)?;
+        let text=CString::new(bytes)?;unsafe {codex_sim_wifi_legacy(text.as_ptr())};Ok(())
+    }
+    pub fn command(&mut self, input: &serde_json::Value, peer: &str, generation: u32, now: u64,
+        physical: u64, light: u64, allowed: bool) -> anyhow::Result<serde_json::Value> {
+        let input = CString::new(serde_json::to_string(input)?)?; let peer = CString::new(peer)?;
+        let mut out = vec![0i8; 16384];
+        let rc = unsafe { codex_sim_wifi_command(input.as_ptr(), peer.as_ptr(), generation, now,
+            physical, light, allowed as c_int, out.as_mut_ptr(), out.len() as c_int) };
+        simulator_ffi_json(rc, &out, "wifi")
+    }
+    pub fn poll(&mut self, now: u64, peer: &str, generation: u32, encrypted: bool, outcome: i32) -> anyhow::Result<bool> {
+        let peer = CString::new(peer)?;
+        Ok(unsafe { codex_sim_wifi_poll(now, peer.as_ptr(), generation, encrypted as c_int, outcome) } == 1)
+    }
+    pub fn storage_failure(&mut self, fail: bool) { unsafe { codex_sim_wifi_storage_failure(fail as c_int) }; }
+}
+
+#[test]
+fn rendezvous_plan_replay_ack_reports_remaining_without_renewal() {
+    let mut plan = SimulatorPlan::new().unwrap();
+    let body = r#"{"plan_id":1,"mode":"light","light_duration_s":120,"rendezvous_period_s":60}"#;
+    for (time, remaining) in [(0,120),(60_000,60),(121_000,0)] {
+        let ack = plan.decide(body, time).unwrap();
+        assert_eq!(ack["granted_s"], remaining, "replay ACK must report time left");
+        assert_eq!(ack["deadline_ms"], 120_000);
+    }
 }

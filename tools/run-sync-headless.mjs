@@ -149,11 +149,20 @@ try {
       `/claim?id=${bridgeId}&lease=3600`, {});
     if (claimed.owner?.id !== bridgeId) throw new Error(`claim failed for ${device.mac}`);
     const status = await call(device.url, endpoint, '/api/status');
-    const configured = await call(device.url, endpoint, '/sim/ble/command', {
-      op: 'sync_config', request_id: `config-${device.mac.slice(-2)}`,
+    const info = await call(device.url, endpoint, '/sim/ble/info');
+    if (info.mac !== status.device_mac || !info.peerBonded || !info.peerEncrypted) throw new Error('BLE identity/bond mismatch');
+    const requestId = `config-${device.mac.slice(-2)}`;
+    const accepted = await call(device.url, endpoint, '/sim/ble/command', {
+      op: 'sync_config', request_id: requestId,
       token: endpoint, device_mac: status.device_mac, session_nonce: status.session_nonce,
       bridge_id: bridgeId, enabled: true });
-    if (configured.result !== 'applied') throw new Error(`sync_config: ${JSON.stringify(configured)}`);
+    if (accepted.result !== 'accepted') throw new Error('BLE upload not accepted');
+    const configured = await call(device.url, endpoint, '/sim/ble/status');
+    if (configured.ack !== 'command' || configured.ble_wire !== 1 ||
+        Buffer.from(configured.rid ?? '', 'base64').toString('utf8') !== requestId ||
+        configured.w?.[0] !== info.wake_generation || configured.w?.[1] !== info.wake_seq ||
+        configured.result !== 'applied') throw new Error(`sync_config: ${JSON.stringify(configured)}`);
+    await call(device.url, endpoint, '/sim/ble/close', {});
     // The fixture's operation token is known here; preseed only this isolated
     // instance so its first HTTP cycle can establish the Bridge-owned serial.
     writeFileSync(join(target, 'instances', instance, 'data',

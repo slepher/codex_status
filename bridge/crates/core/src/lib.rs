@@ -10,6 +10,7 @@ pub mod http;
 pub mod paths;
 pub mod platform;
 pub mod runtime;
+pub mod rendezvous;
 pub mod template;
 pub mod device_client;
 

@@ -209,6 +209,16 @@ pub const MAX_LIGHT_S: u32 = 600;
 pub const MIN_LIGHT_S: u32 = 30;
 pub const RENDEZVOUS_S: u32 = 60;
 pub const BOOT_PROVISIONAL_S: u32 = 300;
+/// Bounded formal light window granted when a queued Wi-Fi read/sync job is the
+/// only pending work (W4-1). Rationale: the firmware's worst-case association is
+/// scan 15 s + connect 30 s and the read opportunity adds a 2 s status probe plus
+/// an 8 s transfer budget, so a window shorter than ~60 s can expire before the
+/// first read; 120 s covers that with ~2x headroom while staying well under
+/// [`MAX_LIGHT_S`] (600 s) so a stuck read can never pin the radio for the
+/// data/publish maximum. It is a *duration*, never a hold deadline: each
+/// rendezvous re-decides from live job state and nothing extends light as a side
+/// effect of reading (see `plan_for_rendezvous`).
+pub const WIFI_READ_LIGHT_S: u32 = 120;
 
 impl Coordinator {
     pub fn new(mac: &str, caps: DeviceCapabilities) -> Self {
@@ -677,11 +687,12 @@ impl Coordinator {
                     .saturating_sub(now.saturating_sub(self.plan.last_accepted_at) as u32)
                     > 60;
             let sent_recently = now.saturating_sub(self.plan.last_sent_at) < 60;
-            if same_content && (accepted_live || sent_recently) {
+            if same_content && last.plan_id >= self.device_plan_high && (accepted_live || sent_recently) {
                 return last.clone();
             }
         }
-        self.plan.next_plan_id += 1;
+        self.plan.next_plan_id = self.plan.next_plan_id.max(self.device_plan_high)
+            .max(self.plan.last_accepted_id).saturating_add(1);
         let mut plan = desired;
         plan.plan_id = self.plan.next_plan_id;
         self.plan.last_sent = Some(plan.clone());
@@ -763,6 +774,11 @@ impl Coordinator {
             // Same id replayed with no matching sent plan: conflict.
             return PlanAck::Conflict;
         }
+        // Same ID never renews a known deadline, even with an old ROM's grant ACK.
+        let accepted_remaining_s = if self.plan.last_accepted_id == plan_id && plan_id != 0 {
+            accepted_remaining_s.min(self.plan.last_accepted_remaining_s
+                .saturating_sub(now.saturating_sub(self.plan.last_accepted_at).min(u32::MAX as u64) as u32))
+        } else { accepted_remaining_s };
         self.device_plan_high = plan_id;
         self.plan.last_accepted_id = plan_id;
         self.plan.last_accepted_remaining_s = accepted_remaining_s;
@@ -1255,6 +1271,17 @@ mod tests {
     }
 
     #[test]
+    fn rendezvous_new_plan_tracks_device_high_and_duplicate_ack_cannot_extend() {
+        let mut c = coord();
+        c.note_status(&json!({"power":{"plan_id":100,"remaining_s":0}}), 1000);
+        let p = c.plan_for(1000, true, 120, "rendezvous");
+        assert_eq!(p.plan_id, 101);
+        c.note_plan_ack(p.plan_id, 120, false, 1000);
+        c.note_plan_ack(p.plan_id, 120, false, 1060); // even a legacy over-report
+        assert_eq!(c.plan.last_accepted_at + c.plan.last_accepted_remaining_s as u64, 1120);
+    }
+
+    #[test]
     fn plan_id_idempotent_and_never_restarts_boot_window() {
         let mut c = coord();
         let p1 = c.plan_for(1000, true, 300, "rendezvous");
@@ -1264,7 +1291,7 @@ mod tests {
         assert_eq!(c.note_plan_ack(p1.plan_id, 299, false, 1006), PlanAck::Accepted);
         let before = c.plan.last_accepted_remaining_s;
         assert_eq!(c.note_plan_ack(p1.plan_id, 299, false, 1007), PlanAck::Accepted);
-        assert_eq!(c.plan.last_accepted_remaining_s, before);
+        assert_eq!(c.plan.last_accepted_remaining_s, before - 1);
         // BOOT: keeping the original window sends remaining time, not a fresh 300.
         let mut c2 = coord();
         let boot = c2.boot_plan(1000, 1000, true, 300);

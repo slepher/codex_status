@@ -1,5 +1,19 @@
 # Bridge macOS 后续实施任务与验收
 
+2026-10-04 最新：会合协议模块及Astra A1–A6、关联A7/A8源码候选已实施，310项Rust回归及C++专测通过，Note4 .46候选构建成功；未部署/烧录，真实仍.45、生产Bridge停机。逐项证据与现场缺口见 [rendezvous-protocol-review.md](rendezvous-protocol-review.md)，执行计划见 [rendezvous-protocol-plan.md](rendezvous-protocol-plan.md)，待办归backlog B6。下文保留此前里程碑状态。
+
+2026-10-03 W0–W6本批软件更新（未部署）：新版完整Wi-Fi投影/事务、三份非秘密状态与持久任务、实际机会调度、字段冲突/待确认、生产Wi-Fi/history Fake HAL和完整双侧UI已实施。五crate239 passed/1 ignored、Fake48 passed（合计287/1 ignored），host3入口与设备页JS通过；最后app51/1 ignored及Fake Wi-Fi3项复测通过。逐阶段/逐A编号证据及边界见 [wifi-rendezvous-execution.md第11节](wifi-rendezvous-execution.md#11-w0w6-软件交付与验收对账2026-10-03未部署)。下文旧“尚未实施”记录保留为当时历史。
+
+自审收紧：预览local_revision原子校验；部分字段不扩大，新项全元数据批准；凭据操作单独选择/内存输入；unknown不能证明不可读密码；明确rejected结束；稳定ID丢ACK先query+readback；大型设备存储临时副本移至有界heap。可选授权后置Data/Plan且250ms上限，配置借合法Wi-Fi8s预算，设备锁及OTA/发布优先。v1迁移/损坏/账本容量/授权期限有宿主断言；旧宿主夹具临时字符串改为拥有副本，消除悬空ID造成的帧断言假失败。
+
+W7未执行，实际仍.44/原运行.app；没有新ROM/App产物、运行应用重启、刷机、串口、真实网络修改或提交。账本8项永久保留无自动清理，满后明拒；整板链接/实板RAM/RF、原屏幕跳变、持续重连/INFO超时、TCC/功耗、Windows/其他架构/1.54及完整app事件/抢锁压力仍未验。一般诊断采集持久化只保留既有入口，不宣称全部改造。B5/B6仍开放，配额延迟调查/backlog A8另列。
+
+最新设计入口（2026-10-03）：用户要求重新设计 Wi-Fi 全量方案管理与同步，见 [wifi-redesign.md](wifi-redesign.md)。当前 protocol=1 实现与下方旧规划不等于新设计已完成；新稿覆盖单方案管理/试连即保存启用的旧交互。Note4 试连跳屏异常待诊断，最新产物/未部署改动见 PROGRESS 顶节。
+
+
+2026-10-03 实施更新：R0 合同已定稿于 [wifi-protocol.md](wifi-protocol.md)，R1–R4 与 R5 ARP/R6 按需监督已实现并通过本机软件回归；Note4 `0.18.42-note4-b-wifi1` 运行镜像已认证核对。以下规划阶段的旧状态仅保留背景，当前现场以 PROGRESS 顶节为准。尚缺真实离线/密码试连/换网、自然会合与常驻生命周期矩阵，B5/B6 不结项。
+
+
 新窗口使用 [remaining-plan.md](remaining-plan.md) 接续未完成部分；下表保留原 T0–T7 任务定义，不表示每一项均未实现。真实状态以 PROGRESS/backlog 为准。
 
 本文件是 [plan.md](plan.md) 的执行拆分；2026-10-03 用户已授权开始执行，先进入 P0/T0。当前状态与排期以 [backlog B5](../../docs/roadmap/backlog.md#b5-bridge-macos-菜单栏支持2026-10-03-新开) 为准。
@@ -34,3 +48,20 @@
 低功耗验收先证明沿用正式 PowerPlan、radio 截止期和 ACK 后收尾；若宣称与 Windows 相同的能耗，须另有电流仪的同条件整周期证据。主机实际睡眠时的会合缺失须独立统计，不伪装成 RF 失败或成功。
 
 OTA/发布是未来端到端验收动作，不是本次操作；须在获准实机验证时明确目标 MAC、已有正确 ROM 与恢复证据。优先用 Fake ROM 验证失败矩阵，避免为托盘移植重刷设备。
+
+
+## BLE fidelity 软件实施（2026-10-03）
+
+- [x] P0 核心：清点出站类型，锁定 `ble_wire=1` 紧凑摘要、字段预算和能力边界，合同见 wifi-protocol.md。
+- [x] P1 核心：固件/宿主共用生产编码，全部 INFO/Status 写入统一 512 B 门槛与写后校验；宿主边界与 Wi-Fi HAL 已验。整板/NimBLE 实测另列未验。
+- [x] P2 核心：Fake 原始属性读写分离；真实 DeviceConnection 共用 ACK 关联/固定截止；属性和分片故障回归通过。
+- [ ] P2 余项：Fake Wi-Fi/history HAL、跨 bond/session 与完整分页快照客户端矩阵。
+- [x] P3 入口：新增 command_with_id；代表 plan 丢 ACK/同 ID 确认回归通过。
+- [ ] P3 恢复：既有 Wi-Fi 读/同步意图持久化、期限/机会重试、待确认查询/回读、重启恢复与冲突暂停；完整同步能力仍依赖 Wi-Fi 重设计。
+- [x] P4 首批回归：BLE/render/Fake/app/core/MCP 共 278 passed / 1 ignored；Wi-Fi HAL 最终帧最大418 B，Node 语法检查通过。
+- [ ] P4 放行：计划第8节全矩阵逐行完成；上述余项与 P5 硬件边界仍在 backlog B6。
+
+首批软件阶段保留既有改动与数据，不运行pio或操作设备；用户随后追加刷机授权，完成项如下。全程未清缓存或提交。
+
+- [x] P5最小追加：仅Note4整板构建、USB MAC/旧ROM核对、.44烧录/整段读回/认证运行镜像确认；配套.app备份/升级/托管重启；一次真实BLE status/plan/sync_open ACK通过。
+- [ ] P5余项：后续连接/INFO读取超时诊断、连续重连、自然timer/电池、完整RF/TCC/功耗与Windows矩阵。

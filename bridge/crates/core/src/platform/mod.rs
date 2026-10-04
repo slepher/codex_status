@@ -9,3 +9,5 @@ pub mod store;
 pub use crate::compile;
 pub use crate::coordinator;
 pub use crate::datasource;
+
+pub mod wifi;

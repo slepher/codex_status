@@ -34,7 +34,7 @@ V2PlanDecision v2DecidePlan(JsonDocument &doc, V2PlanState &state,
     case V2_PLAN_ACCEPTED:
         decision.accepted = true;
         decision.result = "applied";
-        decision.grantedS = state.grantedS();
+        decision.grantedS = state.remainingS(nowMs);
         break;
     }
     return decision;

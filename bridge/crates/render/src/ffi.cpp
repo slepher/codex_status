@@ -9,6 +9,7 @@
 #include "v2_activate_command.h"
 #include "v2_claim_command.h"
 #include "v2_command_envelope.h"
+#include "ble_wire.h"
 #include "v2_status_snapshot.h"
 #include "display_result.h"
 #include "v2_sync.h"
@@ -516,7 +517,7 @@ int codex_sim_data(void *p, const char *message, char *out, int cap) {
     return simCopy(v2BuildAck("data", decision.result, display, "ram",
         decision.error.length() ? decision.error.c_str() : nullptr, decision.seq, 0,
         decision.includeContext ? device.profile.contextId : nullptr,
-        UINT32_MAX, device.firmwareTarget.c_str()), out, cap);
+        UINT32_MAX, device.firmwareTarget.c_str(), decision.includeContext), out, cap);
 }
 
 int codex_sim_activate(void *p, const char *message, uint64_t now_ms,
@@ -1199,6 +1200,70 @@ int codex_v2_build_ack(const char *op, const char *result, const char *display,
     if (body.length() >= (size_t)cap) return -3;
     memcpy(out, body.c_str(), body.length() + 1);
     return (int)body.length();
+}
+// Returns production ArduinoJson wire bytes directly, never a Rust re-encoding.
+int codex_ble_wire(const char *kind, const char *input, char *out, int cap) {
+    JsonDocument doc;
+    if (!kind || !input || !out || cap <= 0 || deserializeJson(doc, input)) return -1;
+    auto text = [&](const char *key) {
+        JsonString json = doc[key].as<JsonString>();
+        String value; if (json) value.concat(json.c_str(), json.size());
+        return value;
+    };
+    String bytes;
+    if (!strcmp(kind, "info")) {
+        BleInfoSnapshot snapshot;
+        snapshot.mac = text("mac"); snapshot.ip = text("ip");
+        snapshot.firmware = text("fw");
+        snapshot.rfRemainingMs = doc["rf_remaining_ms"] | UINT32_MAX;
+        snapshot.generation = doc["wake_generation"] | 0u; snapshot.wakeSeq = doc["wake_seq"] | 0u;
+        snapshot.bonded = doc["peerBonded"] | false; snapshot.encrypted = doc["peerEncrypted"] | false;
+        snapshot.pairing = doc["pairingWindow"] | false; snapshot.configured = doc["bundle_configured"] | false;
+        snapshot.wifiProtocol = doc["wifi_setup_protocol"] | 0;
+        snapshot.wifiManagement = doc["wifi_management"] | 0;
+        snapshot.wifiConnection = doc["wifi_connection"] | 0;
+        bytes = bleBuildInfo(snapshot);
+    } else if (!strcmp(kind, "status")) {
+        BleStatusSnapshot snapshot;
+        snapshot.mac = text("device_mac"); snapshot.nonce = text("session_nonce");
+        snapshot.context = text("active_context_id"); snapshot.activeTemplate = text("active_template_id");
+        snapshot.commitSeq = doc["commit_seq"] | 0u;
+        snapshot.job = text("committed_job_id"); snapshot.appliedSeq = doc["applied_seq"] | 0ULL;
+        snapshot.light = doc["power"]["mode"] == "light"; snapshot.planId = doc["power"]["plan_id"] | 0ULL;
+        snapshot.remainingS = doc["power"]["remaining_s"] | 0u;
+        snapshot.provisionalS = doc["power"]["provisional_remaining_s"] | 0u;
+        snapshot.rendezvousVersion = doc["rendezvous_v"] | 0;
+        snapshot.syncAvailable = doc["sync"]["v"] == 1; snapshot.syncEnabled = doc["sync"]["enabled"] | false;
+        snapshot.rounds = doc["sync"]["rounds"] | 0; snapshot.retrySkip = doc["sync"]["retry_skip"] | 0;
+        snapshot.due = doc["sync"]["due"] | false; snapshot.pending = doc["sync"]["pending"] | false;
+        JsonDocument body;
+        String status = bleBuildStatus(snapshot);
+        if (!status.length() || deserializeJson(body, status)) return -2;
+        bytes = bleBuildReply(body, text("request_id"), doc["wake_generation"] | 0u, doc["wake_seq"] | 0u);
+    } else if (!strcmp(kind, "ack")) {
+        String body = v2BuildAck(doc["op"] | "command", doc["result"] | "rejected",
+            doc["display_state"] | "unchanged", doc["retention"] | "ram", doc["error"] | "",
+            (int64_t)(doc["data_seq"] | UINT64_MAX), doc["plan_id"] | 0ULL,
+            text("active_context_id").c_str(), doc["accepted_remaining_s"] | UINT32_MAX,
+            doc["fw_target"] | "", !doc["data_seq"].isNull());
+        JsonDocument reply; if (deserializeJson(reply, body)) return -2;
+        bytes = bleBuildReply(reply, text("request_id"), doc["wake_generation"] | 0u, doc["wake_seq"] | 0u);
+    } else if (!strcmp(kind, "reply")) {
+        String request = text("request_id");
+        uint32_t generation = doc["wake_generation"] | 0u, seq = doc["wake_seq"] | 0u;
+        bytes = bleBuildReply(doc, request, generation, seq);
+    } else if (!strcmp(kind, "auth")) {
+        bytes = bleBuildAuth(doc["ok"] | false, text("token"));
+    } else if (!strcmp(kind, "endpoint")) {
+        bytes = bleBuildEndpoint(doc["ok"] | false);
+    } else if (!strcmp(kind, "attribute")) {
+        // AUTH/endpoint and already paged Wi-Fi frames still share final limits.
+        serializeJson(doc, bytes);
+        if (!bleWireFits(bytes)) return -2;
+    } else return -1;
+    if (!bytes.length() || bytes.length() >= (size_t)cap) return -2;
+    memcpy(out, bytes.c_str(), bytes.length());
+    return (int)bytes.length();
 }
 int codex_v2_status_snapshot(const char *input, char *out, int cap) {
     if (!input || !out || cap <= 0) return -99;

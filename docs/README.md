@@ -7,16 +7,18 @@
 
 | 你要做什么 | 依次读 |
 |---|---|
-| 接手项目、想知道现状 | `AGENTS.md`（操作约定）→ `PROGRESS.md`（最新现场，现在只有 ~16 KB）→ `docs/roadmap/backlog.md`（唯一待办来源） |
+| 接手项目、想知道现状 | `AGENTS.md`（操作约定）→ `PROGRESS.md`（最新现场与归档入口）→ `docs/roadmap/backlog.md`（唯一待办来源） |
 | 决定下一步做什么 | `docs/roadmap/backlog.md` §2 紧急 / §3 暂缓 |
 | 查某个已结项专项做了什么 | `docs/roadmap/archive-digest-legacy.md` / `archive-digest-recent.md` → 需要细节再进 `docs/history/workflow/<name>/` |
-| 查历史里程碑（0.13–0.18 各轮实机修复） | `docs/history/progress-archive-2026-09-23.md`（≤09-22）、`docs/history/progress-archive-2026-09-25.md`（09-24 及合并过程） |
+| 查历史里程碑（0.13–0.18 各轮实机修复） | `docs/history/progress-archive-2026-09-23.md`（≤09-22）、`docs/history/progress-archive-2026-09-25.md`（09-24 及合并过程）、[2026-10-03 归档](history/progress-archive-2026-10-03.md)（09-25 至 10-03 较早记录） |
 | 改协议/模板/渲染 | `docs/generic-display-platform-design.md`（权威架构）+ `AGENTS.md` §关键不变量 |
 | 改电源/唤醒/占用 | `docs/power-state.md` + `docs/generic-display-platform-design.md` §7 |
 | 改休眠设备的状态页、模板/OTA 延后投递 | `docs/generic-display-platform-design.md` + `project-workflow/sleep-aware-bridge/design.md` / `task.md` |
 | 改 BLE 会合功耗 | `docs/ble-rendezvous-power-design.md` |
 | 接续 Bridge macOS 菜单栏与 BLE 支持 | `project-workflow/bridge-macos/remaining-plan.md`（新窗口剩余实施入口）→ 按需读原 `plan.md` / `task.md`；已授权实施，`bridge_first` 已废弃，待办见 backlog B5 |
-| 实施设备页离线 BLE 配网、绑定独立方案与 BOOT 恢复 | `project-workflow/bridge-macos/remaining-plan.md` R0–R4 + `wifi-setup-plan.md`；功能尚未实现，当前只携带 Note4，待办见 backlog B6 |
+| 实施下一步配网、Bridge 双侧界面与异步会合 | `project-workflow/bridge-macos/wifi-rendezvous-execution.md`（W0–W6、第6节界面与Fake验收）→ `wifi-redesign.md` / `wifi-protocol.md` / BLE fidelity §11–§12；最新现场先读 PROGRESS |
+| 验证 Wi-Fi 分 tab / 真实 macOS 布局 | `project-workflow/bridge-macos/wifi-tabs-plan.md`；`node tools/test-device-page.mjs` + `bash tools/test-wifi-ui.sh`，WKWebView 合成 IPC / 12 场景 / 截图审阅；设备通信另验 |
+| 实施设备页离线 BLE 配网、绑定独立方案与 BOOT 恢复 | `project-workflow/bridge-macos/wifi-redesign.md`（最新全量管理/UI 重设计）→ `remaining-plan.md` R0–R4 / `wifi-protocol.md`；protocol=1 候选已部署，新设计与实机缺陷待完成，仅 Note4 在场，见 backlog B6 |
 | 改模拟器/实验时钟 | `docs/fake-rom-simulator-design.md` + `docs/history/workflow/fake-rom-simulator-def/evidence.md`（D/E/F 已结项） |
 | 改字体资产 | `docs/font-asset-format.md` + `project-workflow/note4-bridge-publish/protocol.md`（**草案，未定稿**） |
 | 查缺陷结案 | `docs/history/bugs-2026-09-22.md`（原 `bugs.md`，已结案） |
@@ -36,6 +38,7 @@
 
 | 位置 | 内容 |
 |---|---|
+| [docs/history/progress-archive-2026-10-03.md](history/progress-archive-2026-10-03.md) | 2026-09-25 至 2026-10-03 较早的 68 节；正文完整保留，当前部署记录留在 PROGRESS.md |
 | `docs/history/progress-archive-2026-09-23.md` | 2026-09-22 及更早的进度节（48 节） |
 | `docs/history/progress-archive-2026-09-25.md` | 2026-09-24 及更早的历史节 + 合并/包隔离过程细节（原 `PROGRESS.md` 111 行起，逐字节保留） |
 | `docs/history/generic-display-platform-design-v1.md` | 早期架构，已被现行设计取代，仅留决策史 |

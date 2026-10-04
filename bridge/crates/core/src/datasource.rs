@@ -190,11 +190,12 @@ impl DataSource {
     }
 }
 
-/// Default trigger classification for a canonical field path (v2 §6/§12):
+/// Default trigger classification after resolving derived field paths (v2 §6/§12):
 /// visible usage values push; reset times, window lengths, server time and raw
 /// metadata pull.
 pub fn classify_trigger(field: &str) -> FieldTrigger {
-    let tail = field.rsplit('.').next().unwrap_or(field);
+    let (canonical, _) = resolve_field(field);
+    let tail = canonical.rsplit('.').next().unwrap_or(&canonical);
     match tail {
         "usedPercent" | "availableCount" | "plan" | "label" | "name" | "id" => FieldTrigger::Push,
         _ => FieldTrigger::Pull,
@@ -514,6 +515,10 @@ mod tests {
     fn trigger_truth_table() {
         assert_eq!(
             classify_trigger("buckets[codex].weekly.usedPercent"),
+            FieldTrigger::Push
+        );
+        assert_eq!(
+            classify_trigger("buckets[codex].weekly.remaining"),
             FieldTrigger::Push
         );
         assert_eq!(

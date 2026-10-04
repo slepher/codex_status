@@ -2,10 +2,12 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>NSBluetoothAlwaysUsageDescription</key>
-<string>Connect to your display to pair, configure its network and exchange data during scheduled Bluetooth wake windows.</string>
+<string>连接墨水屏，完成蓝牙配对、Wi-Fi 配置与唤醒交接。</string>
 <key>NSLocalNetworkUsageDescription</key>
 <string>Discover your display and deliver data, display bundles and firmware on your local network.</string>
 <key>NSLocationWhenInUseUsageDescription</key>
-<string>Read the connected Wi-Fi network to select the matching 2.4GHz network stored on your display.</string>
+<string>macOS 要求定位权限才能读取当前 Wi-Fi 名称，用于匹配墨水屏的网络配置；不会读取或记录地理坐标。</string>
+<key>NSLocationUsageDescription</key>
+<string>macOS 要求定位权限才能读取当前 Wi-Fi 名称，用于匹配墨水屏的网络配置；不会读取或记录地理坐标。</string>
 <key>LSUIElement</key><true/>
 </dict></plist>

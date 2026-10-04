@@ -2,6 +2,8 @@
 #include "dev_log.h"
 #include <NimBLEDevice.h>
 #include <ArduinoJson.h>
+#include "ble_wire.h"
+#include "v2_state.h"
 #include <Preferences.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
@@ -18,6 +20,8 @@ static bool     peerEncrypted  = false;
 static bool     disconnecting  = false;
 static uint16_t peerConnHandle = BLE_HS_CONN_HANDLE_NONE;
 static String   peerAddress;
+static String   peerIdentity;
+static uint32_t connectionGeneration = 0;
 static uint32_t pairingUntil   = 0;
 static bool     advertising    = false;
 static String   endpointBuf;
@@ -71,6 +75,10 @@ class PeerRef {
     bool     bonded() const { return info_->isBonded(); }
     uint16_t handle() const { return info_->getConnHandle(); }
     String   address() const { return info_->getAddress().toString().c_str(); }
+    String identity() const {
+        auto id = info_->getIdAddress();
+        return String(id.toString().c_str()) + "/" + String(id.getType());
+    }
 
   private:
     NimBLEConnInfo *info_;
@@ -86,6 +94,9 @@ class PeerRef {
     uint16_t handle() const { return desc_ ? desc_->conn_handle : BLE_HS_CONN_HANDLE_NONE; }
     String address() const {
         return desc_ ? NimBLEAddress(desc_->peer_id_addr).toString().c_str() : String();
+    }
+    String identity() const {
+        return desc_ ? address() + "/" + String(desc_->peer_id_addr.type) : String();
     }
 
   private:
@@ -128,16 +139,48 @@ static bool appendJson(String &buf, const std::string &value, size_t limit,
     return true;
 }
 
+// A shared last gate for ALL INFO/Status writes, including auth/endpoint.
+// NimBLE setValue returns void: verify the stored length before notifying.
+static bool writeAttribute(NimBLECharacteristic *characteristic, const String &bytes, const char *name) {
+    if (!characteristic) return false;
+    if (!bleWireFits(bytes)) {
+        DevLog.printf("[ble-wire] chr=%s bytes=%u max=512 result=precheck_failed\n", name, (unsigned)bytes.length());
+        return false;
+    }
+    characteristic->setValue((const uint8_t *)bytes.c_str(), bytes.length());
+    const auto stored = characteristic->getValue();
+    const bool written = stored.size() == bytes.length() && !memcmp(stored.data(), bytes.c_str(), bytes.length());
+    JsonDocument metadata;
+    deserializeJson(metadata, bytes);
+    const char *category = metadata["ack"] | "info";
+    const char *op = metadata["op"] | category;
+    const bool known = !strcmp(op,"status") || !strcmp(op,"data") || !strcmp(op,"plan") ||
+        !strcmp(op,"handoff") || !strcmp(op,"sync_config") || !strcmp(op,"sync_open") || !strcmp(op,"wifi") ||
+        !strcmp(op,"auth") || !strcmp(op,"endpoint") || !strcmp(op,"info");
+    // Hash only correlation; never log the frame, token, password or input op.
+    String rid = metadata["rid"] | "";
+    uint32_t correlation = v2Crc32((const uint8_t *)rid.c_str(), rid.length());
+    DevLog.printf("[ble-wire] op=%s chr=%s correlation=%08x bytes=%u max=512 wake=%u/%u result=%s\n",
+        known ? op : "command", name, (unsigned)correlation, (unsigned)bytes.length(),
+        metadata["w"][0] | 0u, metadata["w"][1] | 0u, written ? "written" : "write_failed");
+    return written;
+}
+static String (*infoProvider)() = nullptr;
 static void refreshInfo() {
-    if (!infoChr) return;
-    String info = "{\"schema\":1,\"model\":\"ESP32-S3-ePaper-1.54-BW\",\"fw\":\"" + fwVersion +
-                  "\"";
-    if (infoExtra.length()) info += "," + infoExtra;
-    info += ",\"pairingWindow\":" + String(blePairingWindowOpen() ? "true" : "false") +
-            ",\"peerBonded\":" + String(peerBonded ? "true" : "false") +
-            ",\"peerEncrypted\":" + String(peerEncrypted ? "true" : "false");
-    info += "}";
-    infoChr->setValue(reinterpret_cast<const uint8_t *>(info.c_str()), info.length());
+    if (infoProvider) infoExtra = infoProvider();
+    JsonDocument extra;
+    if (deserializeJson(extra, String("{") + infoExtra + "}")) return;
+    BleInfoSnapshot snapshot;
+    snapshot.mac = extra["mac"] | ""; snapshot.ip = extra["ip"] | "";
+    snapshot.firmware = fwVersion;
+    snapshot.rfRemainingMs = extra["rf_remaining_ms"] | UINT32_MAX;
+    snapshot.generation = extra["wake_generation"] | 0u; snapshot.wakeSeq = extra["wake_seq"] | 0u;
+    snapshot.configured = extra["bundle_configured"] | false;
+    snapshot.wifiProtocol = extra["wifi_setup_protocol"] | 0;
+    snapshot.wifiManagement = extra["wifi_management"] | 0;
+    snapshot.wifiConnection = extra["wifi_connection"] | 0;
+    snapshot.pairing = blePairingWindowOpen(); snapshot.bonded = peerBonded; snapshot.encrypted = peerEncrypted;
+    writeAttribute(infoChr, bleBuildInfo(snapshot), "info");
 }
 
 class InfoCallbacks : public NimBLECharacteristicCallbacks {
@@ -152,6 +195,7 @@ class InfoCallbacks : public NimBLECharacteristicCallbacks {
 class ServerCallbacks : public NimBLEServerCallbacks {
   private:
     void handleDisconnect() {
+        ++connectionGeneration;
         connected = false;
         peerBonded = false;
         peerEncrypted = false;
@@ -189,6 +233,8 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         disconnecting = false;
         clearReceiveBuffers();
         peerAddress = peer.address();
+        peerIdentity = peer.identity();
+        ++connectionGeneration;
         DevLog.printf("[ble] connected: %s bonded=%d\n", peerAddress.c_str(), peerBonded ? 1 : 0);
         refreshInfo();
         if (!peerBonded && !blePairingWindowOpen()) {
@@ -207,6 +253,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         PeerRef peer(desc);
         peerEncrypted = peer.encrypted();
         peerBonded = peer.bonded();
+        peerIdentity = peer.identity();
         refreshInfo();
         if (!peer.secure()) {
             DevLog.println("[ble] authentication rejected: encryption and bond required");
@@ -349,6 +396,8 @@ bool bleIsConnected() { return connected; }
 bool blePeerIsBonded() { return peerBonded; }
 bool blePeerIsEncrypted() { return peerEncrypted; }
 String blePeerAddress() { return peerAddress; }
+String blePeerIdentity() { return peerIdentity; }
+uint32_t bleConnectionGeneration() { return connectionGeneration; }
 bool blePairingWindowOpen() {
     return pairingUntil != 0 && (int32_t)(millis() - pairingUntil) < 0;
 }
@@ -385,23 +434,18 @@ void bleSetCommandHandler(DeviceCommandHandler onCommand) {
     commandHandler = onCommand;
 }
 
+void bleSetInfoProvider(String (*provider)()) { infoProvider = provider; }
+
 void bleSetInfoExtra(const String &json) {
     infoExtra = json;
     refreshInfo();
 }
 
-void bleNotifyStatus(const String &json) {
-    if (!statusChr) return;
-    statusChr->setValue(reinterpret_cast<const uint8_t *>(json.c_str()), json.length());
-    if (connected && peerEncrypted && peerBonded) statusChr->notify();
-    DevLog.printf("[ble] status: %s\n", json.c_str());
-}
+void bleNotifyStatus(const String &json) { bleNotifyStatusQuiet(json); }
 
-// Like bleNotifyStatus but without serial logging; used for secrets (auth token).
 void bleNotifyStatusQuiet(const String &json) {
-    if (!statusChr) return;
-    statusChr->setValue(reinterpret_cast<const uint8_t *>(json.c_str()), json.length());
-    if (connected && peerEncrypted && peerBonded) statusChr->notify();
+    if (writeAttribute(statusChr, json, "status") && connected && peerEncrypted && peerBonded)
+        statusChr->notify();
 }
 
 void blePoll() {

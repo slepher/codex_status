@@ -18,4 +18,4 @@ V2CommandSessionDecision v2CheckCommandSession(
 String v2BuildAck(const char *op, const char *result, const char *display,
                   const char *retention, const char *error, int64_t seq,
                   uint64_t planId, const char *context,
-                  uint32_t acceptedRemainingS, const char *fwTarget);
+                  uint32_t acceptedRemainingS, const char *fwTarget, bool fullSeq = false);

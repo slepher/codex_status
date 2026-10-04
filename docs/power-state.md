@@ -40,7 +40,7 @@ v0.12 已于 0.12.x 实现（§1–§12 描述现行固件）；v0.14 deep/light
 | 状态 | 条件 | 无线 | 睡眠 | 屏幕状态字 |
 |---|---|---|---|---|
 | AP | 无凭据；或 BOOT 15s | Wi-Fi AP | 插电：不睡（USB 自锁）；电池：5min 空闲 → 深睡（无定时唤醒，按键才醒） | `AP` |
-| BLE ON | Wi-Fi 已连 ∧（单击 或 插电+>20% 常开） | Wi-Fi STA + BLE | 不睡 | `BLE ON` |
+| BLE ON | 物理恢复（可离线/AP）或 Wi-Fi 已连 ∧ 插电+>20% | Wi-Fi STA/AP + BLE | 物理恢复固定 120s，USB 自动会话沿原策略 | `BLE ON`（离线/AP 仍优先显示原网络态） |
 | IDLE | Wi-Fi 已连、无会话 | Wi-Fi STA（MAX_MODEM） | light sleep（BLE 先 deinit） | `BLE OFF` |
 | WIFI OFF·插电 | PC USB ∧ 失联 | Wi-Fi STA 每 **60s** 重试 | **不睡**（串口可用） | `WIFI OFF` |
 | WIFI OFF·电池 | 未插电 ∧ 失联 | 全关 | deep sleep：1min×3 → 5min×3 → 15min 永久；按键唤醒清零重来 | `WIFI OFF` |
@@ -49,13 +49,12 @@ v0.12 已于 0.12.x 实现（§1–§12 描述现行固件）；v0.14 deep/light
 - 深睡醒来 = 整机复位：Wi-Fi 与 BLE 一同重新初始化（不存在"只开一个"）。
 - **唯一主动 deep sleep 路径**：WIFI OFF·电池、AP 无凭据超时（无定时）、
   低电保护（实为断电）。其余时刻永不 deep sleep。
-- WIFI OFF 时不建立 BLE 会话（Wi-Fi 不通时单独开 BLE 无意义，插电时同样）。
+- WIFI OFF/AP/无 Bundle 可用 BOOT 开启物理 BLE 恢复；Wi-Fi 丢失与普通业务截止在该固定窗口内不关 BLE/睡眠。timer 不获得恢复授权。冷启动联网失败保留最多 120s 按键处理机会，timer 不增加此宽限。
 
 ## 4. 按键与 LED
 
 - **BOOT 单击**（<2s 释放；1s 节流，屏幕始终反映最终状态）：
-  IDLE → BLE ON；BLE ON → BLE OFF（→ light sleep）；WIFI OFF（插电清醒态）→
-  立即重试 Wi-Fi；AP 态无操作。
+  任意可操作态 → 固定 120s 物理恢复；恢复中再次短击关闭（不延长）。普通 USB BLE 已开时短击仍打开独立恢复授权。GPIO0 深睡唤醒直接进入该恢复，无需第二次按键；PWR 保留原 provisional。
 - **BOOT 2s**：切下一个本地模板（0.13.2 起不再顺带开 BLE 会话；需要 BLE
   用单击）。
 - **BOOT 15s**：进入 AP 配网模式。
@@ -67,22 +66,27 @@ v0.12 已于 0.12.x 实现（§1–§12 描述现行固件）；v0.14 deep/light
 
 - BLE ON 进入：初始化 NimBLE + 广播（名字 `CodexStatus-XXXXXX`）；状态字
   `BLE ON`、绿灯亮。
-- 保活：**PC USB 插着 ∧ 电量 >20% → 无限常开**；充电回到 20% 自动恢复；
+- **物理恢复**：固定 120s，起点为按键/USB pair 操作（GPIO0 深睡唤醒按物理 wake 时刻）；连接、传输、试连不续期，USB 不延长。到期取消未完成凭据试连并关 BLE，恢复原电源决策；低电关机优先。编辑本 bond 方案需要恢复授权与绑定加密链路，不改变 owner/context/正式 PowerPlan。
+- 普通 USB 自动会话保活：**PC USB 插着 ∧ 电量 >20% → 无限常开**；充电回到 20% 自动恢复；
   掉到 20% 或拔线 → 保留 **120s**（任何 BLE 连接/传输期间不切断，断开后重新
   计时）→ 关 BLE；单击亦可立即关闭。
 - 关闭 = 停广播 + `NimBLEDevice::deinit(true)`（释放控制器 PM 锁，light sleep
   的前提）；状态字 `BLE OFF`、绿灯灭。
-- BLE 用途（一次性/按需，仅身份类）：配对与绑定、endpoint/token 下发、
-  OTA token 取用。模板推送与日常数据一律 HTTP（`POST /template`，见 §9）；
-  BLE 不再传输模板。
+- BLE 用途：身份/endpoint/token、现行 `device_first` 数据/Plan 会合，以及本 bond Wi-Fi 方案。模板仍经 Wi-Fi 完整 Bundle 显式发布。配网合同与 ATT 512-byte 分页见 `project-workflow/bridge-macos/wifi-protocol.md`。凭据候选只在 RAM 试连，IP 成功并 NVS 整记录提交后才报持久化；失败/取消不替换旧方案。
 - 触发 bridge 握手：设备 UDP 广播带 `ble=1` 标志，bridge 收到后做一次定向
   BLE 连接完成 endpoint/token 下发即断开；不周期扫描。
+
+### 5.1 会合协议候选（2026-10-04，尚未部署）
+
+新候选把生命周期收归 `src/rendezvous_protocol` 与 Bridge `app/core rendezvous` 模块。正式light或合法sync窗口中，设备先保持BLE和CPU awake，异步启动Wi-Fi/HTTP；Bridge经认证HTTP验证MAC/会话/wake/plan与挑战，再以严格owner匹配完成handoff；设备关BLE后释放NO_LIGHT_SLEEP锁。普通USB自动BLE在交接后不重开，物理恢复仍遵守原固定授权期限。
+
+HTTP就绪、PowerPlan接受与CPU light-sleep分别记账。HTTP交接阶段20s、临时sync从开窗起90s均有硬截止；读取/claim/传输/handoff不续正式期限。Bridge冻结本轮准入任务，完整Wi-Fi读先于诊断complete。新能力版本是可选字段，旧设备保留兼容路径；在两端候选部署前不能把新顺序当作实机能力。设计与Astra审核收口见 [计划](../project-workflow/bridge-macos/rendezvous-protocol-plan.md) / [审核](../project-workflow/bridge-macos/rendezvous-protocol-review.md)。
 
 ## 6. Wi-Fi 策略
 
 - 开机有凭据：尝试连接最多 30s；成功 = 拿到 IP（随后由 bridge 的 push 论证）。
 - 失联判定：连续 **30s** 未连接（断线或连不上）。
-- 插电失联：保持醒着，每 60s 重试；单击立即重试。
+- 插电失联：保持醒着，每 60s 重试；BOOT 单击优先进入物理 BLE 恢复，恢复期间不启动后台重试干扰试连。
 - 未插电失联：按 1min×3 → 5min×3 → 15min 永久 的定时唤醒重试；BOOT/PWR
   （ext1）按键唤醒同样重试并清零计数。
 - 无凭据：AP 模式；电池下 5min 空闲后深睡（无定时；按键唤醒回 AP）。

@@ -1,4 +1,5 @@
 #include "v2_sync_protocol.h"
+#include "wake_trace_projection.h"
 #include <LittleFS.h>
 #include <filesystem>
 #include <fstream>
@@ -194,6 +195,32 @@ int codex_sim_sync_status(void *p, char *out, int cap) {
     else doc["last_completed"] = nullptr;
     doc["last_error"] = syncStoreLost() ? "batch_lost" : nullptr;
     return copyJson(doc, out, cap);
+}
+
+int codex_sim_sync_append_wake(void *p, const char *json) {
+    if(!p)return 0;JsonDocument doc;if(deserializeJson(doc,json))return 0;
+    WakeTraceRec wake{};wake.wake_generation=doc["wake_generation"]|1u;wake.seq=doc["seq"]|1u;
+    wake.wake_type=1;wake.result=2;wake.furthest=9;wake.transport=3;
+    wake.awake_ms=doc["awake_ms"]|1000u;wake.valid_start=0xa5;wake.valid_end=0x5a;
+    for(int i=0;i<9;++i)wake.timing[i]=i;wake.crc=wakeTraceCrc(wake);
+    auto &sim=*(SimSync *)p;
+    return syncAppend(sim.rtc,SYNC_WAKE_SUMMARY,0,sim.wakeSeq,0,(const uint8_t *)&wake,sizeof(wake))&&saveRtc(sim)?1:0;
+}
+int codex_sim_sync_history(void *p,unsigned since,unsigned limit,char *out,int cap) {
+    if(!p)return -1;auto &sim=*(SimSync *)p;
+    JsonDocument doc;auto rows=doc["records"].to<JsonArray>();
+    uint32_t earliest=0,latest=0;bool more=false;
+    for(uint16_t offset=0,next=0;offset<sim.rtc.used;offset=next){
+        SyncRecord record;if(!syncReadAt(sim.rtc,offset,record,next))return -1;
+        if(record.kind!=SYNC_WAKE_SUMMARY||record.payloadLen!=sizeof(WakeTraceRec))continue;
+        WakeTraceRec wake;memcpy(&wake,record.payload,sizeof(wake));if(!wakeTraceValid(wake))return -1;
+        if(!earliest)earliest=wake.seq;latest=wake.seq;
+        if(wake.seq<=since)continue;
+        if(rows.size()>=std::max(1u,std::min(limit,64u))){more=true;continue;}
+        wakeTraceCompactRow(rows,wake,true);
+    }
+    doc["earliest_seq"]=earliest;doc["latest_seq"]=latest;doc["more"]=more;
+    return copyJson(doc,out,cap);
 }
 
 int codex_sim_sync_command(void *p, const char *operation, const char *message,

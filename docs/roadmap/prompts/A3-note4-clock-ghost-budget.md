@@ -28,7 +28,7 @@
   **没有任何预算检查**；`clockTickWake()` 成功时也就无条件 `rtcClkPartials++`（1816）。
 
 > 这个结论**推翻了** `PROGRESS.md` 曾一度写下的「v2 会合路径已覆盖 ghost 预算」（那是我写错的），
-> 与更早的记录 `PROGRESS.md:37` 一致。落笔前自己再复核一遍，别信二手结论。
+> 与 `docs/history/progress-archive-2026-10-03.md`「当前现场与待办（2026-09-25 核查）」保留的结论一致。落笔前自己再复核一遍，别信二手结论。
 
 ## 代码事实（写工单时已核实，可直接用）
 
@@ -113,7 +113,7 @@
 - **不要**改模板、不要发布、不要动设备 token、不要改 `bridge/crates/core` 的编译产物格式。
 - **不要**把测量宽度写进 `CtOp`（那是 backlog D6 的独立任务，需要同步改 Rust 编译器与 Python 测试桥哈希）。
 - **不要**顺手统一 `epdPartialCount` 与时钟预算（见任务 1.4）。
-- **不要**用 `git stash`（本机会丢文件——见 `PROGRESS.md` 的事故记录）。
+- **不要**用 `git stash`（本机会丢文件——见 `docs/history/progress-archive-2026-10-03.md` 的事故记录）。
 - **不要**提交 git；不要把 token 写进任何文件或报告。
 
 ## 交付物

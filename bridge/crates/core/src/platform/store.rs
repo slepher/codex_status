@@ -21,7 +21,18 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         ensure_dir(parent)?;
     }
     let tmp = tmp_path(path);
-    fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
+    let mut options=fs::OpenOptions::new();options.write(true).create(true).truncate(true);
+    #[cfg(unix)] {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file=options.open(&tmp).with_context(||format!("write {}",tmp.display()))?;
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    std::io::Write::write_all(&mut file,bytes)?;
+    drop(file);
     if let Err(e) = fs::rename(&tmp, path) {
         // Best effort cleanup so a failed replace does not leave litter.
         let _ = fs::remove_file(&tmp);

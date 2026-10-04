@@ -761,6 +761,16 @@ fn tool_definitions() -> Value {
             "inputSchema": {"type":"object", "properties":{"mac":{"type":"string"}}, "additionalProperties":false}
         },
         {
+            "name": "platform_wifi_action",
+            "description": "Save non-secret local targets, queue an explicit read or device sync, import selected cached snapshot entries without contacting the device, or cancel a job via the shared application service. Saving never contacts a device. migrate explicitly moves old device Wi-Fi slots into the current authenticated bond after physical BOOT authorization; no credentials leave the device. Credentials are excluded from MCP. save/sync/import require body.local_revision from platform_wifi_view; import also requires body.snapshot_id from wifi.snapshot. selected and fields freeze the approved scope.",
+            "inputSchema": {"type":"object","properties":{"mac":{"type":"string"},"op":{"type":"string","enum":["save","get","sync","import","cancel_job","migrate"]},"body":{"type":"object"}},"required":["mac","op"],"additionalProperties":false}
+        },
+        {
+            "name": "platform_wifi_view",
+            "description": "Read host Wi-Fi permission/network and password-free full Wi-Fi state and jobs. Cached by default; refresh=true queues a persistent read for a legal Wi-Fi opportunity. No credentials.",
+            "inputSchema": {"type":"object","properties":{"mac":{"type":"string"},"refresh":{"type":"boolean"}},"required":["mac"],"additionalProperties":false}
+        },
+        {
             "name": "platform_device_detail",
             "description": "Read one collapsed device-page section from local state. Never contacts a device or changes its plan.",
             "annotations": {"readOnlyHint": true},
@@ -1144,7 +1154,7 @@ async fn call_tool(cfg: &McpConfig, name: &str, args: &Value) -> Result<Vec<Valu
         }
         // Platform tools share the app's application service; without a
         // running app there is no live state to read or change.
-        "platform_device_register" | "platform_overview" | "platform_device_view" | "platform_device_detail" | "platform_template_list" | "platform_template_get" | "platform_template_save"
+        "platform_device_register" | "platform_overview" | "platform_device_view" | "platform_device_detail" | "platform_wifi_view" | "platform_wifi_action" | "platform_template_list" | "platform_template_get" | "platform_template_save"
         | "platform_template_validate" | "platform_profile_get" | "platform_profile_save" | "platform_data_sync_save"
         | "platform_firmware_release_publish"
         | "platform_family_profiles" | "family_platform_profile_save"

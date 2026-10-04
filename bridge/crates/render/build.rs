@@ -43,12 +43,14 @@ fn main() {
         .flag_if_supported("/utf-8")
         .file(firmware.join("template_engine.cpp"))
         .file(firmware.join("v2_runtime.cpp"))
+        .file(firmware.join("rendezvous_protocol.cpp"))
         .file(firmware.join("v2_data_command.cpp"))
         .file(firmware.join("v2_plan_command.cpp"))
         .file(firmware.join("v2_bundle_command.cpp"))
         .file(firmware.join("v2_activate_command.cpp"))
         .file(firmware.join("v2_claim_command.cpp"))
         .file(firmware.join("v2_command_envelope.cpp"))
+        .file(firmware.join("ble_wire.cpp"))
         .file(firmware.join("v2_status_snapshot.cpp"))
         .file(firmware.join("v2_sync.cpp"))
         .file(firmware.join("v2_sync_store.cpp"))
@@ -59,11 +61,14 @@ fn main() {
         .file(firmware.join("font_store.cpp"))
         .file(firmware.join("GUI_Paint.cpp"))
         .file(manifest.join("src/sim_sync.cpp"))
+        .file(manifest.join("src/sim_wifi.cpp"))
         .file(&ffi);
     for name in ["font8", "font12", "font16", "font20", "font24"] {
         build.file(firmware.join(format!("{name}.cpp")));
     }
     build.compile("bridge_render");
+    // The Wi-Fi HAL reads the same zlib NVS encoding as ESP ROM miniz.
+    println!("cargo:rustc-link-lib=z");
 
     // Every header the engine pulls in has to be tracked: the generated font
     // tables are headers, so without this a re-crop would leave the host preview
@@ -71,12 +76,14 @@ fn main() {
     for tracked in ["template_engine.cpp", "template_engine.h", "GUI_Paint.cpp",
                     "GUI_Paint.h", "refresh_policy.cpp", "refresh_policy.h",
                     "v2_state.h", "v2_runtime.h", "v2_runtime.cpp",
+                    "rendezvous_protocol.h", "rendezvous_protocol.cpp",
                     "v2_data_command.h", "v2_data_command.cpp",
                     "v2_plan_command.h", "v2_plan_command.cpp",
                     "v2_bundle_command.h", "v2_bundle_command.cpp",
                     "v2_activate_command.h", "v2_activate_command.cpp",
                     "v2_claim_command.h", "v2_claim_command.cpp",
                     "v2_command_envelope.h", "v2_command_envelope.cpp",
+                    "ble_wire.h", "ble_wire.cpp", "wifi_scheme.h", "wifi_setup.h", "wifi_setup.cpp", "wifi_management.inc", "wake_trace_projection.h",
                     "v2_status_snapshot.h", "v2_status_snapshot.cpp",
                     "v2_sync.h", "v2_sync.cpp",
                     "v2_sync_store.h", "v2_sync_store.cpp",
@@ -92,5 +99,7 @@ fn main() {
     }
     println!("cargo:rerun-if-changed={}", ffi.display());
     println!("cargo:rerun-if-changed={}", manifest.join("src/sim_sync.cpp").display());
+    println!("cargo:rerun-if-changed={}", manifest.join("src/sim_wifi.cpp").display());
+    println!("cargo:rerun-if-changed={}", root.join("tools/wifi-setup-test-hal.h").display());
     println!("cargo:rerun-if-changed={}", manifest.join("shim").display());
 }

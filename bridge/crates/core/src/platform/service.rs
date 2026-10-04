@@ -23,6 +23,7 @@ use crate::platform::model::{
     Template, TemplateKey, PublishJob, MAX_PROFILE_TEMPLATES,
 };
 use crate::platform::store;
+use crate::platform::wifi::{WifiState, Network as WifiNetwork, Job as WifiJob, Snapshot as WifiSnapshot};
 use crate::platform::fonts::{FontLibrary, FontPlan};
 use crate::platform::publish::{FrozenPublish, Capacity, CommittedRefs};
 
@@ -118,6 +119,8 @@ impl AssetJob {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PersistedState {
     #[serde(default)]
+    pub wifi: BTreeMap<String, WifiState>,
+    #[serde(default)]
     pub sources: Vec<DataSource>,
     #[serde(default)]
     pub templates: Vec<Template>,
@@ -156,6 +159,7 @@ pub struct PlatformService {
 }
 
 struct Inner {
+    wifi: BTreeMap<String, WifiState>,
     sources: BTreeMap<String, DataSource>,
     snapshots: BTreeMap<String, SourceSnapshot>,
     templates: BTreeMap<TemplateKey, Template>,
@@ -176,6 +180,8 @@ struct Inner {
 pub const MAX_JOB_SUMMARIES: usize = 20;
 
 impl PlatformService {
+    pub fn data_root(&self) -> &Path { self.dir.parent().expect("platform directory has a root") }
+
     /// Load state from `<root>/platform/` (created on demand).
     pub fn open(root: &Path) -> Result<Self> {
         let dir = root.join("platform");
@@ -183,6 +189,7 @@ impl PlatformService {
         let persisted: PersistedState =
             store::read_json(&dir.join("state.json"))?.unwrap_or_default();
         let PersistedState {
+            mut wifi,
             sources: persisted_sources,
             templates: persisted_templates,
             devices: persisted_devices,
@@ -198,6 +205,7 @@ impl PlatformService {
             contexts,
             plans,
         } = persisted;
+        for state in wifi.values_mut() { state.recover(); }
         for job in persisted_ota_jobs.values_mut() {
             if job.state == "transferring" { job.state = "awaiting_confirmation".into(); }
         }
@@ -304,6 +312,7 @@ impl PlatformService {
         let service = Self {
             dir,
             inner: Mutex::new(Inner {
+                wifi,
                 sources,
                 snapshots: BTreeMap::new(),
                 templates,
@@ -385,6 +394,7 @@ impl PlatformService {
         // Keep frozen in-flight Bundles across Bridge restarts. The device's
         // authenticated status and idempotent BEGIN decide whether to resume.
         let state = PersistedState {
+            wifi: inner.wifi.clone(),
             sources: inner.sources.values().cloned().collect(),
             templates: inner.templates.values().cloned().collect(),
             family_profiles: inner.family_profiles.values().cloned().collect(),
@@ -430,6 +440,225 @@ impl PlatformService {
                 .collect(),
         };
         store::write_json(path, &state)
+    }
+
+    // All UI/MCP Wi-Fi mutations share the existing atomic platform store.
+    fn wifi_mutate<T>(&self, mac: &str, change: impl FnOnce(&mut WifiState) -> Result<T>) -> Result<T> {
+        let mac = DeviceIdentity::normalized_mac(mac).context("invalid_device_mac")?;
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.devices.keys().any(|key| DeviceIdentity::normalized_mac(key).as_deref() == Some(&mac)) { bail!("device_not_registered"); }
+        let old = inner.wifi.get(&mac).cloned();
+        let mut next = old.clone().unwrap_or_default();
+        let result = change(&mut next)?;
+        inner.wifi.insert(mac.clone(), next);
+        if let Err(error) = Self::persist(&inner, &self.state_path()) {
+            if let Some(old) = old { inner.wifi.insert(mac, old); } else { inner.wifi.remove(&mac); }
+            return Err(error);
+        }
+        Ok(result)
+    }
+    pub fn wifi_state(&self, mac: &str) -> WifiState {
+        DeviceIdentity::normalized_mac(mac).and_then(|mac| self.inner.lock().unwrap().wifi.get(&mac).cloned()).unwrap_or_default()
+    }
+    pub fn wifi_clear_connection(&self, mac:&str) -> Result<()> {self.wifi_mutate(mac,|s|{s.connection=None;Ok(())})}
+    pub fn wifi_note_connection(&self, mac: &str, connection: super::wifi::Connection) -> Result<()> {
+        self.wifi_mutate(mac, |s| {
+            let target=s.matching_target(&connection.host_ssid).context("network_not_configured")?;
+            if target.network_id!=connection.network_id || connection.local_revision!=s.local_revision { bail!("local_revision_conflict"); }
+            if connection.error.as_ref().is_some_and(|e|e.len()>64 || !e.bytes().all(|c|c.is_ascii_alphanumeric()||c==b'_')) { bail!("invalid_error_code"); }
+            s.connection=Some(connection);Ok(())
+        })
+    }
+    pub fn wifi_save(&self, mac: &str, expected: u64, targets: Vec<WifiNetwork>, now: u64) -> Result<WifiState> {
+        self.wifi_mutate(mac, |s| { s.save(expected, targets, now)?; Ok(s.clone()) })
+    }
+    pub fn wifi_queue(&self, mac: &str, bridge: &str, kind: &str, selected: Vec<String>, now: u64) -> Result<WifiJob> {
+        self.wifi_queue_fields(mac, bridge, kind, selected, BTreeMap::new(), now)
+    }
+    pub fn wifi_queue_fields(&self, mac: &str, bridge: &str, kind: &str, selected: Vec<String>,
+        fields: BTreeMap<String, Vec<String>>, now: u64) -> Result<WifiJob> {
+        self.wifi_queue_fields_checked(mac, bridge, kind, selected, fields, None, now)
+    }
+    pub fn wifi_queue_fields_checked(&self, mac: &str, bridge: &str, kind: &str, selected: Vec<String>,
+        fields: BTreeMap<String, Vec<String>>, expected: Option<u64>, now: u64) -> Result<WifiJob> {
+        let mac = DeviceIdentity::normalized_mac(mac).context("invalid_device_mac")?;
+        self.wifi_mutate(&mac, |s| {
+            if expected.is_some_and(|v| v != s.local_revision) { bail!("local_revision_conflict"); }
+            s.next_job_seq = s.next_job_seq.checked_add(1).context("wifi_id_exhausted")?;
+            let id = crate::coordinator::new_context_id(&mac, now, s.next_job_seq);
+            s.queue(&mac, bridge, kind, selected, now, id, fields)
+        })
+    }
+    pub fn wifi_queue_manual_sync(&self, mac: &str, bridge: &str, selected: Vec<String>, expected: u64,
+        snapshot_id: &str, host: &str, now: u64) -> Result<WifiJob> {
+        let mac = DeviceIdentity::normalized_mac(mac).context("invalid_device_mac")?;
+        self.wifi_mutate(&mac, |s| {
+            if expected != s.local_revision { bail!("local_revision_conflict"); }
+            s.validate_manual_sync(&selected, host, snapshot_id)?;
+            s.next_job_seq = s.next_job_seq.checked_add(1).context("wifi_id_exhausted")?;
+            let id = crate::coordinator::new_context_id(&mac, now, s.next_job_seq);
+            let mut job = s.queue(&mac, bridge, "sync", selected, now, id, BTreeMap::new())?;
+            job.host_ssid = Some(host.into());
+            *s.jobs.iter_mut().find(|j| j.job_id == job.job_id).unwrap() = job.clone();
+            Ok(job)
+        })
+    }
+    pub fn wifi_resume_authorized(&self, mac: &str, job: &str, now: u64) -> Result<()> {
+        self.wifi_mutate(mac, |s| {
+            let j=s.jobs.iter_mut().find(|j|j.job_id==job).context("wifi_job_not_found")?;
+            if j.state=="waiting_authorization" && !j.sent {
+                j.state="waiting_rendezvous".into();j.error_code=None;j.next_attempt_at=now;j.updated_at=now;
+            }
+            Ok(())
+        })
+    }
+    pub fn wifi_confirm_receipt(&self, mac: &str, job: &str, revision: u64, bond: Option<&str>, now: u64) -> Result<WifiJob> {
+        self.wifi_mutate(mac, |s| s.confirm_receipt(job, revision, bond, now))
+    }
+    pub fn wifi_begin(&self, mac: &str, job: &str, now: u64) -> Result<Option<WifiJob>> {
+        self.wifi_mutate(mac, |s| s.begin(job, now))
+    }
+    pub fn wifi_finish(&self, mac: &str, job: &str, state: &str, error: Option<&str>, now: u64) -> Result<WifiJob> {
+        self.wifi_mutate(mac, |s| s.finish(job, state, error, now))
+    }
+    pub fn wifi_complete_read(&self, mac: &str, job: &str, snapshot: WifiSnapshot, now: u64) -> Result<WifiJob> {
+        self.wifi_mutate(mac, |s| s.complete_read(job, snapshot, now))
+    }
+    pub fn wifi_import(&self, mac: &str, selected: &[String], expected: u64, now: u64) -> Result<WifiState> {
+        self.wifi_mutate(mac, |s| { s.import(selected, expected, now)?; Ok(s.clone()) })
+    }
+
+    pub fn wifi_import_fields(&self, mac: &str, selected: &[String], fields: &BTreeMap<String, Vec<String>>, expected: u64, now: u64) -> Result<WifiState> {
+        self.wifi_import_fields_checked(mac, selected, fields, expected, None, now)
+    }
+    pub fn wifi_import_fields_checked(&self, mac: &str, selected: &[String], fields: &BTreeMap<String, Vec<String>>, expected: u64, snapshot_id: Option<&str>, now: u64) -> Result<WifiState> {
+        self.wifi_mutate(mac, |s| {
+            if snapshot_id.is_some_and(|id| s.snapshot.as_ref().map(|v| v.snapshot_id.as_str()) != Some(id)) {
+                bail!("snapshot_conflict");
+            }
+            s.import_fields(selected, fields, expected, now)?; Ok(s.clone())
+        })
+    }
+    pub fn wifi_expire(&self, mac: &str, now: u64) -> Result<()> {
+        if self.wifi_state(mac).jobs.iter().any(|j| !j.terminal() && now >= j.expires_at) {
+            self.wifi_mutate(mac, |s| { s.expire(now); Ok(()) })?;
+        }
+        Ok(())
+    }
+    pub fn wifi_definite_rejection(&self, mac: &str, job: &str) -> Result<()> {
+        self.wifi_mutate(mac, |s| {
+            let j=s.jobs.iter_mut().find(|j|j.job_id==job).context("wifi_job_not_found")?;
+            j.sent=false;j.may_have_committed=false;Ok(())
+        })
+    }
+    pub fn wifi_mark_sent(&self, mac: &str, job: &str, now: u64) -> Result<()> {
+        self.wifi_mutate(mac, |s| s.mark_sent(job, now))
+    }
+    pub fn wifi_confirm_recovery(&self, mac: &str, job: &str, network: WifiNetwork, revision: u64, now: u64) -> Result<WifiJob> {
+        self.wifi_mutate(mac, |s| {
+            let j = s.jobs.iter_mut().find(|j| j.job_id == job).context("wifi_job_not_found")?;
+            if j.terminal() || !j.sent || j.kind != "recovery_save" || now >= j.expires_at { bail!("wifi_job_no_longer_active"); }
+            network.validate()?;
+            if network.metadata() != j.frozen[0].metadata() { bail!("target_unconfirmed"); }
+            j.state = "completed".into(); j.updated_at = now; j.last_stage = "bounded_recovery_readback".into();
+            j.confirmation = Some("receipt_and_readback".into()); j.confirmed_revision = Some(revision); j.error_code = None;
+            s.baseline.insert(network.network_id.clone(), network.metadata());
+            let result=j.clone();
+            if s.local_revision==result.local_revision {
+                if let Some(target)=s.targets.iter_mut().find(|n|n.network_id==network.network_id && n.metadata()==network.metadata()) {
+                    target.version=network.version;target.credential="keep".into();
+                }
+            }
+            Ok(result)
+        })
+    }
+    /// One bounded opportunity, also exercised through Fake's real client path.
+    /// Transport returns a full snapshot for "snapshot"; other calls are ACKs.
+    pub fn wifi_attempt(&self, mac: &str, job_id: &str, permit: Option<&str>, credentials: &BTreeMap<String, String>,
+        now: u64, mut transport: impl FnMut(&str, Value) -> Result<Value>) -> Result<Option<WifiJob>> {
+        let Some(job) = self.wifi_begin(mac, job_id, now)? else { return Ok(None); };
+        let run = (|| -> Result<WifiJob> {
+            if !matches!(job.kind.as_str(), "sync" | "recovery_save") {
+                let snapshot: WifiSnapshot = serde_json::from_value(transport("snapshot", json!({}))?)?;
+                return self.wifi_complete_read(mac, job_id, snapshot, now);
+            }
+            if job.sent {
+                let result = transport("result", json!({"query_id":job.request_id}))?;
+                if result["ok"] == true && result["outcome"] == "rejected" {
+                    self.wifi_definite_rejection(mac, job_id)?;
+                    return self.wifi_finish(mac, job_id, "failed", Some(result["error"].as_str().unwrap_or("wifi_rejected")), now);
+                }
+                if result["ok"] == true && result["outcome"] == "committed" {
+                    let revision = result["revision"].as_u64().context("receipt_revision_required")?;
+                    return self.wifi_confirm_receipt(mac, job_id, revision, result["bond"].as_str(), now);
+                }
+                return self.wifi_finish(mac, job_id, "awaiting_confirmation", Some("receipt_unknown"), now);
+                // Unknown never permits another apply, even when a password is supplied again.
+            }
+            let snapshot = self.wifi_state(mac).snapshot.context("snapshot_required")?;
+            snapshot.validate(&job.device_mac)?;
+            if permit.is_none() { return self.wifi_finish(mac, job_id, "waiting_rendezvous", Some("window_required"), now); }
+            if job.expected_revision != Some(snapshot.revision) { return self.wifi_finish(mac, job_id, "conflict", Some("snapshot_conflict"), now); }
+            let current: BTreeMap<_,_> = snapshot.networks.iter().filter(|n| n.writable)
+                .map(|n| (n.network.network_id.clone(), n.network.metadata())).collect();
+            if job.selected.iter().any(|id| job.fields.get(id).map_or(current.get(id) != job.before.get(id), |fields|
+                fields.iter().any(|f| f != "credential" && current.get(id).map(|v|&v[f]) != job.before.get(id).map(|v|&v[f])))) {
+                return self.wifi_finish(mac, job_id, "conflict", Some("target_revision_conflict"), now);
+            }
+            let mut changes = serde_json::to_value(&job.frozen)?;
+            for n in changes.as_array_mut().unwrap() {
+                let network_id = n["network_id"].as_str().unwrap().to_owned();
+                if let Some(fields) = job.fields.get(&network_id) {
+                    if let Some(actual) = current.get(&network_id) {
+                        for f in ["host_ssid","ssid","label","deleted"] {
+                            if !fields.iter().any(|selected| selected == f) { n[f] = actual[f].clone(); }
+                        }
+                        if !fields.iter().any(|f| f == "credential") { n["credential"] = json!("keep"); }
+                    } else {
+                        if ["host_ssid","ssid","label","deleted"].iter().any(|f| !fields.iter().any(|s|s==f)) { return self.wifi_finish(mac, job_id, "conflict", Some("new_network_requires_all_fields"), now); }
+                    }
+                }
+                if n["deleted"] != true {
+                    let id=n["network_id"].as_str().unwrap();
+                    let password=credentials.get(id).cloned().or_else(||n["password"].as_str().map(str::to_owned));
+                    let include=job.fields.get(id).is_none_or(|fields|fields.iter().any(|f|f=="credential"));
+                    if include {
+                        if let Some(password)=password {
+                            n["credential"]=json!(if password.is_empty(){"open"}else{"replace"});n["password"]=json!(password);
+                        } else if n["credential"]=="replace" {
+                            return self.wifi_finish(mac,job_id,"waiting_input",Some("credentials_required"),now);
+                        }
+                    } else {n.as_object_mut().unwrap().remove("password");}
+                }
+            }
+            self.wifi_mutate(mac, |s| s.mark_sent(job_id, now))?;
+            let reply = transport("apply", json!({"request_id":job.request_id,"expected_revision":snapshot.revision,
+                "permit":permit,"changes":changes}))?;
+            if reply["ok"] != true {
+                let code = reply["error"].as_str().unwrap_or("wifi_rejected");
+                let state = match code { "physical_required" | "window_required" => "waiting_rendezvous", "revision_conflict" => "conflict",
+                    "storage_unknown" => "awaiting_confirmation", "credentials_required" => "waiting_input", _ => "failed" };
+                if code != "storage_unknown" {
+                    self.wifi_mutate(mac, |s| {
+                        let j = s.jobs.iter_mut().find(|j| j.job_id == job_id).context("wifi_job_not_found")?;
+                        j.sent = false; j.may_have_committed = false; Ok(())
+                    })?;
+                }
+                // An uncertain storage write never permits reapplying.
+                return self.wifi_finish(mac, job_id, state, Some(code), now);
+            }
+            if reply["outcome"] != "committed" { return self.wifi_finish(mac, job_id, "awaiting_confirmation", Some("receipt_unknown"), now); }
+            self.wifi_confirm_receipt(mac, job_id, reply["revision"].as_u64().context("receipt_revision_required")?, reply["bond"].as_str(), now)
+        })();
+        match run {
+            Ok(job) => Ok(Some(job)),
+            Err(error) => {
+                let (state, code) = crate::rendezvous::wifi_error(&error);
+                let current = self.wifi_state(mac).jobs.into_iter().find(|j| j.job_id == job_id).context("wifi_job_not_found")?;
+                self.wifi_finish(mac, job_id, if current.sent { "awaiting_confirmation" } else { state },
+                    Some(code), now).map(Some)
+            }
+        }
     }
 
     fn refresh_bundle_history(inner: &mut Inner, mac: &str) {
@@ -1855,6 +2084,15 @@ impl PlatformService {
         Self::persist(&inner, &self.state_path())
     }
 
+    /// Persist a new endpoint only after the caller verifies authenticated MAC/session.
+    pub fn note_device_endpoint(&self, mac: &str, ip: &str) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let record = inner.devices.get_mut(&mac.to_uppercase()).context("unknown device")?;
+        if record.identity.ip.as_deref() == Some(ip) { return Ok(()); }
+        record.identity.ip = Some(ip.to_owned());
+        Self::persist(&inner, &self.state_path())
+    }
+
     pub fn device_rename(&self, mac: &str, name: &str) -> Result<()> {
         let name = name.trim();
         if name.is_empty() || name.chars().count() > 24 {
@@ -1956,10 +2194,11 @@ impl PlatformService {
         }
         let mut power_reconciled = false;
         if let Some(c) = inner.coordinators.get_mut(&mac) {
-            if let Some(pending) = c.plan.pending_explicit_light.clone() {
+            if let Some(pending) = c.plan.last_sent.clone() {
                 let power = &status["power"];
-                if power["plan_id"] == pending.plan_id && power["mode"] == "light" {
-                    if let Some(remaining) = power["remaining_s"].as_u64().filter(|n| *n > 0) {
+                let mode = if pending.mode == PlanMode::Light { "light" } else { "sleep" };
+                if power["plan_id"] == pending.plan_id && power["mode"] == mode {
+                    if let Some(remaining) = power["remaining_s"].as_u64().filter(|n| *n <= pending.light_duration_s as u64) {
                         power_reconciled = c.note_plan_ack(pending.plan_id, remaining as u32, false, now)
                             == crate::coordinator::PlanAck::Accepted;
                     }
@@ -2011,6 +2250,11 @@ impl PlatformService {
                 last_content_crc: None,
             });
             c.data.in_flight = None;
+            // ACKs belong to their context, even if the installed fields and
+            // current values are unchanged after a device reboot.
+            c.data.acked_push_fp = None;
+            c.data.acked_full_fp = None;
+            c.data.push_dirty = c.sync_enabled;
         }
         refresh_contract(&mut inner, &mac)?;
         if reconcile_needed || job_reconciled || power_reconciled || contract_changed {
@@ -2190,7 +2434,21 @@ impl PlatformService {
             record.sync_enabled && !contract_known &&
             record.observed.active_context_id.as_deref().is_some_and(|id| !id.is_empty()) &&
             record.observed.active_template_id.as_deref().is_some_and(|id| !id.is_empty()));
-        let work_want_light = contract_needed || inner
+        // W4-1: a queued (non-terminal, backoff-eligible) Wi-Fi read/sync job is
+        // real pending work. It is admitted into the window work set and gets a
+        // *bounded* formal light plan, so a read no longer has to borrow somebody
+        // else's window. The Wi-Fi job store is keyed by the normalized MAC.
+        let wifi_window_wanted = DeviceIdentity::normalized_mac(&mac).is_some_and(|wifi_mac| {
+            inner
+                .wifi
+                .get(&wifi_mac)
+                .is_some_and(|state| state.jobs.iter().any(|job| wifi_job_wants_window(job, now)) || state.connection.as_ref().is_some_and(|c|
+                    c.local_revision==state.local_revision && state.matching_target(&c.host_ssid).is_some_and(|n|n.network_id==c.network_id) &&
+                    matches!(c.state.as_str(),"requested"|"waiting_for_window"|"connecting"|"awaiting_confirmation"|"connection_failed") &&
+                    !matches!(c.error.as_deref(),Some("authentication_failed"|"security_mismatch")) &&
+                    c.attempts<3 && (c.state=="connecting" || now>=c.next_attempt_at)))
+        });
+        let other_work_want_light = contract_needed || inner
             .coordinators
             .get(&mac)
             .map(|c| {
@@ -2205,6 +2463,7 @@ impl PlatformService {
             })
             .unwrap_or(false)
             || inner.ota_jobs.get(&mac).is_some_and(|j| j.state == "queued");
+        let work_want_light = other_work_want_light || wifi_window_wanted;
         let c = inner.coordinators.get_mut(&mac).context("unknown device")?;
         let manual_remaining = c.manual_remaining(now);
         let want_light =
@@ -2219,15 +2478,20 @@ impl PlatformService {
             None => {
                 // Without pending work, light lasts exactly as long as the
                 // physical wake's own window: re-sending MAX_LIGHT_S every
-                // rendezvous would extend it forever.
-                let light_s = if work_want_light {
+                // rendezvous would extend it forever. Data/publish work keeps the
+                // existing MAX_LIGHT_S; a Wi-Fi read alone only gets the bounded
+                // read window, and manual/boot time gets no extension at all.
+                let light_s = if other_work_want_light {
                     crate::coordinator::MAX_LIGHT_S
+                } else if wifi_window_wanted {
+                    crate::coordinator::WIFI_READ_LIGHT_S
                 } else {
                     manual_remaining
                 };
                 c.plan_for(now, want_light, light_s, "rendezvous")
             }
         };
+        Self::persist(&inner, &self.state_path())?;
         Ok(plan)
     }
 
@@ -2446,6 +2710,14 @@ impl PlatformService {
         }
         Ok(())
     }
+}
+
+/// A Wi-Fi job counts as window work while it still has a rendezvous-eligible
+/// attempt left: not terminal, not blocked on user input or a conflict, inside
+/// its TTL and past its retry backoff (W4-1). Dead/expired/blocked jobs must not
+/// keep the radio on.
+fn wifi_job_wants_window(job: &WifiJob, now: u64) -> bool {
+    crate::rendezvous::admit_wifi(job, now)
 }
 
 fn collect_font_names(value: &Value, names: &mut Vec<String>) {
@@ -2678,6 +2950,123 @@ mod tests {
         svc
     }
 
+    #[test]
+    fn wifi_offline_intents_survive_restart_and_keep_mac_isolation() {
+        let dir = tempfile::tempdir().unwrap(); let svc = service_with_device(dir.path());
+        let a = "AABBCCDDEEFF"; let b = "001122334455";
+        svc.device_upsert(DeviceIdentity::new(b, "Other").unwrap(), DeviceCapabilities::ssd1681_154g()).unwrap();
+        let targets = serde_json::from_value(json!([{"network_id":"home","host_ssid":"Host","ssid":"Device"}])).unwrap();
+        assert_eq!(svc.wifi_save(a, 0, targets, 100).unwrap().local_revision, 1);
+        assert!(svc.wifi_save(a, 0, vec![], 101).is_err());
+        assert!(svc.job(a).is_none()); assert!(svc.wifi_state(a).snapshot.is_none());
+        let j = svc.wifi_queue(a, "installation", "read", vec![], 100).unwrap();
+        assert_eq!(svc.wifi_queue(a, "installation", "read", vec![], 101).unwrap().job_id, j.job_id);
+        let other = svc.wifi_queue(b, "installation", "read", vec![], 100).unwrap();
+        assert_ne!(j.job_id, other.job_id);
+        assert!(svc.wifi_begin(a, &j.job_id, 101).unwrap().is_some());
+        drop(svc); let svc = PlatformService::open(dir.path()).unwrap();
+        assert_eq!(svc.wifi_state(a).jobs[0].state, "waiting_rendezvous");
+        svc.wifi_finish(a, &j.job_id, "waiting_rendezvous", Some("http_timeout"), 102).unwrap();
+        assert!(svc.wifi_begin(a, &j.job_id, 106).unwrap().is_none());
+        assert!(svc.wifi_begin(a, &j.job_id, 107).unwrap().is_some());
+        svc.wifi_finish(a, &j.job_id, "cancelled", None, 108).unwrap();
+        assert!(svc.wifi_begin(a, &j.job_id, 200).unwrap().is_none());
+        assert_eq!(svc.wifi_state(b).jobs[0].state, "queued");
+        assert!(svc.wifi_begin(b, &other.job_id, 86500).unwrap().is_none());
+        assert_eq!(svc.wifi_state(b).jobs[0].state, "expired");
+        let bytes = std::fs::read_to_string(dir.path().join("platform/state.json")).unwrap();
+        assert!(!bytes.contains("password") && !bytes.contains("token"));
+    }
+
+    #[test]
+    fn wifi_read_only_replaces_valid_complete_snapshot_and_import_checks_revision() {
+        let dir = tempfile::tempdir().unwrap(); let svc = service_with_device(dir.path()); let mac = "AABBCCDDEEFF";
+        let snapshot: WifiSnapshot = serde_json::from_value(json!({"schema":2,"device_mac":mac,"revision":3,
+            "snapshot_id":"snap","complete":true,"observed_at":101,"networks":[{"bond":"own","writable":true,
+            "network":{"network_id":"home","host_ssid":"Host","ssid":"Device"}}],"capacity":{"total":12}})).unwrap();
+        let j = svc.wifi_queue(mac, "installation", "read", vec![], 100).unwrap();
+        let mut partial = snapshot.clone(); partial.complete = false;
+        assert!(svc.wifi_complete_read(mac, &j.job_id, partial, 101).is_err());
+        assert!(svc.wifi_state(mac).snapshot.is_none());
+        let mut wrong = snapshot.clone(); wrong.device_mac = "001122334455".into();
+        assert!(svc.wifi_complete_read(mac, &j.job_id, wrong, 101).is_err());
+        svc.wifi_complete_read(mac, &j.job_id, snapshot.clone(), 101).unwrap();
+        assert!(svc.wifi_state(mac).targets.is_empty());
+        svc.wifi_import(mac, &["home".into()], 0, 102).unwrap();
+        let j = svc.wifi_queue(mac, "installation", "read_import", vec!["home".into()], 103).unwrap();
+        svc.wifi_save(mac, 1, vec![], 104).unwrap();
+        assert_eq!(svc.wifi_complete_read(mac, &j.job_id, snapshot, 105).unwrap().state, "conflict");
+        assert!(svc.wifi_state(mac).targets.is_empty());
+    }
+
+    #[test]
+    fn wifi_selected_fields_preserve_unrelated_changes_and_confirm_only_sent_version() {
+        let dir = tempfile::tempdir().unwrap(); let svc = service_with_device(dir.path()); let mac="AABBCCDDEEFF";
+        let mut snapshot: WifiSnapshot = serde_json::from_value(json!({"schema":2,"device_mac":mac,"revision":1,
+            "snapshot_id":"one","complete":true,"observed_at":100,"networks":[{"bond":"own","writable":true,
+                "network":{"network_id":"home","host_ssid":"Host","ssid":"Old","label":"Old label"}}],"capacity":{"total":12}})).unwrap();
+        let read=svc.wifi_queue(mac,"bridge","read",vec![],100).unwrap();svc.wifi_complete_read(mac,&read.job_id,snapshot.clone(),101).unwrap();
+        svc.wifi_import(mac,&["home".into()],0,102).unwrap();
+        let mut targets=svc.wifi_state(mac).targets;targets[0].ssid="Approved".into();svc.wifi_save(mac,1,targets.clone(),103).unwrap();
+        let fields=BTreeMap::from([("home".into(),vec!["ssid".into()])]);
+        assert!(svc.wifi_queue_fields_checked(mac,"bridge","sync",vec!["home".into()],fields.clone(),Some(1),104).is_err());
+        let job=svc.wifi_queue_fields_checked(mac,"bridge","sync",vec!["home".into()],fields,Some(2),104).unwrap();
+        // Local edit after queueing must not change the frozen intent.
+        targets[0].ssid="Later local draft".into();svc.wifi_save(mac,2,targets,105).unwrap();
+        // The frozen cache is used; external revision changes must be rejected, never reread/rebase.
+        let mut apply_count=0;
+        let result=svc.wifi_attempt(mac,&job.job_id,Some("permit"),&BTreeMap::new(),106,|op,body| {
+            if op=="apply" {
+                apply_count+=1;assert_eq!(body["changes"][0]["ssid"],"Approved");
+                assert_eq!(body["changes"][0]["label"],"Old label");assert_eq!(body["expected_revision"],1);
+                snapshot.networks[0].network.ssid="Approved".into();snapshot.revision=2;
+                Ok(json!({"ok":true,"outcome":"committed","revision":2}))
+            } else { panic!("unexpected config reread: {op}") }
+        }).unwrap().unwrap();
+        assert_eq!(result.state,"completed");assert_eq!(apply_count,1);
+        let state=svc.wifi_state(mac);assert_eq!(state.targets[0].ssid,"Later local draft");
+        assert_eq!(state.baseline["home"]["ssid"],"Approved");assert_eq!(state.baseline["home"]["label"],"Old label");
+        // A changed approved field pauses; no apply despite unrelated revision handling.
+        let job=svc.wifi_queue_fields(mac,"bridge","sync",vec!["home".into()],BTreeMap::from([("home".into(),vec!["ssid".into()])]),107).unwrap();
+        snapshot.networks[0].network.ssid="Changed by device".into();
+        let result=svc.wifi_attempt(mac,&job.job_id,Some("permit"),&BTreeMap::new(),108,|op,_| {
+            assert_eq!(op,"apply");Ok(json!({"ok":false,"error":"revision_conflict"}))
+        }).unwrap().unwrap();assert_eq!(result.state,"conflict");
+    }
+    #[test]
+    fn wifi_cancellation_input_expiry_and_unknown_receipt_never_reapply() {
+        let dir=tempfile::tempdir().unwrap();let svc=service_with_device(dir.path());let mac="AABBCCDDEEFF";
+        let snapshot:WifiSnapshot=serde_json::from_value(json!({"schema":2,"device_mac":mac,"revision":0,"snapshot_id":"snap",
+            "complete":true,"observed_at":100,"networks":[],"capacity":{"total":12}})).unwrap();
+        let read=svc.wifi_queue(mac,"bridge","read",vec![],100).unwrap();svc.wifi_complete_read(mac,&read.job_id,snapshot.clone(),101).unwrap();
+        let targets=serde_json::from_value(json!([{"network_id":"new","host_ssid":"Host","ssid":"Device","credential":"replace"}])).unwrap();
+        svc.wifi_save(mac,0,targets,102).unwrap();let j=svc.wifi_queue(mac,"bridge","sync",vec!["new".into()],103).unwrap();
+        assert_eq!(svc.wifi_attempt(mac,&j.job_id,None,&BTreeMap::new(),104,|op,_|{assert_eq!(op,"snapshot");Ok(serde_json::to_value(&snapshot)?)}).unwrap().unwrap().state,"waiting_rendezvous");
+        assert_eq!(svc.wifi_attempt(mac,&j.job_id,Some("permit"),&BTreeMap::new(),110,|op,_|{assert_eq!(op,"snapshot");Ok(serde_json::to_value(&snapshot)?)}).unwrap().unwrap().state,"waiting_input");
+        let input=BTreeMap::from([("new".into(),(0..12).map(|i|char::from(b'a'+i)).collect::<String>())]);
+        let result=svc.wifi_attempt(mac,&j.job_id,Some("permit"),&input,126,|op,_|{
+            assert_eq!(op,"apply");anyhow::bail!("lost_ack")
+        }).unwrap().unwrap();assert_eq!(result.state,"awaiting_confirmation");
+        drop(svc);let svc=PlatformService::open(dir.path()).unwrap();
+        let mut matching=snapshot.clone();
+        matching.networks=serde_json::from_value(json!([{"bond":"own","writable":true,"network":{"network_id":"new","host_ssid":"Host","ssid":"Device","credential":"device"}}])).unwrap();
+        let result=svc.wifi_attempt(mac,&j.job_id,Some("new-permit"),&input,187,|op,_|{
+            if op=="result"{Ok(json!({"ok":true,"outcome":"unknown"}))}else{panic!("unexpected config reread: {op}")}
+        }).unwrap().unwrap();assert_eq!(result.state,"awaiting_confirmation");assert_eq!(result.error_code.as_deref(),Some("receipt_unknown"));
+        // A definite rejected receipt cannot be relabelled as an unknown success.
+        let result=svc.wifi_attempt(mac,&j.job_id,None,&BTreeMap::new(),248,|op,_| {
+            assert_eq!(op,"result");Ok(json!({"ok":true,"outcome":"rejected","error":"capacity"}))
+        }).unwrap().unwrap();assert_eq!(result.state,"failed");assert!(!result.may_have_committed);
+        let cancelled=svc.wifi_queue(mac,"bridge","sync",vec!["new".into()],249).unwrap();
+        drop(svc);let svc=PlatformService::open(dir.path()).unwrap();
+        assert_eq!(svc.wifi_state(mac).jobs.iter().find(|x|x.job_id==cancelled.job_id).unwrap().state,"waiting_input");
+        svc.wifi_mark_sent(mac,&cancelled.job_id,249).unwrap();
+        assert!(svc.wifi_finish(mac,&cancelled.job_id,"cancelled",None,250).unwrap().may_have_committed);
+        assert!(svc.wifi_attempt(mac,&cancelled.job_id,None,&input,251,|_,_|panic!("cancelled task sent")).unwrap().is_none());
+        let next=svc.wifi_queue(mac,"bridge","read",vec![],300).unwrap();
+        assert!(svc.wifi_attempt(mac,&next.job_id,None,&BTreeMap::new(),86700,|_,_|panic!("expired task sent")).unwrap().is_none());
+    }
+
     fn quad_source() -> Value {
         serde_json::from_str(include_str!(
             "../../../../../tools/test-bridge/templates/quad.json"
@@ -2724,6 +3113,170 @@ mod tests {
         assert_eq!(body["fields"][0]["i"], 3);
         assert_eq!(body["fields"][0]["k"], "account.plan");
         assert_eq!(body["fields"][0]["v"], "plus");
+    }
+
+
+    #[test]
+    fn remaining_changes_push_without_local_profile_after_ack_and_restart() {
+        for ble in [false, true] {
+            for restart in [false, true] {
+                check_remaining_delivery(ble, restart, None);
+            }
+        }
+    }
+
+    #[test]
+    fn remaining_trigger_overrides_survive_without_local_profile() {
+        for ble in [false, true] {
+            for restart in [false, true] {
+                for trigger in ["push", "pull"] {
+                    check_remaining_delivery(ble, restart, Some(trigger));
+                }
+            }
+        }
+    }
+
+    fn check_remaining_delivery(ble: bool, restart: bool, trigger: Option<&str>) {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = PlatformService::open(dir.path()).unwrap();
+        let mac = "AABBCCDDEEFF";
+        let now = crate::now_secs();
+        svc.device_upsert(DeviceIdentity::new(mac, "Test").unwrap(),
+            DeviceCapabilities::ssd1681_154g()).unwrap();
+        if let Some(trigger) = trigger {
+            svc.data_source_save(DataSource {
+                source_id: "codex".into(), kind: DataSourceKind::Codex,
+                config: json!({"triggers":{"usedPercent":trigger}}),
+                credential_ref: None, enabled: true,
+            }).unwrap();
+        }
+        svc.note_device_status_at(mac, &json!({
+            "device_mac":mac, "configured":true,
+            "active_context_id":"device-context", "active_template_id":"device-only",
+            "data_contract":{"template_id":"device-only", "compiler_abi":2,
+                "source_crc":"12345678", "requirements":[
+                    {"index":8, "field":"buckets[codex].weekly.remaining",
+                        "kind":"number", "missing":"hide", "local":false},
+                    {"index":9, "field":"buckets[codex].weekly.resetsAt",
+                        "kind":"number", "missing":"hide", "local":false}
+                ]}
+        }), "http", now).unwrap();
+        svc.set_data_sync(mac, true).unwrap();
+        let envelope = |used, reset| json!({"buckets":[{"id":"codex","windows":[
+            {"kind":"weekly","usedPercent":used,"resetsAt":reset,"windowMins":10080}
+        ]}]});
+        let delivery = |svc: &PlatformService, at| if ble {
+            svc.next_delivery(mac, true, at)
+        } else {
+            svc.next_http_delivery(mac, true, at)
+        };
+        let expected = if ble { "ble_data" } else { "light_data" };
+        let kind = if ble { DeliveryKind::BleData } else { DeliveryKind::LightData };
+        let ack = |svc: &PlatformService, decision: &Value| {
+            let body = svc.data_message_body(mac).unwrap();
+            assert_eq!(svc.note_ack(mac, kind, body["seq"].as_u64().unwrap(),
+                decision["content_crc"].as_str().unwrap(), true, "displayed")["outcome"], "applied");
+        };
+
+        svc.note_codex_envelope(&envelope(7, now + 86400)).unwrap();
+        let first = delivery(&svc, now);
+        assert_eq!(first["decision"], expected);
+        assert_eq!(svc.data_message_body(mac).unwrap()["fields"][0]["v"], 93);
+        ack(&svc, &first);
+        let svc = if restart {
+            drop(svc);
+            PlatformService::open(dir.path()).unwrap()
+        } else { svc };
+        assert!(svc.device_get(mac).unwrap()["profile"].is_null());
+        assert!(svc.templates().is_empty());
+        svc.note_codex_envelope(&envelope(7, now + 86400)).unwrap();
+        let resumed = delivery(&svc, now + 1);
+        if restart && resumed["decision"] == expected {
+            // Startup may reconfirm the cached snapshot; test subsequent changes
+            // against its successful ACK, rather than assuming no startup replay.
+            assert_eq!(svc.data_message_body(mac).unwrap()["fields"][0]["v"], 93);
+            ack(&svc, &resumed);
+        } else {
+            assert_eq!(resumed["decision"], "idle");
+        }
+        let confirmed = svc.coordinator_summary(mac, now).unwrap();
+        assert_eq!(delivery(&svc, now + 1)["decision"], "idle");
+
+        // Pull-only metadata changes stay cached and cannot extend the PowerPlan.
+        let plan = serde_json::to_value(&svc.inner.lock().unwrap().coordinators[mac].plan).unwrap();
+        svc.note_codex_envelope(&envelope(7, now + 86500)).unwrap();
+        let pull = svc.coordinator_summary(mac, now + 2).unwrap();
+        assert_eq!(pull["push_dirty"], false);
+        assert_eq!(pull["pull_only_change"], true);
+        assert_eq!(delivery(&svc, now + 2)["decision"], "idle");
+        assert_eq!(serde_json::to_value(&svc.inner.lock().unwrap().coordinators[mac].plan).unwrap(), plan);
+        assert_eq!(pull["context"]["full_sync_deadline"],
+            confirmed["context"]["full_sync_deadline"]);
+
+        svc.note_codex_envelope(&envelope(8, now + 86500)).unwrap();
+        let changed = svc.coordinator_summary(mac, now + 3).unwrap();
+        let should_push = trigger != Some("pull");
+        assert_eq!(changed["push_dirty"], should_push,
+            "ble={ble}, restart={restart}, override={trigger:?}");
+        assert_eq!(changed["acked_push_fp"], confirmed["acked_push_fp"]);
+        let next = if should_push {
+            delivery(&svc, now + 3)
+        } else {
+            assert_eq!(changed["pull_only_change"], true);
+            assert_eq!(delivery(&svc, now + 3)["decision"], "idle");
+            delivery(&svc, changed["context"]["full_sync_deadline"].as_u64().unwrap() + 1)
+        };
+        assert_eq!(next["decision"], expected);
+        let body = svc.data_message_body(mac).unwrap();
+        assert_eq!(body["fields"][0]["v"], 92);
+        assert_eq!(body["fields"][1]["v"], now + 86500);
+        ack(&svc, &next);
+        assert_eq!(delivery(&svc, now + 4)["decision"], "idle");
+    }
+
+
+    #[test]
+    fn device_context_change_requeues_unchanged_remaining_after_ack() {
+        for ble in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let svc = PlatformService::open(dir.path()).unwrap();
+            let mac = "AABBCCDDEEFF";
+            let now = crate::now_secs();
+            svc.device_upsert(DeviceIdentity::new(mac, "Test").unwrap(),
+                DeviceCapabilities::ssd1681_154g()).unwrap();
+            let mut status = json!({"device_mac":mac, "configured":true,
+                "active_context_id":"before-reboot", "active_template_id":"device-only",
+                "data_seq":0, "applied_seq":0,
+                "data_contract":{"template_id":"device-only","compiler_abi":2,
+                    "source_crc":"12345678","requirements":[{"index":8,
+                        "field":"buckets[codex].weekly.remaining","kind":"number",
+                        "missing":"hide","local":false}]}});
+            svc.note_device_status_at(mac, &status, "http", now).unwrap();
+            svc.set_data_sync(mac, true).unwrap();
+            svc.note_codex_envelope(&json!({"buckets":[{"id":"codex","windows":[
+                {"kind":"weekly","usedPercent":7,"windowMins":10080}]}]})).unwrap();
+            let delivery = |at| if ble { svc.next_delivery(mac, true, at) }
+                else { svc.next_http_delivery(mac, true, at) };
+            let kind = if ble { DeliveryKind::BleData } else { DeliveryKind::LightData };
+            let expected = if ble { "ble_data" } else { "light_data" };
+            let first = delivery(now);
+            let old_seq = first["data_seq"].as_u64().unwrap();
+            let old_crc = first["content_crc"].as_str().unwrap();
+            assert_eq!(svc.note_ack(mac, kind, old_seq, old_crc, true, "displayed")["outcome"], "applied");
+            assert_eq!(delivery(now + 1)["decision"], "idle");
+            status["active_context_id"] = json!("after-reboot");
+            svc.note_device_status_at(mac, &status, "http", now + 2).unwrap();
+            let next = delivery(now + 2);
+            assert_eq!(next["decision"], expected);
+            assert!(next["data_seq"].as_u64().unwrap() > old_seq);
+            let body = svc.data_message_body(mac).unwrap();
+            assert_eq!(body["active_context_id"], "after-reboot");
+            assert_eq!(body["fields"][0]["v"], 93);
+            assert_eq!(svc.note_ack(mac, kind, old_seq, old_crc, true, "displayed")["outcome"], "stale");
+            assert_eq!(svc.note_ack(mac, kind, next["data_seq"].as_u64().unwrap(),
+                next["content_crc"].as_str().unwrap(), true, "displayed")["outcome"], "applied");
+            assert_eq!(delivery(now + 3)["decision"], "idle");
+        }
     }
 
     #[test]
@@ -3404,6 +3957,200 @@ mod tests {
         assert_eq!(after.mode, PlanMode::Sleep);
     }
 
+    /// W4-1 admission: a queued (non-terminal) Wi-Fi read/sync job is real
+    /// pending work, so a rendezvous must grant it a *bounded* formal light
+    /// window instead of waiting for somebody else's window. The window is the
+    /// dedicated `WIFI_READ_LIGHT_S` (pinned here as 120 s): at least
+    /// `MIN_LIGHT_S`, at most `MAX_LIGHT_S`, and strictly below the data/publish
+    /// maximum so a stuck read cannot pin the radio for 600 s.
+    ///
+    /// Red on the pre-fix tree: `plan_for_rendezvous` returns `sleep`.
+    #[test]
+    fn wifi_read_admission_grants_bounded_formal_light() {
+        const EXPECTED_READ_LIGHT_S: u32 = 120;
+        let dir = tempfile::tempdir().unwrap();
+        let svc = service_with_device(dir.path());
+        // Registered with separators: the Wi-Fi job store is keyed by the
+        // normalized MAC, so admission must normalize too.
+        let mac = "AA:BB:CC:DD:EE:FF";
+        let now = crate::now_secs();
+        // Nothing pending: the rendezvous is a plain sleep plan.
+        assert_eq!(
+            svc.plan_for_rendezvous(mac, now, "rendezvous", 0).unwrap().mode,
+            PlanMode::Sleep
+        );
+        // Queueing a read is real pending work and must not need a borrowed window.
+        let job = svc.wifi_queue(mac, "bridge", "read", vec![], now).unwrap();
+        let plan = svc.plan_for_rendezvous(mac, now + 1, "rendezvous", 0).unwrap();
+        assert_eq!(
+            plan.mode, PlanMode::Light,
+            "a queued Wi-Fi read must open a formal light window"
+        );
+        assert_eq!(plan.light_duration_s, EXPECTED_READ_LIGHT_S);
+        assert!(plan.light_duration_s >= crate::coordinator::MIN_LIGHT_S);
+        assert!(plan.light_duration_s <= crate::coordinator::MAX_LIGHT_S);
+        assert!(plan.light_duration_s < crate::coordinator::MAX_LIGHT_S);
+        assert_eq!(plan.reason, "rendezvous");
+        // Admission is a plan decision only: it must not retry, complete or
+        // otherwise mutate the job (no implicit activity, no implicit renewal).
+        let job = svc
+            .wifi_state(mac)
+            .jobs
+            .into_iter()
+            .find(|j| j.job_id == job.job_id)
+            .unwrap();
+        assert_eq!(job.state, "queued");
+        assert_eq!(job.attempt_count, 0);
+        assert!(!job.sent);
+        // A completed read leaves no hold behind: the next rendezvous sleeps.
+        let snapshot: WifiSnapshot = serde_json::from_value(json!({"schema":2,"device_mac":mac,"revision":1,
+            "snapshot_id":"snap","complete":true,"observed_at":now+2,"networks":[],"capacity":{"total":12}})).unwrap();
+        svc.wifi_complete_read(mac, &job.job_id, snapshot, now + 2).unwrap();
+        assert_eq!(
+            svc.plan_for_rendezvous(mac, now + 3, "rendezvous", 0).unwrap().mode,
+            PlanMode::Sleep
+        );
+    }
+
+    #[test]
+    fn rendezvous_admission_excludes_physical_recovery_and_blocked_work() {
+        let dir=tempfile::tempdir().unwrap();let svc=service_with_device(dir.path());
+        let now=crate::now_secs();
+        let mut job=svc.wifi_queue("AA:BB:CC:DD:EE:FF","bridge","read",vec![],now).unwrap();
+        assert!(wifi_job_wants_window(&job,now));
+        job.kind="recovery_save".into();assert!(wifi_job_wants_window(&job,now));
+        job.kind="sync".into();
+        for state in ["waiting_input","conflict","failed","cancelled"] {
+            job.state=state.into();assert!(!wifi_job_wants_window(&job,now),"{state}");
+        }
+        job.state="queued".into();job.next_attempt_at=now+1;assert!(!wifi_job_wants_window(&job,now));
+    }
+
+    #[test]
+    fn rendezvous_wifi_errors_keep_complete_snapshot_and_safe_distinct_codes() {
+        for (message,state,code) in [("snapshot_expired","waiting_rendezvous","snapshot_expired"),
+            ("wifi_snapshot_mismatch","failed","snapshot_mismatch"),("invalid_wifi_snapshot","failed","snapshot_shape"),
+            ("wifi_window_budget","waiting_rendezvous","window_budget_exhausted"),("wifi_http_401","failed","unauthorized")] {
+            let dir=tempfile::tempdir().unwrap();let svc=service_with_device(dir.path());let mac="AA:BB:CC:DD:EE:FF";let now=crate::now_secs();
+            let first=svc.wifi_queue(mac,"bridge","read",vec![],now).unwrap();
+            let snapshot=serde_json::from_value(json!({"schema":2,"device_mac":mac,"revision":1,"snapshot_id":"old",
+                "complete":true,"observed_at":now,"networks":[],"capacity":{"total":12}})).unwrap();
+            svc.wifi_complete_read(mac,&first.job_id,snapshot,now).unwrap();
+            let job=svc.wifi_queue(mac,"bridge","read",vec![],now+1).unwrap();
+            let result=svc.wifi_attempt(mac,&job.job_id,None,&Default::default(),now+1,|_,_|Err(anyhow::anyhow!(message))).unwrap().unwrap();
+            assert_eq!((result.state.as_str(),result.error_code.as_deref()),(state,Some(code)));
+            assert_eq!(svc.wifi_state(mac).snapshot.unwrap().snapshot_id,"old");
+        }
+    }
+
+    #[test]
+    fn wifi_whole_row_rename_then_delete_preserves_identity_after_restart() {
+        let dir=tempfile::tempdir().unwrap();let svc=service_with_device(dir.path());let mac="AABBCCDDEEFF";
+        let mut snapshot:WifiSnapshot=serde_json::from_value(json!({"schema":2,"device_mac":mac,"revision":7,"snapshot_id":"edit-fixture",
+            "complete":true,"observed_at":100,"networks":[{"bond":"own","writable":true,"network":{"network_id":"home","host_ssid":"Host","ssid":"Device","label":"Original","version":7,"password":"fixture-pass"}}],"capacity":{"total":12}})).unwrap();
+        let read=svc.wifi_queue(mac,"bridge","read",vec![],100).unwrap();svc.wifi_complete_read(mac,&read.job_id,snapshot.clone(),101).unwrap();
+        svc.wifi_import(mac,&["home".into()],0,102).unwrap();
+        for deleted in [false,true] {
+            let state=svc.wifi_state(mac);let mut targets=state.targets;
+            targets[0].label="Renamed".into();targets[0].deleted=deleted;
+            svc.wifi_save(mac,state.local_revision,targets,103).unwrap();
+            let job=svc.wifi_queue(mac,"bridge","sync",vec!["home".into()],104).unwrap();
+            let result=svc.wifi_attempt(mac,&job.job_id,Some("permit"),&BTreeMap::new(),105,|op,body| {
+                if op=="apply" {
+                    assert_eq!(body["changes"].as_array().unwrap().len(),1);
+                    assert_eq!(body["changes"][0]["network_id"],"home");assert_eq!(body["changes"][0]["deleted"],deleted);
+                    snapshot.revision+=1;
+                    if deleted {snapshot.networks.clear();}
+                    else {snapshot.networks[0].network.label="Renamed".into();snapshot.networks[0].network.version=snapshot.revision;}
+                    Ok(json!({"ok":true,"outcome":"committed","revision":snapshot.revision}))
+                }else {Ok(serde_json::to_value(&snapshot)?)}
+            }).unwrap().unwrap();assert_eq!(result.state,"completed");
+            assert_eq!(svc.wifi_state(mac).targets.len(),1);
+        }
+        drop(svc);let state=PlatformService::open(dir.path()).unwrap().wifi_state(mac);
+        assert_eq!(state.targets[0].network_id,"home");assert_eq!(state.targets[0].label,"Renamed");assert!(state.targets[0].deleted);
+        assert!(state.snapshot.unwrap().networks.is_empty());
+    }
+
+    #[test]
+    fn wifi_cached_password_survives_restart_import_and_sync_without_input() {
+        let dir=tempfile::tempdir().unwrap();let svc=service_with_device(dir.path());let mac="AABBCCDDEEFF";
+        let snapshot:WifiSnapshot=serde_json::from_value(json!({"schema":2,"device_mac":mac,"revision":1,"snapshot_id":"cached-password",
+            "complete":true,"observed_at":100,"networks":[{"bond":"own","writable":true,"network":{"network_id":"home","host_ssid":"Host","ssid":"Device","password":"fixture-pass"}}],"capacity":{"total":12}})).unwrap();
+        let read=svc.wifi_queue(mac,"bridge","read",vec![],100).unwrap();svc.wifi_complete_read(mac,&read.job_id,snapshot.clone(),101).unwrap();
+        svc.wifi_import_fields_checked(mac,&["home".into()],&BTreeMap::new(),0,Some("cached-password"),102).unwrap();
+        assert_eq!(svc.wifi_state(mac).targets[0].password.as_deref(),Some("fixture-pass"));
+        drop(svc);let svc=PlatformService::open(dir.path()).unwrap();
+        let mut targets=svc.wifi_state(mac).targets;assert_eq!(targets[0].password.as_deref(),Some("fixture-pass"));
+        assert!(!format!("{:?}",targets[0]).contains("fixture-pass"));
+        let mut compared=svc.wifi_state(mac);compared.targets[0].password=Some("changed-pass".into());
+        assert_eq!(compared.differences()[0]["state"],"conflict");
+        assert_eq!(compared.differences()[0]["password"],"different");
+        targets[0].credential="replace".into();svc.wifi_save(mac,1,targets,103).unwrap();
+        let job=svc.wifi_queue(mac,"bridge","sync",vec!["home".into()],104).unwrap();
+        let result=svc.wifi_attempt(mac,&job.job_id,Some("permit"),&BTreeMap::new(),105,|op,body| {
+            if op=="apply" {assert_eq!(body["changes"][0]["password"],"fixture-pass");Ok(json!({"ok":true,"outcome":"committed","revision":2}))}
+            else {Ok(serde_json::to_value(&snapshot)?)}
+        }).unwrap().unwrap();assert_eq!(result.state,"completed");
+        #[cfg(unix)] {use std::os::unix::fs::PermissionsExt;assert_eq!(std::fs::metadata(svc.state_path()).unwrap().permissions().mode()&0o777,0o600);}
+    }
+
+    #[test]
+    fn wifi_recovery_consumes_confirmed_credentials_but_preserves_new_local_edits() {
+        for edit in [false,true] {
+            let dir=tempfile::tempdir().unwrap();let svc=service_with_device(dir.path());let mac="AABBCCDDEEFF";
+            let target:WifiNetwork=serde_json::from_value(json!({"network_id":"home","host_ssid":"Host","ssid":"Device","credential":"replace"})).unwrap();
+            svc.wifi_save(mac,0,vec![target.clone()],100).unwrap();
+            let job=svc.wifi_queue(mac,"bridge","recovery_save",vec!["home".into()],101).unwrap();
+            svc.wifi_mark_sent(mac,&job.job_id,102).unwrap();
+            if edit {let mut changed=target.clone();changed.ssid="New intent".into();svc.wifi_save(mac,1,vec![changed],103).unwrap();}
+            let mut observed=target;observed.credential="device".into();observed.version=7;
+            svc.wifi_confirm_recovery(mac,&job.job_id,observed,7,104).unwrap();
+            let state=svc.wifi_state(mac);
+            assert_eq!(state.targets[0].credential,if edit{"replace"}else{"keep"});
+            assert_eq!(state.targets[0].version,if edit{0}else{7});
+            assert_eq!(state.targets[0].ssid,if edit{"New intent"}else{"Device"});
+            assert!(state.snapshot.is_none()); // no prerequisite full-device read
+        }
+    }
+
+    #[test]
+    fn saved_network_connection_work_has_a_bounded_plan_and_stale_or_rejected_work_does_not() {
+        let now=crate::now_secs();let mac="AA:BB:CC:DD:EE:FF";
+        for (kind,error,attempts,due,wanted) in [("waiting_for_window",None,0,true,true),("selected",None,0,true,false),
+            ("connection_failed",Some("network_not_found"),1,true,true),("connection_failed",Some("authentication_failed"),1,true,false),
+            ("connection_failed",Some("network_not_found"),3,true,false),("connection_failed",Some("network_not_found"),1,false,false)] {
+            let dir=tempfile::tempdir().unwrap();let svc=service_with_device(dir.path());
+            svc.wifi_save(mac,0,vec![serde_json::from_value(json!({"network_id":"home","host_ssid":"Host","ssid":"Device"})).unwrap()],now).unwrap();
+            let c=super::super::wifi::Connection{host_ssid:"Host".into(),network_id:"home".into(),local_revision:1,version:1,
+                state:kind.into(),error:error.map(str::to_owned),reason:0,observed_at:now,attempts,next_attempt_at:if due{now}else{now+60},http_ready:false,actual_ssid:None,ip:None};
+            svc.wifi_note_connection(mac,c.clone()).unwrap();
+            let plan=svc.plan_for_rendezvous(mac,now,"rendezvous",0).unwrap();
+            assert_eq!(plan.mode==PlanMode::Light,wanted,"{kind}/{error:?}/{attempts}/{due}");
+            if wanted {assert!(plan.light_duration_s<=120);}
+            let mut stale=c;stale.local_revision=0;assert!(svc.wifi_note_connection(mac,stale).is_err());
+        }
+    }
+
+    #[test]
+    fn rendezvous_ordinary_plan_persists_and_http_recovers_lost_ack() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = service_with_device(dir.path());
+        let mac = "AA:BB:CC:DD:EE:FF";
+        let now = crate::now_secs();
+        svc.note_device_status_at(mac, &json!({"power":{"plan_id":100,"mode":"sleep","remaining_s":0}}), "ble", now).unwrap();
+        svc.wifi_queue(mac, "bridge", "read", vec![], now).unwrap();
+        let plan = svc.plan_for_rendezvous(mac, now, "rendezvous", 0).unwrap();
+        assert_eq!(plan.plan_id, 101);
+        drop(svc);
+        let resumed = PlatformService::open(dir.path()).unwrap();
+        assert_eq!(resumed.plan_for_rendezvous(mac, now+1, "rendezvous", 0).unwrap(), plan);
+        resumed.note_device_status_at(mac, &json!({"power":{"plan_id":plan.plan_id,"mode":"light","remaining_s":115}}), "http", now+5).unwrap();
+        let summary = resumed.coordinator_summary(mac, now+5).unwrap();
+        assert_eq!(summary["plan"]["last_accepted_id"], plan.plan_id);
+        assert_eq!(summary["plan"]["last_accepted_remaining_s"], 115);
+    }
+
     #[test]
     fn authenticated_status_recovers_lost_explicit_light_ack() {
         let dir = tempfile::tempdir().unwrap();
@@ -3648,4 +4395,31 @@ mod tests {
         let overview = svc.overview();
         assert_eq!(overview["templates"].as_array().unwrap().len(), 1);
     }
+    #[test]
+    fn manual_wifi_sync_retains_current_environment_and_freezes_preview() {
+        let dir=tempfile::tempdir().unwrap();let svc=service_with_device(dir.path());let mac="AABBCCDDEEFF";
+        let snapshot:WifiSnapshot=serde_json::from_value(json!({"schema":2,"device_mac":mac,"revision":7,"snapshot_id":"manual",
+            "complete":true,"observed_at":100,"networks":[{"bond":"own","writable":true,"network":{"network_id":"old","host_ssid":"Host-5G","ssid":"Old-2G"}}],"capacity":{"total":12}})).unwrap();
+        let read=svc.wifi_queue(mac,"bridge","read",vec![],100).unwrap();svc.wifi_complete_read(mac,&read.job_id,snapshot,101).unwrap();
+        let targets=serde_json::from_value(json!([{"network_id":"old","host_ssid":"Host-5G","ssid":"Old-2G","deleted":true},
+            {"network_id":"current","host_ssid":"Host-5G","ssid":"Current-2G","credential":"open"}])).unwrap();
+        svc.wifi_save(mac,0,targets,102).unwrap();
+        assert_eq!(svc.wifi_queue_manual_sync(mac,"bridge",vec!["old".into()],1,"manual","Host-5G",103).unwrap_err().to_string(),"current_network_required");
+        assert!(svc.wifi_queue_manual_sync(mac,"bridge",vec!["current".into()],1,"stale","Host-5G",103).is_err());
+        let job=svc.wifi_queue_manual_sync(mac,"bridge",vec!["old".into(),"current".into()],1,"manual","Host-5G",103).unwrap();
+        assert_eq!(job.expected_revision,Some(7));assert_eq!(job.host_ssid.as_deref(),Some("Host-5G"));
+        let mut newer=svc.wifi_state(mac).targets;newer[1].label="Later draft".into();svc.wifi_save(mac,1,newer,104).unwrap();
+        let outcome=svc.wifi_attempt(mac,&job.job_id,Some("permit"),&BTreeMap::new(),105,|op,body| {
+            assert_eq!(op,"apply","must not reread device configuration");assert_eq!(body["expected_revision"],7);
+            assert_eq!(body["changes"].as_array().unwrap().len(),2);anyhow::bail!("lost_ack")
+        }).unwrap().unwrap();assert_eq!(outcome.state,"awaiting_confirmation");
+        drop(svc);let svc=PlatformService::open(dir.path()).unwrap();
+        let result=svc.wifi_attempt(mac,&job.job_id,None,&BTreeMap::new(),166,|op,_| {
+            assert_eq!(op,"result","lost ACK must only query the original transaction");Ok(json!({"ok":true,"outcome":"committed","revision":8,"bond":"own"}))
+        }).unwrap().unwrap();assert_eq!(result.state,"completed");assert_eq!(result.confirmation.as_deref(),Some("durable_receipt"));
+        let state=svc.wifi_state(mac);assert_eq!(state.targets[1].label,"Later draft");
+        let cache=state.snapshot.unwrap();assert_eq!(cache.networks.len(),1);assert_eq!(cache.networks[0].network.network_id,"current");
+        assert_eq!(cache.revision,8);assert_eq!(cache.networks[0].network.label,"");
+    }
+
 }

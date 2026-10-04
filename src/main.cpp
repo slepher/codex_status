@@ -14,6 +14,7 @@
 #include <LittleFS.h>
 #include <ESPmDNS.h>
 #include <ArduinoJson.h>
+#include "rendezvous_protocol.h"
 #include <time.h>
 #include <sys/time.h>
 #include <string.h>
@@ -47,6 +48,9 @@
 #include "GUI_Paint.h"
 #include "fonts.h"
 #include "ble_bridge.h"
+#include "ble_recovery.h"
+#include "wifi_setup.h"
+#include "wake_trace_projection.h"
 #include "bridge_store.h"
 #include "owner_store.h"
 #include "template_store.h"
@@ -61,6 +65,7 @@
 #include "v2_activate_command.h"
 #include "v2_claim_command.h"
 #include "v2_command_envelope.h"
+#include "ble_wire.h"
 #include "v2_status_snapshot.h"
 #include "display_result.h"
 #include "v2_sync.h"
@@ -85,7 +90,7 @@ static bool targetUnverified = false;
 #define FW_VERSION    "0.13.9-clkwin"
 #elif defined(CODEX_TARGET_NOTE4)
 #ifdef CODEX_NOTE4_ROM_B
-#define FW_VERSION    "0.18.41-note4-b-fields1"
+#define FW_VERSION    "0.18.54-note4-b-wifi-rv2"
 #else
 #define FW_VERSION    "0.18.19-note4-a"
 #endif
@@ -183,6 +188,8 @@ static bool        configMode = false;
 static String      hostname;
 static String      apSsid;
 static esp_pm_lock_handle_t otaPmLock = nullptr;
+static esp_pm_lock_handle_t blePmLock = nullptr;
+static bool blePmHeld = false;
 static bool        otaLockHeld = false;
 
 RTC_DATA_ATTR static uint32_t rtcMagic = 0;
@@ -422,6 +429,21 @@ static uint32_t loopDelayForNow() {
     return loopDelayMs;
 }
 
+// BLE and HTTP overlap only while the CPU is awake. This lock is independent
+// of OTA and physical recovery, and remains held for every actual BLE session.
+static bool setBleAwake(bool held) {
+#ifdef CODEX_PM
+    if (!blePmLock && held && esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "ble-rv", &blePmLock) != ESP_OK)
+        return false;
+    if (held != blePmHeld && blePmLock) {
+        esp_err_t err = held ? esp_pm_lock_acquire(blePmLock) : esp_pm_lock_release(blePmLock);
+        if (err != ESP_OK) return false;
+        blePmHeld = held;
+    }
+#endif
+    return true;
+}
+
 static void configurePowerManagement() {
 #ifdef CODEX_PM
     esp_pm_config_t cfg = {};
@@ -552,26 +574,7 @@ enum : uint8_t {
 // Packed on purpose: this is the RTC contract shared with Bridge history
 // export. Nine uint16 timings use 100 ms units, covering about 109 minutes;
 // JSON expands them back to milliseconds. awake_ms remains uint32.
-struct __attribute__((packed)) WakeTraceRec {
-    uint32_t wake_generation;
-    uint32_t seq;
-    uint8_t wake_type;
-    uint8_t wake_cause;
-    uint8_t ext1;
-    uint8_t valid_start;
-    uint8_t valid_end;
-    uint8_t furthest;
-    uint8_t result;
-    uint8_t error;
-    uint16_t request_crc;
-    uint32_t awake_ms;
-    uint16_t timing[TRACE_STAGE_COUNT];
-    uint16_t stage_mask;
-    uint8_t transport;
-    uint8_t reserved;
-    uint32_t crc;
-};
-static_assert(sizeof(WakeTraceRec) == 48, "wake trace record must stay 48 bytes");
+
 RTC_DATA_ATTR SyncRtc syncRtc;
 uint32_t syncLogWakeSeq = 0;
 bool syncLogReady = false;
@@ -586,19 +589,8 @@ RTC_DATA_ATTR static uint32_t rtcTraceShadowSeq = 0;
 static uint32_t traceStartMs = 0;
 static bool traceBleConnectedSeen = false;
 
-static uint32_t traceCrc(const WakeTraceRec &r) {
-    const uint8_t *p = reinterpret_cast<const uint8_t *>(&r);
-    uint32_t h = 2166136261u;
-    for (size_t i = 0; i < sizeof(WakeTraceRec) - sizeof(r.crc); ++i) {
-        h ^= p[i];
-        h *= 16777619u;
-    }
-    return h;
-}
-static bool traceValid(const WakeTraceRec &r) {
-    return r.valid_start == TRACE_VALID_START && r.valid_end == TRACE_VALID_END &&
-           r.crc == traceCrc(r);
-}
+static uint32_t traceCrc(const WakeTraceRec &r) { return wakeTraceCrc(r); }
+static bool traceValid(const WakeTraceRec &r) { return wakeTraceValid(r); }
 static WakeTraceRec *traceCurrent() {
     return rtcTraceActive ? &rtcTraceShadow : nullptr;
 }
@@ -1037,13 +1029,22 @@ static String         v2SessionNonce;
 // Device safety cap: with a committed bundle but no formal PowerPlan (or before
 // the Bridge answers) the light session is bounded by the max light lease.
 static uint64_t       v2SafetyDeadlineMs = 0;
-static uint64_t       v2ManualBleHoldUntilMs = 0; // runtime-only manual BLE hold; reset on boot
+static BleRecoveryWindow bleRecovery;
+static uint64_t offlineBootGraceUntilMs = 0;
 static String         v2RxPath = "/bundle/rx.bin";
 static String         v2PlanReason = "init";
 // Plan C: while the rendezvous window is open the screen is not touched; the
 // single wake render happens after bleOff (clock window, or the light plan's
 // first frame in startNormalMode). Other BLE paths keep their immediate render.
 static bool           v2InRendezvous = false;
+static RendezvousProtocol v2Rv;
+static String v2RvId, v2RvChallenge, v2RvBridge;
+static bool v2RvHttpStarted = false, v2RvBleReleased = false;
+static bool httpServicesStarted = false;
+static uint64_t v2RvStartMs = 0;
+static uint8_t v2RvWifiPhase = 0;
+static uint64_t v2RvWifiPhaseAt = 0;
+static uint64_t       v2RfDeadlineMs = 0;
 // A BLE data snapshot accepted during the window is rendered with the clock in
 // one frame after the radio is off (v2RendezvousRender).
 static bool           v2WakeRenderPending = false;
@@ -1051,12 +1052,9 @@ static bool           v2WakeRenderPending = false;
 static uint64_t v2NowMs() { return (uint64_t)(esp_timer_get_time() / 1000ULL); }
 static uint32_t v2Millis32() { return (uint32_t)(esp_timer_get_time() / 1000ULL); }
 static uint32_t v2ManualBleHoldRemainingS() {
-    const uint64_t now = v2NowMs();
-    return v2ManualBleHoldUntilMs > now
-        ? (uint32_t)((v2ManualBleHoldUntilMs - now) / 1000ULL)
-        : 0;
+    return bleRecovery.remaining(v2NowMs());
 }
-static bool v2ManualBleHoldActive() { return v2ManualBleHoldUntilMs > v2NowMs(); }
+static bool v2ManualBleHoldActive() { return bleRecovery.active(v2NowMs()); }
 
 static String lastUsage;
 static String lastChannel = "-";
@@ -1101,6 +1099,9 @@ static void handleBleAuth(const String &json);
 static String fmtEpoch(long long ts, const char *fmt);
 static void powerOff();
 static bool configureWifiPowerSave();
+static void registerHttpRoutes();
+static void startNormalMode();
+static void v2RendezvousBegin(bool deep = false);
 static void noteActivity(const char *reason);
 static void sleepToNextEvent();
 static void enterDeep(const char *reason);
@@ -1959,25 +1960,23 @@ static void renderUsage(const String &json, const char *channel) {
 static const char *wakeCauseName(esp_sleep_wakeup_cause_t cause);
 static uint32_t traceEarliestComplete();
 
-static void updateInfoExtra() {
+static String infoExtraJson() {
     String items = "\"mac\":\"" + macText() + "\",\"ip\":\"" + ipText() +
-                   "\",\"http_port\":80,\"rendezvous\":true" +
+                   "\",\"http_port\":80,\"rendezvous\":true,\"wifi_setup_protocol\":1,\"wifi_management\":2,\"wifi_connection\":1" +
                    ",\"wake_generation\":" + String((unsigned long)rtcWakeGeneration) +
                    ",\"wake_seq\":" + String((unsigned long)rtcTraceCurrentSeq) +
                    ",\"wake_stage\":\"" +
                    (traceCurrent() ? traceStageName(traceCurrent()->furthest) : "none") +
                    "\",\"wake_cause\":\"" + wakeCauseName(bootWakeCause) + "\"" +
-                   ",\"bundle_configured\":" + String(v2BundleReady ? "true" : "false") + ",\"templates\":[";
-    String active = tplStoreActive();
-    for (int i = 0; i < tplStoreCount(); i++) {
-        TplMeta m;
-        if (!tplStoreGet(i, m)) continue;
-        if (i) items += ",";
-        items += String("{\"id\":\"") + m.id + "\",\"hash\":\"" + m.hash +
-                 "\",\"active\":" + ((m.id == active) ? "true" : "false") + "}";
-    }
-    items += "]";
-    bleSetInfoExtra(items);
+                   ",\"bundle_configured\":" + String(v2BundleReady ? "true" : "false");
+    const uint64_t now = v2NowMs();
+    const uint64_t until = v2RfDeadlineMs ? v2RfDeadlineMs : bleRecovery.until;
+    if (until) items += ",\"rf_remaining_ms\":" + String((unsigned long)(until > now ? until - now : 0));
+    return items;
+}
+static void updateInfoExtra() {
+    bleSetInfoProvider(infoExtraJson);
+    bleSetInfoExtra(infoExtraJson());
 }
 
 static bool tplCacheLoad() {
@@ -2277,14 +2276,14 @@ static void deepSleepFor(uint32_t sec) {
 static void handleBleEndpoint(const String &json) {
     JsonDocument doc;
     if (deserializeJson(doc, json)) {
-        bleNotifyStatus("{\"ack\":\"endpoint\",\"ok\":false}");
+        bleNotifyStatus(bleBuildEndpoint(false));
         return;
     }
     const char *host = doc["host"] | "";
     uint16_t port = doc["port"] | 0;
     const char *token = doc["token"] | "";
     if (!strlen(host) || !port) {
-        bleNotifyStatus("{\"ack\":\"endpoint\",\"ok\":false}");
+        bleNotifyStatus(bleBuildEndpoint(false));
         return;
     }
     String mac = blePeerAddress();
@@ -2293,7 +2292,7 @@ static void handleBleEndpoint(const String &json) {
     traceSetTransport(1);
     traceSetStage(TRACE_STAGE_COMMAND);
     traceSetStage(TRACE_STAGE_REPLY);
-    bleNotifyStatus("{\"ack\":\"endpoint\",\"ok\":true}");
+    bleNotifyStatus(bleBuildEndpoint(true));
 }
 
 static int countWifiSlots() {
@@ -2306,36 +2305,27 @@ static int countWifiSlots() {
     return n;
 }
 
-static bool hasWifiSlots() { return countWifiSlots() > 0; }
-
-// Scan once and connect to the saved slot with the best signal; the last-used
-// slot wins near-ties. When no saved network is visible, fall back to the
-// last-used slot so the 60 s retry cadence has credentials to retry with.
-static bool connectBest(bool showProgress = true) {
-    WiFi.mode(WIFI_STA);
-    WiFi.setHostname(hostname.c_str());
-    // The scan can take several seconds. Poll it so the already visible wake
-    // frame can alternate its Wi-Fi cell throughout the whole connect attempt.
-    const bool blinkAllowed = lastUsage.length() > 0 && epdPartialReady && epdBaselineTrusted;
-    uint32_t lastBlink = millis();
-    auto blinkWhileConnecting = [&]() {
-        if (!blinkAllowed || !wifiBlinkMs ||
-            (uint32_t)(millis() - lastBlink) < wifiBlinkMs) return;
-        lastBlink = millis();
-        wifiBlinkOn = !wifiBlinkOn;
-        rfnBlink = true;
-        renderCurrent();
-    };
-    if (!blinkAllowed)
-        DevLog.printf("[wifi] icon blink skipped usage=%d partial=%d trusted=%d\n",
-                      lastUsage.length() > 0, epdPartialReady, epdBaselineTrusted);
-    WiFi.scanNetworks(true);
-    uint32_t scanStarted = millis();
-    while (WiFi.scanComplete() == WIFI_SCAN_RUNNING && millis() - scanStarted < 15000UL) {
-        delay(100);
-        blinkWhileConnecting();
+static void loadPreferredWifiCredentials() {
+    if (wifiSchemesCredentials(wifiSsid, wifiPass)) return;
+    prefs.begin("wifi", true);
+    uint8_t slot = prefs.getUChar("last", 0);
+    if (slot >= MAX_SLOTS || !prefs.getString(("s" + String(slot)).c_str(), "").length()) {
+        slot = 0;
+        for (int i = 0; i < MAX_SLOTS; ++i) {
+            if (prefs.getString(("s" + String(i)).c_str(), "").length()) { slot = i; break; }
+        }
     }
-    int n = WiFi.scanComplete();
+    wifiSsid = prefs.getString(("s" + String(slot)).c_str(), "");
+    wifiPass = prefs.getString(("p" + String(slot)).c_str(), "");
+    prefs.end();
+}
+
+static bool hasWifiSlots() {
+    String ssid, password;
+    return countWifiSlots() > 0 || wifiSchemesCredentials(ssid, password);
+}
+
+static int selectLegacyWifi(int n) {
     prefs.begin("wifi", true);
     uint8_t last = prefs.getUChar("last", 0xFF);
     prefs.end();
@@ -2374,8 +2364,8 @@ static bool connectBest(bool showProgress = true) {
             DevLog.println("[wifi] no saved network");
             wifiConnActive = false;
             wifiBlinkOn = false;
-            if (lastUsage.length()) renderCurrent();
-            return false;
+
+            return -1;
         }
         DevLog.printf("[wifi] scan: no saved network visible; trying slot %d\n", bestSlot);
     }
@@ -2386,11 +2376,54 @@ static bool connectBest(bool showProgress = true) {
     if (!wifiSsid.length()) {
         wifiConnActive = false;
         wifiBlinkOn = false;
-        if (lastUsage.length()) renderCurrent();
-        return false;
+
+        return -1;
     }
+    return bestSlot;
+}
+
+// Scan once and connect to the saved slot with the best signal; the last-used
+// slot wins near-ties. When no saved network is visible, fall back to the
+// last-used slot so the 60 s retry cadence has credentials to retry with.
+static bool connectBest(bool showProgress = true) {
+    WiFi.mode(WIFI_STA);
+    WiFi.setHostname(hostname.c_str());
+    // Selected bond network is tried first; USB/AP networks remain fallback.
+    if (wifiSchemesCredentials(wifiSsid, wifiPass)) {
+        wifiSetupConnectionStarted(wifiSsid);
+    WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+        uint32_t started = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - started < WIFI_CONNECT_MS) delay(20);
+        if (WiFi.status() == WL_CONNECTED) return true;
+        WiFi.disconnect(false);
+    }
+    // The scan can take several seconds. Poll it so the already visible wake
+    // frame can alternate its Wi-Fi cell throughout the whole connect attempt.
+    const bool blinkAllowed = lastUsage.length() > 0 && epdPartialReady && epdBaselineTrusted;
+    uint32_t lastBlink = millis();
+    auto blinkWhileConnecting = [&]() {
+        if (!blinkAllowed || !wifiBlinkMs ||
+            (uint32_t)(millis() - lastBlink) < wifiBlinkMs) return;
+        lastBlink = millis();
+        wifiBlinkOn = !wifiBlinkOn;
+        rfnBlink = true;
+        renderCurrent();
+    };
+    if (!blinkAllowed)
+        DevLog.printf("[wifi] icon blink skipped usage=%d partial=%d trusted=%d\n",
+                      lastUsage.length() > 0, epdPartialReady, epdBaselineTrusted);
+    WiFi.scanNetworks(true);
+    uint32_t scanStarted = millis();
+    while (WiFi.scanComplete() == WIFI_SCAN_RUNNING && millis() - scanStarted < 15000UL) {
+        delay(100);
+        blinkWhileConnecting();
+    }
+    int n = WiFi.scanComplete();
+    const int bestSlot = selectLegacyWifi(n);
+    if (bestSlot < 0) return false;
     if (showProgress) screen({"CODEX STATUS", FW_VERSION, "", "Connecting:", wifiSsid});
-    DevLog.printf("[wifi] slot %d rssi=%d\n", bestSlot, bestRssi);
+    DevLog.printf("[wifi] slot %d\n", bestSlot);
+    wifiSetupConnectionStarted(wifiSsid);
     WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
     uint32_t t0 = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_CONNECT_MS) {
@@ -2420,6 +2453,7 @@ static bool connectBest(bool showProgress = true) {
 static bool retryWifi() {
     if (!wifiSsid.length()) return false;
     DevLog.println("[wifi] retry");
+    wifiSetupConnectionStarted(wifiSsid);
     WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
     return true;
 }
@@ -2469,6 +2503,10 @@ static void handleConfigSave() {
 }
 
 static void startConfigMode() {
+    if (v2InRendezvous) {
+        v2Rv.cancel(); v2InRendezvous = false; v2RfDeadlineMs = 0;
+        v2RvBleReleased = false;
+    }
     configMode = true;
     configStartedAt = millis();
     WiFi.mode(WIFI_AP);
@@ -2677,6 +2715,9 @@ static void handleStatusJson() {
     // v2 platform state (device is authoritative; the Bridge reconciles).
     // ------------------------------------------------------------------
     doc["fw_target"] = FW_TARGET_ID;
+    doc["wifi_setup_protocol"] = 1;
+    doc["wifi_management"] = 2;
+    doc["ble_recovery_remaining_s"] = v2ManualBleHoldRemainingS();
     doc["render_target"] = RENDER_TARGET_ID;
     doc["compiler_abi"] = CT_ABI;
     doc["width"] = TARGET_WIDTH;
@@ -2833,6 +2874,7 @@ static bool traceRecordActive(uint32_t seq) {
 }
 
 static void traceAppendRow(JsonArray arr, const WakeTraceRec &r, bool compact = false) {
+    if(compact){wakeTraceCompactRow(arr,r,!traceRecordActive(r.seq));return;}
     JsonObject item = arr.add<JsonObject>();
     item["format"] = TRACE_FORMAT;
     item["wake_generation"] = r.wake_generation;
@@ -3442,7 +3484,7 @@ static void handleClaim() {
 static void handleBleAuth(const String &json) {
     JsonDocument doc;
     if (deserializeJson(doc, json) || doc["cmd"].isNull() || strcmp(doc["cmd"] | "", "token")) {
-        bleNotifyStatusQuiet("{\"ack\":\"auth\",\"ok\":false}");
+        bleNotifyStatusQuiet(bleBuildAuth(false));
         return;
     }
     if (doc["rotate"] | false) rotateAuthToken();
@@ -3450,15 +3492,15 @@ static void handleBleAuth(const String &json) {
     traceSetTransport(1);
     traceSetStage(TRACE_STAGE_COMMAND);
     traceSetStage(TRACE_STAGE_REPLY);
-    bleNotifyStatusQuiet(String("{\"ack\":\"auth\",\"ok\":true,\"token\":\"") + authToken + "\"}");
+    bleNotifyStatusQuiet(bleBuildAuth(true, authToken));
 }
 
 // Bounded mailbox from NimBLE's callback task to the device loop task.
 static QueueHandle_t v2BleQueue = nullptr;
-struct V2BleMessage { String body; String peer; };
+struct V2BleMessage { String body; String peer; String identity; uint32_t generation; };
 static void handleBleV2Ctrl(const String &json) {
     if (!v2BleQueue || json.length() > 8192 || !blePeerIsBonded() || !blePeerIsEncrypted()) return;
-    auto *message = new V2BleMessage{json, blePeerAddress()};
+    auto *message = new V2BleMessage{json, blePeerAddress(), blePeerIdentity(), bleConnectionGeneration()};
     if (xQueueSend(v2BleQueue, &message, 0) != pdTRUE) delete message;
 }
 
@@ -3544,6 +3586,12 @@ static void serviceLed() {
 }
 
 static void enterBleOn(bool userInitiated) {
+    if (userInitiated) v2RvBleReleased = false;
+    if (v2RvBleReleased && !userInitiated) return;
+    if (!setBleAwake(true)) {
+        DevLog.println("[pm] BLE refused: NO_LIGHT_SLEEP lock unavailable");
+        return;
+    }
     // An unconfigured device must still advertise on a timer wake so the
     // bridge can issue a formal light plan and install its first Bundle.
     if (!v2BleQueue) v2BleQueue = xQueueCreate(2, sizeof(V2BleMessage *));
@@ -3567,13 +3615,8 @@ static void enterBleOn(bool userInitiated) {
     bleAdvertiseStart();
     traceSetStage(TRACE_STAGE_BLE_ADV);
     if (userInitiated) {
-        bleOpenPairingWindow(120000);
-        if (v2BundleReady) {
-            const uint64_t requestedUntil = v2NowMs() + BLE_GRACE_MS;
-            if (v2ManualBleHoldUntilMs < requestedUntil) {
-                v2ManualBleHoldUntilMs = requestedUntil;
-            }
-        }
+        bleRecovery.open(v2NowMs());
+        bleOpenPairingWindow(bleRecovery.remaining(v2NowMs()) * 1000UL);
     }
     bool autoCond = plugged && !rtcDeepOnUsb && batteryPct > BLE_AUTO_PCT;
     lastBleAuto = autoCond;
@@ -3586,11 +3629,14 @@ static void bleOff(const char *reason) {
     if (!bleOn) return;
     bleOn = false;
     traceSetStage(TRACE_STAGE_BLE_OFF);
-    if (!strcmp(reason, "user click")) v2ManualBleHoldUntilMs = 0;
+    bleRecovery.close();
+    bleOpenPairingWindow(0);
+    wifiSetupRadioClosed("session_expired");
     lastBleAuto = false;
     bleRadioMark(false);
     bleAdvertiseStop();
     bleDeinit();
+    setBleAwake(false);
     V2BleMessage *pending = nullptr;
     while (v2BleQueue && xQueueReceive(v2BleQueue, &pending, 0) == pdTRUE) delete pending;
     ledSet(false);
@@ -3603,7 +3649,12 @@ static void bleOff(const char *reason) {
 // BLE keep-alive: infinite while plugged and >20%, otherwise 120 s after the
 // last connection/transfer or after the keep-alive condition ends.
 static void serviceBleSession() {
-    if (!bleOn) return;
+    if (!bleOn || v2InRendezvous) return;
+    // Physical authorization never renews on connection/traffic or USB power.
+    if (bleRecovery.until) {
+        if (!v2ManualBleHoldActive()) bleOff("recovery expired");
+        return;
+    }
     bool autoCond = plugged && !rtcDeepOnUsb && batteryPct > BLE_AUTO_PCT;
     if (bleIsConnected()) {
         bleOffDeadline = millis() + BLE_GRACE_MS;
@@ -3646,6 +3697,7 @@ static void pollPlug() {
 }
 
 static void pollWifi() {
+    if (wifiSetupBusy()) return;
     bool nowUp = (WiFi.status() == WL_CONNECTED);
     if (wifiReconfiguring) {
         if (nowUp) {
@@ -3683,18 +3735,20 @@ static void pollWifi() {
     } else if (!wifiLostSince) {
         wifiLostSince = millis();
     }
+    if (v2ManualBleHoldActive() || v2NowMs() < offlineBootGraceUntilMs) return;
     if (wifiLostHandled) {
         if (plugged && !rtcDeepOnUsb && (int32_t)(millis() - nextWifiRetry) >= 0) {
             nextWifiRetry = millis() + WIFI_RETRY_MS;
             ledFlash();
             retryWifi();
         }
+        if (plugged && !rtcDeepOnUsb) return;
+        uint32_t delaySec = retryDelaySec(rtcRetryStage);
+        if (rtcRetryStage < 7) rtcRetryStage++;
+        deepSleepFor(delaySec);
         return;
     }
     if (millis() - wifiLostSince < WIFI_LOST_MS) return;
-    if (v2BundleReady && v2ManualBleHoldActive()) {
-        return;
-    }
     wifiLostHandled = true;
     if (bleOn) bleOff("wifi lost");
     if (plugged && !rtcDeepOnUsb) {
@@ -3726,14 +3780,7 @@ static void checkBattery() {
 static void handleBootClick() {
     if (millis() - lastBootAction < 1000) return;   // 1 s throttle
     lastBootAction = millis();
-    if (!wifiUp) {
-        if (plugged && retryWifi()) {
-            DevLog.println("[boot] click: retry Wi-Fi now");
-            ledFlash();
-        }
-        return;
-    }
-    if (bleOn) {
+    if (v2ManualBleHoldActive()) {
         bleUserOff = true;
         bleOff("user click");
     } else {
@@ -3781,31 +3828,25 @@ static void syncRecordOutcome(uint8_t result, uint16_t error, uint64_t serial = 
     int32_t args[] = {(int32_t)result, (int32_t)error};
     syncAppendEvent(syncRtc, syncLogWakeSeq, millis(), 10, args, 2);
 }
-static void v2Response(int status, const String &body, bool includeWakeInfo = true) {
+static void v2BleNotify(JsonDocument &doc) {
+    String reply = bleBuildReply(doc, v2RequestId, rtcWakeGeneration, rtcTraceCurrentSeq);
+    const char *op = doc["op"] | (doc["ack"] == "wifi" ? "wifi" : "command");
+    const bool known = !strcmp(op, "status") || !strcmp(op, "data") || !strcmp(op, "plan") ||
+        !strcmp(op, "sync_config") || !strcmp(op, "sync_open") || !strcmp(op, "wifi");
+    String correlation = doc["rid"] | "";
+    DevLog.printf("[ble-wire] phase=encode op=%s correlation=%08x encoded_bytes=%u reply_bytes=%u max=512 wake=%u/%u result=%s\n",
+        known ? op : "command", (unsigned)v2Crc32((const uint8_t *)correlation.c_str(), correlation.length()),
+        (unsigned)measureJson(doc), (unsigned)reply.length(), (unsigned)rtcWakeGeneration, (unsigned)rtcTraceCurrentSeq,
+        !reply.length() ? "invalid" : measureJson(doc) > BLE_WIRE_MAX ? "fallback_unknown" : "ready");
+    bleNotifyStatusQuiet(reply);
+}
+static void v2Response(int status, const String &body) {
     if (!v2ReplyOverBle) { server.send(status, "application/json", body); return; }
     JsonDocument doc;
     if (deserializeJson(doc, body)) return;
-    doc["ack"] = "command";
-    doc["request_id"] = v2RequestId;
-    doc["wake_generation"] = rtcWakeGeneration;
-    doc["wake_seq"] = rtcTraceCurrentSeq;
-    const bool historyReply = !doc["records"].isNull();
-    if (!historyReply && includeWakeInfo) {
-        doc["wake_stage"] = traceCurrent() ? traceStageName(traceCurrent()->furthest) : "none";
-        doc["wake_cause"] = wakeCauseName(bootWakeCause);
-    }
-    String reply;
-    serializeJson(doc, reply);
-    JsonArray records = doc["records"].as<JsonArray>();
-    while (reply.length() > 480 && !records.isNull() && records.size()) {
-        records.remove(records.size() - 1);
-        doc["more"] = true;
-        reply = "";
-        serializeJson(doc, reply);
-    }
     traceSetTransport(1);
     traceSetStage(TRACE_STAGE_REPLY);
-    bleNotifyStatusQuiet(reply);
+    v2BleNotify(doc);
 }
 
 static bool v2OwnerOk(const char *bridgeId) {
@@ -3821,9 +3862,9 @@ static bool v2OwnerOk(const char *bridgeId) {
 
 static void v2Ack(const char *op, const char *result, const char *display,
                   const char *retention, const char *error, int64_t seq, uint64_t planId,
-                  const char *context, uint32_t acceptedRemainingS) {
+                  const char *context, uint32_t acceptedRemainingS, bool fullSeq = false) {
     v2Response(200, v2BuildAck(op, result, display, retention, error, seq,
-                               planId, context, acceptedRemainingS, FW_TARGET_ID));
+                               planId, context, acceptedRemainingS, FW_TARGET_ID, fullSeq));
 }
 
 // Only authenticated status exposes this boot session nonce.
@@ -3952,6 +3993,33 @@ static void syncBatchFields(JsonDocument &doc, const SyncStoreBatch &batch) {
     syncProtocolBatchFields(doc.to<JsonObject>(), batch);
 }
 
+// No markSynced, owner claim or PowerPlan mutation: these borrow a live window.
+static void handleWifiManagement(const char *op) {
+    String endpoint;
+    if (!endpointTokenAuthorized(endpoint)) { server.send(401, "application/json", "{\"ok\":false,\"error\":\"unauthorized\"}"); return; }
+    JsonDocument request;
+    const String body = server.arg("plain");
+    if (body.length() > 8192 || deserializeJson(request, body) || String(request["device_mac"] | "") != macText()) {
+        server.send(400, "application/json", "{\"ok\":false,\"error\":\"shape\"}"); return;
+    }
+    request["op"] = op;
+    OwnerRec owner;
+    if (!strcmp(op,"apply") && ownerGet(owner) && owner.id != (request["bridge_id"] | "")) {
+        JsonDocument out;out["device_mac"]=macText();out["ok"]=false;out["error"]="occupied";
+        String text;serializeJson(out,text);server.send(409,"application/json",text);return;
+    }
+    JsonDocument old;
+    JsonArray list = old.to<JsonArray>();
+    prefs.begin("wifi", true);
+    for (int i = 0; i < MAX_SLOTS; ++i) {
+        String ssid = prefs.getString(("s" + String(i)).c_str(), "");
+        if (ssid.length()) { JsonObject n = list.add<JsonObject>(); n["network_id"] = "legacy-" + String(i); n["ssid"] = ssid; }
+    }
+    prefs.end();
+    String legacy; serializeJson(old, legacy);
+    server.send(200, "application/json", wifiManagementCommand(request, v2NowMs(), legacy));
+}
+
 // GET /api/status: authenticated authoritative state (the beacon only points).
 // Business channel auth = endpoint token (same trust as /usage and /template);
 // the device operation token keeps gating /claim, /update, /doUpdate, /diag.
@@ -4010,6 +4078,18 @@ static void handleV2Status() {
     JsonObject display = doc["display"].to<JsonObject>();
     display["epd_writes"] = epdWriteCount;
     display["epd_busy_fails"] = rtcEpdBusyFails;
+    JsonObject rendezvous = doc["rendezvous"].to<JsonObject>();
+    rendezvous["v"] = 1;
+    rendezvous["id"] = v2RvId;
+    rendezvous["ready"] = v2Rv.ready() && WiFi.status() == WL_CONNECTED;
+    rendezvous["handoff"] = v2Rv.handedOff();
+    rendezvous["challenge"] = v2Rv.ready() ? v2RvChallenge : "";
+    rendezvous["wake_generation"] = rtcWakeGeneration;
+    rendezvous["wake_seq"] = rtcTraceCurrentSeq;
+    rendezvous["remaining_ms"] = v2Rv.active() && v2Rv.deadline() > v2NowMs() ? v2Rv.deadline()-v2NowMs() : 0;
+    OwnerRec activeOwner;
+    doc["owner_id"] = ownerGet(activeOwner) ? activeOwner.id : "";
+    doc["wifi_management"] = 2;
     doc["ota_auth"] = "token";
     doc["image_identity"].to<JsonArray>().add("sha256-running-prefix-v1");
     if (syncStoreAvailable()) {
@@ -4022,6 +4102,8 @@ static void handleV2Status() {
     sync["enabled"] = syncEnabled && ownerGet(owner) && owner.id == syncOwner;
     sync["phase"] = syncOpenThisWake ? "WIFI_SYNC_ONCE" :
                     rtcMode == MODE_LIGHT ? "WIFI_LIGHT" : "DEEP";
+    const uint64_t syncUntil = syncOpenAnsweredAt + 90000;
+    sync["remaining_ms"] = syncOpenThisWake && syncUntil > v2NowMs() ? syncUntil-v2NowMs() : 0;
     sync["rounds"] = syncRtc.rounds;
     sync["due"] = (syncRtc.flags & 1) != 0;
     sync["retry_skip"] = syncRtc.retrySkip;
@@ -4165,7 +4247,7 @@ static void applyV2Data(const String &body) {
     if (!decision.firstApplied) {
         v2Ack("data", decision.result, decision.display, "ram",
               decision.error.length() ? decision.error.c_str() : nullptr, decision.seq, 0,
-              decision.includeContext ? v2Profile.contextId : nullptr, UINT32_MAX);
+              decision.includeContext ? v2Profile.contextId : nullptr, UINT32_MAX, decision.includeContext);
         return;
     }
     const String &usage = decision.usage;
@@ -4199,7 +4281,7 @@ static void applyV2Data(const String &body) {
         }
     }
     v2Ack("data", "applied", display, "ram", nullptr, (int64_t)seq, 0, v2Profile.contextId,
-          UINT32_MAX);
+          UINT32_MAX, true);
 }
 
 static void handleV2Data() {
@@ -4232,6 +4314,7 @@ static void applyV2Plan(const String &body) {
               UINT32_MAX);
         return;
     }
+    if (v2InRendezvous) { v2Rv.planReceived(); v2RvBridge = doc["bridge_id"] | ""; }
     const V2PowerPlan &plan = decision.plan;
     v2PlanReason = "bridge";
     if (plan.mode == V2_PLAN_LIGHT) {
@@ -4526,12 +4609,17 @@ static void serviceV2Ble() {
     V2BleMessage *message = nullptr;
     if (xQueueReceive(v2BleQueue, &message, 0) != pdTRUE) return;
     String body = message->body, peer = message->peer;
+    String identity = message->identity;
+    uint32_t generation = message->generation;
     delete message;
-    if (!blePeerIsBonded() || !blePeerIsEncrypted() || peer != blePeerAddress()) return;
+    if (!blePeerIsBonded() || !blePeerIsEncrypted() || peer != blePeerAddress() ||
+        identity != blePeerIdentity() || generation != bleConnectionGeneration()) return;
     JsonDocument doc;
     if (deserializeJson(doc, body)) return;
-    v2RequestId = doc["request_id"] | "";
-    if (!v2RequestId.length() || v2RequestId.length() > 64) return;
+    JsonString request = doc["request_id"].as<JsonString>();
+    if (!request || request.size() != strlen(request.c_str())) return;
+    v2RequestId = doc["request_id"].as<String>();
+    if (!bleWireText(v2RequestId, 64, false)) return;
     bool authenticated = false;
     for (int i = 0; i < storeCount(); ++i) {
         EndpointRec endpoint;
@@ -4540,10 +4628,127 @@ static void serviceV2Ble() {
             authenticated = true; break;
         }
     }
+    String operation = doc["op"] | "";
+    if (operation.startsWith("wifi_")) {
+        // Physical recovery is bond-authorized, independently of HTTP owner,
+        // endpoint token and data contact. Ordinary commands remain unchanged.
+        if (body.length() > 4096 || String(doc["device_mac"] | "") != macText() ||
+            !doc["protocol"].isNull() || !doc["rv"].isNull()) {
+            JsonDocument out;
+            out["ack"] = "wifi"; out["request_id"] = doc["request_id"];
+            out["device_mac"] = macText(); out["ok"] = false; out["error"] = "mac";
+            v2BleNotify(out);
+            return;
+        }
+        OwnerRec owner;
+        bool allowed = authenticated && (!ownerGet(owner) || owner.id == (doc["bridge_id"] | ""));
+        const uint64_t now = v2NowMs();
+        const uint64_t admittedUntil = v2Plan.lightActive(now) ? v2Plan.deadlineMs() :
+            syncOpenThisWake ? syncOpenAnsweredAt + 90000 : 0;
+        const uint64_t wifiWindowUntil = v2Rv.active() ? std::min(admittedUntil, v2Rv.deadline()) : admittedUntil;
+        if (bleRecovery.until <= now && String(doc["session_nonce"] | "") != v2Nonce()) {
+            JsonDocument out; out["ack"]="wifi";out["request_id"]=doc["request_id"];
+            out["device_mac"]=macText();out["ok"]=false;out["error"]="session_expired";v2BleNotify(out);return;
+        }
+        if ((!authenticated || !allowed) && bleRecovery.until <= now) {
+            JsonDocument out; out["ack"]="wifi"; out["request_id"]=doc["request_id"];
+            out["device_mac"]=macText(); out["ok"]=false; out["error"]=authenticated ? "occupied" : "unauthorized";
+            v2BleNotify(out); return;
+        }
+        if (operation == "wifi_authorize") {
+            String result = wifiManagementAuthorize(doc, identity, now, bleRecovery.until,
+                authenticated && allowed ? wifiWindowUntil : 0);
+            JsonDocument out; deserializeJson(out, result); v2BleNotify(out); return;
+        }
+        if (operation == "wifi_owner") {
+            JsonDocument out;
+            out["ack"] = "wifi"; out["request_id"] = doc["request_id"];
+            out["device_mac"] = macText(); out["ok"] = true;
+            OwnerRec current;
+            if (ownerGet(current)) out["owner_id"] = current.id;
+            v2BleNotify(out);
+            return;
+        }
+        if (operation == "wifi_capabilities") {
+            JsonDocument caps;
+            caps["fw_target"] = FW_TARGET_ID; caps["render_target"] = RENDER_TARGET_ID;
+            caps["width"] = TARGET_WIDTH; caps["height"] = TARGET_HEIGHT;
+            caps["pixel_format"] = TARGET_PIXEL_FORMAT; caps["colors"] = TARGET_COLORS;
+            caps["partial"] = bool(TARGET_PARTIAL); caps["hardware_verified"] = bool(TARGET_VERIFIED);
+            caps["max_templates"] = 8; caps["max_bundle_bytes"] = BS_MAX_BUNDLE_BYTES;
+            caps["compiler_abi"] = CT_ABI;
+#ifdef CODEX_TARGET_NOTE4
+            caps["bundle_font_protocol"] = 1;
+#endif
+            String text; serializeJson(caps, text);
+            JsonDocument reply;
+            deserializeJson(reply, wifiSetupReadPage(doc, identity, generation, text));
+            v2BleNotify(reply);
+            return;
+        }
+        if (operation == "wifi_migrate") {
+            // Resolve an earlier uncertain commit from durable storage before retry.
+            if (!wifiSetupBusy()) wifiSchemesBegin();
+            WifiNetwork slots[MAX_SLOTS] = {};
+            size_t count = 0;
+            String preferred = WiFi.status() == WL_CONNECTED ? WiFi.SSID() : String();
+            Preferences oldPrefs;
+            bool opened = oldPrefs.begin("wifi", true);
+            if (opened) {
+                uint8_t last = oldPrefs.getUChar("last", 0);
+                for (int i = 0; i < MAX_SLOTS; ++i) {
+                    String ssid = oldPrefs.getString(("s" + String(i)).c_str(), "");
+                    if (!ssid.length()) continue;
+                    String password = oldPrefs.getString(("p" + String(i)).c_str(), "");
+                    auto &n = slots[count++];
+                    snprintf(n.id, sizeof(n.id), "wifi-slot-%d", i);
+                    // Length errors must reject rather than truncate credentials.
+                    if (ssid.length() > 32 || password.length() > 64 ||
+                        strlen(ssid.c_str()) != ssid.length() || strlen(password.c_str()) != password.length()) n.id[0] = 0;
+                    else { strcpy(n.ssid, ssid.c_str()); strcpy(n.password, password.c_str()); }
+                    if (!preferred.length() && i == last) preferred = ssid;
+                    if (password.length()) memset(const_cast<char *>(password.c_str()), 0, password.length());
+                }
+                oldPrefs.end();
+            }
+            if (!preferred.length() && count) preferred = slots[0].ssid;
+            JsonDocument out;
+            if (!opened) {
+                out["ack"] = "wifi"; out["request_id"] = doc["request_id"];
+                out["device_mac"] = macText(); out["ok"] = false; out["error"] = "storage";
+            } else deserializeJson(out, wifiSchemesMigrate(doc, identity, slots, count,
+                preferred, now, bleRecovery.until, allowed));
+            if (out["persisted"] == true) {
+                bool retired = oldPrefs.begin("wifi", false);
+                if (retired) {
+                    for (int i = 0; i < MAX_SLOTS; ++i) {
+                        for (const char *prefix : {"s", "p"}) {
+                            String key = String(prefix) + String(i);
+                            if (oldPrefs.isKey(key.c_str()) && !oldPrefs.remove(key.c_str())) retired = false;
+                        }
+                    }
+                    oldPrefs.end();
+                }
+                out["retired"] = retired;
+                if (!retired) { out["ok"] = false; out["error"] = "retirement_pending"; }
+            }
+            volatile uint8_t *secret = (volatile uint8_t *)slots;
+            for (size_t i = 0; i < sizeof(slots); ++i) secret[i] = 0;
+            v2BleNotify(out); return;
+        }
+        String result = wifiSetupCommand(doc, identity, generation, now, bleRecovery.until,
+            authenticated && allowed ? wifiWindowUntil : 0, allowed);
+        if (wifiSetupBusy()) wifiUp = false;
+        if (operation == "wifi_scheme_delete") loadPreferredWifiCredentials();
+        JsonDocument reply; deserializeJson(reply, result);
+        v2BleNotify(reply);
+        return;
+    }
     v2ReplyOverBle = true;
     if (!doc["protocol"].isNull() || !doc["rv"].isNull()) {
         v2Ack("command", "rejected", "unchanged", "ram",
               "retired_protocol", -1, 0, nullptr, UINT32_MAX);
+        v2ReplyOverBle = false; v2RequestId = "";
         return;
     }
     if (!authenticated) {
@@ -4562,33 +4767,26 @@ static void serviceV2Ble() {
         markSynced();
         const char *op = doc["op"] | "";
         if (!strcmp(op, "status")) {
-            JsonDocument state;
-            state["result"] = "applied";
-            state["session_nonce"] = v2Nonce();
-            state["device_mac"] = macText();
-            state["active_context_id"] = v2Profile.contextId;
-            state["active_template_id"] = v2Profile.count ? v2Profile.ids[v2Profile.initial] : "";
-            state["committed_job_id"] = v2Profile.jobId;
-            state["applied_seq"] = v2DataSeq.appliedSeq();
-            state["power"]["mode"] = v2Plan.lightActive(v2NowMs()) ? "light" : "sleep";
-            state["power"]["plan_id"] = v2Plan.acceptedId();
-            state["power"]["remaining_s"] = v2Plan.remainingS(v2NowMs());
-            state["power"]["provisional_remaining_s"] = v2Provisional ?
-                V2PlanState::bootProvisionalRemaining(v2BootMs, v2NowMs()) : 0;
-            if (syncStoreAvailable()) {
+            if (!v2InRendezvous && !v2RvBleReleased) v2RendezvousBegin();
+            BleStatusSnapshot snapshot;
+            snapshot.mac = macText(); snapshot.nonce = v2Nonce();
+            snapshot.rendezvousVersion = 1;
+            snapshot.context = v2Profile.contextId;
+            snapshot.activeTemplate = v2Profile.count ? v2Profile.ids[v2Profile.initial] : "";
+            snapshot.job = v2Profile.jobId; snapshot.appliedSeq = v2DataSeq.appliedSeq();
+            snapshot.commitSeq = bsCommitSeq();
+            snapshot.light = v2Plan.lightActive(v2NowMs()); snapshot.planId = v2Plan.acceptedId();
+            snapshot.remainingS = v2Plan.remainingS(v2NowMs());
+            snapshot.provisionalS = v2Provisional ? V2PlanState::bootProvisionalRemaining(v2BootMs, v2NowMs()) : 0;
+            snapshot.syncAvailable = syncStoreAvailable();
+            if (snapshot.syncAvailable) {
                 OwnerRec current;
-                JsonObject sync = state["sync"].to<JsonObject>();
-                sync["v"] = 1;
-                sync["enabled"] = syncEnabled && ownerGet(current) && current.id == syncOwner;
-                sync["rounds"] = syncRtc.rounds;
-                sync["due"] = (syncRtc.flags & 1) != 0;
-                sync["retry_skip"] = syncSkippedThisWake ? syncVisibleSkip : syncRtc.retrySkip;
-                SyncStoreBatch batch;
-                sync["pending"] = syncStoreActive(batch);
+                snapshot.syncEnabled = syncEnabled && ownerGet(current) && current.id == syncOwner;
+                snapshot.rounds = syncRtc.rounds; snapshot.due = (syncRtc.flags & 1) != 0;
+                snapshot.retrySkip = syncSkippedThisWake ? syncVisibleSkip : syncRtc.retrySkip;
+                SyncStoreBatch batch; snapshot.pending = syncStoreActive(batch);
             }
-            String out;
-            serializeJson(state, out);
-            v2Response(200, out, false);
+            v2Response(200, bleBuildStatus(snapshot));
         } else if (!strcmp(op, "sync_config")) {
             OwnerRec current;
             V2CommandSessionDecision session = v2CheckCommandSession(doc, macText(), &v2Nonce());
@@ -4655,6 +4853,21 @@ static void serviceV2Ble() {
                 v2Ack("sync_open", "applied", "unchanged", "ram", nullptr, -1, 0,
                       nullptr, UINT32_MAX);
             }
+        } else if (!strcmp(op, "handoff")) {
+            OwnerRec current;
+            const auto session = v2CheckCommandSession(doc, macText(), &v2Nonce());
+            RendezvousHandoffProof proof;
+            proof.sessionAccepted = session.accepted;
+            proof.ownerAccepted = ownerGet(current) && current.id == (doc["bridge_id"] | "");
+            proof.bridge = doc["bridge_id"] | ""; proof.expectedBridge = v2RvBridge.c_str();
+            proof.id = doc["rendezvous_id"] | ""; proof.expectedId = v2RvId.c_str();
+            proof.challenge = doc["challenge"] | ""; proof.expectedChallenge = v2RvChallenge.c_str();
+            proof.planId = doc["plan_id"] | 0ULL; proof.acceptedPlanId = v2Plan.acceptedId();
+            proof.generation = doc["wake_generation"] | 0u; proof.expectedGeneration = rtcWakeGeneration;
+            proof.wakeSeq = doc["wake_seq"] | 0u; proof.expectedWakeSeq = rtcTraceCurrentSeq;
+            const bool accepted = v2Rv.handoff(v2NowMs(), rendezvousProofMatches(proof));
+            v2Ack("handoff", accepted ? "applied" : "rejected", "unchanged", "ram",
+                  accepted ? nullptr : "handoff_proof", -1, v2Plan.acceptedId(), nullptr, UINT32_MAX);
         } else if (!strcmp(op, "history")) {
             if (v2HistorySyncMs) v2HistorySyncUntilMs = v2NowMs() + v2HistorySyncMs;
             const uint32_t since = doc["since"] | 0u;
@@ -4671,83 +4884,120 @@ static void serviceV2Ble() {
         } else if (!strcmp(op, "plan")) {
             applyV2Plan(body);
         } else {
-            v2Ack(op, "rejected", "unchanged", "ram", "http_required", -1, 0, nullptr, UINT32_MAX);
+            v2Ack("command", "rejected", "unchanged", "ram", "http_required", -1, 0, nullptr, UINT32_MAX);
         }
     }
     v2ReplyOverBle = false;
     v2RequestId = "";
 }
 
-// Timer wakes only open BLE; Wi-Fi requires an accepted light plan.
-// Plan C: bounded window; after a plan ACK it closes 200 ms later. No screen
-// work happens while the radio is on -- the caller renders once afterwards.
+// Rendezvous protocol owns phases/deadlines; these functions adapt radios and
+// HTTP to it. setup returns immediately and loop keeps BLE/buttons/HTTP alive.
 static void v2RendezvousRender(bool light);
-static bool v2Rendezvous() {
-#ifdef CODEX_BLE_B46
-    esp_pm_config_t blePm = {};
-    blePm.max_freq_mhz = 240;
-    blePm.min_freq_mhz = 80;
-    blePm.light_sleep_enable = false;
-    DevLog.printf("[pm] BLE 240/80MHz no light: %s\n",
-                  esp_err_to_name(esp_pm_configure(&blePm)));
-#endif
+static void v2RendezvousBegin(bool deep) {
     v2InRendezvous = true;
-    if (syncStoreAvailable()) {
+    v2RvBleReleased = false;
+    v2RvStartMs = v2NowMs();
+    char identity[33];
+    snprintf(identity, sizeof(identity), "%08lx%08lx%08lx%08lx",
+             (unsigned long)esp_random(), (unsigned long)esp_random(),
+             (unsigned long)esp_random(), (unsigned long)esp_random());
+    v2RvId = identity; v2RvChallenge = ""; v2RvBridge = "";
+    v2RvWifiPhase = 0;
+    if (deep && syncStoreAvailable()) {
         syncCountDeepRendezvous(syncRtc);
         syncSkippedThisWake = syncRtc.retrySkip != 0;
         syncVisibleSkip = syncRtc.retrySkip;
         if (syncSkippedThisWake) syncConsumeSkip(syncRtc);
     }
-    v2HistorySyncMs = 0;
-    v2HistorySyncUntilMs = 0;
+    v2HistorySyncMs = 0; v2HistorySyncUntilMs = 0;
+    v2Rv.begin(v2NowMs(), V2_RENDEZVOUS_WINDOW_MS);
+    v2RfDeadlineMs = v2Rv.deadline();
     enterBleOn(false);
-#ifdef CODEX_BLE_B46
-    if (bleInitialized()) {
-        DevLog.printf("[pm] BT modem sleep: %s\n",
-                      esp_err_to_name(esp_bt_sleep_enable()));
-    }
-#endif
-    const uint64_t windowStart = v2NowMs();
-    uint64_t deadline = windowStart + V2_RENDEZVOUS_WINDOW_MS;
-    uint64_t answeredAt = 0;
-    uint64_t connectedAt = 0;
-    while (v2NowMs() < deadline) {
-        blePoll();
-        tracePollConnection();
-        serviceV2Ble();
-        if (!connectedAt && bleIsConnected()) {
-            // The central is in; the wait deadline is done. Give the command
-            // exchange its own bound instead of cutting a working link.
-            connectedAt = v2NowMs();
-            deadline = connectedAt + V2_RENDEZVOUS_CONNECTED_MS;
-            DevLog.printf("[platform] rendezvous peer connected at %ums\n",
-                          (unsigned)(connectedAt - windowStart));
+    if (!bleOn) v2Rv.cancel();
+}
+
+static void rendezvousWifiBegin() {
+    hostname = "codex-status-" + macSuffix();
+    WiFi.mode(WIFI_STA); WiFi.setHostname(hostname.c_str());
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    // Selected bond first; fall back to the existing signal/last-used policy.
+    if (wifiSetupBusy() || WiFi.status() == WL_CONNECTED) {
+        v2RvWifiPhase = 3;
+    } else if (wifiSchemesCredentials(wifiSsid, wifiPass)) {
+        retryWifi(); v2RvWifiPhase = 1;
+    } else { WiFi.scanNetworks(true); v2RvWifiPhase = 2; }
+    v2RvWifiPhaseAt = v2NowMs();
+    if (!httpServicesStarted) { registerHttpRoutes(); server.begin(); httpServicesStarted = true; }
+    v2RvHttpStarted = true;
+    wifiConnActive = true; wifiBlinkOn = true;
+}
+
+static void rendezvousWifiTick() {
+    const uint64_t now = v2NowMs();
+    if (wifiSetupBusy()) return;
+    if (WiFi.status() == WL_CONNECTED && !(WiFi.localIP() == IPAddress(0,0,0,0))) {
+        wifiUp = true;
+        if (!v2Rv.ready()) {
+            char challenge[17];
+            snprintf(challenge, sizeof(challenge), "%08lx%08lx", (unsigned long)esp_random(), (unsigned long)esp_random());
+            v2RvChallenge = challenge;
+            v2Rv.httpReady(); updateInfoExtra();
         }
-        if (v2Plan.accepted() || syncOpenThisWake) {
-            if (syncEnabled && (syncRtc.flags & 1) && !syncOpenThisWake &&
-                !syncSkippedThisWake) { delay(10); continue; }
-            if (syncOpenThisWake && syncOpenAnsweredAt > answeredAt)
-                answeredAt = syncOpenAnsweredAt;
-            if (!answeredAt) answeredAt = v2NowMs();
-            const uint64_t normalUntil = answeredAt + V2_RENDEZVOUS_ACK_GRACE_MS;
-            const uint64_t historyUntil = v2HistorySyncUntilMs;
-            const uint64_t closeAt = historyUntil > normalUntil ? historyUntil : normalUntil;
-            if (v2NowMs() >= closeAt) break;
-        }
-        delay(10);
+        return;
     }
-    bool light = v2Plan.lightActive(v2NowMs());
-    bleOff("rendezvous complete");
-    v2InRendezvous = false;
+    // A Bridge-requested candidate owns association until its existing deadline.
+    if (v2RvWifiPhase == 1 && now-v2RvWifiPhaseAt >= 6000) {
+        WiFi.disconnect(false); WiFi.scanNetworks(true);
+        v2RvWifiPhase = 2; v2RvWifiPhaseAt = now;
+    }
+    if (v2RvWifiPhase == 2 && (WiFi.scanComplete() != WIFI_SCAN_RUNNING || now-v2RvWifiPhaseAt >= 5000)) {
+        if (selectLegacyWifi(WiFi.scanComplete()) >= 0) retryWifi();
+        v2RvWifiPhase = 3;
+    }
+    // Configure before association completes; handoff must not trigger a new
+    // association after the Bridge has proved the HTTP path.
+    wifi_config_t cfg = {};
+    if (esp_wifi_get_config(WIFI_IF_STA, &cfg) == ESP_OK && cfg.sta.listen_interval != 10) {
+        cfg.sta.listen_interval = 10; esp_wifi_set_config(WIFI_IF_STA, &cfg);
+    }
+    esp_wifi_set_ps(WIFI_PS_NONE);
+}
+
+static void v2RendezvousTick() {
+    const uint64_t now = v2NowMs();
+    if (bleIsConnected()) v2Rv.connected(now);
+    const bool light = v2Plan.lightActive(now);
+    const bool syncGuard = syncEnabled && (syncRtc.flags & 1) && !syncOpenThisWake && !syncSkippedThisWake;
+    if ((v2Rv.hasPlan() && light) || syncOpenThisWake) {
+        const uint64_t legalUntil = light ? v2Plan.deadlineMs() : syncOpenAnsweredAt + 90000;
+        v2Rv.admitHttp(now, legalUntil);
+        if (v2Rv.needsHttp()) {
+            if (!v2RvWifiPhase) rendezvousWifiBegin();
+            rendezvousWifiTick();
+        }
+    } else if (v2Rv.hasPlan() && !syncGuard) {
+        v2Rv.finishExchange(now, v2HistorySyncUntilMs);
+    }
+    v2RfDeadlineMs = v2Rv.deadline();
+    if (v2Rv.active() && bleOn && !v2BatteryPowerOff(plugged, batteryPercent()) && !configMode) {
+        if (!v2Rv.tick(now)) return;
+    } else v2Rv.cancel();
+    const bool handedOff = v2Rv.handedOff();
+    // Physical recovery has its own fixed deadline. Ordinary/USB auto BLE is
+    // released for this window and cannot reopen behind a completed handoff.
+    if (!v2ManualBleHoldActive()) { v2RvBleReleased = true; bleOff(handedOff ? "HTTP handoff" : "rendezvous deadline"); }
+    v2InRendezvous = false; v2RfDeadlineMs = 0;
     wakeResult = light ? WAKE_RV_LIGHT : WAKE_RV_SLEEP;
     rtcNetCycles++;
-    DevLog.printf("[platform] rendezvous %s plan=%lu time=%s awake=%ums ble=%ums win=%ums\n",
-                  answeredAt ? "answered" : "timeout", (unsigned long)v2Plan.acceptedId(),
-                  timeKnown() ? timeSourceName(timeSource) : "none", (unsigned)millis(),
-                  (unsigned)bleRadioMs(), (unsigned)(v2NowMs() - windowStart));
-    if (light) { wifiConnActive = true; wifiBlinkOn = true; }
+    DevLog.printf("[platform] rendezvous handoff=%d light=%d elapsed=%ums\n", handedOff, light, (unsigned)(now-v2RvStartMs));
     v2RendezvousRender(light);
-    return light || syncOpenThisWake;
+    if (light || syncOpenThisWake || v2ManualBleHoldActive()) startNormalMode();
+    else {
+        rtcNextContactS = V2_RENDEZVOUS_S;
+        rtcNextNetAt = timeKnown() ? (uint32_t)time(nullptr)+rtcNextContactS : 0;
+        sleepToNextEvent();
+    }
 }
 
 // Plan C: the single wake render, after the BLE window is closed. The reserved
@@ -4813,6 +5063,9 @@ static void v2RendezvousRender(bool light) {
 }
 
 static void registerHttpRoutes() {
+    static bool registered = false;
+    if (registered) return;
+    registered = true;
     const char *bundleHeaders[] = {"X-Request-Id", "X-Session-Nonce", "X-Offset", "Authorization"};
     server.collectHeaders(bundleHeaders, 4);
     server.on("/", HTTP_GET, handleStatus);
@@ -4826,6 +5079,9 @@ static void registerHttpRoutes() {
     // v2 platform protocol: authenticated business endpoints (token + owner);
     // none of them extend the light deadline implicitly.
     server.on("/api/status", HTTP_GET, handleV2Status);
+    server.on("/api/wifi/snapshot", HTTP_POST, [] { handleWifiManagement("snapshot"); });
+    server.on("/api/wifi/apply", HTTP_POST, [] { handleWifiManagement("apply"); });
+    server.on("/api/wifi/result", HTTP_POST, [] { handleWifiManagement("result"); });
     server.on("/api/sync/begin", HTTP_POST, handleSyncBegin);
     server.on("/api/sync/page", HTTP_POST, handleSyncPage);
     server.on("/api/sync/ack", HTTP_POST, handleSyncAck);
@@ -4916,6 +5172,10 @@ static void registerHttpRoutes() {
 // listen interval needs one reassociation; while that runs pollWifi must not
 // read the deliberate drop as a lost link.
 static bool configureWifiPowerSave() {
+    if (v2RvHttpStarted) {
+        esp_wifi_set_ps(bleOn ? WIFI_PS_NONE : WIFI_PS_MAX_MODEM);
+        return WiFi.status() == WL_CONNECTED;
+    }
     wifi_config_t cfg = {};
     bool reassociate = false;
     if (esp_wifi_get_config(WIFI_IF_STA, &cfg) == ESP_OK && cfg.sta.listen_interval != 10) {
@@ -4981,11 +5241,18 @@ static void startNormalMode() {
     const bool cachedColdBoot = !wokeFromDeep && lastUsage.length() > 0;
     if (cachedColdBoot) renderCurrent();
 
-    wifiUp = connectBest(!wokeFromDeep && !cachedColdBoot);
+    // A physical recovery must reach the button/BLE loop immediately. Legacy
+    // scan/association is blocking and is deferred until maintenance ends.
+    wifiUp = (v2RvHttpStarted || v2ManualBleHoldActive()) ? WiFi.status() == WL_CONNECTED
+                                   : connectBest(!wokeFromDeep && !cachedColdBoot);
+    if (v2ManualBleHoldActive() && !wifiUp) {
+        loadPreferredWifiCredentials();
+        WiFi.mode(WIFI_STA);
+        retryWifi(); // asynchronous: BLE/buttons are served by loop
+    }
     wifiConnActive = false;
     wifiBlinkOn = false;
-    registerHttpRoutes();
-    server.begin();
+    if (!httpServicesStarted) { registerHttpRoutes(); server.begin(); httpServicesStarted = true; }
 
     if (wifiUp) {
         traceSetStage(TRACE_STAGE_WIFI_IP);
@@ -5037,7 +5304,7 @@ static void startNormalMode() {
         if (plugged && !rtcDeepOnUsb) {
             nextWifiRetry = millis() + WIFI_RETRY_MS;
             DevLog.println("[wifi] no link at boot (plugged): retry every 60s");
-        } else {
+        } else if (!v2ManualBleHoldActive() && v2NowMs() >= offlineBootGraceUntilMs) {
             if (syncOpenThisWake) {
                 syncRecordOutcome(1, 1);
                 syncFail(syncRtc);
@@ -5133,7 +5400,7 @@ static bool deepNetDue() {
 // Light -> deep transition: capture the clock window, mark the mode and sleep.
 static void enterDeep(const char *reason) {
     // Every deep-sleep path must honor the PC USB keep-awake policy.
-    if (plugged && !rtcDeepOnUsb) return;
+    if ((plugged && !rtcDeepOnUsb) || v2ManualBleHoldActive()) return;
     setStage(19);
     if (clkR.valid && lastDisplayedFrame) clkCaptureFromFramebuffer();
     rtcNextContactS = V2_RENDEZVOUS_S;
@@ -5410,17 +5677,17 @@ void setup() {
         sleepToNextEvent();   // no network, owner claim, or data-sequence change
     }
 
+    if (cause == ESP_SLEEP_WAKEUP_EXT1 &&
+        (esp_sleep_get_ext1_wakeup_status() & (1ULL << 0))) {
+        // GPIO0 itself woke the device: do not require a second click.
+        bleRecovery.open(v2BootMs);
+        enterBleOn(true);
+    }
+    wifiSchemesBegin();
+    if (cause != ESP_SLEEP_WAKEUP_TIMER) offlineBootGraceUntilMs = v2NowMs() + 120000;
     if (hasWifiSlots()) {
         if (deepWakePath) {
-            if (!v2Rendezvous()) {
-                // Plan C: v2Rendezvous already rendered once after the radio
-                // was closed (clock window or deferred data frame); the sleep
-                // plan path only has to schedule the next rendezvous.
-                rtcNextContactS = V2_RENDEZVOUS_S;
-                rtcNextNetAt = timeKnown() ? (uint32_t)time(nullptr) + rtcNextContactS : 0;
-                sleepToNextEvent();
-            }
-            startNormalMode();
+            v2RendezvousBegin(true);
         } else {
             rtcStage = 99;
             startNormalMode();
@@ -5613,20 +5880,6 @@ void loop() {
         pwrHandled = false;
     }
 
-    if (configMode) {
-        // AP without credentials: battery sleeps after 5 idle minutes (buttons
-        // only); plugged stays awake so provisioning/serial stay available.
-        if (!plugged && millis() - configStartedAt > CONFIG_IDLE_MS &&
-            !v2ManualBleHoldActive()) {
-            DevLog.println("[config] AP idle timeout (battery): deep sleep");
-            deepSleepFor(0);
-        }
-        delay(5);
-        return;
-    }
-
-    ArduinoOTA.handle();
-
     static uint32_t bootDownAt = 0;
     static int      bootStage = 0;
     // Arm the button only after GPIO0 has read HIGH once: a strapping/mux
@@ -5662,6 +5915,44 @@ void loop() {
         }
     }
 
+    pollPlug();
+    serviceBleSession();
+    serviceLed();
+    OwnerRec wifiOwner;
+    const String selectingBridge = wifiSetupSelectingBridge();
+    if (selectingBridge.length() && ownerGet(wifiOwner) && wifiOwner.id != selectingBridge)
+        wifiSetupAbort("occupied");
+    wifiSetupPoll(v2NowMs(), blePeerIdentity(), bleConnectionGeneration(),
+                  bleIsConnected() && blePeerIsBonded() && blePeerIsEncrypted());
+    static bool wasSettingUp = false;
+    if (wasSettingUp && !wifiSetupBusy() && WiFi.status() == WL_CONNECTED) {
+        wifiSchemesCredentials(wifiSsid, wifiPass);
+        if (configMode && wifiSetupActivated()) {
+            configMode = false;
+            server.stop(); httpServicesStarted = false;
+            WiFi.mode(WIFI_STA);
+            startNormalMode();
+        }
+        updateInfoExtra();
+    }
+    wasSettingUp = wifiSetupBusy();
+    if (configMode) {
+        if (!plugged && millis() - configStartedAt > CONFIG_IDLE_MS &&
+            !v2ManualBleHoldActive()) {
+            DevLog.println("[config] AP idle timeout (battery): deep sleep");
+            deepSleepFor(0);
+        }
+        delay(5);
+        return;
+    }
+    if (v2InRendezvous) {
+        v2RendezvousTick();
+        serviceLed();
+        delay(5);
+        return;
+    }
+    ArduinoOTA.handle();
+
     if (pendingTplChanged) {
         pendingTplChanged = false;
         activeTplId = "";
@@ -5677,11 +5968,12 @@ void loop() {
             syncOpenThisWake = false;
             syncExitAtMs = 0;
             if (!v2Plan.lightActive(v2NowMs())) enterDeep("sync complete");
-        } else if (syncLastProgressMs && (uint32_t)(millis() - syncLastProgressMs) >= 90000) {
+        } else if (v2NowMs() >= syncOpenAnsweredAt + 90000 ||
+                   (syncLastProgressMs && (uint32_t)(millis() - syncLastProgressMs) >= 90000)) {
             syncRecordOutcome(1, 3);
             syncFail(syncRtc);
             syncOpenThisWake = false;
-            DevLog.println("[sync] no durable progress for 90s");
+            DevLog.println("[sync] 90s window exhausted");
             if (!v2Plan.lightActive(v2NowMs())) enterDeep("sync incomplete");
         }
     }
@@ -5701,6 +5993,7 @@ void loop() {
                 syncAddReason(syncRtc, 1u << 2);
                 syncOpenThisWake = true;
                 syncLastProgressMs = millis();
+                syncOpenAnsweredAt = v2NowMs();
                 sendAnnounce(bleOn);
             } else enterDeep("plan");
             break;
@@ -5710,6 +6003,7 @@ void loop() {
                 syncAddReason(syncRtc, 1u << 2);
                 syncOpenThisWake = true;
                 syncLastProgressMs = millis();
+                syncOpenAnsweredAt = v2NowMs();
                 sendAnnounce(bleOn);
             } else enterDeep("provisional");
             break;

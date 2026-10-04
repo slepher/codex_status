@@ -414,6 +414,10 @@ impl Store {
 /// Run a frozen transfer over the existing Bridge -> device HTTP direction.
 /// A transport error leaves the checkpoint intact for the next Wi-Fi opening.
 pub fn transfer(data_root: &Path, link: &DeviceLink) -> Result<Value> {
+    transfer_with_budget(data_root, link, bridge_core::rendezvous::Budget::new(Duration::from_secs(90)))
+}
+
+pub fn transfer_with_budget(data_root: &Path, link: &DeviceLink, budget: bridge_core::rendezvous::Budget) -> Result<Value> {
     let compact_mac = DeviceIdentity::normalized_mac(&link.mac)
         .context("sync device MAC invalid")?;
     let wire_mac = compact_mac.as_bytes().chunks(2)
@@ -422,11 +426,11 @@ pub fn transfer(data_root: &Path, link: &DeviceLink) -> Result<Value> {
     let timeout = Duration::from_secs(15);
     let mut status = None;
     for attempt in 0..3 {
-        match device_client::status(&link.ip, &link.token, timeout) {
+        match device_client::status(&link.ip, &link.token, budget.remaining().min(timeout)) {
             Ok(value) => { status = Some(value); break; }
             Err(error) if error.to_string().contains("401") => return Err(error),
             Err(error) if attempt == 2 => return Err(error).context("sync Wi-Fi association unavailable"),
-            Err(_) => std::thread::sleep(Duration::from_secs(if attempt == 0 { 1 } else { 3 })),
+            Err(_) => std::thread::sleep(budget.remaining().min(Duration::from_secs(if attempt == 0 { 1 } else { 3 }))),
         }
     }
     let status = status.context("sync Wi-Fi status unavailable")?;
@@ -443,7 +447,7 @@ pub fn transfer(data_root: &Path, link: &DeviceLink) -> Result<Value> {
         request += 1;
         let id = format!("sync-{op}-{request}");
         device_client::sync(&link.ip, &link.token, &wire_mac, &link.bridge_id,
-            nonce, op, &id, &fields, timeout)
+            nonce, op, &id, &fields, budget.remaining().min(timeout))
     };
     if store.awaiting_ack() {
         let id = store.batch_id().context("missing completed batch id")?.to_owned();
@@ -543,7 +547,7 @@ mod tests {
         let result = (|| -> Result<()> {
             let mut line = String::new();
             BufReader::new(child.stdout.as_mut().unwrap()).read_line(&mut line)?;
-            let ready: Value = serde_json::from_str(&line)?;
+            let ready: Value = serde_json::from_str(&line).context("Fake ROM startup ready JSON")?;
             let address = ready["http"].as_str().context("fake ROM address")?
                 .trim_start_matches("http://").to_owned();
             let http = |method: &str, path: &str, token: &str, body: &Value| -> Result<Value> {
@@ -556,7 +560,7 @@ mod tests {
                 socket.read_to_end(&mut response)?;
                 let start = response.windows(4).position(|part| part == b"\r\n\r\n")
                     .context("fake ROM HTTP response")? + 4;
-                Ok(serde_json::from_slice(&response[start..])?)
+                Ok(serde_json::from_slice(&response[start..]).with_context(|| format!("Fake ROM {method} {path} response JSON ({} bytes)", response.len()-start))?)
             };
             let claim = http("POST", "/claim?id=bridge-test&lease=120", "sync-device", &Value::Null)?;
             anyhow::ensure!(claim["owner"]["id"] == "bridge-test", "Fake ROM claim failed: {claim}");
@@ -564,7 +568,13 @@ mod tests {
             let config = json!({"op":"sync_config","request_id":"config-1",
                 "token":"sync-endpoint","device_mac":"02:00:00:00:00:B2",
                 "session_nonce":status["session_nonce"],"bridge_id":"bridge-test","enabled":true});
-            let ack = http("POST", "/sim/ble/command", "sync-endpoint", &config)?;
+            // The current carrier separates INFO connection, write acceptance
+            // and Status business ACK; use that protocol in this older fixture.
+            let _ = http("GET", "/sim/ble/info", "sync-endpoint", &Value::Null)?;
+            let accepted = http("POST", "/sim/ble/command", "sync-endpoint", &config)?;
+            anyhow::ensure!(accepted["result"] == "accepted", "Fake ROM transport failed");
+            let wire = http("GET", "/sim/ble/status", "sync-endpoint", &Value::Null)?;
+            let ack = bridge_ble::decode_wire(&serde_json::to_vec(&wire)?)?;
             anyhow::ensure!(ack["result"] == "applied", "Fake ROM config failed: {ack}");
             let link = DeviceLink { mac: "0200000000B2".into(), ip: address,
                 token: "sync-endpoint".into(), bridge_id: "bridge-test".into() };
@@ -585,7 +595,9 @@ mod tests {
         })();
         let _ = child.kill();
         let _ = child.wait();
-        result.unwrap();
+        let mut diagnostic = String::new();
+        if let Some(mut stderr) = child.stderr.take() { let _ = stderr.read_to_string(&mut diagnostic); }
+        result.with_context(|| format!("Fake ROM stderr: {diagnostic}")).unwrap();
     }
 
     #[test]

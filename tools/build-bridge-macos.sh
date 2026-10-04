@@ -4,7 +4,7 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 build_root="$repo_root/artifacts/bridge-macos"
 target_root="$build_root/target"
-app_root="$build_root/Codex Status Bridge.app"
+app_root="${CODEX_STATUS_APP_OUTPUT:-$build_root/Codex Status Bridge.app}"
 : "${CODEX_STATUS_ARDUINOJSON:?Set CODEX_STATUS_ARDUINOJSON to a pinned ArduinoJson src directory}"
 cd "$repo_root/bridge"
 cargo build --locked -p bridge-app --target-dir "$target_root"

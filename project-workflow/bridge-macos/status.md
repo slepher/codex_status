@@ -1,5 +1,28 @@
 # Bridge macOS 规划状态
 
+2026-10-04 当前补齐：Wi-Fi整条覆盖、执行历史折叠、Bridge已保存当前SSID驱动与单条BLE连接反馈已实现并配套部署（Note4 .52）。运行镜像及Bridge健康/缓存核验通过，UI24场景及两端回归通过；系统两权限未授予，真实离线/改网/故障矩阵和变长资源仓库仍开放。当前产物/哈希以PROGRESS顶节为准；下面“未部署”均为历史阶段。
+
+2026-10-04 最新：会合协议模块及Astra A1–A6、关联A7/A8源码候选已实施，310项Rust回归及C++专测通过，Note4 .46候选构建成功；未部署/烧录，真实仍.45、生产Bridge停机。逐项证据与现场缺口见 [rendezvous-protocol-review.md](rendezvous-protocol-review.md)，执行计划见 [rendezvous-protocol-plan.md](rendezvous-protocol-plan.md)，待办归backlog B6。下文保留此前里程碑状态。
+
+2026-10-03 W7已按用户追加授权完成：Bridge+Note4 ROM一并部署，运行.45/wifi_management=2的镜像SHA256已核对。A8同时修复remaining默认分类与新context旧确认指纹，自动HTTP seq16 applied/displayed、源/最后写屏缓冲89一致。产物/备份/回归及USB plugged=false验证边界见PROGRESS顶节、usb-sync-diagnosis.md与wifi-rendezvous-execution.md §12；B5/B6真实配置/RF/TCC/功耗与USB仍开放。下文旧未部署记录保留为此前历史。
+
+
+2026-10-03 W0–W6本批软件更新（未部署）：新版完整Wi-Fi投影/事务、三份非秘密状态与持久任务、实际机会调度、字段冲突/待确认、生产Wi-Fi/history Fake HAL和完整双侧UI已实施。五crate239 passed/1 ignored、Fake48 passed（合计287/1 ignored），host3入口与设备页JS通过；最后app51/1 ignored及Fake Wi-Fi3项复测通过。逐阶段/逐A编号证据及边界见 [wifi-rendezvous-execution.md第11节](wifi-rendezvous-execution.md#11-w0w6-软件交付与验收对账2026-10-03未部署)。下文旧“尚未实施”记录保留为当时历史。
+
+自审收紧：预览local_revision原子校验；部分字段不扩大，新项全元数据批准；凭据操作单独选择/内存输入；unknown不能证明不可读密码；明确rejected结束；稳定ID丢ACK先query+readback；大型设备存储临时副本移至有界heap。可选授权后置Data/Plan且250ms上限，配置借合法Wi-Fi8s预算，设备锁及OTA/发布优先。v1迁移/损坏/账本容量/授权期限有宿主断言；旧宿主夹具临时字符串改为拥有副本，消除悬空ID造成的帧断言假失败。
+
+W7未执行，实际仍.44/原运行.app；没有新ROM/App产物、运行应用重启、刷机、串口、真实网络修改或提交。账本8项永久保留无自动清理，满后明拒；整板链接/实板RAM/RF、原屏幕跳变、持续重连/INFO超时、TCC/功耗、Windows/其他架构/1.54及完整app事件/抢锁压力仍未验。一般诊断采集持久化只保留既有入口，不宣称全部改造。B5/B6仍开放，配额延迟调查/backlog A8另列。
+
+2026-10-03 用户追加刷机已完成：Note4 `0.18.44-note4-b-ble1` / MAC7C4FADB93408，USB整段读回与认证运行前缀SHA256均为 `56367D6BDBC056B597DE354B05B47320404A2712CBC4F631532A512D1A81D0C8`；配套Bridge已升级，运行数据/旧应用备份保留。真实已绑定链路status/plan/sync_open ACK成功一次，但后续connect/INFO read仍超时，完整会合问题未结案。P3持久恢复及P2/P4余项不因刷机而结项；当前现场与证据以PROGRESS顶节为准。
+
+2026-10-03 BLE 真实性首批软件交付：P0/P1 核心与 P2 原始属性/真实客户端链已实现，合同与边界见 [fake-rom-ble-fidelity-plan.md](fake-rom-ble-fidelity-plan.md) 第11节及 [wifi-protocol.md](wifi-protocol.md)。六 crate 回归合计278 passed / 1 ignored；实际 Wi-Fi HAL 最长最终关联帧418 B。P3仅新增稳定ID入口，持久读/同步作业恢复尚未实现；P2 Wi-Fi/history HAL与跨 bond/session/分页矩阵、P4完整放行仍待补。本轮未整板构建或部署、未操作设备/运行.app，不能将源码候选当成在机能力；B5/B6保持未结项。
+
+最新设计入口（2026-10-03）：用户要求重新设计 Wi-Fi 全量方案管理与同步，见 [wifi-redesign.md](wifi-redesign.md)。当前 protocol=1 实现与下方旧规划不等于新设计已完成；新稿覆盖单方案管理/试连即保存启用的旧交互。Note4 试连跳屏异常待诊断，最新产物/未部署改动见 PROGRESS 顶节。
+
+
+2026-10-03 实施更新：R0 合同已定稿于 [wifi-protocol.md](wifi-protocol.md)，R1–R4 与 R5 ARP/R6 按需监督已实现并通过本机软件回归；Note4 `0.18.42-note4-b-wifi1` 运行镜像已认证核对。以下规划阶段的旧状态仅保留背景，当前现场以 PROGRESS 顶节为准。尚缺真实离线/密码试连/换网、自然会合与常驻生命周期矩阵，B5/B6 不结项。
+
+
 新窗口实施入口：[remaining-plan.md](remaining-plan.md)，只接续 backlog B5/B6 的未完成工作；包含当前 ROM/应用证明、运行数据与已完成项、R0–R7 执行顺序和可复制接续提示。
 
 2026-10-03 最新：用户已授权开始执行，P0/T0 正在推进。已升级系统 Rust/Cargo 至 1.99.0、修复 Rustup 入口；取消并清理此前启动的隔离工具链，只隔离构建产物。原规划仍要求首版 BLE/低功耗对等，`bridge_first` 保持废弃。

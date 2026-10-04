@@ -3,5 +3,8 @@ nvs,      data, nvs,     0x9000,   0x4000,
 otadata,  data, ota,     0xD000,   0x2000,
 phy_init, data, phy,     0xF000,   0x1000,
 ota_0,    app,  ota_0,   0x20000,  0x5F0000,
-ota_1,    app,  ota_1,   0x610000, 0x5F0000,
+ota_1,    app,  ota_1,   0x610000, 0x4F0000,
+# Reserve 1 MiB from ota_1 tail; keep both app starts, NVS and LittleFS in place.
+# Images for two-slot OTA must fit the smaller 0x4F0000-byte slot.
+coredump, data, coredump, 0xB00000, 0x100000,
 storage,  data, spiffs,  0xC00000, 0x400000,

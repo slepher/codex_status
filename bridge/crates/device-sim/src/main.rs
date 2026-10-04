@@ -25,7 +25,7 @@ const MAX_STEP_MS: u64 = 86_400_000;
 const CAPABILITIES: &[&str] = &["device_status", "clock_control", "claim", "plan_state",
     "bundle_transfer", "bundle_persistence", "data_render", "activate",
     "power_sleep_http", "power_lifecycle", "button_cycle", "ota_catalog", "fake_ble_rendezvous",
-    "sync_v1"];
+    "sync_v1", "wifi_setup_transactions", "wifi_full_snapshot_sync"];
 const UNSUPPORTED: &[&str] = &[
     "physical_ble",
     "physical_display",
@@ -53,6 +53,85 @@ struct SimState {
     power_reconcile: Arc<Mutex<()>>,
     stall_ack_after: Arc<Mutex<Option<StallFault>>>,
     ble_rx: Arc<Mutex<Vec<u8>>>,
+    ble: Arc<Mutex<SimBle>>,
+    wifi: Arc<Mutex<SimWifi>>,
+}
+
+struct SimWifi {
+    engine: bridge_render::SimulatorWifi,
+    peer: String,
+    physical_until: u64,
+    outcome: i32,
+    drop_http_ack: bool,
+}
+
+// Connection-local GATT attributes, distinct from business HTTP responses.
+#[derive(Default)]
+struct SimBle {
+    generation: u64,
+    connected: bool,
+    wake: (u64, u64),
+    info: Vec<u8>,
+    status: Vec<u8>,
+    pending: Option<(u64, Vec<u8>)>,
+    fault: Option<BleFault>,
+    read_failed: bool,
+    events: std::collections::VecDeque<Value>,
+}
+#[derive(Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BleFault {
+    kind: String,
+    #[serde(default)] size: usize,
+    #[serde(default)] delay_ms: u64,
+}
+impl SimBle {
+    fn store(&mut self, op: &str, mut bytes: Vec<u8>, now: u64) {
+        let fault = self.fault.take();
+        let kind = fault.as_ref().map(|f| f.kind.as_str()).unwrap_or("none");
+        if let Some(f) = &fault {
+            if f.size > 0 {
+                // Explicit SYNTHETIC same-length frame; not a captured ROM frame.
+                if bytes.last() == Some(&b'}') && f.size >= bytes.len() + 13 {
+                    bytes.pop(); bytes.extend_from_slice(b",\"padding\":\"");
+                    bytes.resize(f.size - 2, b'x'); bytes.extend_from_slice(b"\"}");
+                } else { bytes.resize(f.size, b'x'); }
+            }
+        }
+        if matches!(kind, "wrong_request" | "wrong_wake" | "wrong_mac" | "wrong_session" | "wrong_op") {
+            if let Ok(mut value) = serde_json::from_slice::<Value>(&bytes) {
+                match kind {
+                    "wrong_op" => value["op"] = json!("other"),
+                    "wrong_request" => value["rid"] = json!("c3RhbGU="),
+                    "wrong_wake" => value["w"][1] = json!(self.wake.1.saturating_add(1)),
+                    "wrong_mac" => value["device_mac"] = json!("AA:BB:CC:DD:EE:FF"),
+                    "wrong_session" => value["session_nonce"] = json!("f".repeat(32)),
+                    _ => unreachable!(),
+                }
+                bytes = serde_json::to_vec(&value).unwrap();
+            }
+        }
+        let attempted = bytes.len();
+        let result = match kind {
+            "legacy_overflow" if attempted > 512 => { self.status.clear(); "library_cleared" }
+            "guard_overflow" if attempted > 512 => "precheck_failed",
+            "write_failed" | "drop_ack" => "write_failed",
+            "disconnect" | "window_closed" => { self.connected = false; self.pending = None; "disconnected" }
+            "empty" => { self.status.clear(); "empty" }
+            "malformed" => { self.status = b"invalid-json".to_vec(); "malformed" }
+            "stale" | "overwrite" => "old_value",
+            "read_failed" => { self.read_failed = true; "read_failed" }
+            "delay" => {
+                self.pending = Some((now.saturating_add(fault.as_ref().unwrap().delay_ms), bytes));
+                "delayed"
+            }
+            _ if attempted > 512 => "precheck_failed",
+            _ => { self.status = bytes; "written" } // notify_lost is still readable
+        };
+        self.events.push_back(json!({"op":op,"characteristic":"status","bytes":attempted,
+            "max":512,"result":result,"generation":self.generation,"wake_generation":self.wake.0,"wake_seq":self.wake.1}));
+        while self.events.len() > 64 { self.events.pop_front(); }
+    }
 }
 
 #[derive(Clone)]
@@ -802,6 +881,8 @@ fn reboot_device(state: &SimState, cause: &str) -> Result<SimSession> {
 fn reset_power_after_reboot(state: &SimState, now_ms: u64, cause: &str) -> Result<()> {
     reboot_device(state, cause)?;
     state.ble_rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+    { let mut ble = state.ble.lock().unwrap();
+      let next = ble.generation.saturating_add(1); *ble = SimBle::default(); ble.generation = next; }
     let configured = state.bundle.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
         .status()?["configured"] == true;
     let mut power = state.power.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1284,6 +1365,7 @@ async fn status_impl(state: SimState, request: Request<Body>, gate: bool) -> Res
                 owner.as_ref().is_some_and(|owner|
                     sync["config_owner"].as_str() == Some(owner.id.as_str())));
             sync.as_object_mut().map(|object| object.remove("config_owner"));
+            status["wifi_management"] = json!(2);
             status["sync_v1"] = json!(1);
             status["diag_format"] = json!(1);
             status["diag_capacity"] = json!(4096);
@@ -2209,27 +2291,91 @@ async fn sim_ble_info(State(state): State<SimState>, request: Request<Body>) -> 
     if !power.light && power.ble_window_until_ms.is_none() {
         return StatusCode::NOT_FOUND.into_response();
     }
-    Json(json!({"mac":state.mac,"rendezvous":true,"bonded":true,"encrypted":true,
-        "wake_generation":session_snapshot(&state).boot_id,"wake_seq":power.wake_count,
-        "wake_cause":if power.ble_window_until_ms.is_some() {"timer"} else {"light"}}))
-        .into_response()
+    let generation = session_snapshot(&state).boot_id;
+    let fw = state.ota.lock().unwrap().active_version().fw.clone();
+    let bytes = match bridge_render::simulator_ble_wire("info", &json!({
+        "mac":state.mac,"ip":"127.0.0.1","fw":fw,"peerBonded":true,"peerEncrypted":true,
+        "wake_generation":generation,"wake_seq":power.wake_count,"bundle_configured":power.configured,
+        "wifi_setup_protocol":1,"wifi_management":2,"wifi_connection":1,"rf_remaining_ms":power.ble_window_until_ms.map(|until| until.saturating_sub(clock.monotonic_ms))})) {
+        Ok(bytes) => bytes, Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let connect = request.uri().query().is_some_and(|q| q == "connect=1");
+    let mut ble = state.ble.lock().unwrap();
+    if connect || !ble.connected || ble.wake != (generation, power.wake_count) {
+        ble.generation = ble.generation.saturating_add(1); ble.connected = true;
+        ble.wake = (generation, power.wake_count); ble.status.clear(); ble.pending = None; ble.read_failed = false;
+        state.ble_rx.lock().unwrap().clear();
+    }
+    ble.info = bytes.clone();
+    ([("x-sim-ble-generation", ble.generation.to_string())], bytes).into_response()
 }
 
-async fn sim_ble_token(State(state): State<SimState>, request: Request<Body>) -> Response {
+fn ble_generation_ok(state: &SimState, request: &Request<Body>) -> bool {
+    // Header-less calls remain a test carrier; DeviceConnection always stamps it.
+    request.headers().get("x-sim-ble-generation").map_or(true, |header|
+        header.to_str().ok().and_then(|g| g.parse::<u64>().ok()) == Some(state.ble.lock().unwrap().generation))
+}
+async fn sim_ble_status(State(state): State<SimState>, request: Request<Body>) -> Response {
     if !bearer(&request, &state.endpoint_token) { return unauthorized(); }
-    let Some(clock) = clock_snapshot(&state) else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    };
-    let Ok(power) = reconcile_power(&state, clock.monotonic_ms) else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    };
-    if !power.light && power.ble_window_until_ms.is_none() {
+    if !ble_generation_ok(&state, &request) { return StatusCode::CONFLICT.into_response(); }
+    let Some(clock) = clock_snapshot(&state) else { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); };
+    let Ok(power) = reconcile_power(&state, clock.monotonic_ms) else { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); };
+    let mut ble = state.ble.lock().unwrap();
+    if !ble.connected || (!power.light && power.ble_window_until_ms.is_none()) ||
+        ble.wake != (session_snapshot(&state).boot_id, power.wake_count) {
+        ble.connected = false; ble.pending = None; state.ble_rx.lock().unwrap().clear();
         return StatusCode::NOT_FOUND.into_response();
     }
-    Json(json!({"token":state.device_token.as_ref()})).into_response()
+    if ble.read_failed { return StatusCode::SERVICE_UNAVAILABLE.into_response(); }
+    if ble.pending.as_ref().is_some_and(|(at, _)| clock.monotonic_ms >= *at) {
+        ble.status = ble.pending.take().unwrap().1;
+    }
+    ble.status.clone().into_response()
+}
+async fn sim_ble_aux(State(state): State<SimState>, request: Request<Body>) -> Response {
+    if !bearer(&request, &state.endpoint_token) { return unauthorized(); }
+    if !ble_generation_ok(&state, &request) { return StatusCode::CONFLICT.into_response(); }
+    let token = request.uri().path().ends_with("token");
+    let Some(clock) = clock_snapshot(&state) else { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); };
+    let Ok(power) = reconcile_power(&state, clock.monotonic_ms) else { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); };
+    if !power.light && power.ble_window_until_ms.is_none() { return StatusCode::NOT_FOUND.into_response(); }
+    let Ok(bytes) = to_bytes(request.into_body(), if token {256} else {1024}).await else { return StatusCode::PAYLOAD_TOO_LARGE.into_response(); };
+    let Ok(body) = serde_json::from_slice::<Value>(&bytes) else { return StatusCode::BAD_REQUEST.into_response(); };
+    let valid = if token { body["cmd"] == "token" && body.get("rotate").is_none() }
+        else { body["schema"] == 1 && body["host"].is_string() && body["port"].as_u64().is_some_and(|p| p > 0 && p <= 65535) && body["token"] == state.endpoint_token.as_ref() };
+    let op = if token {"auth"} else {"endpoint"};
+    let mut response = json!({"ack":op,"ok":valid});
+    if token && valid { response["token"] = json!(state.device_token.as_ref()); }
+    let Ok(raw) = bridge_render::simulator_ble_wire(op, &response) else { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); };
+    state.ble.lock().unwrap().store(op, raw, clock.monotonic_ms);
+    Json(json!({"result":"accepted"})).into_response()
+}
+async fn sim_ble_close(State(state): State<SimState>, request: Request<Body>) -> Response {
+    if !bearer(&request, &state.endpoint_token) { return unauthorized(); }
+    if !ble_generation_ok(&state, &request) { return StatusCode::CONFLICT.into_response(); }
+    let mut ble = state.ble.lock().unwrap();
+    ble.connected = false; ble.pending = None; ble.status.clear();
+    state.ble_rx.lock().unwrap().clear();
+    Json(json!({"result":"closed"})).into_response()
+}
+async fn sim_ble_fault(State(state): State<SimState>, request: Request<Body>) -> Response {
+    if !bearer(&request, &state.control_token) { return unauthorized(); }
+    let Ok(bytes) = to_bytes(request.into_body(), 1024).await else { return StatusCode::PAYLOAD_TOO_LARGE.into_response(); };
+    let Ok(fault) = serde_json::from_slice::<BleFault>(&bytes) else { return StatusCode::BAD_REQUEST.into_response(); };
+    if !matches!(fault.kind.as_str(), "none" | "legacy_overflow" | "guard_overflow" | "write_failed" |
+        "disconnect" | "window_closed" | "empty" | "malformed" | "stale" | "overwrite" | "read_failed" | "delay" | "notify_lost" | "drop_ack" | "wrong_request" | "wrong_wake" | "wrong_mac" | "wrong_session" | "wrong_op") ||
+        fault.size > 8192 || fault.delay_ms > 86_400_000 { return StatusCode::BAD_REQUEST.into_response(); }
+    state.ble.lock().unwrap().fault = Some(fault);
+    Json(json!({"result":"armed"})).into_response()
+}
+async fn sim_ble_attributes(State(state): State<SimState>, request: Request<Body>) -> Response {
+    if !bearer(&request, &state.control_token) { return unauthorized(); }
+    let ble = state.ble.lock().unwrap();
+    Json(json!({"generation":ble.generation,"connected":ble.connected,"info_bytes":ble.info.len(),
+        "status_bytes":ble.status.len(),"events":ble.events})).into_response()
 }
 
-async fn sim_ble_command(State(state): State<SimState>, request: Request<Body>) -> Response {
+async fn sim_ble_business(State(state): State<SimState>, request: Request<Body>) -> Response {
     if !bearer(&request, &state.endpoint_token) { return unauthorized(); }
     let body = match to_bytes(request.into_body(), 8192).await {
         Ok(body) => body,
@@ -2254,9 +2400,9 @@ async fn sim_ble_command(State(state): State<SimState>, request: Request<Body>) 
         return StatusCode::BAD_REQUEST.into_response();
     };
     let request_id = message["request_id"].clone();
-    if !request_id.is_string() { return StatusCode::BAD_REQUEST.into_response(); }
+    if request_id.as_str().is_none_or(|id| id.is_empty() || id.len() > 64 || id.contains('\0')) { return StatusCode::BAD_REQUEST.into_response(); }
     if message.get("protocol").is_some() || message.get("rv").is_some() {
-        return Json(json!({"ack":"command","op":op,"request_id":request_id,
+        return Json(json!({"ack":"command","op":"command","request_id":request_id,
             "result":"rejected","error":"retired_protocol"})).into_response();
     }
     let response = match op {
@@ -2277,6 +2423,15 @@ async fn sim_ble_command(State(state): State<SimState>, request: Request<Body>) 
                 .header(header::AUTHORIZATION, format!("Bearer {}", state.endpoint_token))
                 .body(Body::from(body.to_vec())).unwrap();
             device_command_impl(state.clone(), request, "data", false).await
+        }
+        "history" => {
+            if message["device_mac"]!=state.mac||message["session_nonce"]!=session_snapshot(&state).nonce {
+                Json(json!({"op":"history","result":"rejected","error":"session"})).into_response()
+            } else {
+                let reply=state.sync.lock().unwrap().history(message["since"].as_u64().unwrap_or(0) as u32,
+                    message["limit"].as_u64().unwrap_or(8).min(64) as u32);
+                match reply {Ok(mut reply)=>{reply["op"]=json!("history");reply["result"]=json!("applied");Json(reply).into_response()},Err(_)=>StatusCode::INTERNAL_SERVER_ERROR.into_response()}
+            }
         }
         "sync_config" | "sync_open" => {
             let now_s = now_seconds(&state, clock);
@@ -2331,7 +2486,7 @@ async fn sim_ble_command(State(state): State<SimState>, request: Request<Body>) 
                 }
             }
         }
-        _ => Json(json!({"result":"http_required"})).into_response(),
+        _ => Json(json!({"op":"command","result":"rejected","error":"http_required"})).into_response(),
     };
     if response.status() != StatusCode::OK { return response; }
     let Ok(bytes) = to_bytes(response.into_body(), BODY_LIMIT).await else {
@@ -2341,8 +2496,8 @@ async fn sim_ble_command(State(state): State<SimState>, request: Request<Body>) 
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     if op == "status" {
-        // Match the firmware's BLE digest: field tables ride on HTTP only.
-        ack.as_object_mut().map(|object| object.remove("data_contract"));
+        // Runtime input for the shared C++ BLE projection below. No HTTP
+        // document is stored as an attribute, and no firmware bytes re-encoded.
         ack["result"] = "applied".into();
         ack["sync"]["v"] = json!(1);
         ack["sync"]["pending"] = json!(!ack["sync"]["pending_batch"].is_null());
@@ -2378,8 +2533,110 @@ async fn sim_ble_command(State(state): State<SimState>, request: Request<Body>) 
     Json(ack).into_response()
 }
 
+// Control-only fault/physical actions; business callers cannot self-assert a bond.
+async fn sim_history_control(State(state):State<SimState>,request:Request<Body>)->Response {
+    if !bearer(&request,&state.control_token){return unauthorized();}
+    let Ok(bytes)=to_bytes(request.into_body(),1024).await else{return StatusCode::BAD_REQUEST.into_response();};
+    let Ok(value)=serde_json::from_slice::<Value>(&bytes) else{return StatusCode::BAD_REQUEST.into_response();};
+    match state.sync.lock().unwrap().append_wake(&value){Ok(())=>Json(json!({"ok":true,"synthetic":true})).into_response(),Err(_)=>StatusCode::BAD_REQUEST.into_response()}
+}
+async fn sim_wifi_control(State(state): State<SimState>, request: Request<Body>) -> Response {
+    if !bearer(&request, &state.control_token) { return unauthorized(); }
+    let Some(clock) = clock_snapshot(&state) else { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); };
+    let Ok(bytes) = to_bytes(request.into_body(), 1024).await else { return StatusCode::BAD_REQUEST.into_response(); };
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else { return StatusCode::BAD_REQUEST.into_response(); };
+    let generation = state.ble.lock().unwrap().generation as u32;
+    let mut wifi = state.wifi.lock().unwrap();
+    if let Some(ms) = value["maintenance_ms"].as_u64() {
+        if ms > 120000 { return StatusCode::BAD_REQUEST.into_response(); }
+        wifi.physical_until = clock.monotonic_ms + ms;
+    }
+    if let Some(peer) = value["bond"].as_str() {
+        if peer.len() != 19 || !peer.ends_with("/1") { return StatusCode::BAD_REQUEST.into_response(); }
+        wifi.peer = peer.into();
+        let mut ble = state.ble.lock().unwrap(); ble.connected = false; ble.status.clear(); ble.pending = None;
+    }
+    if let Some(legacy)=value.get("legacy") { if wifi.engine.legacy(legacy).is_err() { return StatusCode::BAD_REQUEST.into_response(); } }
+    if let Some(outcome) = value["outcome"].as_i64() {
+        if !(0..=2).contains(&outcome) { return StatusCode::BAD_REQUEST.into_response(); }
+        wifi.outcome = outcome as i32;
+    }
+    if let Some(fail) = value["storage_failure"].as_bool() { wifi.engine.storage_failure(fail); }
+    if let Some(drop) = value["drop_http_ack"].as_bool() { wifi.drop_http_ack = drop; }
+    let peer = wifi.peer.clone(); let outcome = wifi.outcome;
+    let busy = wifi.engine.poll(clock.monotonic_ms, &peer, generation, true, outcome).unwrap_or(false);
+    Json(json!({"busy":busy})).into_response()
+}
+async fn wifi_http(State(state): State<SimState>, request: Request<Body>) -> Response {
+    if !bearer(&request, &state.endpoint_token) { return unauthorized(); }
+    if let Some(response) = device_gate(&state).await { return response; }
+    let op = match request.uri().path() { "/api/wifi/snapshot" => "snapshot", "/api/wifi/apply" => "apply", _ => "result" };
+    let Some(clock) = clock_snapshot(&state) else { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); };
+    let Ok(bytes) = to_bytes(request.into_body(), 8192).await else { return StatusCode::PAYLOAD_TOO_LARGE.into_response(); };
+    let Ok(mut message) = serde_json::from_slice::<Value>(&bytes) else { return StatusCode::BAD_REQUEST.into_response(); };
+    if message["device_mac"] != state.mac { return StatusCode::BAD_REQUEST.into_response(); }
+    message["op"] = json!(op);
+    let generation = state.ble.lock().unwrap().generation as u32;
+    let mut wifi = state.wifi.lock().unwrap(); let peer = wifi.peer.clone(); let physical = wifi.physical_until;
+    let reply = wifi.engine.command(&message, &peer, generation, clock.monotonic_ms, physical, 0, true);
+    if op == "apply" && wifi.drop_http_ack { wifi.drop_http_ack = false; return StatusCode::GATEWAY_TIMEOUT.into_response(); }
+    match reply { Ok(reply) => Json(reply).into_response(), Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response() }
+}
+
+async fn sim_ble_command(State(state): State<SimState>, request: Request<Body>) -> Response {
+    if !bearer(&request, &state.endpoint_token) { return unauthorized(); }
+    if !ble_generation_ok(&state, &request) { return StatusCode::CONFLICT.into_response(); }
+    let Some(clock) = clock_snapshot(&state) else { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); };
+    let Ok(power) = reconcile_power(&state, clock.monotonic_ms) else { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); };
+    if !state.ble.lock().unwrap().connected || (!power.light && power.ble_window_until_ms.is_none()) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Ok(bytes) = to_bytes(request.into_body(), 8192).await else { return StatusCode::PAYLOAD_TOO_LARGE.into_response(); };
+    let Ok(message) = serde_json::from_slice::<Value>(&bytes) else { return StatusCode::BAD_REQUEST.into_response(); };
+    let op = message["op"].as_str().unwrap_or("command");
+    if op.starts_with("wifi_") {
+        if bytes.len() > 1024 { return StatusCode::PAYLOAD_TOO_LARGE.into_response(); }
+        if message["device_mac"] != state.mac { return StatusCode::BAD_REQUEST.into_response(); }
+        let generation = state.ble.lock().unwrap().generation as u32;
+        let now = clock.monotonic_ms;
+        let bridge = message["bridge_id"].as_str().unwrap_or("");
+        let allowed = state.owner.lock().unwrap().get_valid(now_seconds(&state, clock)).ok().flatten()
+            .is_none_or(|owner| owner.id == bridge);
+        let reply = {
+            let mut wifi = state.wifi.lock().unwrap();
+            let peer = wifi.peer.clone(); let outcome = wifi.outcome; let physical = wifi.physical_until;
+            let light = if power.light { now + 25000 } else { 0 };
+            let _ = wifi.engine.poll(now, &peer, generation, true, outcome);
+            wifi.engine.command(&message, &peer, generation, now, physical, light, allowed)
+        };
+        let Ok(mut reply) = reply else { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); };
+        reply["wake_generation"] = json!(session_snapshot(&state).boot_id);
+        reply["wake_seq"] = json!(power.wake_count);
+        let raw = bridge_render::simulator_ble_wire("reply", &reply);
+        if let Ok(raw) = raw { state.ble.lock().unwrap().store(op, raw, now); }
+        return Json(json!({"result":"accepted"})).into_response();
+    }
+    let request = Request::builder().uri("/sim/ble/business")
+        .header(header::AUTHORIZATION, format!("Bearer {}", state.endpoint_token))
+        .body(Body::from(bytes.to_vec())).unwrap();
+    let response = sim_ble_business(State(state.clone()), request).await;
+    // A business refusal is a device ACK too, not an HTTP upload failure.
+    let Ok(bytes) = to_bytes(response.into_body(), BODY_LIMIT).await else { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); };
+    let Ok(mut ack) = serde_json::from_slice::<Value>(&bytes) else { return Json(json!({"result":"accepted"})).into_response(); };
+    ack["request_id"] = message["request_id"].clone();
+    ack["wake_generation"] = json!(session_snapshot(&state).boot_id);
+    ack["wake_seq"] = json!(state.power.lock().unwrap().wake_count);
+    let raw = bridge_render::simulator_ble_wire(if op == "status" && ack["result"] == "applied" {"status"} else {"reply"}, &ack);
+    if let Ok(raw) = raw {
+        let now = clock_snapshot(&state).unwrap().monotonic_ms;
+        state.ble.lock().unwrap().store(if matches!(op,"status"|"plan"|"data"|"sync_config"|"sync_open") {op} else {"command"}, raw, now);
+    }
+    Json(json!({"result":"accepted"})).into_response()
+}
+
 async fn sim_ble_fragment(State(state): State<SimState>, request: Request<Body>) -> Response {
     if !bearer(&request, &state.endpoint_token) { return unauthorized(); }
+    if !ble_generation_ok(&state, &request) { return StatusCode::CONFLICT.into_response(); }
     let Some(clock) = clock_snapshot(&state) else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
@@ -2401,6 +2658,7 @@ async fn sim_ble_fragment(State(state): State<SimState>, request: Request<Body>)
     if !matches!(final_chunk, "0" | "1") {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    let generation = request.headers().get("x-sim-ble-generation").cloned();
     let body = match to_bytes(request.into_body(), 180).await {
         Ok(body) if !body.is_empty() => body,
         _ => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
@@ -2412,15 +2670,21 @@ async fn sim_ble_fragment(State(state): State<SimState>, request: Request<Body>)
             return StatusCode::CONFLICT.into_response();
         }
         rx.extend_from_slice(&body);
-        (final_chunk == "1").then(|| std::mem::take(&mut *rx))
+        // Real appendJson dispatches when JSON is complete; final/offset are
+        // ONLY local carrier fields, not part of the ROM protocol.
+        if serde_json::from_slice::<Value>(&rx).is_ok() { Some(std::mem::take(&mut *rx)) }
+        else if final_chunk == "1" { rx.clear(); None } else { None }
     };
     let Some(completed) = completed else {
-        return Json(json!({"result":"more"})).into_response();
+        return Json(json!({"result":if final_chunk == "1" {"accepted"} else {"more"}})).into_response();
     };
-    let request = Request::builder().uri("/sim/ble/command")
-        .header(header::AUTHORIZATION, format!("Bearer {}", state.endpoint_token))
-        .body(Body::from(completed)).unwrap();
-    sim_ble_command(State(state), request).await
+    let mut builder = Request::builder().uri("/sim/ble/command")
+        .header(header::AUTHORIZATION, format!("Bearer {}", state.endpoint_token));
+    if let Some(generation) = generation { builder = builder.header("x-sim-ble-generation", generation); }
+    let request = builder.body(Body::from(completed)).unwrap();
+    let response = sim_ble_command(State(state), request).await;
+    if response.status() != StatusCode::OK { return response; }
+    Json(json!({"result":if final_chunk == "1" {"accepted"} else {"more"}})).into_response()
 }
 
 async fn claim(State(state): State<SimState>, request: Request<Body>) -> Response {
@@ -2623,6 +2887,11 @@ fn app(state: SimState) -> Router {
     Router::new()
         .route("/status.json", get(public_status))
         .route("/api/status", get(status))
+        .route("/api/wifi/snapshot", post(wifi_http))
+        .route("/api/wifi/apply", post(wifi_http))
+        .route("/api/wifi/result", post(wifi_http))
+        .route("/sim/wifi", post(sim_wifi_control))
+        .route("/sim/history", post(sim_history_control))
         .route("/api/sync/begin", post(sync_begin))
         .route("/api/sync/page", post(sync_page))
         .route("/api/sync/ack", post(sync_ack))
@@ -2639,7 +2908,12 @@ fn app(state: SimState) -> Router {
         .route("/sim/storage", post(sim_storage))
         .route("/sim/versions", get(sim_versions_get).post(sim_versions_post))
         .route("/sim/ble/info", get(sim_ble_info))
-        .route("/sim/ble/token", get(sim_ble_token))
+        .route("/sim/ble/token", post(sim_ble_aux))
+        .route("/sim/ble/endpoint", post(sim_ble_aux))
+        .route("/sim/ble/status", get(sim_ble_status))
+        .route("/sim/ble/close", post(sim_ble_close))
+        .route("/sim/ble/fault", post(sim_ble_fault))
+        .route("/sim/ble/attributes", get(sim_ble_attributes))
         .route("/sim/ble/command", post(sim_ble_command))
         .route("/sim/ble/fragment", post(sim_ble_fragment))
         .route("/update", get(ota_token_route))
@@ -2711,6 +2985,11 @@ async fn main() -> Result<()> {
         power_reconcile: Arc::new(Mutex::new(())),
         stall_ack_after: Arc::new(Mutex::new(None)),
         ble_rx: Arc::new(Mutex::new(Vec::new())),
+        ble: Arc::new(Mutex::new(SimBle::default())),
+        wifi: Arc::new(Mutex::new(SimWifi {
+            engine: bridge_render::SimulatorWifi::new(&options.data_dir)?, peer: "02:00:00:00:00:02/1".into(),
+            physical_until: 0, outcome: 1, drop_http_ack: false,
+        })),
     };
     let listener = tokio::net::TcpListener::bind(options.listen)
         .await

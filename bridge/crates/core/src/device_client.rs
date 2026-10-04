@@ -16,6 +16,25 @@ use serde_json::{json, Value};
 pub const BUNDLE_CHUNK_BYTES: usize = 4096;
 const MAX_BUNDLE_BYTES: usize = 262_144;
 
+#[derive(Debug)]
+pub struct HttpStatus(pub u16);
+impl std::fmt::Display for HttpStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "device HTTP {}", self.0) }
+}
+impl std::error::Error for HttpStatus {}
+
+fn write_until(stream: &mut TcpStream, mut bytes: &[u8], deadline: Instant) -> Result<()> {
+    while !bytes.is_empty() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        anyhow::ensure!(!remaining.is_zero(), "wifi_window_budget");
+        stream.set_write_timeout(Some(remaining))?;
+        let written = stream.write(bytes)?;
+        anyhow::ensure!(written != 0, "device HTTP write incomplete");
+        bytes = &bytes[written..];
+    }
+    Ok(())
+}
+
 /// One HTTP round trip with a bounded body.
 fn request(
     ip: &str,
@@ -26,6 +45,8 @@ fn request(
     extra_headers: &[(&str, &str)],
     timeout: Duration,
 ) -> Result<(u16, String)> {
+    anyhow::ensure!(!timeout.is_zero(), "wifi_window_budget");
+    let deadline = Instant::now() + timeout;
     let target = if ip.contains(':') {
         ip.to_string()
     } else {
@@ -56,14 +77,15 @@ fn request(
         head.push_str("\r\n");
     }
     head.push_str("\r\n");
-    stream.write_all(head.as_bytes())?;
-    if let Some(bytes) = body {
-        stream.write_all(bytes)?;
-    }
+    write_until(&mut stream, head.as_bytes(), deadline)?;
+    if let Some(bytes) = body { write_until(&mut stream, bytes, deadline)?; }
     let mut raw = Vec::new();
     let mut chunk = [0u8; 2048];
     let mut expected_len = None;
     loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        anyhow::ensure!(!remaining.is_zero(), "wifi_window_budget");
+        stream.set_read_timeout(Some(remaining))?;
         let read = stream.read(&mut chunk)?;
         if read == 0 {
             break;
@@ -167,17 +189,12 @@ fn post_json(ip: &str, path: &str, token: &str, body: &Value, timeout: Duration)
         error_category,
         "device HTTP result"
     );
-    let parsed: Value =
-        serde_json::from_str(&response_body).unwrap_or(json!({"raw": response_body}));
     if status == 409 {
+        let parsed: Value = serde_json::from_str(&response_body).unwrap_or(Value::Null);
         return Ok(json!({"result": "rejected", "error": "occupied", "detail": parsed}));
     }
-    if status == 401 {
-        bail!("device rejected the endpoint token (401)");
-    }
-    if !(200..300).contains(&status) {
-        bail!("device returned HTTP {status}");
-    }
+    if !(200..300).contains(&status) { return Err(HttpStatus(status).into()); }
+    let parsed: Value = serde_json::from_str(&response_body).context("device_json_shape")?;
     Ok(parsed)
 }
 
@@ -247,10 +264,10 @@ pub fn status(ip: &str, token: &str, timeout: Duration) -> Result<Value> {
         "device HTTP result"
     );
     if status == 401 {
-        bail!("device rejected the endpoint token (401)");
+        return Err(HttpStatus(401).into());
     }
     if status != 200 {
-        bail!("device /api/status HTTP {status}");
+        return Err(HttpStatus(status).into());
     }
     Ok(serde_json::from_str(&body).context("device status json")?)
 }
@@ -487,34 +504,7 @@ mod tests {
     use std::net::TcpListener;
     use std::thread;
 
-    #[test]
-    fn chunk_plan_is_bounded_and_contiguous() {
-        let plan = chunk_plan(10_000, 4096);
-        assert_eq!(plan, vec![(0, 4096), (4096, 4096), (8192, 1808)]);
-        assert_eq!(plan.iter().map(|(_, n)| n).sum::<usize>(), 10_000);
-    }
-
-    #[test]
-    fn event_metadata_keeps_correlators_and_rejects_unbounded_values() {
-        let body = json!({"request_id": "data-0012", "device_mac": "AABBCCDDEEFF",
-            "seq": 12, "plan_id": 7, "job_id": "job-1", "token": "must-not-log"});
-        assert_eq!(event_id(&body, "request_id").as_deref(), Some("data-0012"));
-        assert_eq!(
-            event_id(&body, "device_mac").as_deref(),
-            Some("AABBCCDDEEFF")
-        );
-        assert_eq!(body["seq"].as_u64(), Some(12));
-        assert_eq!(body["plan_id"].as_u64(), Some(7));
-        assert_eq!(event_id(&body, "token"), None);
-        assert_eq!(
-            event_id(&json!({"request_id": "x".repeat(81)}), "request_id"),
-            None
-        );
-    }
-
-    #[test]
-    fn post_json_reports_http_status_without_exposing_request_or_response_bodies() {
-        fn serve_once(status: u16, payload: &'static str) -> String {
+    fn respond_once(status: u16, payload: String) -> (String, thread::JoinHandle<()>) {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap().to_string();
             let server = thread::spawn(move || {
@@ -543,6 +533,38 @@ mod tests {
                 let response = format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}", payload.len());
                 stream.write_all(response.as_bytes()).unwrap();
             });
+        (address, server)
+    }
+
+    #[test]
+    fn chunk_plan_is_bounded_and_contiguous() {
+        let plan = chunk_plan(10_000, 4096);
+        assert_eq!(plan, vec![(0, 4096), (4096, 4096), (8192, 1808)]);
+        assert_eq!(plan.iter().map(|(_, n)| n).sum::<usize>(), 10_000);
+    }
+
+    #[test]
+    fn event_metadata_keeps_correlators_and_rejects_unbounded_values() {
+        let body = json!({"request_id": "data-0012", "device_mac": "AABBCCDDEEFF",
+            "seq": 12, "plan_id": 7, "job_id": "job-1", "token": "must-not-log"});
+        assert_eq!(event_id(&body, "request_id").as_deref(), Some("data-0012"));
+        assert_eq!(
+            event_id(&body, "device_mac").as_deref(),
+            Some("AABBCCDDEEFF")
+        );
+        assert_eq!(body["seq"].as_u64(), Some(12));
+        assert_eq!(body["plan_id"].as_u64(), Some(7));
+        assert_eq!(event_id(&body, "token"), None);
+        assert_eq!(
+            event_id(&json!({"request_id": "x".repeat(81)}), "request_id"),
+            None
+        );
+    }
+
+    #[test]
+    fn post_json_reports_http_status_without_exposing_request_or_response_bodies() {
+        fn serve_once(status: u16, payload: &'static str) -> String {
+            let (address, server) = respond_once(status, payload.to_owned());
             let result = post_json(
                 &address,
                 "/api/data",
@@ -573,6 +595,25 @@ mod tests {
     }
 
     #[test]
+    fn wifi_snapshot_http_errors_and_invalid_pages_keep_finite_categories() {
+        let mac = "AABBCCDDEEFF";
+        for (status, body, expected) in [
+            (401, json!({"secret":"must-not-expose"}).to_string(), ("failed", "unauthorized")),
+            (200, "{".into(), ("failed", "snapshot_shape")),
+            (200, json!({"device_mac":mac,"ok":false,"error":"snapshot_expired"}).to_string(), ("waiting_rendezvous", "snapshot_expired")),
+            (200, json!({"device_mac":mac,"ok":false,"error":"revision_conflict"}).to_string(), ("conflict", "revision_conflict")),
+            (200, json!({"device_mac":"112233445566","ok":true}).to_string(), ("failed", "snapshot_mismatch")),
+            (200, json!({"device_mac":mac,"ok":true,"schema":2,"snapshot_id":"s","revision":1,"total":2,"offset":1,"next_offset":2,"chunk":"{}","done":true}).to_string(), ("failed", "snapshot_mismatch")),
+        ] {
+            let (ip, server) = respond_once(status, body);
+            let error = wifi_snapshot(&ip, "synthetic-token", mac, "bridge", None, Duration::from_secs(2)).unwrap_err();
+            server.join().unwrap();
+            assert_eq!(crate::rendezvous::wifi_error(&error), expected);
+            assert!(!error.to_string().contains("must-not-expose"));
+        }
+    }
+
+    #[test]
     fn ota_image_uses_token_without_sync_owner_and_checks_device_mac() {
         for (reported, accepted) in [("AA:BB:CC:DD:EE:FF", true), ("11:22:33:44:55:66", false)] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -593,5 +634,57 @@ mod tests {
             if accepted { assert_eq!(result.unwrap()["device_mac"], "AABBCCDDEEFF"); }
             else { assert!(result.unwrap_err().to_string().contains("MAC mismatch")); }
         }
+    }
+}
+
+/// Wi-Fi management uses the endpoint token and borrows the current window.
+/// It never claims ownership or sends a PowerPlan.
+pub fn wifi_request(ip: &str, token: &str, mac: &str, bridge: &str, op: &str,
+                    mut body: Value, timeout: Duration) -> Result<Value> {
+    if !matches!(op, "snapshot" | "apply" | "result") { bail!("invalid_wifi_operation"); }
+    let compact = DeviceIdentity::normalized_mac(mac).context("invalid_device_mac")?;
+    let wire_mac = compact.as_bytes().chunks(2).map(|p| std::str::from_utf8(p).unwrap()).collect::<Vec<_>>().join(":");
+    body["device_mac"] = json!(wire_mac); body["bridge_id"] = json!(bridge);
+    let reply = post_json(ip, &format!("/api/wifi/{op}"), token, &body, timeout)?;
+    if reply["device_mac"].as_str().and_then(DeviceIdentity::normalized_mac).as_deref()
+        != DeviceIdentity::normalized_mac(mac).as_deref() {
+        if reply["error"] == "occupied" { bail!("occupied"); }
+        bail!("wifi_mac_mismatch");
+    }
+    Ok(reply)
+}
+
+/// Freeze and consume every page before exposing a complete snapshot. One hard
+/// deadline covers the entire read; a failed page never becomes an empty list.
+pub fn wifi_snapshot(ip: &str, token: &str, mac: &str, bridge: &str, permit: Option<&str>,
+                     timeout: Duration) -> Result<crate::platform::wifi::Snapshot> {
+    let until = Instant::now() + timeout;
+    let mut offset = 0usize; let mut snapshot = String::new(); let mut revision = None;
+    let mut total = None; let mut text = String::new();
+    loop {
+        let remaining = until.saturating_duration_since(Instant::now());
+        if remaining.is_zero() { bail!("wifi_snapshot_timeout"); }
+        let reply = wifi_request(ip, token, mac, bridge, "snapshot",
+            json!({"offset":offset,"snapshot_id":snapshot,"permit":permit}), remaining)?;
+        if reply["ok"] != true { bail!("{}", reply["error"].as_str().unwrap_or("wifi_snapshot_rejected")); }
+        let current = reply["snapshot_id"].as_str().context("wifi_snapshot_id")?;
+        let rev = reply["revision"].as_u64().context("wifi_revision")?;
+        let size = reply["total"].as_u64().context("wifi_snapshot_length")? as usize;
+        let next = reply["next_offset"].as_u64().context("wifi_snapshot_offset")? as usize;
+        let chunk = reply["chunk"].as_str().context("wifi_snapshot_chunk")?;
+        if reply["schema"] != 2 || size > 16384 || reply["offset"] != offset || next <= offset
+            || next > size || chunk.len() != next - offset || (offset > 0 && (current != snapshot || revision != Some(rev) || total != Some(size))) {
+            bail!("wifi_snapshot_mismatch");
+        }
+        snapshot = current.to_owned(); revision = Some(rev); total = Some(size); text.push_str(chunk); offset = next;
+        if reply["complete"] == true {
+            if offset != size { bail!("wifi_snapshot_incomplete"); }
+            let parsed: crate::platform::wifi::Snapshot = serde_json::from_str(&text).context("wifi_snapshot_shape")?;
+            let normalized = DeviceIdentity::normalized_mac(mac).context("invalid_device_mac")?;
+            parsed.validate(&normalized)?;
+            if parsed.snapshot_id != snapshot || parsed.revision != rev { bail!("wifi_snapshot_mismatch"); }
+            return Ok(parsed);
+        }
+        if offset == size { bail!("wifi_snapshot_incomplete"); }
     }
 }
