@@ -1,5 +1,11 @@
 # BLE Wi-Fi 实施合同与 R0 记录
 
+## 2026-10-04 统一在线状态与传输协议候选（未实施）
+
+Astra medium一次审核后已修订；用户明确选择统一严格权限，BOOT保存/试连不再豁免claim/owner，先绑定/身份修复，再显式claim。此为新设计合同，现行ROM尚未修改；审核记录wifi-unified-protocol-review.md。
+
+最新用户要求及设计见[统一设备在线与HTTP/BLE控制协议设计](wifi-unified-protocol-design.md)。USB/BOOT/Bridge激活产生同一状态事件，HTTP/GATT同一认证DeviceStatus；HTTP已可用直接执行管理命令，电池期限不隐式续期。普通操作取消对BLE短时permit的依赖，由持久身份关联与设备即时可用性决定；保留目标owner/版本/原子回执及OTA设备操作token。本候选尚未部署，下方为现行/历史合同。
+
 存储/本地写入口的2026-10-04新实现与候选边界见 [wifi-variable-storage.md](wifi-variable-storage.md)：WFS3与按需RAM软件验证完成，AP/USB认证事务已收归；.55已提交并OTA部署，真实WFS3迁移/后续启动读取/运行镜像已确认，旧兼容读取保留。此前“变长/入口未实施”属于阶段记录。
 ## 2026-10-04 当前会合 Wi-Fi 合同（已实施并配套部署）
 

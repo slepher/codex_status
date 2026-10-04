@@ -138,6 +138,7 @@ pub struct BleConfig {
     pub host: String,
     pub port: u16,
     pub token: String,
+    pub bridge_id: String,
     /// Scan window per cycle. Long for one-shot tools, short (5 s) for the
     /// low-duty tray loop.
     pub scan_timeout_ms: u64,
@@ -671,11 +672,14 @@ impl Pusher {
         Self::write_json(
             peripheral,
             CHR_ENDPOINT,
-            &Self::endpoint_payload(&self.cfg.host, self.cfg.port, &self.cfg.token),
+            &Self::endpoint_payload_for(&self.cfg.host, self.cfg.port, &self.cfg.token, &self.cfg.bridge_id),
         )
         .await
     }
 
+    fn endpoint_payload_for(host: &str,port:u16,token:&str,principal:&str)->Vec<u8> {
+        json!({"schema":2,"host":host,"port":port,"token":token,"bridge_id":principal}).to_string().into_bytes()
+    }
     fn endpoint_payload(host: &str, port: u16, token: &str) -> Vec<u8> {
         json!({
             "schema": 1,
@@ -1198,12 +1202,12 @@ impl DeviceConnection {
             if let Some(url) = &self.fake_url {
                 reqwest::Client::new().post(format!("{url}/sim/ble/endpoint"))
                     .header("x-sim-ble-generation", self.info["_sim_generation"].as_u64().unwrap().to_string())
-                    .bearer_auth(&self.token).body(Pusher::endpoint_payload(host, port, token))
+                    .bearer_auth(&self.token).body(Pusher::endpoint_payload_for(host, port, token, &self.bridge_id))
                     .send().await?.error_for_status()?;
                 Ok(())
             } else {
                 Pusher::write_json(self.peripheral.as_ref().unwrap(), CHR_ENDPOINT,
-                    &Pusher::endpoint_payload(host, port, token)).await
+                    &Pusher::endpoint_payload_for(host, port, token, &self.bridge_id)).await
             }
         }).await.context("device BLE endpoint write timed out")?
     }
@@ -1266,7 +1270,8 @@ impl DeviceConnection {
         body["token"] = json!(self.token);
         stamp_clock(&mut body, &self.device_mac);
         let bytes = serde_json::to_vec(&body)?;
-        if op.starts_with("wifi_") && bytes.len() > 4096 { bail!("Wi-Fi BLE command exceeds 4096 bytes"); }
+        let wifi_limit=if self.info["wifi_management"]==3 {4096}else{1024};
+        if op.starts_with("wifi_") && bytes.len() > wifi_limit { bail!("Wi-Fi BLE command exceeds {wifi_limit} bytes"); }
         if bytes.len() > 8192 {
             bail!("device BLE command exceeds 8192 bytes");
         }
@@ -1404,7 +1409,7 @@ impl DeviceConnection {
     /// ATT values are limited to 512 bytes. Read frozen Wi-Fi summaries through
     /// bounded hex pages on the existing Status attribute, without a new GATT table.
     pub async fn wifi_read(&mut self, op: &str) -> Result<serde_json::Value> {
-        if !matches!(op, "wifi_scheme_get" | "wifi_capabilities") { bail!("invalid Wi-Fi read"); }
+        if !matches!(op, "wifi_scheme_get" | "wifi_capabilities" | "wifi_status") { bail!("invalid Wi-Fi read"); }
         let mut body = json!({"offset":0});
         let mut bytes = Vec::new();
         let mut snapshot = None;
@@ -1424,6 +1429,29 @@ impl DeviceConnection {
             if bytes.len() != next || next > total { bail!("Wi-Fi summary offset mismatch"); }
             if next == total { return serde_json::from_slice(&bytes).context("Wi-Fi summary JSON"); }
             body = json!({"offset":next,"snapshot":id});
+        }
+    }
+
+    /// Same frozen snapshot used by HTTP, carried in bounded GATT replies.
+    pub async fn wifi_snapshot(&mut self) -> Result<serde_json::Value> {
+        let mut offset=0usize;let mut snapshot=String::new();let mut revision=None;let mut total=None;let mut text=String::new();
+        loop {
+            let reply=self.command("wifi_snapshot",json!({"offset":offset,"snapshot_id":snapshot})).await?;
+            if reply["ok"]!=true {bail!("{}",reply["error"].as_str().unwrap_or("wifi_snapshot_rejected"));}
+            let id=reply["snapshot_id"].as_str().context("wifi_snapshot_id")?;
+            let rev=reply["revision"].as_u64().context("wifi_revision")?;
+            let size=reply["total"].as_u64().context("wifi_snapshot_length")? as usize;
+            let next=reply["next_offset"].as_u64().context("wifi_snapshot_offset")? as usize;
+            let chunk=reply["chunk"].as_str().context("wifi_snapshot_chunk")?;
+            if reply["schema"]!=2 || size>16384 || reply["offset"]!=offset || next<=offset || next>size || chunk.len()!=next-offset ||
+                (offset>0 && (id!=snapshot || revision!=Some(rev) || total!=Some(size))) {bail!("wifi_snapshot_mismatch");}
+            snapshot=id.to_owned();revision=Some(rev);total=Some(size);text.push_str(chunk);offset=next;
+            if reply["complete"]==true {
+                if offset!=size {bail!("wifi_snapshot_incomplete");}
+                let parsed:bridge_core::platform::wifi::Snapshot=serde_json::from_str(&text)?;parsed.validate(&bridge_core::platform::model::DeviceIdentity::normalized_mac(&self.device_mac).context("invalid_device_mac")?)?;
+                if parsed.snapshot_id!=snapshot || parsed.revision!=rev {bail!("wifi_snapshot_mismatch");}
+                return Ok(serde_json::to_value(parsed)?);
+            }
         }
     }
 

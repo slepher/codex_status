@@ -24,7 +24,7 @@ for block in re.split(r"(?=^[0-9a-f]+ <[^\n]+>:\n)", assembly, flags=re.MULTILIN
 reader = next((name for name in functions if name.startswith("readWifiStore(Preferences&, WifiStore")), None)
 required = ["wifiSchemesBegin()", reader]
 if reader and "WifiStoreV2" not in reader:
-    for prefix in ("saveV2(", "wifiSetupPoll(", "wifiSetupCommand(", "wifiManagementCommand("):
+    for prefix in ("saveV2(", "wifiSetupPoll(", "wifiSetupCommand(", "wifiManagementCommand(", "wifiControlCommand(", "wifiManagementWithContext(", "wifiDeviceStatus(", "handleWifiManagement(", "servicePresence(", "storeUpsert(", "storeAuthenticate("):
         required.append(next((name for name in functions if name.startswith(prefix)), None))
 failed = False
 for name in required:
@@ -40,7 +40,7 @@ for name in required:
 # Scope is explicit: Wi-Fi module + Preferences/NVS frames present in this ELF.
 # Indirect platform/library calls and ISR stacks remain outside this subtotal.
 def local(name):
-    return name.startswith(("wifi", "Wifi", "readWifiStore(", "saveV2(", "save(Wifi", "Preferences::", "nvs_", "nvs::"))
+    return name.startswith(("wifi", "Wifi", "readWifiStore(", "saveV2(", "save(Wifi", "Preferences::", "nvs_", "nvs::", "store", "load(Endpoints", "save(Endpoints", "wifiDeviceStatus(", "handleWifiManagement(", "servicePresence("))
 
 def chain(name, seen=frozenset()):
     if name in seen or name not in functions or not local(name):

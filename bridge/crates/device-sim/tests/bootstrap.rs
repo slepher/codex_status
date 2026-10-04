@@ -14,6 +14,7 @@ use std::{
 const ENDPOINT: &str = "endpoint-test-secret";
 const DEVICE: &str = "device-test-secret";
 const CONTROL: &str = "control-test-secret";
+static BLE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 
 struct Simulator {
@@ -33,10 +34,12 @@ impl Simulator {
         command
             .args(["--listen", "127.0.0.1:0", "--mac", mac, "--data-dir"])
             .arg(&data_dir)
-            .args(extra)
+            .args(extra.iter().filter(|arg|**arg!="--wifi-unified-test"))
             .env("CODEX_STATUS_SIM_ENDPOINT_TOKEN", ENDPOINT)
             .env("CODEX_STATUS_SIM_DEVICE_TOKEN", DEVICE)
             .env("CODEX_STATUS_SIM_CONTROL_TOKEN", CONTROL)
+            .env("CODEX_STATUS_SIM_WIFI_PROTOCOL",if extra.contains(&"--wifi-unified-test") {"3"}else{"2"})
+            .env("CODEX_STATUS_SIM_WIFI_PRINCIPAL","bridge-test")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = command.spawn().expect("start simulator");
@@ -1654,6 +1657,7 @@ fn timer_ble_rendezvous_accepts_formal_plan_before_http_opens() {
 
 #[test]
 fn bridge_device_connection_uses_fake_ble_without_os_radio() {
+    let _env_guard=BLE_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let sim = Simulator::start("02:00:00:00:00:3B", &[]);
     assert_eq!(set_time(&sim, Some(CONTROL),
         &serde_json::json!({"op":"rate","rate_ppm":0})).0, 200);
@@ -2855,6 +2859,7 @@ fn instance_identity_rejects_mac_conflict_and_corrupt_owner_file() {
 
 #[test]
 fn wifi_jobs_use_production_hal_real_ble_ack_and_query_after_lost_http_ack() {
+    let _env_guard=BLE_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     use bridge_core::platform::{service::PlatformService, model::{DeviceIdentity,DeviceCapabilities}};
     use std::collections::BTreeMap;
     let mac = "02000000004A";
@@ -2913,6 +2918,7 @@ fn wifi_jobs_use_production_hal_real_ble_ack_and_query_after_lost_http_ack() {
 
 #[test]
 fn wifi_fake_full_projection_freezes_pages_and_preserves_bond_legacy_and_atomic_rejects() {
+    let _env_guard=BLE_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mac="02000000004B";let sim=Simulator::start(mac,&[]);let address=sim.address().to_string();
     assert_eq!(request(sim.address(),"POST","/sim/wifi",Some(CONTROL),br#"{"maintenance_ms":120000,"legacy":[{"network_id":"legacy-0","ssid":"USB-AP"},{"network_id":"legacy-1","ssid":"Second-AP"}]}"#).0,200);
     std::env::set_var("CODEX_STATUS_SIM_BLE_ENDPOINTS",serde_json::json!({mac:format!("http://{}",sim.address())}).to_string());
@@ -2948,7 +2954,7 @@ fn wifi_fake_full_projection_freezes_pages_and_preserves_bond_legacy_and_atomic_
         let reply=link.command("wifi_authorize",serde_json::json!({})).await.unwrap();
         // A new generation cannot consume a stale ACK; the original raw bytes
         // are still subject to the same attribute capacity guard.
-        link.close().await;reply["permit"].as_str().unwrap().to_owned()
+        link.close().await;assert_eq!(reply["ok"],true,"{}",reply["error"]);reply["permit"].as_str().unwrap().to_owned()
     });
     let foreign=bridge_core::device_client::wifi_snapshot(&address,ENDPOINT,mac,"other-installation",Some(&second),Duration::from_secs(3)).unwrap();
     assert!(foreign.networks.iter().all(|n|!n.writable));
@@ -2968,6 +2974,7 @@ fn wifi_fake_full_projection_freezes_pages_and_preserves_bond_legacy_and_atomic_
 
 #[test]
 fn wifi_bounded_recovery_and_history_share_production_bytes_and_keep_display() {
+    let _env_guard=BLE_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mac="02000000004C";let sim=Simulator::start(mac,&[]);
     assert_eq!(request(sim.address(),"POST","/sim/wifi",Some(CONTROL),br#"{"maintenance_ms":120000}"#).0,200);
     let before=request(sim.address(),"GET","/sim/frame",Some(CONTROL),b"").1;
@@ -3056,4 +3063,86 @@ fn rendezvous_audit_sync_completion_closes_window_before_wifi_snapshot() {
     let after = bridge_core::device_client::wifi_snapshot(&ip,ENDPOINT,mac,"bridge-test",None,Duration::from_millis(250));
     assert!(after.is_err(),"the closed HTTP surface must reject a following snapshot");
     eprintln!("CONFIRMED: snapshot succeeds before sync_complete and fails afterwards without a formal light window.");
+}
+
+#[test]
+fn unified_usb_http_without_ble_survives_bridge_restart_lost_ack_and_receipt_retirement() {
+    use bridge_core::platform::{service::PlatformService,model::{DeviceIdentity,DeviceCapabilities}};
+    use std::collections::BTreeMap;
+    let mac="0200000000C1";let mut sim=Simulator::start(mac,&["--wifi-unified-test"]);let address=sim.address().to_string();
+    assert_eq!(request(sim.address(),"POST","/sim/power",Some(CONTROL),br#"{"plugged":true}"#).0,200);
+    assert_eq!(claim(&sim,"id=bridge-test",Some(DEVICE)).0,200);
+    let root=temp_data_dir();let svc=PlatformService::open(&root).unwrap();
+    svc.device_upsert(DeviceIdentity::new(mac,"Unified fake").unwrap(),DeviceCapabilities::ssd1681_154g()).unwrap();
+    let status=bridge_core::device_client::status(&address,ENDPOINT,Duration::from_secs(3)).unwrap();
+    assert_eq!(status["wifi_management"],3);assert_eq!(status["wifi_control"]["mode"],"continuous");assert_eq!(status["wifi_control"]["write_allowed"],true);
+    svc.note_authenticated_status_at(mac,&status,100).unwrap();
+    let matched=bridge_core::device_client::wifi_command(&address,ENDPOINT,mac,"bridge-test","match",status["session_nonce"].as_str().unwrap(),serde_json::json!({"network_id":"missing","open":true,"metadata_key":"0".repeat(64)}),Duration::from_secs(3)).unwrap();
+    assert_eq!(matched["ok"],true,"read-only HTTP setup command needs its own correlation ID");
+    assert_eq!(matched["version"],0);
+    let read=svc.wifi_queue(mac,"bridge-test","read",vec![],100).unwrap();
+    let transport=|op:&str,body:Value| {
+        if op=="snapshot" {Ok(serde_json::to_value(bridge_core::device_client::wifi_snapshot(&address,ENDPOINT,mac,"bridge-test",None,Duration::from_secs(3))?)?)}
+        else {bridge_core::device_client::wifi_command(&address,ENDPOINT,mac,"bridge-test",op,status["session_nonce"].as_str().unwrap(),body,Duration::from_secs(3))}
+    };
+    assert_eq!(svc.wifi_attempt(mac,&read.job_id,None,&BTreeMap::new(),101,transport).unwrap().unwrap().state,"completed");
+    let targets=serde_json::from_value(serde_json::json!([{"network_id":"home","host_ssid":"Host5G","ssid":"Device2G","credential":"open"}])).unwrap();svc.wifi_save(mac,0,targets,102).unwrap();
+    let job=svc.wifi_queue(mac,"bridge-test","sync",vec!["home".into()],103).unwrap();assert!(job.request_id.starts_with("w3_"));
+    assert_eq!(request(sim.address(),"POST","/sim/wifi",Some(CONTROL),br#"{"drop_http_ack":true}"#).0,200);
+    assert_eq!(svc.wifi_attempt(mac,&job.job_id,Some("authenticated_http"),&BTreeMap::new(),104,transport).unwrap().unwrap().state,"awaiting_confirmation");
+    drop(svc);let svc=PlatformService::open(&root).unwrap();let mut calls=vec![];
+    let done=svc.wifi_attempt(mac,&job.job_id,None,&BTreeMap::new(),110,|op,body|{calls.push(op.to_owned());transport(op,body)}).unwrap().unwrap();
+    assert_eq!(done.state,"completed");assert!(done.receipt_ack_pending);assert_eq!(calls,["result"]);
+    {
+        let _env_guard=BLE_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("CODEX_STATUS_SIM_BLE_ENDPOINTS",serde_json::json!({mac:format!("http://{}",sim.address())}).to_string());
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut link=bridge_ble::DeviceConnection::connect(mac,ENDPOINT,"bridge-test").await.unwrap().unwrap();assert_eq!(link.info["wifi_management"],3);
+            link.write_endpoint("127.0.0.1",8765,ENDPOINT).await.unwrap();
+            let full=link.wifi_read("wifi_status").await.unwrap();assert_eq!(full["presence"]["mode"],"continuous");
+            assert_eq!(link.command("wifi_result",serde_json::json!({"query_id":job.request_id})).await.unwrap()["outcome"],"committed");
+            let snapshot=link.wifi_snapshot().await.unwrap();assert_eq!(snapshot["revision"],1);assert_eq!(snapshot["networks"].as_array().unwrap().len(),1);
+            link.close().await;
+        });
+        std::env::remove_var("CODEX_STATUS_SIM_BLE_ENDPOINTS");
+    }
+    assert_eq!(transport("result_ack",serde_json::json!({"query_id":job.request_id})).unwrap()["outcome"],"retired");svc.wifi_receipt_acked(mac,&job.job_id).unwrap();
+    let redundant=svc.wifi_queue(mac,"bridge-test","sync",vec!["home".into()],120).unwrap();
+    let confirmed=svc.wifi_confirm_current(mac,&redundant.job_id,1,&BTreeMap::from([("home".into(),1)]),121).unwrap();
+    assert_eq!(confirmed.request_id,redundant.request_id);assert!(!confirmed.sent && !confirmed.receipt_ack_pending);assert_eq!(confirmed.confirmation.as_deref(),Some("verified_post_state"));assert!(!svc.wifi_state(mac).snapshot.as_ref().unwrap().complete);
+    let old=serde_json::json!({"request_id":job.request_id,"expected_revision":1,"changes":[{"network_id":"home","host_ssid":"Host5G","ssid":"Device2G","credential":"open"}]});
+    assert_eq!(transport("apply",old.clone()).unwrap()["error"],"request_retired");
+    sim.stop_preserving_data();let restarted=Simulator::start_with_dir(mac,&["--wifi-unified-test"],sim.data_dir.clone(),true);
+    let recovered=bridge_core::device_client::status(&restarted.address().to_string(),ENDPOINT,Duration::from_secs(3)).unwrap();
+    assert_eq!(bridge_core::device_client::wifi_command(&restarted.address().to_string(),ENDPOINT,mac,"bridge-test","apply",recovered["session_nonce"].as_str().unwrap(),old,Duration::from_secs(3)).unwrap()["error"],"request_retired");
+    // Principal cannot select a namespace in the request.
+    assert_eq!(bridge_core::device_client::wifi_command(&restarted.address().to_string(),ENDPOINT,mac,"other","result","",serde_json::json!({"query_id":job.request_id,"bond":"arbitrary"}),Duration::from_secs(3)).unwrap()["error"],"principal_mismatch");
+    let _=fs::remove_dir_all(root);
+}
+
+#[test]
+fn new_wifi_sync_with_old_snapshot_reports_real_device_revision_rejection() {
+    use bridge_core::platform::{service::PlatformService,model::{DeviceIdentity,DeviceCapabilities}};
+    use std::collections::BTreeMap;
+    let mac="0200000000C2";let sim=Simulator::start(mac,&["--wifi-unified-test"]);let address=sim.address().to_string();
+    assert_eq!(request(sim.address(),"POST","/sim/power",Some(CONTROL),br#"{"plugged":true}"#).0,200);
+    assert_eq!(claim(&sim,"id=bridge-test",Some(DEVICE)).0,200);
+    let status=bridge_core::device_client::status(&address,ENDPOINT,Duration::from_secs(3)).unwrap();
+    let root=temp_data_dir();let svc=PlatformService::open(&root).unwrap();svc.device_upsert(DeviceIdentity::new(mac,"Stale cache fake").unwrap(),DeviceCapabilities::ssd1681_154g()).unwrap();
+    let read=svc.wifi_queue(mac,"bridge-test","read",vec![],100).unwrap();
+    let snapshot=bridge_core::device_client::wifi_snapshot(&address,ENDPOINT,mac,"bridge-test",None,Duration::from_secs(3)).unwrap();assert_eq!(snapshot.revision,0);
+    svc.wifi_complete_read(mac,&read.job_id,snapshot,100).unwrap();
+    let transport=|op:&str,body:Value|bridge_core::device_client::wifi_command(&address,ENDPOINT,mac,"bridge-test",op,status["session_nonce"].as_str().unwrap(),body,Duration::from_secs(3));
+    let external=transport("apply",serde_json::json!({"request_id":"external-config","expected_revision":0,"changes":[{"network_id":"home","host_ssid":"Host","ssid":"External","credential":"open"}]})).unwrap();assert_eq!(external["revision"],1);
+    svc.wifi_save(mac,0,serde_json::from_value(serde_json::json!([{"network_id":"home","host_ssid":"Host","ssid":"Desired","credential":"open"}])).unwrap(),101).unwrap();
+    let job=svc.wifi_queue(mac,"bridge-test","sync",vec!["home".into()],102).unwrap();assert_eq!(job.expected_revision,Some(0));assert!(!job.sent);
+    let result=svc.wifi_attempt(mac,&job.job_id,Some("authenticated_http"),&BTreeMap::new(),103,|op,body| {
+        assert_eq!(op,"apply");assert_eq!(body["expected_revision"],0);let reply=transport(op,body)?;assert_eq!(reply["error"],"revision_conflict");Ok(reply)
+    }).unwrap().unwrap();
+    assert_eq!(result.state,"conflict");assert_eq!(result.error_code.as_deref(),Some("revision_conflict"));assert!(!result.sent&&!result.may_have_committed);assert!(!result.runnable(200));
+    assert!(svc.wifi_attempt(mac,&job.job_id,None,&BTreeMap::new(),200,|_,_|panic!("terminal refusal must not poll forever")).unwrap().is_none());
+    assert_eq!(svc.wifi_state(mac).snapshot.unwrap().revision,0);assert_eq!(svc.wifi_state(mac).targets[0].ssid,"Desired");
+    let fresh=bridge_core::device_client::status(&address,ENDPOINT,Duration::from_secs(3)).unwrap();
+    assert_eq!(fresh["wifi_storage"]["revision"],1);assert!(fresh["status_seq"].as_u64().unwrap()>status["status_seq"].as_u64().unwrap());
+    let _=fs::remove_dir_all(root);
 }

@@ -177,6 +177,25 @@
 
 ### B6. 离线 BLE 配 Wi-Fi 与 BOOT 蓝牙恢复入口（2026-10-03 新开）
 
+- **2026-10-05新事务旧缓存冲突反馈已修复部署**：用户取消a7efde70624b7097后，认证read取得revision3、新sync83cecdbef6a0e7c6以3提交4/durable_receipt，真实WFS4迁移成功。App发送前revision冲突明确conflict/revision_conflict、停止自动调度，不apply、不自动覆盖缓存；UI提示重新读取并保留Bridge编辑。Fake补真实生产wifi_storage状态/修订序号，新增App预检、设备拒绝和UI完整失败链路red→green；262 passed/1ignored、Node及WK48通过，窄宽截图已审阅。默认Bridge B3AC01D2…F6C7D9/38549/health204，身份/数据/成功任务保留；AGENTS.md写入任何请求包含失败必须明确返回。ROM仍.61未重刷，无另建实机任务；旧IDretired不证明旧请求成功，完整RF/电池/BOOT/命名实例/掉电容量仍开放。最新证据及备份见PROGRESS顶节/执行文档。
+
+- **2026-10-05 USB常驻发送预算及HTTP读回信封修复已部署**：continuous/sent-query不再引用旧sync0截止；明确零发送与部分发送超时区分，避免新任务误标远端可能生效；HTTP setup只读关联ID补齐，写事务ID不变。三个生产seam red→green，受影响260 passed/1ignored。默认Bridge D6DC32B2…13FA2AD/35567，实机USB/BLE OFF现场与重启后原ID认证HTTP查询200已验，错误从window_budget_exhausted转为receipt_unknown。当前a7efde70624b7097/w3_0000000000000010仍awaiting_confirmation，slot0目标未匹配；用户未选择取消重建，保留原任务。绑定read/write有效，.61 ROM未重刷；软件修复不代表当前同步已完成或B6全部实体验收闭环。证据见执行文档/PROGRESS最新节。
+
+
+- **2026-10-04 Astra medium一次审核已完成，设计已修订/待实现**：[审核](../../project-workflow/bridge-macos/wifi-unified-protocol-review.md)。补peer+principal token双证明、旧namespace不共享授权；激活pending/active/完成回执原子边界，RAM trial重启无终态如实未知；去掉BLE连接断开取消普通任务，恢复旧网同期限；区分8身份关联、3 namespace/12配置、8回执。用户已选择BOOT严格权限：只提供合法绑定/身份修复，保存/试连/启用先claim、他人owner拒绝。设计第3/4/7/8节已收口，代码与实体矩阵未实现，不结B6。
+
+- **2026-10-05统一协议已配套部署，原任务实体闭环待系统权限**：U0 WFS4高水位/确认退役、U1–U5共享身份/命令、HTTP优先、BLE适配与在线通知/UI已实施；最终275 Rust/Fake、C++ sanitizer、JS、WK46场景和真实Note4 ELF栈门禁通过。最终默认Bridge B65A64FE…F24D60及Note4 .61已部署，OTA a9811cd3 succeeded/image_verified、独立运行hash匹配578EEDE7…703E3F4。原f287ac24cd546159保留ID/sent=false，合法绑定修复实际受bluetooth_permission_required阻挡，已请求用户对最终app授权；原revision1→设备3只做完整冻结意图认证核对，不强制覆盖。详见[wifi-unified-protocol-execution.md](../../project-workflow/bridge-macos/wifi-unified-protocol-execution.md)。USB+BLE OFF/light0+Bridge重启原任务闭环及完整RF/电池/命名实例/掉电容量矩阵仍待实机验收，B6不结项。
+- **2026-10-04统一协议设计依据**：[设计稿](../../project-workflow/bridge-macos/wifi-unified-protocol-design.md)。USB插入/BOOT/Bridge主动激活共用DeviceStatus、在线事件和倒计时；认证/api/status区分continuous/window及通道ready，USB正式light剩余0不误挡。HTTP优先直接管理，BLE回退；长期principal关联、owner/即时可用性替代BLE临时permit前置，跨通道事务/回执恢复。定向通知覆盖命名实例，丢通知/Bridge重启需补查；深睡无接收机会不伪造远程在线。现行HTTP OTA已实机证明保留。按U1–U6实施并验USB/BOOT/主动激活/Bridge重启/丢ACK/电池期限/身份迁移/资源矩阵；本轮仅文档，无软件或ROM部署，不标记B6完成。
+
+- **2026-10-04 USB常驻写许可缺口已定位，待修复**：plugged=true/deep_usb0、BLE交接后关闭，HTTP正式Plan仍更新；Bridge短时permit仅BLE签发/缓存，重启或过期后HTTP机会无法补取。任务f287ac24cd546159持续window_required/sent=false（22:02:54第14次），等待自然会合无法保证USB常驻下前进。需补USB常驻获取有效绑定写许可与重启/过期/同窗回归，不能用拔USB/改deep_usb替代正常流程，不能绕过bond/owner/窗口期限；现场与源码链见PROGRESS最新节和wifi-task-time-usb-status.json。
+
+- **2026-10-04任务可观察性补充已部署**：当前Wi-Fi任务和执行记录显示完整创建时间，JS/WK42/窄宽截图通过。真实同步f287ac24cd546159创建21:48:32，仍window_required且sent=false；可达HTTP没有证明有效写许可，许可取得/实际同步完成仍需现场确认。本次只读核查与UI展示未取消/重发任务或改网，证据见PROGRESS最新节。
+
+- **2026-10-04同步来源独立修复已部署**：修正来源writable禁用回传checkbox及同步后同ID来源混入比较/再次导入的设计偏差；导入Bridge配置独立编辑/保存，目标本机版本用于后续比较。新增设备→Bridge→编辑保存→设备完整点击与Rust服务往返red→green，覆盖本机/其他来源和确认后再次导入；core120/app66（1ignored）/JS/WK42与生产C++管理内存检查通过，窄宽截图已审阅。部署数据rev13/两目标/快照/基线保留，无需重导；WK合成IPC与Rust stub不替代真实设备端到端/RF验收。证据与备份见PROGRESS最新节，B6仍开放。
+
+- **2026-10-04导入编辑/一步保存修复已部署**：用户澄清导入后即为Bridge可编辑配置，保留原标识；源设备bond/writable仅管设备操作，不延续为本地只读。编辑表单一次手动正式保存，取消加入草稿和外部按钮，输入不自动保存；按钮旁显示保存进度/结果，失败保修改。旧origin在显式保存时规范为local。生产HTML VM/WK取得red→green，补设备只读导入真实Rust import/save/restart与缺permit拒绝回归；checkbox原生尺寸/文字对齐另有WK几何red→green。部署状态见PROGRESS最新节；不代表真实改网/RF矩阵通过。
+
+
 - **2026-10-04变长存储/AP与USB收归已提交并部署，真实WFS3迁移已验**：[设计与资源验收](../../project-workflow/bridge-macos/wifi-variable-storage.md)。WFS3显式头/字段记录长度/CRC、实际条目与字符串按需RAM、单一仓库及堆候选，活动同版引用/旧凭据最小快照；旧WFZ2/raw-v2/v1验证迁移后退役scheme，保留读取恢复代码。AP/USB不再写sN/pN，认证JSONapply/result共用permit/owner/修订/回执，不伪造bond或保存即激活。生产C++三套内存检查、core12/app8/device-sim5及旧恢复通过；唯一Note4候选.55、栈门禁与资源预算已具备，空/典型两条两回执/满容量格式33/387/5036B，存储峰值组件预算最高22436B。用户明确授权后源码f8426cb已提交，OTA bfd4e115 succeeded/image_verified；Note4运行.55/ota_0，独立镜像hash匹配3A552561…642FF。真实迁移WFS3 ready/249B/2条/0回执/旧scheme退役，后续深睡启动仍加载；Bridge健康与缓存不变。AP/USB真实写入与Flash掉电、RF/功耗/跨平台/兼容代码最终移除独立留项，不结B6。
 
 - **2026-10-04页面手动同步校验已实现/部署**：仅比较页Bridge→设备同步允许删除原方案，但缓存合并结果须保留当前环境host_ssid→设备2.4GHz映射，否则阻止预览/提交。预览冻结主机网络、本地版本、快照与所选项，服务原子复核；不自动扩大范围/切网/试连。自动配网、程序化MCP同步、本地保存和缓存导入不受此守卫影响。最终范围隔离回归通过；详见[实施及验收记录](../../project-workflow/bridge-macos/wifi-rendezvous-implementation.md)。

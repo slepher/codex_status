@@ -3499,6 +3499,36 @@ mod ble_close_lock_tests {
         assert!(delivery_lock(&ctx,HUNG_MAC).try_lock().is_ok());
     }
 
+    #[tokio::test(flavor="multi_thread",worker_threads=2)]
+    async fn fresh_sync_from_stale_cache_ends_as_conflict_before_sending() {
+        let calls=Arc::new(Mutex::new(Vec::<String>::new()));
+        let app=Router::new().route("/api/status",get(||async {Json(json!({"device_mac":HUNG_MAC,"wifi_management":3,"boot_id":"stale-cache-test","uptime_ms":100,
+            "session_nonce":"00112233445566778899aabbccddeeff","status_seq":1,"owner_id":"bridge-lock-repro",
+            "wifi_control":{"mode":"continuous","read_allowed":true,"write_allowed":true},"wifi_storage":{"revision":3},
+            "power":{"remaining_s":0},"sync":{"remaining_ms":0}}))}))
+            .route("/api/wifi/command",post(|State(calls):State<Arc<Mutex<Vec<String>>>>,Json(body):Json<Value>|async move {
+                let op=body["op"].as_str().unwrap().to_owned();calls.lock().unwrap().push(op.clone());
+                Json(if op=="match" {json!({"ok":true,"device_mac":HUNG_MAC,"network_id":body["network_id"],"matches":false,"version":3})}
+                    else {json!({"ok":false,"device_mac":HUNG_MAC,"error":"revision_conflict"})})
+            })).with_state(calls.clone());
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let ip=listener.local_addr().unwrap().to_string();
+        let server=tokio::spawn(async move {let _=axum::serve(listener,app).await;});
+        let dir=tempfile::tempdir().unwrap();let ctx=test_ctx_with_ip(dir.path(),HUNG_MAC,&ip);let svc=service(&ctx);let now=device_now(HUNG_MAC);
+        let read=svc.wifi_queue(HUNG_MAC,&ctx.bridge_id,"read",vec![],now).unwrap();
+        svc.wifi_complete_read(HUNG_MAC,&read.job_id,serde_json::from_value(json!({"schema":2,"device_mac":HUNG_MAC,"revision":1,"snapshot_id":"old-cache",
+            "complete":true,"observed_at":now,"capacity":{"total":12},"networks":[]})).unwrap(),now).unwrap();
+        let targets=serde_json::from_value(json!([{"network_id":"home","host_ssid":"Host","ssid":"Desired","credential":"open"}])).unwrap();
+        svc.wifi_save(HUNG_MAC,0,targets,now).unwrap();let job=svc.wifi_queue(HUNG_MAC,&ctx.bridge_id,"sync",vec!["home".into()],now).unwrap();
+        assert!(!job.sent);assert_eq!(job.expected_revision,Some(1));
+        crate::wifi::opportunity(&ctx,HUNG_MAC).await;
+        let result=svc.wifi_state(HUNG_MAC).jobs.into_iter().find(|j|j.job_id==job.job_id).unwrap();
+        assert_eq!(result.state,"conflict");assert_eq!(result.error_code.as_deref(),Some("revision_conflict"));assert!(!result.sent && !result.may_have_committed);
+        assert_eq!(*calls.lock().unwrap(),vec!["match"],"known stale cache must stop before mutation");
+        assert_eq!(svc.wifi_state(HUNG_MAC).snapshot.unwrap().revision,1,"no implicit full config refresh");
+        assert_eq!(svc.wifi_state(HUNG_MAC).targets[0].ssid,"Desired");
+        assert_eq!(result.request_id,job.request_id);assert!(!result.runnable(now+600));server.abort();
+    }
+
     #[tokio::test]
     async fn wifi_cached_import_is_local_and_checks_the_selected_snapshot() {
         for op in ["import", "read_import"] {

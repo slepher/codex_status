@@ -25,6 +25,8 @@ window.__wifiUiScenario = async function(scenario) {
     fields:[{field:'ssid',bridge:'Home-2G',device:'Old-2G',conflict:false}]}];
   wifiSelections.clear(); wifiPreview = null;
   $('wifi-target').textContent = 'Note4 · ' + mac;
+  wifiRenderOnline({observed_at:Date.now()/1000,presence:{mode:'continuous',remaining_ms:null,reasons:['usb']},transports:{http:{ready:true},ble:{ready:false}},wifi_control:{write_allowed:true}});
+  check($('wifi-online').textContent.includes('USB 常驻在线') && $('wifi-online').textContent.includes('BLE 关闭'),'Missing independent transport availability');
   $('wifi-auto').textContent = scenario==='empty'?'活动网络未知 · 自动选网使用已确认映射':'活动网络 Home-2G · 自动选网使用已确认映射';
   $('wifi-times').textContent = scenario==='empty'?'Bridge 尚无目标 · 尚未读取完整设备方案':'Bridge 已保存 · 设备完整快照 r7';
   wifiShowHost({state:scenario === 'empty' ? 'permission_required' : 'connected',networks:[{ssid:'Home-5G'}]});
@@ -112,14 +114,25 @@ window.__wifiUiScenario = async function(scenario) {
   } else if (scenario === 'compare') {
     $('wifi-tab-compare').click();
     check(!$('wifi-sync-submit').disabled,'Preview should enable scoped sync');
+  } else if (scenario === 'stale-cache') {
+    wifiState.jobs=[{job_id:'fresh-stale-job',device_mac:mac,kind:'sync',state:'conflict',attempt_count:0,
+      last_stage:'accepted',error_code:'revision_conflict',created_at:now,may_have_committed:false}];
+    wifiRenderJobs();wifiShowResult(wifiState.jobs[0]);$('wifi-job-history').open=true;
+    check($('wifi-current-jobs').textContent.includes('需处理冲突'),'Missing terminal conflict');
+    check($('wifi-current-jobs').textContent.includes('缓存已过期') && $('wifi-current-jobs').textContent.includes('重新读取设备'),'Missing actionable stale-cache feedback');
+    check(!$('wifi-current-jobs').textContent.includes('待确认'),'Rejected new job must not remain pending');
+    check($('wifi-result').textContent.includes('Bridge 配置已保留'),'Local edits must stay preserved');
   } else if (scenario === 'waiting' || scenario === 'error') {
     wifiState.jobs=[{job_id:'fixture-job',device_mac:mac,kind:'read',state:scenario === 'waiting' ? 'waiting_rendezvous' : 'failed',
       attempt_count:1,last_stage:'connecting',error_code:scenario === 'error' ? 'unsupported' : '',
-      expires_at:now+86400,last_attempt_at:now-60}];
+      created_at:1791121712,expires_at:now+86400,last_attempt_at:now-60}];
     wifiRenderJobs();
     wifiShowResult({job_id:'fixture-job',state:wifiState.jobs[0].state,error_code:wifiState.jobs[0].error_code});
-    check($(scenario==='waiting'?'wifi-current-jobs':'wifi-jobs').textContent.includes(scenario === 'waiting' ? '等待下次真实会合' : '不支持'),'Missing task/error state');
+    check($(scenario==='waiting'?'wifi-current-jobs':'wifi-jobs').textContent.includes(scenario === 'waiting' ? '等待设备可用通道' : '不支持'),'Missing task/error state');
+    const taskText=$(scenario==='waiting'?'wifi-current-jobs':'wifi-jobs').textContent;
+    check(taskText.includes('创建时间 '+wifiCreatedTime(1791121712)),'Task creation timestamp missing');
     check(!$('wifi-job-history').open,'Execution history must default to collapsed');
+    if(scenario==='error')$('wifi-job-history').open=true;
   }
   if(scenario==='rename'||scenario==='delete') {
     window.__wifiTestState=structuredClone(wifiState);
@@ -128,7 +141,7 @@ window.__wifiUiScenario = async function(scenario) {
     check($('wifi-id').readOnly,'Existing row identifier must be read-only');
     if(scenario==='rename'){$('wifi-label').value='重新命名的网络';$('wifi-ssid').value='Renamed-2G';}
     else $('wifi-local').querySelectorAll('button')[2].click();
-    const save=document.querySelector('[onclick="wifiSaveLocal()"]');
+    const save=$('wifi-submit');
     check(save.getClientRects().length>0,'Save must remain visible for deletion');
     save.click();await wait();
     const targets=window.__wifiTestState.targets;
@@ -137,6 +150,86 @@ window.__wifiUiScenario = async function(scenario) {
     if(scenario==='rename')check(targets[0].label==='重新命名的网络'&&targets[0].ssid==='Renamed-2G','Rename lost changes');
     else {check(targets[0].deleted,'Editor resurrected deleted row');check($('wifi-local').textContent.includes('撤销删除'),'Deletion needs an undo action');}
     check(!window.__uiCalls.slice(callsBefore).some(c=>c.name==='platform_wifi'&&['get','sync','trial'].includes(c.args?.op)),'Local edit contacted device');
+  }
+  if(scenario==='roundtrip-own'||scenario==='roundtrip-other') {
+    const foreign=scenario==='roundtrip-other';
+    const remote={bond:foreign?'other':'own',writable:!foreign,network:{...structuredClone(network),password:foreign?undefined:network.password}};
+    const stored={local_revision:0,saved_at:100,targets:[],jobs:[],snapshot:{...structuredClone(wifiScheme),networks:[remote]}};
+    const differences=()=>[{network_id:'home',state:stored.targets.length?'bridge_changed':'device_only',writable:!foreign,
+      bridge:stored.targets[0]||null,device:stored.snapshot.networks.filter(r=>r.network.network_id==='home'),fields:[]}];
+    window.__wifiRoundtripInvoke=async(name,args)=>{
+      window.__uiCalls.push({name,args});check(name==='platform_wifi','Unexpected roundtrip IPC');
+      if(args.op==='view')return {wifi:structuredClone(stored),differences:differences(),host:{state:'connected',networks:[{ssid:network.host_ssid}]}};
+      if(args.op==='import'){stored.targets=[{...structuredClone(remote.network),origin:'local',credential:'device'}];stored.local_revision++;return structuredClone(stored);}
+      if(args.op==='save'){stored.targets=structuredClone(args.body.targets);stored.local_revision++;return structuredClone(stored);}
+      if(args.op==='sync'){
+        check(args.body.selected.length===1&&args.body.selected[0]==='home','Roundtrip selection lost identity');
+        check(stored.targets[0].label==='回传修改'&&stored.targets[0].password==='fixture-updated-pass','Sync did not use edited saved target');
+        const row={bond:'own',writable:true,network:{...structuredClone(stored.targets[0]),version:8}};
+        if(foreign)stored.snapshot.networks.push(row);else stored.snapshot.networks[0]=row;
+        return {job_id:'roundtrip-job',state:'completed'};
+      }
+      throw Error('Unexpected roundtrip operation '+args.op);
+    };
+    wifiDirty=false;wifiSelections.clear();wifiPreview=null;await wifiRefreshView();$('wifi-tab-compare').click();$('wifi-direction').value='import';wifiRenderComparison();
+    let box=$('wifi-compare').querySelector('input[type=checkbox]');check(!box.disabled,'Imported source must be selectable');box.click();
+    document.querySelector('[onclick="wifiPreviewSync()"]') .click();$('wifi-sync-submit').click();await wait();
+    check(stored.targets.length===1,'Device→Bridge click failed');
+    $('wifi-tab-bridge').click();$('wifi-local').querySelector('button').click();
+    $('wifi-label').value='回传修改';$('wifi-password').value='fixture-updated-pass';$('wifi-submit').click();await wait();
+    check(stored.targets.length===1&&stored.targets[0].network_id==='home','Editing changed imported identity');
+    $('wifi-tab-compare').click();$('wifi-direction').value='sync';wifiSelections.clear();wifiRenderComparison();
+    box=$('wifi-compare').querySelector('input[type=checkbox]');check(!box.disabled,'Saved imported target cannot be selected for Bridge→device');
+    box.click();check(wifiSelections.has('home'),'Real checkbox click failed to select the target');
+    document.querySelector('[onclick="wifiPreviewSync()"]') .click();check(!$('wifi-sync-submit').disabled,'Roundtrip preview blocked');
+    $('wifi-sync-submit').click();await wait();
+    check(stored.snapshot.networks.some(r=>r.writable&&r.network.label==='回传修改'),'Roundtrip failed to save into current binding');
+    if(foreign)check(stored.snapshot.networks[0].bond==='other'&&stored.snapshot.networks[0].network.label===network.label,'Roundtrip changed foreign source');
+    box=$('wifi-compare').querySelector('input[type=checkbox]');check(!box.disabled,'Own+foreign same ID blocked subsequent updates');
+    $('wifi-direction').value='import';wifiSelections.clear();wifiRenderComparison();
+    box=$('wifi-compare').querySelector('input[type=checkbox]');check(!box.disabled,'Source row blocked importing the current target after sync');
+    box.click();document.querySelector('[onclick="wifiPreviewSync()"]').click();check($('wifi-preview').textContent.includes('回传修改'),'Reimport preview used old source row');
+    $('wifi-direction').value='sync';$('wifi-direction').dispatchEvent(new Event('change',{bubbles:true}));
+    $('wifi-compare').querySelector('input[type=checkbox]').click();document.querySelector('[onclick="wifiPreviewSync()"]').click();
+    if(foreign)check(!$('wifi-compare').textContent.includes('其他绑定'),'Comparison still displays the obsolete source next to the current target');
+    window.__wifiRoundtripInvoke=null;
+  }
+  if(scenario==='delivery-alignment') {
+    const input=$('pt-sync'),label=input.closest('label');
+    const text=[...label.childNodes].find(n=>n.nodeType===Node.TEXT_NODE&&n.textContent.trim())||label.querySelector('span');
+    const range=document.createRange();range.selectNodeContents(text);
+    const a=input.getBoundingClientRect(),b=range.getBoundingClientRect();
+    check(Math.abs((a.top+a.bottom-b.top-b.bottom)/2)<=2,'Delivery checkbox and label text are not vertically aligned');
+    check(a.height<=20,'Text-field minimum height inflated native checkbox');
+    label.closest('.card').scrollIntoView({block:'start'});await wait();
+  }
+  if(scenario==='imported-edit'||scenario==='save-error') {
+    const original={...structuredClone(network),origin:'other-bond',credential:'device',password:undefined};
+    wifiState.targets=[original];wifiDraft=structuredClone(wifiState.targets);wifiDirty=false;
+    window.__wifiTestState=structuredClone(wifiState);wifiRenderLocal();
+    $('wifi-tab-bridge').click();
+    const edit=$('wifi-local').querySelector('button');
+    check(edit.textContent==='编辑','Imported Bridge target must offer direct editing');
+    const saveCalls=window.__uiCalls.filter(c=>c.name==='platform_wifi'&&c.args?.op==='save').length;
+    edit.click();await wait();
+    $('wifi-label').value='导入后修改的网络';$('wifi-password').value='fixture-new-pass';
+    check($('wifi-submit').textContent==='保存到 Bridge','Editor must provide one formal save action');
+    check(!document.querySelector('[onclick="wifiSaveLocal()"]'),'Outer save action must be removed');
+    check(window.__uiCalls.filter(c=>c.name==='platform_wifi'&&c.args?.op==='save').length===saveCalls,'Editing must not auto-save');
+    const save=$('wifi-submit');
+    window.__wifiSaveError=scenario==='save-error'?'fixture_save_failed':null;
+    save.click();await wait();window.__wifiSaveError=null;
+    const targets=window.__wifiTestState.targets;
+    if(scenario==='save-error') {
+      check(targets.length===1&&wifiDirty,'Failed save must retain edits without changing stored targets');
+      check($('wifi-save-result').textContent.includes('fixture_save_failed'),'Save error must be visible beside save button');
+    } else {
+      check(targets.length===1&&targets[0].origin==='local'&&targets[0].network_id===original.network_id,'Direct editing must retain row identity');
+      check(targets[0].label==='导入后修改的网络'&&targets[0].password==='fixture-new-pass','Saved imported target lost edits');
+      check($('wifi-save-result').textContent.includes('已保存'),'Save feedback missing beside button');
+    }
+    check(!window.__uiCalls.slice(callsBefore).some(c=>c.name==='platform_wifi'&&['get','sync','trial','current'].includes(c.args?.op)),'Local imported edit contacted device');
+    $('wifi-editor').scrollIntoView({block:'start'});await wait();
   }
   if(scenario.startsWith('current-')) {
     const kind=scenario.slice(8),state={missing:'no_mapping',connecting:'connecting',error:'connection_failed',ready:'connected',unreachable:'bridge_unreachable'}[kind];
@@ -159,6 +252,10 @@ window.__wifiUiScenario = async function(scenario) {
     check(!$('wifi-sync-submit').disabled,'Retained current mapping was rejected');
     wifiState.targets[0].deleted=true;wifiDifferences[0].bridge=wifiState.targets[0];wifiRenderComparison();wifiPreviewSync();$('wifi-preview').scrollIntoView({block:'center'});
   }
+  if(scenario==='online-usb'||scenario==='online-boot') {
+    wifiRenderOnline({observed_at:Date.now()/1000,presence:scenario==='online-usb'?{mode:'continuous',remaining_ms:null,reasons:['usb']}:{mode:'window',remaining_ms:120000,reasons:['boot']},transports:{http:{ready:true},ble:{ready:scenario==='online-boot'}},wifi_control:{write_allowed:true}});
+    check($('wifi-online').textContent.includes(scenario==='online-usb'?'USB 常驻在线':'BOOT 在线'),'Missing presence reason');
+  }
   await wait();
   const card = $('wifi-card'), bounds=card.getBoundingClientRect();
   check(card.scrollWidth <= card.clientWidth+1,'Wi-Fi card overflows horizontally');
@@ -168,7 +265,9 @@ window.__wifiUiScenario = async function(scenario) {
     check(r.left >= bounds.left-1 && r.right <= bounds.right+1,'Control exceeds Wi-Fi card: '+(node.id||node.textContent));
   }
   check(window.__uiErrors.length === 0,'JavaScript errors: '+window.__uiErrors.join('; '));
-  card.scrollIntoView({block:'start'});
+  if(scenario==='imported-edit'||scenario==='save-error')$('wifi-save-result').scrollIntoView({block:'center'});
+  else if(scenario==='waiting'||scenario==='error'||scenario==='stale-cache')$('wifi-current-jobs').closest('.wifi-tasks').scrollIntoView({block:'start'});
+  else (scenario==='delivery-alignment'?$('pt-sync').closest('.card'):card).scrollIntoView({block:'start'});
   await wait();
   return {scenario,width:innerWidth,visiblePanel:document.querySelector('.wifi-panel:not([hidden])').id,
     cardWidth:Math.round(bounds.width),backendCallsDuringTabSwitch:window.__uiCalls.length-callsBefore};

@@ -19,9 +19,10 @@ final class Runner: NSObject, WKNavigationDelegate {
         window.addEventListener('unhandledrejection',e=>window.__uiErrors.push(String(e.reason)));
         window.setInterval=()=>0;
         window.__TAURI__={core:{invoke:async(name,args)=>{
+          if(window.__wifiRoundtripInvoke)return window.__wifiRoundtripInvoke(name,args);
           window.__uiCalls.push({name,args});
           if(name==='platform_wifi'&&window.__wifiTestState){
-            if(args.op==='save'){window.__wifiTestState.targets=structuredClone(args.body.targets);window.__wifiTestState.local_revision++;return structuredClone(window.__wifiTestState);}
+            if(args.op==='save'){if(window.__wifiSaveError)throw window.__wifiSaveError;window.__wifiTestState.targets=structuredClone(args.body.targets);window.__wifiTestState.local_revision++;return structuredClone(window.__wifiTestState);}
             if(args.op==='view')return {wifi:structuredClone(window.__wifiTestState),differences:[],host:{state:'permission_required'}};
           }
           return {devices:[],profiles:[],templates:[],sources:[],jobs:[],plans:[],contexts:[]};
@@ -48,7 +49,7 @@ final class Runner: NSObject, WKNavigationDelegate {
                 var results: [Any] = []
                 for (width,height) in [(560,680),(1000,800)] {
                     window.setContentSize(NSSize(width:width,height:height))
-                    for scenario in ["empty","bridge","device","compare","waiting","error","permission-request","permission-settings","current-missing","current-connecting","current-error","current-ready","rename","delete","current-unreachable","sync-guard"] {
+                    for scenario in ["empty","bridge","device","compare","waiting","error","permission-request","permission-settings","current-missing","current-connecting","current-error","current-ready","rename","delete","current-unreachable","sync-guard","imported-edit","save-error","delivery-alignment","roundtrip-own","roundtrip-other","online-usb","online-boot","stale-cache"] {
                         let result = try await web.callAsyncJavaScript("return await window.__wifiUiScenario(name)",arguments:["name":scenario],in:nil,contentWorld:.page)
                         results.append(result ?? NSNull())
                         let config=WKSnapshotConfiguration()

@@ -3,6 +3,9 @@
 
 struct EndpointRec {
     String   mac;
+    String   principal;
+    String   identity;
+    String   nameSpace;
     String   host;
     uint16_t port = 0;
     String   token;
@@ -12,7 +15,9 @@ struct EndpointRec {
 
 int  storeCount();
 bool storeGet(int i, EndpointRec &rec);
-void storeUpsert(const String &mac, const String &host, uint16_t port, const String &token);
+const char *storeUpsert(const String &mac, const String &host, uint16_t port, const String &token,
+                        const String &principal, const String &identity, const String &newNamespace, bool physical);
+bool storeAuthenticate(const String &token, EndpointRec &rec);
 void storeTouch(const String &mac);
 void storeSetBssid(const String &mac, const String &bssid);
 void storeClear();

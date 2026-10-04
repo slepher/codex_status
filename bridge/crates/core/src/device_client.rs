@@ -641,7 +641,7 @@ mod tests {
 /// It never claims ownership or sends a PowerPlan.
 pub fn wifi_request(ip: &str, token: &str, mac: &str, bridge: &str, op: &str,
                     mut body: Value, timeout: Duration) -> Result<Value> {
-    if !matches!(op, "snapshot" | "apply" | "result") { bail!("invalid_wifi_operation"); }
+    if !matches!(op, "snapshot" | "apply" | "result" | "result_ack") { bail!("invalid_wifi_operation"); }
     let compact = DeviceIdentity::normalized_mac(mac).context("invalid_device_mac")?;
     let wire_mac = compact.as_bytes().chunks(2).map(|p| std::str::from_utf8(p).unwrap()).collect::<Vec<_>>().join(":");
     body["device_mac"] = json!(wire_mac); body["bridge_id"] = json!(bridge);
@@ -651,6 +651,21 @@ pub fn wifi_request(ip: &str, token: &str, mac: &str, bridge: &str, op: &str,
         if reply["error"] == "occupied" { bail!("occupied"); }
         bail!("wifi_mac_mismatch");
     }
+    Ok(reply)
+}
+
+/// New control transport, same identity and transaction envelope as GATT.
+pub fn wifi_command(ip:&str,token:&str,mac:&str,bridge:&str,op:&str,nonce:&str,mut body:Value,timeout:Duration)->Result<Value> {
+    let compact=DeviceIdentity::normalized_mac(mac).context("invalid_device_mac")?;
+    // Setup reads share the GATT correlation envelope. Mutation IDs must always
+    // come from the durable job; never generate a new transaction here.
+    if body["request_id"].is_null() && matches!(op,"match"|"active"|"setup_status"|"scheme_get") {
+        body["request_id"]=json!(format!("query-{op}-{:08x}",crc32fast::hash(&crate::template::canonical_bytes(&body))));
+    }
+    body["device_mac"]=json!(compact.as_bytes().chunks(2).map(|p|std::str::from_utf8(p).unwrap()).collect::<Vec<_>>().join(":"));
+    body["bridge_id"]=json!(bridge);body["op"]=json!(op);body["protocol"]=json!(2);body["session_nonce"]=json!(nonce);
+    let reply=post_json(ip,"/api/wifi/command",token,&body,timeout)?;
+    anyhow::ensure!(reply["device_mac"].as_str().and_then(DeviceIdentity::normalized_mac).as_deref()==Some(compact.as_str()),"wifi_mac_mismatch");
     Ok(reply)
 }
 

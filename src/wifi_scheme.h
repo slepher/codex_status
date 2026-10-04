@@ -106,12 +106,29 @@ struct WifiSchemes {
     bool valid() const { return networks.valid() && selectedBond.valid() && selectedId.valid(); }
 };
 struct WifiReceipt {
-    WifiText bridge, request, bond, error;
+    WifiText bridge, request, bond, error, operation, target;
+    uint64_t targetVersion=0;
     uint8_t hash[32] = {};
     uint64_t revision = 0;
-    bool valid() const { return bridge.valid() && request.valid() && bond.valid() && error.valid(); }
-    size_t heapBytes() const { return bridge.bytes()+request.bytes()+bond.bytes()+error.bytes(); }
+    bool valid() const { return bridge.valid() && request.valid() && bond.valid() && error.valid() && operation.valid() && target.valid(); }
+    size_t heapBytes() const { return bridge.bytes()+request.bytes()+bond.bytes()+error.bytes()+operation.bytes()+target.bytes(); }
 };
+struct WifiCursor {
+    WifiText bridge, bond;
+    uint64_t high = 0;
+    bool valid() const { return bridge.valid() && bond.valid(); }
+    size_t heapBytes() const { return bridge.bytes()+bond.bytes(); }
+};
+// Only canonical sequence IDs are retireable; arbitrary legacy IDs stay retained.
+static uint64_t wifiRequestSequence(const char *id) {
+    if (strlen(id)!=19 || strncmp(id,"w3_",3)) return 0;
+    uint64_t sequence=0;
+    for (size_t i=3;i<19;++i) {
+        char c=id[i]; if (!((c>='0'&&c<='9')||(c>='a'&&c<='f'))) return 0;
+        sequence=(sequence<<4)|(c<='9'?c-'0':c-'a'+10);
+    }
+    return sequence;
+}
 struct WifiStore {
     WifiSchemes schemes;
     // Only bond/id are retained for an unedited active row. Before editing or
@@ -119,6 +136,7 @@ struct WifiStore {
     WifiNetwork active;
     uint64_t revision = 0, activeVersion = 0;
     WifiRows<WifiReceipt> receipts;
+    WifiRows<WifiCursor> cursors;
     const WifiNetwork *activeCredentials() const {
         int slot = schemes.find(active.bond, active.id);
         return slot >= 0 && schemes.networks[slot].version == activeVersion ? &schemes.networks[slot] : &active;
@@ -133,10 +151,12 @@ struct WifiStore {
         if (slot >= 0) { active.bond.set(schemes.networks[slot].bond); active.id.set(schemes.networks[slot].id); }
         activeVersion = slot >= 0 ? schemes.networks[slot].version : 0;
     }
-    bool valid() const { return schemes.valid() && active.valid() && receipts.valid(); }
+    bool valid() const { return schemes.valid() && active.valid() && receipts.valid() && cursors.valid(); }
     size_t heapBytes() const {
         size_t bytes = schemes.networks.size()*sizeof(WifiNetwork)+receipts.size()*sizeof(WifiReceipt)+active.heapBytes()+schemes.selectedBond.bytes()+schemes.selectedId.bytes();
         for (const auto &n : schemes.networks) bytes += n.heapBytes();
-        for (const auto &r : receipts) bytes += r.heapBytes(); return bytes;
+        for (const auto &r : receipts) bytes += r.heapBytes();
+        bytes += cursors.size()*sizeof(WifiCursor);
+        for (const auto &c : cursors) bytes += c.heapBytes(); return bytes;
     }
 };

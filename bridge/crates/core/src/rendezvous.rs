@@ -38,6 +38,15 @@ impl Budget {
     }
 }
 
+/// A carrier rejected locally before emitting any bytes. Only this explicit
+/// proof permits undoing the current attempt's conservative sent marker.
+#[derive(Debug)]
+pub struct NotDispatched;
+impl std::fmt::Display for NotDispatched {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str("wifi_window_budget")}
+}
+impl std::error::Error for NotDispatched {}
+
 /// Finite identifiers only. Never store arbitrary transport/device messages.
 pub fn wifi_error(error: &anyhow::Error) -> (&'static str, &'static str) {
     for cause in error.chain() {

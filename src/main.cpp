@@ -7,6 +7,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <HTTPClient.h>
 #include <WebServer.h>
 #include <Update.h>
 #include <ArduinoOTA.h>
@@ -91,13 +92,9 @@ static bool targetUnverified = false;
 #if defined(CODEX_CLK_WINDOW_TEST)
 #define FW_VERSION    "0.13.9-clkwin"
 #elif defined(CODEX_TARGET_NOTE4)
-#ifdef CODEX_NOTE4_ROM_B
-#define FW_VERSION    "0.18.55-note4-b-wifi-store3"
+#define FW_VERSION    "0.18.61-note4"
 #else
-#define FW_VERSION    "0.18.19-note4-a"
-#endif
-#else
-#define FW_VERSION    "0.18.34-bw-ota1"
+#define FW_VERSION    "0.18.35-bw-rtc1"
 #endif
 // WebServer dispatch and filesystem work run in Arduino's loop task.
 // Keep headroom for nested handlers even when an endpoint changes later.
@@ -1169,6 +1166,8 @@ static int  batteryPercent();
 static bool requestAuthorized();
 static void handleWifiManagement(const char *op);
 static String wifiManagementRequest(JsonDocument &request, const char *op);
+static void wifiDeviceStatus(JsonDocument &doc,const EndpointRec *endpoint=nullptr);
+static void servicePresence();
 static void deepSleepFor(uint32_t sec);
 static void renderCurrent();
 static void persistMode();
@@ -2044,7 +2043,7 @@ static uint32_t traceEarliestComplete();
 
 static String infoExtraJson() {
     String items = "\"mac\":\"" + macText() + "\",\"ip\":\"" + ipText() +
-                   "\",\"http_port\":80,\"rendezvous\":true,\"wifi_setup_protocol\":1,\"wifi_management\":2,\"wifi_connection\":1" +
+                   "\",\"http_port\":80,\"rendezvous\":true,\"wifi_setup_protocol\":1,\"wifi_management\":3,\"wifi_connection\":1" +
                    ",\"wake_generation\":" + String((unsigned long)rtcWakeGeneration) +
                    ",\"wake_seq\":" + String((unsigned long)rtcTraceCurrentSeq) +
                    ",\"wake_stage\":\"" +
@@ -2053,7 +2052,7 @@ static String infoExtraJson() {
                    ",\"bundle_configured\":" + String(v2BundleReady ? "true" : "false");
     const uint64_t now = v2NowMs();
     const uint64_t until = v2RfDeadlineMs ? v2RfDeadlineMs : bleRecovery.until;
-    if (until) items += ",\"rf_remaining_ms\":" + String((unsigned long)(until > now ? until - now : 0));
+    if (until && !(plugged && !rtcDeepOnUsb)) items += ",\"rf_remaining_ms\":" + String((unsigned long)(until > now ? until - now : 0));
     return items;
 }
 static void updateInfoExtra() {
@@ -2247,15 +2246,9 @@ static bool endpointTokenAuthorized(String &mac) {
     String token = header.substring(7);
     token.trim();
     if (!token.length()) return false;
-    for (int i = 0; i < storeCount(); i++) {
-        EndpointRec rec;
-        if (!storeGet(i, rec)) continue;
-        if (rec.token.length() && rec.token == token) {
-            mac = rec.mac;
-            return true;
-        }
-    }
-    return false;
+    EndpointRec rec;
+    if (!storeAuthenticate(token,rec)) return false;
+    mac=rec.mac; return true;
 }
 
 // Deep-sleep wake sources: RTC timer plus BOOT (GPIO0) and PWR (GPIO18),
@@ -2362,6 +2355,8 @@ static void handleBleEndpoint(const String &json) {
         bleNotifyStatus(bleBuildEndpoint(false));
         return;
     }
+    if(doc["schema"]!=2 || !doc["port"].is<uint16_t>()){bleNotifyStatus(bleBuildEndpoint(false));return;}
+    for(const char *key:{"host","token","bridge_id"}){JsonString value=doc[key].as<JsonString>();if(!value || value.size()!=strlen(value.c_str())){bleNotifyStatus(bleBuildEndpoint(false));return;}}
     const char *host = doc["host"] | "";
     uint16_t port = doc["port"] | 0;
     const char *token = doc["token"] | "";
@@ -2371,7 +2366,14 @@ static void handleBleEndpoint(const String &json) {
     }
     String mac = blePeerAddress();
     if (!mac.length()) mac = "unknown";
-    storeUpsert(mac, host, port, token);
+    String identity=blePeerIdentity(), principal=doc["bridge_id"]|"";
+    if (!blePeerIsBonded() || !blePeerIsEncrypted() || !identity.length() ||
+        !bleWireText(principal,64,false) || !bleWireText(String(host),64,false) || !bleWireText(String(token),128,false)) {
+        bleNotifyStatus(bleBuildEndpoint(false)); return;
+    }
+    char ns[17];snprintf(ns,sizeof(ns),"%08lx%08lx",(unsigned long)esp_random(),(unsigned long)esp_random());
+    const char *failure=storeUpsert(mac,host,port,token,principal,identity,String(ns),bleRecovery.until>v2NowMs());
+    if (failure) { bleNotifyStatus(bleBuildEndpoint(false));return; }
     traceSetTransport(1);
     traceSetStage(TRACE_STAGE_COMMAND);
     traceSetStage(TRACE_STAGE_REPLY);
@@ -2571,6 +2573,8 @@ static void startConfigMode() {
     server.on("/save", HTTP_POST, handleConfigSave);
     server.on("/api/wifi/apply", HTTP_POST, [] { handleWifiManagement("apply"); });
     server.on("/api/wifi/result", HTTP_POST, [] { handleWifiManagement("result"); });
+    server.on("/api/wifi/result_ack", HTTP_POST, [] { handleWifiManagement("result_ack"); });
+    server.on("/api/wifi/command", HTTP_POST, [] { handleWifiManagement("command"); });
     server.on("/clear", HTTP_GET, [] { server.send(410, "text/plain", "Use authenticated Wi-Fi transactions; GET cannot clear configuration."); });
     const char *headers[] = {"Authorization"}; server.collectHeaders(headers, 1);
     server.begin();
@@ -2765,7 +2769,7 @@ static void handleStatusJson() {
     // ------------------------------------------------------------------
     doc["fw_target"] = FW_TARGET_ID;
     doc["wifi_setup_protocol"] = 1;
-    doc["wifi_management"] = 2;
+    doc["wifi_management"] = 3;
     doc["ble_recovery_remaining_s"] = v2ManualBleHoldRemainingS();
     doc["render_target"] = RENDER_TARGET_ID;
     doc["compiler_abi"] = CT_ABI;
@@ -3592,6 +3596,7 @@ static void requestAnnounce(bool bleFlag) {
 }
 
 static void serviceAnnounce() {
+    servicePresence();
     if (!wifiUp) return;
     if (millis() - lastAnnounce > ANNOUNCE_MS) { sendAnnounce(bleOn); return; }
     // IP-change detection at 1 Hz: esp_netif_get_ip_info() is not free and
@@ -4043,37 +4048,102 @@ static void syncBatchFields(JsonDocument &doc, const SyncStoreBatch &batch) {
 }
 
 // No markSynced, owner claim or PowerPlan mutation: these borrow a live window.
-static void handleWifiManagement(const char *op) {
-    String endpoint;
-    if (!endpointTokenAuthorized(endpoint)) { server.send(401, "application/json", "{\"ok\":false,\"error\":\"unauthorized\"}"); return; }
-    JsonDocument request;
-    const String body = server.arg("plain");
-    if (body.length() > 8192 || deserializeJson(request, body) || String(request["device_mac"] | "") != macText()) {
-        server.send(400, "application/json", "{\"ok\":false,\"error\":\"shape\"}"); return;
+static uint64_t wifiPresenceUntil(uint64_t now) {
+    if(plugged && !rtcDeepOnUsb)return UINT64_MAX;
+    uint64_t until=v2Plan.lightActive(now)?v2Plan.deadlineMs():0;
+    if(syncOpenThisWake)until=std::max(until,syncOpenAnsweredAt+90000);
+    if(v2Provisional)until=std::max(until,v2BootMs+300000);
+    until=std::max(until,bleRecovery.until);return until>now?until:0;
+}
+static uint64_t wifiControlUntil(uint64_t now) {
+    if(otaInProgress)return 0;
+    uint64_t until=wifiPresenceUntil(now);
+    if(until!=UINT64_MAX && v2Rv.active() && v2Rv.deadline())until=std::min(until,v2Rv.deadline());
+    return until>now?until:0;
+}
+static WifiControlContext wifiControlContext(const EndpointRec &endpoint,JsonDocument &request) {
+    WifiControlContext context;context.principal=endpoint.principal;context.nameSpace=endpoint.nameSpace;
+    OwnerRec owner;bool owned=ownerGet(owner);context.claimed=owned && owner.id==endpoint.principal;context.occupied=owned && owner.id!=endpoint.principal;
+    context.until=wifiControlUntil(v2NowMs());context.physicalUntil=bleRecovery.until;
+    context.sessionValid=String(request["session_nonce"]|"")==v2Nonce();return context;
+}
+static void wifiDeviceStatus(JsonDocument &doc,const EndpointRec *endpoint) {
+    const uint64_t now=v2NowMs(),until=wifiPresenceUntil(now),controlUntil=wifiControlUntil(now);
+    const bool continuous=until==UINT64_MAX;
+    const bool httpReady=wifiUp && WiFi.status()==WL_CONNECTED && WiFi.localIP()!=IPAddress(0,0,0,0);
+    OwnerRec owner;const bool owned=ownerGet(owner);
+    String key=String(plugged)+"|"+String(rtcDeepOnUsb)+"|"+String(httpReady)+"|"+String(bleOn)+"|"+String(until)+"|"+String(bleRecovery.until)+
+        String("|")+String(v2Plan.deadlineMs())+String("|")+WiFi.localIP().toString()+"|"+(owned?owner.id:String())+"|"+String(wifiSetupBusy());
+    wifiSchemesStorageStatus(doc["wifi_storage"].to<JsonObject>());
+    key+="|"+String(doc["wifi_storage"]["revision"].as<uint64_t>())+"|"+String(doc["wifi_storage"]["receipts"].as<unsigned>())+"|"+String(controlUntil);
+    static uint32_t sequence=0;static String previous;
+    if(!sequence || key!=previous){++sequence;previous=key;}
+    doc["boot_id"]=v2Nonce();doc["status_seq"]=sequence;doc["device_mac"]=macText();
+    doc["wifi_management"]=3;
+    doc["power"]["mode"]=rtcMode==MODE_LIGHT?"light":"sleep";doc["power"]["plan_id"]=v2Plan.acceptedId();doc["power"]["remaining_s"]=v2Plan.remainingS(now);
+    auto presence=doc["presence"].to<JsonObject>();presence["mode"]=continuous?"continuous":until>now?"window":"ending";
+    if(continuous)presence["remaining_ms"]=nullptr;else presence["remaining_ms"]=until>now?until-now:0;
+    presence["window_id"]=v2Nonce()+String("_")+String(sequence);
+    presence["maintenance_remaining_ms"]=bleRecovery.until>now?bleRecovery.until-now:0;
+    auto reasons=presence["reasons"].to<JsonArray>();
+    if(continuous)reasons.add("usb");if(bleRecovery.until>now)reasons.add("boot");
+    if(v2Provisional)reasons.add("startup");if(v2Plan.lightActive(now))reasons.add("bridge");else if(!continuous && bleRecovery.until<=now)reasons.add("timer");
+    auto http=doc["transports"]["http"].to<JsonObject>();http["ready"]=httpReady;http["ip"]=ipText();http["port"]=80;
+    doc["transports"]["ble"]["ready"]=bleOn;
+    if(endpoint){
+        auto control=doc["wifi_control"].to<JsonObject>();bool bound=endpoint->principal.length()&&endpoint->nameSpace.length();
+        bool claimed=owned && owner.id==endpoint->principal;
+        control["mode"]=controlUntil==UINT64_MAX?"continuous":controlUntil>now?"window":"unavailable";
+        control["read_allowed"]=bound && controlUntil>now;
+        control["write_allowed"]=bound && claimed && controlUntil>now && !wifiSetupBusy();
+        if(controlUntil==UINT64_MAX)control["remaining_ms"]=nullptr;else control["remaining_ms"]=controlUntil>now?controlUntil-now:0;
+        control["principal"]=endpoint->principal;
+        control["namespace"]=endpoint->nameSpace;
+        control["transaction_high_watermark"]=wifiManagementHighWater(endpoint->principal,endpoint->nameSpace);
+        const char *reason=!bound?"binding_required":otaInProgress?"ota_busy":!controlUntil?"window_closed":!claimed?(owned?"occupied":"claim_required"):wifiSetupBusy()?"busy":nullptr;
+        if(reason)control["reason"]=reason;else control["reason"]=nullptr;
     }
-    String response = wifiManagementRequest(request, op);
-    JsonDocument outcome; deserializeJson(outcome, response);
-    server.send(outcome["error"] == "occupied" ? 409 : 200, "application/json", response);
+}
+static __attribute__((noinline)) void servicePresence() {
+    if(!wifiUp || WiFi.status()!=WL_CONNECTED || otaInProgress)return;
+    const uint64_t now=v2NowMs(),until=wifiControlUntil(now);
+    if(until>now && until!=UINT64_MAX && until-now<1000)return;
+    static uint64_t lastSample=0,lastPass=0;static uint32_t prior=0;static int endpointIndex=0;
+    if(now-lastSample<1000)return;lastSample=now;
+    JsonDocument status;wifiDeviceStatus(status);uint32_t seq=status["status_seq"]|0u;
+    if(seq!=prior || now-lastPass>=30000){prior=seq;lastPass=now;endpointIndex=0;sendAnnounce(bleOn);}
+    EndpointRec endpoint;if(!storeGet(endpointIndex,endpoint))return;++endpointIndex;
+    if(!endpoint.principal.length())return;
+    JsonDocument event;event["event"]="presence";event["device_mac"]=macText();event["boot_id"]=v2Nonce();
+    event["status_seq"]=seq;event["ip"]=ipText();event["trigger"]=status["presence"]["reasons"];event["transports"]=status["transports"];
+    String body;serializeJson(event,body);HTTPClient client;client.setConnectTimeout(150);client.setTimeout(150);
+    if(client.begin(String("http://")+endpoint.host+String(":")+String(endpoint.port)+"/api/device/presence")) {
+        client.addHeader("Content-Type","application/json");client.addHeader("Authorization",String("Bearer ")+endpoint.token);client.POST(body);client.end();
+    }
+}
+// No owner/plan mutation. Auth is resolved independently of payload bridge_id.
+static void handleWifiManagement(const char *op) {
+    String header=server.header("Authorization");EndpointRec endpoint;
+    if(!header.startsWith("Bearer ") || !storeAuthenticate(header.substring(7),endpoint)) {
+        server.send(401,"application/json","{\"ok\":false,\"error\":\"unauthorized\"}");return;
+    }
+    JsonDocument request;const String body=server.arg("plain");
+    if(body.length()>8192 || deserializeJson(request,body) || String(request["device_mac"]|"")!=macText()) {
+        server.send(400,"application/json","{\"ok\":false,\"error\":\"shape\"}");return;
+    }
+    if(strcmp(op,"command"))request["op"]=op;
+    auto context=wifiControlContext(endpoint,request);
+    String response=wifiControlCommand(request,context,v2NowMs());
+    JsonDocument outcome;deserializeJson(outcome,response);
+    server.send(200,"application/json",response);
 }
 
-static String wifiManagementRequest(JsonDocument &request, const char *op) {
-    if (String(request["device_mac"] | "") != macText()) return "{\"ok\":false,\"error\":\"identity\"}";
-    request["op"] = op;
-    OwnerRec owner;
-    if (!strcmp(op,"apply") && ownerGet(owner) && owner.id != (request["bridge_id"] | "")) {
-        JsonDocument out;out["device_mac"]=macText();out["ok"]=false;out["error"]="occupied";
-        String text;serializeJson(out,text);return text;
-    }
-    JsonDocument old;
-    JsonArray list = old.to<JsonArray>();
-    prefs.begin("wifi", true);
-    for (int i = 0; i < MAX_SLOTS; ++i) {
-        String ssid = prefs.getString(("s" + String(i)).c_str(), "");
-        if (ssid.length()) { JsonObject n = list.add<JsonObject>(); n["network_id"] = "legacy-" + String(i); n["ssid"] = ssid; }
-    }
-    prefs.end();
-    String legacy; serializeJson(old, legacy);
-    return wifiManagementCommand(request, v2NowMs(), legacy);
+static String wifiManagementRequest(JsonDocument &request,const char *op) {
+    EndpointRec endpoint;
+    if(!storeAuthenticate(request["token"]|"",endpoint)) return "{\"ok\":false,\"error\":\"unauthorized\"}";
+    request["op"]=op;
+    auto context=wifiControlContext(endpoint,request);
+    return wifiControlCommand(request,context,v2NowMs());
 }
 
 // GET /api/status: authenticated authoritative state (the beacon only points).
@@ -4145,7 +4215,9 @@ static void handleV2Status() {
     rendezvous["remaining_ms"] = v2Rv.active() && v2Rv.deadline() > v2NowMs() ? v2Rv.deadline()-v2NowMs() : 0;
     OwnerRec activeOwner;
     doc["owner_id"] = ownerGet(activeOwner) ? activeOwner.id : "";
-    doc["wifi_management"] = 2;
+    EndpointRec endpoint;
+    if(storeAuthenticate(server.header("Authorization").substring(7),endpoint))wifiDeviceStatus(doc,&endpoint);
+    doc["wifi_management"] = 3;
     doc["ota_auth"] = "token";
     doc["image_identity"].to<JsonArray>().add("sha256-running-prefix-v1");
     if (syncStoreAvailable()) {
@@ -4682,7 +4754,8 @@ static void serviceV2Ble() {
     for (int i = 0; i < storeCount(); ++i) {
         EndpointRec endpoint;
         if (storeGet(i, endpoint) && endpoint.token.length() &&
-            endpoint.token == (doc["token"] | "") && endpoint.mac == peer) {
+            endpoint.token == (doc["token"] | "") && endpoint.identity == identity &&
+            endpoint.principal == (doc["bridge_id"]|"")) {
             authenticated = true; break;
         }
     }
@@ -4699,19 +4772,34 @@ static void serviceV2Ble() {
             return;
         }
         OwnerRec owner;
-        bool allowed = authenticated && (!ownerGet(owner) || owner.id == (doc["bridge_id"] | ""));
+        bool allowed = authenticated && ownerGet(owner) && owner.id == (doc["bridge_id"] | "");
         const uint64_t now = v2NowMs();
         const uint64_t admittedUntil = v2Plan.lightActive(now) ? v2Plan.deadlineMs() :
             syncOpenThisWake ? syncOpenAnsweredAt + 90000 : 0;
         const uint64_t wifiWindowUntil = v2Rv.active() ? std::min(admittedUntil, v2Rv.deadline()) : admittedUntil;
-        if (bleRecovery.until <= now && String(doc["session_nonce"] | "") != v2Nonce()) {
-            JsonDocument out; out["ack"]="wifi";out["request_id"]=doc["request_id"];
-            out["device_mac"]=macText();out["ok"]=false;out["error"]="session_expired";v2BleNotify(out);return;
-        }
-        if ((!authenticated || !allowed) && bleRecovery.until <= now) {
+        if (!authenticated) {
             JsonDocument out; out["ack"]="wifi"; out["request_id"]=doc["request_id"];
             out["device_mac"]=macText(); out["ok"]=false; out["error"]=authenticated ? "occupied" : "unauthorized";
             v2BleNotify(out); return;
+        }
+        if (operation=="wifi_command" || operation=="wifi_save" || operation=="wifi_result" || operation=="wifi_result_ack" ||
+            operation=="wifi_match" || operation=="wifi_active" || operation=="wifi_trial" || operation=="wifi_activate" ||
+            operation=="wifi_setup_status" || operation=="wifi_setup_cancel" || operation=="wifi_snapshot" || operation=="wifi_status" || operation=="wifi_scheme_get") {
+            EndpointRec endpoint;JsonDocument out;
+            if(!storeAuthenticate(doc["token"]|"",endpoint) || endpoint.identity!=identity || endpoint.principal!=(doc["bridge_id"]|"")) {
+                out["ok"]=false;out["error"]="binding_required";out["device_mac"]=macText();
+            } else {
+                auto context=wifiControlContext(endpoint,doc);context.generation=generation;
+                if(operation=="wifi_command")doc["op"]=doc["command"];
+                if(operation=="wifi_status"){
+                    JsonDocument status;wifiDeviceStatus(status,&endpoint);status["session_nonce"]=v2Nonce();status["ok"]=true;
+                    String text;serializeJson(status,text);deserializeJson(out,wifiSetupReadPage(doc,endpoint.nameSpace,generation,text));
+                }
+                else deserializeJson(out,wifiControlCommand(doc,context,now));
+            }
+            out["ack"]="wifi";out["op"]="wifi";out["request_id"]=doc["request_id"];
+            if(wifiSetupBusy())wifiUp=false;
+            v2BleNotify(out);return;
         }
         if (operation == "wifi_authorize") {
             String result = wifiManagementAuthorize(doc, identity, now, bleRecovery.until,
@@ -4745,6 +4833,10 @@ static void serviceV2Ble() {
             return;
         }
         if (operation == "wifi_migrate") {
+            EndpointRec mapping;if(!storeAuthenticate(doc["token"]|"",mapping) || !allowed){
+                JsonDocument out;out["ack"]="wifi";out["request_id"]=doc["request_id"];out["device_mac"]=macText();out["ok"]=false;out["error"]="claim_required";v2BleNotify(out);return;
+            }
+            String endpointNamespace=mapping.nameSpace;
             // Resolve an earlier uncertain commit from durable storage before retry.
             if (!wifiSetupBusy()) wifiSchemesBegin();
             WifiNetwork slots[MAX_SLOTS] = {};
@@ -4774,7 +4866,7 @@ static void serviceV2Ble() {
             if (!opened) {
                 out["ack"] = "wifi"; out["request_id"] = doc["request_id"];
                 out["device_mac"] = macText(); out["ok"] = false; out["error"] = "storage";
-            } else deserializeJson(out, wifiSchemesMigrate(doc, identity, slots, count,
+            } else deserializeJson(out, wifiSchemesMigrate(doc, endpointNamespace, slots, count,
                 preferred, now, bleRecovery.until, allowed));
             if (out["persisted"] == true) {
                 bool retired = oldPrefs.begin("wifi", false);
@@ -4791,6 +4883,9 @@ static void serviceV2Ble() {
                 if (!retired) { out["ok"] = false; out["error"] = "retirement_pending"; }
             }
             v2BleNotify(out); return;
+        }
+        if(operation=="wifi_setup" || operation=="wifi_select" || operation=="wifi_scheme_delete") {
+            JsonDocument out;out["ack"]="wifi";out["request_id"]=doc["request_id"];out["device_mac"]=macText();out["ok"]=false;out["error"]="retired_operation";v2BleNotify(out);return;
         }
         String result = wifiSetupCommand(doc, identity, generation, now, bleRecovery.until,
             authenticated && allowed ? wifiWindowUntil : 0, allowed);
@@ -5138,6 +5233,8 @@ static void registerHttpRoutes() {
     server.on("/api/wifi/snapshot", HTTP_POST, [] { handleWifiManagement("snapshot"); });
     server.on("/api/wifi/apply", HTTP_POST, [] { handleWifiManagement("apply"); });
     server.on("/api/wifi/result", HTTP_POST, [] { handleWifiManagement("result"); });
+    server.on("/api/wifi/result_ack", HTTP_POST, [] { handleWifiManagement("result_ack"); });
+    server.on("/api/wifi/command", HTTP_POST, [] { handleWifiManagement("command"); });
     server.on("/api/sync/begin", HTTP_POST, handleSyncBegin);
     server.on("/api/sync/page", HTTP_POST, handleSyncPage);
     server.on("/api/sync/ack", HTTP_POST, handleSyncAck);
@@ -5987,7 +6084,11 @@ void loop() {
     serviceLed();
     OwnerRec wifiOwner;
     const String selectingBridge = wifiSetupSelectingBridge();
-    if (selectingBridge.length() && ownerGet(wifiOwner) && wifiOwner.id != selectingBridge)
+    if(wifiSetupBusy()) {
+        OwnerRec owner;String principal=wifiSetupSelectingBridge();
+        wifiSetupConstrain(v2NowMs(),wifiControlUntil(v2NowMs()),ownerGet(owner) && owner.id==principal);
+    }
+    if (wifiSetupBusy() && selectingBridge.length() && ownerGet(wifiOwner) && wifiOwner.id != selectingBridge)
         wifiSetupAbort("occupied");
     wifiSetupPoll(v2NowMs(), blePeerIdentity(), bleConnectionGeneration(),
                   bleIsConnected() && blePeerIsBonded() && blePeerIsEncrypted());

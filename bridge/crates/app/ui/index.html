@@ -149,6 +149,8 @@
   button.primary:hover:not(:disabled) { background: #1d5949; border-color: #1d5949; }
   button.danger { background: #fff8f6; }
   select, input, textarea { min-height: 34px; max-width: 100%; background: var(--surface); border-color: #d7e1d9; }
+  input[type="checkbox"] { min-height: 0; padding: 0; margin: 0; flex: none; vertical-align: middle; }
+  .checkbox-label { display: inline-flex; align-items: center; gap: 8px; }
   textarea { width: 100%; padding: 10px; border: 1px solid var(--line); border-radius: 9px; resize: vertical; color: var(--ink); }
   .muted, .sub, .todo, .ring small { color: var(--muted); }
   .badge, .tag { border: 1px solid #b9dac6; border-radius: 999px; background: var(--accent-soft); color: var(--accent); font-size: 11px; padding: 3px 8px; }
@@ -241,7 +243,7 @@
   .wifi-compare-table th { color: var(--muted); font-weight: 500; }
   .wifi-compare-table td:first-child { width: 36%; }
   .wifi-compare-table details { margin-top: 8px; }
-  .wifi-compare-table label { display: block; margin-top: 8px; line-height: 1.6; }
+  .wifi-compare-table label { display: flex; align-items: center; gap: 8px; margin-top: 8px; line-height: 1.6; }
   .wifi-compare-table input[type="checkbox"] { min-height: 0; }
   .wifi-compare-empty { padding: 18px 0; }
   .wifi-preview { margin-top: 12px; padding: 10px 12px; background: var(--page); border-radius: 8px; font-size: 12px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -309,6 +311,7 @@
       </div>
       <div class="card wifi-card" id="wifi-card">
         <h2>Wi-Fi 方案 · <span id="wifi-target">选择设备</span></h2>
+        <p id="wifi-online" role="status" aria-live="polite">等待认证在线状态</p>
         <p class="section-note">离线编辑 Bridge 目标，读取设备方案后比较与同步。同步只保存配置，试连和启用分别执行。</p>
         <div class="wifi-permissions" id="wifi-permissions" hidden>
           <h3>完成 macOS 权限设置</h3>
@@ -337,7 +340,7 @@
           <div class="wifi-panel-heading"><div><h3>Bridge 保存的目标方案</h3><p id="wifi-dirty" class="muted" role="status">已保存</p></div><button onclick="wifiNew()">新增网络</button></div>
           <div id="wifi-local" class="plist"></div>
           <details class="wifi-editor" id="wifi-editor"><summary>新增或编辑网络</summary>
-            <form onsubmit="event.preventDefault();wifiSubmit()" autocomplete="off" oninput="wifiFormChanged()">
+            <form onsubmit="event.preventDefault();wifiSaveLocal()" autocomplete="off" oninput="wifiFormChanged()">
               <div class="wifi-form-grid">
                 <div class="wifi-field"><label for="wifi-id">网络标识</label><input id="wifi-id" maxlength="32" required pattern="[A-Za-z0-9_-]+" placeholder="home"><small>保存后标识固定；重命名请修改显示名称。</small></div>
                 <div class="wifi-field"><label for="wifi-label">显示名称</label><input id="wifi-label" maxlength="64" placeholder="书桌网络"></div>
@@ -346,9 +349,10 @@
                 <div class="wifi-field"><label for="wifi-credential">凭据处理</label><select id="wifi-credential"><option value="keep">保留设备凭据</option><option value="replace">提供新密码</option><option value="open">开放网络</option></select></div>
                 <div class="wifi-field"><label for="wifi-password">Wi-Fi 密码</label><div class="wifi-password-control"><input id="wifi-password" type="password" autocomplete="new-password"><button id="wifi-password-toggle" class="wifi-password-toggle" type="button" onclick="wifiTogglePassword()" aria-label="显示密码" aria-pressed="false" title="显示密码"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/><path class="slash" d="m3 3 18 18"/></svg></button></div><small id="wifi-password-note">随网络配置保存到 Bridge。</small></div>
               </div>
-              <div class="action-strip"><button id="wifi-submit" type="submit">加入 / 更新草稿</button>
+              <div class="action-strip"><button id="wifi-submit" class="primary" type="submit">保存到 Bridge</button>
                 <button type="button" onclick="wifiSaveCurrent()">保存并用于当前网络</button>
                 <button type="button" onclick="wifiCancelEdit()">取消编辑</button></div>
+              <p id="wifi-save-result" class="status" role="status" aria-live="polite"></p>
               <details class="wifi-recovery"><summary>临时试连与断网恢复</summary>
                 <p class="section-note">单击设备 BOOT 打开 120 秒维护窗口。先试连或保存，确认版本后再启用。</p>
                 <div class="action-strip"><button type="button" onclick="wifiAuthorize()">BOOT 维护授权</button>
@@ -358,7 +362,6 @@
               </details>
             </form>
           </details>
-          <div class="action-strip"><button class="primary" type="button" onclick="wifiSaveLocal()">保存到 Bridge</button></div>
         </section>
         <section class="wifi-panel" id="wifi-panel-device" role="tabpanel" aria-labelledby="wifi-tab-device" tabindex="0" hidden>
           <div class="wifi-panel-heading"><h3>设备已读取的方案</h3><button class="primary" onclick="wifiReadScheme()">读取设备完整方案</button></div>
@@ -404,7 +407,7 @@
       <div class="card">
         <h2>电量与数据投递</h2>
         <div class="row"><span>设备电量</span><span id="dev-batt">尚未读取</span></div>
-        <div class="toolbar"><label class="muted"><input type="checkbox" id="pt-sync"> 允许向此设备投递业务数据</label>
+        <div class="toolbar"><label class="muted checkbox-label"><input type="checkbox" id="pt-sync"><span>允许向此设备投递业务数据</span></label>
           <button onclick="saveDeviceDataSync()">保存许可</button></div>
         <div class="sub" id="dev-data-needs">等待设备报告所需数据字段。</div>
         <div class="sub" id="pt-device-state">状态和诊断同步不受此许可影响。</div>
@@ -1071,23 +1074,23 @@
   let wifiViewMac=null, wifiRequestSeq=0;
   let wifiPermissions=null, wifiPermissionBusy=false, wifiPermissionGuideShown=false;
   const wifiDrafts=new Map(), wifiSelections=new Map();
-  const wifiError=e=>({physical_required:'请单击 BOOT 开启维护窗口',unsupported:'此固件尚不支持完整方案，请等待升级',
-    local_revision_conflict:'Bridge 保存版本已改变，保留草稿，请重新比较',target_revision_conflict:'方案已改变，请处理冲突',host_network_changed:'主机网络已改变，请重新选择当前网络',network_not_configured:'Bridge 尚无当前网络配置，请先保存方案',current_network_required:'请保留或加入当前网络后再同步。',host_network_unknown:'无法识别当前网络，请先授权读取主机 Wi-Fi。',snapshot_conflict:'设备快照已变化，请重新预览。',
+  const wifiError=e=>({revision_conflict:'设备方案已变化，缓存已过期，请重新读取设备后再同步。Bridge 配置已保留。',physical_required:'请单击 BOOT 开启维护窗口',unsupported:'此固件尚不支持完整方案，请等待升级',
+    local_revision_conflict:'Bridge 保存版本已改变，保留修改，请重新比较',target_revision_conflict:'方案已改变，请处理冲突',host_network_changed:'主机网络已改变，请重新选择当前网络',network_not_configured:'Bridge 尚无当前网络配置，请先保存方案',current_network_required:'请保留或加入当前网络后再同步。',host_network_unknown:'无法识别当前网络，请先授权读取主机 Wi-Fi。',snapshot_conflict:'设备快照已变化，请重新预览。',
     snapshot_required_or_read_only:'需要完整快照，或选中项属于只读归属',credentials_required:'等待本次密码输入',
     bluetooth_permission_required:'请在 Wi-Fi 页面完成 macOS 蓝牙授权',bluetooth_permission_denied:'请在系统设置 → 隐私与安全性 → 蓝牙中允许 Codex Status Bridge',
     bluetooth_permission_restricted:'蓝牙权限受系统管理限制，请联系管理员',
     ble_connection_failed:'本次蓝牙连接失败，持久任务继续等待会合',device_not_advertising_press_boot:'尚未发现目标，请单击 BOOT',
-    snapshot_conflict:'设备快照已变化，请重新选择并预览',snapshot_id_required:'请先选择已读取的设备快照',occupied:'设备由其他 Bridge 占用',window_required:'等待已有 Wi-Fi 工作窗口',storage_unknown:'持久化结果未知，先查询原事务'}[String(e)]||String(e));
+    snapshot_conflict:'设备快照已变化，请重新选择并预览',snapshot_id_required:'请先选择已读取的设备快照',occupied:'设备由其他 Bridge 占用',binding_required:'需要修复 Bridge 与设备的认证关联',principal_mismatch:'设备认证身份不匹配',claim_required:'需先取得本机占用',request_retired:'原事务已退役，禁止重复执行',result_capacity:'设备待确认回执已满',window_required:'等待已有 Wi-Fi 工作窗口',storage_unknown:'持久化结果未知，先查询原事务'}[String(e)]||String(e));
   const wifiCredentialLabel=c=>({keep:'保留设备凭据',replace:'提供新密码',open:'开放网络',device:'使用已保存密码'}[c]||c);
   const wifiKindLabel=k=>({read:'读取设备方案',sync:'同步到设备',import:'导入 Bridge',read_import:'读取后导入',recovery_save:'恢复保存'}[k]||k);
   const wifiAttemptLabel=s=>({connecting:'连接设备',request_sent:'请求已发送',reading:'读取方案',applying:'保存方案'}[s]||s);
   const wifiFieldLabels={host_ssid:'主机 Wi-Fi',ssid:'设备 Wi-Fi',label:'显示名称',deleted:'删除',credential:'凭据'};
-  const wifiStage=s=>({queued:'已排队',waiting_rendezvous:'等待下次真实会合',waiting_authorization:'等待设备会合授权',
+  const wifiStage=s=>({queued:'已排队',waiting_rendezvous:'等待设备可用通道',waiting_authorization:'需要恢复设备认证',
     waiting_input:'等待凭据输入',reading:'正在读取',applying:'正在同步',awaiting_confirmation:'待确认，先查询原事务',
     conflict:'需处理冲突',completed:'完成',cancelled:'已取消',expired:'已过期',failed:'已终止'}[s]||s);
   function wifiShowResult(r) {
     $('wifi-result').textContent=r.job_id?`${wifiStage(r.state)} · ${r.job_id} · ${r.error_code?wifiError(r.error_code):r.last_stage||''}`:
-      r.error?wifiError(r.error):r.state==='waiting_rendezvous'?'已接收，等待设备会合后核对并启用当前网络':r.stage==='connecting'?'正在临时试连（未保存）':r.stage==='trial_complete'?'试连完成，已恢复原链路；保存与启用仍须分别操作':
+      r.error?wifiError(r.error):r.state==='waiting_rendezvous'?'已接收，等待可用通道核对并启用当前网络':r.stage==='connecting'?'正在临时试连（未保存）':r.stage==='trial_complete'?'试连完成，已恢复原链路；保存与启用仍须分别操作':
       r.persisted?'指定版本已启用':r.ok===true?'维护授权已验证':'本次操作结束';
   }
   function wifiShowTab(tab, focus=false) {
@@ -1112,13 +1115,16 @@
     button.setAttribute('aria-pressed',String(show));button.setAttribute('aria-label',label);button.title=label;
   }
   function wifiTogglePassword(){wifiPasswordVisibility($('wifi-password').type!=='text');}
+  function wifiLocalResult(message) {
+    for(const id of ['wifi-result','wifi-save-result'])$(id).textContent=message;
+  }
   function wifiNew() {
-    wifiEditingId=null;$('wifi-id').readOnly=false;
+    wifiEditingId=null;$('wifi-id').readOnly=false;wifiLocalResult('');
     wifiPasswordVisibility();$('wifi-password-note').textContent='随网络配置保存到 Bridge。';
     for(const id of ['wifi-id','wifi-label','wifi-host-ssid','wifi-ssid','wifi-password'])$(id).value='';
     $('wifi-credential').value='keep';$('wifi-editor').open=true;$('wifi-id').focus();
   }
-  function wifiFormChanged() { $('wifi-dirty').textContent='表单有未加入草稿的修改'; }
+  function wifiFormChanged() { $('wifi-dirty').textContent='有未保存的修改'; }
   function wifiShowHost(h={}) {
     wifiHostNetwork=h;
     $('wifi-host').textContent=({permission_required:'需要定位权限',permission_denied:'定位权限已拒绝',location_disabled:'系统定位服务已关闭',no_wifi:'有线或无 Wi-Fi',ambiguous:'多个 Wi-Fi 接口',unavailable:'网络读取不可用'}[h.state])||h.networks?.[0]?.ssid||'主机网络未知';
@@ -1181,6 +1187,18 @@
     try {wifiShowHost(await invoke('platform_wifi',{mac:'',op:'host',body:{}}));}
     catch(e){$('wifi-host').textContent=wifiError(e);}
   }
+  function wifiRenderOnline(status) {
+    const node=$('wifi-online');if(!node)return;
+    if(!status?.presence){node.textContent='等待认证在线状态';return;}
+    const age=Math.max(0,Date.now()/1000-Number(status.observed_at||0));
+    const p=status.presence,t=status.transports||{},control=status.wifi_control||{};
+    if(age>30){node.textContent='在线状态待确认 · 最近认证 '+eventTime(status.observed_at);return;}
+    const reasons=p.reasons||[],left=p.remaining_ms==null?null:Math.max(0,Math.floor(p.remaining_ms/1000-age));
+    const why=p.mode==='continuous'&&reasons.includes('usb')?'USB 常驻在线':reasons.includes('boot')?'BOOT 在线':reasons.includes('bridge')?'Bridge 激活在线':'设备工作窗口';
+    node.textContent=(left===0?'窗口已结束 / 预计休眠':why+(left==null?'':' · 剩余 '+left+' 秒'))+
+      ' · HTTP '+(t.http?.ready?'就绪':'暂不可达')+' · BLE '+(t.ble?.ready?'就绪':'关闭')+
+      (control.reason?' · '+wifiError(control.reason):'');
+  }
   async function wifiRefreshView() {
     if(!selectedDeviceMac) return;
     const mac=selectedDeviceMac,generation=deviceSelectionGeneration,seq=++wifiRequestSeq;
@@ -1189,6 +1207,7 @@
       if(!isCurrentDevice(mac,generation)||seq!==wifiRequestSeq) return;
       wifiViewMac=mac; wifiState=v.wifi||{local_revision:0,targets:[],jobs:[]}; wifiDifferences=v.differences||[];
       wifiScheme=wifiState.snapshot; wifiShowHost(v.host);wifiShowPermissions(v.permissions);
+      wifiRenderOnline(v.online);
       if(!wifiDirty) wifiDraft=structuredClone(wifiState.targets||[]);
       $('wifi-target').textContent=mac;
       $('wifi-times').textContent=`Bridge 保存 ${eventTime(wifiState.saved_at)} · 修订 ${wifiState.local_revision} · 设备 ${wifiScheme?.complete?'完整快照 r'+wifiScheme.revision:'未读取完整快照'} · 读取 ${eventTime(wifiScheme?.observed_at)} · 容量 ${wifiScheme?.capacity?.total??'未知'} / 每绑定 ${wifiScheme?.capacity?.per_bond??'未知'}`;
@@ -1197,8 +1216,8 @@
     } catch(e) { if(isCurrentDevice(mac,generation)) $('wifi-result').textContent=wifiError(e); }
   }
   function wifiRenderLocal() {
-    $('wifi-dirty').textContent=wifiDirty?'本地草稿未保存':'Bridge 目标已保存';
-    $('wifi-local').innerHTML=wifiDraft.map((n,i)=>`<div class="prow"><div class="pmeta"><b>${escapeHtml(n.label||n.network_id)}</b><small>${escapeHtml(n.host_ssid)} → ${escapeHtml(n.ssid)} · ${escapeHtml(wifiCredentialLabel(n.credential))}${n.deleted?(wifiDirty?' · 待删除（需保存并同步）':' · 已标记删除'):''}${n.origin!=='local'?' · 只读参考':''}</small></div><button onclick="wifiEdit(${i})">编辑</button><button onclick="wifiCopy(${i})">复制</button><button onclick="wifiDelete(${i})">${n.deleted?'撤销删除':'标记删除'}</button></div>`).join('')||'尚无本地目标，离线可新增。';
+    $('wifi-dirty').textContent=wifiDirty?'有未保存的修改':'Bridge 目标已保存';
+    $('wifi-local').innerHTML=wifiDraft.map((n,i)=>`<div class="prow"><div class="pmeta"><b>${escapeHtml(n.label||n.network_id)}</b><small>${escapeHtml(n.host_ssid)} → ${escapeHtml(n.ssid)} · ${escapeHtml(wifiCredentialLabel(n.credential))}${n.deleted?(wifiDirty?' · 待删除（需保存并同步）':' · 已标记删除'):''}</small></div><button onclick="wifiEdit(${i})">编辑</button><button onclick="wifiCopy(${i})">复制</button><button onclick="wifiDelete(${i})">${n.deleted?'撤销删除':'标记删除'}</button></div>`).join('')||'尚无本地目标，离线可新增。';
   }
   function wifiRenderScheme() {
     if(!wifiScheme?.complete) { $('wifi-networks').textContent='尚未读取完整设备方案；本地编辑可继续。'; return; }
@@ -1210,7 +1229,7 @@
   }
   function wifiEdit(i) {
     const n=wifiDraft[i];if(!n)return;
-    wifiEditingId=n.network_id;$('wifi-id').readOnly=true;
+    wifiLocalResult('');wifiEditingId=n.network_id;$('wifi-id').readOnly=true;
     $('wifi-editor').open=true;
     $('wifi-id').value=n.network_id;$('wifi-label').value=n.label||'';$('wifi-host-ssid').value=n.host_ssid;$('wifi-ssid').value=n.ssid;
     $('wifi-credential').value=n.credential==='device'?'keep':n.credential;$('wifi-password').value=n.password??'';
@@ -1220,40 +1239,41 @@
     const n=wifiDraft[i];if(!n)return;let count=1,id;
     do { id=n.network_id.slice(0,24)+'-copy'+count++; } while(wifiDraft.some(n=>n.network_id===id));
     wifiDraft.push({...structuredClone(n),network_id:id,origin:'local',version:0,credential:'replace',deleted:false});wifiDirty=true;wifiRenderLocal();wifiEdit(wifiDraft.length-1);
+    wifiLocalResult('已复制为新的本地方案；原记录保留，修改后请保存到 Bridge。');
   }
   function wifiDelete(i) {
     const n=wifiDraft[i];if(!n)return;
-    if(n.origin!=='local'){$('wifi-result').textContent='只读参考请先复制为新目标';return;}
     if(!n.deleted&&!window.confirm(`标记删除 ${n.label||n.network_id}？保存到 Bridge 后，再同步到设备才会删除设备配置。`))return;
     n.deleted=!n.deleted;wifiDirty=true;wifiPreview=null;
-    wifiRenderLocal();$('wifi-result').textContent=n.deleted?'已标记删除；请保存到 Bridge，再在比较页同步此删除。':'已撤销删除；请保存到 Bridge。';
+    if(wifiEditingId!==n.network_id)wifiEdit(i);$('wifi-editor').open=true;
+    wifiRenderLocal();wifiLocalResult(n.deleted?'已标记删除；请保存到 Bridge，再在比较页同步此删除。':'已撤销删除；请保存到 Bridge。');
   }
   function wifiSubmit() {
     const n={network_id:wifiEditingId??$('wifi-id').value,host_ssid:$('wifi-host-ssid').value,ssid:$('wifi-ssid').value,label:$('wifi-label').value,
       credential:$('wifi-credential').value,origin:'local',version:0,deleted:false};
     const old=wifiDraft.find(t=>t.network_id===n.network_id),password=$('wifi-password').value;
-    if(wifiEditingId===null&&old){$('wifi-result').textContent='该网络标识已存在，请编辑原条目或使用新标识。';return false;}
-    n.version=old?.version??0;n.origin=old?.origin??'local';n.deleted=old?.deleted??false;
-    if(!n.network_id||!n.host_ssid||!n.ssid){$('wifi-result').textContent='请填写网络标识和网络名称';return false;}
+    if(wifiEditingId===null&&old){wifiLocalResult('该网络标识已存在，请编辑原条目或使用新标识。');return false;}
+    n.version=old?.version??0;n.deleted=old?.deleted??false;
+    if(!n.network_id||!n.host_ssid||!n.ssid){wifiLocalResult('请填写网络标识和网络名称');return false;}
     if(n.credential==='open'){n.password='';}
     else if(password||old?.password!=null){n.password=password;if(password!==old?.password)n.credential=password?'replace':'open';else if(old?.credential==='replace')n.credential='replace';}
-    if(old?.origin&&old.origin!=='local'){ $('wifi-result').textContent='只读参考请先复制为新目标';return false; }
     const i=wifiDraft.findIndex(t=>t.network_id===n.network_id);if(i>=0)wifiDraft[i]=n;else wifiDraft.push(n);
     wifiEditingId=n.network_id;$('wifi-id').value=n.network_id;$('wifi-id').readOnly=true;
-    wifiDirty=true;wifiPreview=null;wifiRenderLocal();$('wifi-result').textContent='草稿已更新；保存到 Bridge 仅写本地。';return true;
+    wifiDirty=true;wifiPreview=null;wifiRenderLocal();return true;
   }
   async function wifiSaveLocal() {
     if($('wifi-editor').open&&$('wifi-id').value&&!wifiSubmit())return;
     const mac=selectedTarget(),generation=deviceSelectionGeneration;
+    wifiLocalResult('正在保存到 Bridge…');
     try { const state=await invoke('platform_wifi',{mac,op:'save',body:{local_revision:wifiState.local_revision,targets:structuredClone(wifiDraft)}});
       if(!isCurrentDevice(mac,generation))return;wifiState=state;wifiDirty=false;wifiDrafts.delete(mac);wifiPreview=null;await wifiRefreshView();
-      $('wifi-result').textContent='Bridge 目标已保存；设备未联系、未切网。'; } catch(e) {if(isCurrentDevice(mac,generation))$('wifi-result').textContent=wifiError(e);}
+      wifiLocalResult('Bridge 配置已保存。'); } catch(e) {if(isCurrentDevice(mac,generation))wifiLocalResult(wifiError(e));}
   }
   function wifiRenderCurrent(v){
     const ssid=wifiHostNetwork?.state==='connected'?wifiHostNetwork.networks?.[0]?.ssid:null,target=v.matched_target,c=v.connection;
     const job=(wifiState.jobs||[]).slice().reverse().find(j=>!['completed','cancelled','expired','failed'].includes(j.state)&&j.kind==='recovery_save'&&j.frozen?.[0]?.network_id===target?.network_id);
     const state=job?.state||v.automatic_state;
-    const text={requested:'已请求使用当前网络，等待设备会合。',queued:'已排队，等待设备会合。',waiting_rendezvous:'等待设备会合后通过蓝牙处理。',no_mapping:'Bridge 没有该网络的配置，请新增。',waiting_for_window:'已匹配 Bridge 方案，等待设备会合。',selected:'设备已选此方案，等待联网验证。',connecting:'设备正在连接此网络。',needs_sync:'设备需要更新此方案，会合时将通过蓝牙写入。',waiting_input:'此方案缺少可用凭据，请提供本次密码。',waiting_authorization:'等待设备会合后通过蓝牙写入此方案。',awaiting_confirmation:'正在确认上次操作结果，请勿重复提交。',occupied:'设备由其他 Bridge 占用。',firmware_upgrade_required:'设备固件需要升级以报告网络连接结果。'};
+    const text={requested:'已请求使用当前网络，等待设备会合。',queued:'已排队，等待设备会合。',waiting_rendezvous:'等待设备的可用通道。',no_mapping:'Bridge 没有该网络的配置，请新增。',waiting_for_window:'已匹配 Bridge 方案，等待设备会合。',selected:'设备已选此方案，等待联网验证。',connecting:'设备正在连接此网络。',needs_sync:'设备需要更新此方案，通道可用时将写入。',waiting_input:'此方案缺少可用凭据，请提供本次密码。',waiting_authorization:'等待设备的可用通道写入此方案。',awaiting_confirmation:'正在确认上次操作结果，请勿重复提交。',occupied:'设备由其他 Bridge 占用。',firmware_upgrade_required:'设备固件需要升级以报告网络连接结果。'};
     const failure={authentication_failed:'设备认证失败，请核对密码和安全模式。',security_mismatch:'网络安全模式不兼容，请修正配置。',network_not_found:'设备未找到此网络，请检查 2.4GHz 网络是否可用。',signal_weak:'网络信号过弱，请检查距离。',association_failed:'设备关联失败，请检查网络。',handshake_timeout:'认证握手超时，请检查网络或凭据。',dhcp_timeout:'已关联但未取得 IP，请检查路由器 DHCP。',connect_timeout:'连接超时，请检查网络；尚不能判断密码错误。',storage:'配置保存失败，请重新检查设备。'};
     const message=state==='bridge_unreachable'?(c?.error==='unauthorized'?'设备 HTTP 授权失败，请检查 Bridge 授权。':c?.error==='http_identity_mismatch'?'HTTP 设备身份不符，请检查地址。':'设备已连接当前网络，但 Bridge 无法访问设备 HTTP；请检查网络隔离或访问地址。'):state==='connection_failed'?(failure[c?.error]||'设备连接失败，请检查配置。'):
       state==='connected'?(c?.http_ready?'设备已连接，HTTP 交接已确认。':'设备已入网，正在确认 HTTP 交接。'):text[state]||'等待可用的主机 Wi-Fi 与设备会合。';
@@ -1276,14 +1296,23 @@
   }
   function wifiCancelEdit(){wifiEditingId=null;$('wifi-id').readOnly=false;wifiPasswordVisibility();wifiDraft=structuredClone(wifiState.targets||[]);wifiDirty=false;wifiPreview=null;$('wifi-id').value='';$('wifi-password').value='';$('wifi-editor').open=false;wifiRenderLocal();}
   function wifiChoose(i,checked){const id=wifiDifferences[i]?.network_id;if(!id)return;checked?wifiSelections.set(id,true):wifiSelections.delete(id);wifiPreview=null;$('wifi-sync-submit').disabled=true;}
-  function wifiCanSelect(d,importing){return !!wifiScheme?.complete&&(importing?d.device?.length===1:d.writable&&!!d.bridge&&d.bridge.origin==='local');}
+  function wifiImportRow(d){
+    const rows=d.device||[],own=rows.filter(r=>r.writable);
+    return own.length===1?own[0]:own.length===0&&rows.length===1?rows[0]:null;
+  }
+  function wifiCanSelect(d,importing){
+    if(!wifiScheme?.complete)return false;
+    if(importing)return !!wifiImportRow(d);
+    const own=(d.device||[]).filter(r=>r.writable);
+    return !!d.bridge&&d.bridge.origin==='local'&&own.length<=1&&(!d.bridge.deleted||own.length===1);
+  }
   function wifiRenderComparison(){
     const importing=$('wifi-direction').value==='import';
     $('wifi-sync-submit').textContent=importing?'保存整条方案到 Bridge':'覆盖选中方案到设备';
     const labels={equal:'一致',bridge_only:'仅 Bridge 有',device_only:'仅设备有',bridge_changed:'Bridge 修改',device_changed:'设备修改',conflict:'双方冲突',both_changed:'双方均修改',no_baseline:'首次比较',explicit_delete:'明确删除',unknown_snapshot:'快照未知',ambiguous:'同 ID 多归属'};
     $('wifi-compare').innerHTML=wifiDifferences.map((d,i)=>{
-      const enabled=wifiCanSelect(d,importing);
-      return `<tr><td><label><input type="checkbox" ${enabled?'':'disabled'} ${wifiSelections.has(d.network_id)?'checked':''} onchange="wifiChoose(${i},this.checked)">${escapeHtml(d.network_id)} · ${labels[d.state]||d.state}</label></td><td data-label="Bridge 目标">${escapeHtml(d.bridge?.label||'')}<br>${escapeHtml(d.bridge?.host_ssid||'—')} → ${escapeHtml(d.bridge?.ssid||'—')}<br>${escapeHtml(wifiCredentialLabel(d.bridge?.credential)||'')}</td><td data-label="设备快照">${(d.device||[]).map(n=>`${escapeHtml(n.network.label||'')}<br>${escapeHtml(n.network.host_ssid)} → ${escapeHtml(n.network.ssid)} · ${escapeHtml(n.writable?'本机绑定':n.bond==='legacy'?'USB / AP':'其他绑定')}`).join('<br>')||'—'}<br>${({equal:'密码一致',different:'密码不同',unknown:'密码尚未完整缓存'})[d.password]||'密码尚未完整缓存'}</td><td data-label="本次处理">${enabled?(importing?'整条保存到本地':d.bridge?.deleted?'删除此网络':'整条保存待启用版本'):'等待完整读取 / 只读'}</td></tr>`;
+      const enabled=wifiCanSelect(d,importing),targetRow=wifiImportRow(d),rows=targetRow?[targetRow]:(d.device||[]);
+      return `<tr><td><label><input type="checkbox" ${enabled?'':'disabled'} ${wifiSelections.has(d.network_id)?'checked':''} onchange="wifiChoose(${i},this.checked)"><span>${escapeHtml(d.network_id)} · ${labels[d.state]||d.state}</span></label></td><td data-label="Bridge 目标">${escapeHtml(d.bridge?.label||'')}<br>${escapeHtml(d.bridge?.host_ssid||'—')} → ${escapeHtml(d.bridge?.ssid||'—')}<br>${escapeHtml(wifiCredentialLabel(d.bridge?.credential)||'')}</td><td data-label="设备快照">${rows.map(n=>`${escapeHtml(n.network.label||'')}<br>${escapeHtml(n.network.host_ssid)} → ${escapeHtml(n.network.ssid)} · ${escapeHtml(n.writable?'本机绑定':n.bond==='legacy'?'USB / AP':'其他绑定')}`).join('<br>')||'—'}<br>${({equal:'密码一致',different:'密码不同',unknown:'密码尚未完整缓存'})[d.password]||'密码尚未完整缓存'}</td><td data-label="本次处理">${enabled?(importing?'整条保存到本地':d.bridge?.deleted?'删除此网络':'整条保存待启用版本'):!wifiScheme?.complete?'等待完整读取':d.bridge?.deleted?'本机绑定中无此记录可删除':'缺少配置或明确版本'}</td></tr>`;
     }).join('')||'<tr><td class="wifi-compare-empty" colspan="4">本地和设备尚无可比较项。先读取设备方案，Bridge 目标仍可离线编辑。</td></tr>';
   }
   function wifiSelectDifferences(){
@@ -1300,14 +1329,14 @@
     return retained||included?null:'请保留或加入当前网络后再同步。';
   }
   function wifiPreviewSync(){
-    if(wifiDirty){$('wifi-preview').textContent='先保存或取消本地草稿，再预览覆盖方案。';return;}
+    if(wifiDirty){$('wifi-preview').textContent='先保存或取消本地修改，再预览覆盖方案。';return;}
     const selected=[...wifiSelections.keys()].filter(id=>wifiDifferences.some(d=>d.network_id===id));
     if(!selected.length||!wifiScheme?.complete){$('wifi-preview').textContent='需要完整快照与明确选择的整条方案。';return;}
     const op=$('wifi-direction').value==='import'?'import':'sync';
-    if(selected.some(id=>!wifiCanSelect(wifiDifferences.find(d=>d.network_id===id),op==='import'))){$('wifi-preview').textContent='选择包含只读或不明确归属，请处理后预览。';return;}
+    if(selected.some(id=>!wifiCanSelect(wifiDifferences.find(d=>d.network_id===id),op==='import'))){$('wifi-preview').textContent='选中项缺少已保存配置或明确的设备版本，请处理后预览。';return;}
     if(op==='sync'){const error=wifiManualNetworkGuard(selected);if(error){wifiPreview=null;$('wifi-preview').textContent=error;$('wifi-sync-submit').disabled=true;return;}}
     wifiPreview={mac:selectedTarget(),revision:wifiState.local_revision,snapshot:wifiScheme.snapshot_id,host:wifiHostNetwork?.networks?.[0]?.ssid,op,selected};
-    $('wifi-preview').textContent=selected.map(id=>{const d=wifiDifferences.find(d=>d.network_id===id),n=op==='sync'?d.bridge:d.device[0].network;
+    $('wifi-preview').textContent=selected.map(id=>{const d=wifiDifferences.find(d=>d.network_id===id),n=op==='sync'?d.bridge:wifiImportRow(d).network;
       return `${n.label||id} · ${n.deleted?'明确删除这一网络':`${n.host_ssid} → ${n.ssid} · 整条覆盖`} · ${op==='sync'?wifiCredentialLabel(n.credential)+' · 保存到设备': '包含已读取的密码 · 保存到 Bridge'}`;}).join('\n');
     $('wifi-sync-submit').disabled=false;
   }
@@ -1322,12 +1351,13 @@
     catch(e){if(isCurrentDevice(mac,generation))$('wifi-result').textContent=wifiError(e);}finally{if(body.credentials)for(const id of Object.keys(body.credentials))body.credentials[id]='';}}
   async function wifiReadScheme(){await wifiQueue('get');}
   async function wifiAuthorize(){await wifiQueue('authorize');}
+  const wifiCreatedTime = ts => ts ? new Date(ts * 1000).toLocaleString('zh-CN', {hour12:false}) : '时间未记录';
   function wifiRenderJobs(){
     const jobs=(wifiState.jobs||[]).slice().reverse(),terminal=j=>['completed','cancelled','expired','failed'].includes(j.state);
     const buttons=j=>`${!terminal(j)?`<button onclick="wifiCancelJob('${j.job_id}')">取消任务</button>`:''}${j.state==='waiting_input'?`<button onclick="wifiJobInput('${j.job_id}')">提供本次密码</button>`:''}`;
-    $('wifi-current-jobs').innerHTML=jobs.filter(j=>!terminal(j)).map(j=>`<div class="prow"><div class="pmeta"><b>${escapeHtml(wifiKindLabel(j.kind))} · ${wifiStage(j.state)}</b><small>${j.error_code?escapeHtml(wifiError(j.error_code)):''}${j.may_have_committed?' · 远端可能已生效，取消不回滚':''}</small></div>${buttons(j)}</div>`).join('')||'暂无进行中的任务';
+    $('wifi-current-jobs').innerHTML=jobs.filter(j=>!terminal(j)).map(j=>`<div class="prow"><div class="pmeta"><b>${escapeHtml(wifiKindLabel(j.kind))} · ${wifiStage(j.state)}</b><small>${j.error_code?escapeHtml(wifiError(j.error_code)):''}${j.may_have_committed?' · 远端可能已生效，取消不回滚':''}<br>创建时间 ${escapeHtml(wifiCreatedTime(j.created_at))}</small></div>${buttons(j)}</div>`).join('')||'暂无进行中的任务';
     const history=jobs.filter(terminal);$('wifi-history-label').textContent=`执行记录（${history.length}）`;
-    $('wifi-jobs').innerHTML=history.map(j=>`<div class="prow"><div class="pmeta"><b>${escapeHtml(wifiKindLabel(j.kind))} · ${wifiStage(j.state)}</b><small>${escapeHtml(j.device_mac)} · ${escapeHtml(j.job_id)} · 尝试 ${j.attempt_count} · ${j.error_code?escapeHtml(wifiError(j.error_code)):escapeHtml(wifiAttemptLabel(j.last_stage))}<br>最近执行 ${eventTime(j.last_attempt_at)}${j.confirmation?' · '+escapeHtml(j.confirmation):''}</small></div></div>`).join('')||'暂无执行记录';
+    $('wifi-jobs').innerHTML=history.map(j=>`<div class="prow"><div class="pmeta"><b>${escapeHtml(wifiKindLabel(j.kind))} · ${wifiStage(j.state)}</b><small>${escapeHtml(j.device_mac)} · ${escapeHtml(j.job_id)} · 尝试 ${j.attempt_count} · ${j.error_code?escapeHtml(wifiError(j.error_code)):escapeHtml(wifiAttemptLabel(j.last_stage))}<br>创建时间 ${escapeHtml(wifiCreatedTime(j.created_at))} · 最近执行 ${eventTime(j.last_attempt_at)}${j.confirmation?' · '+escapeHtml(j.confirmation):''}</small></div></div>`).join('')||'暂无执行记录';
   }
   async function wifiCancelJob(id){await wifiQueue('cancel_job',{job_id:id});}
   async function wifiJobInput(id){const network=$('wifi-id').value,password=$('wifi-password').value;$('wifi-password').value='';await wifiQueue('input',{job_id:id,credentials:{[network]:password}});}
@@ -1376,7 +1406,7 @@
     wifiState={local_revision:0,targets:[],jobs:[]};wifiScheme=null;wifiDifferences=[];wifiPreview=null;wifiSelections.clear();wifiRequestSeq++;
     wifiPasswordVisibility();$('wifi-password').value='';for(const id of ['wifi-id','wifi-host-ssid','wifi-ssid','wifi-label'])$(id).value='';
     $('wifi-credential').value='keep';$('wifi-networks').textContent='尚未读取完整设备方案';$('wifi-compare').innerHTML='';
-    $('wifi-jobs').innerHTML='';$('wifi-current-jobs').textContent='暂无进行中的任务';$('wifi-history-label').textContent='执行记录';$('wifi-job-history').open=false;$('wifi-sync-submit').disabled=true;wifiRenderLocal();$('wifi-result').textContent='等待操作';
+    $('wifi-jobs').innerHTML='';$('wifi-current-jobs').textContent='暂无进行中的任务';$('wifi-history-label').textContent='执行记录';$('wifi-job-history').open=false;$('wifi-sync-submit').disabled=true;wifiRenderLocal();wifiLocalResult('等待操作');
     for (const id of ['dev-contact','dev-fw','dev-latest','dev-verdict','dev-installed',
       'dev-active','dev-applied','dev-display','dev-batt','dev-owner','dev-name']) $(id).textContent = '尚未读取';
     $('dev-upgrade-failure-row').hidden = true;

@@ -763,7 +763,7 @@ fn tool_definitions() -> Value {
         {
             "name": "platform_wifi_action",
             "description": "Save non-secret local targets, queue an explicit read or device sync, import selected cached snapshot entries without contacting the device, or cancel a job via the shared application service. Saving never contacts a device. migrate explicitly moves old device Wi-Fi slots into the current authenticated bond after physical BOOT authorization; no credentials leave the device. Credentials are excluded from MCP. save/sync/import require body.local_revision from platform_wifi_view; import also requires body.snapshot_id from wifi.snapshot. selected and fields freeze the approved scope.",
-            "inputSchema": {"type":"object","properties":{"mac":{"type":"string"},"op":{"type":"string","enum":["save","get","sync","import","cancel_job","migrate"]},"body":{"type":"object"}},"required":["mac","op"],"additionalProperties":false}
+            "inputSchema": {"type":"object","properties":{"mac":{"type":"string"},"op":{"type":"string","enum":["save","get","sync","import","cancel_job","migrate","trial","activate","status","cancel","use_current","authorize"]},"body":{"type":"object"}},"required":["mac","op"],"additionalProperties":false}
         },
         {
             "name": "platform_wifi_view",

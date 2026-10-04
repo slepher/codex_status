@@ -24,7 +24,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bridge_ble::{lan_ip, BleConfig, Pusher};
 use bridge_core::activity::Activity;
 use bridge_core::codex::locate_codex;
-use bridge_core::http::serve;
+use bridge_core::http::serve_with_router;
 use bridge_core::runtime::{run_poller, PollerConfig};
 use bridge_core::template::Library;
 use config::Config;
@@ -1092,6 +1092,36 @@ async fn mcp_handler(
         }
         None => axum::http::StatusCode::ACCEPTED.into_response(),
     }
+}
+
+// Notification is a hint only. Registered MAC/IP and current endpoint token
+// restrict probes; authenticated status, never the event payload, updates truth.
+async fn presence_hint(axum::extract::State(ctx):axum::extract::State<Arc<AppCtx>>,
+    headers:axum::http::HeaderMap,axum::Json(hint):axum::Json<Value>)->axum::http::StatusCode {
+    if headers.get(axum::http::header::AUTHORIZATION).and_then(|h|h.to_str().ok())!=Some(format!("Bearer {}",ctx.config.token).as_str()) {
+        return axum::http::StatusCode::UNAUTHORIZED;
+    }
+    let Some(mac)=hint["device_mac"].as_str().and_then(bridge_core::platform::model::DeviceIdentity::normalized_mac) else{return axum::http::StatusCode::BAD_REQUEST;};
+    let Some(mut link)=platform::device_link_for_mac(&ctx,&mac) else{return axum::http::StatusCode::NOT_FOUND;};
+    let Some(candidate)=hint["ip"].as_str().filter(|ip|ip.parse::<std::net::Ipv4Addr>().is_ok()) else{return axum::http::StatusCode::BAD_REQUEST;};
+    let changed=candidate!=link.ip;link.ip=candidate.to_owned();
+    // try_lock coalesces repeated hints and bounds work independently per MAC.
+    let lock=platform::delivery_lock(&ctx,&mac);
+    let Ok(guard)=lock.try_lock_owned() else{return axum::http::StatusCode::ACCEPTED;};
+    tokio::spawn(async move {
+        let sampled=std::time::Instant::now();let fetch=link.clone();
+        if let Ok(Ok(status))=tokio::task::spawn_blocking(move||bridge_core::device_client::status(&fetch.ip,&fetch.token,Duration::from_secs(2))).await {
+            if status["device_mac"].as_str().and_then(bridge_core::platform::model::DeviceIdentity::normalized_mac).as_deref()==Some(mac.as_str()) {
+                let now=device_now_secs(&mac).max(0) as u64;
+                if platform::service(&ctx).note_authenticated_status_at(&mac,&status,now).is_err(){return;}
+                if changed {let _=platform::revalidate_registered_device_endpoint(&ctx,&mac,&link.ip).await;}
+                // Carry on only explicit existing jobs; notification never creates work.
+                if sampled.elapsed()<Duration::from_secs(3) {crate::wifi::opportunity_locked(&ctx,&mac).await;}
+            }
+        }
+        drop(guard);
+    });
+    axum::http::StatusCode::ACCEPTED
 }
 
 async fn mcp_serve(ctx: Arc<AppCtx>) {
@@ -3115,7 +3145,7 @@ async fn run_services(ctx: Arc<AppCtx>) {
     {
         let ctx = ctx.clone();
         tokio::spawn(async move {
-            if let Err(e) = serve(addr).await {
+            if let Err(e) = serve_with_router(addr, axum::Router::new().route("/api/device/presence",axum::routing::post(presence_hint)).with_state(ctx.clone())).await {
                 tracing::error!("http server: {e}");
                 let mut status = ctx.status.lock().unwrap();
                 status.last_error = Some(format!("http: {e}"));
@@ -3277,6 +3307,7 @@ async fn run_services(ctx: Arc<AppCtx>) {
             host: lan_ip(),
             port: ctx.config.port,
             token: ctx.config.token.clone(),
+            bridge_id: ctx.bridge_id.clone(),
             scan_timeout_ms: 30000,
         };
         let pusher = Pusher::new(ble_cfg);

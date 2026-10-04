@@ -63,6 +63,10 @@ struct SimWifi {
     physical_until: u64,
     outcome: i32,
     drop_http_ack: bool,
+    unified: bool,
+    principal: String,
+    status_seq:u64,
+    status_key:String,
 }
 
 // Connection-local GATT attributes, distinct from business HTTP responses.
@@ -705,7 +709,7 @@ fn default_rom_bytes(target: &str, fw: &str) -> Vec<u8> {
 }
 
 fn default_catalog(target: &str) -> RomCatalog {
-    let suffix = if target == "codex-status-154g" { "bw" } else { "note4-b" };
+    let suffix = if target == "codex-status-154g" { "bw" } else { "note4" };
     let versions = ["0.18.24", "0.18.25"].iter().enumerate().map(|(index, prefix)| {
         let fw = format!("{prefix}-{suffix}");
         let bytes = default_rom_bytes(target, &fw);
@@ -1365,7 +1369,20 @@ async fn status_impl(state: SimState, request: Request<Body>, gate: bool) -> Res
                 owner.as_ref().is_some_and(|owner|
                     sync["config_owner"].as_str() == Some(owner.id.as_str())));
             sync.as_object_mut().map(|object| object.remove("config_owner"));
-            status["wifi_management"] = json!(2);
+            let mut wifi=state.wifi.lock().unwrap();let continuous=power.plugged && !power.deep_on_usb;
+            status["wifi_management"] = json!(if wifi.unified {3}else{2});
+            status["wifi_storage"]=match wifi.engine.storage_status() {Ok(value)=>value,Err(_)=>return (StatusCode::INTERNAL_SERVER_ERROR,Json(json!({"ok":false,"error":"wifi_storage_status_unavailable","stage":"status"}))).into_response()};
+            if wifi.unified {
+                let until=wifi_control_until(&state,&power,wifi.physical_until,clock.monotonic_ms);
+                let remaining=if continuous {Value::Null}else{json!(until.saturating_sub(clock.monotonic_ms))};
+                let claimed=owner.as_ref().is_some_and(|o|o.id==wifi.principal);
+                let key=format!("{}:{continuous}:{}:{claimed}:{until}:{}",session_snapshot(&state).boot_id,power.light,wifi.physical_until)+&format!(":{}:{}",status["wifi_storage"]["revision"],status["wifi_storage"]["receipts"]);
+                if key!=wifi.status_key {wifi.status_seq+=1;wifi.status_key=key;}status["status_seq"]=json!(wifi.status_seq);
+                status["presence"]=json!({"mode":if continuous {"continuous"}else{"window"},"remaining_ms":remaining,"reasons":[if continuous {"usb"}else{"timer"}]});
+                status["transports"]=json!({"http":{"ready":true},"ble":{"ready":power.ble_window_until_ms.is_some()}});
+                status["wifi_control"]=json!({"mode":if continuous {"continuous"}else{"window"},"read_allowed":until>clock.monotonic_ms,"write_allowed":claimed && until>clock.monotonic_ms,"remaining_ms":remaining,"principal":wifi.principal,"namespace":wifi.peer,"reason":if claimed {Value::Null}else{json!("claim_required")}});
+            }
+            drop(wifi);
             status["sync_v1"] = json!(1);
             status["diag_format"] = json!(1);
             status["diag_capacity"] = json!(4096);
@@ -2296,7 +2313,7 @@ async fn sim_ble_info(State(state): State<SimState>, request: Request<Body>) -> 
     let bytes = match bridge_render::simulator_ble_wire("info", &json!({
         "mac":state.mac,"ip":"127.0.0.1","fw":fw,"peerBonded":true,"peerEncrypted":true,
         "wake_generation":generation,"wake_seq":power.wake_count,"bundle_configured":power.configured,
-        "wifi_setup_protocol":1,"wifi_management":2,"wifi_connection":1,"rf_remaining_ms":power.ble_window_until_ms.map(|until| until.saturating_sub(clock.monotonic_ms))})) {
+        "wifi_setup_protocol":1,"wifi_management":if state.wifi.lock().unwrap().unified {3}else{2},"wifi_connection":1,"rf_remaining_ms":power.ble_window_until_ms.map(|until| until.saturating_sub(clock.monotonic_ms))})) {
         Ok(bytes) => bytes, Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     let connect = request.uri().query().is_some_and(|q| q == "connect=1");
@@ -2342,7 +2359,7 @@ async fn sim_ble_aux(State(state): State<SimState>, request: Request<Body>) -> R
     let Ok(bytes) = to_bytes(request.into_body(), if token {256} else {1024}).await else { return StatusCode::PAYLOAD_TOO_LARGE.into_response(); };
     let Ok(body) = serde_json::from_slice::<Value>(&bytes) else { return StatusCode::BAD_REQUEST.into_response(); };
     let valid = if token { body["cmd"] == "token" && body.get("rotate").is_none() }
-        else { body["schema"] == 1 && body["host"].is_string() && body["port"].as_u64().is_some_and(|p| p > 0 && p <= 65535) && body["token"] == state.endpoint_token.as_ref() };
+        else { matches!(body["schema"].as_u64(),Some(1|2)) && body["host"].is_string() && body["port"].as_u64().is_some_and(|p| p > 0 && p <= 65535) && body["token"] == state.endpoint_token.as_ref() };
     let op = if token {"auth"} else {"endpoint"};
     let mut response = json!({"ack":op,"ok":valid});
     if token && valid { response["token"] = json!(state.device_token.as_ref()); }
@@ -2567,19 +2584,32 @@ async fn sim_wifi_control(State(state): State<SimState>, request: Request<Body>)
     let busy = wifi.engine.poll(clock.monotonic_ms, &peer, generation, true, outcome).unwrap_or(false);
     Json(json!({"busy":busy})).into_response()
 }
+fn wifi_control_until(state:&SimState,power:&SimPower,physical:u64,now:u64)->u64 {
+    if power.plugged && !power.deep_on_usb {return u64::MAX;}
+    let plan=state.plan.lock().unwrap();let (_,mode,_,seconds,accepted)=plan.status_fields();
+    let formal=if mode=="light" {power.boot_ms.saturating_add(accepted).saturating_add(u64::from(seconds)*1000)}else{0};
+    let sync=if power.sync_open {power.sync_last_progress_ms.saturating_add(90000)}else{0};
+    let until=physical.max(formal).max(sync);if until>now {until}else{0}
+}
 async fn wifi_http(State(state): State<SimState>, request: Request<Body>) -> Response {
     if !bearer(&request, &state.endpoint_token) { return unauthorized(); }
     if let Some(response) = device_gate(&state).await { return response; }
-    let op = match request.uri().path() { "/api/wifi/snapshot" => "snapshot", "/api/wifi/apply" => "apply", _ => "result" };
+    let op = match request.uri().path() { "/api/wifi/snapshot" => "snapshot", "/api/wifi/apply" => "apply", "/api/wifi/result_ack"=>"result_ack", "/api/wifi/command"=>"command", _ => "result" };
     let Some(clock) = clock_snapshot(&state) else { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); };
     let Ok(bytes) = to_bytes(request.into_body(), 8192).await else { return StatusCode::PAYLOAD_TOO_LARGE.into_response(); };
     let Ok(mut message) = serde_json::from_slice::<Value>(&bytes) else { return StatusCode::BAD_REQUEST.into_response(); };
     if message["device_mac"] != state.mac { return StatusCode::BAD_REQUEST.into_response(); }
-    message["op"] = json!(op);
+    if op!="command" {message["op"] = json!(op);}
     let generation = state.ble.lock().unwrap().generation as u32;
     let mut wifi = state.wifi.lock().unwrap(); let peer = wifi.peer.clone(); let physical = wifi.physical_until;
-    let reply = wifi.engine.command(&message, &peer, generation, clock.monotonic_ms, physical, 0, true);
-    if op == "apply" && wifi.drop_http_ack { wifi.drop_http_ack = false; return StatusCode::GATEWAY_TIMEOUT.into_response(); }
+    let reply = if wifi.unified {
+        let power=state.power.lock().unwrap().clone();let principal=wifi.principal.clone();
+        let allowed=state.owner.lock().unwrap().get_valid(now_seconds(&state,clock)).ok().flatten().is_some_and(|o|o.id==principal);
+        let until=wifi_control_until(&state,&power,physical,clock.monotonic_ms);
+        let session_valid=message["session_nonce"]==session_snapshot(&state).nonce;
+        wifi.engine.control(&message,&principal,&peer,0,clock.monotonic_ms,until,physical,allowed,session_valid)
+    } else {wifi.engine.command(&message, &peer, generation, clock.monotonic_ms, physical, 0, true)};
+    if message["op"] == "apply" && wifi.drop_http_ack { wifi.drop_http_ack = false; return StatusCode::GATEWAY_TIMEOUT.into_response(); }
     match reply { Ok(reply) => Json(reply).into_response(), Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response() }
 }
 
@@ -2595,9 +2625,20 @@ async fn sim_ble_command(State(state): State<SimState>, request: Request<Body>) 
     let Ok(message) = serde_json::from_slice::<Value>(&bytes) else { return StatusCode::BAD_REQUEST.into_response(); };
     let op = message["op"].as_str().unwrap_or("command");
     if op.starts_with("wifi_") {
-        if bytes.len() > 1024 { return StatusCode::PAYLOAD_TOO_LARGE.into_response(); }
+        if bytes.len() > if state.wifi.lock().unwrap().unified {4096}else{1024} { return StatusCode::PAYLOAD_TOO_LARGE.into_response(); }
         if message["device_mac"] != state.mac { return StatusCode::BAD_REQUEST.into_response(); }
         let generation = state.ble.lock().unwrap().generation as u32;
+        if op=="wifi_status" && state.wifi.lock().unwrap().unified {
+            let authenticated=Request::builder().uri("/api/status").header(header::AUTHORIZATION,format!("Bearer {}",state.endpoint_token)).body(Body::empty()).unwrap();
+            let response=status_impl(state.clone(),authenticated,false).await;
+            let Ok(bytes)=to_bytes(response.into_body(),16384).await else{return StatusCode::INTERNAL_SERVER_ERROR.into_response();};
+            let Ok(text)=std::str::from_utf8(&bytes) else{return StatusCode::INTERNAL_SERVER_ERROR.into_response();};
+            let mut wifi=state.wifi.lock().unwrap();let peer=wifi.peer.clone();
+            let Ok(mut reply)=wifi.engine.read_page(&message,&peer,generation,text) else{return StatusCode::INTERNAL_SERVER_ERROR.into_response();};drop(wifi);
+            reply["wake_generation"]=json!(session_snapshot(&state).boot_id);reply["wake_seq"]=json!(power.wake_count);
+            if let Ok(raw)=bridge_render::simulator_ble_wire("reply",&reply){state.ble.lock().unwrap().store(op,raw,clock.monotonic_ms);}
+            return Json(json!({"result":"accepted"})).into_response();
+        }
         let now = clock.monotonic_ms;
         let bridge = message["bridge_id"].as_str().unwrap_or("");
         let allowed = state.owner.lock().unwrap().get_valid(now_seconds(&state, clock)).ok().flatten()
@@ -2607,9 +2648,14 @@ async fn sim_ble_command(State(state): State<SimState>, request: Request<Body>) 
             let peer = wifi.peer.clone(); let outcome = wifi.outcome; let physical = wifi.physical_until;
             let light = if power.light { now + 25000 } else { 0 };
             let _ = wifi.engine.poll(now, &peer, generation, true, outcome);
-            wifi.engine.command(&message, &peer, generation, now, physical, light, allowed)
+            if wifi.unified {
+                let principal=wifi.principal.clone();let claimed=state.owner.lock().unwrap().get_valid(now_seconds(&state,clock)).ok().flatten().is_some_and(|o|o.id==principal);
+                let until=wifi_control_until(&state,&power,physical,now);
+                wifi.engine.control(&message,&principal,&peer,generation,now,until,physical,claimed,message["session_nonce"]==session_snapshot(&state).nonce)
+            } else {wifi.engine.command(&message, &peer, generation, now, physical, light, allowed)}
         };
         let Ok(mut reply) = reply else { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); };
+        reply["ack"]=json!("wifi");reply["op"]=json!("wifi");reply["request_id"]=message["request_id"].clone();
         reply["wake_generation"] = json!(session_snapshot(&state).boot_id);
         reply["wake_seq"] = json!(power.wake_count);
         let raw = bridge_render::simulator_ble_wire("reply", &reply);
@@ -2890,6 +2936,8 @@ fn app(state: SimState) -> Router {
         .route("/api/wifi/snapshot", post(wifi_http))
         .route("/api/wifi/apply", post(wifi_http))
         .route("/api/wifi/result", post(wifi_http))
+        .route("/api/wifi/result_ack", post(wifi_http))
+        .route("/api/wifi/command", post(wifi_http))
         .route("/sim/wifi", post(sim_wifi_control))
         .route("/sim/history", post(sim_history_control))
         .route("/api/sync/begin", post(sync_begin))
@@ -2989,6 +3037,8 @@ async fn main() -> Result<()> {
         wifi: Arc::new(Mutex::new(SimWifi {
             engine: bridge_render::SimulatorWifi::new(&options.data_dir)?, peer: "02:00:00:00:00:02/1".into(),
             physical_until: 0, outcome: 1, drop_http_ack: false,
+            unified: std::env::var("CODEX_STATUS_SIM_WIFI_PROTOCOL").as_deref()==Ok("3"),
+            principal: std::env::var("CODEX_STATUS_SIM_WIFI_PRINCIPAL").unwrap_or("bridge".into()),status_seq:0,status_key:String::new(),
         })),
     };
     let listener = tokio::net::TcpListener::bind(options.listen)

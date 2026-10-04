@@ -57,7 +57,7 @@ static void legacyFixture(int version,bool compressed) {
     else {const auto *start=version==1?(const uint8_t *)&old->schemes:(const uint8_t *)old.get();size_t size=version==1?sizeof(old->schemes):sizeof(*old);testNvsLegacyBlob.assign(start,start+size);}
     auto previous=testNvsLegacyBlob;testNvsFail=true;assert(!wifiSchemesBegin()&&testNvsLegacyBlob==previous&&testNvsBlob.empty());testNvsFail=false;
     testNvsNewReadbackFail=true;assert(!wifiSchemesBegin()&&testNvsLegacyBlob==previous&&!testNvsBlob.empty());testNvsNewReadbackFail=false;
-    assert(wifiSchemesBegin()&&testNvsLegacyBlob.empty()&&!memcmp(testNvsBlob.data(),"WFS3",4));
+    assert(wifiSchemesBegin()&&testNvsLegacyBlob.empty()&&!memcmp(testNvsBlob.data(),"WFS4",4));
     String ssid,password;assert(wifiSchemesCredentials(ssid,password)&&ssid=="OldDevice"&&password=="test-password");
     if(version==2)assert(wifiStore.receipts.size()==1&&wifiStore.receipts[0].revision==7&&!strcmp(wifiStore.receipts[0].request,"uncertain"));
     auto migrated=testNvsBlob;assert(wifiSchemesBegin()&&testNvsBlob==migrated); // migration idempotent
@@ -68,7 +68,7 @@ int main() {
     for(size_t size=0;size<valid.size();++size) {auto cut=valid;cut.resize(size);refused(std::move(cut));}
     for(size_t i=0;i<valid.size();++i){auto broken=valid;broken[i]^=0x80;refused(std::move(broken));}
     auto broken=valid;broken.push_back(0);refused(broken);
-    for(auto [offset,value]:std::initializer_list<std::pair<size_t,uint8_t>>{{4,4},{5,1},{6,13},{7,9},{32,3},{33,22}}) {broken=valid;broken[offset]=value;reseal(broken);refused(broken);}
+    for(auto [offset,value]:std::initializer_list<std::pair<size_t,uint8_t>>{{4,5},{5,9},{6,13},{7,9},{32,3},{33,22}}) {broken=valid;broken[offset]=value;reseal(broken);refused(broken);}
     // Every stored row has independent framing; valid CRC cannot hide an
     // embedded NUL, duplicate id/mapping, excess bonds or mismatched active.
     broken=valid;broken[34]=0;reseal(broken);refused(broken);
@@ -87,7 +87,7 @@ int main() {
     WifiStore threeBonds=example(1,0);for(const char *b:{"other-1","other-2"}){WifiNetwork n=threeBonds.schemes.networks[0];n.bond.set(b);assert(!threeBonds.schemes.put(n,false));}extraOwn.bond.set("fourth");assert(!strcmp(threeBonds.schemes.put(extraOwn,false),"capacity"));
     WifiNetwork excess=schemes.networks[0];excess.id.set("extra");excess.host.set("extra");assert(!strcmp(schemes.put(excess,false),"capacity"));
     WifiStore edited=wifiStore;edited.preserveActive();edited.schemes.networks[0].ssid.set(std::string(32,'x').c_str());edited.schemes.networks[0].password.set(std::string(64,'b').c_str());edited.schemes.networks[0].version=++edited.revision;
-    assert(saveV2(edited)&&testNvsBlob.size()==5134&&wifiSchemesBegin());String ssid,password;assert(wifiSchemesCredentials(ssid,password)&&ssid==std::string(32,'s').c_str()&&password==std::string(64,'a').c_str());
+    assert(saveV2(edited)&&testNvsBlob.size()==5214&&wifiSchemesBegin());String ssid,password;assert(wifiSchemesCredentials(ssid,password)&&ssid==std::string(32,'s').c_str()&&password==std::string(64,'a').c_str());
     WifiStore erased=wifiStore;assert(erased.schemes.erase(0));assert(saveV2(erased)&&wifiSchemesBegin());assert(wifiSchemesCredentials(ssid,password)&&ssid==std::string(32,'s').c_str());
     // Fault each nothrow allocation in clone/edit/receipt/encode/readback.
     size_t exercisedAllocationFailures=0;
@@ -130,5 +130,11 @@ int main() {
         size_t strings=storeHeap-networks*sizeof(WifiNetwork)-receipts*sizeof(WifiReceipt);
         std::cout<<"budget networks="<<networks<<" receipts="<<receipts<<" blob="<<testNvsBlob.size()<<" string_allocations_bytes="<<strings<<" host_store_heap="<<storeHeap<<" host_clone_save_peak_delta="<<peak<<"\n";
     }
+    reset();auto combined=example(12,8,true);
+    for(size_t i=0;i<8;++i){WifiCursor c;c.bridge.set((std::string(63,'p')+char('a'+i)).c_str());c.bond.set(std::string(21,'b').c_str());c.high=8;assert(combined.cursors.append(c));combined.receipts[i].operation.set("activate");combined.receipts[i].target.set(std::string(32,'n').c_str());}
+    combined.preserveActive();combined.schemes.networks[0].version=++combined.revision;
+    assert(saveV2(combined));size_t base=liveBytes;peakBytes=base;
+    {std::unique_ptr<WifiStore> next(new(std::nothrow) WifiStore(wifiStore));assert(next&&saveV2(*next));}
+    std::cout<<"combined upper bound blob="<<testNvsBlob.size()<<" heap="<<wifiStore.heapBytes()<<" clone-save peak delta="<<peakBytes-base<<" cursor="<<sizeof(WifiCursor)<<" bytes\n";
     std::cout<<"host layout network="<<sizeof(WifiNetwork)<<" receipt="<<sizeof(WifiReceipt)<<" store="<<sizeof(WifiStore)<<" legacy="<<sizeof(WifiLegacyStoreV2)<<"\n";
 }

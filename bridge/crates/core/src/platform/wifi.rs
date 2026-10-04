@@ -75,6 +75,17 @@ pub struct Snapshot {
     pub capacity: Value,
 }
 impl Snapshot {
+    fn preferred_network(&self, id: &str) -> Result<&ObservedNetwork> {
+        let mut own=self.networks.iter().filter(|n|n.network.network_id==id&&n.writable);
+        if let Some(row)=own.next() {
+            if own.next().is_some() { bail!("ambiguous_network_id"); }
+            return Ok(row);
+        }
+        let mut source=self.networks.iter().filter(|n|n.network.network_id==id);
+        let row=source.next().context("invalid_wifi_selection")?;
+        if source.next().is_some() { bail!("ambiguous_network_id"); }
+        Ok(row)
+    }
     pub fn validate(&self, mac: &str) -> Result<()> {
         if self.schema != 2 || !self.complete || self.snapshot_id.is_empty()
             || DeviceIdentity::normalized_mac(&self.device_mac).as_deref() != Some(mac)
@@ -163,6 +174,10 @@ pub struct Job {
     pub confirmed_revision: Option<u64>,
     #[serde(default)]
     pub confirmation: Option<String>,
+    #[serde(default)]
+    pub receipt_ack_pending: bool,
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    pub command: Option<Value>,
 }
 impl Job {
     pub fn terminal(&self) -> bool {
@@ -192,12 +207,14 @@ impl WifiState {
             }
         }
     }
-    pub fn save(&mut self, expected: u64, targets: Vec<Network>, now: u64) -> Result<()> {
+    pub fn save(&mut self, expected: u64, mut targets: Vec<Network>, now: u64) -> Result<()> {
         if expected != self.local_revision { bail!("local_revision_conflict"); }
         if targets.len() > 16 { bail!("capacity"); }
         let mut ids = BTreeSet::new();
         let mut hosts = BTreeSet::new();
-        for n in &targets {
+        for n in &mut targets {
+            // Device binding ownership belongs to the snapshot, not imported local configurations.
+            n.origin = "local".into();
             n.validate()?;
             if !ids.insert(&n.network_id) || (!n.deleted && n.origin == "local" && !hosts.insert(&n.host_ssid)) {
                 bail!("mapping_conflict");
@@ -216,7 +233,7 @@ impl WifiState {
         }
     }
     pub fn queue(&mut self, mac: &str, bridge: &str, kind: &str, selected: Vec<String>, now: u64, job_id: String, fields: BTreeMap<String, Vec<String>>) -> Result<Job> {
-        if !matches!(kind, "read" | "sync" | "read_import" | "recovery_save") || bridge.is_empty() || bridge.len() > 64 {
+        if !matches!(kind, "read" | "sync" | "read_import" | "recovery_save" | "trial" | "activate") || bridge.is_empty() || bridge.len() > 64 {
             bail!("invalid_wifi_intent");
         }
         self.expire(now);
@@ -244,11 +261,11 @@ impl WifiState {
         if self.jobs.len() >= 32 { bail!("wifi_job_capacity"); }
         let before = self.snapshot.as_ref().map(|s| s.networks.iter().filter(|n| n.writable && selected.contains(&n.network.network_id))
             .map(|n| (n.network.network_id.clone(), n.network.metadata())).collect()).unwrap_or_default();
-        let j = Job { request_id: job_id.clone(), job_id, device_mac: mac.into(), bridge_id: bridge.into(), kind: kind.into(),
+        let j = Job { request_id: if self.next_job_seq>0 { format!("w3_{:016x}",self.next_job_seq) } else { job_id.clone() }, job_id, device_mac: mac.into(), bridge_id: bridge.into(), kind: kind.into(),
             state: "queued".into(), created_at: now, expires_at: now.saturating_add(INTENT_TTL_S), updated_at: now,
             local_revision: self.local_revision, attempt_count: 0, last_attempt_at: None, next_attempt_at: now,
             last_stage: "accepted".into(), error_code: None, sent: false, may_have_committed: false,
-            selected, frozen, fields, expected_revision: self.snapshot.as_ref().map(|s| s.revision), host_ssid: None, before, confirmed_revision: None, confirmation: None };
+            selected, frozen, fields, expected_revision: self.snapshot.as_ref().map(|s| s.revision), host_ssid: None, before, confirmed_revision: None, confirmation: None, receipt_ack_pending: false, command: None };
         self.jobs.push(j.clone());
         Ok(j)
     }
@@ -384,7 +401,7 @@ impl WifiState {
             snapshot.revision = revision; snapshot.snapshot_id = job.request_id.clone(); snapshot.observed_at = now;
             let result = self.confirm_sync(job_id, snapshot, true, now)?;
             let current = self.jobs.iter_mut().find(|j| j.job_id == job_id).unwrap();
-            current.last_stage = "committed_receipt".into(); current.confirmation = Some("durable_receipt".into());
+            current.last_stage = "committed_receipt".into(); current.confirmation = Some("durable_receipt".into()); current.receipt_ack_pending=current.request_id.starts_with("w3_");
             let _ = result; return Ok(current.clone());
         }
         for frozen in &job.frozen {
@@ -397,7 +414,7 @@ impl WifiState {
         }
         let j = self.jobs.iter_mut().find(|j| j.job_id == job_id).unwrap();
         j.state = "completed".into(); j.updated_at = now; j.last_stage = "committed_receipt".into();
-        j.confirmed_revision = Some(revision); j.confirmation = Some("durable_receipt".into()); j.error_code = None;
+        j.confirmed_revision = Some(revision); j.confirmation = Some("durable_receipt".into()); j.receipt_ack_pending=j.request_id.starts_with("w3_"); j.error_code = None;
         Ok(j.clone())
     }
     pub fn import(&mut self, selected: &[String], expected: u64, now: u64) -> Result<()> {
@@ -410,10 +427,8 @@ impl WifiState {
         let s = self.snapshot.as_ref().ok_or_else(|| anyhow::anyhow!("snapshot_required"))?;
         let mut targets = self.targets.clone(); let mut baseline = self.baseline.clone();
         for id in selected {
-            // An ambiguous ID across bonds must be explicitly resolved, never guessed.
-            let mut found = s.networks.iter().filter(|n| &n.network.network_id == id);
-            let n = found.next().ok_or_else(|| anyhow::anyhow!("invalid_wifi_selection"))?;
-            if found.next().is_some() { bail!("ambiguous_network_id"); }
+            // Prefer the current target version; a foreign source never shadows it.
+            let n = s.preferred_network(id)?;
             if !targets.iter().any(|t| &t.network_id == id) && fields.get(id).is_some_and(|fs|
                 ["host_ssid","ssid","label","deleted"].iter().any(|f|!fs.iter().any(|s| s==f))) {
                 bail!("new_network_requires_all_fields");
@@ -429,7 +444,7 @@ impl WifiState {
                     }
                 }
             }
-            t.origin = if n.writable { "local".into() } else { n.bond.clone() };
+            t.origin = "local".into();
             if let Some(old) = targets.iter_mut().find(|t| &t.network_id == id) { *old = t; } else { targets.push(t); }
             let meta = n.network.metadata();
             if let Some(fs) = fields.get(id) {
@@ -446,7 +461,8 @@ impl WifiState {
         ids.into_iter().map(|id| {
             let local = self.targets.iter().find(|n| n.network_id == id);
             let remote: Vec<_> = self.snapshot.as_ref().map(|s| s.networks.iter().filter(|n| n.network.network_id == id).collect()).unwrap_or_default();
-            let actual = remote.first().map(|n| n.network.metadata());
+            let selected = self.snapshot.as_ref().and_then(|s|s.preferred_network(&id).ok());
+            let actual = selected.map(|n| n.network.metadata());
             let target = local.map(Network::metadata);
             let base = self.baseline.get(&id);
             let fields: Vec<_> = ["host_ssid", "ssid", "label", "deleted"].iter().map(|f| {
@@ -457,14 +473,14 @@ impl WifiState {
                     else if b.as_ref()==Some(&r) {"bridge_changed"} else if b.as_ref()==Some(&l) {"device_changed"} else {"conflict"};
                 json!({"field":f,"bridge":l,"device":r,"baseline":b,"state":state,"conflict":state=="conflict"})
             }).collect();
-            let password = match (local.and_then(|n| n.password.as_ref()), remote.first().and_then(|n| n.network.password.as_ref())) {
+            let password = match (local.and_then(|n| n.password.as_ref()), selected.and_then(|n| n.network.password.as_ref())) {
                 (Some(a), Some(b)) if a == b => "equal",
                 (Some(_), Some(_)) => "different",
                 _ => "unknown",
             };
             let has=|kind:&str| fields.iter().any(|f|f["state"]==kind);
             let state = if self.snapshot.is_none() { "unknown_snapshot" }
-                else if remote.len() > 1 { "ambiguous" }
+                else if remote.len() > 1 && selected.is_none() { "ambiguous" }
                 else if local.is_some_and(|n| n.deleted) { "explicit_delete" }
                 else if local.is_none() { "device_only" }
                 else if actual.is_none() { "bridge_only" }
@@ -473,7 +489,7 @@ impl WifiState {
                 else if has("bridge_changed")&&has("device_changed") {"both_changed"}
                 else if has("bridge_changed") {"bridge_changed"}else if has("device_changed"){"device_changed"}else{"equal"};
             json!({"network_id":id,"state":state,"bridge":local,"device":remote,"fields":fields,
-                "writable":remote.len() <= 1 && remote.first().is_none_or(|n| n.writable),"password":password})
+                "writable":selected.map_or(remote.is_empty(),|n|n.writable),"password":password})
         }).collect()
     }
 }

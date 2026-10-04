@@ -12,8 +12,8 @@ extern "C" int codex_sim_wifi_open(const char *dir) {
     std::ifstream file(wifiBlobPath, std::ios::binary);
     if (file) testNvsBlob.assign(std::istreambuf_iterator<char>(file), {});
     testNvsLegacyBlob.clear();
-    if (testNvsBlob.size() && memcmp(testNvsBlob.data(),"WFS3",std::min(size_t(4),testNvsBlob.size()))) testNvsLegacyBlob.swap(testNvsBlob);
-    wifiManagementResetSession(); running = false; storeReady = false;
+    if (testNvsBlob.size() && (memcmp(testNvsBlob.data(),"WFS3",std::min(size_t(4),testNvsBlob.size())) && memcmp(testNvsBlob.data(),"WFS4",std::min(size_t(4),testNvsBlob.size())))) testNvsLegacyBlob.swap(testNvsBlob);
+    wifiManagementResetSession(); running = false; storeReady = false; requestId="";transactionPeer="";transactionUnified=false;
     return wifiSchemesBegin() ? 1 : 0;
 }
 extern "C" int codex_sim_wifi_command(const char *input, const char *peer, uint32_t generation,
@@ -39,3 +39,23 @@ extern "C" int codex_sim_wifi_poll(uint64_t now, const char *peer, uint32_t gene
 extern "C" void codex_sim_wifi_storage_failure(int fail) { testNvsFail = fail != 0; }
 
 extern "C" void codex_sim_wifi_legacy(const char *json) { simWifiLegacy = json; }
+
+extern "C" int codex_sim_wifi_control(const char *input,const char *principal,const char *nameSpace,uint32_t generation,
+    uint64_t now,uint64_t until,uint64_t physical,int claimed,int sessionValid,char *out,int cap) {
+    JsonDocument doc;if(deserializeJson(doc,input))return -1;
+    WifiControlContext ctx;ctx.principal=principal;ctx.nameSpace=nameSpace;ctx.generation=generation;ctx.until=until;ctx.physicalUntil=physical;
+    ctx.claimed=claimed!=0;ctx.sessionValid=sessionValid!=0;
+    String response=wifiControlCommand(doc,ctx,now,simWifiLegacy);if(response.length()>=(size_t)cap)return -2;
+    memcpy(out,response.c_str(),response.length()+1);return response.length();
+}
+
+extern "C" int codex_sim_wifi_read_page(const char *input,const char *peer,uint32_t generation,const char *text,char *out,int cap) {
+    JsonDocument doc;if(deserializeJson(doc,input))return -1;String response=wifiSetupReadPage(doc,peer,generation,text);
+    if(response.length()>=(size_t)cap)return -2;memcpy(out,response.c_str(),response.length()+1);return response.length();
+}
+
+extern "C" int codex_sim_wifi_storage_status(char *out,int cap) {
+    JsonDocument doc;wifiSchemesStorageStatus(doc.to<JsonObject>());
+    String response;serializeJson(doc,response);if(response.length()>=(size_t)cap)return -2;
+    memcpy(out,response.c_str(),response.length()+1);return response.length();
+}

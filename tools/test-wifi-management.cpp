@@ -223,4 +223,67 @@ int main() {
     auto expiredBatch=batch;expiredBatch["request_id"]="expired-formal";expiredBatch["expected_revision"]=1;
     assert(bleInvoke(expiredBatch,true,30000,30000)["error"]=="window_required");
     std::cout<<"Formal BLE window: atomic batch, owner/expiry/bond rejection, durable receipt and replay passed\n";
+    // Permanent sequence fence survives ACK retirement, channel/session reset
+    // and atomic NVS failures; legacy arbitrary IDs cannot be safely retired.
+    auto seq=change("w3_0000000000000001",wifiStore.revision,"");
+    deserializeJson(ack,wifiManagementAuthorize(authorize,bond,1000,0,30000));seq["permit"]=ack["permit"];
+    assert(invoke(seq)["outcome"]=="committed");
+    auto confirm=request("result_ack");confirm["query_id"]=seq["request_id"];confirm["result_peer"]=bond;
+    const auto beforeAck=testNvsBlob;
+    testNvsFail=true;assert(invoke(confirm)["error"]=="storage_unknown"&&testNvsBlob==beforeAck);testNvsFail=false;
+    assert(wifiSchemesBegin()&&invoke(seq)["outcome"]=="committed");
+    testNvsCommitThenFail=true;assert(invoke(confirm)["error"]=="storage_unknown");testNvsCommitThenFail=false;
+    assert(wifiSchemesBegin()&&invoke(confirm)["outcome"]=="retired");
+    assert(invoke(confirm)["outcome"]=="retired");
+    assert(invoke(seq)["error"]=="request_retired");
+    seq["expected_revision"]=wifiStore.revision;seq["changes"][0]["ssid"]="Replay";
+    assert(invoke(seq)["error"]=="request_retired");
+    confirm["query_id"]="formal-batch";assert(invoke(confirm)["error"]=="legacy_receipt_retained");
+    confirm["query_id"]="w3_0000000000000001";confirm["bridge_id"]="foreign";assert(invoke(confirm)["outcome"]=="unknown");
+    seq["request_id"]="w3_0000000000000002";assert(invoke(seq)["outcome"]=="committed");
+    const auto committedSeq=testNvsBlob;seq["changes"][0]["ssid"]="Conflict";
+    assert(invoke(seq)["error"]=="request_conflict"&&testNvsBlob==committedSeq);
+    wifiManagementResetSession();assert(wifiSchemesBegin());
+    auto seqQuery=request("result");seqQuery["query_id"]="w3_0000000000000002";seqQuery["result_peer"]=bond;
+    assert(invoke(seqQuery)["outcome"]=="committed");
+    std::cout<<"WFS4 permanent fence: confirmation, retained legacy, cross-principal, replay and commit-then-error restart passed\n";
+
+    // Both adapters call this exact production handler. USB continuous has no
+    // permit/BLE/PowerPlan prerequisite; ownership still gates every side effect.
+    testNvsBlob.clear();running=false;transactionUnified=false;wifiManagementResetSession();assert(wifiSchemesBegin());
+    WifiControlContext ctx;ctx.principal="installation";ctx.nameSpace=bond;ctx.until=UINT64_MAX;ctx.claimed=true;
+    auto unified=[&](JsonDocument &d){JsonDocument r;assert(!deserializeJson(r,wifiControlCommand(d,ctx,1000)));return r;};
+    auto usb=change("w3_0000000000000010",0,"");ctx.claimed=false;
+    assert(unified(usb)["error"]=="claim_required"&&wifiStore.revision==0);
+    ctx.occupied=true;assert(unified(usb)["error"]=="occupied");ctx.occupied=false;ctx.claimed=true;
+    ctx.sessionValid=false;assert(unified(usb)["error"]=="session_expired");ctx.sessionValid=true;
+    assert(unified(usb)["outcome"]=="committed");
+    auto queryUsb=request("result");queryUsb["query_id"]=usb["request_id"];
+    ctx.until=0;ctx.claimed=false;ctx.sessionValid=false;
+    assert(unified(queryUsb)["outcome"]=="committed"&&unified(usb)["outcome"]=="committed");
+    auto snap=request("snapshot");assert(unified(snap)["error"]=="window_required");
+    ctx.until=UINT64_MAX;ctx.claimed=true;ctx.sessionValid=true;
+    auto activateUsb=request("activate","w3_0000000000000011");activateUsb["network_id"]="home";activateUsb["version"]=1;
+    const int rfBeforePending=WiFi.begins;testNvsFail=true;
+    assert(unified(activateUsb)["error"]=="storage_unknown"&&WiFi.begins==rfBeforePending);testNvsFail=false;assert(wifiSchemesBegin());
+    auto started=unified(activateUsb);assert(started["ok"]==true&&wifiSetupBusy());
+    auto pendingBytes=testNvsBlob;auto queryActivation=request("result");queryActivation["query_id"]=activateUsb["request_id"];
+    assert(unified(queryActivation)["outcome"]=="accepted");
+    wifiSetupPoll(1001,"",99,false);assert(wifiSetupBusy()); // transport disconnect is not cancellation
+    WiFi.connected=WL_CONNECTED;WiFi.ipReady=true;wifiSetupPoll(1002,"",99,false);
+    assert(wifiSetupActivated()&&unified(queryActivation)["outcome"]=="committed");
+    auto completedBytes=testNvsBlob;requestId="";transactionUnified=false;assert(wifiSchemesBegin());
+    const int rfAfterCommit=WiFi.begins;ctx.claimed=false;ctx.sessionValid=false;
+    assert(unified(activateUsb)["outcome"]=="committed"&&WiFi.begins==rfAfterCommit);
+    testNvsBlob=pendingBytes;assert(wifiSchemesBegin());assert(unified(queryActivation)["outcome"]=="unknown");
+    assert(unified(activateUsb)["outcome"]=="unknown"&&WiFi.begins==rfAfterCommit);
+    testNvsBlob=completedBytes;assert(wifiSchemesBegin());ctx.claimed=true;ctx.sessionValid=true;
+    auto usbTrial=request("trial","w3_0000000000000012");usbTrial["network_id"]="trial";usbTrial["host_ssid"]="Host";usbTrial["ssid"]="Candidate";usbTrial["password"]="";usbTrial["replace"]=false;
+    assert(unified(usbTrial)["ok"]==true);WiFi.connected=WL_CONNECTED;WiFi.ipReady=true;
+    wifiSetupPoll(1002,"",0,false);assert(!wifiSetupBusy());requestId="";transactionUnified=false;assert(wifiSchemesBegin());
+    auto queryTrial=request("result");queryTrial["query_id"]=usbTrial["request_id"];assert(unified(queryTrial)["outcome"]=="unknown");
+    usbTrial["request_id"]="w3_0000000000000013";ctx.until=1005;assert(unified(usbTrial)["ok"]==true);
+    int beforeClose=WiFi.begins;wifiSetupConstrain(1005,0,true);assert(!wifiSetupBusy()&&WiFi.begins==beforeClose);
+    std::cout<<"Unified HTTP/BLE: USB no-permit, strict claim, stale session replay, pending/active atomicity, reboot unknown trial and no RF after deadline passed\n";
+
 }

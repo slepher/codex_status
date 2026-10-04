@@ -20,6 +20,9 @@ struct Args {
     token: String,
     #[arg(long, default_value = "30")]
     interval: u64,
+    /// Stable principal for this endpoint; use the existing Bridge installation ID.
+    #[arg(long)]
+    bridge_id: String,
     /// Run a single endpoint handoff and exit instead of looping.
     #[arg(long)]
     once: bool,
@@ -40,6 +43,7 @@ async fn main() -> Result<()> {
         host: args.host.clone().unwrap_or_else(lan_ip),
         port: args.port,
         token: args.token.clone(),
+        bridge_id: args.bridge_id.clone(),
         scan_timeout_ms: 30000,
     };
     tracing::info!("endpoint advertised: {}:{}", cfg.host, cfg.port);

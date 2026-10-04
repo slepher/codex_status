@@ -396,8 +396,12 @@ extern "C" {
     fn codex_sim_wifi_open(dir: *const c_char) -> c_int;
     fn codex_sim_wifi_command(input: *const c_char, peer: *const c_char, generation: u32, now: u64,
         physical: u64, light: u64, allowed: c_int, out: *mut c_char, cap: c_int) -> c_int;
+    fn codex_sim_wifi_control(input:*const c_char,principal:*const c_char,name_space:*const c_char,generation:u32,
+        now:u64,until:u64,physical:u64,claimed:c_int,session_valid:c_int,out:*mut c_char,cap:c_int)->c_int;
+    fn codex_sim_wifi_read_page(input:*const c_char,peer:*const c_char,generation:u32,text:*const c_char,out:*mut c_char,cap:c_int)->c_int;
     fn codex_sim_wifi_poll(now: u64, peer: *const c_char, generation: u32, encrypted: c_int, outcome: c_int) -> c_int;
     fn codex_sim_wifi_storage_failure(fail: c_int);
+    fn codex_sim_wifi_storage_status(out:*mut c_char,cap:c_int)->c_int;
 
     #[cfg(test)]
     fn codex_sync_core_check() -> c_int;
@@ -1390,9 +1394,22 @@ impl SimulatorWifi {
             physical, light, allowed as c_int, out.as_mut_ptr(), out.len() as c_int) };
         simulator_ffi_json(rc, &out, "wifi")
     }
+    pub fn control(&mut self,input:&serde_json::Value,principal:&str,namespace:&str,generation:u32,now:u64,until:u64,physical:u64,claimed:bool,session_valid:bool)->anyhow::Result<serde_json::Value> {
+        let input=CString::new(serde_json::to_string(input)?)?;let principal=CString::new(principal)?;let namespace=CString::new(namespace)?;let mut out=vec![0i8;16384];
+        let rc=unsafe{codex_sim_wifi_control(input.as_ptr(),principal.as_ptr(),namespace.as_ptr(),generation,now,until,physical,claimed as c_int,session_valid as c_int,out.as_mut_ptr(),out.len() as c_int)};
+        simulator_ffi_json(rc,&out,"wifi_control")
+    }
+    pub fn read_page(&mut self,input:&serde_json::Value,peer:&str,generation:u32,text:&str)->anyhow::Result<serde_json::Value> {
+        let input=CString::new(serde_json::to_string(input)?)?;let peer=CString::new(peer)?;let text=CString::new(text)?;let mut out=vec![0i8;16384];
+        let rc=unsafe{codex_sim_wifi_read_page(input.as_ptr(),peer.as_ptr(),generation,text.as_ptr(),out.as_mut_ptr(),out.len() as c_int)};simulator_ffi_json(rc,&out,"wifi_status_page")
+    }
     pub fn poll(&mut self, now: u64, peer: &str, generation: u32, encrypted: bool, outcome: i32) -> anyhow::Result<bool> {
         let peer = CString::new(peer)?;
         Ok(unsafe { codex_sim_wifi_poll(now, peer.as_ptr(), generation, encrypted as c_int, outcome) } == 1)
+    }
+    pub fn storage_status(&mut self)->anyhow::Result<serde_json::Value> {
+        let mut out=vec![0i8;2048];let rc=unsafe{codex_sim_wifi_storage_status(out.as_mut_ptr(),out.len() as c_int)};
+        simulator_ffi_json(rc,&out,"wifi_storage_status")
     }
     pub fn storage_failure(&mut self, fail: bool) { unsafe { codex_sim_wifi_storage_failure(fail as c_int) }; }
 }

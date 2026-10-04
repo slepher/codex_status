@@ -16,6 +16,7 @@
 | 改休眠设备的状态页、模板/OTA 延后投递 | `docs/generic-display-platform-design.md` + `project-workflow/sleep-aware-bridge/design.md` / `task.md` |
 | 改 BLE 会合功耗 | `docs/ble-rendezvous-power-design.md` |
 | 接续 Bridge macOS 菜单栏与 BLE 支持 | `project-workflow/bridge-macos/remaining-plan.md`（新窗口剩余实施入口）→ 按需读原 `plan.md` / `task.md`；已授权实施，`bridge_first` 已废弃，待办见 backlog B5 |
+| 设计/实施 USB、BOOT、Bridge 激活的统一在线状态与 HTTP/BLE 管理 | `project-workflow/bridge-macos/wifi-unified-protocol-design.md`（最新候选、未实现；认证状态直通/事件提示/身份迁移/验收矩阵）→ `wifi-redesign.md`；现场先读 PROGRESS，待办归 B6 |
 | 实施下一步配网、Bridge 双侧界面与异步会合 | `project-workflow/bridge-macos/wifi-rendezvous-execution.md`（W0–W6、第6节界面与Fake验收）→ `wifi-redesign.md` / `wifi-protocol.md` / BLE fidelity §11–§12；最新现场先读 PROGRESS |
 | 验证 Wi-Fi 分 tab / 真实 macOS 布局 | `project-workflow/bridge-macos/wifi-tabs-plan.md`；`node tools/test-device-page.mjs` + `bash tools/test-wifi-ui.sh`，WKWebView 合成 IPC / 12 场景 / 截图审阅；设备通信另验 |
 | 实施设备页离线 BLE 配网、绑定独立方案与 BOOT 恢复 | `project-workflow/bridge-macos/wifi-redesign.md`（最新全量管理/UI 重设计）→ `remaining-plan.md` R0–R4 / `wifi-protocol.md`；protocol=1 候选已部署，新设计与实机缺陷待完成，仅 Note4 在场，见 backlog B6 |
