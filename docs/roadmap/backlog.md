@@ -57,8 +57,11 @@
 - 用户指定顺序：本项先于状态同步阻塞调查，其后完成原交汇设计；分区工作指定单独agent接手。计划/交接见 [note4-coredump-plan.md](../../project-workflow/bridge-macos/note4-coredump-plan.md)。
 - .45已再次自报panic；USB启动日志和完整flash读回确认旧表无coredump。私有全flash+匹配ELF已备份，实际活动镜像核对。CSV已规划1MiB dump在0xB00000，缩短ota_1尾部并保留NVS/otadata/文件系统和app起始；生成/离线迁移校验通过。
 - **2026-10-04 01:54 已写设备并完成写后验收**：USB（MAC 7C:4F:AD:B9:34:08）`write-flash 0x8000` + `erase-region 0xB00000 0x100000` 成功；读回 0x8000 逐字节等于候选表（3072B SHA256 `6A11BC01…0A39`），dump 区 1MiB 非 0xFF 字节为 0；与私有备份比对——bootloader/otadata/phy/ota_0/ota_1/storage 一致、活动 .45 仍 `B4635DC0…468C`，仅 NVS 有 658B 运行期键写差异。启动日志确认 `v0.18.45-note4-b-wifi3`/`ota_1`/bundle `5d798bd9`/ctx `dea4fb9663b879f5`/commit 421 保持，HTTP `/status.json` 200。证据 [note4-repartition-verify](../../artifacts/bridge-macos/note4-repartition-verify/)。
-- **现场工具诱发复位说明（2026-10-04）**：esptool 开关 USB-Serial/JTAG 口会按设计复位芯片；写表/擦除/read-flash/hard-reset/串口抓取以及子 agent 反复开串口轮询都会让设备重启。"设备一直重启"经 Bridge 连续 `/api/status` 200（02:11:00–02:12:55，83–250ms）与 `uptime_s` 无中断证伪为崩溃；无 panic/`reset_reason=4`。非必要不再开串口轮询。
-- **仍未验**：真实 panic 转储 + CRC + 匹配 ELF 解码（启动识别不代替转储验收）；保首份 dump 策略仍属下次配置变更（现 .45 默认可被新 dump 覆盖，`FLASH_NO_OVERWRITE` 未启用）。不要用普通应用OTA或只改CSV宣称实机分区已更新。
+- **现场工具诱发复位说明（2026-10-04早期记录，20:38已细化）**：esptool进入/退出ROM的复位与普通串口监听分开；早期写表/擦除/read-flash/hard-reset及普通pyserial抓取/轮询流程曾使设备重启，不能泛化为所有port open/read必复位。"设备一直重启"经 Bridge 连续 `/api/status` 200（02:11:00–02:12:55，83–250ms）与 `uptime_s` 无中断证伪为崩溃；无 panic/`reset_reason=4`。非必要不再开串口轮询。
+- **2026-10-04 20:38真实转储验收已完成，新增BLE panic定位**：[调查与串口对照](../../project-workflow/bridge-macos/note4-panic-20261004.md)。Note4 .59再次panic（用户未操作USB/按键）；只读实际表/1MiB dump/运行槽镜像，23972B有效转储CRC通过、镜像与匹配ELF哈希通过、官方解码完成。nimble_host InstFetchProhibited/PC0，寄存器事件地址精确匹配ble_hs_timer.ev；loopTask同时在会合关BLE/NimBLE deinit/host stop中。已定位直接空timer回调，源码的queued事件与callout memset竞态高度吻合；取证结束时仍须生产调度定向复现与修复（本轮修复见下项）；不因转储可读结案。原始凭据敏感证据私有保存，设备dump未擦除。
+- **2026-10-04 BLE timer竞态已修复并部署.60**：真实NimBLE生产函数queued/dequeued交错旧版稳定PC0，STOPPING只stop、最终deinit负责销毁的修复通过ASan/UBSan2000轮；构建补丁严格校验/幂等。Note4唯一目标.60 ROM已OTA、独立认证运行hash与最新release确认（详见PROGRESS最新节）。USB被动串口下十次实际诊断init/scan/deinit同boot无panic；120s恢复窗实际连接/断开、到期controller released与正常深睡/自然timer reset_reason8已验。完整USB/电池连续业务会合、长期RF与功耗仍开放，不以短样本结案；1.54未构建部署。
+- **串口复位规则修正**：同机实测raw无modem ioctl与跳过DTR/RTS更新的pyserial不复位；普通false/false open及单独DTR=false触发USB_UART_CHIP_RESET，随后RTS=false不再触发（只证明本次初态）。esptool主动ROM进入/退出复位分别记账，AGENTS.md已更新保现场recipe；不能将串口读取概括为必复位或以此跳过用户授权诊断。
+- **仍待实施**：保首份dump策略（.60仍未启用`FLASH_NO_OVERWRITE`）、修复后的长期实机USB/电池/RF验收。BLE timer生命周期修复/回归/Note4部署已完成，真实panic+CRC+匹配ELF已验；普通应用OTA仍不更新分区表。
 
 
 ### A0. 恢复书桌屏旧诊断 checkpoint 的同步确认
