@@ -101,7 +101,7 @@ HTTP就绪、PowerPlan接受与CPU light-sleep分别记账。HTTP交接阶段20s
   `device.state` equals `"WIFI OFF"`）；两种键互斥且只允许 `bind` + 其一，
   未知键/类型整份拒绝。`equals` 模板需 `min_fw=0.13.5`。
 - **`device.now`（0.13.6+）**：设备本地时钟 `HH:MM`（由 `server_time` 同步、
-  RTC 走时；时间未知时不存在）。模板引用该绑定时设备每分钟局部重绘一次
+  RTC走时；Note4现部署0.18.59优先板载独立RTC，1.54旧部署仍内部RTC；时间未知时不存在）。模板引用该绑定时设备每分钟局部重绘一次
   （与桥 5min 推送解耦）；不引用则维持"仅事件重绘"。**0.13.7 修复实现**：
   「是否引用」在模板加载时缓存（`activeTplHasNow`，勿每轮 `indexOf` 扫
   ~8KB 模板——会冲掉唤醒路径缓存、light sleep 碎片化）、分钟检查用
@@ -306,15 +306,14 @@ DevLog/`/log`），用于证明 light sleep 生效。0.13.0 起同一文本也�
 
 ### 13.5 时间与持久化
 
-- 深睡前保存完整的 UTC 秒与微秒，唤醒后加上 `esp_rtc_get_time_us()`
-  差分（RTC 域连续）恢复完整 `timeval`，避免每次分钟唤醒丢失亚秒。
-  当前
-  `CONFIG_RTC_CLK_SRC_INT_RC=y`（内部 RC，有漂移），可选
-  `CONFIG_RTC_CLK_SRC_EXT_CRYS`（需确认板上 32.768k 晶振）或使用板上
-  **PCF85063**（I2C，现固件未用）。
-- RTC/NVS 清单：`mode`、`usage_rev`、`last_change`、`next_net_at`、
-  `retryStage`、`epochUsAtSleep`+`rtcTimeAtSleepUs`、时钟 rect/旧像素/
-  `partialCount`；NVS 兜 OTA/软复位。
+- **Note4 0.18.59-note4 已部署；1.54 仅软件实现/未部署**：Note4 的 **PCF8563** 与 1.54 的 **PCF85063A**，均在 I²C `0x51` / SDA GPIO47 / SCL GPIO48；两者日期寄存器基址分别为 `0x02` / `0x04`，不能按相同地址猜型号。来源与验收见 [独立 RTC 计划](../project-workflow/external-rtc/plan.md)。旧文档只写 PCF85063，不适用于 Note4。
+- RTC 保存 **UTC**；显示通过系统时间+既有 TZ，改时区不改 RTC。每次启动（含冷启动、软件复位、深睡唤醒）先读板载 RTC；light 每60s读一次，系统与 RTC 整秒差≤1s保留亚秒相位，差>1s才校正。不是按 CPU 执行时长累计日期时间。
+- Bridge 新校时及 SNTP 成功校时写回 RTC。SNTP 回调在短临界区保存UTC与单调锚点；主循环补上经过时间并在主循环/深睡前完成 I²C，防止并发RTC读取覆盖最新校时；内部 RC 回退值不写回污染 RTC。使用既有 Wire，100kHz、每操作25ms超时、TX/RX各32B（Arduino Wire平台最小值）；不每轮或每秒访问 I²C，不新增NVS写入。
+- Note4厂商I²C路径需GPIO42高电平；RTC操作作用域临时开启并在成功/失败时恢复原电平，兼容显示初始化关闭42的行为，不常开该音频电源。实机已确认ready/valid及后续采样推进；离线/深睡/24h与供电/功耗边界仍待验证。
+- 校时以 STOP→完整日历写→读回核对→运行→最终有效性确认完成；中断/撕裂/读回失败不宣称成功，本次启动阻止旧RTC值覆盖最新可信时间。日期校验包括 OS/VL、STOP/测试/非24小时模式、BCD、闰日/实际月份天数、范围 `1600000001..2099-12-31T23:59:59Z`；PCF8563以 C=0 表示2000–2099，C=1拒绝。首次未校时/完全失电标志须等可信校时恢复。
+- 失败回退保留原逻辑：深睡前保存完整 UTC 秒与微秒，唤醒加 `esp_rtc_get_time_us()` 差分。内部 `CONFIG_RTC_CLK_SRC_INT_RC=y` 有温漂；ESP32 内部 RTC 定时器仍负责定时唤醒，单调计时器负责超时与正式PowerPlan期限；本轮未接独立RTC INT唤醒，未证明完全断电保持、唤醒调度准度或板级功耗。
+- `/status.json` 与认证 `/api/status` 增加 `clock_rtc`：型号、最后操作状态、有效性、最后采样UTC与当前来源。原 `time_source=rtc` / history.src=2仍指内部回退；新增 `external_rtc`=3、`ntp`=4，不改变旧值或BLE结构。字段仅反映缓存，不因读状态再读I²C。
+- RTC/NVS 清单继续保留 `mode`、`usage_rev`、`last_change`、`next_net_at`、`retryStage`、`epochUsAtSleep`+`rtcTimeAtSleepUs`、时钟rect/旧像素/partialCount。硬件供电与24h漂移须实机核验；源码和宿主假总线通过不能替代。
 
 ### 13.6 功耗估算（按 A/B 实测修正）
 

@@ -38,6 +38,7 @@
 #include <esp_timer.h>
 #include <esp_private/pm_impl.h>
 #include <esp_rtc_time.h>
+#include <esp_sntp.h>
 #include <driver/rtc_io.h>
 #include <driver/gpio.h>
 #include <driver/usb_serial_jtag.h>
@@ -53,6 +54,7 @@
 #include "wake_trace_projection.h"
 #include "bridge_store.h"
 #include "owner_store.h"
+#include "external_rtc.h"
 #include "template_store.h"
 #include "template_engine.h"
 #include "template_xfer.h"
@@ -548,7 +550,9 @@ enum : uint8_t {
 enum : uint8_t {
     TIME_NONE = 0,
     TIME_BLE = 1,
-    TIME_RTC = 2,
+    TIME_RTC = 2,         // internal RTC fallback (legacy value preserved)
+    TIME_EXTERNAL_RTC = 3,
+    TIME_NTP = 4,
 };
 enum : uint8_t {
     TRACE_WAKE_BOOT = 0, TRACE_WAKE_TIMER = 1, TRACE_WAKE_BUTTON = 2,
@@ -833,6 +837,11 @@ static uint32_t bleOnAccumMs = 0;         // BLE radio ms accumulated this wake
 static uint32_t bleOnSinceMs = 0;         // millis() when BLE went on; 0 = off
 static uint8_t  wakeResult = WAKE_LIGHT;  // what this wake turned out to be
 static uint8_t  timeSource = TIME_NONE;   // clock provenance of this wake
+static ExternalRtc externalRtc;
+static portMUX_TYPE ntpRtcMux = portMUX_INITIALIZER_UNLOCKED;
+static bool ntpRtcPending = false;
+static uint64_t ntpRtcEpochUs = 0, ntpRtcMonotonicUs = 0;
+static uint64_t externalRtcLastPollMs = 0;
 RTC_DATA_ATTR static uint32_t rtcLastAwakeMs = 0;
 RTC_DATA_ATTR static uint32_t rtcLastBleMs = 0;
 RTC_DATA_ATTR static uint32_t rtcLastRenders = 0;
@@ -860,7 +869,74 @@ static uint32_t bleRadioMs() {
 }
 
 static const char *timeSourceName(uint8_t src) {
-    return src == TIME_BLE ? "ble" : src == TIME_RTC ? "rtc" : "none";
+    return src == TIME_BLE ? "ble" : src == TIME_RTC ? "rtc" :
+           src == TIME_EXTERNAL_RTC ? "external_rtc" : src == TIME_NTP ? "ntp" : "none";
+}
+
+// Only a fresh trusted Bridge/SNTP correction writes the board RTC. Writing
+// the internal-RC fallback here would turn offline drift into a new RTC anchor.
+static void writeExternalRtcFromSystem() {
+    time_t utc = time(nullptr);
+    if (!externalRtc.write(utc)) {
+        DevLog.printf("[clock] %s correction failed: %s\n", externalRtc.model(), externalRtc.status());
+    }
+}
+
+static void ntpTimeSynced(struct timeval *tv) {
+    // SNTP runs on TCP/IP's task. Capture its actual UTC and elapsed-time anchor:
+    // a concurrent RTC poll must not replace the new NTP time before writeback.
+    // No I2C, logging or allocation in this callback/critical section.
+    if (!tv || tv->tv_sec <= 1600000000) return;
+    const uint64_t epochUs = (uint64_t)tv->tv_sec * 1000000ULL + tv->tv_usec;
+    const uint64_t monotonicUs = (uint64_t)esp_timer_get_time();
+    portENTER_CRITICAL(&ntpRtcMux);
+    ntpRtcEpochUs = epochUs;
+    ntpRtcMonotonicUs = monotonicUs;
+    ntpRtcPending = true;
+    portEXIT_CRITICAL(&ntpRtcMux);
+}
+
+static void flushNtpRtcSync() {
+    portENTER_CRITICAL(&ntpRtcMux);
+    const bool pending = ntpRtcPending;
+    const uint64_t epochUs = ntpRtcEpochUs, monotonicUs = ntpRtcMonotonicUs;
+    ntpRtcPending = false;
+    portEXIT_CRITICAL(&ntpRtcMux);
+    if (!pending) return;
+    // setup/network/render work may delay this flush. Use the captured sample
+    // plus elapsed monotonic time, never a potentially overwritten system time.
+    const uint64_t nowUs = (uint64_t)esp_timer_get_time();
+    const uint64_t currentUs = epochUs + (nowUs >= monotonicUs ? nowUs - monotonicUs : 0);
+    struct timeval tv = {(time_t)(currentUs / 1000000ULL),
+                         (suseconds_t)(currentUs % 1000000ULL)};
+    if (settimeofday(&tv, nullptr) != 0) return;
+    timeSource = TIME_NTP;
+    writeExternalRtcFromSystem();
+}
+
+static bool readExternalRtc(bool boot) {
+    time_t utc;
+    externalRtcLastPollMs = (uint64_t)(esp_timer_get_time() / 1000ULL);
+    if (!externalRtc.read(utc)) return false;
+    time_t current = time(nullptr);
+    // The chip has whole-second resolution. Preserve a recent system clock's
+    // subsecond phase within 1 s; offline repeated wakes use the chip's absolute
+    // UTC, never a cumulative, rounded sleep delta.
+    if (boot || !timeKnown() || current < utc - 1 || current > utc + 1) {
+        struct timeval tv = {utc, 0};
+        if (settimeofday(&tv, nullptr) != 0) return false;
+        timeSource = TIME_EXTERNAL_RTC;
+    }
+    return true;
+}
+
+static void writeClockStatus(JsonObject clock) {
+    clock["model"] = externalRtc.model();
+    clock["status"] = externalRtc.status();
+    clock["valid"] = externalRtc.valid();
+    if (externalRtc.valid()) clock["sampled_utc"] = (int64_t)externalRtc.sampledUtc();
+    else clock["sampled_utc"] = nullptr;
+    clock["source"] = timeSourceName(timeSource);
 }
 
 static const char *wakeResultName(uint8_t result) {
@@ -952,8 +1028,10 @@ static void adoptServerTime(JsonDocument &doc) {
     long long st = doc["server_time"] | 0LL;
     if (!timeKnown() && st > 1600000000) {
         struct timeval tv = {(time_t)st, 0};
-        settimeofday(&tv, nullptr);
-        timeSource = TIME_BLE;
+        if (settimeofday(&tv, nullptr) == 0) {
+            timeSource = TIME_BLE;
+            writeExternalRtcFromSystem();
+        }
         DevLog.printf("[pm] clock set from bridge: %lld\n", st);
     }
     adoptTzOffset(doc);
@@ -966,8 +1044,10 @@ static bool adoptServerTimeForce(JsonDocument &doc) {
     long long st = doc["server_time"] | 0LL;
     if (st > 1600000000) {
         struct timeval tv = {(time_t)st, 0};
-        settimeofday(&tv, nullptr);
-        timeSource = TIME_BLE;
+        if (settimeofday(&tv, nullptr) == 0) {
+            timeSource = TIME_BLE;
+            writeExternalRtcFromSystem();
+        }
     }
     return adoptTzOffset(doc);
 }
@@ -2227,6 +2307,7 @@ static void releaseWakeHolds() {
 // path where those drivers were never initialized (an uninitialized
 // WiFi.disconnect(true) is a known hang risk).
 static void deepSleepRaw(uint32_t sec) {
+    flushNtpRtcSync();  // do not lose a successful SNTP correction at sleep/reset
     if (sec < 2) sec = 2;
     if (sec > 3600) sec = 3600;
     // Plan C telemetry: snapshot this wake's totals into RTC (RAM accounting
@@ -2665,6 +2746,7 @@ static void handleStatusJson() {
     doc["ble_on_ms"] = bleRadioMs();
     doc["render_count"] = bootRenderCount;
     doc["time_source"] = timeSourceName(timeSource);
+    writeClockStatus(doc["clock_rtc"].to<JsonObject>());
     doc["render_ms"] = wakeRenderMs;
     // Post-OTA minimum light window remaining (0 = not in one), so the bridge
     // can verify the window it is responsible for extending.
@@ -4104,6 +4186,7 @@ static void handleV2Status() {
     sync["last_error"] = syncStoreLost() ? "batch_lost" : nullptr;
     sync["confirmation_pending"] = false;
     wifiSchemesStorageStatus(doc["wifi_storage"].to<JsonObject>());
+    writeClockStatus(doc["clock_rtc"].to<JsonObject>());
     String out;
     serializeJson(doc, out);
     server.send(200, "application/json", out);
@@ -5183,6 +5266,7 @@ static void startNormalMode() {
     hostname = "codex-status-" + macSuffix();
     // Keep the active TZ (NVS/bridge-provided); a hard-coded "CST-8" here used
     // to clobber a bridge-synced timezone on every light start.
+    esp_sntp_set_time_sync_notification_cb(ntpTimeSynced);
     configTzTime(deviceTz, "pool.ntp.org");
     pinMode(0, INPUT_PULLUP);
     pinMode(18, INPUT_PULLUP);
@@ -5473,8 +5557,12 @@ void setup() {
     nvsStageMark(4);      // holds released without losing the VBAT latch
     plugged = usb_serial_jtag_is_connected();
     batteryPct = batteryPercent();
-    if (rtcMagic == 0xC0DE0001) restoreTimeFromRtc();
-    if (timeKnown()) timeSource = TIME_RTC;
+    if (!readExternalRtc(true)) {
+        DevLog.printf("[clock] %s unavailable: %s; internal RTC fallback\n",
+                      externalRtc.model(), externalRtc.status());
+        if (rtcMagic == 0xC0DE0001) restoreTimeFromRtc();
+        if (timeKnown()) timeSource = TIME_RTC;
+    }
 
     // A deep timer wake before the next contact first tries the retained clock
     // window. If the panel lacks a usable baseline, setup falls through to the
@@ -5817,6 +5905,9 @@ static void powerOff() {
 }
 
 void loop() {
+    flushNtpRtcSync();
+    const uint64_t clockPollMs = (uint64_t)(esp_timer_get_time() / 1000ULL);
+    if (clockPollMs - externalRtcLastPollMs >= 60000) readExternalRtc(false);
     if (otaRebootPending && (int32_t)(millis() - otaRebootAt) >= 0) ESP.restart();
     // OTA stall watchdog: no upload chunk for 20 s -> abort and restore the UI
     // (the WebServer also reports UPLOAD_FILE_ABORTED; this is the backstop).

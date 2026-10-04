@@ -157,7 +157,7 @@ if (status.light_sleep_ms !== undefined) {
 // rendezvous-only average is the number to use for the Plan C budget.
 console.log('per wake result (format-2 or legacy ev=7):');
 for (const [name, g] of historySummary.groups) {
-  const src = [...g.src.entries()].map(([s, n]) => `${['none', 'ble', 'rtc'][s] || s}:${n}`).join(' ');
+  const src = [...g.src.entries()].map(([s, n]) => `${['none', 'ble', 'rtc', 'external_rtc', 'ntp'][s] || s}:${n}`).join(' ');
   const results = g.results.size ? ` results=${[...g.results.entries()].map(([result, n]) => `${result}:${n}`).join(',')}` : '';
   console.log(`  ${name.padEnd(17)} n=${g.n}  avg ${f(g.ms / g.n / 1000, 2)}s  (src ${src})${results}`);
 }
