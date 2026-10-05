@@ -179,6 +179,7 @@ static void refreshInfo() {
     snapshot.wifiProtocol = extra["wifi_setup_protocol"] | 0;
     snapshot.wifiManagement = extra["wifi_management"] | 0;
     snapshot.wifiConnection = extra["wifi_connection"] | 0;
+    snapshot.bleClaim = extra["ble_claim"] | 0;
     snapshot.pairing = blePairingWindowOpen(); snapshot.bonded = peerBonded; snapshot.encrypted = peerEncrypted;
     writeAttribute(infoChr, bleBuildInfo(snapshot), "info");
 }

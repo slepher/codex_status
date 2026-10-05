@@ -3,6 +3,37 @@
 use super::*;
 use bridge_core::rendezvous::{Budget, CLOSE_BUDGET, HTTP_HANDOFF_BUDGET};
 
+// Explicit claim is required before BLE provisioning can create the HTTP path.
+// Reuses the HTTP claim permission/decision contract on capable firmware.
+pub(super) async fn claim_on_ble(ctx: &AppCtx, mac: &str, link: &mut bridge_ble::DeviceConnection) -> Result<(), String> {
+    if link.info["ble_claim"] != 1 { return Ok(()); }
+    if ctx.device_status_cache.lock().unwrap().get(mac).is_some_and(|s| s.yielded) {
+        return Err("owner_yielded".into());
+    }
+    let owner = link.command("wifi_owner", json!({})).await.map_err(|_| "owner_check_failed")?;
+    if owner["ok"] != true { return Err("owner_check_failed".into()); }
+    // Established wifi_owner replies omit owner_id when free. A successful
+    // authenticated reply proves that state; a wrong-typed field never does.
+    let id = match owner.get("owner_id") {
+        None => "", Some(Value::String(id)) => id.as_str(),
+        _ => return Err("owner_check_unknown".into()),
+    };
+    if !id.is_empty() && id != ctx.bridge_id { return Err("occupied".into()); }
+    let token = bridge_mcp::load_device_token(&crate::mcp_config(ctx), mac).ok_or("device_token_required")?;
+    let name = ctx.bridge_name.lock().unwrap().clone();
+    let ack = link.command("claim", json!({"operation_token":token,"name":name,
+        "host":bridge_ble::lan_ip(),"port":ctx.config.port,"lease_s":300})).await
+        .map_err(|_| "claim_result_unknown")?;
+    if ack["result"] != "applied" || ack["owner_id"] != ctx.bridge_id {
+        return Err(ack["error"].as_str().unwrap_or("claim_rejected").to_owned());
+    }
+    let remaining = ack["expires_in_s"].as_u64().filter(|s| *s > 0 && *s <= 300).ok_or("claim_result_unknown")?;
+    crate::update_device_claim_cache(&mut ctx.device_status_cache.lock().unwrap(), mac,
+        Some(json!({"id":ctx.bridge_id,"lease_s":300,"expires_in_s":remaining})), device_now(mac) as i64, false);
+    tracing::info!(device_mac=%mac, transport="ble", "explicit device claim confirmed");
+    Ok(())
+}
+
 /// One real GATT rendezvous. Small snapshots stay on BLE; larger work receives
 /// a formal light plan and is then delivered by the HTTP cycle.
 pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportunity, String> {
@@ -65,6 +96,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
         service(ctx)
             .note_ble_contact_at(&mac, received_at)
             .map_err(err_text)?;
+        claim_on_ble(ctx, &mac, &mut link).await?;
         let sync_capable = state["sync"]["v"] == 1;
         let mut sync_enabled = state["sync"]["enabled"] == true;
         if sync_capable && !sync_enabled {
@@ -230,6 +262,11 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
                     sync_opened = true;
                     state["_sync_open_unknown"] = json!(false);
                 }
+                Ok(_) if accepted && plan.mode == bridge_core::platform::model::PlanMode::Light => {
+                    state["_sync_open_unknown"] = json!(false);
+                    state["_sync_open_error"] = json!("sync_open_rejected");
+                    tracing::warn!(device_mac=%mac,stage="sync_open",error_category="sync_open_rejected","sync window rejected; accepted light plan remains valid");
+                }
                 Ok(_) => return Err("sync_open_rejected".into()),
                 // Unknown is only a candidate opportunity. Authenticated HTTP
                 // must prove the same plan/wake and the temporary sync phase.
@@ -263,6 +300,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
     };
     let shared_tail = Budget::at(admitted_at, HTTP_HANDOFF_BUDGET).capped(http_window.remaining());
     let mut http_budget = http_window;
+    let mut wifi_repair_error = None;
     if let Ok((state, _, opened, light)) = &normal_result {
         if *opened || *light {
             let plan_id = state["_sent_plan"]["plan_id"].as_u64().unwrap_or(0);
@@ -271,11 +309,13 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             // These optional commands consume a short shared tail; none gets
             // a new unbounded maintenance window before handoff.
             if !admitted_wifi.is_empty() {
-                let _ = tokio::time::timeout(
-                    Duration::from_millis(250),
-                    crate::wifi::note_link(ctx, &mac, &mut link),
-                )
-                .await;
+                // Cancelling a fragmented write leaves a partial JSON frame.
+                // Use the shared deadline; on timeout never reuse this link.
+                if tokio::time::timeout(shared_tail.remaining(),crate::wifi::note_link(ctx,&mac,&mut link)).await.is_err() {
+                    drop(_device_delivery);drop(_delivery);
+                    link.close_bounded(CLOSE_BUDGET).await;
+                    return Err("wifi_window_timeout".into());
+                }
             }
             // An unknown plan may query an already sent transaction, but
             // does not authorize a fresh write before HTTP proves the plan.
@@ -286,15 +326,15 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
                 let _ = crate::wifi::recover_on_link_budget(ctx, &mac, &mut link, shared_tail).await;
             }
             if !unknown && state["_wifi_repair"] == true {
-                crate::wifi::automatic_on_link(
+                if let Err(error) = crate::wifi::automatic_on_link(
                     ctx,
                     &mac,
                     &mut link,
                     shared_tail,
                 )
-                .await;
+                .await { wifi_repair_error = Some(error); }
             }
-            if explicit || unknown {
+            if (explicit || unknown) && wifi_repair_error.is_none() {
                 match ready_and_handoff(
                     ctx,
                     &mac,
@@ -331,6 +371,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             }
         }
     }
+    if let Some(error) = wifi_repair_error { normal_result = Err(error); }
     if let Ok((state, enabled, _, light)) = &normal_result {
         if !enabled {
             let _ = tokio::time::timeout(

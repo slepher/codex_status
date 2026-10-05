@@ -530,6 +530,11 @@ mod tests {
                         }
                     }
                 }
+                if String::from_utf8_lossy(&request).contains("POST /api/wifi/snapshot") {
+                    let start=request.windows(4).position(|w|w==b"\r\n\r\n").unwrap()+4;
+                    let body:Value=serde_json::from_slice(&request[start..]).unwrap();
+                    assert_eq!(body["session_nonce"],"snapshot-test-nonce");
+                }
                 let response = format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}", payload.len());
                 stream.write_all(response.as_bytes()).unwrap();
             });
@@ -606,7 +611,7 @@ mod tests {
             (200, json!({"device_mac":mac,"ok":true,"schema":2,"snapshot_id":"s","revision":1,"total":2,"offset":1,"next_offset":2,"chunk":"{}","done":true}).to_string(), ("failed", "snapshot_mismatch")),
         ] {
             let (ip, server) = respond_once(status, body);
-            let error = wifi_snapshot(&ip, "synthetic-token", mac, "bridge", None, Duration::from_secs(2)).unwrap_err();
+            let error = wifi_snapshot(&ip, "synthetic-token", mac, "bridge", None, "snapshot-test-nonce", Duration::from_secs(2)).unwrap_err();
             server.join().unwrap();
             assert_eq!(crate::rendezvous::wifi_error(&error), expected);
             assert!(!error.to_string().contains("must-not-expose"));
@@ -671,7 +676,7 @@ pub fn wifi_command(ip:&str,token:&str,mac:&str,bridge:&str,op:&str,nonce:&str,m
 
 /// Freeze and consume every page before exposing a complete snapshot. One hard
 /// deadline covers the entire read; a failed page never becomes an empty list.
-pub fn wifi_snapshot(ip: &str, token: &str, mac: &str, bridge: &str, permit: Option<&str>,
+pub fn wifi_snapshot(ip: &str, token: &str, mac: &str, bridge: &str, permit: Option<&str>, nonce: &str,
                      timeout: Duration) -> Result<crate::platform::wifi::Snapshot> {
     let until = Instant::now() + timeout;
     let mut offset = 0usize; let mut snapshot = String::new(); let mut revision = None;
@@ -680,7 +685,7 @@ pub fn wifi_snapshot(ip: &str, token: &str, mac: &str, bridge: &str, permit: Opt
         let remaining = until.saturating_duration_since(Instant::now());
         if remaining.is_zero() { bail!("wifi_snapshot_timeout"); }
         let reply = wifi_request(ip, token, mac, bridge, "snapshot",
-            json!({"offset":offset,"snapshot_id":snapshot,"permit":permit}), remaining)?;
+            json!({"offset":offset,"snapshot_id":snapshot,"permit":permit,"session_nonce":nonce}), remaining)?;
         if reply["ok"] != true { bail!("{}", reply["error"].as_str().unwrap_or("wifi_snapshot_rejected")); }
         let current = reply["snapshot_id"].as_str().context("wifi_snapshot_id")?;
         let rev = reply["revision"].as_u64().context("wifi_revision")?;

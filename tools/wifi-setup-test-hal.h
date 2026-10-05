@@ -1,11 +1,26 @@
 #pragma once
 #include <vector>
+#ifdef _WIN32
+extern "C" size_t codex_wifi_deflate(void *, size_t, const void *, size_t);
+extern "C" size_t codex_wifi_inflate(void *, size_t, const void *, size_t);
+extern "C" int codex_wifi_replace(const char *, const char *);
+extern "C" void codex_wifi_sha256(const unsigned char *, size_t, unsigned char *);
+#else
 #include <zlib.h>
+#endif
 inline size_t wifiDeflate(void *out, size_t cap, const void *in, size_t size) {
+#ifdef _WIN32
+    return codex_wifi_deflate(out, cap, in, size);
+#else
     uLongf n=cap; return compress2((Bytef *)out,&n,(const Bytef *)in,size,Z_DEFAULT_COMPRESSION)==Z_OK?n:0;
+#endif
 }
 inline size_t wifiInflate(void *out, size_t cap, const void *in, size_t size) {
+#ifdef _WIN32
+    return codex_wifi_inflate(out, cap, in, size);
+#else
     uLongf n=cap; return uncompress((Bytef *)out,&n,(const Bytef *)in,size)==Z_OK?n:0;
+#endif
 }
 #ifdef CODEX_WIFI_SIM
 #include <fstream>
@@ -14,14 +29,18 @@ extern std::string wifiBlobPath;
 #endif
 #ifdef __APPLE__
 #include <CommonCrypto/CommonDigest.h>
-#else
+#elif !defined(_WIN32)
 #include <openssl/sha.h>
 #endif
 inline int mbedtls_sha256(const unsigned char *data, size_t size, unsigned char *hash, int) {
 #ifdef __APPLE__
     CC_SHA256(data, (CC_LONG)size, hash);
 #else
+#ifdef _WIN32
+    codex_wifi_sha256(data, size, hash);
+#else
     SHA256(data, size, hash);
+#endif
 #endif
     return 0;
 }
@@ -47,7 +66,12 @@ public:
         auto temporary = wifiBlobPath + ".tmp";
         std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
         file.write((const char *)bytes, size); file.close();
-        if (!file || std::rename(temporary.c_str(), wifiBlobPath.c_str())) return 0;
+        if (!file) return 0;
+#ifdef _WIN32
+        if (codex_wifi_replace(temporary.c_str(), wifiBlobPath.c_str())) return 0;
+#else
+        if (std::rename(temporary.c_str(), wifiBlobPath.c_str())) return 0;
+#endif
 #endif
         testNvsBlob.assign(bytes, bytes + size); return testNvsCommitThenFail ? 0 : size;
     }

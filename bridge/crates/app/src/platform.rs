@@ -2529,6 +2529,10 @@ mod ble_close_lock_tests {
         mac: String,
         hang_close: bool,
         protocol: AtomicBool,
+        ble_claim: AtomicBool,
+        omit_free_owner: AtomicBool,
+        claim_owner: Mutex<String>,
+        claim_rejected: AtomicBool,
         lost_plan: AtomicBool,
         lost_handoff: AtomicBool,
         applied_plan: AtomicU64,
@@ -2584,7 +2588,7 @@ mod ble_close_lock_tests {
                 // 2 = Wi-Fi management supported. Without it `wifi::note_link`
                 // fails every queued job as `unsupported` before the cycle's
                 // drain/opportunity steps, which would hide the order under test.
-                "wifi_management": 2,
+                "wifi_management": 2, "ble_claim":u8::from(fake.ble_claim.load(Ordering::SeqCst)),
                 "wake_generation":if fake.protocol.load(Ordering::SeqCst) {json!(2)} else {Value::Null},
                 "wake_seq":if fake.protocol.load(Ordering::SeqCst) {json!(9)} else {Value::Null}})),
         )
@@ -2649,6 +2653,18 @@ mod ble_close_lock_tests {
                 _ => {},
             }
         }
+        if fake.ble_claim.load(Ordering::SeqCst) && op == "wifi_owner" {
+            let id=fake.claim_owner.lock().unwrap();
+            if !id.is_empty() || !fake.omit_free_owner.load(Ordering::SeqCst) { reply["owner_id"] = json!(*id); }
+        }
+        if fake.ble_claim.load(Ordering::SeqCst) && op == "claim" {
+            if fake.claim_rejected.load(Ordering::SeqCst) {
+                reply["result"]=json!("rejected");reply["error"]=json!("storage");
+            } else {
+                *fake.claim_owner.lock().unwrap()=command["bridge_id"].as_str().unwrap().into();
+            }
+            reply["owner_id"]=json!(*fake.claim_owner.lock().unwrap());reply["expires_in_s"]=json!(300);
+        }
         let blocked = (op == "plan" && fake.lost_plan.load(Ordering::SeqCst)) ||
             (op == "handoff" && fake.lost_handoff.load(Ordering::SeqCst)) ||
             *fake.blocked_op.lock().unwrap() == op;
@@ -2694,7 +2710,11 @@ mod ble_close_lock_tests {
         let fake = Arc::new(FakeBle {
             mac: mac.to_owned(),
             hang_close,
-            protocol: AtomicBool::new(false), lost_plan: AtomicBool::new(false), lost_handoff: AtomicBool::new(false),
+            protocol: AtomicBool::new(false),
+            ble_claim: AtomicBool::new(false),
+            omit_free_owner: AtomicBool::new(false),
+            claim_owner: Mutex::new(String::new()),
+            claim_rejected: AtomicBool::new(false), lost_plan: AtomicBool::new(false), lost_handoff: AtomicBool::new(false),
             applied_plan: AtomicU64::new(0), apply_plan: AtomicBool::new(true), handoff_done: AtomicBool::new(false), sync_opened: AtomicBool::new(false), blocked_op: Mutex::new(String::new()),
             sync_due,
             closes: AtomicUsize::new(0),
@@ -2782,6 +2802,42 @@ mod ble_close_lock_tests {
             mcp_error: Mutex::new(None),
             mcp_tx,
             platform,
+        }
+    }
+
+    #[tokio::test(flavor="multi_thread",worker_threads=4)]
+    async fn ble_first_claim_precedes_plan_and_never_forces_or_retries_unknown() {
+        let _serial=SIM_ENV.lock().unwrap_or_else(|p|p.into_inner());
+        for case in ["free","free_legacy","occupied","storage","yielded","lost_ack"] {
+            let dir=tempfile::tempdir().unwrap();
+            let (fake,url)=start_fake_ble(HUNG_MAC,false).await;
+            fake.ble_claim.store(true,Ordering::SeqCst);
+            if case=="free_legacy" { fake.omit_free_owner.store(true,Ordering::SeqCst); }
+            if case=="occupied" { *fake.claim_owner.lock().unwrap()="other-host".into(); }
+            if case=="storage" { fake.claim_rejected.store(true,Ordering::SeqCst); }
+            if case=="lost_ack" { *fake.blocked_op.lock().unwrap()="claim".into(); }
+            let ctx=test_ctx(dir.path(),&[HUNG_MAC]);
+            if case=="yielded" { crate::update_device_claim_cache(&mut ctx.device_status_cache.lock().unwrap(),HUNG_MAC,None,device_now(HUNG_MAC) as i64,true); }
+            bridge_mcp::save_device_token_at(dir.path(),HUNG_MAC,&"a".repeat(32)).unwrap();
+            std::env::set_var("CODEX_STATUS_SIM_BLE_ENDPOINTS",json!({HUNG_MAC:url}).to_string());
+            let result=ble_cycle(&ctx,&[HUNG_MAC.into()]).await;
+            std::env::remove_var("CODEX_STATUS_SIM_BLE_ENDPOINTS");
+            let commands=fake.commands.lock().unwrap();
+            let ops=commands.iter().map(|c|c["op"].as_str().unwrap()).collect::<Vec<_>>();
+            if case.starts_with("free") {
+                assert!(matches!(result,Ok(BleOpportunity::Connected{result:Ok(()),..})),"{result:?}");
+                assert!(ops.iter().position(|op|*op=="claim").unwrap()<ops.iter().position(|op|*op=="plan").unwrap());
+            } else {
+                let expected=match case {"occupied"=>"occupied","storage"=>"storage","yielded"=>"owner_yielded",_=>"claim_result_unknown"};
+                assert!(matches!(&result,Ok(BleOpportunity::Connected{result:Err(e),..}) if e==expected),"{case}: {result:?}");
+                assert!(!ops.contains(&"plan"));
+            }
+            let claims=commands.iter().filter(|c|c["op"]=="claim").collect::<Vec<_>>();
+            assert!(claims.len()<=1);
+            for command in claims {
+                assert_eq!(command["operation_token"],"a".repeat(32));
+                assert!(command["force"].is_null()&&command["release"].is_null());
+            }
         }
     }
 

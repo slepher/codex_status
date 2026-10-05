@@ -16,3 +16,7 @@ cc = "1"
 [dev-dependencies]
 bridge-core = { path = "../core" }
 base64 = "0.22"
+
+[target.'cfg(windows)'.dependencies]
+miniz_oxide = "0.8"
+sha2 = "0.10"

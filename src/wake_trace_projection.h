@@ -3,7 +3,8 @@
 #include "v2_sync.h"
 
 // The retained production record, also used by Fake's diagnostic HAL.
-struct __attribute__((packed)) WakeTraceRec {
+#pragma pack(push, 1)
+struct WakeTraceRec {
     uint32_t wake_generation, seq;
     uint8_t wake_type, wake_cause, ext1, valid_start, valid_end, furthest, result, error;
     uint16_t request_crc;
@@ -13,6 +14,7 @@ struct __attribute__((packed)) WakeTraceRec {
     uint8_t transport, reserved;
     uint32_t crc;
 };
+#pragma pack(pop)
 static_assert(sizeof(WakeTraceRec)==48,"wake trace record must stay 48 bytes");
 inline uint32_t wakeTraceCrc(const WakeTraceRec &r) {
     const auto *p=(const uint8_t *)&r;uint32_t h=2166136261u;

@@ -68,7 +68,9 @@ fn main() {
     }
     build.compile("bridge_render");
     // The Wi-Fi HAL reads the same zlib NVS encoding as ESP ROM miniz.
-    println!("cargo:rustc-link-lib=z");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        println!("cargo:rustc-link-lib=z");
+    }
 
     // Every header the engine pulls in has to be tracked: the generated font
     // tables are headers, so without this a re-crop would leave the host preview

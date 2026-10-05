@@ -14,6 +14,11 @@ int main() {
     proof.wakeSeq=8;assert(!rendezvousProofMatches(proof));proof.wakeSeq=9;
     proof.expectedBridge="";assert(!rendezvousProofMatches(proof));
     RendezvousProtocol rv;
+    // No Bridge/Plan: the production protocol never enters HTTP and expires.
+    rv.begin(0,4000);
+    assert(!rv.hasPlan() && !rv.needsHttp() && !rv.tick(3999));
+    assert(rv.tick(4000) && !rv.needsHttp());
+
     rv.begin(0,4000); rv.connected(100); rv.admitHttp(500,120000);
     assert(rv.needsHttp() && rv.deadline()==500+RV_HANDOFF_MS);
     assert(!rv.handoff(700,true)); // listening is not ready yet

@@ -1444,7 +1444,7 @@ impl DeviceConnection {
             let next=reply["next_offset"].as_u64().context("wifi_snapshot_offset")? as usize;
             let chunk=reply["chunk"].as_str().context("wifi_snapshot_chunk")?;
             if reply["schema"]!=2 || size>16384 || reply["offset"]!=offset || next<=offset || next>size || chunk.len()!=next-offset ||
-                (offset>0 && (id!=snapshot || revision!=Some(rev) || total!=Some(size))) {bail!("wifi_snapshot_mismatch");}
+                (offset>0 && (id!=snapshot || revision!=Some(rev) || total!=Some(size))) {tracing::warn!(offset,next,size,chunk_bytes=chunk.len(),returned_offset=?reply["offset"].as_u64(),id_matches=id==snapshot,revision_matches=revision==Some(rev),total_matches=total==Some(size),"Wi-Fi snapshot page mismatch");bail!("wifi_snapshot_mismatch");}
             snapshot=id.to_owned();revision=Some(rev);total=Some(size);text.push_str(chunk);offset=next;
             if reply["complete"]==true {
                 if offset!=size {bail!("wifi_snapshot_incomplete");}

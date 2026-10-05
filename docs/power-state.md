@@ -389,3 +389,9 @@ DevLog/`/log`），用于证明 light sleep 生效。0.13.0 起同一文本也�
 - 事件码：1 boot（aux=`esp_sleep_wakeup_cause_t`）、2 enter-deep、3 thin
   （aux=1 已画时钟）、4 net-ok（aux=200）、5 net-fail、6 to-light
   （aux=1 按钮唤醒）。
+
+### 2026-10-06 owner deadline and BLE-first claim correction
+
+Ownership expires on a checked RTC deadline, including time spent asleep. A 24-byte retained checkpoint contains renewal RTC microseconds, expiry RTC microseconds, the owner identity tag and OWL1 checksum over explicit fields. Deep sleep may restore the original deadline only after identity, checksum, lease length and clock continuity checks. A cold/software/USB reset without this proof clears occupancy; startup is never a renewal. Legacy uptime-only records cannot justify a new five-minute lease. Wall-clock synchronization does not change this deadline. `expires_in_s` uses the same RTC clock as permission decisions.
+
+Explicit HTTP `POST /claim` and capability `ble_claim=1`'s BLE `claim` share `ownerApplyClaim` and the existing decision contract. BLE additionally requires bonded encryption, current endpoint principal/token, command MAC/nonce validation and the device operation token; its new ordinary bootstrap request never accepts force/release. Bridge checks the authoritative owner and local yielded state first, sends claim once before Plan/provisioning, confirms the matching owner ACK, and returns unknown on missing ACK without resubmitting. Storage failure/readback mismatch is an explicit error. Valid foreign owners remain untouched. Existing HTTP force/release requires its existing explicit user action and device token. GATT characteristic layout is unchanged.

@@ -2886,7 +2886,7 @@ fn wifi_jobs_use_production_hal_real_ble_ack_and_query_after_lost_http_ack() {
     let mut transport = |op: &str, body: Value| {
         transport_ops.push(op.to_owned());
         if op == "snapshot" {
-            let mut s = bridge_core::device_client::wifi_snapshot(&address,ENDPOINT,mac,"bridge-test",Some(&permit),Duration::from_secs(3)).map_err(|error| { eprintln!("Wi-Fi snapshot failed: {error:#}"); error })?;
+            let mut s = bridge_core::device_client::wifi_snapshot(&address,ENDPOINT,mac,"bridge-test",Some(&permit),"",Duration::from_secs(3)).map_err(|error| { eprintln!("Wi-Fi snapshot failed: {error:#}"); error })?;
             s.observed_at = 107; Ok(serde_json::to_value(s)?)
         } else { bridge_core::device_client::wifi_request(&address,ENDPOINT,mac,"bridge-test",op,body,Duration::from_secs(3)) }
     };
@@ -2897,7 +2897,7 @@ fn wifi_jobs_use_production_hal_real_ble_ack_and_query_after_lost_http_ack() {
     assert_eq!(request(sim.address(),"POST","/sim/wifi",Some(CONTROL),br#"{"drop_http_ack":true}"#).0,200);
     let awaiting = svc.wifi_attempt(mac,&job.job_id,Some(&permit),&BTreeMap::new(),110,&mut transport).unwrap().unwrap();
     assert_eq!(awaiting.state,"awaiting_confirmation"); assert!(awaiting.sent && awaiting.may_have_committed);
-    let snapshot = bridge_core::device_client::wifi_snapshot(&address,ENDPOINT,mac,"bridge-test",Some(&permit),Duration::from_secs(3)).unwrap();
+    let snapshot = bridge_core::device_client::wifi_snapshot(&address,ENDPOINT,mac,"bridge-test",Some(&permit),"",Duration::from_secs(3)).unwrap();
     assert_eq!(snapshot.revision,1); assert_eq!(snapshot.active["network_id"],"");
     drop(svc); let svc = PlatformService::open(&root).unwrap();
     let mut calls=Vec::new();
@@ -2932,7 +2932,7 @@ fn wifi_fake_full_projection_freezes_pages_and_preserves_bond_legacy_and_atomic_
     let apply=bridge_core::device_client::wifi_request(&address,ENDPOINT,mac,"bridge-test","apply",serde_json::json!({
         "request_id":"batch","expected_revision":0,"permit":permit,"changes":changes}),Duration::from_secs(3)).unwrap();
     assert_eq!(apply["outcome"],"committed");
-    let full=bridge_core::device_client::wifi_snapshot(&address,ENDPOINT,mac,"bridge-test",Some(&permit),Duration::from_secs(3)).unwrap();
+    let full=bridge_core::device_client::wifi_snapshot(&address,ENDPOINT,mac,"bridge-test",Some(&permit),"",Duration::from_secs(3)).unwrap();
     assert_eq!(full.networks.len(),6);assert_eq!(full.networks.iter().filter(|n|n.writable).count(),4);
     assert_eq!(full.networks.last().unwrap().bond,"legacy");assert_eq!(full.active["network_id"],"");
     let legacy:Vec<_>=full.networks.iter().filter(|n|n.bond=="legacy")
@@ -2947,7 +2947,7 @@ fn wifi_fake_full_projection_freezes_pages_and_preserves_bond_legacy_and_atomic_
     assert_eq!(bad["error"],"capacity");
     let receipt=bridge_core::device_client::wifi_request(&address,ENDPOINT,mac,"bridge-test","result",serde_json::json!({"query_id":"invalid-batch"}),Duration::from_secs(3)).unwrap();
     assert_eq!(receipt["outcome"],"rejected");assert_eq!(receipt["revision"],1);
-    assert_eq!(bridge_core::device_client::wifi_snapshot(&address,ENDPOINT,mac,"bridge-test",Some(&permit),Duration::from_secs(3)).unwrap().networks[0].network.host_ssid,"Host0");
+    assert_eq!(bridge_core::device_client::wifi_snapshot(&address,ENDPOINT,mac,"bridge-test",Some(&permit),"",Duration::from_secs(3)).unwrap().networks[0].network.host_ssid,"Host0");
     assert_eq!(request(sim.address(),"POST","/sim/wifi",Some(CONTROL),br#"{"bond":"02:00:00:00:00:03/1","maintenance_ms":120000}"#).0,200);
     let second=runtime.block_on(async {
         let mut link=bridge_ble::DeviceConnection::connect(mac,ENDPOINT,"other-installation").await.unwrap().unwrap();
@@ -2956,7 +2956,7 @@ fn wifi_fake_full_projection_freezes_pages_and_preserves_bond_legacy_and_atomic_
         // are still subject to the same attribute capacity guard.
         link.close().await;assert_eq!(reply["ok"],true,"{}",reply["error"]);reply["permit"].as_str().unwrap().to_owned()
     });
-    let foreign=bridge_core::device_client::wifi_snapshot(&address,ENDPOINT,mac,"other-installation",Some(&second),Duration::from_secs(3)).unwrap();
+    let foreign=bridge_core::device_client::wifi_snapshot(&address,ENDPOINT,mac,"other-installation",Some(&second),"",Duration::from_secs(3)).unwrap();
     assert!(foreign.networks.iter().all(|n|!n.writable));
     let added=bridge_core::device_client::wifi_request(&address,ENDPOINT,mac,"other-installation","apply",serde_json::json!({
         "request_id":"foreign-own","expected_revision":1,"permit":second,"changes":[
@@ -2965,7 +2965,7 @@ fn wifi_fake_full_projection_freezes_pages_and_preserves_bond_legacy_and_atomic_
     let stale=bridge_core::device_client::wifi_request(&address,ENDPOINT,mac,"bridge-test","snapshot",serde_json::json!({
         "offset":first["next_offset"],"snapshot_id":first["snapshot_id"],"permit":permit}),Duration::from_secs(3)).unwrap();
     assert_eq!(stale["error"],"snapshot_expired");
-    let full=bridge_core::device_client::wifi_snapshot(&address,ENDPOINT,mac,"other-installation",Some(&second),Duration::from_secs(3)).unwrap();
+    let full=bridge_core::device_client::wifi_snapshot(&address,ENDPOINT,mac,"other-installation",Some(&second),"",Duration::from_secs(3)).unwrap();
     assert_eq!(full.networks.len(),7);assert_eq!(full.networks.iter().filter(|n|n.writable).count(),1);
     let attrs=json_body(&request(sim.address(),"GET","/sim/ble/attributes",Some(CONTROL),b"").1);
     assert!(attrs.to_string().contains("512"));
@@ -3055,12 +3055,12 @@ fn rendezvous_audit_sync_completion_closes_window_before_wifi_snapshot() {
         &serde_json::json!({"op":"step","delta_ms":120000})).0,200);
     assert_eq!(sim_state(&sim)["power"]["sync_open"],true);
     let ip = sim.address().to_string();
-    let before = bridge_core::device_client::wifi_snapshot(&ip,ENDPOINT,mac,"bridge-test",None,Duration::from_secs(1));
+    let before = bridge_core::device_client::wifi_snapshot(&ip,ENDPOINT,mac,"bridge-test",None,"",Duration::from_secs(1));
     assert!(before.is_ok(),"snapshot must be reachable before diagnostic drain: {before:?}");
     // The production Bridge drains sync diagnostics BEFORE wifi::opportunity_locked.
     note4_sync_roundtrip(&sim,3,&["light_exit"]);
     assert_eq!(sim_state(&sim)["power"]["sync_open"],false);
-    let after = bridge_core::device_client::wifi_snapshot(&ip,ENDPOINT,mac,"bridge-test",None,Duration::from_millis(250));
+    let after = bridge_core::device_client::wifi_snapshot(&ip,ENDPOINT,mac,"bridge-test",None,"",Duration::from_millis(250));
     assert!(after.is_err(),"the closed HTTP surface must reject a following snapshot");
     eprintln!("CONFIRMED: snapshot succeeds before sync_complete and fails afterwards without a formal light window.");
 }
@@ -3082,7 +3082,7 @@ fn unified_usb_http_without_ble_survives_bridge_restart_lost_ack_and_receipt_ret
     assert_eq!(matched["version"],0);
     let read=svc.wifi_queue(mac,"bridge-test","read",vec![],100).unwrap();
     let transport=|op:&str,body:Value| {
-        if op=="snapshot" {Ok(serde_json::to_value(bridge_core::device_client::wifi_snapshot(&address,ENDPOINT,mac,"bridge-test",None,Duration::from_secs(3))?)?)}
+        if op=="snapshot" {Ok(serde_json::to_value(bridge_core::device_client::wifi_snapshot(&address,ENDPOINT,mac,"bridge-test",None,"",Duration::from_secs(3))?)?)}
         else {bridge_core::device_client::wifi_command(&address,ENDPOINT,mac,"bridge-test",op,status["session_nonce"].as_str().unwrap(),body,Duration::from_secs(3))}
     };
     assert_eq!(svc.wifi_attempt(mac,&read.job_id,None,&BTreeMap::new(),101,transport).unwrap().unwrap().state,"completed");
@@ -3130,7 +3130,7 @@ fn new_wifi_sync_with_old_snapshot_reports_real_device_revision_rejection() {
     let status=bridge_core::device_client::status(&address,ENDPOINT,Duration::from_secs(3)).unwrap();
     let root=temp_data_dir();let svc=PlatformService::open(&root).unwrap();svc.device_upsert(DeviceIdentity::new(mac,"Stale cache fake").unwrap(),DeviceCapabilities::ssd1681_154g()).unwrap();
     let read=svc.wifi_queue(mac,"bridge-test","read",vec![],100).unwrap();
-    let snapshot=bridge_core::device_client::wifi_snapshot(&address,ENDPOINT,mac,"bridge-test",None,Duration::from_secs(3)).unwrap();assert_eq!(snapshot.revision,0);
+    let snapshot=bridge_core::device_client::wifi_snapshot(&address,ENDPOINT,mac,"bridge-test",None,"",Duration::from_secs(3)).unwrap();assert_eq!(snapshot.revision,0);
     svc.wifi_complete_read(mac,&read.job_id,snapshot,100).unwrap();
     let transport=|op:&str,body:Value|bridge_core::device_client::wifi_command(&address,ENDPOINT,mac,"bridge-test",op,status["session_nonce"].as_str().unwrap(),body,Duration::from_secs(3));
     let external=transport("apply",serde_json::json!({"request_id":"external-config","expected_revision":0,"changes":[{"network_id":"home","host_ssid":"Host","ssid":"External","credential":"open"}]})).unwrap();assert_eq!(external["revision"],1);

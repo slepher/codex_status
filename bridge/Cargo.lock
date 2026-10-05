@@ -396,8 +396,10 @@ dependencies = [
  "base64 0.22.1",
  "bridge-core",
  "cc",
+ "miniz_oxide 0.8.9",
  "png 0.17.16",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

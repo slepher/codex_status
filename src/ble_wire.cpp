@@ -57,6 +57,7 @@ String bleBuildInfo(const BleInfoSnapshot &s) {
     doc["wifi_setup_protocol"] = s.wifiProtocol;
     doc["wifi_management"] = s.wifiManagement;
     if(s.wifiConnection) doc["wc"] = s.wifiConnection;
+    if(s.bleClaim) doc["ble_claim"] = s.bleClaim;
     doc["wake_generation"] = s.generation; doc["wake_seq"] = s.wakeSeq;
     if (s.rfRemainingMs != UINT32_MAX) doc["rf_remaining_ms"] = s.rfRemainingMs;
     doc["pairingWindow"] = s.pairing; doc["peerBonded"] = s.bonded;

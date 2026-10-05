@@ -10,10 +10,11 @@ static WifiPermit wifiPermits[3];
 static String fullSnapshot, fullSnapshotId, fullSnapshotBridge;
 static uint64_t fullSnapshotUntil = 0;
 static uint64_t fullSnapshotRevision = 0;
+static bool fullSnapshotOwnerRead = false;
 void wifiManagementResetSession() {
     for (auto &p : wifiPermits) p = WifiPermit{};
     fullSnapshot = fullSnapshotId = fullSnapshotBridge = "";
-    fullSnapshotUntil = 0;
+    fullSnapshotUntil = 0; fullSnapshotOwnerRead = false;
 }
 static String wifiRandomId() {
     char text[33];
@@ -57,7 +58,7 @@ static WifiPermit *findWifiPermit(JsonDocument &request, uint64_t now) {
     return nullptr;
 }
 static void projectWifiNetwork(JsonArray list, const WifiNetwork &n, const char *label,
-                               uint64_t version, bool writable) {
+                               uint64_t version, bool writable, bool ownerRead = false) {
     JsonObject item = list.add<JsonObject>();
     // Legacy rows are projected from a loop-local WifiNetwork. ArduinoJson
     // borrows const char arrays; own these strings until the snapshot freezes.
@@ -66,7 +67,7 @@ static void projectWifiNetwork(JsonArray list, const WifiNetwork &n, const char 
     net["network_id"] = String(n.id); net["host_ssid"] = String(n.host); net["ssid"] = String(n.ssid);
     net["label"] = String(label); net["version"] = version; net["credential"] = "device";
     net["origin"] = String(writable ? "local" : n.bond); net["deleted"] = false;
-    if(writable) net["password"] = String(n.password);
+    if(writable || ownerRead) net["password"] = String(n.password);
 }
 static String wifiManagementWithContext(JsonDocument &doc, uint64_t now, const String &legacy, const WifiControlContext *context) {
     const String op = doc["op"] | "", bridge = doc["bridge_id"] | "";
@@ -100,7 +101,8 @@ static String wifiManagementWithContext(JsonDocument &doc, uint64_t now, const S
             JsonArray list = snapshot["networks"].to<JsonArray>();
             for (size_t i = 0; i < schemes.networks.size(); ++i) if (*schemes.networks[i].id)
                 projectWifiNetwork(list, schemes.networks[i], schemes.networks[i].label, schemes.networks[i].version,
-                    permit && permit->peer == schemes.networks[i].bond);
+                    permit && permit->peer == schemes.networks[i].bond,
+                    context && context->sessionValid && context->claimed);
             JsonDocument old;
             if (legacy.length() && !deserializeJson(old, legacy)) for (JsonObject n : old.as<JsonArray>()) {
                 WifiNetwork network; network.bond.set("legacy");
@@ -111,9 +113,11 @@ static String wifiManagementWithContext(JsonDocument &doc, uint64_t now, const S
             }
             fullSnapshot = ""; serializeJson(snapshot, fullSnapshot);
             fullSnapshotId = snapshot["snapshot_id"].as<String>(); fullSnapshotBridge = bridge;
+            fullSnapshotOwnerRead = context && context->sessionValid && context->claimed;
             fullSnapshotUntil = now + 30000; fullSnapshotRevision = wifiStore.revision;
         } else if (now >= fullSnapshotUntil || bridge != fullSnapshotBridge ||
             String(doc["snapshot_id"] | "") != fullSnapshotId || fullSnapshotRevision != wifiStore.revision) return reply(doc, "snapshot_expired");
+        if (fullSnapshotOwnerRead && !(context && context->sessionValid && context->claimed)) return reply(doc, "claim_required");
         if (offset >= fullSnapshot.length()) return reply(doc, "shape");
         uint32_t next = std::min((uint32_t)fullSnapshot.length(), offset + (context && context->generation ? 80 : 768));
         while (next < fullSnapshot.length() && next > offset && (((uint8_t)fullSnapshot[next] & 0xc0) == 0x80)) --next;

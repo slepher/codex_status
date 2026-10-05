@@ -109,3 +109,27 @@ pub fn read(_request_permission: bool) -> Value { json!({"state":"unsupported", 
 pub fn current_ssid(value: &Value) -> Option<&str> {
     (value["state"] == "connected").then(|| value["networks"][0]["ssid"].as_str()).flatten()
 }
+
+// Freeze the actual environment across save→activate. Saved configuration is
+// never evidence of which network the host currently uses.
+pub fn require_same_network(expected: &Value, actual: &Value) -> Result<(), String> {
+    let expected = current_ssid(expected).filter(|s| !s.is_empty()).ok_or("host_network_unknown")?;
+    let actual = current_ssid(actual).filter(|s| !s.is_empty()).ok_or("host_network_unknown")?;
+    if expected != actual { return Err("host_network_changed".into()); }
+    Ok(())
+}
+
+#[cfg(test)]
+mod network_contact_tests {
+    use super::*;
+    #[test]
+    fn current_network_must_be_known_and_unchanged() {
+        let a = json!({"state":"connected","networks":[{"ssid":"A"}]});
+        let b = json!({"state":"connected","networks":[{"ssid":"B"}]});
+        assert!(require_same_network(&b, &b).is_ok());
+        assert_eq!(require_same_network(&a, &b).unwrap_err(), "host_network_changed");
+        for state in ["permission_denied","ambiguous","unavailable","no_wifi"] {
+            assert_eq!(require_same_network(&b, &json!({"state":state,"networks":[{"ssid":"B"}]})).unwrap_err(), "host_network_unknown");
+        }
+    }
+}

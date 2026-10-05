@@ -1424,3 +1424,117 @@ fn rendezvous_plan_replay_ack_reports_remaining_without_renewal() {
         assert_eq!(ack["deadline_ms"], 120_000);
     }
 }
+#[cfg(windows)]
+mod windows_wifi_hal {
+    use sha2::{Digest, Sha256};
+
+    // Rust's Windows rename replaces an existing file atomically (MoveFileExW).
+    #[no_mangle]
+    unsafe extern "C" fn codex_wifi_replace(from: *const std::ffi::c_char, to: *const std::ffi::c_char) -> i32 {
+        let from = unsafe { std::ffi::CStr::from_ptr(from) }.to_str();
+        let to = unsafe { std::ffi::CStr::from_ptr(to) }.to_str();
+        match (from, to) {
+            (Ok(from), Ok(to)) if std::fs::rename(from, to).is_ok() => 0,
+            _ => -1,
+        }
+    }
+
+    unsafe fn copy_output(out: *mut u8, capacity: usize, bytes: &[u8]) -> usize {
+        if bytes.len() > capacity { return 0; }
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len()); }
+        bytes.len()
+    }
+
+    #[no_mangle]
+    unsafe extern "C" fn codex_wifi_deflate(out: *mut u8, capacity: usize, input: *const u8, size: usize) -> usize {
+        let input = unsafe { std::slice::from_raw_parts(input, size) };
+        let bytes = miniz_oxide::deflate::compress_to_vec_zlib(input, 6);
+        unsafe { copy_output(out, capacity, &bytes) }
+    }
+
+    #[no_mangle]
+    unsafe extern "C" fn codex_wifi_inflate(out: *mut u8, capacity: usize, input: *const u8, size: usize) -> usize {
+        let input = unsafe { std::slice::from_raw_parts(input, size) };
+        match miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(input, capacity) {
+            Ok(bytes) => unsafe { copy_output(out, capacity, &bytes) },
+            Err(_) => 0,
+        }
+    }
+
+    #[no_mangle]
+    unsafe extern "C" fn codex_wifi_sha256(input: *const u8, size: usize, out: *mut u8) {
+        let input = unsafe { std::slice::from_raw_parts(input, size) };
+        let hash = Sha256::digest(input);
+        unsafe { std::ptr::copy_nonoverlapping(hash.as_ptr(), out, hash.len()); }
+    }
+
+    #[test]
+    fn windows_wifi_codec_checks_limits_corruption_and_hash() {
+        let input = b"wifi legacy storage round trip";
+        let mut packed = [0u8; 128];
+        let size = unsafe { codex_wifi_deflate(packed.as_mut_ptr(), packed.len(), input.as_ptr(), input.len()) };
+        assert!(size > 0);
+        let mut decoded = [0u8; 128];
+        let n = unsafe { codex_wifi_inflate(decoded.as_mut_ptr(), decoded.len(), packed.as_ptr(), size) };
+        assert_eq!(&decoded[..n], input);
+        assert_eq!(unsafe { codex_wifi_inflate(decoded.as_mut_ptr(), 1, packed.as_ptr(), size) }, 0);
+        assert_eq!(unsafe { codex_wifi_deflate(packed.as_mut_ptr(), 1, input.as_ptr(), input.len()) }, 0);
+        packed[0] ^= 0xff;
+        assert_eq!(unsafe { codex_wifi_inflate(decoded.as_mut_ptr(), decoded.len(), packed.as_ptr(), size) }, 0);
+        let mut hash = [0u8; 32];
+        unsafe { codex_wifi_sha256(b"abc".as_ptr(), 3, hash.as_mut_ptr()); }
+        assert_eq!(hash, [0xba,0x78,0x16,0xbf,0x8f,0x01,0xcf,0xea,0x41,0x41,0x40,0xde,0x5d,0xae,0x22,0x23,
+            0xb0,0x03,0x61,0xa3,0x96,0x17,0x7a,0x9c,0xb4,0x10,0xff,0x61,0xf2,0x00,0x15,0xad]);
+    }
+}
+
+#[test]
+fn ble_claim_projection_preserves_capability_and_bounded_error_reply() {
+    let info=simulator_ble_wire("info",&serde_json::json!({"mac":"7C:4F:AD:B9:34:08","ip":"255.255.255.255",
+        "fw":"x".repeat(64),"wifi_management":3,"wifi_connection":1,"ble_claim":1,
+        "rf_remaining_ms":u32::MAX-1,"wake_generation":u32::MAX,"wake_seq":u32::MAX})).unwrap();
+    assert!(info.len()<=512);
+    let info:serde_json::Value=serde_json::from_slice(&info).unwrap();
+    assert_eq!(info["ble_claim"],1);
+    for error in ["occupied","storage","unauthorized"] {
+        let bytes=simulator_ble_wire("reply",&serde_json::json!({"op":"claim","request_id":"a".repeat(64),
+            "device_mac":"7C:4F:AD:B9:34:08","result":"rejected","error":error,"stage":"claim",
+            "owner_id":"o".repeat(128),"expires_in_s":300})).unwrap();
+        let reply:serde_json::Value=serde_json::from_slice(&bytes).unwrap();
+        assert!(bytes.len()<=512);assert_eq!(reply["error"],error);assert_eq!(reply["result"],"rejected");
+    }
+}
+
+#[test]
+fn owner_snapshot_reads_other_bindings_without_granting_write() {
+    let dir=std::env::temp_dir().join(format!("codex-wifi-projection-{}",std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut sim=SimulatorWifi::new(&dir).unwrap();
+    for (i,namespace) in ["legacy","foreign"].iter().enumerate() {
+        let ack=sim.control(&serde_json::json!({"op":"apply","bridge_id":"test","request_id":format!("write{i}"),"device_mac":"AABBCCDDEEFF","expected_revision":i,
+            "changes":[{"network_id":format!("slot{i}"),"host_ssid":"Host","ssid":"Device","credential":"replace","password":"test-password"}]}),"test",namespace,1,1000,u64::MAX,0,true,true).unwrap();
+        assert_eq!(ack["outcome"],"committed");
+    }
+    let mut offset=0;let mut id=String::new();let mut full=String::new();
+    loop {
+        let r=sim.control(&serde_json::json!({"op":"snapshot","bridge_id":"test","request_id":"read","device_mac":"AABBCCDDEEFF","offset":offset,"snapshot_id":id}),"test","own",1,1001,u64::MAX,0,true,true).unwrap();
+        if offset==0 {
+            let denied=sim.control(&serde_json::json!({"op":"snapshot","bridge_id":"test","request_id":"expired-owner","device_mac":"AABBCCDDEEFF","offset":r["next_offset"],"snapshot_id":r["snapshot_id"]}),"test","own",1,1001,u64::MAX,0,false,true).unwrap();
+            assert_eq!(denied["error"],"claim_required");
+        }
+        assert_eq!(r["ok"],true);full.push_str(r["chunk"].as_str().unwrap());id=r["snapshot_id"].as_str().unwrap().into();offset=r["next_offset"].as_u64().unwrap();
+        if r["complete"]==true {break;}
+    }
+    let snapshot:serde_json::Value=serde_json::from_str(&full).unwrap();
+    let rows=snapshot["networks"].as_array().unwrap();
+    let legacy=rows.iter().find(|r|r["bond"]=="legacy").unwrap();
+    assert_eq!(legacy["writable"],false);assert_eq!(legacy["network"]["password"],"test-password");
+    let foreign=rows.iter().find(|r|r["bond"]=="foreign").unwrap();assert_eq!(foreign["network"]["password"],"test-password");assert_eq!(foreign["writable"],false);
+    let mut offset=0;let mut id=String::new();let mut full=String::new();
+    loop {
+        let r=sim.control(&serde_json::json!({"op":"snapshot","bridge_id":"test","request_id":"unclaimed-read","device_mac":"AABBCCDDEEFF","offset":offset,"snapshot_id":id}),"test","own",1,1002,u64::MAX,0,false,true).unwrap();
+        full.push_str(r["chunk"].as_str().unwrap());id=r["snapshot_id"].as_str().unwrap().into();offset=r["next_offset"].as_u64().unwrap();if r["complete"]==true {break;}
+    }
+    let hidden:serde_json::Value=serde_json::from_str(&full).unwrap();assert!(hidden["networks"].as_array().unwrap().iter().all(|r|r["network"]["password"].is_null()));
+    std::fs::remove_dir_all(dir).unwrap();
+}

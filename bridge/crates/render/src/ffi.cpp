@@ -1222,6 +1222,7 @@ int codex_ble_wire(const char *kind, const char *input, char *out, int cap) {
         snapshot.wifiProtocol = doc["wifi_setup_protocol"] | 0;
         snapshot.wifiManagement = doc["wifi_management"] | 0;
         snapshot.wifiConnection = doc["wifi_connection"] | 0;
+        snapshot.bleClaim = doc["ble_claim"] | 0;
         bytes = bleBuildInfo(snapshot);
     } else if (!strcmp(kind, "status")) {
         BleStatusSnapshot snapshot;

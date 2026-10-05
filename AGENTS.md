@@ -80,7 +80,7 @@ git diff --check                   # 提交前必查
 - 所有绘制文本先做 ASCII 净化（防字库越界）。
 - `/update`、`/doUpdate`、ArduinoOTA、`POST /claim` 必须携带设备 token（开机自动签发并存于 NVS，仅经绑定 BLE 链路取用/轮换）；无/错 token 返回 401，不要绕过或放宽。
 - 设备身份 = Wi-Fi MAC（学习并持久化），显示名可改但非主键；UDP/HTTP/BLE 通告 MAC 不符即拒绝。发现链：属性 IP → UDP → ARP（Windows）→ BLE（手动兜底）；mDNS 已关，勿再依赖 `.local`。
-- 占用只走显式 `POST /claim`：`/api/data`、`/api/plan`、`/api/bundle/*`、`/api/activate` 永不创建/转移 owner（仅刷新匹配 id 的 `last_seen`）；owner 有效且命令 `bridge_id` 不符一律 409，`activate` 无旁路；lease 到期只清空。桥空闲自动 claim、60s 续约、他人占用不推送；模板发布仍是用户显式动作（claim 是协议行为，不等于发布）。
+- 占用只走显式 claim 请求（HTTP `POST /claim` 与 `ble_claim=1` 的 BLE `claim` 共用处理器；BLE另需绑定加密、当前principal/会话/MAC和设备操作token，普通BLE入口不支持force/release）：`/api/data`、`/api/plan`、`/api/bundle/*`、`/api/activate` 永不创建/转移 owner（仅刷新匹配 id 的 `last_seen`）；owner 有效且命令 `bridge_id` 不符一律 409，`activate` 无旁路；lease 到期只清空。桥空闲自动 claim、60s 续约、他人占用不推送；模板发布仍是用户显式动作（claim 是协议行为，不等于发布）。
 - 改 GATT 特征表后 Windows 会缓存旧属性，需解除配对再重配（或后续评估 Service Changed）。
 - 便携数据布局：Windows 运行数据 `<exe>/data/`，种子 `<exe>/seed/`（开发回退 `tools/test-bridge/`）；macOS 数据在 `~/Library/Application Support/dev.codexstatus.bridge/data`，命名实例在同根 `instances/<name>/data`，安装身份在同根 `installation-id`，打包种子在 `.app/Contents/Resources/seed/templates`，显式 `CODEX_STATUS_DATA` 优先。程序不向 `.app` 内写数据。⚠️ **`<exe>/data/` 就在 `bridge/target/debug/data/` 里**——`cargo` 报 `os error 5`（`target/debug/.fingerprint/...` 这类沙箱旧文件缺能力 ACE，`Set-Acl` 也改不动）而想"删 `target/debug` 重建"时，**先把 `data/` 备份出去**：它装着 `state.json`（设备登记/Profile/jobs/contexts/plans）、模板库、`device-token-*.json`、`bridge-app.json`（endpoint token）。2026-09-25 有一次真实事故（见 `docs/history/progress-archive-2026-10-03.md`「桥：契约刷新修复 + ACL 闸门绕过」节）：删目录连带删掉运行时数据，靠写回配置 + 从 `tools/test-bridge/` 与仓库夹具重导模板 + 重新登记设备/重建 Profile 才恢复。**更安全的做法是 `cargo build/test --target-dir <仓库内新目录>`**，完全不碰现有 `target/debug`。
 - 推送是用户显式动作：Profile = 1–8 个有序模板（全部参与按键循环，无 enabled 子集），显式发布冻结一个完整 Bundle；保存模板/Profile、MCP save、UI save 都只落盘，不得自动发布。旧版 ≤3 槽通道与 `profiles.json` 存储已删除（2026-09-25），桥只服务现行平台设备。
@@ -108,7 +108,7 @@ git diff --check                   # 提交前必查
 - **停止或重建默认 Bridge**：只操作当前 `bridge/target/debug` 对应的进程，不擅自停止别处运行的实例。先结束同 exe 的 `--watchdog <主 PID>`，再 `Stop-ScheduledTask -TaskName CodexStatusBridge`；若任务已是 `Ready` 而端口仍被 watchdog 拉起的主进程监听，再按监听 PID 停该主进程。重建 exe 前确保两者都退出，保留 `<exe>/data/`，构建成功后用上面的脚本按需重新启动。Bridge UI 嵌入 exe：修改 `bridge/crates/app/ui/index.html` 后须在**包含该 UI 改动的工作区**重建并重启；2026-09-26 曾从干净 worktree 构建，导致旧界面覆盖新版。停止/重启前核对路径、端口及任务状态。
 - **旧的 watchdog 纯重启路径**：`pwsh tools/restart-bridge.ps1` 只强杀主进程，依赖 watchdog 拉回；2026-09-25 曾在旧分离启动方式下验证，但**改为计划任务后尚未验证任务状态与新进程归属，不要用它代替上面的计划任务启动/重建流程**。watchdog 仅在非零退出码时重启，且 5 分钟内 3 次异常退出就放弃（见 `<exe>/data/logs/watchdog.log`）。构建时运行中的 exe 被锁住，必须先按上述顺序停进程。需要反复重建/启动时，非受限权限可通过本会话权限预设管理；不要为了绕过审批而在受限沙箱中启动后台桥。
 - 命名 Bridge 实例必须指定不同 HTTP/MCP 端口；各自运行数据在 `<exe>/instances/<name>/data`，默认实例保留 `<exe>/data`。命名实例不监听设备固定 UDP 8767，只走精确 MAC 的 HTTP/BLE；不同实例 owner ID 不同，同一设备仍由 claim/lease 决定占用。托盘背景形状可用 `-IconShape square|circle|diamond` 区分。
-- 不提交任何密钥：Wi-Fi 密码按用户2026-10-04修订，允许作为完整配置保存于Bridge本机运行data及设备RAM/NVS，首次认证读取后复用缓存、编辑框用眼睛按钮显隐；不落仓库、不进日志。BLE token沿用既有受控存储/传输，不进入仓库或日志。
+- 不提交任何密钥：Wi-Fi 密码按用户2026-10-04修订，允许作为完整配置保存于Bridge本机运行data及设备RAM/NVS，首次认证读取后复用缓存、编辑框用眼睛按钮显隐；有效 session 与 owner 的完整配置读取包含其他绑定已有凭据，但写入仍按 namespace 隔离；不落仓库、不进日志。BLE token沿用既有受控存储/传输，不进入仓库或日志。
 
 ## 硬件现场与坑
 

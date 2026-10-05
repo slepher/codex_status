@@ -271,3 +271,13 @@ Bridge 是“希望设置成什么”的来源，设备是“实际已保存什�
 ### 2026-10-04 导入→编辑→设备同步勾选诊断计划
 
 用户反馈Bridge→设备checkbox不可选，现场targets已local且含密码、快照两条均来自其他绑定writable=false；wifiCanSelect错误要求d.writable。既有各阶段测试和先前导入编辑测试未覆盖此完整点击链。补WK生产HTML真实checkbox点击的本机/其他绑定两条导入→编辑正式保存→预览→同步链，先red；Rust实际import/save/manual_queue/apply/receipt/restart检查新当前绑定与原绑定保留。选择以已保存Bridge目标和当前绑定可操作项为准，不能将源绑定只读继承到本地发送；删除不存在的当前绑定记录仍禁用，导入跨绑定同ID不猜测。固件已按permit peer+network_id寻址，不改授权或固件。通过JS/WK和受影响Rust后连同本地保存文案部署，实机网络不写。
+
+## 2026-10-06 authoritative BLE-first contact contract
+
+Every ordinary cold/button/timer contact starts a bounded BLE exchange. Without an authenticated Bridge command the battery device sleeps; USB keep-awake schedules bounded BLE contacts and remains responsive, without autonomous Wi-Fi association. Physical BOOT pairing/recovery keeps its separate fixed window. Old normal-startup connectBest, old-slot scanning/default credential retry and blocking power-save reassociation are retired.
+
+After trusted BLE contact, Bridge reads the host's actual associated SSID and resolves the unique host→device-2.4GHz mapping. Missing permission, unknown/ambiguous host, missing mapping and credentials are explicit failures. Host identity is rechecked before configuration writes and across save→activate; a change aborts the current selection. Device configurations are not evidence of the host's current network. BLE authenticated save/query and explicit activate retain namespace isolation, claim checks, revision checks and durable receipts; save alone does not activate.
+
+A formal work/PowerPlan admits HTTP but does not choose or associate an old active network. The Bridge performs the existing asynchronous configuration/activation transaction first, then proves MAC/session/wake/Plan via HTTP before handoff. No implicit deadline renewal and no replacement request ID on lost replies. Failure leaves configurations intact and returns a bounded result. Normal data/Plan via BLE does not require Wi-Fi if no HTTP work is needed.
+
+2026-10-06 用户续问修订：设备完整方案的密码缓存属于读取权限，不等于源记录可写。当前认证 session 且有效 owner 的完整快照包含各已存 WFS 绑定凭据，便于整条导入/编辑；原记录 writable 仍按本绑定，其他绑定不允许直接写。无 owner/无有效 session 不扩大凭据可见范围；跨分页失去 owner 立即 claim_required，不继续发送原敏感快照。凭据仍仅本机运行 data / RAM / NVS，不日志/仓库。

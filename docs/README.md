@@ -16,11 +16,12 @@
 | 改休眠设备的状态页、模板/OTA 延后投递 | `docs/generic-display-platform-design.md` + `project-workflow/sleep-aware-bridge/design.md` / `task.md` |
 | 实施 PowerPlan 与 Data 同轮联合下发 | `project-workflow/bridge-macos/powerplan-data-execution-plan.md`（P1–P6；仅计划，待办 A9） |
 | 改 BLE 会合功耗 | `docs/ble-rendezvous-power-design.md` |
+| 改双 ROM 首次蓝牙配网页与新配对屏幕码 | `project-workflow/ble-wifi-provisioning/design.md` + `plan.md`（2026-09-30 原始设计；协议/存储/窗口以后续统一协议为准，剩余归 backlog B6） |
 | 接续 Bridge macOS 菜单栏与 BLE 支持 | `project-workflow/bridge-macos/remaining-plan.md`（新窗口剩余实施入口）→ 按需读原 `plan.md` / `task.md`；已授权实施，`bridge_first` 已废弃，待办见 backlog B5 |
-| 设计/实施 USB、BOOT、Bridge 激活的统一在线状态与 HTTP/BLE 管理 | `project-workflow/bridge-macos/wifi-unified-protocol-design.md`（最新候选、未实现；认证状态直通/事件提示/身份迁移/验收矩阵）→ `wifi-redesign.md`；现场先读 PROGRESS，待办归 B6 |
+| 设计/实施 USB、BOOT、Bridge 激活的统一在线状态与 HTTP/BLE 管理 | `project-workflow/bridge-macos/wifi-unified-protocol-design.md`（设计依据；配套实施/部署见同目录 `wifi-unified-protocol-execution.md`，剩余验收见 B6）→ `wifi-redesign.md`；现场先读 PROGRESS，待办归 B6 |
 | 实施下一步配网、Bridge 双侧界面与异步会合 | `project-workflow/bridge-macos/wifi-rendezvous-execution.md`（W0–W6、第6节界面与Fake验收）→ `wifi-redesign.md` / `wifi-protocol.md` / BLE fidelity §11–§12；最新现场先读 PROGRESS |
 | 验证 Wi-Fi 分 tab / 真实 macOS 布局 | `project-workflow/bridge-macos/wifi-tabs-plan.md`；`node tools/test-device-page.mjs` + `bash tools/test-wifi-ui.sh`，WKWebView 合成 IPC / 12 场景 / 截图审阅；设备通信另验 |
-| 实施设备页离线 BLE 配网、绑定独立方案与 BOOT 恢复 | `project-workflow/bridge-macos/wifi-redesign.md`（最新全量管理/UI 重设计）→ `remaining-plan.md` R0–R4 / `wifi-protocol.md`；protocol=1 候选已部署，新设计与实机缺陷待完成，仅 Note4 在场，见 backlog B6 |
+| 实施设备页离线 BLE 配网、绑定独立方案与 BOOT 恢复 | `project-workflow/bridge-macos/wifi-redesign.md`（最新全量管理/UI 重设计）→ `remaining-plan.md` R0–R4 / `wifi-protocol.md`；统一协议已配套部署，完整 RF/跨平台/双板矩阵仍待验，仅 Note4 在场，见 backlog B6 |
 | 改模拟器/实验时钟 | `docs/fake-rom-simulator-design.md` + `docs/history/workflow/fake-rom-simulator-def/evidence.md`（D/E/F 已结项） |
 | 改字体资产 | `docs/font-asset-format.md` + `project-workflow/note4-bridge-publish/protocol.md`（**草案，未定稿**） |
 | 查缺陷结案 | `docs/history/bugs-2026-09-22.md`（原 `bugs.md`，已结案） |

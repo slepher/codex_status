@@ -675,16 +675,25 @@ impl PlatformService {
                 return self.wifi_finish(mac, job_id, "awaiting_confirmation", Some("receipt_unknown"), now);
                 // Unknown never permits another apply, even when a password is supplied again.
             }
-            let snapshot = self.wifi_state(mac).snapshot.context("snapshot_required")?;
-            snapshot.validate(&job.device_mac)?;
             if permit.is_none() { return self.wifi_finish(mac, job_id, "waiting_rendezvous", Some("window_required"), now); }
-            if job.expected_revision != Some(snapshot.revision) { return self.wifi_finish(mac, job_id, "conflict", Some("snapshot_conflict"), now); }
-            let current: BTreeMap<_,_> = snapshot.networks.iter().filter(|n| n.writable)
-                .map(|n| (n.network.network_id.clone(), n.network.metadata())).collect();
-            if job.selected.iter().any(|id| job.fields.get(id).map_or(current.get(id) != job.before.get(id), |fields|
-                fields.iter().any(|f| f != "credential" && current.get(id).map(|v|&v[f]) != job.before.get(id).map(|v|&v[f])))) {
-                return self.wifi_finish(mac, job_id, "conflict", Some("target_revision_conflict"), now);
-            }
+            // Automatic whole-row provisioning needs only the current revision.
+            // User edits still require their frozen full snapshot and conflict checks.
+            let (revision, current) = if job.kind == "recovery_save" {
+                let active = transport("active", json!({}))?;
+                anyhow::ensure!(active["ok"] == true, "revision_unavailable");
+                (active["revision"].as_u64().context("revision_unavailable")?, BTreeMap::new())
+            } else {
+                let snapshot = self.wifi_state(mac).snapshot.context("snapshot_required")?;
+                snapshot.validate(&job.device_mac)?;
+                if job.expected_revision != Some(snapshot.revision) { return self.wifi_finish(mac, job_id, "conflict", Some("snapshot_conflict"), now); }
+                let current: BTreeMap<_,_> = snapshot.networks.iter().filter(|n| n.writable)
+                    .map(|n| (n.network.network_id.clone(), n.network.metadata())).collect();
+                if job.selected.iter().any(|id| job.fields.get(id).map_or(current.get(id) != job.before.get(id), |fields|
+                    fields.iter().any(|f| f != "credential" && current.get(id).map(|v|&v[f]) != job.before.get(id).map(|v|&v[f])))) {
+                    return self.wifi_finish(mac, job_id, "conflict", Some("target_revision_conflict"), now);
+                }
+                (snapshot.revision, current)
+            };
             let mut changes = serde_json::to_value(&job.frozen)?;
             for n in changes.as_array_mut().unwrap() {
                 let network_id = n["network_id"].as_str().unwrap().to_owned();
@@ -711,8 +720,13 @@ impl PlatformService {
                     } else {n.as_object_mut().unwrap().remove("password");}
                 }
             }
+            if job.kind == "recovery_save" {
+                self.wifi_mutate(mac, |s| {
+                    s.jobs.iter_mut().find(|j| j.job_id==job_id).context("wifi_job_not_found")?.expected_revision=Some(revision);Ok(())
+                })?;
+            }
             self.wifi_mutate(mac, |s| s.mark_sent(job_id, now))?;
-            let reply = transport("apply", json!({"request_id":job.request_id,"expected_revision":snapshot.revision,
+            let reply = transport("apply", json!({"request_id":job.request_id,"expected_revision":revision,
                 "permit":permit,"changes":changes}))?;
             if reply["ok"] != true {
                 let code = reply["error"].as_str().unwrap_or("wifi_rejected");
@@ -3131,6 +3145,30 @@ mod tests {
         let result=svc.wifi_attempt(mac,&job.job_id,Some("permit"),&BTreeMap::new(),108,|op,_| {
             assert_eq!(op,"apply");Ok(json!({"ok":false,"error":"revision_conflict"}))
         }).unwrap().unwrap();assert_eq!(result.state,"conflict");
+    }
+    #[test]
+    fn recovery_without_snapshot_is_atomic_and_lost_ack_is_query_only() {
+        for outcome in ["committed", "lost", "conflict"] {
+            let dir=tempfile::tempdir().unwrap();let svc=service_with_device(dir.path());let mac="AABBCCDDEEFF";
+            let targets=serde_json::from_value(json!([{"network_id":"home","host_ssid":"Host","ssid":"Device","credential":"replace","password":"password123"}])).unwrap();
+            svc.wifi_save(mac,0,targets,100).unwrap();
+            let job=svc.wifi_queue(mac,"bridge","recovery_save",vec!["home".into()],101).unwrap();
+            let mut ops=vec![];
+            let result=svc.wifi_attempt(mac,&job.job_id,Some("authenticated_ble"),&BTreeMap::new(),102,|op,body| {
+                ops.push(op.to_owned());
+                if op=="active" {return Ok(json!({"ok":true,"revision":7}));}
+                assert_eq!(op,"apply");assert_eq!(body["expected_revision"],7);assert_eq!(body["request_id"],job.request_id);
+                assert_eq!(body["changes"].as_array().unwrap().len(),1);
+                match outcome {"lost"=>anyhow::bail!("lost_ack"),"conflict"=>Ok(json!({"ok":false,"error":"revision_conflict"})),_=>Ok(json!({"ok":true,"outcome":"committed","revision":8,"bond":"own"}))}
+            }).unwrap().unwrap();
+            assert_eq!(ops,vec!["active","apply"]);
+            assert_eq!(result.state,match outcome {"lost"=>"awaiting_confirmation","conflict"=>"conflict",_=>"completed"});
+            if outcome=="lost" {
+                let result=svc.wifi_attempt(mac,&job.job_id,Some("authenticated_ble"),&BTreeMap::new(),170,|op,_| {
+                    assert_eq!(op,"result");Ok(json!({"ok":true,"outcome":"committed","revision":8,"bond":"own"}))
+                }).unwrap().unwrap();assert_eq!(result.state,"completed");
+            }
+        }
     }
     #[test]
     fn wifi_cancellation_input_expiry_and_unknown_receipt_never_reapply() {
