@@ -14,6 +14,7 @@
 | 改协议/模板/渲染 | `docs/generic-display-platform-design.md`（权威架构）+ `AGENTS.md` §关键不变量 |
 | 改电源/唤醒/占用 | `docs/power-state.md` + `docs/generic-display-platform-design.md` §7 |
 | 改休眠设备的状态页、模板/OTA 延后投递 | `docs/generic-display-platform-design.md` + `project-workflow/sleep-aware-bridge/design.md` / `task.md` |
+| 实施 PowerPlan 与 Data 同轮联合下发 | `project-workflow/bridge-macos/powerplan-data-execution-plan.md`（P1–P6；仅计划，待办 A9） |
 | 改 BLE 会合功耗 | `docs/ble-rendezvous-power-design.md` |
 | 接续 Bridge macOS 菜单栏与 BLE 支持 | `project-workflow/bridge-macos/remaining-plan.md`（新窗口剩余实施入口）→ 按需读原 `plan.md` / `task.md`；已授权实施，`bridge_first` 已废弃，待办见 backlog B5 |
 | 设计/实施 USB、BOOT、Bridge 激活的统一在线状态与 HTTP/BLE 管理 | `project-workflow/bridge-macos/wifi-unified-protocol-design.md`（最新候选、未实现；认证状态直通/事件提示/身份迁移/验收矩阵）→ `wifi-redesign.md`；现场先读 PROGRESS，待办归 B6 |

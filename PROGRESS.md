@@ -1,5 +1,11 @@
 # Codex Status 项目进度（交接文档）
 
+## 2026-10-05 PowerPlan 与 Data 同轮联合下发执行计划已生成（未实现）
+
+- **现场核对**：用户报告weekly66→65；本轮独立读取Bridge Codex缓存usedPercent35/余量65，旧值66无独立快照。Note4登记MAC7C4FADB93408/IP192.168.10.103（采样时）；北京时间14:18:27 usage changed，14:20/14:22/14:24 BLE data ACK约4.86s超时，变化后无新Plan ACK。Bridge push_dirty/in_flight seq97 attempts3、确认seq96；设备后报applied_seq97，缺完整关联证明，不冒充数据ACK成功。最后确认Plan1274/sleep/0s。已确认先Data等待后Plan的编排阻断，ACK丢失的RF/设备原因尚未查明。
+- **用户决定与交付**：用户认可电源意图与数据同轮下放，要求生成执行计划。新计划project-workflow/bridge-macos/powerplan-data-execution-plan.md：复用plan可选data及能力协商，小包联合/大包Plan→HTTP，发送前冻结、分项结果、原ID持久恢复、真实push有界窗口、丢ACK认证查询与资源/实机验收；待办唯一归backlog A9，文档导航已链接。
+- **边界**：仅文档交付，未改生产代码/模板/运行配置、构建/部署/刷写、开串口或提交。默认Bridge与Note4固件沿前节已部署版本；此轮不重新证明运行镜像hash，不将协议计划当修复结果。后续执行按届时授权及默认Note4目标约束，保留现场data和原未确认事务。
+
 ## 2026-10-05 11:26 已完成任务仍显示排队的界面提示已修复部署
 
 - **现场与根因**：用户11:19两截图，同read39a7a49ab08b980c历史完成/complete_snapshot，底部仍“已排队 · accepted”。只读运行state确认completed/attempt1，非设备未完成。生产HTML VM将get入队→view完成稳定复现相同残留（wifi-job-feedback-red.log）；任务列表刷新但操作提示只保存初始响应。原测试缺少初始响应→被动刷新终态的断言。

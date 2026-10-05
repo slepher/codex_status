@@ -108,6 +108,13 @@
 - 真实源剩余90→89，22:36:11自动HTTP ACK seq16 applied/displayed；认证data/applied均16，确认push指纹一致，最后写屏缓冲89，无push_now/源伪造/模板发布。原92/93差异在部署前小时同步已消失，故不再以旧数值作当下验收。
 - 本项闭环；USB常驻BLE绘制、重连/局刷和新Wi-Fi真实配置矩阵仍见B5/B6/A3，不把A8通过当全部USB/硬件问题已解决。[证据与诊断](../../project-workflow/bridge-macos/usb-sync-diagnosis.md)。
 
+### A9. PowerPlan 与 Data 同轮联合下发（2026-10-05）
+
+- 用户已确认：真实push变化时，Bridge发送前冻结电源意图；小数据与PowerPlan同请求，大数据先Plan再经合法HTTP窗口投递。Data ACK成功不立即撤销活跃窗口，丢ACK不阻断Plan下放；重试不续租、不换原事务ID。
+- 现场weekly余量65（usedPercent35），14:18:27检测usage变化；14:20/14:22/14:24 BLE data ACK超时，最后确认仍Plan1274/sleep/0s；设备后报applied_seq97，Bridge原seq97仍待确认。已证明Bridge先Data后Plan的编排缺口；ACK丢失的RF/设备原因未确定。
+- 执行计划：[powerplan-data-execution-plan.md](../../project-workflow/bridge-macos/powerplan-data-execution-plan.md)，P1–P6覆盖能力协商、复用plan可选data、分项结果、持久冻结、context/CRC/Plan核对、大小包/旧设备兼容、生产组合失败矩阵与资源门禁。当前仅计划，未实现/构建/部署。
+- 完成判据：小数据联合下放及大数据交接通过；ACK丢失仍能确认原Plan/Data；拒绝/冲突/过期/未知有明确有界反馈；原期限不被重试延长；授权后的Note4自然会合、BLE OFF/实际PM及到期deep实机验收分别留证。沿默认Note4构建约束，1.54与其他实例不自动纳入发布。
+
 ### A3. 修掉 Note4 深睡时钟残影（唯一影响日常观感的显示缺陷）
 - **2026-09-30 进展**：ExtraLight 200 Bundle job `5d798bd9` 已成功；`0.18.40-note4-b-display1` OTA job `10ec4b37` 已认证 `image_verified`，设备新回报 `display_state=displayed`、`epd_busy_fails=0`。源码以成功写入计数优先于局刷失败计数，宿主覆盖“局刷失败后整刷成功”及真正未写入失败。仍需将局刷失败原因分型（影子帧、分配、BUSY/阶段）并确认有无硬件侧间歇 BUSY 故障；旧 `failed` 不能当作模板提交失败。
 - **现象**：deep 期间只写时钟窗口，残影累积；`SYNC`/用量属整帧元素所以停在最后一次整帧（现场曾被读成 `04:64`）。
