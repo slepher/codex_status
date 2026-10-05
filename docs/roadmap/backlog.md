@@ -177,6 +177,8 @@
 
 ### B6. 离线 BLE 配 Wi-Fi 与 BOOT 蓝牙恢复入口（2026-10-03 新开）
 
+- **2026-10-05任务完成后排队提示残留已修复部署**：真实read39a7a49ab08b980c已完成，底部初始accepted未参与刷新；生产HTML red→green，同job_id提示跟随进度/成功/失败，静态后续反馈清除旧关联，迟到ack也经view校正。阶段中文化，Node/WK52通过、窄宽成功/失败截图已审阅；默认Bridge664B86AF…27F06F5/2756/health204，原任务/身份/data保留，未改ROM或另建实机任务。WK合成IPC不代替RF验收，B6仍开放；证据/备份见PROGRESS顶节及wifi-tabs-plan.md。
+
 - **2026-10-05新事务旧缓存冲突反馈已修复部署**：用户取消a7efde70624b7097后，认证read取得revision3、新sync83cecdbef6a0e7c6以3提交4/durable_receipt，真实WFS4迁移成功。App发送前revision冲突明确conflict/revision_conflict、停止自动调度，不apply、不自动覆盖缓存；UI提示重新读取并保留Bridge编辑。Fake补真实生产wifi_storage状态/修订序号，新增App预检、设备拒绝和UI完整失败链路red→green；262 passed/1ignored、Node及WK48通过，窄宽截图已审阅。默认Bridge B3AC01D2…F6C7D9/38549/health204，身份/数据/成功任务保留；AGENTS.md写入任何请求包含失败必须明确返回。ROM仍.61未重刷，无另建实机任务；旧IDretired不证明旧请求成功，完整RF/电池/BOOT/命名实例/掉电容量仍开放。最新证据及备份见PROGRESS顶节/执行文档。
 
 - **2026-10-05 USB常驻发送预算及HTTP读回信封修复已部署**：continuous/sent-query不再引用旧sync0截止；明确零发送与部分发送超时区分，避免新任务误标远端可能生效；HTTP setup只读关联ID补齐，写事务ID不变。三个生产seam red→green，受影响260 passed/1ignored。默认Bridge D6DC32B2…13FA2AD/35567，实机USB/BLE OFF现场与重启后原ID认证HTTP查询200已验，错误从window_budget_exhausted转为receipt_unknown。当前a7efde70624b7097/w3_0000000000000010仍awaiting_confirmation，slot0目标未匹配；用户未选择取消重建，保留原任务。绑定read/write有效，.61 ROM未重刷；软件修复不代表当前同步已完成或B6全部实体验收闭环。证据见执行文档/PROGRESS最新节。

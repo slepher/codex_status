@@ -122,6 +122,33 @@ window.__wifiUiScenario = async function(scenario) {
     check($('wifi-current-jobs').textContent.includes('缓存已过期') && $('wifi-current-jobs').textContent.includes('重新读取设备'),'Missing actionable stale-cache feedback');
     check(!$('wifi-current-jobs').textContent.includes('待确认'),'Rejected new job must not remain pending');
     check($('wifi-result').textContent.includes('Bridge 配置已保留'),'Local edits must stay preserved');
+  } else if (scenario === 'job-feedback' || scenario === 'job-feedback-error') {
+    const state=structuredClone(wifiState);
+    const job={job_id:'read-feedback',device_mac:mac,kind:'read',state:'queued',last_stage:'accepted',created_at:now,attempt_count:0};
+    state.jobs=[job];
+    window.__wifiRoundtripInvoke=async(name,args)=>{
+      window.__uiCalls.push({name,args});check(name==='platform_wifi','Unexpected job-feedback IPC');
+      if(args.op==='get')return structuredClone(job);
+      check(args.op==='view','Unexpected job-feedback operation');
+      return {wifi:structuredClone(state),differences:[],host:{state:'connected',networks:[{ssid:'Home-5G'}]}};
+    };
+    wifiShowTab('device');
+    $('wifi-panel-device').querySelector('[onclick="wifiReadScheme()"]').click();
+    await wait();
+    check($('wifi-result').textContent.includes('已排队'),'Missing initial queue acknowledgement');
+    job.state='reading';job.last_stage='snapshot';job.attempt_count=1;
+    await wifiRefreshView();
+    check($('wifi-result').textContent.includes('正在读取'),'Task progress did not update feedback');
+    job.state=scenario==='job-feedback'?'completed':'failed';
+    job.last_stage='complete_snapshot';job.error_code=scenario==='job-feedback'?null:'unsupported';
+    await wifiRefreshView();
+    check(!$('wifi-result').textContent.includes('已排队')&&!$('wifi-result').textContent.includes('accepted'),'Stale queue acknowledgement survived terminal refresh');
+    check($('wifi-result').textContent.includes(scenario==='job-feedback'?'设备方案已读取':'不支持'),'Missing final success/failure feedback');
+    check($('wifi-current-jobs').textContent==='暂无进行中的任务','Terminal task still shown as current');
+    check(!$('wifi-job-history').open,'Completion unexpectedly expanded history');
+    wifiLocalResult('Bridge 配置已保存。');await wifiRefreshView();
+    check($('wifi-result').textContent==='Bridge 配置已保存。','Old task overwrote a newer local operation');
+    wifiShowResult(job);window.__wifiRoundtripInvoke=null;
   } else if (scenario === 'waiting' || scenario === 'error') {
     wifiState.jobs=[{job_id:'fixture-job',device_mac:mac,kind:'read',state:scenario === 'waiting' ? 'waiting_rendezvous' : 'failed',
       attempt_count:1,last_stage:'connecting',error_code:scenario === 'error' ? 'unsupported' : '',
@@ -266,7 +293,7 @@ window.__wifiUiScenario = async function(scenario) {
   }
   check(window.__uiErrors.length === 0,'JavaScript errors: '+window.__uiErrors.join('; '));
   if(scenario==='imported-edit'||scenario==='save-error')$('wifi-save-result').scrollIntoView({block:'center'});
-  else if(scenario==='waiting'||scenario==='error'||scenario==='stale-cache')$('wifi-current-jobs').closest('.wifi-tasks').scrollIntoView({block:'start'});
+  else if(scenario==='waiting'||scenario==='error'||scenario==='stale-cache'||scenario.startsWith('job-feedback'))$('wifi-current-jobs').closest('.wifi-tasks').scrollIntoView({block:'start'});
   else (scenario==='delivery-alignment'?$('pt-sync').closest('.card'):card).scrollIntoView({block:'start'});
   await wait();
   return {scenario,width:innerWidth,visiblePanel:document.querySelector('.wifi-panel:not([hidden])').id,

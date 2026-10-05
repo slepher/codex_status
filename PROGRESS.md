@@ -1,5 +1,12 @@
 # Codex Status 项目进度（交接文档）
 
+## 2026-10-05 11:26 已完成任务仍显示排队的界面提示已修复部署
+
+- **现场与根因**：用户11:19两截图，同read39a7a49ab08b980c历史完成/complete_snapshot，底部仍“已排队 · accepted”。只读运行state确认completed/attempt1，非设备未完成。生产HTML VM将get入队→view完成稳定复现相同残留（wifi-job-feedback-red.log）；任务列表刷新但操作提示只保存初始响应。原测试缺少初始响应→被动刷新终态的断言。
+- **修复/验证**：操作提示跟踪同job_id最新作业，完成/失败/进度均随view更新；统一静态反馈清除旧关联，后续保存/导入/错误/设备切换不被旧任务覆盖。accepted/complete_snapshot等阶段中文化，保留任务ID供核对；迟到入队响应通过紧接的view校正。Node回归通过（wifi-job-feedback-green.log），原生WK52场景通过（wifi-job-feedback-wk.log），560/1000 job-feedback及job-feedback-error四张截图已审阅。WK实际点击生产读取按钮+合成IPC，覆盖队列→进度→成功/失败和新保存反馈保留，不冒充实际Rust/设备RF通信。
+- **默认Bridge部署**：app artifacts/bridge-macos/Codex Status Bridge.app，SHA256 `664B86AF8CC2013690C78E79B2EACE1E9E725AFAB957636BC873ECF5A27F06F5`，supervisor2756/health204/MCP8766监听，候选/部署hash及签名匹配。安装身份与data保留，截图任务39a7a49ab08b980c原记录完整且completed/complete_snapshot；私有备份 `/Users/slepher/Library/Application Support/dev.codexstatus.bridge/deployment-backups/wifi-job-feedback-20261005-112614`，回滚app `/Users/slepher/project/codex_status/artifacts/bridge-macos/Codex Status Bridge-before-job-feedback-20261005-112614.app`，证据wifi-job-feedback-deployment.json与build.log。仅重建/重启默认实例，未操作命名实例、另建实机作业或修改网络。
+- **固件与边界**：本轮无固件改动/构建/刷写。沿用此前核验Note4 MAC7C4FADB93408、0.18.61-note4/ota_0，ROM artifacts/bridge-macos/0.18.61-note4-wifi-unified.bin，1874080 B，SHA256 `578EEDE7CEBEF30AC3DB016B40B78F3F204C30E78AEF3F9305AEA3DED703E3F4`；匹配ELF SHA256 `7F3A79599D553D95C15B864A8213C0B490C1DE7B275467BB664697136A24E0BD`，本轮未重新查询设备运行镜像。界面修复不结B6，其余RF/电池/BOOT/命名实例/掉电容量矩阵仍见backlog。本轮界面修复、回归及现场记录已按用户要求提交。
+
 ## 2026-10-05 01:49 新事务旧缓存冲突反馈已修复部署，用户重新读取后同步成功
 
 - **用户纠正与实体结果**：a7efde70624b7097是新事务，expected revision1引用过期设备缓存，设备已revision3；此前称“旧事务”不准确。用户取消该待确认任务，read 9a99ea2ee94c5faa获得revision3，新sync 83cecdbef6a0e7c6/request `w3_0000000000000013`以3提交4，completed/durable_receipt且receipt_ack_pending=false。实体WFS4 ready/uncertain=false/369B/2网络/1legacy回执/1cursor/high_watermark19，同boot USB continuous/BLE OFF；证据wifi-budget-sync-success.json。旧请求retired仅证明围栏已退役，不证明它曾成功。

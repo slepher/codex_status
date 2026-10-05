@@ -168,6 +168,23 @@ assert(!element('wifi-networks').innerHTML.includes('<script>'));
 const beforeRead=calls.length;await run('wifiReadScheme()');
 assert(calls.slice(beforeRead).some(c=>c.name==='platform_wifi'&&c.args.op==='get'));
 assert.match(element('wifi-result').textContent,/已排队/);
+// Match the user's queue acknowledgement -> passive completion refresh sequence.
+wifi.jobs=[{job_id:'read-1',device_mac:macA,kind:'read',state:'completed',last_stage:'complete_snapshot',attempt_count:1}];
+await run('wifiRefreshView()');
+assert.match(element('wifi-result').textContent,/完成/);
+assert.doesNotMatch(element('wifi-result').textContent,/已排队|accepted/);
+assert.match(element('wifi-current-jobs').innerHTML,/暂无进行中的任务/);
+assert.match(element('wifi-jobs').innerHTML,/完成/);
+// An acknowledgement arriving after completion must immediately reconcile from view.
+await run('wifiReadScheme()');
+assert.match(element('wifi-result').textContent,/完成.*设备方案已读取/);
+wifi.jobs[0]={...wifi.jobs[0],state:'failed',error_code:'unsupported'};
+await run('wifiRefreshView()');
+assert.match(element('wifi-result').textContent,/已终止.*不支持/);
+run("wifiLocalResult('Bridge 配置已保存。')");
+await run('wifiRefreshView()');
+assert.equal(element('wifi-result').textContent,'Bridge 配置已保存。');
+wifi.jobs=[];
 run('wifiDraft[0].password="fixture-pass";wifiEdit(0)');assert.equal(element('wifi-password').value,'fixture-pass');
 assert.equal(element('wifi-password').type,'password');run('wifiTogglePassword()');assert.equal(element('wifi-password').type,'text');
 assert.equal(element('wifi-password-toggle').getAttribute('aria-label'),'隐藏密码');
