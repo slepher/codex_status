@@ -1,5 +1,8 @@
 # Wi-Fi 双侧方案、比较与同步设计
 
+> 2026-10-06 用户修订：设备 Wi-Fi 配置全局共享，有效 session + 当前 claim/lease owner 可修改、删除、试连及启用任何来源记录。bond 只保留来源及已有内部引用，事务回执/重放围栏仍按 principal/namespace 隔离；总容量12，不再按创建者限4条/3组。同ID旧记录不自动合并，明确 ambiguous_network_id；保留内容及凭据。实现、验证和部署边界见 [shared-wifi-20261006-plan.md](shared-wifi-20261006-plan.md)，本修订覆盖下文历史绑定只读/配置写隔离规则。
+
+
 ## 2026-10-04 最新统一协议设计（未实施）
 
 一次Astra medium审核已完成，确定性问题已修订；用户已选BOOT严格权限：物理窗只提供绑定/身份修复，保存/试连/启用均先claim，他人owner拒绝。身份双证明、激活原子回执、trial未知结果、跨通道生命周期和独立容量见设计第3/4/7/8节；[审核记录](wifi-unified-protocol-review.md)。

@@ -428,7 +428,8 @@ String wifiSetupCommand(JsonDocument &doc, const String &peer, uint32_t generati
     if (!strcmp(op, "wifi_match")) {
         const char *networkId = doc["network_id"] | "";
         if (!identifier(networkId, 32)) return reply(doc, "shape");
-        int slot = schemes.find(peer.c_str(), networkId);
+        int slot = unified ? schemes.findShared(networkId) : schemes.find(peer.c_str(), networkId);
+        if (slot == -2) return reply(doc, "ambiguous_network_id");
         JsonDocument out;
         out["ack"] = "wifi"; out["op"] = "wifi"; out["request_id"] = id;
         out["device_mac"] = doc["device_mac"]; out["ok"] = true; out["network_id"] = networkId;
@@ -449,7 +450,7 @@ String wifiSetupCommand(JsonDocument &doc, const String &peer, uint32_t generati
             }
         }
         out["matches"] = matches;
-        bool active = slot >= 0 && peer == wifiStore.active.bond && String(networkId) == wifiStore.active.id &&
+        bool active = slot >= 0 && String(schemes.networks[slot].bond) == wifiStore.active.bond && String(networkId) == wifiStore.active.id &&
             wifiStore.activeVersion == schemes.networks[slot].version;
         bool connected = active && WiFi.status() == WL_CONNECTED && WiFi.SSID() == String(schemes.networks[slot].ssid) &&
             !(WiFi.localIP() == IPAddress(0,0,0,0));
@@ -476,12 +477,12 @@ String wifiSetupCommand(JsonDocument &doc, const String &peer, uint32_t generati
         JsonDocument out;
         out["ack"] = "wifi"; out["op"] = op; out["request_id"] = id;
         out["device_mac"] = doc["device_mac"]; out["ok"] = true;
-        out["capacity"] = 4; out["wifi_setup_protocol"] = 1;
+        out["capacity"] = unified ? 12 : 4; out["wifi_setup_protocol"] = 1;
         out["physical_remaining_s"] = physicalUntil > now ? (physicalUntil - now) / 1000 : 0;
-        out["selected_id"] = peer == schemes.selectedBond ? schemes.selectedId.c_str() : "";
+        out["selected_id"] = unified || peer == schemes.selectedBond ? schemes.selectedId.c_str() : "";
         JsonArray networks = out["networks"].to<JsonArray>();
         for (const auto &network : schemes.networks) {
-            if (!*network.id || peer != network.bond) continue;
+            if (!*network.id || (!unified && peer != network.bond)) continue;
             JsonObject n = networks.add<JsonObject>();
             n["network_id"] = network.id.c_str(); n["host_ssid"] = network.host.c_str(); n["ssid"] = network.ssid.c_str();
             int index = schemes.find(network.bond, network.id);
@@ -518,7 +519,8 @@ String wifiSetupCommand(JsonDocument &doc, const String &peer, uint32_t generati
     if (select && !selectAllowed) return reply(doc, "occupied");
     const char *networkId = doc["network_id"] | "";
     if (!identifier(networkId, 32)) return reply(doc, "shape");
-    int slot = schemes.find(peer.c_str(), networkId);
+    int slot = unified ? schemes.findShared(networkId) : schemes.find(peer.c_str(), networkId);
+    if (slot == -2) return reply(doc, "ambiguous_network_id");
     WifiNetwork network;
     if (activate && (!doc["version"].is<uint64_t>() || doc["version"].as<uint64_t>() != (slot < 0 ? 0 : schemes.networks[slot].version))) return reply(doc, "revision_conflict");
     if (setup) {
@@ -526,7 +528,7 @@ String wifiSetupCommand(JsonDocument &doc, const String &peer, uint32_t generati
         const char *password = doc["password"] | "";
         if (!doc["password"].is<const char *>() || !ssidValid(host) || !ssidValid(ssid) ||
             !passwordValid(password) || !doc["replace"].is<bool>()) return reply(doc, "shape");
-        network.bond.set(peer.c_str()); network.id.set(networkId);
+        network.bond.set(slot >= 0 ? schemes.networks[slot].bond.c_str() : peer.c_str()); network.id.set(networkId);
         network.host.set(host); network.ssid.set(ssid); network.password.set(password);
         if (slot >= 0) { network.label = schemes.networks[slot].label; network.version = schemes.networks[slot].version; }
         WifiSchemes next = schemes;

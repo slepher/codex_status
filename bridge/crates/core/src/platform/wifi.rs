@@ -130,6 +130,25 @@ pub struct Connection {
     #[serde(default)]
     pub ip: Option<String>,
 }
+impl Connection {
+    pub fn confirm_http(&mut self) {
+        self.state = "connected".into();
+        self.error = None;
+        self.reason = 0;
+        self.attempts = 0;
+        self.next_attempt_at = 0;
+        self.http_ready = true;
+    }
+    pub fn automatic_state(&self) -> &str {
+        if self.attempts >= 3 && !self.http_ready &&
+            matches!(self.state.as_str(), "waiting_for_window" | "connection_failed") &&
+            !matches!(self.error.as_deref(), Some("authentication_failed" | "security_mismatch")) {
+            "retry_exhausted"
+        } else {
+            &self.state
+        }
+    }
+}
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WifiState {
     #[serde(default)]
@@ -395,7 +414,8 @@ impl WifiState {
                     if !fields.iter().any(|f| f == "credential") { network.password = old.password.clone(); }
                 }
                 network.version = revision; network.credential = "device".into();
-                let observed = ObservedNetwork { bond: own_bond.clone(), writable: true, network };
+                let origin_bond = index.map(|i| snapshot.networks[i].bond.clone()).unwrap_or_else(|| own_bond.clone());
+                let observed = ObservedNetwork { bond: origin_bond, writable: true, network };
                 if let Some(i) = index { snapshot.networks[i] = observed; } else { snapshot.networks.push(observed); }
             }
             snapshot.revision = revision; snapshot.snapshot_id = job.request_id.clone(); snapshot.observed_at = now;

@@ -1,5 +1,48 @@
 # Codex Status 项目进度（交接文档）
 
+## 2026-10-07 Bridge Wi-Fi连续失败预算修复已部署，实机认证成功归零
+
+- **修复**：成功HTTP此前只改connected而累计attempts不归零，后台认证状态路径也绕过app侧更新，导致正常断网后3次预算永久耗尽。现在统一Connection.confirm_http，并在严格验证MAC/状态序号/大小后的认证HTTP状态处理入口与状态原子持久化；持久化失败回滚，BLE通知/拒绝的状态不清零，requested新意图保留。成功确认后下一轮断网仍有有限3次机会，连续失败继续停止。
+- **明确反馈**：MCP/UI显示retry_exhausted及失败建议，提供既有use_current显式重试按钮；原已发送非终态事务优先awaiting_confirmation/查询原ID，不发新写。密码/安全失败仍显示修正建议；保存配置不会自动发布。无存储格式/固件变更。
+- **最终Windows默认Bridge**：exe SHA256 `BDC2818BA2EF3DB65482AF94230B366CFD89C512967E5D463C654468EB158F52`，PID58704，计划任务CodexStatusBridge Running，8765/8766均该PID。仅同exe watchdog→任务→主进程停机，在当前含UI改动工作区构建13.96s并按需计划任务启动，保留data；原exe与完整data备份在`artifacts/ble-info-panic-20261007/bridge-before-retry.exe`及`retry-data-before/data/`，含秘密不提交。
+- **实机证据**：部署前attempts2→后台认证HTTP成功后attempts0/next_attempt_at0/connected/http_ready=true/error null；两次platform_status_refresh result=ok。MAC7C4FADB93408，home/wd21-la/192.168.3.177，14个原事务及1条Bridge映射与备份逐字段相同；boot `6522a1f4678e3324a062e986036ddd37`不变，uptime1258570ms，fw0.18.69-note4/reset11（前次工具USB复位）。证据retry-runtime-final-proof.json、retry-runtime-state-proof.json、retry-auth-status-proof.json；本轮未开串口/刷ROM/改凭据/新发设备写事务。
+- **验证与边界**：最终core125 passed、app70 passed/1既有ignored、生产HTML Node测试及diff check通过；覆盖认证HTTP/仅BLE/错误MAC/过期状态/requested、重启、预算耗尽、未知事务不重发、按钮失败反馈。日志retry-{core-final-tests,app-final-tests,bridge-final-build}.log。已尝试原生WK脚本，本Windows/WSL无swiftc，Mac窄宽截图及Mac部署未验；长期电池/RF多轮仍归B6。计划`project-workflow/bridge-macos/wifi-retry-20261007-plan.md`。用户已授权提交本轮修复及关联验证记录。
+- **设备ROM沿用已验证.69**：唯一zectrix-note4-b，`artifacts/ble-info-panic-20261007/note4-0.18.69.bin`，1863488B，SHA256 `11990BB19076EF5841A827BA5A9616259759B2485AAA26320AA31771F8A92F73`；匹配ELF `5D8E3E600E368D7B70C27F37BFB5A9451FD3E5CF9BC44F5EE328545A8CFABBA2`。panic根因、刷写与镜像核验见下节。
+
+## 2026-10-07 BLE INFO重复释放已复现修复，Note4 .69已部署与运行hash验证
+
+- **根因已验证**：.68真实CRC有效dump的nimble_host→onAuthenticationComplete→refreshInfo→infoExtra String::move/free断言，由主循环与BLE回调无锁改写同一String触发。生产函数+实际Arduino WString双线程交错稳定观测同一缓冲重复free（旧路径exit86 red），不是密码/配对丢失。修复一个原生recursive_mutex同步INFO缓存/provider/fw及INFO/Status特征生命周期，也同步peer地址/身份String复制；关闭时锁内脱离特征，锁外停止host，host停止后清接收缓存，避免持锁等待回调及清缓存竞态。不改GATT/认证/claim/窗口与存储格式。
+- **验证与资源**：生产函数并发8000次更新、认证/读取/设置交错、实际bleDeinit+最终host回调、特征脱离/重新发布通过ASan/UBSan；BLE-first/claim授权源guard与diff check通过。真实ELF Wi-Fi栈门禁通过（HTTP局部链2912B；BLE dispatcher既有1136B沿原预算），refreshInfo208/bleBegin64/bleDeinit32/notify32B局部帧与.68相同，不等同完整任务峰值。mutex4B/IDF堆载荷8+92=100B（分配器开销另计），持久化0B，各配置使用量成本相同；静态RAM117324B不增（链接对齐），flash1816327B。计划/证据`project-workflow/bridge-macos/ble-info-panic-20261007-plan.md` / `artifacts/ble-info-panic-20261007/`。
+- **最终部署ROM**：唯一env zectrix-note4-b / `0.18.69-note4`，`artifacts/ble-info-panic-20261007/note4-0.18.69.bin`，1863488B，SHA256 `11990BB19076EF5841A827BA5A9616259759B2485AAA26320AA31771F8A92F73`；匹配ELF `5D8E3E600E368D7B70C27F37BFB5A9451FD3E5CF9BC44F5EE328545A8CFABBA2`。64.48s增量，仅ble_bridge/main，无clean/重装/其他目标。COM5 MAC7C4FADB93408，真实otadata CRC seq17/18/state2选ota_1@0x610000，仅写应用/Hash verified；写后启动前分区/NVS/otadata/phy逐字节不变，未写/擦dump/storage。`running-image-69.json`设备操作token认证返回MAC/fw/target/slot/1863488B运行SHA全匹配。
+- **实体恢复/边界**：已有home映射/凭据不改，以既有应用服务显式use_current重开有限连接机会，原生绑定认证→显式claim8c94→正式600s Plan→home activation回执→wd21-la/192.168.3.177→HTTP handoff→BLE controller释放。Bridge当前connected/http_ready，原Bridge PID53328/exe不变。停止串口重开后7次认证HTTP200，boot `6522a1f4678e3324a062e986036ddd37`不变、uptime149960→211243ms（61.283s），reset_reason11/USB、无新panic；证据stability-69.json。短样本不替代长期RF/电池矩阵。
+- **Windows串口核验修正**：本轮跳过pyserial `_update_dtr_state/_update_rts_state`仍不足，serialwin32 `_reconfigure_port`的SetCommState会写控制线；验证期出现USB reset11及boot变更，不能当.69新panic，不能继续宣传Windows保现场保证。不再重开串口，后续用原生不写DCB的监听及前后boot实证；Mac已验证recipe仍限原平台。esptool进入ROM/恢复hard-reset单记。旧.68完整dump/匹配ELF保留，含敏感内存不提交/全文打印。未提交；独立Bridge成功不清attempts导致后续3/3锁住与耗尽UI错误仍归B6，未冒充本轮修复。
+
+## 2026-10-07 Note4 Wi-Fi 再次离线：USB确认BLE信息更新崩溃及Bridge重试耗尽（诊断，未修复）
+
+- 用户授权检查并接入USB。COM5/VID303A PID1001/serial与esptool MAC均为7C4FADB93408；跳过DTR/RTS更新、保留接收缓冲，被动监听及只读status/log/pmstats确认0.18.68-note4/ota_1/WIFI OFF/ip=-，等待Bridge选网。跟进监听捕获应用启动reset=panic，不能将本次离线仅归因于睡眠或密码。串口BLE还出现encryption/bond拒绝，未据此判定配对丢失。
+- **真实转储**：实际表只读核对coredump@0xB00000/0x100000；导出完整1048576B，有效18084B/version0x90102/CRC32计算与存储均43EF71E0。原件SHA256 `CB288406D961FBB7C28B465EB8736C7956F0565E940D90C5589B954E37F4B543`。官方esp-coredump1.17.2成功解码，dump ELF摘要前缀ccb352e14与既有.68 ELF SHA256 `CCB352E1456E51F0133D122E6CA2303FB0E21A818C9649FA38D33EB7A81D19CC`匹配（设备只记录此前缀，不冒充完整hash证明）。nimble_host在onAuthenticationComplete→refreshInfo(src/ble_bridge.cpp:170)→String::move(infoExtra)→free触发tlsf_free断言block already marked as free；已定位内存重复释放/损坏现场。源码主循环及BLE回调均无锁更新共享infoExtra，并发竞态为待复现方向，不把源码推断当已验证根治。
+- **独立Bridge阻挡**：默认计划任务Running、主PID53328/同exe watchdog40088、health204，主机wd21-wo；保存home→wd21-la映射、密码缓存仍存在。wifi_view连接attempts3/state waiting_for_window/error null/http_ready false，最后认证状态/完整snapshot是10-06旧缓存，不能当当前在线。automatic_on_link在attempts>=3返回wifi_retry_exhausted，正式窗口准入也要求attempts<3；成功HTTP确认未清此累计次数，后续正常断网仍会被锁住，UI却直接展示waiting_for_window。上一轮只修新OTA显式任务重置，普通重连未解决。需成功确认重置/有界失败预算与明确耗尽反馈回归，见backlog B6。
+- 证据仅在gitignored `artifacts/note4-wifi-20261006/usb-{wifi-diagnostic,wifi-status,wifi-followup,partitions,coredump,coredump-export,coredump-decoded,coredump-match}-20261007*`，原dump/解码可能含凭据，不提交或完整打印。工具usb-reset进入下载模式及hard-reset恢复应用单独记账；首次导出因GBK进度字符异常中断并工具复位，UTF-8重试成功。未擦dump/ROM/分区/NVS，未改配对/配置/claim，末次只读status确认应用.68/ota_1已恢复、仍WIFI OFF。ROM仍沿用 `artifacts/note4-wifi-20261006/note4-0.18.68.bin` /1861216B/SHA256 `1EC5EA49A9233954D0A30E85B5B0B98EA39E112A0A474F9D8E53598516E52BF2`，无构建部署或提交。
+
+## 2026-10-06 Bridge路径OTA .68已完成，修复连接重试/验收循环阻断
+
+- **用户纠正成立**：旧IP不可达不等于无法Bridge刷入。通过MCP firmware_ota冻结既有.68 ROM，MAC7C4FADB93408/request note4-shared-wifi-0_18_68-20261006/job eaadc30f持久排队；BLE可信认证→显式claim→正式600s PowerPlan→按主机实际wd21-wo映射home→设备wd21-la/192.168.3.177→认证OTA上传→重启→BLE恢复网络→运行镜像证明，全程无USB、无force、无重发OTA。
+- **真实两个阻断**：新OTA已有合法窗口，但连接缓存attempts3令automatic_on_link静默跳过激活，ready循环反复match/HTTP超时。先用既有应用服务use_current恢复本原OTA工作，不直接编辑data；根治queue_ota在新显式任务的同一持久提交中重置有限连接机会，重复同request不重置；保护connecting/awaiting_confirmation及已知密码/安全错误，持久失败恢复原连接。重试耗尽/backoff/认证错误现在明确返回。上传后的awaiting_confirmation又把联网前置当后续写阻挡，无法证明新镜像；现在仅transferring阻挡网络恢复，确认阶段只激活已匹配保存项，匹配不符明确拒绝、禁止配置改写；只驱动该activation原job，不借通道执行其他排队写。OTA未知状态仍query-only，不再次上传。上传前已发激活2d先查原回执确认，再在本次启动建立新激活2e，不把旧回执当当前联网证据。
+- **刷入与镜像最终验收**：2026-10-06 16:55（香港）原job succeeded/image_verified，attempt_count1/upload_ack，设备自报0.18.68-note4/target zectrix-note4-400x300，1861216B运行SHA256 `1EC5EA49A9233954D0A30E85B5B0B98EA39E112A0A474F9D8E53598516E52BF2` 与 `artifacts/note4-wifi-20261006/note4-0.18.68.bin`完全相同。匹配ELF `CCB352E1456E51F0133D122E6CA2303FB0E21A818C9649FA38D33EB7A81D19CC`；本轮仅桥端修复，ROM沿上轮已验产物，无重新编ROM、USB复位/擦写/NVS改写。上传ACK后首次读取仍是旧.67，未误标成功；最终等待自然重启及认证镜像证明才完成。证据bridge-ota-68-proof.json。
+- **共享权限实机已生效**：认证完整read w3_2f/job7eaf5c52f2e9bb95 completed/complete_snapshot，revision13；旧Mac bond f0:18:98:6b:98:c6/0的wifi-slot-0/1及Windows home三条全部writable=true/password_cached=true。保留原来源/凭据，不改两条Mac配置；当前home激活及回执完成，HTTP200。只记录密码存在性，证据shared-wifi-68-runtime-proof.json，真实跨桥修改/删除的其余矩阵不由writable投影替代。
+- **Windows最终Bridge**：exe SHA256 `22D7A2EA14D4E29ACB79C021B8EACE87C4DE55C1B6F442C853130A64CD945F43`，PID53328，计划任务/8765/8766；按同exe watchdog→任务→主进程停止，仅在OTA已upload_ack/awaiting_confirmation时重建，保留data和原任务。核心OTA6 passed含新任务/同ID重放/重启/unknown/密码错误保护与联网许可矩阵；app68 passed/1既有ignored，diff check通过。日志ota-recovery-{bridge-build,app-tests}.log。Mac未build/部署；旧ID冲突逐条修复入口/电池RF长期矩阵仍归B6，无提交。
+
+
+## 2026-10-06 统一设备 Wi-Fi 配置权限已实现，Windows Bridge运行，Note4 .68待刷
+
+- **用户明确范围**：统一Mac/Windows创建的设备Wi-Fi配置权限，保留claim/lease。当前认证session+owner可共享修改、删除、试连、启用全部WFS4来源记录；配置按全设备唯一network_id查找，原bond仅来源/active引用，更新保留密码与来源，不创建跨绑定副本。完整owner快照全部writable，失session/owner不读取共享密码；scheme_get补同一权限检查。总12条，去掉按创建者4条/3组配额；WFS4及原子NVS/读回不变。旧permit兼容适配器仍用原namespace；现行HTTP/BLE统一control使用共享规则。事务principal/namespace回执、高水位、operation token及正式窗口原样保留，不取消占用或常开Wi-Fi。
+- **冲突与界面**：旧同ID跨bond记录不自动合并、不挑赢家，保存/删除/启用明确ambiguous_network_id，确定拒绝可查询原回执，原内容不变；显式逐记录消歧入口未实现，登记B6。UI展示设备配置，补冲突提示；Bridge确认写入后的缓存保持原记录bond，避免误归当前Bridge。当前最后已证三条wifi-slot-0/1/home无同ID冲突，本轮未改实机配置。
+- **Windows默认Bridge已部署运行**：最终exe SHA256 `F4DB55ABAEBB9CD59226FE1562383739ADA9AC84C57A724919856ADEC204B575`，PID60196，计划任务CodexStatusBridge，8765/8766。先按要求临时启动旧Bridge，再仅同exe watchdog→任务→主进程停机构建/提权重启；保留data/设备登记/映射/密码/事务。回退exe `artifacts/note4-wifi-20261006/bridge-before-shared.exe`。Mac app未build/部署。
+- **Note4最终候选，未刷入**：唯一env zectrix-note4-b / `0.18.68-note4`，`artifacts/note4-wifi-20261006/note4-0.18.68.bin`，1861216B，SHA256 `1EC5EA49A9233954D0A30E85B5B0B98EA39E112A0A474F9D8E53598516E52BF2`；匹配ELF SHA256 `CCB352E1456E51F0133D122E6CA2303FB0E21A818C9649FA38D33EB7A81D19CC`，target/version marker已验。最终40.73s增量，无clean/重装/其他env；静态RAM117324B/flash1814439B。生产Wi-Fi ELF栈门禁通过，HTTP局部链2912B/BLE局部链3600B，setup640/control400B；BLE dispatcher1136B沿既有预算，不冒充1024单帧全部通过。
+- **验证**：render生产C++8 passed，覆盖跨桥keep密码/编辑/启用/删除、session/claim/revision拒绝、重放与回执隔离、分页失owner、同binding12条/第13拒绝、旧同ID确定拒绝与回执；core Wi-Fi16 passed含来源缓存/restart，app68 passed/1既有ignored，Node界面通过、diff check通过。仓库实际短字段样本持久化/host请求RAM：空0/224B，1条153/527B，典型4条363/1104B，12条879/2538B；无额外全仓库副本或固定预分配，详见shared-wifi-20261006-plan.md预算/峰值分析。原生WK脚本已尝试，本Windows缺swiftc，Mac窄宽截图未验。
+- **现场阻挡与继续入口**：提权PlatformIO Python枚举无USB串口；登记7C4FADB93408/192.168.3.177公开状态访问失败，无法USB/OTA刷入。本轮没有设备复位、擦写或凭据修改，最后已证实机仍为下节.67，不能把.68候选当部署。已有用户刷写授权持续，连接可用后先核MAC/实际OTA活动槽再只更新应用，验运行SHA及完整共享快照。B6不结项，Mac及真实跨桥/RF矩阵继续。无提交。
+
+
 
 ## 2026-10-06 owner过期、BLE-first配网与完整密码缓存修复已部署（最终.67）
 

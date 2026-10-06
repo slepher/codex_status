@@ -325,7 +325,7 @@
         </div>
         <div class="wifi-summary">
           <div class="row"><span>主机当前 Wi-Fi</span><span id="wifi-host">尚未读取</span></div>
-          <p id="wifi-auto" role="status" aria-live="polite"></p><div class="action-strip"><button id="wifi-current-action" onclick="wifiEditCurrent()" hidden>配置当前网络</button></div><p id="wifi-times" class="muted"></p>
+          <p id="wifi-auto" role="status" aria-live="polite"></p><div class="action-strip"><button id="wifi-current-action" onclick="wifiEditCurrent()" hidden>配置当前网络</button><button id="wifi-current-retry" onclick="wifiRetryCurrent()" hidden>重新尝试连接</button></div><p id="wifi-times" class="muted"></p>
         </div>
         <details class="wifi-tools"><summary>主机网络与缓存读取</summary>
           <div class="action-strip"><button onclick="wifiHost(false)">读取主机网络</button>
@@ -365,7 +365,7 @@
         </section>
         <section class="wifi-panel" id="wifi-panel-device" role="tabpanel" aria-labelledby="wifi-tab-device" tabindex="0" hidden>
           <div class="wifi-panel-heading"><h3>设备已读取的方案</h3><button class="primary" onclick="wifiReadScheme()">读取设备完整方案</button></div>
-          <p class="section-note">完整快照按绑定分组；其他绑定和 USB/AP 网络只读。本机绑定网络的密码随完整方案读取并缓存。</p>
+          <p class="section-note">当前占用设备的 Bridge 可管理全部已保存 Wi-Fi 配置；完整读取会缓存已有密码。USB/AP 旧记录需先导入。</p>
           <div id="wifi-networks" class="plist muted">尚未读取完整设备方案</div>
         </section>
         <section class="wifi-panel" id="wifi-panel-compare" role="tabpanel" aria-labelledby="wifi-tab-compare" tabindex="0" hidden>
@@ -1074,7 +1074,7 @@
   let wifiViewMac=null, wifiRequestSeq=0, wifiResultJobId=null;
   let wifiPermissions=null, wifiPermissionBusy=false, wifiPermissionGuideShown=false;
   const wifiDrafts=new Map(), wifiSelections=new Map();
-  const wifiError=e=>({revision_conflict:'设备方案已变化，缓存已过期，请重新读取设备后再同步。Bridge 配置已保留。',physical_required:'请单击 BOOT 开启维护窗口',unsupported:'此固件尚不支持完整方案，请等待升级',
+  const wifiError=e=>({ambiguous_network_id:'设备存在同名配置，无法确定目标。配置已保留，请核对冲突记录。',revision_conflict:'设备方案已变化，缓存已过期，请重新读取设备后再同步。Bridge 配置已保留。',physical_required:'请单击 BOOT 开启维护窗口',unsupported:'此固件尚不支持完整方案，请等待升级',
     local_revision_conflict:'Bridge 保存版本已改变，保留修改，请重新比较',target_revision_conflict:'方案已改变，请处理冲突',host_network_changed:'主机网络已改变，请重新选择当前网络',network_not_configured:'Bridge 尚无当前网络配置，请先保存方案',current_network_required:'请保留或加入当前网络后再同步。',host_network_unknown:'无法识别当前网络，请先授权读取主机 Wi-Fi。',snapshot_conflict:'设备快照已变化，请重新预览。',
     snapshot_required_or_read_only:'需要完整快照，或选中项属于只读归属',credentials_required:'等待本次密码输入',
     bluetooth_permission_required:'请在 Wi-Fi 页面完成 macOS 蓝牙授权',bluetooth_permission_denied:'请在系统设置 → 隐私与安全性 → 蓝牙中允许 Codex Status Bridge',
@@ -1214,7 +1214,7 @@
       wifiRenderOnline(v.online);
       if(!wifiDirty) wifiDraft=structuredClone(wifiState.targets||[]);
       $('wifi-target').textContent=mac;
-      $('wifi-times').textContent=`Bridge 保存 ${eventTime(wifiState.saved_at)} · 修订 ${wifiState.local_revision} · 设备 ${wifiScheme?.complete?'完整快照 r'+wifiScheme.revision:'未读取完整快照'} · 读取 ${eventTime(wifiScheme?.observed_at)} · 容量 ${wifiScheme?.capacity?.total??'未知'} / 每绑定 ${wifiScheme?.capacity?.per_bond??'未知'}`;
+      $('wifi-times').textContent=`Bridge 保存 ${eventTime(wifiState.saved_at)} · 修订 ${wifiState.local_revision} · 设备 ${wifiScheme?.complete?'完整快照 r'+wifiScheme.revision:'未读取完整快照'} · 读取 ${eventTime(wifiScheme?.observed_at)} · 容量 ${wifiScheme?.capacity?.total??'未知'}`;
       wifiRenderCurrent(v);
       wifiRenderLocal();wifiRenderScheme();wifiRenderComparison();wifiRenderJobs();
     } catch(e) { if(isCurrentDevice(mac,generation)) wifiSetResult(wifiError(e)); }
@@ -1226,7 +1226,7 @@
   function wifiRenderScheme() {
     if(!wifiScheme?.complete) { $('wifi-networks').textContent='尚未读取完整设备方案；本地编辑可继续。'; return; }
     const groups=new Map();
-    (wifiScheme.networks||[]).forEach((n,i)=>{ const label=n.writable?'本机绑定':n.bond==='legacy'?'USB / AP legacy（只读）':`其他绑定 ${n.bond}（只读）`;
+    (wifiScheme.networks||[]).forEach((n,i)=>{ const label=n.writable?'设备配置':n.bond==='legacy'?'USB / AP legacy（只读）':'设备配置（需占用）';
       if(!groups.has(label)) groups.set(label,[]);groups.get(label).push({n,i}); });
     $('wifi-networks').innerHTML=[...groups].map(([label,rows])=>`<h4>${escapeHtml(label)} · ${rows.length}</h4>`+rows.map(({n,i})=>
       `<div class="prow"><div class="pmeta"><b>${escapeHtml(n.network.label||n.network.network_id)}</b><small>${escapeHtml(n.network.host_ssid)} → ${escapeHtml(n.network.ssid)} · v${n.network.version} · ${n.network.password==null?'未缓存密码':'密码已缓存'}</small></div>${n.writable?`<button onclick="wifiSelect(${i})">启用此版本</button>`:''}</div>`).join('')).join('')||'完整快照：设备没有已保存网络。';
@@ -1275,15 +1275,24 @@
   }
   function wifiRenderCurrent(v){
     const ssid=wifiHostNetwork?.state==='connected'?wifiHostNetwork.networks?.[0]?.ssid:null,target=v.matched_target,c=v.connection;
-    const job=(wifiState.jobs||[]).slice().reverse().find(j=>!['completed','cancelled','expired','failed'].includes(j.state)&&j.kind==='recovery_save'&&j.frozen?.[0]?.network_id===target?.network_id);
-    const state=job?.state||v.automatic_state;
+    const job=(wifiState.jobs||[]).slice().reverse().find(j=>!['completed','cancelled','expired','failed'].includes(j.state)&&(j.sent||(j.kind==='recovery_save'&&j.frozen?.[0]?.network_id===target?.network_id)));
+    const state=job?.sent?'awaiting_confirmation':job?.state||v.automatic_state;
     const text={requested:'已请求使用当前网络，等待设备会合。',queued:'已排队，等待设备会合。',waiting_rendezvous:'等待设备的可用通道。',no_mapping:'Bridge 没有该网络的配置，请新增。',waiting_for_window:'已匹配 Bridge 方案，等待设备会合。',selected:'设备已选此方案，等待联网验证。',connecting:'设备正在连接此网络。',needs_sync:'设备需要更新此方案，通道可用时将写入。',waiting_input:'此方案缺少可用凭据，请提供本次密码。',waiting_authorization:'等待设备的可用通道写入此方案。',awaiting_confirmation:'正在确认上次操作结果，请勿重复提交。',occupied:'设备由其他 Bridge 占用。',firmware_upgrade_required:'设备固件需要升级以报告网络连接结果。'};
     const failure={authentication_failed:'设备认证失败，请核对密码和安全模式。',security_mismatch:'网络安全模式不兼容，请修正配置。',network_not_found:'设备未找到此网络，请检查 2.4GHz 网络是否可用。',signal_weak:'网络信号过弱，请检查距离。',association_failed:'设备关联失败，请检查网络。',handshake_timeout:'认证握手超时，请检查网络或凭据。',dhcp_timeout:'已关联但未取得 IP，请检查路由器 DHCP。',connect_timeout:'连接超时，请检查网络；尚不能判断密码错误。',storage:'配置保存失败，请重新检查设备。'};
-    const message=state==='bridge_unreachable'?(c?.error==='unauthorized'?'设备 HTTP 授权失败，请检查 Bridge 授权。':c?.error==='http_identity_mismatch'?'HTTP 设备身份不符，请检查地址。':'设备已连接当前网络，但 Bridge 无法访问设备 HTTP；请检查网络隔离或访问地址。'):state==='connection_failed'?(failure[c?.error]||'设备连接失败，请检查配置。'):
+    const message=state==='retry_exhausted'?`自动连接已尝试 3 次，现已停止。${failure[c?.error]||'请检查网络。'}检查后可点击“重新尝试连接”。`:state==='bridge_unreachable'?(c?.error==='unauthorized'?'设备 HTTP 授权失败，请检查 Bridge 授权。':c?.error==='http_identity_mismatch'?'HTTP 设备身份不符，请检查地址。':'设备已连接当前网络，但 Bridge 无法访问设备 HTTP；请检查网络隔离或访问地址。'):state==='connection_failed'?(failure[c?.error]||'设备连接失败，请检查配置。'):
       state==='connected'?(c?.http_ready?'设备已连接，HTTP 交接已确认。':'设备已入网，正在确认 HTTP 交接。'):text[state]||'等待可用的主机 Wi-Fi 与设备会合。';
     $('wifi-auto').textContent=ssid?`${target?.label||target?.network_id||ssid} · ${message}`:message;
     const action=$('wifi-current-action');action.hidden=!ssid;
     action.textContent=target?(state==='connection_failed'?'修正此网络配置':state==='waiting_input'?'补充此网络密码':'编辑此网络配置'):'配置当前网络';
+    $('wifi-current-retry').hidden=!ssid||!target||state!=='retry_exhausted';
+  }
+  async function wifiRetryCurrent(){
+    const ssid=wifiHostNetwork?.state==='connected'?wifiHostNetwork.networks?.[0]?.ssid:null;
+    const target=wifiState.targets?.find(n=>!n.deleted&&n.host_ssid===ssid);
+    if(!target)return;
+    const button=$('wifi-current-retry');button.disabled=true;
+    try{await wifiQueue('use_current',{network_id:target.network_id,local_revision:wifiState.local_revision});}
+    finally{button.disabled=false;}
   }
   function wifiEditCurrent(){
     const ssid=wifiHostNetwork?.state==='connected'?wifiHostNetwork.networks?.[0]?.ssid:null;if(!ssid)return;
@@ -1316,7 +1325,7 @@
     const labels={equal:'一致',bridge_only:'仅 Bridge 有',device_only:'仅设备有',bridge_changed:'Bridge 修改',device_changed:'设备修改',conflict:'双方冲突',both_changed:'双方均修改',no_baseline:'首次比较',explicit_delete:'明确删除',unknown_snapshot:'快照未知',ambiguous:'同 ID 多归属'};
     $('wifi-compare').innerHTML=wifiDifferences.map((d,i)=>{
       const enabled=wifiCanSelect(d,importing),targetRow=wifiImportRow(d),rows=targetRow?[targetRow]:(d.device||[]);
-      return `<tr><td><label><input type="checkbox" ${enabled?'':'disabled'} ${wifiSelections.has(d.network_id)?'checked':''} onchange="wifiChoose(${i},this.checked)"><span>${escapeHtml(d.network_id)} · ${labels[d.state]||d.state}</span></label></td><td data-label="Bridge 目标">${escapeHtml(d.bridge?.label||'')}<br>${escapeHtml(d.bridge?.host_ssid||'—')} → ${escapeHtml(d.bridge?.ssid||'—')}<br>${escapeHtml(wifiCredentialLabel(d.bridge?.credential)||'')}</td><td data-label="设备快照">${rows.map(n=>`${escapeHtml(n.network.label||'')}<br>${escapeHtml(n.network.host_ssid)} → ${escapeHtml(n.network.ssid)} · ${escapeHtml(n.writable?'本机绑定':n.bond==='legacy'?'USB / AP':'其他绑定')}`).join('<br>')||'—'}<br>${({equal:'密码一致',different:'密码不同',unknown:'密码尚未完整缓存'})[d.password]||'密码尚未完整缓存'}</td><td data-label="本次处理">${enabled?(importing?'整条保存到本地':d.bridge?.deleted?'删除此网络':'整条保存待启用版本'):!wifiScheme?.complete?'等待完整读取':d.bridge?.deleted?'本机绑定中无此记录可删除':'缺少配置或明确版本'}</td></tr>`;
+      return `<tr><td><label><input type="checkbox" ${enabled?'':'disabled'} ${wifiSelections.has(d.network_id)?'checked':''} onchange="wifiChoose(${i},this.checked)"><span>${escapeHtml(d.network_id)} · ${labels[d.state]||d.state}</span></label></td><td data-label="Bridge 目标">${escapeHtml(d.bridge?.label||'')}<br>${escapeHtml(d.bridge?.host_ssid||'—')} → ${escapeHtml(d.bridge?.ssid||'—')}<br>${escapeHtml(wifiCredentialLabel(d.bridge?.credential)||'')}</td><td data-label="设备快照">${rows.map(n=>`${escapeHtml(n.network.label||'')}<br>${escapeHtml(n.network.host_ssid)} → ${escapeHtml(n.network.ssid)} · ${escapeHtml(n.writable?'设备配置':n.bond==='legacy'?'USB / AP':'设备配置（需占用）')}`).join('<br>')||'—'}<br>${({equal:'密码一致',different:'密码不同',unknown:'密码尚未完整缓存'})[d.password]||'密码尚未完整缓存'}</td><td data-label="本次处理">${enabled?(importing?'整条保存到本地':d.bridge?.deleted?'删除此网络':'整条保存待启用版本'):!wifiScheme?.complete?'等待完整读取':d.bridge?.deleted?'设备中无此记录可删除':'缺少配置或明确版本'}</td></tr>`;
     }).join('')||'<tr><td class="wifi-compare-empty" colspan="4">本地和设备尚无可比较项。先读取设备方案，Bridge 目标仍可离线编辑。</td></tr>';
   }
   function wifiSelectDifferences(){

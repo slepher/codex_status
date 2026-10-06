@@ -9,6 +9,7 @@
 #include <esp_wifi.h>
 #include <algorithm>
 #include <atomic>
+#include <mutex>
 
 static EndpointJsonHandler endpointHandler = nullptr;
 static AuthJsonHandler     authHandler     = nullptr;
@@ -29,6 +30,9 @@ static String   tplCtrlBuf;
 static String   authBuf;
 static String   fwVersion      = "?";
 static String   infoExtra;
+// Main loop and NimBLE callbacks share INFO state and GATT lifetime. Never
+// hold this mutex while stopping the host: its final callbacks need the lock.
+static std::recursive_mutex infoMutex;
 static NimBLECharacteristic *statusChr  = nullptr;
 static NimBLECharacteristic *infoChr    = nullptr;
 static NimBLEServer        *bleServer  = nullptr;
@@ -167,6 +171,7 @@ static bool writeAttribute(NimBLECharacteristic *characteristic, const String &b
 }
 static String (*infoProvider)() = nullptr;
 static void refreshInfo() {
+    std::lock_guard<std::recursive_mutex> lock(infoMutex);
     if (infoProvider) infoExtra = infoProvider();
     JsonDocument extra;
     if (deserializeJson(extra, String("{") + infoExtra + "}")) return;
@@ -233,10 +238,13 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         peerEncrypted = peer.encrypted();
         disconnecting = false;
         clearReceiveBuffers();
-        peerAddress = peer.address();
-        peerIdentity = peer.identity();
+        {
+            std::lock_guard<std::recursive_mutex> lock(infoMutex);
+            peerAddress = peer.address();
+            peerIdentity = peer.identity();
+        }
         ++connectionGeneration;
-        DevLog.printf("[ble] connected: %s bonded=%d\n", peerAddress.c_str(), peerBonded ? 1 : 0);
+        DevLog.printf("[ble] connected: %s bonded=%d\n", peer.address().c_str(), peerBonded ? 1 : 0);
         refreshInfo();
         if (!peerBonded && !blePairingWindowOpen()) {
             DevLog.println("[ble] unbonded peer outside pairing window; disconnecting");
@@ -254,7 +262,10 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         PeerRef peer(desc);
         peerEncrypted = peer.encrypted();
         peerBonded = peer.bonded();
-        peerIdentity = peer.identity();
+        {
+            std::lock_guard<std::recursive_mutex> lock(infoMutex);
+            peerIdentity = peer.identity();
+        }
         refreshInfo();
         if (!peer.secure()) {
             DevLog.println("[ble] authentication rejected: encryption and bond required");
@@ -310,6 +321,7 @@ class AuthCallbacks : public NimBLECharacteristicCallbacks {
 };
 
 void bleBegin(const String &deviceName, const String &fw) {
+    std::lock_guard<std::recursive_mutex> lock(infoMutex);
     if (NimBLEDevice::isInitialized()) return;
     fwVersion = fw;
     NimBLEDevice::init(deviceName.c_str());
@@ -385,19 +397,23 @@ void bleDeinit() {
     peerEncrypted = false;
     peerConnHandle = BLE_HS_CONN_HANDLE_NONE;
     disconnecting = false;
-    statusChr = nullptr;
-    infoChr = nullptr;
+    {
+        std::lock_guard<std::recursive_mutex> lock(infoMutex);
+        statusChr = nullptr;
+        infoChr = nullptr;
+    }
     bleServer = nullptr;
-    clearReceiveBuffers();
     NimBLEDevice::deinit(true);
+    // No host callback may still append or clear these Strings now.
+    clearReceiveBuffers();
     DevLog.println("[ble] deinitialized (controller released)");
 }
 
 bool bleIsConnected() { return connected; }
 bool blePeerIsBonded() { return peerBonded; }
 bool blePeerIsEncrypted() { return peerEncrypted; }
-String blePeerAddress() { return peerAddress; }
-String blePeerIdentity() { return peerIdentity; }
+String blePeerAddress() { std::lock_guard<std::recursive_mutex> lock(infoMutex); return peerAddress; }
+String blePeerIdentity() { std::lock_guard<std::recursive_mutex> lock(infoMutex); return peerIdentity; }
 uint32_t bleConnectionGeneration() { return connectionGeneration; }
 bool blePairingWindowOpen() {
     return pairingUntil != 0 && (int32_t)(millis() - pairingUntil) < 0;
@@ -435,9 +451,13 @@ void bleSetCommandHandler(DeviceCommandHandler onCommand) {
     commandHandler = onCommand;
 }
 
-void bleSetInfoProvider(String (*provider)()) { infoProvider = provider; }
+void bleSetInfoProvider(String (*provider)()) {
+    std::lock_guard<std::recursive_mutex> lock(infoMutex);
+    infoProvider = provider;
+}
 
 void bleSetInfoExtra(const String &json) {
+    std::lock_guard<std::recursive_mutex> lock(infoMutex);
     infoExtra = json;
     refreshInfo();
 }
@@ -445,6 +465,7 @@ void bleSetInfoExtra(const String &json) {
 void bleNotifyStatus(const String &json) { bleNotifyStatusQuiet(json); }
 
 void bleNotifyStatusQuiet(const String &json) {
+    std::lock_guard<std::recursive_mutex> lock(infoMutex);
     if (writeAttribute(statusChr, json, "status") && connected && peerEncrypted && peerBonded)
         statusChr->notify();
 }

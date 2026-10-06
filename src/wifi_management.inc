@@ -93,7 +93,7 @@ static String wifiManagementWithContext(JsonDocument &doc, uint64_t now, const S
             snapshot["revision"] = wifiStore.revision;
             snapshot["snapshot_id"] = wifiRandomId(); snapshot["complete"] = true;
             snapshot["observed_at"] = 0;
-            snapshot["capacity"]["total"] = 12; snapshot["capacity"]["per_bond"] = 4;
+            snapshot["capacity"]["total"] = 12;
             snapshot["active"]["bond"] = wifiStore.active.bond.c_str();
             snapshot["active"]["network_id"] = wifiStore.active.id.c_str();
             // Active version can differ from the saved version.
@@ -101,7 +101,7 @@ static String wifiManagementWithContext(JsonDocument &doc, uint64_t now, const S
             JsonArray list = snapshot["networks"].to<JsonArray>();
             for (size_t i = 0; i < schemes.networks.size(); ++i) if (*schemes.networks[i].id)
                 projectWifiNetwork(list, schemes.networks[i], schemes.networks[i].label, schemes.networks[i].version,
-                    permit && permit->peer == schemes.networks[i].bond,
+                    context ? context->sessionValid && context->claimed : permit && permit->peer == schemes.networks[i].bond,
                     context && context->sessionValid && context->claimed);
             JsonDocument old;
             if (legacy.length() && !deserializeJson(old, legacy)) for (JsonObject n : old.as<JsonArray>()) {
@@ -201,7 +201,8 @@ static String wifiManagementWithContext(JsonDocument &doc, uint64_t now, const S
             const char *networkId = change["network_id"] | "";
             if (!identifier(networkId, 32) || used.indexOf((String("|") + networkId + "|").c_str()) >= 0) { failure = "shape"; break; }
             used += String("|") + networkId + "|";
-            int slot = next.schemes.find(permit->peer.c_str(), networkId);
+            int slot = context ? next.schemes.findShared(networkId) : next.schemes.find(permit->peer.c_str(), networkId);
+            if (slot == -2) { failure = "ambiguous_network_id"; break; }
             if (change["deleted"] == true) {
                 if (slot < 0) { failure = "not_found"; break; }
                 if (!next.schemes.erase(slot)) { failure = "memory"; break; } continue;
@@ -216,7 +217,7 @@ static String wifiManagementWithContext(JsonDocument &doc, uint64_t now, const S
             }
             if (failure) break;
             WifiNetwork network;
-            network.bond.set(permit->peer.c_str()); network.id.set(networkId);
+            network.bond.set(slot >= 0 ? next.schemes.networks[slot].bond.c_str() : permit->peer.c_str()); network.id.set(networkId);
             network.host.set(host); network.ssid.set(ssid);
             if (!strcmp(credential, "keep") || !strcmp(credential, "device")) {
                 if (slot < 0) { failure = "credentials_required"; break; }
@@ -232,15 +233,15 @@ static String wifiManagementWithContext(JsonDocument &doc, uint64_t now, const S
             next.schemes.selectedBond.set(bond); next.schemes.selectedId.set(selected);
             network.password.clear();
             if (failure) break;
-            slot = next.schemes.find(permit->peer.c_str(), networkId);
+            slot = context ? next.schemes.findShared(networkId) : next.schemes.find(permit->peer.c_str(), networkId);
             next.schemes.networks[slot].label.set(label); next.schemes.networks[slot].version = wifiStore.revision + 1;
         }
-        // Retire the saved active row only when another own-bond row remains.
+        // Retire the saved active row only when another device configuration remains.
         // The live connection/active copy survives until explicit activation.
-        if (!failure && *next.active.id && !strcmp(next.active.bond, permit->peer.c_str()) &&
+        if (!failure && *next.active.id &&
             next.schemes.find(next.active.bond, next.active.id) < 0) {
             bool replacement = false;
-            for (const auto &n : next.schemes.networks) if (*n.id && !strcmp(n.bond, permit->peer.c_str())) replacement = true;
+            for (const auto &n : next.schemes.networks) if (*n.id) replacement = true;
             if (!replacement) failure = "active_protected";
         }
         if (failure) {
@@ -298,6 +299,8 @@ String wifiControlCommand(JsonDocument &doc,const WifiControlContext &ctx,uint64
         if ((op=="trial" || op=="activate") && wifiRequestSequence(requestedId) && wifiRequestSequence(requestedId)<=wifiManagementHighWater(ctx.principal,ctx.nameSpace))return reply(doc,"request_retired");
         if ((op=="trial" || op=="activate") && !ctx.sessionValid) return reply(doc,"session_expired");
         if ((op=="trial" || op=="activate") && !ctx.claimed) return reply(doc,ctx.occupied?"occupied":"claim_required");
+        if(op=="scheme_get" && !ctx.sessionValid)return reply(doc,"session_expired");
+        if(op=="scheme_get" && !ctx.claimed)return reply(doc,ctx.occupied?"occupied":"claim_required");
         if(op=="scheme_get" && ctx.until<=now)return reply(doc,"window_required");
         return wifiSetupCommand(request,ctx.nameSpace,ctx.generation,now,ctx.physicalUntil,ctx.until,ctx.claimed,true);
     }

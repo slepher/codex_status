@@ -3684,4 +3684,36 @@ mod ble_close_lock_tests {
         assert_eq!(job["kind"],"sync");assert_eq!(job["state"],"queued");assert_eq!(job["expected_revision"],1);assert!(job["host_ssid"].is_null());
     }
 
+    #[test]
+    fn confirmed_http_resets_consecutive_wifi_budget_without_replaying_unknown_jobs() {
+        let dir=tempfile::tempdir().unwrap();let ctx=test_ctx(dir.path(),&[HUNG_MAC]);let svc=service(&ctx);let now=device_now(HUNG_MAC);
+        svc.wifi_save(HUNG_MAC,0,serde_json::from_value(json!([{"network_id":"home","host_ssid":"Host","ssid":"Device","credential":"open"}])).unwrap(),now).unwrap();
+        let job=svc.wifi_queue(HUNG_MAC,&ctx.bridge_id,"recovery_save",vec!["home".into()],now).unwrap();
+        svc.wifi_mark_sent(HUNG_MAC,&job.job_id,now).unwrap();
+        svc.wifi_finish(HUNG_MAC,&job.job_id,"awaiting_confirmation",Some("ack_unavailable"),now).unwrap();
+        let before=serde_json::to_value(svc.wifi_state(HUNG_MAC).jobs).unwrap();
+        for state in ["connection_failed","waiting_for_window","awaiting_confirmation","requested"] {
+            let c=serde_json::from_value(json!({"host_ssid":"Host","network_id":"home","local_revision":1,"version":8,
+                "state":state,"error":"connect_timeout","reason":0,"observed_at":now,"attempts":3,"next_attempt_at":now+60,"http_ready":false})).unwrap();
+            svc.wifi_note_connection(HUNG_MAC,c).unwrap();
+            crate::wifi::http_failed(&ctx,HUNG_MAC,"http_unavailable");
+            assert_eq!(svc.wifi_state(HUNG_MAC).connection.unwrap().attempts,3,"a failed read is not a new retry grant");
+            crate::wifi::http_ready(&ctx,HUNG_MAC);
+            let c=svc.wifi_state(HUNG_MAC).connection.unwrap();
+            assert_eq!(c.attempts,if state=="requested"{3}else{0});
+            if state!="requested" {assert!(c.http_ready);assert_eq!(c.next_attempt_at,0);assert_eq!(c.error,None);}
+            assert_eq!(serde_json::to_value(svc.wifi_state(HUNG_MAC).jobs).unwrap(),before,"HTTP does not replace or resend an unknown transaction");
+        }
+        crate::wifi::http_failed(&ctx,HUNG_MAC,"unauthorized");
+        assert_eq!(svc.wifi_state(HUNG_MAC).connection.unwrap().attempts,3);
+        // Persist the successful reset, then prove restart keeps the new budget.
+        let mut c=svc.wifi_state(HUNG_MAC).connection.unwrap();c.state="connection_failed".into();svc.wifi_note_connection(HUNG_MAC,c).unwrap();
+        crate::wifi::http_ready(&ctx,HUNG_MAC);
+        drop(ctx);
+        let ctx=test_ctx(dir.path(),&[HUNG_MAC]);let svc=service(&ctx);
+        assert_eq!(svc.wifi_state(HUNG_MAC).connection.unwrap().attempts,0);
+        let mut c=svc.wifi_state(HUNG_MAC).connection.unwrap();c.http_ready=false;c.state="waiting_for_window".into();svc.wifi_note_connection(HUNG_MAC,c).unwrap();
+        assert_eq!(svc.wifi_state(HUNG_MAC).connection.unwrap().automatic_state(),"waiting_for_window");
+    }
+
 }

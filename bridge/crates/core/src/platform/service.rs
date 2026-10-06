@@ -93,6 +93,11 @@ impl OtaJob {
         !matches!(self.state.as_str(), "succeeded" | "failed" | "cancelled")
     }
 
+    /// Recovering Wi-Fi is necessary to verify the post-reboot image. Only an
+    /// actual upload blocks this prerequisite; confirmation never authorizes
+    /// another firmware upload or unrelated configuration writes.
+    pub fn blocks_network_repair(&self) -> bool { self.state == "transferring" }
+
     /// Exact image verification may remain pending on current ROMs. Once the
     /// upload was acknowledged and the expected version was authenticated after
     /// it, other explicit work may proceed without treating the OTA as verified.
@@ -686,6 +691,9 @@ impl PlatformService {
                 let snapshot = self.wifi_state(mac).snapshot.context("snapshot_required")?;
                 snapshot.validate(&job.device_mac)?;
                 if job.expected_revision != Some(snapshot.revision) { return self.wifi_finish(mac, job_id, "conflict", Some("snapshot_conflict"), now); }
+                if job.selected.iter().any(|id| snapshot.networks.iter().filter(|n| n.network.network_id == *id).count() > 1) {
+                    return self.wifi_finish(mac, job_id, "conflict", Some("ambiguous_network_id"), now);
+                }
                 let current: BTreeMap<_,_> = snapshot.networks.iter().filter(|n| n.writable)
                     .map(|n| (n.network.network_id.clone(), n.network.metadata())).collect();
                 if job.selected.iter().any(|id| job.fields.get(id).map_or(current.get(id) != job.before.get(id), |fields|
@@ -1550,7 +1558,22 @@ impl PlatformService {
             });
             if inner.ota_history.len() > MAX_JOB_SUMMARIES { inner.ota_history.remove(0); }
         }
+        // New explicit OTA work gets a bounded connection opportunity. A prior
+        // automatic retry ceiling must not silently strand a fresh user request.
+        // Queue replays returned above; unknown activation and bad credentials
+        // remain query/repair-only instead of authorizing another write.
+        let old_connection = inner.wifi.get(&mac).and_then(|w| w.connection.clone());
+        if let Some(wifi) = inner.wifi.get_mut(&mac) {
+            if let Some(connection) = wifi.connection.as_mut().filter(|c|
+                c.local_revision == wifi.local_revision && !c.http_ready &&
+                !matches!(c.state.as_str(), "connecting" | "awaiting_confirmation") &&
+                !matches!(c.error.as_deref(), Some("authentication_failed" | "security_mismatch"))) {
+                connection.attempts = 0; connection.next_attempt_at = 0;
+                connection.state = "requested".into(); connection.error = None;
+            }
+        }
         if let Err(e) = Self::persist(&inner, &self.state_path()) {
+            if let Some(wifi) = inner.wifi.get_mut(&mac) { wifi.connection = old_connection; }
             let reused_blob = old.as_ref().is_some_and(|previous| previous.blob == job.blob);
             if let Some(old) = old { inner.ota_jobs.insert(mac, old); } else { inner.ota_jobs.remove(&mac); }
             inner.ota_history = old_history;
@@ -2171,10 +2194,24 @@ impl PlatformService {
         record.last_authenticated_contact_at = Some(now);
         record.last_authenticated_transport = Some(transport.into());
         record.last_status_attempt = Some(StatusAttempt { at: now, outcome: "ok".into(), error: None });
+        // Every validated HTTP status path confirms connectivity, including
+        // background polling and BLE hints followed by an HTTP read.
+        let previous_connection = inner.wifi.get(&mac).and_then(|wifi| wifi.connection.clone());
+        if transport == "http" {
+            if let Some(wifi) = inner.wifi.get_mut(&mac) {
+                if let Some(connection) = wifi.connection.as_mut().filter(|c|
+                    c.local_revision == wifi.local_revision && c.state != "requested") {
+                    connection.confirm_http();
+                }
+            }
+        }
         if let Err(error) = Self::persist(&inner, &self.state_path()) {
             let record = inner.devices.get_mut(&mac).unwrap();
             (record.last_authenticated, record.last_status_attempt,
                 record.last_authenticated_contact_at, record.last_authenticated_transport) = previous;
+            if let Some(wifi) = inner.wifi.get_mut(&mac) {
+                wifi.connection = previous_connection;
+            }
             return Err(error);
         }
         Ok(())
@@ -4292,6 +4329,36 @@ mod tests {
     }
 
     #[test]
+    fn wifi_shared_configuration_sync_preserves_creator_provenance() {
+        for foreign in [false,true] {
+            let dir=tempfile::tempdir().unwrap();let svc=service_with_device(dir.path());let mac="AABBCCDDEEFF";
+            let snapshot:WifiSnapshot=serde_json::from_value(json!({"schema":2,"device_mac":mac,"revision":3,"snapshot_id":"roundtrip",
+                "complete":true,"observed_at":100,"networks":[{"bond":if foreign{"other"}else{"own"},"writable":true,
+                "network":{"network_id":"home","host_ssid":"Host","ssid":"Device","label":"Source","version":3}}],"capacity":{"total":12}})).unwrap();
+            let read=svc.wifi_queue(mac,"bridge","read",vec![],100).unwrap();svc.wifi_complete_read(mac,&read.job_id,snapshot,101).unwrap();
+            svc.wifi_import(mac,&["home".into()],0,102).unwrap();
+            let mut targets=svc.wifi_state(mac).targets;targets[0].ssid="Edited-2G".into();targets[0].label="Edited".into();targets[0].password=Some("fixture-pass".into());
+            svc.wifi_save(mac,1,targets,103).unwrap();
+            let job=svc.wifi_queue_manual_sync(mac,"bridge",vec!["home".into()],2,"roundtrip","Host",104).unwrap();
+            let result=svc.wifi_attempt(mac,&job.job_id,Some("permit"),&BTreeMap::new(),105,|op,body|{
+                assert_eq!(op,"apply");assert_eq!(body["changes"].as_array().unwrap().len(),1);
+                assert_eq!(body["changes"][0]["network_id"],"home");assert_eq!(body["changes"][0]["ssid"],"Edited-2G");
+                assert_eq!(body["changes"][0]["password"],"fixture-pass");
+                Ok(json!({"ok":true,"outcome":"committed","revision":4,"bond":"own"}))
+            }).unwrap().unwrap();assert_eq!(result.state,"completed");
+            let state=svc.wifi_state(mac);let rows=&state.snapshot.as_ref().unwrap().networks;
+            assert_eq!(rows.len(),1);
+            assert_eq!(rows[0].bond,if foreign{"other"}else{"own"});
+            assert_eq!(rows.iter().find(|r|r.writable).unwrap().network.ssid,"Edited-2G");
+            assert_eq!(state.differences()[0]["state"],"equal","Current target comparison must not use the old source row");
+            svc.wifi_import(mac,&["home".into()],2,106).unwrap();
+            assert_eq!(svc.wifi_state(mac).targets[0].ssid,"Edited-2G","Reimport must choose the current target version");
+            drop(svc);let reopened=PlatformService::open(dir.path()).unwrap().wifi_state(mac);
+            assert_eq!(reopened.targets.len(),1);assert_eq!(reopened.targets[0].network_id,"home");assert_eq!(reopened.targets[0].origin,"local");
+        }
+    }
+
+    #[test]
     fn wifi_cached_password_survives_restart_import_and_sync_without_input() {
         let dir=tempfile::tempdir().unwrap();let svc=service_with_device(dir.path());let mac="AABBCCDDEEFF";
         let snapshot:WifiSnapshot=serde_json::from_value(json!({"schema":2,"device_mac":mac,"revision":1,"snapshot_id":"cached-password",
@@ -4641,4 +4708,68 @@ mod tests {
         assert_eq!(cache.revision,8);assert_eq!(cache.networks[0].network.label,"");
     }
 
+}
+
+#[cfg(test)]
+mod ota_connection_tests {
+    use super::*;
+    #[test]
+    fn authenticated_http_status_resets_wifi_budget_but_ble_and_rejected_status_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = PlatformService::open(dir.path()).unwrap();
+        let mac = "AABBCCDDEEFF";
+        svc.device_upsert(DeviceIdentity::new(mac,"Test").unwrap(),DeviceCapabilities::ssd1681_154g()).unwrap();
+        svc.wifi_save(mac,0,vec![serde_json::from_value(json!({"network_id":"home","host_ssid":"Host","ssid":"Device","credential":"open"})).unwrap()],100).unwrap();
+        let connection: crate::platform::wifi::Connection = serde_json::from_value(json!({
+            "host_ssid":"Host","network_id":"home","local_revision":1,"version":1,
+            "state":"connection_failed","error":"connect_timeout","reason":0,"observed_at":100,
+            "attempts":3,"next_attempt_at":200,"http_ready":false})).unwrap();
+        svc.wifi_note_connection(mac,connection.clone()).unwrap();
+        let status = json!({"device_mac":mac,"boot_id":"boot","status_seq":2});
+        svc.note_authenticated_status_via_at(mac,&status,"ble",101).unwrap();
+        assert_eq!(svc.wifi_state(mac).connection.unwrap().attempts,3);
+        assert!(svc.note_authenticated_status_at(mac,&json!({"device_mac":"FFFFFFFFFFFF"}),102).is_err());
+        assert!(svc.note_authenticated_status_at(mac,&json!({"device_mac":mac,"boot_id":"boot","status_seq":1}),102).is_err());
+        assert_eq!(svc.wifi_state(mac).connection.unwrap().attempts,3);
+        svc.note_authenticated_status_at(mac,&status,103).unwrap();
+        let confirmed = svc.wifi_state(mac).connection.unwrap();
+        assert_eq!((confirmed.attempts,confirmed.next_attempt_at),(0,0));
+        assert_eq!(confirmed.state,"connected");
+        assert!(confirmed.http_ready);
+        assert!(confirmed.error.is_none());
+        drop(svc);
+        let svc = PlatformService::open(dir.path()).unwrap();
+        assert_eq!(svc.wifi_state(mac).connection.unwrap().attempts,0);
+        let mut pending = connection.clone();pending.state="requested".into();
+        svc.wifi_note_connection(mac,pending).unwrap();
+        svc.note_authenticated_status_at(mac,&status,104).unwrap();
+        assert_eq!(svc.wifi_state(mac).connection.unwrap().attempts,3);
+    }
+    #[test]
+    fn new_ota_renews_bounded_connection_but_replay_and_unknown_do_not() {
+        for (state,error,reset) in [("waiting_for_window",None,true),("connection_failed",Some("connect_timeout"),true),
+            ("awaiting_confirmation",Some("wifi_command_unknown"),false),("connecting",None,false),
+            ("connection_failed",Some("authentication_failed"),false),("connection_failed",Some("security_mismatch"),false)] {
+            let dir=tempfile::tempdir().unwrap();let svc=PlatformService::open(dir.path()).unwrap();let mac="AABBCCDDEEFF";
+            svc.device_upsert(DeviceIdentity::new(mac,"Test").unwrap(),DeviceCapabilities::ssd1681_154g()).unwrap();
+            svc.wifi_save(mac,0,vec![serde_json::from_value(json!({"network_id":"home","host_ssid":"Host","ssid":"Device","credential":"open"})).unwrap()],100).unwrap();
+            let connection: crate::platform::wifi::Connection=serde_json::from_value(json!({"host_ssid":"Host","network_id":"home","local_revision":1,"version":1,
+                "state":state,"error":error,"reason":0,"observed_at":100,"attempts":3,"next_attempt_at":200,"http_ready":false})).unwrap();
+            svc.wifi_note_connection(mac,connection.clone()).unwrap();
+            let target=svc.device_get(mac).unwrap()["capabilities"]["firmware_target"].as_str().unwrap().to_owned();
+            let mut rom=vec![7u8;2048];rom[0]=0xe9;let marker=format!("codex-status-ota-v1|{target}|test-ota\0");rom[32..32+marker.len()].copy_from_slice(marker.as_bytes());
+            let path=dir.path().join("image.bin");std::fs::write(&path,rom).unwrap();
+            svc.queue_ota(mac,"bridge","ota-request",&path,"test-ota",&target).unwrap();
+            let mut ota=svc.ota_job(mac).unwrap();
+            for (phase,blocked) in [("queued",false),("transferring",true),("awaiting_confirmation",false),("succeeded",false)] {
+                ota.state=phase.into();assert_eq!(ota.blocks_network_repair(),blocked);
+            }
+            let next=svc.wifi_state(mac).connection.unwrap();assert_eq!(next.attempts,if reset{0}else{3});
+            assert_eq!(next.state,if reset{"requested"}else{state});assert_eq!(next.error,if reset{None}else{error.map(str::to_owned)});
+            svc.wifi_note_connection(mac,connection.clone()).unwrap();
+            svc.queue_ota(mac,"bridge","ota-request",&path,"test-ota",&target).unwrap();
+            assert_eq!(svc.wifi_state(mac).connection.unwrap().attempts,3);
+            drop(svc);assert_eq!(PlatformService::open(dir.path()).unwrap().wifi_state(mac).connection.unwrap().attempts,3);
+        }
+    }
 }

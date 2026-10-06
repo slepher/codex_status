@@ -185,7 +185,9 @@
 
 ### B6. 离线 BLE 配 Wi-Fi 与 BOOT 蓝牙恢复入口（2026-10-03 新开）
 
-- **2026-10-06 用户最新权限澄清，待实施**：设备Wi-Fi配置不应因Mac/Windows或创建它的Bridge绑定而区别；移除其他绑定记录只读/另行导入副本的限制，认证及有效owner统一控制修改/删除/启用。现行.67仍按namespace限制写入，本次提交不冒充已修；需统一记录身份/同ID冲突、旧数据迁移、原事务/回执与跨桥读写回归。
+- **2026-10-07 后续实体验收**：Bridge连续失败预算生命周期/耗尽反馈/显式重试已修复并部署，后台及主动认证HTTP实机归零、原事务保留，移交PROGRESS；.68 INFO重复释放修复与.69运行SHA亦已验证。长期电池/RF多轮、Mac原生UI/部署仍待验。Windows跳过pyserial_update_*不足以保现场，serialwin32仍SetCommState，补不写DCB的原生监听及boot对照；不以USB reset11当panic。
+
+- **2026-10-06 统一Wi-Fi权限已实现并Bridge OTA部署.68**：有效session+claim/lease owner统一管理全部WFS4来源记录，来源/密码、principal/namespace事务回执及高水位保留；总12条，旧同ID明确拒绝。Windows修复新OTA被旧重试上限阻挡，以及等待镜像确认反过来阻挡Wi-Fi前置恢复；原eaadc30f仅上传1次并image_verified，.68运行SHA与ROM一致。实机完整snapshot r13三条（含两条Mac来源）全部writable/password_cached，软件跨桥读写/启用/删除/拒绝/缓存回归通过。Mac app/WK、真实跨桥改删及长期RF矩阵待验；旧同ID显式逐记录修复入口待补，不静默迁移。见shared-wifi-20261006-plan.md及PROGRESS。
 
 - **2026-10-06 owner/BLE-first/完整密码缓存已修复部署；实体剩余矩阵待验**：最终Note4 .67/ROM ADC9CF4F…F69BBC1运行镜像认证匹配；Windows Bridge4A8D2FB8…FAC58D7部署。owner RTC原截止、显式BLE claim、无自主旧Wi-Fi、真实host映射单行保存启用闭环通过；设备已在wd21-la/192.168.3.177/认证HTTP正常。有效session+owner完整读其他绑定凭据、源记录仍只读，HTTP每页nonce及失owner分页拒绝；最后revision10三条密码全部缓存。生产store/失败合同、core配网/HTTPpager、app68/1ignored、生产Fake权限分页及匹配ELF栈通过。仍需真实电池反复深睡累计租约/无Bridge睡眠/BOOT/RF连续联系、掉电/EPD与macOS本地部署验收；不结B6。最终现场/证据见PROGRESS最新节及owner-expiry-20261006-plan.md。
 

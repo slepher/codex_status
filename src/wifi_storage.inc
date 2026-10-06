@@ -59,19 +59,16 @@ struct WifiReader {
 };
 static bool wifiStoreShape(const WifiStore &s) {
     if (!s.valid() || s.schemes.networks.size()>12 || s.receipts.size()>8 || s.cursors.size()>8) return false;
-    size_t bonds = 0;
     for (size_t i = 0; i < s.schemes.networks.size(); ++i) {
         const auto &n = s.schemes.networks[i];
         if (!*n.bond || strlen(n.bond)>21 || !identifier(n.id,32) || !ssidValid(n.host) || !ssidValid(n.ssid) || !passwordValid(n.password) || strlen(n.label)>64 || n.version>s.revision) return false;
-        size_t own = 0; bool first = true;
         for (size_t j = 0; j < s.schemes.networks.size(); ++j) {
             const auto &other = s.schemes.networks[j];
-            if (!strcmp(n.bond,other.bond)) { ++own; if (j<i) first = false;
+            if (!strcmp(n.bond,other.bond)) {
                 if (j!=i && (!strcmp(n.id,other.id) || !strcmp(n.host,other.host))) return false; }
         }
-        if (own>4) return false; if (first) ++bonds;
     }
-    if (bonds>3 || s.activeVersion>s.revision) return false;
+    if (s.activeVersion>s.revision) return false;
     if (*s.active.id) {
         const auto *n = s.activeCredentials();
         if (!*s.active.bond || strlen(s.active.bond)>21 || !identifier(s.active.id,32) || !ssidValid(n->ssid) || !passwordValid(n->password)) return false;

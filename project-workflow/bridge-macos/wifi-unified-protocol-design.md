@@ -1,5 +1,8 @@
 # 设备在线状态与统一控制协议：HTTP 直接交互与 BLE 回退
 
+> 2026-10-06 用户修订：设备 Wi-Fi 配置全局共享，有效 session + 当前 claim/lease owner 可修改、删除、试连及启用任何来源记录。bond 只保留来源及已有内部引用，事务回执/重放围栏仍按 principal/namespace 隔离；总容量12，不再按创建者限4条/3组。同ID旧记录不自动合并，明确 ambiguous_network_id；保留内容及凭据。实现、验证和部署边界见 [shared-wifi-20261006-plan.md](shared-wifi-20261006-plan.md)，本修订覆盖下文历史绑定只读/配置写隔离规则。
+
+
 日期：2026-10-04。状态：已完成一次 Astra medium 审核并修订；用户已选择统一严格权限，设计决策已收口，已实施核心与软件验证，部署/实体证据见wifi-unified-protocol-execution.md。依据用户最新要求：统一管理语义，设备 HTTP 可用时直接通信；通过认证 HTTP 状态获知管理可用性与剩余期限，跳过 BLE 交汇。覆盖范围还包括USB插入、BOOT物理唤醒/恢复与Bridge主动激活的在线通知、期限及通道就绪。本文覆盖旧设计中“每次 Wi-Fi 管理操作必须先通过 BLE 获取短时 permit”的限制。实施和验收待办只维护 docs/roadmap/backlog.md B6。
 
 ## 1. 产品合同

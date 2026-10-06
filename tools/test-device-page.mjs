@@ -163,7 +163,7 @@ handlers.platform_wifi = ({op,body}) => op==='view'?{wifi,differences:[differenc
   op==='save'?{...wifi,local_revision:2,targets:body.targets}:op==='sync'?{job_id:'sync-1',device_mac:macA,state:'waiting_rendezvous'}:
   op==='trial'?{stage:'trial_complete',persisted:false}:{};
 select(macA);await run('wifiRefreshView()');
-assert.match(element('wifi-networks').innerHTML,/其他绑定/);assert.match(element('wifi-networks').innerHTML,/USB \/ AP legacy/);
+assert.match(element('wifi-networks').innerHTML,/设备配置（需占用）/);assert.match(element('wifi-networks').innerHTML,/USB \/ AP legacy/);
 assert(!element('wifi-networks').innerHTML.includes('<script>'));
 const beforeRead=calls.length;await run('wifiReadScheme()');
 assert(calls.slice(beforeRead).some(c=>c.name==='platform_wifi'&&c.args.op==='get'));
@@ -369,3 +369,28 @@ run(`wifiRenderOnline({observed_at:Date.now()/1000-60,presence:{mode:'continuous
 assert.match(element('wifi-online').textContent,/在线状态待确认/);
 
 assert.match(run("wifiError('revision_conflict')"),/缓存已过期.*重新读取设备/);
+
+run("wifiState={local_revision:7,targets:[{network_id:'home',host_ssid:'Host 5G',ssid:'Device',deleted:false}],jobs:[]};wifiHostNetwork={state:'connected',networks:[{ssid:'Host 5G'}]}");
+run("wifiRenderCurrent({matched_target:wifiState.targets[0],automatic_state:'retry_exhausted',connection:{attempts:3,error:'connect_timeout'}})");
+assert.match(element('wifi-auto').textContent,/已尝试 3 次.*已停止.*连接超时/);
+assert.equal(element('wifi-current-retry').hidden,false);
+run("wifiState.jobs=[{kind:'activate',state:'awaiting_confirmation',sent:true}];wifiRenderCurrent({matched_target:wifiState.targets[0],automatic_state:'retry_exhausted',connection:{attempts:3}})");
+assert.equal(element('wifi-current-retry').hidden,true);
+assert.match(element('wifi-auto').textContent,/确认上次操作.*勿重复/);
+run('wifiState.jobs=[]');
+const retryStart=calls.length;
+handlers.platform_wifi=()=>({state:'waiting_rendezvous'});
+await run('wifiRetryCurrent()');
+const retry=calls.slice(retryStart).find(c=>c.args.op==='use_current');
+assert(retry);assert.deepEqual(JSON.parse(JSON.stringify(retry.args.body)),{network_id:'home',local_revision:7});
+assert.equal(element('wifi-current-retry').disabled,false);
+for(const state of ['connecting','awaiting_confirmation','connected','connection_failed']){
+  run(`wifiRenderCurrent({matched_target:wifiState.targets[0],automatic_state:'${state}',connection:{error:'authentication_failed'}})`);
+  assert.equal(element('wifi-current-retry').hidden,true);
+}
+handlers.platform_wifi=()=>{throw 'local_revision_conflict'};
+run("wifiState.targets=[{network_id:'home',host_ssid:'Host 5G',ssid:'Device',deleted:false}];wifiHostNetwork={state:'connected',networks:[{ssid:'Host 5G'}]}");
+await run('wifiRetryCurrent()');
+assert.equal(element('wifi-current-retry').disabled,false);
+assert.match(element('wifi-result').textContent,/修订|冲突|重新/);
+console.log('Wi-Fi exhausted budget: explicit message/retry, unknown/auth states protected, failure visible OK');

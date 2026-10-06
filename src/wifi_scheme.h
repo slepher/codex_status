@@ -80,19 +80,25 @@ struct WifiSchemes {
         for (size_t i = 0; i < networks.size(); ++i) if (!strcmp(networks[i].bond, bond) && !strcmp(networks[i].id, id)) return (int)i;
         return -1;
     }
+    // Binding is provenance, not configuration ownership. Reject ambiguous old IDs.
+    int findShared(const char *id) const {
+        int slot = -1;
+        for (size_t i = 0; i < networks.size(); ++i) if (!strcmp(networks[i].id, id)) {
+            if (slot >= 0) return -2;
+            slot = (int)i;
+        }
+        return slot;
+    }
     const char *put(const WifiNetwork &network, bool replace) {
         if (!valid() || !network.valid()) return "memory";
-        int slot = find(network.bond, network.id), count = 0, bonds = 0;
+        int slot = find(network.bond, network.id);
         if (slot >= 0 && !replace) return "exists";
         if (slot < 0 && replace) return "not_found";
         for (size_t i = 0; i < networks.size(); ++i) {
             const auto &n = networks[i];
-            if (!strcmp(n.bond, network.bond)) { ++count; if ((int)i != slot && !strcmp(n.host, network.host)) return "mapping_conflict"; }
-            bool first = true;
-            for (size_t j = 0; j < i; ++j) if (!strcmp(networks[j].bond, n.bond)) first = false;
-            if (first) ++bonds;
+            if (!strcmp(n.bond, network.bond) && (int)i != slot && !strcmp(n.host, network.host)) return "mapping_conflict";
         }
-        if (slot < 0 && (networks.size() >= 12 || count >= 4 || (!count && bonds >= 3))) return "capacity";
+        if (slot < 0 && networks.size() >= 12) return "capacity";
         if (slot < 0) { if (!networks.append(network)) return "memory"; }
         else networks[slot] = network;
         selectedBond.set(network.bond); selectedId.set(network.id);
