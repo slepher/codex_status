@@ -22,6 +22,9 @@ fn find_arduinojson(root: &Path) -> PathBuf {
 }
 
 fn main() {
+    println!("cargo:rerun-if-changed=../../../src/status_pages.h");
+    println!("cargo:rerun-if-changed=../../../src/network_display_state.h");
+    println!("cargo:rerun-if-changed=src/sim_status.cpp");
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let root = manifest.join("../../..");
     let firmware = root.join("src");
@@ -62,6 +65,7 @@ fn main() {
         .file(firmware.join("GUI_Paint.cpp"))
         .file(manifest.join("src/sim_sync.cpp"))
         .file(manifest.join("src/sim_wifi.cpp"))
+        .file(manifest.join("src/sim_status.cpp"))
         .file(&ffi);
     for name in ["font8", "font12", "font16", "font20", "font24"] {
         build.file(firmware.join(format!("{name}.cpp")));

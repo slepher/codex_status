@@ -58,6 +58,8 @@ request_no 在每个方向独立单调递增、不回绕；首版每方向仅一
 
 无法解析信封时返回明确的载体格式错误，不信任损坏请求中的关联号。能可靠提取请求编号且已认证时返回对应 rejected 及结构化原因；没有收到响应在有限超时后返回超时，确已发送而提交状态无法判定时返回 unknown 并查询原业务事务。
 
+认证 HTTP Status 保留完整业务状态。JSON 不超过 4048 B 时直接返回；较大时按实际长度冻结一份快照，最大 16384 B，15 s 后释放，不写 NVS。首帧和续帧返回 `result/status_read/offset/total_bytes/chunk_hex/next_offset`：随机 32 位十六进制读标识，原始块最多 1800 B，以 hex 传输避免 UTF-8 截断，`next_offset=0` 表示完成。续读仍走 op1 `/api/status`，载荷为 `{"status_read":"…","offset":1800}`，精确绑定已认证 endpoint token；新首读替换旧快照，过期、读标识或偏移不符明确拒绝。Bridge 验证读标识、总长、偏移、块和最终完整 JSON，整个读取（含会话锁等待）共享一个期限，并按设备/token 串行读取。不得裁剪 `data_contract` 或诊断字段来冒充完整状态；超过总预算返回 `status_limit`，业务错误不可仅凭 HTTP200 当成有效 Status 或身份不匹配。
+
 信封不额外添加 CRC 或 MAC。BLE 链路保护、HTTP 既有认证和业务完整性检查分别沿用；Data CRC、Bundle hash/CRC 等保留在载荷中，不能因删除信封重复字段而取消。若将来要求应用层抗篡改，应另立认证方案和字节预算，不能把随机 session_id 冒充 MAC。
 
 ## 6. HTTP / BLE 载体映射

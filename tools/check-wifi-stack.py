@@ -41,6 +41,8 @@ if report:
         name = next((name for name in functions if name.startswith(prefix)), None)
         if name is not None or prefix != "buildPlatformStatus(": required.append(name)
 failed = False
+for prefix in ("pageStatus(", "StatusPages::"):
+    required.extend(name for name in functions if name.startswith(prefix))
 for name in required:
     if name is None:
         print("FAIL: missing required Wi-Fi Xtensa frame")
@@ -54,7 +56,7 @@ for name in required:
 # Scope is explicit: Wi-Fi module + Preferences/NVS frames present in this ELF.
 # Indirect platform/library calls and ISR stacks remain outside this subtotal.
 def local(name):
-    return name.startswith(("wifi", "Wifi", "readWifiStore(", "saveV2(", "save(Wifi", "Preferences::", "nvs_", "nvs::", "store", "load(Endpoints", "save(Endpoints", "wifiDeviceStatus(", "handleWifiManagement(", "servicePresence(", "serviceReadyReport(", "v2Http", "v2Response(", "handleV2Status(", "buildPlatformStatus(", "handleClaim(", "serviceV2Ble(", "_ZL22handleBleWifiMigration", "handleBleWifiMigration(", "handleBleWifiCapabilities(", "v2BleNotify("))
+    return name.startswith(("wifi", "Wifi", "readWifiStore(", "saveV2(", "save(Wifi", "Preferences::", "nvs_", "nvs::", "store", "load(Endpoints", "save(Endpoints", "wifiDeviceStatus(", "handleWifiManagement(", "servicePresence(", "serviceReadyReport(", "v2Http", "v2Response(", "handleV2Status(", "pageStatus(", "StatusPages::", "buildPlatformStatus(", "handleClaim(", "serviceV2Ble(", "_ZL22handleBleWifiMigration", "handleBleWifiMigration(", "handleBleWifiCapabilities(", "v2BleNotify("))
 
 def chain(name, seen=frozenset()):
     if name in seen or name not in functions or not local(name):

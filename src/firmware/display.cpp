@@ -5,6 +5,7 @@
 #include "platform_internal.h"
 #include "power_internal.h"
 #include "radio_internal.h"
+#include "transport_internal.h"
 
 namespace firmware::display {
 
@@ -900,6 +901,19 @@ void renderActiveUsage(const String &json, const char *channel) {
 void renderCurrent() {
     if (platform::state.lastUsage.length()) renderActiveUsage(platform::state.lastUsage, platform::state.lastChannel.c_str());
     else screenStatus();
+    state.networkGlyph.observe(radio::state.wifiUp);
+    const bool confirmed = state.epdBaselineTrusted && state.lastDisplayedFrame && state.frame &&
+        memcmp(state.lastDisplayedFrame, state.frame, EPD_FB_BYTES) == 0;
+    state.networkGlyph.rendered(confirmed, clock::v2NowMs());
+}
+
+void serviceNetworkGlyph() {
+    state.networkGlyph.observe(radio::state.wifiUp);
+    if (!state.networkGlyph.due(clock::v2NowMs()) || radio::state.wifiConnActive || transport::state.otaInProgress) return;
+    if (state.networkGlyph.attempts) state.forceCleanRefresh = true;
+    renderCurrent();
+    DevLog.printf("[ui] network glyph connected=%d confirmed=%d attempts=%u\n",
+                  radio::state.wifiUp, !state.networkGlyph.pending, state.networkGlyph.attempts);
 }
 
 // Put the sleep frame back without entering deep: used when a wake render

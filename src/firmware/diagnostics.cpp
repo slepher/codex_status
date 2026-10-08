@@ -7,8 +7,11 @@
 #include "radio_internal.h"
 #include "sync_internal.h"
 #include "transport_internal.h"
+#include "status_pages.h"
 
 namespace firmware::diagnostics {
+static StatusPages statusPages;
+void expireStatusRead() { statusPages.expire(clock::v2NowMs()); }
 
 State state;
 RTC_DATA_ATTR Retained retained;
@@ -1245,6 +1248,14 @@ static __attribute__((noinline)) void buildPlatformStatus(JsonDocument &doc) {
 // GET /api/status: authenticated authoritative state (the beacon only points).
 // Business channel auth = endpoint token (same trust as /usage and /template);
 // the device operation token keeps gating /claim, /update, /doUpdate, /diag.
+static __attribute__((noinline)) void pageStatus(String &out, const String &token) {
+    char id[33];
+    snprintf(id, sizeof(id), "%08x%08x%08x%08x", (unsigned)esp_random(),
+             (unsigned)esp_random(), (unsigned)esp_random(), (unsigned)esp_random());
+    out = statusPages.begin(out, token, id, clock::v2NowMs());
+    DevLog.println("[platform] status paged");
+}
+
 void handleV2Status() {
     DevLog.printf("[platform] req status heap=%u", (unsigned)ESP.getFreeHeap());
     String mac;
@@ -1254,6 +1265,20 @@ void handleV2Status() {
         return;
     }
     traceMarkHttp(true, 200);
+    JsonDocument options;
+    if (deserializeJson(options, transport::state.v2HttpBody)) {
+        transport::v2Response(400, "{\"result\":\"rejected\",\"error\":\"payload\"}"); return;
+    }
+    const String readId = options["status_read"] | "";
+    const String readToken = transport::state.server.header("Authorization");
+    if (readId.length()) {
+        if (!options["offset"].is<uint32_t>()) {
+            transport::v2Response(400, "{\"result\":\"rejected\",\"error\":\"status_offset\"}"); return;
+        }
+        String page = statusPages.read(readToken, readId, options["offset"].as<uint32_t>(), clock::v2NowMs());
+        transport::v2Response(page.indexOf("\"rejected\"") >= 0 ? 409 : 200, page); return;
+    }
+    statusPages.clear();
     // Read-only Status does not advance the Data contact clock or owner lease.
     JsonDocument doc;
     buildPlatformStatus(doc);
@@ -1327,8 +1352,7 @@ void handleV2Status() {
     sync["confirmation_pending"] = false;
     wifiSchemesStorageStatus(doc["wifi_storage"].to<JsonObject>());
     clock::writeClockStatus(doc["clock_rtc"].to<JsonObject>());
-    JsonDocument options;
-    if (!deserializeJson(options, transport::state.v2HttpBody) && options["compact"] == true) {
+    if (options["compact"] == true) {
         doc["status_projection"] = "compact";
         doc.remove("data_contract");
         doc.remove("wifi_storage");
@@ -1338,6 +1362,10 @@ void handleV2Status() {
     }
     String out;
     serializeJson(doc, out);
+    if (out.length() > 4096 - COMPACT_FRAME_HEADER) {
+        doc.clear();
+        pageStatus(out, readToken);
+    }
     transport::v2Response(200, out);
 }
 

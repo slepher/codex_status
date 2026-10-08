@@ -92,11 +92,34 @@ fn complete_ack_does_not_wait_for_socket_close() {
     std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         let _ = read_request(&mut stream);
-        respond(&mut stream, 200, &json!({"result": "applied"}));
+        respond(&mut stream, 200, &json!({"result": "applied", "device_mac":"AABBCCDDEEFF"}));
         std::thread::sleep(Duration::from_secs(1));
     });
     let status = device_client::status(&addr.to_string(), "tok", Duration::from_millis(300)).unwrap();
     assert_eq!(status["result"], "applied");
+}
+
+#[test]
+fn paged_status_preserves_the_complete_contract_and_rejects_changed_read_id() {
+    for tamper in [false,true] {
+        let listener=TcpListener::bind("127.0.0.1:0").unwrap();let addr=listener.local_addr().unwrap();
+        let expected=json!({"result":"applied","device_mac":"AABBCCDDEEFF","active_context_id":"123456789abcdef0","data_contract":{"requirements":[{"field":"长字段".repeat(800)}]}});
+        let bytes=serde_json::to_vec(&expected).unwrap();
+        let server=std::thread::spawn(move || {
+            for (index,chunk) in bytes.chunks(1800).enumerate() {
+                let (mut socket,_)=listener.accept().unwrap();let request=read_request(&mut socket);
+                if index>0 {assert!(serde_json::from_slice::<Value>(&request.3).unwrap()["status_read"].is_string());}
+                let id=if tamper && index==1 {"22222222222222222222222222222222"}else{"11111111111111111111111111111111"};
+                let hex=chunk.iter().map(|b|format!("{b:02x}")).collect::<String>();
+                respond(&mut socket,200,&json!({"result":"applied","status_read":id,"offset":index*1800,"total_bytes":bytes.len(),"next_offset":if (index+1)*1800<bytes.len(){(index+1)*1800}else{0},"chunk_hex":hex}));
+                if tamper && index==1 {break;}
+            }
+        });
+        let actual=device_client::status(&addr.to_string(),"synthetic-pages",Duration::from_secs(2));
+        if tamper {assert!(actual.unwrap_err().to_string().contains("status page identity mismatch"));}
+        else {assert_eq!(actual.unwrap(),expected);}
+        server.join().unwrap();
+    }
 }
 
 fn spawn_fake() -> (String, FakeDevice) {

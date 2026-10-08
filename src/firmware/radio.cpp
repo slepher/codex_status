@@ -623,6 +623,8 @@ static void rendezvousWifiTick() {
     if (wifiSetupBusy()) return;
     if (WiFi.status() == WL_CONNECTED && !(WiFi.localIP() == IPAddress(0,0,0,0))) {
         state.wifiUp = true;
+        state.wifiConnActive = false;
+        state.wifiBlinkOn = false;
         if (!state.v2Rv.ready()) { state.v2Rv.httpReady(); updateInfoExtra(); }
         serviceReadyReport();
         return;

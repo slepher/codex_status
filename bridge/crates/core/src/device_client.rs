@@ -137,6 +137,7 @@ fn transport_request(
 #[derive(Default)]
 struct HttpFrameSession { id: [u8; 16], next_no: u64, context: [u8; 16] }
 static FRAME_SESSIONS: OnceLock<Mutex<HashMap<String, Arc<Mutex<HttpFrameSession>>>>> = OnceLock::new();
+static STATUS_READS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 static NEXT_OPEN_NONCE: AtomicU64 = AtomicU64::new(1);
 
 fn new_open_nonce() -> [u8; 16] {
@@ -178,12 +179,13 @@ fn request(
     extra_headers: &[(&str, &str)], timeout: Duration,
 ) -> Result<(u16, String)> {
     use crate::compact_frame::{Header, CONTENT_TYPE, HEADER_LEN, MAX_HTTP_FRAME};
+    let deadline = Instant::now() + timeout;
     let op = frame_operation(path)?;
     let session = frame_session(ip, token);
-    if op != 1 && op != 19 && session.lock().unwrap().id == [0; 16] {
-        status(ip, token, timeout).context("establish device HTTP session")?;
+    if op != 1 && op != 19 && lock_session_until(&session, deadline)?.id == [0; 16] {
+        status(ip, token, deadline.saturating_duration_since(Instant::now())).context("establish device HTTP session")?;
     }
-    let mut session = session.lock().unwrap();
+    let mut session = lock_session_until(&session, deadline)?;
     let opening = op == 1 || (op == 19 && session.id == [0; 16]);
     anyhow::ensure!(opening || session.id != [0; 16], "device HTTP session is not established");
     let number = session.next_no.checked_add(1).context("HTTP request number exhausted")?;
@@ -204,7 +206,7 @@ fn request(
     let mut frame = header.encode().map_err(anyhow::Error::msg)?.to_vec();
     frame.extend_from_slice(payload);
     let (status, response) = transport_request(ip, "POST", path, token, Some(&frame),
-        extra_headers, CONTENT_TYPE, timeout)?;
+        extra_headers, CONTENT_TYPE, deadline.saturating_duration_since(Instant::now()))?;
     if status == 401 && op != 4 { return Err(HttpStatus(401).into()); }
     let (ack, bytes) = Header::decode(&response, MAX_HTTP_FRAME)
         .map_err(|e| anyhow!("device protocol mismatch: {e}; update Bridge and device software"))?;
@@ -231,6 +233,20 @@ fn request(
         }
     }
     Ok((status, std::str::from_utf8(bytes).context("device frame payload UTF-8")?.to_owned()))
+}
+
+fn lock_session_until<T>(session: &Mutex<T>, deadline: Instant)
+    -> Result<std::sync::MutexGuard<'_, T>> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        anyhow::ensure!(!remaining.is_zero(), "wifi_window_budget");
+        match session.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(_)) => bail!("device_http_session_poisoned"),
+            Err(std::sync::TryLockError::WouldBlock) =>
+                std::thread::sleep(remaining.min(Duration::from_millis(2))),
+        }
+    }
 }
 
 /// Low-level framed exchange for diagnostics and same-source protocol tests.
@@ -372,9 +388,15 @@ pub fn status_compact(ip: &str, token: &str, timeout: Duration) -> Result<Value>
 
 fn status_mode(ip: &str, token: &str, timeout: Duration, compact: bool) -> Result<Value> {
     let started = Instant::now();
+    let deadline = started + timeout;
+    use sha2::{Digest, Sha256};
+    let key = format!("{ip}:{:x}", Sha256::digest(token.as_bytes()));
+    let lock = STATUS_READS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap()
+        .entry(key).or_insert_with(|| Arc::new(Mutex::new(()))).clone();
+    let _read = lock_session_until(&lock, deadline)?;
     tracing::info!(event = "send", operation = "/api/status", "device HTTP request");
     let projection = compact.then_some(br#"{"compact":true}"#.as_slice());
-    let response = request(ip, "POST", "/api/status", token, projection, &[], timeout);
+    let response = request(ip, "POST", "/api/status", token, projection, &[], deadline.saturating_duration_since(Instant::now()));
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let (status, body) = match response {
         Ok(response) => response,
@@ -405,7 +427,54 @@ fn status_mode(ip: &str, token: &str, timeout: Duration, compact: bool) -> Resul
     if status != 200 {
         return Err(HttpStatus(status).into());
     }
-    Ok(serde_json::from_str(&body).context("device status json")?)
+    let mut value:Value=serde_json::from_str(&body).context("device status json")?;
+    if value["status_read"].is_string() {
+        let id=value["status_read"].as_str().unwrap().to_owned();
+        anyhow::ensure!(id.len()==32 && id.bytes().all(|c|c.is_ascii_hexdigit()),"invalid status read ID");
+        let total=value["total_bytes"].as_u64().context("status total missing")? as usize;
+        anyhow::ensure!(total>0 && total<=16384,"invalid status total");
+        let mut bytes=Vec::with_capacity(total);
+        loop {
+            anyhow::ensure!(value["result"]=="applied" && value["status_read"]==id &&
+                value["total_bytes"].as_u64()==Some(total as u64) &&
+                value["offset"].as_u64()==Some(bytes.len() as u64),"status page identity mismatch");
+            let hex=value["chunk_hex"].as_str().context("status chunk missing")?;
+            anyhow::ensure!(!hex.is_empty() && hex.len()<=3600 && hex.len()%2==0 &&
+                hex.bytes().all(|c|c.is_ascii_hexdigit()),"invalid status chunk");
+            for offset in (0..hex.len()).step_by(2) {bytes.push(u8::from_str_radix(&hex[offset..offset+2],16)?);}
+            anyhow::ensure!(bytes.len()<=total,"status chunk exceeds total");
+            let next=value["next_offset"].as_u64().context("status next offset missing")?;
+            if next==0 {anyhow::ensure!(bytes.len()==total,"incomplete status read");break;}
+            anyhow::ensure!(next==bytes.len() as u64 && bytes.len()<total,"status read does not advance");
+            let body=serde_json::to_vec(&json!({"status_read":id,"offset":next}))?;
+            let (code,reply)=request(ip,"POST","/api/status",token,Some(&body),&[],deadline.saturating_duration_since(Instant::now()))?;
+            anyhow::ensure!(code==200,"status continuation HTTP {code}");
+            value=serde_json::from_str(&reply)?;
+        }
+        value=parse_status_body(std::str::from_utf8(&bytes)?)?;
+        let session=frame_session(ip,token);
+        let mut session=lock_session_until(&session,deadline)?;
+        if let Some(ctx)=value["active_context_id"].as_str().filter(|s|s.len()==16 && s.bytes().all(|c|c.is_ascii_hexdigit())) {session.context.copy_from_slice(ctx.as_bytes());}
+        return Ok(value);
+    }
+    parse_status_body(&body)
+}
+
+fn parse_status_body(body: &str) -> Result<Value> {
+    let value: Value = serde_json::from_str(body).context("device status json")?;
+    if value["error"].is_string() || matches!(value["result"].as_str(), Some("unknown" | "rejected")) {
+        let code = match value["error"].as_str() {
+            Some("reply_limit") => "reply_limit",
+            Some("batch_lost") => "batch_lost",
+            _ => "device_status_failed",
+        };
+        tracing::warn!(event="result", operation="/api/status", error_category="device_status", error_code=code,
+            "device Status returned an error payload");
+        bail!("device Status failed: {code}");
+    }
+    anyhow::ensure!(value["device_mac"].as_str().is_some_and(|mac| DeviceIdentity::normalized_mac(mac).is_some()),
+        "device Status missing identity");
+    Ok(value)
 }
 
 /// Running OTA partition hash, authorized by the device operation token alone.
@@ -692,6 +761,37 @@ mod tests {
         let plan = chunk_plan(10_000, 4096);
         assert_eq!(plan, vec![(0, 4096), (4096, 4096), (8192, 1808)]);
         assert_eq!(plan.iter().map(|(_, n)| n).sum::<usize>(), 10_000);
+    }
+
+    #[test]
+    fn status_deadline_includes_session_lock_without_sending_or_consuming_number() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let session = frame_session(&address, "synthetic-lock-test");
+        let held = session.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _guard = held.lock().unwrap();
+            ready_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        ready_rx.recv().unwrap();
+        let started = Instant::now();
+        let error = status(&address, "synthetic-lock-test", Duration::from_millis(30)).unwrap_err();
+        assert!(started.elapsed() < Duration::from_millis(150));
+        assert_eq!(error.to_string(), "wifi_window_budget");
+        assert!(matches!(listener.accept(), Err(error) if error.kind()==std::io::ErrorKind::WouldBlock));
+        worker.join().unwrap();
+        assert_eq!(session.lock().unwrap().next_no, 0);
+    }
+
+    #[test]
+    fn status_error_payload_is_not_an_identity_failure_or_success() {
+        let error = parse_status_body(r#"{"result":"unknown","error":"reply_limit","stage":"frame"}"#).unwrap_err();
+        assert_eq!(error.to_string(), "device Status failed: reply_limit");
+        assert_eq!(parse_status_body("{}").unwrap_err().to_string(), "device Status missing identity");
+        assert!(parse_status_body(r#"{"device_mac":"AA:BB:CC:DD:EE:FF","result":"applied"}"#).is_ok());
     }
 
     #[test]

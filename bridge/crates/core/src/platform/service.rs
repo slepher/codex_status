@@ -4418,7 +4418,7 @@ mod tests {
             let dir=tempfile::tempdir().unwrap();let svc=service_with_device(dir.path());
             svc.wifi_save(mac,0,vec![serde_json::from_value(json!({"network_id":"home","host_ssid":"Host","ssid":"Device"})).unwrap()],now).unwrap();
             let c=super::super::wifi::Connection{host_ssid:"Host".into(),network_id:"home".into(),local_revision:1,version:1,
-                state:kind.into(),error:error.map(str::to_owned),reason:0,observed_at:now,attempts,next_attempt_at:if due{now}else{now+60},http_ready:false,actual_ssid:None,ip:None};
+                state:kind.into(),error:error.map(str::to_owned),reason:0,observed_at:now,attempts,next_attempt_at:if due{now}else{now+60},http_ready:false,bridge_error:None,actual_ssid:None,ip:None};
             svc.wifi_note_connection(mac,c.clone()).unwrap();
             assert_eq!(svc.plan_for_rendezvous(mac,now,"rendezvous",0).unwrap().mode,PlanMode::Sleep);
             let plan=svc.plan_for_rendezvous_network_work(mac,now,"rendezvous",0,true).unwrap();

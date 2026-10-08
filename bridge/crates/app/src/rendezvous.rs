@@ -563,7 +563,7 @@ async fn wait_for_device_http(
         };
         let ip = target.ip.clone();
         let token = target.token.clone();
-        let timeout = budget.remaining().min(Duration::from_secs(1));
+        let timeout = budget.remaining().min(Duration::from_secs(3));
         let sample_start = std::time::Instant::now();
         let sampled_at = device_now(mac);
         let observed = blocking(move || {

@@ -365,7 +365,7 @@ fn current_input_key(mac:&str,target:&Network,revision:u64)->String {
 fn fresh_connection(state: &WifiState, target: &Network, now: u64) -> Connection {
     state.matching_connection(&target.host_ssid).cloned().unwrap_or(Connection {
         host_ssid:target.host_ssid.clone(),network_id:target.network_id.clone(),local_revision:state.local_revision,
-        version:0,state:"waiting_for_window".into(),error:None,reason:0,observed_at:now,attempts:0,next_attempt_at:0,http_ready:false,actual_ssid:None,ip:None,
+        version:0,state:"waiting_for_window".into(),error:None,reason:0,observed_at:now,attempts:0,next_attempt_at:0,http_ready:false,bridge_error:None,actual_ssid:None,ip:None,
     })
 }
 fn note_match(ctx: &AppCtx, mac: &str, target: &Network, reply: &Value) -> Option<Connection> {
@@ -429,8 +429,7 @@ pub fn http_failed(ctx:&AppCtx,mac:&str,error:&str) {
     let state=platform::service(ctx).wifi_state(mac);
     if let Some(mut c)=state.connection.filter(|c|c.local_revision==state.local_revision) {
         if c.state=="connected" || matches!(error,"http_identity_mismatch"|"unauthorized") {
-            c.state="bridge_unreachable".into();c.http_ready=false;
-            c.error=Some(match error {"http_identity_mismatch"=>"http_identity_mismatch","unauthorized"=>"unauthorized",_=>"http_unavailable"}.into());
+            c.fail_http(match error {"http_identity_mismatch"=>"http_identity_mismatch","unauthorized"=>"unauthorized",_=>"http_unavailable"});
             let _=platform::service(ctx).wifi_note_connection(mac,c);
         }
     }

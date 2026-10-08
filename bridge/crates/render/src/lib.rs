@@ -2,6 +2,8 @@
 //! Paint raster), used for pixel-accurate template previews.
 
 use std::ffi::CString;
+mod status_pages;
+pub use status_pages::SimulatorStatusPages;
 use std::os::raw::{c_char, c_int};
 use std::sync::mpsc::{sync_channel, Receiver, Sender, SyncSender};
 use std::sync::OnceLock;

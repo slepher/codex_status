@@ -55,6 +55,7 @@ struct SimState {
     power: Arc<Mutex<SimPower>>,
     power_reconcile: Arc<Mutex<()>>,
     stall_ack_after: Arc<Mutex<Option<StallFault>>>,
+    status_padding_bytes: Arc<Mutex<usize>>,
     ble_rx: Arc<Mutex<Vec<u8>>>,
     ble: Arc<Mutex<SimBle>>,
     wifi: Arc<Mutex<SimWifi>>,
@@ -76,6 +77,7 @@ struct SimWifi {
 
 #[derive(Default)]
 struct SimHttpFrame {
+    status_pages: Option<bridge_render::SimulatorStatusPages>,
     id: [u8; 16],
     open_nonce: [u8; 16],
     token_digest: [u8; 32],
@@ -1432,6 +1434,8 @@ async fn status_impl(state: SimState, request: Request<Body>, gate: bool) -> Res
                 vec!["sha256-running-prefix-v1"]
             } else { vec![] });
             status["sync"] = sync;
+            let padding = *state.status_padding_bytes.lock().unwrap();
+            if padding > 0 { status["synthetic_status_padding"] = json!("x".repeat(padding)); }
             status["sync"]["phase"] = json!(if power.sync_open {"WIFI_SYNC_ONCE"}
                 else if power.light {"WIFI_LIGHT"} else {"DEEP"});
             if compact {
@@ -1752,6 +1756,13 @@ async fn sim_fault(State(state): State<SimState>, request: Request<Body>) -> Res
         Ok(value) => value,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
+    if let Some(size) = value["status_padding_bytes"].as_u64() {
+        if size > 20000 || value.as_object().is_none_or(|v| v.len() != 1) {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+        *state.status_padding_bytes.lock().unwrap() = size as usize;
+        return Json(json!({"status_padding_bytes":size})).into_response();
+    }
     let Some(after) = value["stall_ack_after"].as_str() else {
         return StatusCode::BAD_REQUEST.into_response();
     };
@@ -3183,7 +3194,7 @@ where F: FnOnce(State<SimState>, Request<Body>) -> Fut,
             Json(json!({"error":"content_type","stage":"frame"}))).into_response();
     }
     let token = request.headers().get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok()).unwrap_or("");
+        .and_then(|v| v.to_str().ok()).unwrap_or("").to_owned();
     let digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
     let (parts, body) = request.into_parts();
     let Ok(raw) = to_bytes(body, 4096).await else { return StatusCode::PAYLOAD_TOO_LARGE.into_response(); };
@@ -3244,6 +3255,18 @@ where F: FnOnce(State<SimState>, Request<Body>) -> Fut,
         }
         Admission::New => {}
     }
+    if op==1 {
+        if let Some(id)=serde_json::from_slice::<Value>(payload).ok().and_then(|v|v["status_read"].as_str().map(str::to_owned)) {
+            let input:Value=serde_json::from_slice(payload).unwrap();
+            let offset=input["offset"].as_u64().unwrap_or(u64::MAX);
+            let reply=session.status_pages.as_mut().and_then(|pages|
+                pages.page(None,&token,&id,offset as usize,device_uptime_ms(&state,clock_snapshot(&state).unwrap())).ok())
+                .unwrap_or(json!({"result":"rejected","error":"status_read_expired","stage":"status_read"}));
+            let rejected=reply["result"]=="rejected";
+            return framed_http_response(if rejected {StatusCode::CONFLICT}else{StatusCode::OK},frame,session.id,if rejected{2}else{0},&serde_json::to_vec(&reply).unwrap());
+        }
+        session.status_pages = None;
+    }
     let request = Request::from_parts(parts, Body::from(payload.to_vec()));
     let response = handler(State(state.clone()),request).await;
     let status = response.status();
@@ -3256,10 +3279,17 @@ where F: FnOnce(State<SimState>, Request<Body>) -> Fut,
             _ if value["ok"] == false || !status.is_success() => 2, _ => 0,
         }
     }).unwrap_or(if status.is_success() {0} else {2});
-    let payload = if bytes.len() + HEADER_LEN <= 4096 { bytes.to_vec() } else {
+    let page=if op==1 && bytes.len()+HEADER_LEN>4096 {
+        let pages=match bridge_render::SimulatorStatusPages::new(){Ok(p)=>p,Err(_)=>return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
+        session.status_pages=Some(pages);
+        let id=Sha256::digest(&raw)[..16].iter().map(|b|format!("{b:02x}")).collect::<String>();
+        let reply=session.status_pages.as_mut().unwrap().page(Some(std::str::from_utf8(&bytes).unwrap()),&token,&id,0,device_uptime_ms(&state,clock_snapshot(&state).unwrap())).unwrap();
+        Some(serde_json::to_vec(&reply).unwrap())
+    }else{None};
+    let payload = if let Some(page)=page.as_ref() {page.clone()} else if bytes.len() + HEADER_LEN <= 4096 { bytes.to_vec() } else {
         br#"{"result":"unknown","error":"reply_limit","stage":"frame","query":"original_business_id"}"#.to_vec()
     };
-    let result = if bytes.len() + HEADER_LEN > 4096 {3} else {result};
+    let result = if page.is_some(){0}else if bytes.len() + HEADER_LEN > 4096 {3} else {result};
     let mut reply = Header {kind:1,op,result,payload_len:payload.len() as u16,
         session:session.id,request_no:frame.request_no,context:frame.context}.encode().unwrap().to_vec();
     reply.extend_from_slice(&payload);
@@ -3377,6 +3407,7 @@ async fn main() -> Result<()> {
         power: Arc::new(Mutex::new(power)),
         power_reconcile: Arc::new(Mutex::new(())),
         stall_ack_after: Arc::new(Mutex::new(None)),
+        status_padding_bytes: Arc::new(Mutex::new(0)),
         ble_rx: Arc::new(Mutex::new(Vec::new())),
         ble: Arc::new(Mutex::new(SimBle::default())),
         wifi: Arc::new(Mutex::new(SimWifi {

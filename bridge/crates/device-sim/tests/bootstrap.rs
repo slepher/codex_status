@@ -1594,6 +1594,22 @@ fn bundle_hard_exit_during_slot_or_metadata_sync_restores_prior_job() {
 }
 
 #[test]
+fn complete_large_status_roundtrips_shared_pager_and_production_client() {
+    let sim = Simulator::start("02:00:00:00:00:7B", &[]);
+    let baseline = bridge_core::device_client::status(&sim.address().to_string(), ENDPOINT, Duration::from_secs(3)).unwrap();
+    assert_eq!(request(sim.address(), "POST", "/sim/fault", Some(CONTROL),
+        br#"{"status_padding_bytes":6000}"#).0, 200);
+    let status = bridge_core::device_client::status(&sim.address().to_string(), ENDPOINT, Duration::from_secs(3)).unwrap();
+    assert_eq!(status["synthetic_status_padding"].as_str().unwrap().len(), 6000);
+    assert_eq!(status["device_mac"], "02:00:00:00:00:7B");
+    assert!(status["sync"].is_object() && status.get("data_contract").is_some());
+    assert_eq!(status["data_contract"], baseline["data_contract"]);
+    assert_eq!(request(sim.address(), "POST", "/sim/fault", Some(CONTROL),
+        br#"{"status_padding_bytes":20000}"#).0, 200);
+    assert!(bridge_core::device_client::status(&sim.address().to_string(), ENDPOINT, Duration::from_secs(3)).is_err());
+}
+
+#[test]
 fn real_device_client_installs_one_and_eight_template_bundles() {
     for count in [1usize, 8] {
         let mut sim = Simulator::start("02:00:00:00:00:31", &[]);

@@ -126,11 +126,17 @@ pub struct Connection {
     #[serde(default)]
     pub http_ready: bool,
     #[serde(default)]
+    pub bridge_error: Option<String>,
+    #[serde(default)]
     pub actual_ssid: Option<String>,
     #[serde(default)]
     pub ip: Option<String>,
 }
 impl Connection {
+    pub fn fail_http(&mut self, error: &str) {
+        self.http_ready = false;
+        self.bridge_error = Some(error.to_owned());
+    }
     pub fn confirm_http(&mut self) {
         self.state = "connected".into();
         self.error = None;
@@ -138,6 +144,7 @@ impl Connection {
         self.attempts = 0;
         self.next_attempt_at = 0;
         self.http_ready = true;
+        self.bridge_error = None;
     }
     pub fn automatic_state(&self) -> &str {
         if self.attempts >= 3 && !self.http_ready &&
@@ -147,6 +154,17 @@ impl Connection {
         } else {
             &self.state
         }
+    }
+}
+
+#[cfg(test)] mod connection_state_tests {
+    use super::*;
+    #[test] fn bridge_rejection_does_not_change_device_network_state() {
+        let mut c:Connection=serde_json::from_value(json!({"host_ssid":"Host","network_id":"home","local_revision":1,"version":8,"state":"connected","error":null,"reason":0,"observed_at":10,"attempts":0,"next_attempt_at":0,"http_ready":true,"actual_ssid":"Device","ip":"192.168.3.177"})).unwrap();
+        c.fail_http("unauthorized");assert_eq!(c.state,"connected");assert!(c.error.is_none());
+        assert_eq!(c.actual_ssid.as_deref(),Some("Device"));assert_eq!(c.ip.as_deref(),Some("192.168.3.177"));
+        assert_eq!(c.bridge_error.as_deref(),Some("unauthorized"));assert!(!c.http_ready);
+        c.confirm_http();assert!(c.bridge_error.is_none());assert!(c.http_ready);
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

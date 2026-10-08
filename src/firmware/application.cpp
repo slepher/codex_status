@@ -264,6 +264,7 @@ void initialize(const char *firmwareVersion, const char *imageIdentity) {
 }
 
 void tick() {
+    diagnostics::expireStatusRead();
     clock::flushNtpRtcSync();
     const uint64_t clockPollMs = (uint64_t)(esp_timer_get_time() / 1000ULL);
     if (clockPollMs - clock::state.externalRtcLastPollMs >= 60000) clock::readExternalRtc(false);
@@ -391,6 +392,7 @@ void tick() {
         display::renderCurrent();
     }
     radio::pollWifi();
+    display::serviceNetworkGlyph();
     if (!radio::state.wifiUp && !wifiSetupBusy() && !power::v2ManualBleHoldActive() &&
         radio::state.nextBleContactMs && clock::v2NowMs() >= radio::state.nextBleContactMs) {
         radio::v2RendezvousBegin();

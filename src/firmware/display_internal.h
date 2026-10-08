@@ -3,6 +3,7 @@
 // Firmware integration only: state is owned here; never copy it as a snapshot.
 #include "config.h"
 #include "dependencies.h"
+#include "network_display_state.h"
 
 namespace firmware::display {
 
@@ -17,6 +18,7 @@ struct ClkRegion {
 };
 
 struct State {
+    NetworkDisplayState networkGlyph;
 
     // NVS `pm/panel_pwr`: 1 keeps the Note4 logic rail on in deep sleep; 0
     // powers it off. Both modes turn the controller's internal HV supply off.
@@ -85,6 +87,7 @@ void clkTestTick();
 #endif
 void renderActiveUsage(const String &json, const char *channel);
 void renderCurrent();
+void serviceNetworkGlyph();
 void v2RendezvousRender(bool light);
 
 } // namespace firmware::display

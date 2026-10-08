@@ -1,5 +1,33 @@
 # Codex Status 项目进度（交接文档）
 
+## 2026-10-09 Note4 .72 修复并部署：完整Status分页、整体HTTP期限、独立Wi-Fi状态与图标重绘
+
+- 用户授权修复并部署，范围仍仅Note4；验收后追加授权提交本次修复、测试与部署记录。修复新48 B协议迁移遗漏：HTTP完整帧4096 B/业务4048 B不变，较大Status冻结单份完整JSON并按1800 B原始块hex分页，读标识/token/偏移/总长校验，整体读取期限含锁等待，15 s释放、总长16384 B上限；明确拒绝预算、过期和错误，不裁剪合同。协议细节已更新 `docs/bridge-device-compact-envelope-design.md`。原reply_limit不再误报MAC身份变化。
+- Wi-Fi驱动状态与Bridge验证独立：Bridge失败只更新http_ready/bridge_error，不改联网状态或凭据。会合取得真实IP后清除连接动画；普通loop在pollWifi后独立检查网络图标变化，不依赖新Data。渲染以可信基线且目标帧等于已写帧确认，失败5 s后强制全刷、有界3次；实际电源关网仍按驱动事实显示断开。此修复覆盖已发现的会合结束后漏重画路径，不声明所有EPD硬件异常已消除。
+- **已部署ROM** `zectrix-note4-b / zectrix-note4-400x300 / 0.18.72-note4`：`artifacts/note4-0.18.72-status-wifi.bin`，**1,901,760 B**，SHA256 **095BAD001B34ACA7BCB7B9E3809E21D742F026D623FD0BD829D07E950DE45865**；匹配ELF同名，SHA256 **23E35E7A5CC224792797EB4F607A1B85F4B6BEB6F79DE8ACAAA69D9A94B07D7D**。只构建Note4，无clean/框架重装/其他env。认证操作token+目标guard OTA HTTP200/UPDATE OK，ota_1→ota_0，工具未擦NVS或dump、未USB烧录。正式MCP release publish已登记同一完整ROM，不排第二份OTA。
+- **实际运行核验**：MAC7C4FADB93408 / IP192.168.3.177，01:12及01:16认证读 .72/ota_0，运行1,901,760 B前缀SHA与发布ROM完全一致。boot_id791553a888205498417e8dc516c24577，reset_reason3为本次OTA软件重启；01:16 uptime420200ms、Wi-Fi connected/RSSI-22、HTTP ready、完整data_contract存在，完整Status3890 B/帧3938 B（同步收尾后无需分页）。01:17正式Bridge platform_status_refresh=result ok，并已将running_images按本次完整长度/哈希更新。owner lease在期间到期后仍Wi-Fi connected，未混同占用与网络状态。
+- **Bridge已替换并运行** `bridge/target/debug/bridge-app.exe` SHA256 **B770BA43129F4BECE1DA6D46EB4707EA136776CD1953C0D649E3E4AE744CA4B0**；按原路径停watchdog/任务、备份data/exe后替换，计划任务CodexStatusBridge Running，主PID45672/watchdog21440，8765/8766。备份 `artifacts/bridge-before-fix72-20261009.exe` / `.private.zip`。书桌屏70041DD7A340仍paused，登记/Profile/凭据保留，ROM未动。
+- 原activate **w3_00000000000000b0**已由正常Bridge查询收尾为completed/last_error null/receipt_ack_pending=false，未强行换ID重发或手改生产state；connection=connected/http_ready=true/bridge_error null/attempts0，home/v8。Bridge完成sync-v1转移和PowerPlan ACK，部署后的恢复工作不能计为空闲重复activate；纯空闲判据另由同一Fake报告闭环四轮验证。
+- 显示实机证据：统一/log记录partial失败后全刷回退，CLI slot ota_0/epd_writes7/busy_fails1/trusted1；01:12→01:16仍7/1、Wi-Fi正常。可信基线证明刷新驱动已确认，不替代屏幕目视、RF长期或全刷故障矩阵。Native USB第二轮读到0 B，网络前读已确认 .72，但网络后读超时，不能声称该次监听前后boot均已验证；本次未用DTR/RTS或SetCommState，CLI结果由网络/log独立取到。
+- 回归：app75/75，core132/132、HTTP7/7、render同源分页/独立重绘及既有测试通过；最终Fake bootstrap **58/58**（含6000 B合成扩展Status→共享C++分页→真实HTTP→生产客户端完整读取、超16384 B拒绝）；3项生产Bridge外部Fake联测显式3/3（首次缺SIM_EXE/私有网卡环境失败，补齐后通过）。锁竞争超时、错误Status、读标识变化/权限/偏移/过期、无Data重绘及重试上限均有回归。Node设备页测试通过；Windows无swiftc，macOS原生WKWebView检查未运行，不宣称macOS UI实体验收。
+- 资源：静态RAM **117,940 B**（比.71 +80），应用Flash **1,850,603 B**。新增StatusPages静态56 B、networkGlyph16 B，余为对齐/其他生成差异；Wi-Fi持久格式不变，空/单条/典型/上限新增NVS均0。无分页时长期快照堆0；分页只保存实际S字节（4049..16384，15 s后释放），单块hex≤3601 B、JSON复制≤3601 B、序列化回复<4049 B、JSON首池1024 B及token/读ID≤170 B，主要增量工作缓冲约12 KiB+S，最大约28 KiB，另有allocator元数据/上层既有JSON成本，**不是实测整机峰值**。实际部署heap_free87616→93260、heap_min52048→51720，为不同运行时刻，不能据此伪称隔离峰值；动态堆/RF/电池矩阵仍在A9/B6。
+- 匹配ELF栈门禁全PASS：handleV2Status **976/1024 B**，StatusPages::read176 B、pageStatus128 B，最长列出Wi-Fi本地链3424/4096 B，loop12288 B。初候选1040 B被门禁拒绝，抽出分页helper后通过，未放宽预算。objdump将helper误分类为数据，额外对去.xt.prop的诊断副本检查全部栈；其.flash.text SHA256370F3398…7729B与原ELF逐字节相同，发布ELF未改。证据 `artifacts/note4-fix72-{tests,shared-tests,final-fake-tests,pager-e2e,live-fake-tests,build,stack,stack-complete}-20261009.log`、`{ota,verify,refresh,release}-20261009.json`、device-log.private.txt；诊断副本不用于烧录。
+
+
+## 2026-10-09 Note4断开图标复查：真实Status超帧、Bridge误分类及HTTP锁期限缺陷，USB证明当前联网
+
+- 用户追加报告断开图标并接USB，要求综合设备信息形成结论。本轮只读诊断/源码修正/测试；**未重启Bridge、未刷ROM、未修改Wi-Fi配置或提交**。运行仍前节Bridge62E6C492…59C76C4与Note4 .71。前次10分钟无空闲重复activate只覆盖该样本，不代表后续Status/恢复链路已全部验收。
+- 00:05生产日志：原activate `w3_00000000000000b0`/job77568449490b8208已ACK，network_start accepted、设备ready report received；随后的HTTP200被Bridge误判identity_mismatch，原事务留awaiting_confirmation。先前约12–13分钟的activate服务真实合同/诊断工作，不是原空闲3分钟漏洞；既发原事务未强制重发/取消/换ID。
+- **00:33:57实机认证捕获已证实根因**：完整 `/api/status` HTTP200，48 B信封result=3，业务payload89 B为`result=unknown/error=reply_limit/stage=frame`，没有device_mac。固件v2Response将超过4048 B的Status换成错误载荷，但保留HTTP200；Bridge status_mode此前忽略该业务错误，将其作为状态交matching_http，才误报身份错误。不能据此声称MAC变了、配置错误或Wi-Fi硬件失败。动态Status/合同/同步元数据的实际超限组合仍需补完整资源/协议边界复现，不能静默裁剪合同或仅抬大缓冲。
+- 00:35:11对照精简Status：payload1641 B、信封result=0/applied，MAC7C4FADB93408、FW0.18.71-note4、HTTP ready=true/IP192.168.3.177、owner8c94。说明当前Wi-Fi和认证业务链可达；不替代完整Status/字段合同读取，也不证明此前所有时刻没有掉网。
+- **第二个已证实Bridge实现bug**：400ms请求实际4625ms，request在frame session Mutex上无期限等待，TCP timeout从拿锁后才起算；竞争挤占BLE机会，后续命令可能未发。工作树已按整体deadline有界try_lock（保留single-flight，不先消耗请求号/发请求），并识别Status的reply_limit/失败payload而非误报身份成功。core131/131及HTTP集成6/6通过；新增竞争锁测试确认期限内退出且未发/未耗请求号，失败Status不会当身份错误。**这些Bridge修正尚未构建部署；固件完整Status超限尚未修复。**
+- USB现场：COM5/VID303A PID1001，Composite serial MAC为7C:4F:AD:B9:34:08，核对后原生CreateFile/ReadFile监听18s，只设置读取timeouts，不调用SetCommState/DTR/RTS，仅发只读status/log/status。前后boot_id均ca02b674ae93f0eb746c6e7277059786，uptime1121267→1140447ms、reset_reason8，无监听触发复位文本。串口fw .71/ota_1、IP.177/RSSI-66；前后认证HTTP ready=true。当前USB接入与监听过程不算panic实证。
+- 00:43追加图标调查：认证精简Status仍HTTP ready=true/.177/.71，但USB第二轮18s读到0字节，随后网络超时，不能把首轮不复位保证套到第二轮。采集脚本固定文件名误覆盖首轮USB原文；已保存二轮结果、将首轮工具返回中的元数据明确标为重建（usb-first-from-tool.json，非原文），脚本后续用时间戳避免覆盖；本对话首轮完整工具返回仍可核验。
+- Wi-Fi图标更新链路存在确定遗漏路径：实际codex-status-a模板的断开图标条件是device.state==WIFI OFF。rendezvousWifiTick在取得IP后直接wifiUp=true，没有触发网络状态重绘；会合期间application tick提前return，之后pollWifi已看不到false→true边沿。会合无新Data时v2RendezvousRender(light)仅返回，startNormalMode在深睡唤醒且无sleep glyph标志时也不强制重画。故“Wi-Fi已连接，但屏幕保留原WIFI OFF”有代码上的完整可达路径；Status失败导致无Data重画可放大该遗漏，不能误称验证失败直接使RF断开。仍需定向复现并修正独立网络状态渲染及EPD失败重试。
+- 用户追加要求Wi-Fi状态与Bridge状态独立：已检查固件pollWifi依据WiFi.status更新wifiUp，Wi-Fi图标env.state取templateStateText；offlineMins是另一Bridge失联标记。未发现HTTP身份验证失败直接修改wifiUp的证据；Bridge的wifi.connection.state混入bridge_unreachable属于模型分层问题，后续修正按独立驱动事实/Bridge认证业务状态验收，不把协议错误当RF失败。该要求已纳入计划及backlog。
+- 独立显示异常：串口epd_writes13/busy_fails39/trusted1，日志多次`partial failed; escalating to full refresh`。已证局刷失败/全刷回退，**尚未证明全刷也失败或屏幕一定停更**；断开图标可能是正常窗口关网时绘制后未更新，不能单靠图标推断当前RF状态。显示恢复、完整Status预算与Bridge恢复调用链继续归backlog A9/B6，不据此结项。
+- 证据（均本地，private原文不提交）：`artifacts/note4-disconnect-20261009-{state,status,compact,usb}.json`、bridge.log、status/compact.private.bin、usb.private.log；`note4-disconnect-core-tests-20261009.log`。本次结论已与USB和真实帧对照，下一阶段应修正有界完整Status读取/明确错误及恢复期限，保留原事务与认证；运行版本与哈希仍沿下一节。
+
 ## 2026-10-08 新协议重复 activate 已修正并部署，Note4 .71 运行镜像已核对
 
 - 用户要求先验证新协议、仍触发则在新框架修正并部署，范围仅Note4；旧协议隔离worktree仅作对照，未部署。负对照证实新协议也会因陈旧waiting/connecting/failed状态在无实际工作时申请Light，是调度实现bug。现仅真实HTTP工作或显式requested准入；既发事务、期限、预算及真实工作恢复保留。OTA awaiting_confirmation是合法HTTP工作，单独纳入准入。

@@ -70,6 +70,7 @@ void traceMarkThin();
 void traceBegin(esp_sleep_wakeup_cause_t cause);
 void traceFinishSleep();
 void tracePollConnection();
+void expireStatusRead();
 void histAdd(uint8_t ev, uint16_t aux);
 void bleRadioMark(bool on);
 uint32_t bleRadioMs();
