@@ -2548,12 +2548,17 @@ impl PlatformService {
     /// window that later rendezvous must not cut short: the effective deadline is
     /// `max(formal plan, t_boot + BOOT_PROVISIONAL_S)`. Pending work may extend
     /// it; only the explicit entry points may end it earlier.
-    pub fn plan_for_rendezvous(
+    pub fn plan_for_rendezvous(&self,mac:&str,now:u64,wake_reason:&str,provisional_remaining_s:u32)->Result<PowerPlan> {
+        self.plan_for_rendezvous_network_work(mac,now,wake_reason,provisional_remaining_s,false)
+    }
+
+    pub fn plan_for_rendezvous_network_work(
         &self,
         mac: &str,
         now: u64,
         wake_reason: &str,
         provisional_remaining_s: u32,
+        network_work: bool,
     ) -> Result<PowerPlan> {
         let mac = mac.to_uppercase();
         let mut inner = self.inner.lock().unwrap();
@@ -2593,6 +2598,7 @@ impl PlatformService {
                 .wifi
                 .get(&wifi_mac)
                 .is_some_and(|state| state.jobs.iter().any(|job| wifi_job_wants_window(job, now)) || state.connection.as_ref().is_some_and(|c|
+                    (network_work || c.state=="requested") &&
                     c.local_revision==state.local_revision && state.matching_target(&c.host_ssid).is_some_and(|n|n.network_id==c.network_id) &&
                     matches!(c.state.as_str(),"requested"|"waiting_for_window"|"connecting"|"awaiting_confirmation"|"connection_failed") &&
                     !matches!(c.error.as_deref(),Some("authentication_failed"|"security_mismatch")) &&
@@ -2612,7 +2618,7 @@ impl PlatformService {
                         .unwrap_or(false)
             })
             .unwrap_or(false)
-            || inner.ota_jobs.get(&mac).is_some_and(|j| j.state == "queued");
+            || inner.ota_jobs.get(&mac).is_some_and(|j| matches!(j.state.as_str(),"queued"|"awaiting_confirmation"));
         let work_want_light = other_work_want_light || wifi_window_wanted;
         let c = inner.coordinators.get_mut(&mac).context("unknown device")?;
         let manual_remaining = c.manual_remaining(now);
@@ -4414,7 +4420,8 @@ mod tests {
             let c=super::super::wifi::Connection{host_ssid:"Host".into(),network_id:"home".into(),local_revision:1,version:1,
                 state:kind.into(),error:error.map(str::to_owned),reason:0,observed_at:now,attempts,next_attempt_at:if due{now}else{now+60},http_ready:false,actual_ssid:None,ip:None};
             svc.wifi_note_connection(mac,c.clone()).unwrap();
-            let plan=svc.plan_for_rendezvous(mac,now,"rendezvous",0).unwrap();
+            assert_eq!(svc.plan_for_rendezvous(mac,now,"rendezvous",0).unwrap().mode,PlanMode::Sleep);
+            let plan=svc.plan_for_rendezvous_network_work(mac,now,"rendezvous",0,true).unwrap();
             assert_eq!(plan.mode==PlanMode::Light,wanted,"{kind}/{error:?}/{attempts}/{due}");
             if wanted {assert!(plan.light_duration_s<=120);}
             let mut stale=c;stale.local_revision=0;assert!(svc.wifi_note_connection(mac,stale).is_err());
@@ -4774,5 +4781,30 @@ mod ota_connection_tests {
             assert_eq!(svc.wifi_state(mac).connection.unwrap().attempts,3);
             drop(svc);assert_eq!(PlatformService::open(dir.path()).unwrap().wifi_state(mac).connection.unwrap().attempts,3);
         }
+    }
+}
+
+#[cfg(test)]
+mod wifi_idle_admission_tests {
+    use super::*;
+    #[test]
+    fn wifi_idle_connection_does_not_authorize_periodic_light_but_real_work_does() {
+        let root=tempfile::tempdir().unwrap();let svc=PlatformService::open(root.path()).unwrap();
+        let mac="0200000000E1";
+        svc.device_upsert(DeviceIdentity::new(mac,"Idle test").unwrap(),DeviceCapabilities::ssd1681_154g()).unwrap();
+        svc.wifi_save(mac,0,serde_json::from_value(json!([{"network_id":"home","host_ssid":"Host","ssid":"Device","credential":"open"}])).unwrap(),100).unwrap();
+        for state in ["waiting_for_window","connection_failed","connecting","awaiting_confirmation"] {
+            svc.wifi_note_connection(mac,serde_json::from_value(json!({"host_ssid":"Host","network_id":"home","local_revision":1,
+                "version":8,"state":state,"error":null,"reason":0,"observed_at":100,"attempts":0,"next_attempt_at":0,"http_ready":false})).unwrap()).unwrap();
+            for now in [100,280,460,640] {
+                assert_eq!(svc.plan_for_rendezvous(mac,now,"rendezvous",0).unwrap().mode,PlanMode::Sleep);
+            }
+            assert_eq!(svc.plan_for_rendezvous_network_work(mac,641,"rendezvous",0,true).unwrap().mode,PlanMode::Light);
+        }
+        let mut c=svc.wifi_state(mac).connection.unwrap();c.state="requested".into();svc.wifi_note_connection(mac,c).unwrap();
+        assert_eq!(svc.plan_for_rendezvous(mac,700,"rendezvous",0).unwrap().mode,PlanMode::Light);
+        let mut c=svc.wifi_state(mac).connection.unwrap();c.state="waiting_for_window".into();svc.wifi_note_connection(mac,c).unwrap();
+        svc.wifi_queue(mac,"bridge-test","read",vec![],710).unwrap();
+        assert_eq!(svc.plan_for_rendezvous(mac,711,"rendezvous",0).unwrap().mode,PlanMode::Light);
     }
 }

@@ -58,6 +58,8 @@ struct SimState {
     ble_rx: Arc<Mutex<Vec<u8>>>,
     ble: Arc<Mutex<SimBle>>,
     wifi: Arc<Mutex<SimWifi>>,
+    report_ip: Ipv4Addr,
+    ready_report: Arc<Mutex<Option<Value>>>,
 }
 
 struct SimWifi {
@@ -499,8 +501,8 @@ fn parse_options() -> Result<Options> {
     }
     let listen: SocketAddr = listen.parse().context("invalid --listen address")?;
     ensure!(
-        listen.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST),
-        "--listen must use 127.0.0.1"
+        matches!(listen.ip(), IpAddr::V4(ip) if ip.is_loopback() || ip.is_private()),
+        "--listen must use loopback or a private IPv4 address (synthetic MAC only)"
     );
     let mac = normalize_mac(mac.as_deref().context("--mac is required")?)?;
     ensure!(target == "codex-status-154g" || target == "zectrix-note4-400x300",
@@ -904,6 +906,7 @@ fn rotate_session(state: &SimState) -> Result<SimSession> {
 }
 
 fn reboot_device(state: &SimState, cause: &str) -> Result<SimSession> {
+    *state.ready_report.lock().unwrap() = None;
     let session = rotate_session(state)?;
     let bundle = bridge_render::SimulatorBundle::new(&state.data_dir, &state.target,
         session.boot_id, cause)?;
@@ -1379,6 +1382,7 @@ async fn status_impl(state: SimState, request: Request<Body>, gate: bool) -> Res
                 Ok(owner) => owner,
                 Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
             };
+            status["owner_id"] = json!(owner.as_ref().map(|owner| owner.id.as_str()).unwrap_or(""));
             sync["enabled"] = json!(sync["enabled"] == true &&
                 owner.as_ref().is_some_and(|owner|
                     sync["config_owner"].as_str() == Some(owner.id.as_str())));
@@ -1414,7 +1418,7 @@ async fn status_impl(state: SimState, request: Request<Body>, gate: bool) -> Res
             status["diag_format"] = json!(1);
             status["diag_capacity"] = json!(4096);
             status["firmware_target"] = json!(state.target);
-            status["boot_id"] = json!(session_snapshot(&state).boot_id.to_string());
+            status["boot_id"] = json!(session_snapshot(&state).nonce);
             status["uptime_ms"] = json!(device_uptime_ms(&state, clock));
             status["heap_free"] = json!(0);
             status["heap_min"] = json!(0);
@@ -2001,8 +2005,9 @@ async fn ota_upload(State(state): State<SimState>, request: Request<Body>) -> Re
 async fn ota_image(State(state): State<SimState>, request: Request<Body>) -> Response {
     if let Some(response) = device_gate(&state).await { return response; }
     if !bearer(&request, &state.device_token) { return unauthorized(); }
-    let args = query_args(&request);
-    let Some(length) = args.get("image_bytes").and_then(|s| s.parse::<usize>().ok()) else {
+    let Ok(bytes)=to_bytes(request.into_body(),4096).await else {return StatusCode::PAYLOAD_TOO_LARGE.into_response();};
+    let input:Value=serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    let Some(length) = input["image_bytes"].as_u64().filter(|n|*n<=u32::MAX as u64).map(|n|n as usize) else {
         return (StatusCode::BAD_REQUEST, Json(json!({"error":"range"}))).into_response();
     };
     let ota = state.ota.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2410,6 +2415,74 @@ async fn sim_ble_aux(State(state): State<SimState>, request: Request<Body>) -> R
     state.ble.lock().unwrap().store(op, raw, clock.monotonic_ms);
     Json(json!({"result":"accepted"})).into_response()
 }
+// Network adapter around the shared ROM rendezvous/Wi-Fi engines. Real RF and
+// Arduino HTTPClient are intentionally outside the host simulator.
+async fn sim_ready_reports(state: SimState) {
+    let client = reqwest::Client::builder().no_proxy().local_address(IpAddr::V4(state.report_ip))
+        .timeout(Duration::from_secs(1)).build().unwrap();
+    loop {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let intent = state.ready_report.lock().unwrap().clone();
+        let Some(intent) = intent else { continue; };
+        if clock_snapshot(&state).is_some_and(|clock| state.rendezvous.lock().unwrap().deadline()<=clock.monotonic_ms) {
+            *state.ready_report.lock().unwrap()=None;
+            continue;
+        }
+        let request = Request::builder().uri("/api/status")
+            .header(header::AUTHORIZATION, format!("Bearer {}", state.endpoint_token))
+            .body(Body::empty()).unwrap();
+        let response = status_impl(state.clone(), request, false).await;
+        let Ok(bytes) = to_bytes(response.into_body(), 16384).await else {continue;};
+        let Ok(status) = serde_json::from_slice::<Value>(&bytes) else {continue;};
+        if status["rendezvous"]["ready"] != true {continue;}
+        *state.ready_report.lock().unwrap() = None;
+        let principal = intent["bridge_id"].as_str().unwrap_or("");
+        let base = format!("http://{}:{}/api/device", intent["bridge_addr"].as_str().unwrap_or(""), intent["bridge_port"]);
+        let boot = session_snapshot(&state).nonce;
+        let hello = json!({"device_mac":state.mac,"boot_id":boot,
+            "principal":principal,"instance_id":principal});
+        let mut received = false;
+        for attempt in 0..3 {
+            let Some(clock) = clock_snapshot(&state) else {break;};
+            let deadline = state.rendezvous.lock().unwrap().deadline();
+            if deadline <= clock.monotonic_ms + 1000 {break;}
+            let result: Result<()> = async {
+                let session:Value = client.post(format!("{base}/session")).bearer_auth(state.endpoint_token.as_ref())
+                    .json(&hello).send().await?.error_for_status()?.json().await?;
+                let id=session["session_id"].as_str().context("missing report session")?;
+                ensure!(id.len()==32,"invalid report session");
+                let mut session_bytes=[0u8;16];
+                for (index,byte) in session_bytes.iter_mut().enumerate() {
+                    *byte=u8::from_str_radix(&id[index*2..index*2+2],16)?;
+                }
+                let report=json!({"device_mac":state.mac,"boot_id":boot,"principal":principal,
+                    "instance_id":principal,"origin_session":intent["session_nonce"],
+                    "origin_request_no":intent["origin_request_no"],"business_id":intent["plan_id"].to_string(),
+                    "context_id":"","ip":state.report_ip.to_string(),"port":80,"http_ready":true,
+                    "plan_result":"applied","data_result":"none","network_result":"ready",
+                    "remaining_ms":(deadline-clock.monotonic_ms).min(90000)});
+                let payload=serde_json::to_vec(&report)?;
+                let frame=Header{kind:2,op:20,result:0,payload_len:payload.len() as u16,
+                    session:session_bytes,request_no:1,context:[0;16]};
+                let mut wire=frame.encode().map_err(anyhow::Error::msg)?.to_vec();wire.extend_from_slice(&payload);
+                let response=client.post(format!("{base}/report")).bearer_auth(state.endpoint_token.as_ref())
+                    .header(header::CONTENT_TYPE,bridge_core::compact_frame::CONTENT_TYPE).body(wire).send().await?;
+                ensure!(response.status()==StatusCode::ACCEPTED,"report rejected");
+                let bytes=response.bytes().await?;
+                let (ack,payload)=Header::decode(&bytes,256).map_err(anyhow::Error::msg)?;
+                ensure!(ack.kind==1 && ack.op==20 && ack.result==1 && ack.request_no==1 && ack.session==frame.session,"report ACK binding");
+                let body:Value=serde_json::from_slice(payload)?;
+                ensure!(body["result"]=="report_received","report ACK result");
+                Ok(())
+            }.await;
+            if result.is_ok() {received=true;break;}
+            eprintln!("synthetic ready report attempt {}: {}",attempt+1,result.unwrap_err());
+            tokio::time::sleep(Duration::from_millis(if attempt==0 {250}else{1000})).await;
+        }
+        state.ble.lock().unwrap().events.push_back(json!({"event":"ready_report","received":received}));
+    }
+}
+
 async fn sim_ble_close(State(state): State<SimState>, request: Request<Body>) -> Response {
     if !bearer(&request, &state.endpoint_token) { return unauthorized(); }
     if !ble_generation_ok(&state, &request) { return StatusCode::CONFLICT.into_response(); }
@@ -2506,6 +2579,7 @@ async fn sim_ble_business(State(state): State<SimState>, request: Request<Body>)
                 rv.admit_http(clock.monotonic_ms,legal_until);
                 rv.phase()==2
             } else {false};
+            if admitted { *state.ready_report.lock().unwrap() = Some(message.clone()); }
             Json(json!({"op":"network_start","result":if admitted {"accepted"} else {"rejected"},
                 "error":if admitted {None} else {Some("plan_window")}})).into_response()
         }
@@ -3120,7 +3194,7 @@ where F: FnOnce(State<SimState>, Request<Body>) -> Fut,
         return (StatusCode::BAD_REQUEST, Json(json!({"error":"operation","stage":"frame"}))).into_response();
     }
     let mut session = state.http_frame.lock().await;
-    if op == 1 || (op == 19 && payload == br#"{"open":true}"#) {
+    if op == 1 || (op == 19 && serde_json::from_slice::<Value>(payload).ok().is_some_and(|v|v["open"]==true)) {
         if frame.session == [0; 16] {
             return framed_http_response(StatusCode::CONFLICT,frame,session.id,2,
                 br#"{"result":"rejected","error":"session"}"#);
@@ -3311,11 +3385,22 @@ async fn main() -> Result<()> {
             unified: std::env::var("CODEX_STATUS_SIM_WIFI_PROTOCOL").as_deref()==Ok("3"),
             principal: std::env::var("CODEX_STATUS_SIM_WIFI_PRINCIPAL").unwrap_or("bridge".into()),status_seq:0,status_key:String::new(),
         })),
+        report_ip: match options.listen.ip() { IpAddr::V4(ip) => ip, _ => unreachable!() },
+        ready_report: Arc::new(Mutex::new(None)),
     };
     let listener = tokio::net::TcpListener::bind(options.listen)
         .await
         .context("failed to bind simulator listener")?;
     let address = listener.local_addr()?;
+    // Fake GATT stays loopback-only even when business HTTP/report traffic is
+    // tested on a private interface with production source-address checks.
+    let ble_address = if !state.report_ip.is_loopback() {
+        let ble_listener=tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST,0)).await?;
+        let ble_address=ble_listener.local_addr()?;
+        let ble_state=state.clone();
+        tokio::spawn(async move {axum::serve(ble_listener,app(ble_state)).await.unwrap();});
+        ble_address
+    } else {address};
     println!(
         "{}",
         json!({
@@ -3324,11 +3409,13 @@ async fn main() -> Result<()> {
             "target": state.target,
             "boot_id": session_snapshot(&state).boot_id,
             "http": format!("http://{address}"),
+            "ble_http": format!("http://{ble_address}"),
             "capabilities": CAPABILITIES
         })
     );
     use std::io::Write;
     std::io::stdout().flush()?;
+    tokio::spawn(sim_ready_reports(state.clone()));
     axum::serve(listener, app(state))
         .await
         .context("simulator server failed")?;

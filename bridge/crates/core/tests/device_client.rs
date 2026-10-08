@@ -10,6 +10,8 @@ use std::time::Duration;
 
 use bridge_core::device_client;
 use serde_json::{json, Value};
+use bridge_core::compact_frame::{Header, CONTENT_TYPE};
+thread_local! { static REQUEST_FRAME: std::cell::Cell<Option<Header>> = const {std::cell::Cell::new(None)}; }
 
 struct FakeDevice {
     pub calls: Arc<Mutex<Vec<String>>>,
@@ -53,6 +55,10 @@ fn read_request(stream: &mut TcpStream) -> (String, String, String, Vec<u8>) {
         body.extend_from_slice(&tmp[..n]);
     }
     body.truncate(content_len);
+    let (frame,payload)=Header::decode(&body,4096).expect("client must send the compact frame");
+    assert_eq!(frame.kind,0);
+    REQUEST_FRAME.set(Some(frame));
+    body=payload.to_vec();
     let line = head.lines().next().unwrap_or("").to_string();
     let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
     (line, path, head, body)
@@ -66,13 +72,17 @@ fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
 }
 
 fn respond(stream: &mut TcpStream, status: u16, body: &Value) {
-    let text = body.to_string();
+    let payload = body.to_string();
+    let request=REQUEST_FRAME.get().unwrap();
+    let ack=Header{kind:1,op:request.op,result:if status>=400 || body["result"]=="rejected" {2}else{0},
+        payload_len:payload.len() as u16,session:[9;16],request_no:request.request_no,context:request.context};
+    let mut bytes=ack.encode().unwrap().to_vec();bytes.extend_from_slice(payload.as_bytes());
     let head = format!(
-        "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        text.len()
+        "HTTP/1.1 {status} OK\r\nContent-Type: {CONTENT_TYPE}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        bytes.len()
     );
     let _ = stream.write_all(head.as_bytes());
-    let _ = stream.write_all(text.as_bytes());
+    let _ = stream.write_all(&bytes);
 }
 
 #[test]
@@ -115,7 +125,7 @@ fn spawn_fake() -> (String, FakeDevice) {
                     200,
                     &json!({
                         "result": "applied",
-                        "active_context_id": "ctx-1",
+                        "active_context_id": "0000000000000001",
                         "device_mac": "70:04:1D:D7:A3:40", "session_nonce": "0123456789abcdef0123456789abcdef",
                         "active_template_id": "quad",
                         "data_seq": 4,
@@ -124,7 +134,7 @@ fn spawn_fake() -> (String, FakeDevice) {
                 );
             } else if path == "/api/data" {
                 let message: Value = serde_json::from_slice(&body).unwrap();
-                let ok = message["seq"] == 5 && message["context_id"] == "ctx-1";
+                let ok = message["seq"] == 5 && message["context_id"] == "0000000000000001";
                 respond(
                     &mut stream,
                     200,
@@ -193,14 +203,14 @@ fn spawn_fake() -> (String, FakeDevice) {
                 );
             } else if path.starts_with("/api/activate") {
                 let command: Value = serde_json::from_slice(&body).unwrap();
-                assert_eq!(command["expected_active_context_id"], "ctx-1");
-                assert_eq!(command["request_id"], "activate-ctx-1-mini");
+                assert_eq!(command["expected_active_context_id"], "0000000000000001");
+                assert_eq!(command["request_id"], "activate-0000000000000001-mini");
                 assert_eq!(command["template_id"], "mini");
                 assert_eq!(command["session_nonce"], "0123456789abcdef0123456789abcdef");
                 respond(
                     &mut stream,
                     200,
-                    &json!({"result": "applied", "active_context_id": "ctx-2"}),
+                    &json!({"result": "applied", "active_context_id": "0000000000000002"}),
                 );
             } else {
                 respond(&mut stream, 404, &json!({"result": "rejected"}));
@@ -223,7 +233,7 @@ fn status_data_plan_activate_round_trip() {
         &addr,
         token,
         "70:04:1D:D7:A3:40",
-        &json!({"context_id": "ctx-1", "seq": 5, "fields": []}),
+        &json!({"context_id": "0000000000000001", "seq": 5, "fields": []}),
         timeout,
     )
     .unwrap();
@@ -239,11 +249,11 @@ fn status_data_plan_activate_round_trip() {
     .unwrap();
     assert_eq!(ack["accepted_remaining_s"], 300);
 
-    let ack = device_client::activate(&addr, token, "70:04:1D:D7:A3:40", "bridge-1", "mini", "ctx-1", timeout).unwrap();
-    assert_eq!(ack["active_context_id"], "ctx-2");
+    let ack = device_client::activate(&addr, token, "70:04:1D:D7:A3:40", "bridge-1", "mini", "0000000000000001", timeout).unwrap();
+    assert_eq!(ack["active_context_id"], "0000000000000002");
     let calls = fake.calls.lock().unwrap().clone();
-    assert_eq!(calls[0], "GET /api/status");
-    let writes: Vec<_> = calls.iter().filter(|p| *p != "GET /api/status").cloned().collect();
+    assert_eq!(calls[0], "POST /api/status");
+    let writes: Vec<_> = calls.iter().filter(|p| *p != "POST /api/status").cloned().collect();
     assert_eq!(writes, vec!["POST /api/data", "POST /api/plan", "POST /api/activate"]);
 }
 
@@ -280,7 +290,7 @@ fn bundle_install_is_ordered_and_complete() {
     assert_eq!(ack["result"], "applied");
     assert_eq!(fake.payload.lock().unwrap().len(), padded.len());
     let calls = fake.calls.lock().unwrap().clone();
-    assert_eq!(calls[0], "GET /api/status");
+    assert_eq!(calls[0], "POST /api/status");
     assert_eq!(calls[1], "POST /api/bundle/begin");
     assert_eq!(
         calls
@@ -288,20 +298,20 @@ fn bundle_install_is_ordered_and_complete() {
             .filter(|c| c.starts_with("POST /api/bundle/chunk"))
             .count(),
         3,
-        "10000 bytes at 4096 -> 3 chunks, ordered by offset"
+        "10000 bytes at 4048 -> 3 chunks, ordered by offset"
     );
     assert_eq!(calls.last().unwrap(), "POST /api/bundle/commit");
 }
 
 #[test]
-fn wrong_target_mac_stops_all_writes_after_status_get() {
+fn wrong_target_mac_stops_all_writes_after_status_read() {
     let (addr, fake) = spawn_fake();
     let timeout = Duration::from_secs(2);
     let wrong_mac = "AA:BB:CC:DD:EE:FF";
 
     assert!(device_client::data(&addr, "tok", wrong_mac, &json!({"seq": 1}), timeout).is_err());
     assert!(device_client::plan(&addr, "tok", wrong_mac, &json!({"plan_id": 1}), timeout).is_err());
-    assert!(device_client::activate(&addr, "tok", wrong_mac, "bridge-1", "mini", "ctx-1", timeout).is_err());
+    assert!(device_client::activate(&addr, "tok", wrong_mac, "bridge-1", "mini", "0000000000000001", timeout).is_err());
     let bundle = serde_json::to_vec(&json!({"job_id": "job-guard"})).unwrap();
     assert!(device_client::install_bundle(
         &addr, "tok", wrong_mac, "bridge-1", &bundle, device_client::BUNDLE_CHUNK_BYTES, timeout
@@ -309,8 +319,8 @@ fn wrong_target_mac_stops_all_writes_after_status_get() {
 
     assert_eq!(
         fake.calls.lock().unwrap().as_slice(),
-        ["GET /api/status", "GET /api/status", "GET /api/status", "GET /api/status"],
-        "MAC mismatch must perform only authenticated GET /api/status, with no write POST"
+        ["POST /api/status", "POST /api/status", "POST /api/status", "POST /api/status"],
+        "MAC mismatch must perform only authenticated POST /api/status, with no write POST"
     );
 }
 

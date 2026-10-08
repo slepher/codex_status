@@ -126,9 +126,17 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             .then(|| service(ctx).data_message_body(&mac)).flatten();
         let needs_http = !admitted_wifi.is_empty()
             || service(ctx).wifi_state(&mac).connection.is_some_and(|c| c.state == "requested")
-            || matches!(decision["decision"].as_str(), Some("light_data" | "bundle" | "activate"))
+            || matches!(decision["decision"].as_str(), Some("light_data" | "bundle" | "activate" | "waiting_for_device_contract"))
+            || service(ctx).ota_job(&mac).is_some_and(|job|
+                matches!(job.state.as_str(), "queued" | "awaiting_confirmation"))
             || (sync_enabled && state["sync"]["retry_skip"] == 0
                 && (state["sync"]["due"] == true || state["sync"]["pending"] == true));
+        tracing::info!(event="network_admission",device_mac=%mac,needs_http,
+            delivery=decision["decision"].as_str().unwrap_or("unknown"),
+            wifi_jobs=admitted_wifi.len(),
+            ota_state=service(ctx).ota_job(&mac).map(|job|job.state).as_deref().unwrap_or("none"),
+            diagnostics_due=state["sync"]["due"]==true,
+            "rendezvous network work admission");
         let remaining = state["power"]["provisional_remaining_s"]
             .as_u64()
             .unwrap_or(0) as u32;
@@ -147,7 +155,6 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
         } else { false };
         state["_http_reachable"] = json!(reachable);
         state["_need_http"] = json!(needs_http);
-        state["_http_reachable"] = json!(reachable);
         let requested = service(ctx).wifi_state(&mac).connection.is_some_and(|c| c.state=="requested");
         state["_wifi_repair"] = json!(needs_http && (!reachable || requested));
         if reachable && !requested { crate::wifi::http_ready(ctx, &mac); }
@@ -158,7 +165,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
         admitted_wifi = service(ctx).wifi_state(&mac).jobs.iter()
             .filter(|job| bridge_core::rendezvous::admit_wifi(job, device_now(&mac))).map(|j| j.job_id.clone()).collect();
         let plan = service(ctx)
-            .plan_for_rendezvous(
+            .plan_for_rendezvous_network_work(
                 &mac,
                 device_now(&mac),
                 if remaining > 0 {
@@ -167,6 +174,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
                     "rendezvous"
                 },
                 remaining,
+                needs_http,
             )
             .map_err(err_text)?;
         let mut plan_body = serde_json::to_value(&plan).map_err(err_text)?;
@@ -494,7 +502,14 @@ fn matching_http(
             && status["power"]["mode"] == "sleep"
             && status["power"]["remaining_s"] == 0
             && status["sync"]["phase"] == "WIFI_SYNC_ONCE";
-        if status["power"]["mode"].as_str() != Some(mode) && !expired_in_sync {
+        // SyncOpen can keep the radio awake independently of a zero-duration
+        // Sleep Plan (including a USB-powered device). It does not grant Light.
+        let sleep_in_sync = mode == "sleep"
+            && status["power"]["mode"] == "light"
+            && status["power"]["remaining_s"] == 0
+            && status["sync"]["phase"] == "WIFI_SYNC_ONCE"
+            && ble["_sync_open_id"].as_str().is_some_and(|id| !id.is_empty());
+        if status["power"]["mode"].as_str() != Some(mode) && !expired_in_sync && !sleep_in_sync {
             return Err("plan_unconfirmed".into());
         }
         if mode == "light"
@@ -644,6 +659,12 @@ mod tests {
         sleep_ble["_sync_open_unknown"] = json!(true);
         expired["power"]["mode"] = json!("sleep");
         assert!(matching_http(&expired, "7C4FADB93408", &sleep_ble, 101, true).is_ok());
+        sleep_ble["_sync_open_id"]=json!("original-sync-open");
+        expired["power"]["mode"]=json!("light");
+        assert!(matching_http(&expired, "7C4FADB93408", &sleep_ble, 101, true).is_ok());
+        let mut unbound=sleep_ble.clone();unbound.as_object_mut().unwrap().remove("_sync_open_id");
+        assert_eq!(matching_http(&expired,"7C4FADB93408",&unbound,101,true),Err("plan_unconfirmed".into()));
+        expired["power"]["mode"]=json!("sleep");
         expired["sync"]["phase"] = json!("DEEP");
         assert_eq!(
             matching_http(&expired, "7C4FADB93408", &sleep_ble, 101, true),

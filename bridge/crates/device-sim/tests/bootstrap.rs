@@ -1297,8 +1297,8 @@ fn sync_v1_s10_running_image_hash_uses_active_bytes_not_version_label() {
     ]})).unwrap()).unwrap();
     let mut sim = Simulator::start_with_dir("02:00:00:00:00:A1", &[
         "--catalog", catalog.to_str().unwrap()], dir, true);
-    let image = |n: usize, token| request(sim.address(), "GET",
-        &format!("/api/ota/image?image_bytes={n}"), token, b"");
+    let image = |n: usize, token| request(sim.address(), "POST",
+        "/api/ota/image", token, serde_json::json!({"image_bytes":n}).to_string().as_bytes());
     assert_eq!(image(1024, None).0, 401);
     assert_eq!(image(1025, Some(DEVICE)).0, 400);
     let before = json_body(&image(1024, Some(DEVICE)).1);

@@ -188,7 +188,13 @@ fn request(
     anyhow::ensure!(opening || session.id != [0; 16], "device HTTP session is not established");
     let number = session.next_no.checked_add(1).context("HTTP request number exhausted")?;
     session.next_no = number;
-    let payload = if opening && op == 19 { br#"{"open":true}"#.as_slice() }
+    let open_payload;
+    let payload = if opening && op == 19 {
+        let mut value:Value=serde_json::from_slice(body.unwrap_or(b"{}"))?;
+        value["open"]=json!(true);
+        open_payload=serde_json::to_vec(&value)?;
+        open_payload.as_slice()
+    }
         else { body.unwrap_or(b"{}") };
     anyhow::ensure!(payload.len() + HEADER_LEN <= MAX_HTTP_FRAME, "device HTTP frame exceeds 4096 bytes");
     let header = Header { kind: 0, op, result: 0,
@@ -405,10 +411,11 @@ fn status_mode(ip: &str, token: &str, timeout: Duration, compact: bool) -> Resul
 /// Running OTA partition hash, authorized by the device operation token alone.
 pub fn ota_image(ip: &str, token: &str, mac: &str, image_bytes: usize, timeout: Duration) -> Result<Value> {
     let expected_mac = DeviceIdentity::normalized_mac(mac).context("invalid OTA target MAC")?;
-    let path = format!("/api/ota/image?image_bytes={image_bytes}");
-    let (status, body) = match request(ip, "GET", &path, token, None, &[], timeout) {
+    let path = "/api/ota/image";
+    let payload=serde_json::to_vec(&json!({"image_bytes":image_bytes}))?;
+    let (status, body) = match request(ip, "POST", path, token, Some(&payload), &[], timeout) {
         Err(error) if error.to_string() == "device_http_session_expired" =>
-            request(ip, "GET", &path, token, None, &[], timeout)?,
+            request(ip, "POST", path, token, Some(&payload), &[], timeout)?,
         result => result?,
     };
     if status != 200 { bail!("device /api/ota/image HTTP {status}"); }
@@ -781,10 +788,12 @@ mod tests {
                     }
                 };
                 let request = String::from_utf8_lossy(&buffer);
-                assert!(request.starts_with("POST /api/ota/image?image_bytes=1024 HTTP/1.1"));
+                assert!(request.starts_with("POST /api/ota/image HTTP/1.1"));
                 assert!(request.contains("Authorization: Bearer secret-token\r\n"));
                 let body = format!(r#"{{"device_mac":"{reported}","image_bytes":1024,"sha256":"abc"}}"#);
-                let (frame,_) = crate::compact_frame::Header::decode(&buffer[start..],4096).unwrap();
+                let (frame,payload) = crate::compact_frame::Header::decode(&buffer[start..],4096).unwrap();
+                let input:Value=serde_json::from_slice(payload).unwrap();
+                assert_eq!(input["image_bytes"],1024);assert_eq!(input["open"],true);
                 assert_eq!(frame.op,19);
                 let header=crate::compact_frame::Header{kind:1,op:19,result:0,
                     payload_len:body.len() as u16,session:[7;16],request_no:frame.request_no,context:frame.context};

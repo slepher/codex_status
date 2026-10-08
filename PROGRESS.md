@@ -1,5 +1,27 @@
 # Codex Status 项目进度（交接文档）
 
+## 2026-10-08 新协议重复 activate 已修正并部署，Note4 .71 运行镜像已核对
+
+- 用户要求先验证新协议、仍触发则在新框架修正并部署，范围仅Note4；旧协议隔离worktree仅作对照，未部署。负对照证实新协议也会因陈旧waiting/connecting/failed状态在无实际工作时申请Light，是调度实现bug。现仅真实HTTP工作或显式requested准入；既发事务、期限、预算及真实工作恢复保留。OTA awaiting_confirmation是合法HTTP工作，单独纳入准入。
+- 报告认证回读原来检查不存在的`owner.id`，现使用设备真实`owner_id`；Sleep Plan遇独立SyncOpen/USB保持awake时，须原Plan/原SyncOpen/认证临时同步状态和零Light剩余才准许同步，不延长Light。源IP、会话、owner、MAC、认证和事务围栏未放宽。
+- 协调升级中实机又暴露信封载荷问题：二进制HTTP POST不保留旧URL query，.70运行镜像查询返回明确range拒绝。现在op19把image_bytes和open放入JSON业务载荷，开会话不覆盖业务参数；Bundle块原用明确请求头，不受影响。.70上传确认但未取得hash证明的任务已有限归档；.71为不同镜像/请求ID，未将结果未知操作换ID重发。
+- 同一Fake网络闭环通过：私有虚拟接口192.168.136.1:80、合成LAA MAC，Fake独立报告→生产Bridge接收→认证HTTP回读→完成原read→后续四轮生产BLE联系，RF begin保持1且无新增activate。180秒间隔规划回归和修复前失败负对照留证。Fake共用C++ Wi-Fi HAL/Rendezvous和正式信封，Rust网络adapter不等同Arduino HTTPClient或物理RF。
+- 回归：app75/75（3项ignored另显式全部通过）、core129/129、HTTP集成6/6、BLE17/17、Fake bootstrap57/57、render53/53、MCP3/3；最新op19载荷修正后core/HTTP/Fake及3项同源联测复验通过。匹配ELF栈门禁与固件模块边界通过；最终git diff --check通过；用户随后授权提交，提交范围包含已部署的固件模块拆分及其检查脚本。
+- **实际部署Note4** `7C4FADB93408 / 192.168.3.177`，`zectrix-note4-b / 0.18.71-note4`，ROM `artifacts/note4-0.18.71-new-protocol.bin` **1,898,240 B**，SHA256 **DE7897DD61D6EA7B3A326F71D92C7541CF9C245207D7FFD90D202F33EA5E6D31**；匹配ELF同名，SHA256 **197EFC74691EAB2E2CD884760ABA1FB142B8DBBCF27C05ADEF53C7718429D592**。唯一目标marker偏移184976。只构建Note4，72.50s增量、无clean/重装/其他env。
+- 22:15认证直接读取证明MAC、FW .71及running_slot ota_1，指定1,898,240 B运行前缀hash与发布文件完全一致。原OTA任务e70d4281/request new-protocol-note4-71-20261008为succeeded/image_verified、upload_ack=true、attempt_count=1、last_error=null。boot_id07948c161f94c9f8597affd906c3c9c1/reset_reason8，active home/v8、Wi-Fi connected、HTTP ready、owner8c94。22:13生产Bridge已完成设备主动ready报告的认证回读，plan2806；当次activate服务OTA确认、合同/诊断同步，不能算空闲重复。
+- 资源：静态RAM **117,860 B**，应用Flash **1,847,323 B**；Wi-Fi/NVS格式不变，空/1条/典型/上限的新增持久字节均为0。匹配ELF v2HttpBegin368 B（比.70 +80）、handleOtaImage464 B、BLE dispatcher960/1024 B，最长已列Wi-Fi本地链3424/4096 B、loop栈12288 B。op19新增两字段JsonDocument解析，配置池首分配1024 B且解析后收缩；这只是已知池成本，非实测整机堆峰值，原hash4096 B工作块仍在。动态峰值、RF/电池/掉电矩阵仍待实机长期验收，不宣称B6/A9整体结项。
+- 部署前私有完整data/exe备份：`bridge-before-new-protocol-20261008`及`bridge-before-new-protocol71-20261008`的exe/private.zip；CRC及state存在性核对通过。任务计划程序启动默认Bridge，8765/8766，保留data。书桌屏只暂停同步不足以停止BLE读取，最终补`bridge-app.json.paused_device_macs=[70041DD7A340]`按MAC排除后台HTTP/BLE调度，登记/Profile/凭据保留；配置变更前已私有备份。最终Bridge SHA256 **62E6C49214665BBC789B515A58E8B97D9863E9EAFA4E7F98A2D25419B59C76C4**，22:21计划任务启动主PID41500。22:23观察距升级确认约596s（超过三次原180s间隔），新增Note4 activate=0，next_job_seq保持168；书桌屏暂停后后台联系=0。正常数据工作另续发过正式PowerPlan，故此实机样本不是四轮纯空闲BLE会合，纯空闲四轮由同源Fake独立验证。
+- 证据：`artifacts/wifi-new-protocol-runtime-proof-20261008.json`、`wifi-new-protocol71-deployment-20261008.json`、`wifi-new-protocol-book-pause-deployment-20261008.json`、`wifi-new-protocol-observation-20261008.json`；negative/network/full/client/remaining/ignored/image/pause-tests、rom71-build、stack71/extra-stack日志。计划`project-workflow/bridge-macos/wifi-idle-activate-20261008-plan.md`；唯一路线图backlog A9/B6保留其余实体矩阵。
+
+## 2026-10-08 固件 main 胶水层已完成（未部署候选）
+
+- 用户授权模块化：`src/main.cpp` 从当前精简协议候选的 **6,421 行收敛为21行**，只保留版本/OTA marker、12,288 B loop栈hook及setup/loop转交。执行归属 `src/firmware/{application,display,platform,transport,radio,power,clock,diagnostics,sync}.cpp`；状态按模块持有，普通/RTC分开，局部状态留TU内，不用单一大context/逐字段extern/.inc拼接。dev_log通过sync log sink访问诊断环。计划与边界/验收见 `project-workflow/firmware-modularization/{plan,review}.md`。
+- **仅工作树重构/离线测试/Note4构建，未部署、串口、设备写入、Bridge重启或提交**。运行Bridge/设备现场仍为下面13:55/13:57及已部署.69镜像；继承上一节精简协议候选，不能把此次重构当A9尚缺同一Fake报告网络闭环或RF/电池验收。旧文档的main行号属于迁移前时点；函数→新模块映射在本地证据。
+- 验证：241个迁移生产函数体归属限定/元数据/有界状态snapshot构造展开后对照一致；胶水/存储边界、生产启动/loop顺序及BLE claim鉴权检查通过；render9单元+44集成共53项通过；真实clock函数与外部RTC driver的WSL g++ ASan/UBSan测试通过，pending-only负对照在NTP竞态目标断言失败。最终git diff/新增文件空白检查通过；宿主测试不覆盖全main硬件生命周期，未声明实机验收。
+- 最终唯一 **zectrix-note4-b / 0.18.69-note4** 候选：`.pio/build/zectrix-note4-b/firmware.bin` **1,897,824 B**，SHA256 **F2F04ECC20F699FA8A8730832AE22A6D403C6DBFCEA57A812A6E916805201050**；匹配ELF SHA256 **1196614A6409E3497D0EFB40C752B3D87D18283DB784BA3D03B819F24504FC7B**，OTA marker偏移184992且唯一。隔离目标脚本构建成功，保留缓存、无framework重装、不构建其他env。
+- 资源：静态RAM **117,860 B（+56）**、应用Flash **1,846,899 B（+13,836）**、`.rtc.data` **5,080 B（+64）**，force_slow/fast不变；未新增持久字节或堆工作区。匹配ELF原阈值栈门禁全PASS：BLE dispatcher **960/1,024 B**、迁移helper496 B、Status handler880 B/builder224 B、最长已列Wi-Fi本地链 **3,424/4,096 B**。首版handler超门限16B已用独立有界snapshot构造修正；入口setup/loop各32B、initialize224B/tick240B。栈hook反汇编为`3<<12=12,288 B`（保留原值），旧门禁硬编码8192B说明已删除。RTC对象在rtc.data，静态构造指令检查无加载RTC地址；真实动态峰值/间接平台与ISR/深睡保留仍需实机验证。
+- 证据：`artifacts/firmware-modularization-{build,stack,render-tests,clock-test,clock-negative}-20261008.log`、`firmware-modularization-resources-20261008.json`、`firmware-modularization-map.json`、`verify-firmware-moves.py`；迁移前source/bin/ELF已私有保存在artifacts，本轮不覆盖已部署ROM记录。
+
 ## 2026-10-08 精简协议实施现场：P0–P5 工作树候选，Fake ROM 验收进行中
 
 - 本轮仅改工作树并做合成测试/Note4构建；**未重启或替换运行 Bridge、未部署或刷写设备、未提交**。运行现场仍以下节 13:55/13:57 为准；此 ROM 是未部署候选。

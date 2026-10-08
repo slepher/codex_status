@@ -3230,7 +3230,7 @@ mod ble_close_lock_tests {
     fn ready_report_requires_current_authenticated_light_owner_fact() {
         let mut status=json!({"device_mac":HUNG_MAC,"boot_id":"same-boot",
             "power":{"plan_id":7,"mode":"light","remaining_s":25},
-            "transports":{"http":{"ready":true}},"owner":{"id":"bridge-lock-repro"}});
+            "transports":{"http":{"ready":true}},"owner_id":"bridge-lock-repro"});
         let verified=|body:&Value|crate::report_fact_verified(body,HUNG_MAC,
             "same-boot",7,"bridge-lock-repro");
         assert!(verified(&status));
@@ -3241,8 +3241,8 @@ mod ble_close_lock_tests {
             ("power.mode",json!("sleep")),
             ("power.remaining_s",json!(0)),
             ("transports.http.ready",json!(false)),
-            ("owner.id",json!("other")),
-            ("owner.id",Value::Null),
+            ("owner_id",json!("other")),
+            ("owner_id",Value::Null),
         ] {
             let mut changed=status.clone();
             let mut slot=&mut changed;
@@ -3290,6 +3290,30 @@ mod ble_close_lock_tests {
     /// the device side. The fake BLE server logs its `/sim/ble/close` hit and
     /// the fake device HTTP server logs each `/api/status` read, so the two
     /// production HTTP steps after the close are visible and distinguishable.
+    #[tokio::test(flavor="multi_thread",worker_threads=4)]
+    async fn wifi_idle_repeated_contacts_do_not_probe_http_or_activate_network() {
+        let _serial=SIM_ENV.lock().unwrap_or_else(|p|p.into_inner());
+        let dir=tempfile::tempdir().unwrap();let events=Arc::new(Mutex::new(Vec::new()));
+        let (ble,url)=start_fake_ble_with(HUNG_MAC,false,false,events.clone()).await;
+        let (_http,ip)=start_fake_http(events.clone(),plain_status_body(HUNG_MAC),0,Duration::ZERO);
+        let ctx=test_ctx_with_ip(dir.path(),HUNG_MAC,&ip);let svc=service(&ctx);let now=device_now(HUNG_MAC);
+        svc.wifi_save(HUNG_MAC,0,serde_json::from_value(json!([{"network_id":"home","host_ssid":"Host","ssid":"Device","credential":"open"}])).unwrap(),now).unwrap();
+        svc.wifi_note_connection(HUNG_MAC,serde_json::from_value(json!({"host_ssid":"Host","network_id":"home","local_revision":1,
+            "version":8,"state":"waiting_for_window","error":null,"reason":0,"observed_at":now,"attempts":0,"next_attempt_at":0,"http_ready":false})).unwrap()).unwrap();
+        std::env::set_var("CODEX_STATUS_SIM_BLE_ENDPOINTS",json!({HUNG_MAC:url}).to_string());
+        for _ in 0..4 {
+            let result=ble_cycle(&ctx,&[HUNG_MAC.to_owned()]).await;
+            assert!(matches!(result,Ok(BleOpportunity::Connected{result:Ok(()),..})),"{result:?}");
+        }
+        std::env::remove_var("CODEX_STATUS_SIM_BLE_ENDPOINTS");
+        let commands=ble.commands.lock().unwrap();
+        assert_eq!(commands.iter().filter(|c|c["op"]=="plan").count(),4);
+        assert!(commands.iter().filter(|c|c["op"]=="plan").all(|c|c["mode"]=="sleep"));
+        assert!(!commands.iter().any(|c|matches!(c["op"].as_str(),Some("wifi_activate"|"wifi_match"|"handoff"|"sync_open"))));
+        assert!(!events.lock().unwrap().iter().any(|e|e.starts_with("http:")),"idle BLE contacts must not probe HTTP");
+        assert!(svc.wifi_state(HUNG_MAC).jobs.is_empty());assert_eq!(svc.wifi_state(HUNG_MAC).connection.unwrap().attempts,0);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn combo_cycle_order_close_then_drain_then_wifi_opportunity() {
         let _serial = SIM_ENV.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -4006,6 +4030,79 @@ mod ble_close_lock_tests {
         assert_eq!(radio["radio"]["begins"],0,"no RF call despite consuming the entire retry budget");
         eprintln!("FIX VERIFIED: unknown submissions protected; automatic_on_link reports capacity error, attempts=0, RF begin=0.");
         link.close_bounded(Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test(flavor="multi_thread",worker_threads=4)]
+    #[ignore="requires same-target device-sim and CODEX_STATUS_TEST_REPORT_IP private local interface"]
+    async fn wifi_new_protocol_fake_report_readback_then_idle_does_not_activate() {
+        use std::io::BufRead;
+        const MAC:&str="0200000000D4";
+        let _serial=SIM_ENV.lock().unwrap_or_else(|p|p.into_inner());
+        let ip:std::net::Ipv4Addr=std::env::var("CODEX_STATUS_TEST_REPORT_IP").expect("private local interface required").parse().unwrap();
+        assert!(ip.is_private() && !ip.is_loopback());
+        struct Cleanup(std::process::Child);
+        impl Drop for Cleanup {fn drop(&mut self){let _=self.0.kill();let _=self.0.wait();std::env::remove_var("CODEX_STATUS_SIM_BLE_ENDPOINTS");}}
+        let dir=tempfile::tempdir().unwrap();let sim_dir=tempfile::tempdir().unwrap();
+        let exe=std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join(format!("device-sim{}",std::env::consts::EXE_SUFFIX));
+        let address=format!("{ip}:80");
+        let mut child=std::process::Command::new(exe).args(["--listen",&address,"--mac",MAC,"--data-dir"])
+            .arg(sim_dir.path()).env("CODEX_STATUS_SIM_ENDPOINT_TOKEN",TOKEN)
+            .env("CODEX_STATUS_SIM_DEVICE_TOKEN","synthetic-device-token")
+            .env("CODEX_STATUS_SIM_CONTROL_TOKEN","synthetic-control-token")
+            .env("CODEX_STATUS_SIM_WIFI_PROTOCOL","3").env("CODEX_STATUS_SIM_WIFI_PRINCIPAL","bridge-lock-repro")
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::inherit()).spawn().unwrap();
+        let mut line=String::new();std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        let _cleanup=Cleanup(child);let ready:Value=serde_json::from_str(&line).unwrap();let url=ready["http"].as_str().unwrap();
+        let client=reqwest::Client::builder().no_proxy().build().unwrap();
+        assert!(client.post(format!("{url}/sim/power")).bearer_auth("synthetic-control-token").json(&json!({"plugged":true})).send().await.unwrap().status().is_success());
+        let endpoint=address.clone();
+        let (code,_)=tokio::task::spawn_blocking(move||bridge_core::device_client::claim(&endpoint,TOKEN,"synthetic-device-token",
+            &json!({"id":"bridge-lock-repro","lease":"300"}),Duration::from_secs(3)).unwrap()).await.unwrap();assert_eq!(code,200);
+        let listener=tokio::net::TcpListener::bind((ip,0)).await.unwrap();
+        let mut ctx=test_ctx_with_ip(dir.path(),MAC,&ip.to_string());ctx.config.port=listener.local_addr().unwrap().port();let ctx=Arc::new(ctx);
+        let router=Router::new().route("/api/device/session",post(crate::report_session))
+            .route("/api/device/report",post(crate::framed_ready_report)).with_state(ctx.clone());
+        let server=tokio::spawn(async move{axum::serve(listener,router.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();});
+        std::env::set_var("CODEX_STATUS_SIM_BLE_ENDPOINTS",json!({MAC:ready["ble_http"]}).to_string());
+        let mut link=bridge_ble::DeviceConnection::connect(MAC,TOKEN,&ctx.bridge_id).await.unwrap().unwrap();
+        let saved=link.command("wifi_save",json!({"expected_revision":0,"changes":[
+            {"network_id":"home","host_ssid":"FakeHost","ssid":"FakeDevice","credential":"open"}]})).await.unwrap();assert_eq!(saved["outcome"],"committed");
+        let job=queue_read_job(&ctx,MAC);let plan=service(&ctx).plan_for_rendezvous_network_work(MAC,device_now(MAC),"rendezvous",0,true).unwrap();
+        let mut body=serde_json::to_value(&plan).unwrap();body["need_http"]=json!(true);
+        assert_eq!(link.command("plan",body).await.unwrap()["result"],"applied");
+        let activation=link.command("wifi_activate",json!({"network_id":"home","version":1})).await.unwrap();
+        assert_eq!(activation["stage"],"accepted","{activation}");
+        // Poll the actual shared Wi-Fi HAL to DHCP/IP completion.
+        for _ in 0..2 {assert!(client.post(format!("{url}/sim/wifi")).bearer_auth("synthetic-control-token").json(&json!({"outcome":1})).send().await.unwrap().status().is_success());}
+        assert_eq!(link.command("network_start",json!({"plan_id":plan.plan_id,"bridge_addr":ip.to_string(),
+            "bridge_port":ctx.config.port,"origin_request_no":plan.plan_id})).await.unwrap()["result"],"accepted");
+        assert_eq!(service(&ctx).coordinator_summary(MAC,device_now(MAC)).unwrap()["plan"]["last_accepted_id"],0);
+        link.close_bounded(Duration::from_secs(1)).await;
+        let until=tokio::time::Instant::now()+Duration::from_secs(8);
+        while observed_job(&ctx,MAC,&job).0!="completed" && tokio::time::Instant::now()<until {tokio::time::sleep(Duration::from_millis(100)).await;}
+        if observed_job(&ctx,MAC,&job).0!="completed" {
+            let attrs:Value=client.get(format!("{url}/sim/ble/attributes")).bearer_auth("synthetic-control-token").send().await.unwrap().json().await.unwrap();
+            let endpoint=address.clone();let status=tokio::task::spawn_blocking(move||bridge_core::device_client::status(&endpoint,TOKEN,Duration::from_secs(2)).unwrap()).await.unwrap();
+            eprintln!("Fake report facts: events={} power={} rv={} transports={} owner={} boot={}",attrs["events"],status["power"],status["rendezvous"],status["transports"],status["owner"],status["boot_id"]);
+        }
+        assert_eq!(observed_job(&ctx,MAC,&job),("completed".into(),None),"real report must trigger authenticated readback and queued work");
+        assert_eq!(service(&ctx).coordinator_summary(MAC,device_now(MAC)).unwrap()["plan"]["last_accepted_id"],plan.plan_id);
+        let attrs:Value=client.get(format!("{url}/sim/ble/attributes")).bearer_auth("synthetic-control-token").send().await.unwrap().json().await.unwrap();
+        assert!(attrs["events"].as_array().unwrap().iter().any(|e|e["event"]=="ready_report" && e["received"]==true));
+        let radio:Value=client.post(format!("{url}/sim/wifi")).bearer_auth("synthetic-control-token").json(&json!({"outcome":1})).send().await.unwrap().json().await.unwrap();
+        let begins=radio["radio"]["begins"].clone();assert_eq!(begins,1);
+        for _ in 0..4 {
+            let result=ble_cycle(&ctx,&[MAC.to_owned()]).await;
+            if !matches!(result,Ok(BleOpportunity::Connected{result:Ok(()),..})) {
+                let endpoint=address.clone();let status=tokio::task::spawn_blocking(move||bridge_core::device_client::status(&endpoint,TOKEN,Duration::from_secs(2)).unwrap()).await.unwrap();
+                eprintln!("post-work cycle: power={} sync={} decision={} coordinator={}",status["power"],status["sync"],service(&ctx).next_delivery(MAC,true,device_now(MAC)),service(&ctx).coordinator_summary(MAC,device_now(MAC)).unwrap()["plan"]);
+            }
+            assert!(matches!(result,Ok(BleOpportunity::Connected{result:Ok(()),..})),"{result:?}");
+        }
+        let after:Value=client.post(format!("{url}/sim/wifi")).bearer_auth("synthetic-control-token").json(&json!({"outcome":1})).send().await.unwrap().json().await.unwrap();
+        assert_eq!(after["radio"]["begins"],begins,"completed HTTP work must not authorize a later activation");
+        assert!(!service(&ctx).wifi_state(MAC).jobs.iter().any(|j|j.kind=="activate"));
+        server.abort();
     }
 
 }

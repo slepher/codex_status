@@ -18,6 +18,8 @@ pub struct Config {
     pub device_ip: String,
     /// Device identity: Wi-Fi MAC learned from UDP/HTTP/BLE, persisted.
     pub device_mac: Option<String>,
+    /// Temporarily exclude registered devices from automatic HTTP/BLE work.
+    pub paused_device_macs: Vec<String>,
     /// Editable display name (not a uniqueness key; defaults to
     /// `CodexStatus-<MAC suffix>` on first identification).
     pub device_name: String,
@@ -42,6 +44,7 @@ impl Default for Config {
             mcp_port: 8766,
             device_ip: "192.168.1.50".to_string(),
             device_mac: None,
+            paused_device_macs: Vec::new(),
             device_name: String::new(),
             bridge_name: String::new(),
             codex_path: None,
@@ -52,6 +55,12 @@ impl Default for Config {
 }
 
 impl Config {
+    pub fn device_paused(&self, mac: &str) -> bool {
+        let normalize = bridge_core::platform::model::DeviceIdentity::normalized_mac;
+        let Some(mac) = normalize(mac) else { return false };
+        self.paused_device_macs.iter().any(|paused| normalize(paused).as_ref() == Some(&mac))
+    }
+
     pub fn load(path: &Path) -> Self {
         let mut cfg = std::fs::read_to_string(path)
             .ok()
@@ -137,4 +146,21 @@ pub fn config_path(_root: &Path) -> PathBuf {
     std::env::var("CODEX_STATUS_CONFIG")
         .map(PathBuf::from)
         .unwrap_or_else(|_| bridge_core::paths::data_root().join("bridge-app.json"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn temporary_device_pause_preserves_other_devices_and_old_configuration() {
+        let original: Config = serde_json::from_str("{}").unwrap();
+        assert!(!original.device_paused("70041DD7A340"));
+        let configured: Config = serde_json::from_str(
+            r#"{"paused_device_macs":["70:04:1d:d7:a3:40"]}"#,
+        ).unwrap();
+        assert!(configured.device_paused("70041DD7A340"));
+        assert!(!configured.device_paused("7C4FADB93408"));
+        assert!(!configured.device_paused("invalid"));
+    }
 }

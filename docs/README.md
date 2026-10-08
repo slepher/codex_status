@@ -12,6 +12,7 @@
 | 查某个已结项专项做了什么 | `docs/roadmap/archive-digest-legacy.md` / `archive-digest-recent.md` → 需要细节再进 `docs/history/workflow/<name>/` |
 | 查历史里程碑（0.13–0.18 各轮实机修复） | `docs/history/progress-archive-2026-09-23.md`（≤09-22）、`docs/history/progress-archive-2026-09-25.md`（09-24 及合并过程）、[2026-10-03 归档](history/progress-archive-2026-10-03.md)（09-25 至 10-03 较早记录） |
 | 改协议/模板/渲染 | `docs/generic-display-platform-design.md`（权威架构）+ `AGENTS.md` §关键不变量 |
+| 改固件启动/调度或查 main 胶水层后的模块归属 | [固件模块化计划](../project-workflow/firmware-modularization/plan.md) → [边界与验收](../project-workflow/firmware-modularization/review.md)；代码在 `src/firmware/` |
 | 查 Bridge—设备协议分层、HTTP/BLE 映射与当前差异 | [bridge-device-protocol.md](bridge-device-protocol.md)（2026-10-08 按源码核对；先业务合同，后载体绑定） |
 | 查 HTTP 直达、BLE 交汇及先 ready 后关闭 BLE 的应有行为 | [bridge-device-communication-scenarios.md](bridge-device-communication-scenarios.md)（场景合同）→ [bridge-device-communication-implementation.md](bridge-device-communication-implementation.md)（源码证据与验收边界） |
 | 判断历史协议哪些已过期、哪些遗漏或仍是草案 | [bridge-device-protocol-history-audit.md](bridge-device-protocol-history-audit.md)（定向历史对账，当前源码/现场交叉核对） |

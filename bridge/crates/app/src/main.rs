@@ -205,6 +205,12 @@ fn device_cycle_targets(
         .collect()
 }
 
+fn automatic_devices(ctx: &AppCtx) -> Vec<Value> {
+    ctx.platform.devices().into_iter().filter(|device| {
+        device["device_mac"].as_str().is_some_and(|mac| !ctx.config.device_paused(mac))
+    }).collect()
+}
+
 fn device_status_fresh(mac: &str, status: &CachedDeviceStatus, now: i64, ttl_s: u64) -> bool {
     if let Some(monotonic) = bridge_core::device_clock::monotonic_ms(mac) {
         return status.fetched_mono_ms.is_some_and(|at|
@@ -1213,6 +1219,7 @@ async fn ready_report(axum::extract::State(ctx):axum::extract::State<Arc<AppCtx>
     let boot=report["boot_id"].as_str().unwrap().to_owned();
     let plan_id=reported_plan.unwrap();
     let remaining=Duration::from_millis(report["remaining_ms"].as_u64().unwrap().min(5000));
+    tracing::info!(event="ready_report",device_mac=%mac,plan_id,result="received","device network report received; business proof pending");
     tokio::spawn(async move {
         let lock=platform::delivery_lock(&ctx,&mac);
         let Ok(_guard)=tokio::time::timeout(remaining,lock.lock_owned()).await else{return;};
@@ -1221,6 +1228,7 @@ async fn ready_report(axum::extract::State(ctx):axum::extract::State<Arc<AppCtx>
             bridge_core::device_client::status(&target_ip,&endpoint_token,remaining)).await;
         let Ok(Ok(status))=result else{return;};
         if !report_fact_verified(&status,&mac,&boot,plan_id,&ctx.bridge_id) {return;}
+        tracing::info!(event="ready_report",device_mac=%mac,plan_id,result="verified","device network report authenticated readback verified");
         let now=device_now_secs(&mac).max(0) as u64;
         if platform::service(&ctx).note_device_status_at(&mac,&status,"http",now).is_err() ||
             platform::service(&ctx).note_authenticated_status_at(&mac,&status,now).is_err() {return;}
@@ -1240,7 +1248,7 @@ fn report_fact_verified(status:&Value,mac:&str,boot:&str,plan_id:u64,owner:&str)
         status["power"]["mode"]=="light" &&
         status["power"]["remaining_s"].as_u64().unwrap_or(0)>0 &&
         status["transports"]["http"]["ready"]==true &&
-        status["owner"]["id"]==owner
+        status["owner_id"]==owner
 }
 
 async fn framed_ready_report(
@@ -3148,6 +3156,9 @@ async fn device_cache_loop(ctx: Arc<AppCtx>) {
         let Some(mac) = selected_mac(&ctx) else {
             continue;
         };
+        if ctx.config.device_paused(&mac) {
+            continue;
+        }
         let Some(facts) = device_facts_for(&ctx, &mac) else {
             continue;
         };
@@ -3261,7 +3272,7 @@ async fn device_status_poll_loop(ctx: Arc<AppCtx>) {
         if ctx.status.lock().unwrap().paused {
             continue;
         }
-        for device in platform::service(&ctx).devices() {
+        for device in automatic_devices(&ctx) {
             if ctx.status.lock().unwrap().paused {
                 break;
             }
@@ -3388,7 +3399,7 @@ async fn run_services(ctx: Arc<AppCtx>) {
                         }
                     }
                 }
-                let devices = platform::service(&ctx).devices();
+                let devices = automatic_devices(&ctx);
                 let targets = {
                     let cache = ctx.device_status_cache.lock().unwrap();
                     device_cycle_targets(&devices, &cache, now_secs())
@@ -3437,7 +3448,7 @@ async fn run_services(ctx: Arc<AppCtx>) {
         }
         let udp_request = ctx.udp_ble.swap(false, Ordering::SeqCst);
         let current_is_registered_device = platform::is_registered_device(&ctx);
-        let devices = ctx.platform.devices();
+        let devices = automatic_devices(&ctx);
         let registered_device = device_ble_candidates(&devices, &HashMap::new(), now_secs());
         if !udp_request || current_is_registered_device || !registered_device.is_empty() {
             let candidates = device_ble_candidates(&devices, &last_device_attempt, now_secs());

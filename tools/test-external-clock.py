@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test exact main clock helpers + production driver at a controlled bus seam.
+"""Test exact firmware clock helpers + production driver at a controlled bus seam.
 This covers helper ordering, not Arduino's scheduler/SNTP/Wi-Fi or real RF.
 """
 from pathlib import Path
@@ -9,16 +9,16 @@ import sys
 repo = Path(__file__).resolve().parents[1]
 out = repo / 'artifacts/external-rtc'
 out.mkdir(parents=True, exist_ok=True)
-source = (repo / 'src/main.cpp').read_text()
-start = source.index('static void writeExternalRtcFromSystem()')
-end = source.index('static void writeClockStatus(', start)
+source = (repo / 'src/firmware/clock.cpp').read_text()
+start = source.index('static void writeExternalRtcFromSystem() {')
+end = source.index('void writeClockStatus(', start)
 helpers = source[start:end]
 # Negative control models the old pending-only handoff without production edits.
 if '--pending-only' in sys.argv:
-    start = helpers.index('static void ntpTimeSynced(')
-    end = helpers.index('static bool readExternalRtc(', start)
-    helpers = helpers[:start] + '''static void ntpTimeSynced(struct timeval *) { ntpRtcPending=true; }
-static void flushNtpRtcSync() {
+    start = helpers.index('void ntpTimeSynced(')
+    end = helpers.index('bool readExternalRtc(', start)
+    helpers = helpers[:start] + '''void ntpTimeSynced(struct timeval *) { ntpRtcPending=true; }
+void flushNtpRtcSync() {
     if(!ntpRtcPending) return;
     ntpRtcPending=false;timeSource=TIME_NTP;writeExternalRtcFromSystem();
 }
@@ -41,8 +41,13 @@ static int64_t esp_timer_get_time() {return virtualNow;}
 static bool timeKnown() {return testTime(nullptr)>1600000000;}
 struct Log {void printf(const char *,...) {}} DevLog;
 enum {TIME_NONE=0,TIME_BLE=1,TIME_RTC=2,TIME_EXTERNAL_RTC=3,TIME_NTP=4};
-static uint8_t timeSource=TIME_NONE;
-static ExternalRtc externalRtc;
+struct ClockState {
+    uint8_t timeSource=TIME_NONE;
+    ExternalRtc externalRtc;
+    uint64_t externalRtcLastPollMs=0;
+} state;
+static uint8_t &timeSource=state.timeSource;
+static ExternalRtc &externalRtc=state.externalRtc;
 static std::mutex ntpRtcMux;
 static bool ntpRtcPending=false;
 static uint64_t ntpRtcEpochUs=0,ntpRtcMonotonicUs=0,externalRtcLastPollMs=0;
@@ -78,7 +83,7 @@ int main() {
     assert(!readExternalRtc(true)&&testTime(nullptr)==before);
     auto mono=virtualNow;Wire.registers[2]&=0x7f;
     assert(readExternalRtc(true)&&virtualNow==mono);
-    std::cout<<"main clock helpers: cold restore/phase/fallback/NTP race+30s delay/monotonic isolation passed\n";
+    std::cout<<"firmware clock helpers: cold restore/phase/fallback/NTP race+30s delay/monotonic isolation passed\n";
 }
 '''
 name = 'test-clock-pending-only' if '--pending-only' in sys.argv else 'test-clock'
