@@ -8,12 +8,15 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::HashMap;
 
 use anyhow::{anyhow, bail, Context, Result};
 use crate::platform::model::DeviceIdentity;
 use serde_json::{json, Value};
 
-pub const BUNDLE_CHUNK_BYTES: usize = 4096;
+pub const BUNDLE_CHUNK_BYTES: usize = 4048;
 const MAX_BUNDLE_BYTES: usize = 262_144;
 
 #[derive(Debug)]
@@ -36,15 +39,16 @@ fn write_until(stream: &mut TcpStream, mut bytes: &[u8], deadline: Instant) -> R
 }
 
 /// One HTTP round trip with a bounded body.
-fn request(
+fn transport_request(
     ip: &str,
     method: &str,
     path: &str,
     token: &str,
     body: Option<&[u8]>,
     extra_headers: &[(&str, &str)],
+    content_type: &str,
     timeout: Duration,
-) -> Result<(u16, String)> {
+) -> Result<(u16, Vec<u8>)> {
     anyhow::ensure!(!timeout.is_zero(), "wifi_window_budget");
     let deadline = Instant::now() + timeout;
     let target = if ip.contains(':') {
@@ -59,14 +63,14 @@ fn request(
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     let mut head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: device\r\nConnection: close\r\nAccept: application/json\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: device\r\nConnection: close\r\nAccept: {content_type}\r\n"
     );
     if !token.is_empty() {
         head.push_str(&format!("Authorization: Bearer {token}\r\n"));
     }
     if let Some(bytes) = body {
         head.push_str(&format!(
-            "Content-Type: application/json\r\nContent-Length: {}\r\n",
+            "Content-Type: {content_type}\r\nContent-Length: {}\r\n",
             bytes.len()
         ));
     }
@@ -127,8 +131,123 @@ fn request(
         .nth(1)
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(0);
-    let response_body = String::from_utf8_lossy(&raw[body_start..]).trim().to_string();
-    Ok((status, response_body))
+    Ok((status, raw[body_start..].to_vec()))
+}
+
+#[derive(Default)]
+struct HttpFrameSession { id: [u8; 16], next_no: u64, context: [u8; 16] }
+static FRAME_SESSIONS: OnceLock<Mutex<HashMap<String, Arc<Mutex<HttpFrameSession>>>>> = OnceLock::new();
+static NEXT_OPEN_NONCE: AtomicU64 = AtomicU64::new(1);
+
+fn new_open_nonce() -> [u8; 16] {
+    use sha2::{Digest, Sha256};
+    let counter=NEXT_OPEN_NONCE.fetch_add(1,Ordering::Relaxed);
+    let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default().as_nanos();
+    let digest=Sha256::digest(format!("{}:{now}:{counter}",std::process::id()));
+    digest[..16].try_into().unwrap()
+}
+
+fn frame_session(ip: &str, token: &str) -> Arc<Mutex<HttpFrameSession>> {
+    use sha2::{Digest, Sha256};
+    let key = format!("{ip}:{:x}", Sha256::digest(token.as_bytes()));
+    FRAME_SESSIONS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap()
+        .entry(key).or_insert_with(|| Arc::new(Mutex::new(HttpFrameSession::default()))).clone()
+}
+
+fn frame_operation(path: &str) -> Result<u16> {
+    let path = path.split('?').next().unwrap_or(path);
+    let name = match path {
+        "/api/status" => "status", "/api/data" => "data", "/api/plan" => "plan",
+        "/claim" => "claim",
+        "/api/activate" => "activate", "/api/ota/image" => "ota_image",
+        "/api/bundle/begin" => "bundle_begin", "/api/bundle/chunk" => "bundle_chunk",
+        "/api/bundle/commit" => "bundle_commit",
+        "/api/sync/begin" => "sync_begin", "/api/sync/page" => "sync_page",
+        "/api/sync/ack" => "sync_ack", "/api/sync/complete" => "sync_complete",
+        "/api/wifi/snapshot" => "wifi_snapshot", "/api/wifi/apply" => "wifi_apply",
+        "/api/wifi/result" => "wifi_result", "/api/wifi/result_ack" => "wifi_result_ack",
+        "/api/wifi/command" => "wifi_command",
+        _ => bail!("unregistered device HTTP operation {path}"),
+    };
+    crate::compact_frame::operation(name).context("unregistered frame operation")
+}
+
+fn request(
+    ip: &str, _method: &str, path: &str, token: &str, body: Option<&[u8]>,
+    extra_headers: &[(&str, &str)], timeout: Duration,
+) -> Result<(u16, String)> {
+    use crate::compact_frame::{Header, CONTENT_TYPE, HEADER_LEN, MAX_HTTP_FRAME};
+    let op = frame_operation(path)?;
+    let session = frame_session(ip, token);
+    if op != 1 && op != 19 && session.lock().unwrap().id == [0; 16] {
+        status(ip, token, timeout).context("establish device HTTP session")?;
+    }
+    let mut session = session.lock().unwrap();
+    let opening = op == 1 || (op == 19 && session.id == [0; 16]);
+    anyhow::ensure!(opening || session.id != [0; 16], "device HTTP session is not established");
+    let number = session.next_no.checked_add(1).context("HTTP request number exhausted")?;
+    session.next_no = number;
+    let payload = if opening && op == 19 { br#"{"open":true}"#.as_slice() }
+        else { body.unwrap_or(b"{}") };
+    anyhow::ensure!(payload.len() + HEADER_LEN <= MAX_HTTP_FRAME, "device HTTP frame exceeds 4096 bytes");
+    let header = Header { kind: 0, op, result: 0,
+        payload_len: payload.len().try_into().context("HTTP payload too large")?,
+        session: if opening { new_open_nonce() } else { session.id },
+        request_no: number, context: if opening { [0; 16] } else { session.context } };
+    let mut frame = header.encode().map_err(anyhow::Error::msg)?.to_vec();
+    frame.extend_from_slice(payload);
+    let (status, response) = transport_request(ip, "POST", path, token, Some(&frame),
+        extra_headers, CONTENT_TYPE, timeout)?;
+    if status == 401 && op != 4 { return Err(HttpStatus(401).into()); }
+    let (ack, bytes) = Header::decode(&response, MAX_HTTP_FRAME)
+        .map_err(|e| anyhow!("device protocol mismatch: {e}; update Bridge and device software"))?;
+    if status == 409 && serde_json::from_slice::<Value>(bytes).ok()
+        .is_some_and(|reply|reply["error"]=="session") {
+        session.id = [0;16];
+        return Err(anyhow!(if op == 19 {"device_http_session_expired"}
+            else {"device_http_session_expired; query original business transaction"}));
+    }
+    anyhow::ensure!(ack.kind == 1 && ack.op == op && ack.request_no == number &&
+        (opening || ack.session == session.id), "device HTTP response identity mismatch");
+    if opening && status == 200 && ack.result == 0 {
+        anyhow::ensure!(ack.session != [0; 16], "device HTTP session missing");
+        session.id = ack.session;
+        session.context = [0; 16];
+    }
+    if status == 200 && ack.result == 0 {
+        if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
+            if let Some(ctx) = value["active_context_id"].as_str() {
+                if ctx.len() == 16 && ctx.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    session.context.copy_from_slice(ctx.as_bytes());
+                }
+            }
+        }
+    }
+    Ok((status, std::str::from_utf8(bytes).context("device frame payload UTF-8")?.to_owned()))
+}
+
+/// Low-level framed exchange for diagnostics and same-source protocol tests.
+/// It shares the production session and request numbering with business calls.
+pub fn raw_frame_request(ip: &str, path: &str, token: &str, body: &[u8],
+                         timeout: Duration) -> Result<(u16, Vec<u8>)> {
+    let response = request(ip, "POST", path, token, Some(body), &[], timeout);
+    let (status, payload) = match response {
+        Err(error) if frame_operation(path).ok()==Some(19) &&
+            error.to_string()=="device_http_session_expired" =>
+            request(ip, "POST", path, token, Some(body), &[], timeout)?,
+        result => result?,
+    };
+    Ok((status, payload.into_bytes()))
+}
+
+/// Explicit owner operation. The endpoint token binds the HTTP frame session;
+/// the separately negotiated device token gates the claim itself.
+pub fn claim(ip: &str, endpoint_token: &str, device_token: &str,
+             body: &Value, timeout: Duration) -> Result<(u16, String)> {
+    let payload = serde_json::to_vec(body)?;
+    request(ip, "POST", "/claim", endpoint_token, Some(&payload),
+        &[("X-Device-Token",device_token)], timeout)
 }
 
 fn post_json(ip: &str, path: &str, token: &str, body: &Value, timeout: Duration) -> Result<Value> {
@@ -236,9 +355,20 @@ fn safe_error_category(error: &anyhow::Error) -> &'static str {
 
 /// Authenticated Status read: the only authoritative device state.
 pub fn status(ip: &str, token: &str, timeout: Duration) -> Result<Value> {
+    status_mode(ip, token, timeout, false)
+}
+
+/// Stable 900 s observation. The active context identifies an unchanged
+/// device-authenticated data contract; a changed context requires a full read.
+pub fn status_compact(ip: &str, token: &str, timeout: Duration) -> Result<Value> {
+    status_mode(ip, token, timeout, true)
+}
+
+fn status_mode(ip: &str, token: &str, timeout: Duration, compact: bool) -> Result<Value> {
     let started = Instant::now();
     tracing::info!(event = "send", operation = "/api/status", "device HTTP request");
-    let response = request(ip, "GET", "/api/status", token, None, &[], timeout);
+    let projection = compact.then_some(br#"{"compact":true}"#.as_slice());
+    let response = request(ip, "POST", "/api/status", token, projection, &[], timeout);
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let (status, body) = match response {
         Ok(response) => response,
@@ -276,7 +406,11 @@ pub fn status(ip: &str, token: &str, timeout: Duration) -> Result<Value> {
 pub fn ota_image(ip: &str, token: &str, mac: &str, image_bytes: usize, timeout: Duration) -> Result<Value> {
     let expected_mac = DeviceIdentity::normalized_mac(mac).context("invalid OTA target MAC")?;
     let path = format!("/api/ota/image?image_bytes={image_bytes}");
-    let (status, body) = request(ip, "GET", &path, token, None, &[], timeout)?;
+    let (status, body) = match request(ip, "GET", &path, token, None, &[], timeout) {
+        Err(error) if error.to_string() == "device_http_session_expired" =>
+            request(ip, "GET", &path, token, None, &[], timeout)?,
+        result => result?,
+    };
     if status != 200 { bail!("device /api/ota/image HTTP {status}"); }
     let mut image: Value = serde_json::from_str(&body).context("OTA image JSON")?;
     let reported_mac = image["device_mac"].as_str()
@@ -401,7 +535,7 @@ pub fn install_bundle(
     if payload.is_empty() || payload.len() > MAX_BUNDLE_BYTES {
         bail!("bundle payload size {} out of range", payload.len());
     }
-    let chunk_bytes = chunk_bytes.clamp(256, 16 * 1024);
+    let chunk_bytes = chunk_bytes.clamp(256, BUNDLE_CHUNK_BYTES);
     let (nonce, device_mac) = session_nonce(ip, token, expected_mac, timeout)?;
     let content_crc = format!("{:08x}", crc32fast::hash(payload));
     let bundle: Value = serde_json::from_slice(payload).context("bundle JSON")?;
@@ -508,35 +642,40 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap().to_string();
             let server = thread::spawn(move || {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut request = Vec::new();
-                let mut chunk = [0; 1024];
-                loop {
-                    let count = stream.read(&mut chunk).unwrap();
-                    if count == 0 {
-                        break;
-                    }
-                    request.extend_from_slice(&chunk[..count]);
-                    if let Some(head_end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
-                        let header = String::from_utf8_lossy(&request[..head_end]);
-                        let content_len = header.lines().find_map(|line| {
-                            let (name, value) = line.split_once(':')?;
-                            name.eq_ignore_ascii_case("Content-Length")
-                                .then(|| value.trim().parse::<usize>().ok())
-                                .flatten()
-                        }).unwrap_or(0);
-                        if request.len() >= head_end + 4 + content_len {
-                            break;
+                for opening in [true,false] {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut request = Vec::new();
+                    let mut chunk = [0; 1024];
+                    let start = loop {
+                        let count = stream.read(&mut chunk).unwrap();
+                        if count == 0 { panic!("incomplete HTTP frame"); }
+                        request.extend_from_slice(&chunk[..count]);
+                        if let Some(head_end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                            let header = String::from_utf8_lossy(&request[..head_end]);
+                            let content_len = header.lines().find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("Content-Length")
+                                    .then(|| value.trim().parse::<usize>().ok()).flatten()
+                            }).unwrap_or(0);
+                            if request.len() >= head_end + 4 + content_len { break head_end + 4; }
                         }
+                    };
+                    let (frame, body) = crate::compact_frame::Header::decode(&request[start..],4096).unwrap();
+                    assert_eq!(frame.op==1,opening);
+                    if frame.op==14 {
+                        let body:Value=serde_json::from_slice(body).unwrap();
+                        assert_eq!(body["session_nonce"],"snapshot-test-nonce");
                     }
+                    let code = if opening { if status==401 {401}else{200} } else {status};
+                    let text = if opening {r#"{"device_mac":"AABBCCDDEEFF","session_nonce":"snapshot-test-nonce"}"#} else {&payload};
+                    let header=crate::compact_frame::Header{kind:1,op:frame.op,result:if code>=400 {2}else{0},
+                        payload_len:text.len() as u16,session:[7;16],request_no:frame.request_no,context:frame.context};
+                    let mut reply=header.encode().unwrap().to_vec(); reply.extend_from_slice(text.as_bytes());
+                    let response = format!("HTTP/1.1 {code} Test\r\nContent-Type: application/vnd.codex-status.frame\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",reply.len());
+                    stream.write_all(response.as_bytes()).unwrap();
+                    stream.write_all(&reply).unwrap();
+                    if status==401 {break;}
                 }
-                if String::from_utf8_lossy(&request).contains("POST /api/wifi/snapshot") {
-                    let start=request.windows(4).position(|w|w==b"\r\n\r\n").unwrap()+4;
-                    let body:Value=serde_json::from_slice(&request[start..]).unwrap();
-                    assert_eq!(body["session_nonce"],"snapshot-test-nonce");
-                }
-                let response = format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}", payload.len());
-                stream.write_all(response.as_bytes()).unwrap();
             });
         (address, server)
     }
@@ -625,14 +764,33 @@ mod tests {
             let address = listener.local_addr().unwrap().to_string();
             let server = thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut buffer = [0u8; 1024];
-                let count = stream.read(&mut buffer).unwrap();
-                let request = String::from_utf8_lossy(&buffer[..count]);
-                assert!(request.starts_with("GET /api/ota/image?image_bytes=1024 HTTP/1.1"));
+                let mut buffer = Vec::new();
+                let mut chunk = [0u8; 1024];
+                let start = loop {
+                    let count = stream.read(&mut chunk).unwrap();
+                    assert!(count > 0,"incomplete OTA request frame");
+                    buffer.extend_from_slice(&chunk[..count]);
+                    if let Some(head_end)=buffer.windows(4).position(|w|w==b"\r\n\r\n") {
+                        let headers=String::from_utf8_lossy(&buffer[..head_end]);
+                        let content_len=headers.lines().find_map(|line| {
+                            let (name,value)=line.split_once(':')?;
+                            name.eq_ignore_ascii_case("Content-Length")
+                                .then(||value.trim().parse::<usize>().ok()).flatten()
+                        }).unwrap_or(0);
+                        if buffer.len()>=head_end+4+content_len {break head_end+4;}
+                    }
+                };
+                let request = String::from_utf8_lossy(&buffer);
+                assert!(request.starts_with("POST /api/ota/image?image_bytes=1024 HTTP/1.1"));
                 assert!(request.contains("Authorization: Bearer secret-token\r\n"));
                 let body = format!(r#"{{"device_mac":"{reported}","image_bytes":1024,"sha256":"abc"}}"#);
-                let reply = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
-                stream.write_all(reply.as_bytes()).unwrap();
+                let (frame,_) = crate::compact_frame::Header::decode(&buffer[start..],4096).unwrap();
+                assert_eq!(frame.op,19);
+                let header=crate::compact_frame::Header{kind:1,op:19,result:0,
+                    payload_len:body.len() as u16,session:[7;16],request_no:frame.request_no,context:frame.context};
+                let mut bytes=header.encode().unwrap().to_vec();bytes.extend_from_slice(body.as_bytes());
+                let reply = format!("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.codex-status.frame\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len());
+                stream.write_all(reply.as_bytes()).unwrap();stream.write_all(&bytes).unwrap();
             });
             let result = ota_image(&address, "secret-token", "AABBCCDDEEFF", 1024, Duration::from_secs(2));
             server.join().unwrap();

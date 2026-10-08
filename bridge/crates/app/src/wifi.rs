@@ -340,6 +340,10 @@ pub async fn view(ctx: &AppCtx, mac: &str, refresh: bool) -> Result<Value, Strin
 }
 
 async fn current_host(ctx:&AppCtx) -> Value {
+    #[cfg(test)]
+    if let Ok(host)=std::env::var("CODEX_STATUS_TEST_HOST_WIFI") {
+        return serde_json::from_str(&host).expect("synthetic test host network");
+    }
     // CoreLocation needs a live GUI main loop. Headless test contexts have none.
     if ctx.app_handle.get().is_none(){return json!({"state":"unavailable","networks":[]});}
     tokio::task::spawn_blocking(||host_wifi::read(false)).await.unwrap_or(Value::Null)
@@ -412,13 +416,6 @@ pub async fn prepare_connection(ctx:&AppCtx,mac:&str,link:&mut bridge_ble::Devic
             queue_current_recovery(ctx,mac,&state,target,crate::device_now_secs(mac).max(0) as u64,physical_window);
         }
     }
-}
-/// Read one matched row's connection result; never fetch the full scheme.
-pub async fn refresh_connection(ctx: &AppCtx,mac:&str,link:&mut bridge_ble::DeviceConnection) {
-    let state=platform::service(ctx).wifi_state(mac);
-    let Some(connection)=state.connection.as_ref() else{return;};
-    let Some(target)=state.matching_target(&connection.host_ssid).filter(|_|connection.local_revision==state.local_revision) else{return;};
-    if let Ok(reply)=link.command("wifi_match",target_query(target)).await {note_match(ctx,mac,target,&reply);}
 }
 pub fn http_ready(ctx:&AppCtx,mac:&str) {
     let state=platform::service(ctx).wifi_state(mac);
@@ -510,12 +507,27 @@ pub async fn automatic_on_link(ctx: &AppCtx,mac:&str,link:&mut bridge_ble::Devic
         host_wifi::require_same_network(&contact_host,&fresh)?;
         let Ok(owner)=link.command("wifi_owner",json!({})).await else{return Ok(());};
         if owner["owner_id"].as_str().is_some_and(|id|!id.is_empty()&&id!=ctx.bridge_id){connection.state="occupied".into();let _=platform::service(ctx).wifi_note_connection(mac,connection);return Ok(());}
-        connection.attempts+=1;connection.next_attempt_at=now+60;connection.state="connecting".into();connection.http_ready=false;
-        if platform::service(ctx).wifi_note_connection(mac,connection.clone()).is_err(){return Ok(());}
         if link.info["wifi_management"]==3 {
-            if let Ok(job)=platform::service(ctx).wifi_queue_control(mac,&ctx.bridge_id,"activate",json!({"network_id":target.network_id,"version":reply["version"]}),now) {unified_on_link(ctx,mac,link,budget,Some(&job.job_id)).await;}
+            let job=match svc.wifi_queue_control(mac,&ctx.bridge_id,"activate",json!({"network_id":target.network_id,"version":reply["version"]}),now) {
+                Ok(job)=>job,
+                Err(error)=>{let code=error.to_string();connection.error=Some(code.clone());
+                    svc.wifi_note_connection(mac,connection).map_err(|_|"persistence_failed".to_owned())?;return Err(code);}
+            };
+            let was_sent=job.sent;
+            unified_on_link(ctx,mac,link,budget,Some(&job.job_id)).await;
+            if !was_sent {
+                let current=svc.wifi_state(mac).jobs.into_iter().find(|j|j.job_id==job.job_id).ok_or("wifi_job_not_found")?;
+                if !current.sent {
+                    let code=current.error_code.unwrap_or("wifi_not_dispatched".into());connection.error=Some(code.clone());
+                    svc.wifi_note_connection(mac,connection).map_err(|_|"persistence_failed".to_owned())?;return Err(code);
+                }
+                connection.attempts+=1;connection.next_attempt_at=now+60;connection.state="connecting".into();connection.http_ready=false;connection.error=None;
+                svc.wifi_note_connection(mac,connection).map_err(|_|"persistence_failed".to_owned())?;
+            }
             return Ok(());
         }
+        connection.attempts+=1;connection.next_attempt_at=now+60;connection.state="connecting".into();connection.http_ready=false;
+        svc.wifi_note_connection(mac,connection.clone()).map_err(|_|"persistence_failed".to_owned())?;
         match link.command("wifi_activate",json!({"network_id":target.network_id,"version":reply["version"]})).await {
             Ok(result) if result["ok"]==true => {},
             Ok(result) => {connection.state="connection_failed".into();connection.error=Some(result["error"].as_str().filter(|e|e.len()<64&&e.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'_')).unwrap_or("wifi_rejected").into());let _=platform::service(ctx).wifi_note_connection(mac,connection);},

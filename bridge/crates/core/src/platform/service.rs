@@ -2284,7 +2284,7 @@ impl PlatformService {
             // BLE's existing context/active digest identifies the installed
             // immutable contract. A new context or active requires a fresh HTTP
             // field table; never guess it from local templates.
-            None if transport == "ble" => record.data_contract.clone().filter(|table|
+            None if transport == "ble" || status["status_projection"] == "compact" => record.data_contract.clone().filter(|table|
                 table.template_id == reported &&
                 record.observed.active_context_id.as_deref() ==
                     status["active_context_id"].as_str()),
@@ -3488,8 +3488,11 @@ mod tests {
         status.as_object_mut().unwrap().remove("data_contract");
         svc.note_device_status_at(mac, &status, "ble", 104).unwrap();
         assert_eq!(svc.device_get(mac).unwrap()["data_contract"], before);
+        status["status_projection"] = json!("compact");
+        svc.note_device_status_at(mac, &status, "http", 104).unwrap();
+        assert_eq!(svc.device_get(mac).unwrap()["data_contract"], before);
         status["active_context_id"] = json!("ctx-b");
-        svc.note_device_status_at(mac, &status, "ble", 105).unwrap();
+        svc.note_device_status_at(mac, &status, "http", 105).unwrap();
         assert!(svc.device_get(mac).unwrap()["data_contract"].is_null());
         assert_eq!(svc.next_delivery(mac, true, 105)["decision"], "waiting_for_device_contract");
         assert_eq!(svc.plan_for_rendezvous(mac, 105, "rendezvous", 0).unwrap().mode, PlanMode::Light);

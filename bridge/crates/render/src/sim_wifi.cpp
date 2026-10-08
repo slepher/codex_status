@@ -37,6 +37,9 @@ extern "C" int codex_sim_wifi_poll(uint64_t now, const char *peer, uint32_t gene
     return running ? 1 : 0;
 }
 extern "C" void codex_sim_wifi_storage_failure(int fail) { testNvsFail = fail != 0; }
+extern "C" void codex_sim_wifi_constrain(uint64_t now,uint64_t until,int ownerAllowed) {
+    wifiSetupConstrain(now,until,ownerAllowed!=0);
+}
 
 extern "C" void codex_sim_wifi_legacy(const char *json) { simWifiLegacy = json; }
 
@@ -56,6 +59,16 @@ extern "C" int codex_sim_wifi_read_page(const char *input,const char *peer,uint3
 
 extern "C" int codex_sim_wifi_storage_status(char *out,int cap) {
     JsonDocument doc;wifiSchemesStorageStatus(doc.to<JsonObject>());
+    String response;serializeJson(doc,response);if(response.length()>=(size_t)cap)return -2;
+    memcpy(out,response.c_str(),response.length()+1);return response.length();
+}
+
+// Test-only RF observation: never export credential bytes.
+extern "C" int codex_sim_wifi_observe(char *out,int cap) {
+    JsonDocument doc;doc["begins"]=WiFi.begins;doc["ssid"]=WiFi.SSID();
+    doc["connected"]=WiFi.status()==WL_CONNECTED;doc["has_ip"]=!(WiFi.localIP()==IPAddress(0,0,0,0));
+    doc["busy"]=running;doc["stage"]=stage;doc["error"]=error;
+    doc["candidate_credentials_used"]=running && WiFi.SSID()==String(candidate.ssid) && WiFi.psk()==String(candidate.password);
     String response;serializeJson(doc,response);if(response.length()>=(size_t)cap)return -2;
     memcpy(out,response.c_str(),response.length()+1);return response.length();
 }

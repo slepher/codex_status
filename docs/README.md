@@ -12,6 +12,10 @@
 | 查某个已结项专项做了什么 | `docs/roadmap/archive-digest-legacy.md` / `archive-digest-recent.md` → 需要细节再进 `docs/history/workflow/<name>/` |
 | 查历史里程碑（0.13–0.18 各轮实机修复） | `docs/history/progress-archive-2026-09-23.md`（≤09-22）、`docs/history/progress-archive-2026-09-25.md`（09-24 及合并过程）、[2026-10-03 归档](history/progress-archive-2026-10-03.md)（09-25 至 10-03 较早记录） |
 | 改协议/模板/渲染 | `docs/generic-display-platform-design.md`（权威架构）+ `AGENTS.md` §关键不变量 |
+| 查 Bridge—设备协议分层、HTTP/BLE 映射与当前差异 | [bridge-device-protocol.md](bridge-device-protocol.md)（2026-10-08 按源码核对；先业务合同，后载体绑定） |
+| 查 HTTP 直达、BLE 交汇及先 ready 后关闭 BLE 的应有行为 | [bridge-device-communication-scenarios.md](bridge-device-communication-scenarios.md)（场景合同）→ [bridge-device-communication-implementation.md](bridge-device-communication-implementation.md)（源码证据与验收边界） |
+| 判断历史协议哪些已过期、哪些遗漏或仍是草案 | [bridge-device-protocol-history-audit.md](bridge-device-protocol-history-audit.md)（定向历史对账，当前源码/现场交叉核对） |
+| 查同父目录 Slate 的协议参考及适用边界 | [bridge-device-slate-protocol-comparison.md](bridge-device-slate-protocol-comparison.md)（schema、错误、摘要、生命周期；只读比较） |
 | 改电源/唤醒/占用 | `docs/power-state.md` + `docs/generic-display-platform-design.md` §7 |
 | 改休眠设备的状态页、模板/OTA 延后投递 | `docs/generic-display-platform-design.md` + `project-workflow/sleep-aware-bridge/design.md` / `task.md` |
 | 实施 PowerPlan 与 Data 同轮联合下发 | `project-workflow/bridge-macos/powerplan-data-execution-plan.md`（P1–P6；仅计划，待办 A9） |
@@ -30,6 +34,12 @@
 
 | 文件 | 状态 | 说明 |
 |---|---|---|
+| `bridge-device-protocol.md` | 源码核对说明 | Bridge—设备业务合同、HTTP/BLE wire、认证/事务/会合、能力边界及旧设计差异 |
+| `bridge-device-compact-envelope-design.md` | 提案，未实施 | 固定 48 B 二进制信封、认证会话绑定、结果与上下文语义、HTTP/BLE 映射及迁移边界 |
+| `bridge-device-communication-scenarios.md` | 应有行为 | S01–S14 下层执行场景，独立于具体报文与实现 |
+| `bridge-device-communication-implementation.md` | 源码对照 | 场景的当前处理分支、ready/收尾差异及未验收边界 |
+| `bridge-device-protocol-history-audit.md` | 历史对账 | 过期实现/现场、遗漏合同、待实现方案及验收边界分别记录 |
+| `bridge-device-slate-protocol-comparison.md` | 参考比较 | Slate 的可借鉴原则、已有等价机制与不能照搬的身份/事务/提交语义 |
 | `generic-display-platform-design.md` | **权威** | 通用显示平台现行架构。与它冲突的旧描述一律以它为准 |
 | `power-state.md` | **权威** | 电源状态、身份/发现、占用 claim/lease 语义（§9.1/§9.2/§13.3） |
 | `ble-rendezvous-power-design.md` | 设计已定稿，实现分 6 阶段 | 会合功耗设计；阶段 1/2 已上线，其余见 backlog C4 |
@@ -96,3 +106,5 @@ Fake ROM D/E/F 已结项并归档；下表只列仍需推进的专项。
 - `PROGRESS.md` 只保留**最新现场**；每次里程碑追加一节，超过约 15 KB 就把最旧的节下沉到新的 `docs/history/progress-archive-<date>.md`。
 - 待办只写在 `docs/roadmap/backlog.md`；不要在 `PROGRESS.md`、`AGENTS.md` 或 `status.md` 里另开一份待办清单。
 - 专项完成后：把结论与证据搬进 `PROGRESS.md`，从 backlog 删除该条，专项目录按上面的判据归档。
+
+协议精简及提前结束BLE的新设计，Astra High审核与分阶段实施见 [审核记录](../project-workflow/bridge-macos/bridge-device-compact-protocol-review.md) / [实施计划](../project-workflow/bridge-macos/bridge-device-compact-protocol-implementation-plan.md)；执行规则权威入口为通信场景，编码入口为48 B信封设计，当前实现证据独立保留。

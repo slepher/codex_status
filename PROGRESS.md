@@ -1,5 +1,72 @@
 # Codex Status 项目进度（交接文档）
 
+## 2026-10-08 精简协议实施现场：P0–P5 工作树候选，Fake ROM 验收进行中
+
+- 本轮仅改工作树并做合成测试/Note4构建；**未重启或替换运行 Bridge、未部署或刷写设备、未提交**。运行现场仍以下节 13:55/13:57 为准；此 ROM 是未部署候选。
+- P1–P3：BLE Plan先接纳并可带Data，分项ACK；合法Plan不被Data错误阻断，外层鉴权失败先于owner副作用。Bridge接收设备主动HTTP ready report仅作`report_received` hint，随后经认证设备HTTP回读原MAC/boot/Plan/owner和业务结果。普通BLE结束与已接纳网络工作分离；BLE-only不探测HTTP。ownerTouch不续lease，只有显式claim续约。
+- P4/P5已接生产代码：HTTP/BLE业务路由及/claim采用唯一48 B固定二进制信封，BLE仍按MTU碎片传输；双向认证会话/单调请求号及retired围栏，错误marker/长度/op/context/session拒绝，原业务ID持久查询不由会话缓存代替。HTTP认证开会话使用本次独有16 B客户端打开标识，设备回传独立服务端session；相同打开标识在当前会话内重放受保留结果围栏约束。设备→Bridge报告带独立新会话帧；Bridge 900s精简Status只在合法现成联系机会投递，不延长Data联系、owner或Light。旧handoff及旧业务JSON载体路径已移除；JSON仍为信封内部业务payload。
+- 验证：core 128/128、render 单元9及各集成集共53项、BLE 17/17、app 73/73+2 ignored；两个ignored同源 app→Fake 容量拒绝与诊断归档显式各1/1通过；**Fake bootstrap 57/57通过**。新增同源 C++ `RendezvousProtocol` 接入Fake会合：生产BLE客户端发送正式Plan与开网意图后，DHCP无IP及普通BLE未释放时认证Status均无HTTP ready；IP到位且BLE关闭才ready，原期限到期后rendezvous ready清零。Fake的Wi-Fi连接状态由同源Wi-Fi HAL观测，不再写死ready。跨语言48 B黄金向量、Fake HTTP拒绝/打开标识退休及OTA重启定向测试通过。Windows合成循环HTTP曾因丢ACK旧属性无节流产生15717个loopback TIME_WAIT/socket10048；在BLE未匹配ACK读取加20ms单调期限节流后完整app回归仅约1578个TIME_WAIT且全绿，加入读取次数上限断言。迟到report回读需认证核实真实Light仍有效、HTTP ready、owner精确匹配；app谓词/重复/重启/反向不可达定向测试通过。**仍未完成设备主动report sender→Bridge接收器→认证回读的同一Fake网络闭环**，现有Fake loopback地址不符合生产报告源IPv4非loopback与设备IP匹配校验；不得把分层测试冒充该闭环或硬件RF/NimBLE电量验收。当前候选不得部署。
+- 最新唯一 Note4 `zectrix-note4-b` 构建：版本`0.18.69-note4`，`.pio/build/zectrix-note4-b/firmware.bin` **1,881,312 B**，SHA256 **1BFA8CB990E378E78B3B5247E11D0FF6A7CBE4227815C345416CC8AEC9735F9E**；匹配ELF SHA256 **B78F7158076B527448BBBC04C4266067A4039AA88307CDD27968C7E960DB57A6**；目标marker在bin偏移184728。静态RAM117,804 B、应用Flash1,833,063 B。匹配ELF栈门禁exit0全PASS：BLE dispatcher单帧976/1024 B、抽出迁移helper496/1024 B、最长dispatcher已列本地链3440/4096 B（loopTask8192 B；平台/ISR及动态峰值仍需实机证明）。HTTP完整帧上限4096 B、BLE完整帧8192 B、属性512 B/载荷464 B；原Wi-Fi持久格式未改变，不新增凭据或会话NVS。
+
+## 2026-10-08 Astra High协议审核及实施计划已整理（仅文档）
+
+- 用户指定Astra/high两轮只读审核已完成，第一轮9项与最终复核边界归档 `project-workflow/bridge-macos/bridge-device-compact-protocol-review.md`；实施计划为同目录 `bridge-device-compact-protocol-implementation-plan.md`，待办并入backlog A9，不新增平行任务账本。
+- 已统一场景正文/矩阵为BLE接纳后提前关闭、设备独立认证HTTP report、Bridge真实设备HTTP响应验证；执行详规从48 B信封文档移入场景§6。旧handoff仍作为实现证据，不当新目标。
+- 采用原A9 Plan-first/partial，context完整16字符ASCII无alias、每方向single-flight、HTTP新session与原BLE历史关联分离；复用已有presence客户端/接收端但保留hint语义，不把共享token声明升级为业务ACK。深睡owner默认自然到期，Status/report不续租；ownerTouch当前续lease列入实施修正门禁。
+- 用户补充不维护协议版本历史、不为兼容性过度设计：计划取消旧设备兼容/降级/双协议，Bridge与设备分别更新软件版本；48 B头改固定marker=0xC1，不作为版本协商。阶段性编码仅开发验证，最终唯一协议，软件不匹配明确失败。
+- 计划P0合同、P1联合请求、P2回报、P3生命周期、P4编码、P5调度及资源/故障/实机门禁分开；900秒Status不替代Data机会/诊断同步。尚未实施或执行生产测试/构建/部署，无设备操作，ROM与运行现场沿后续现场节。
+
+## 2026-10-08 换接场景修订：提前结束 BLE，设备主动 HTTP 报告（设计，未实施）
+
+- 用户新方向已纳入 `docs/bridge-device-compact-envelope-design.md` §8；场景文档注明替代前一轮保留BLE直到HTTP ready/handoff的正常顺序，实现对照保留现行源码证据。
+- BLE首份Data+正式Light分项确认后关闭普通BLE，开网accepted与HTTPready分开；设备认证HTTP报告原业务结果及服务地址，Bridge收到后验证设备入站HTTP，再推送下一份Data。15分钟Status与Data/Plan独立，BLE-only不为Status开网，不隐式续owner/Light。
+- 用户确认BLE开网意图携带Bridge可达IP及实例HTTP监听端口，放在载荷、不增加48 B信封；多网卡按目标网络路由选择，临时回报地址绑定认证会话/原请求，设备ready报告反向提供设备服务地址。详见设计§8.3.2，未新增运行端点。
+- 用户进一步确认Bridge请求数据统一分流：BLE可完整完成则交会内获取；需HTTP且离线则交会下发意图、结束普通BLE、设备主动ready通知、Bridge访问设备服务读取。已有HTTP直达，真实认证读取可兼作可达验证，不重复预读；详见设计§8.3.1。
+- Bridge发起HTTP工作等待有限BLE机会后可复用该恢复逻辑；回执丢失、开网失败、反向不可达、过期/重启及未知提交分开处理。新增客户端/接收端/认证与组合提交均未实施；未构建、部署或重启，现场ROM/hash沿下节。
+
+## 2026-10-08 小于 50 B 信封设计已整理（提案，未实施）
+
+- 文档 `docs/bridge-device-compact-envelope-design.md` 定义固定 48 B 二进制信封：8 B 编码/操作/结果/长度、16 B session、8 B request、16 B context。业务载荷、HTTP认证头、BLE分片头另计；不以会话标识替代认证凭据。
+- 保留原owner、Data seq、Plan plan_id、持久事务与结果未知合同；BLE-only不启动HTTP，状态单属性最多464 B载荷。认证会话/上下文绑定、错误路径、迁移及资源验收边界已单列。宿主结构尺寸、大端编码和边界计算通过，尚未实施固件或Bridge、未部署或重启；现场及ROM/hash沿下节。
+
+## 2026-10-08 Bridge Wi-Fi 恢复修复已部署，Note4 实机启用成功（13:55–13:57）
+
+- 用户授权更新 Bridge；修复队列仅安全回收已确认且无需再ACK的终态历史，保留未知提交/待ACK回执，满容量淘汰最旧可退役历史；next_job_seq与设备重放围栏不重置。自动启用入队失败明确返回/记录错误，只有首次实际发送后才扣预算，查询原事务不重复扣除，发送前失败不扣预算。
+- 同源Fake的32条已确认历史测试反转后通过：重开服务且未到TTL也允许第33条，过期历史正常回收；追加32条未知/待ACK保护；真实app/Fake BLE联测容量拒绝返回wifi_job_capacity、attempts=0、RF begin=0。相关回归core18/app6/device-sim8与显式外部Fake联测1（共33）通过；git diff --check通过。保留原Fake状态适配限制及完整调度待办，不因测试通过宣称整个协议已验收。
+- 本工作区隔离构建后替换默认 `bridge/target/debug/bridge-app.exe`；SHA256 **38B7CE11F6C9A940481420DC6AEF7D1C57219915C8CDD9296DEDED41DB9FCDDE**。已核对任务/路径/端口，先停watchdog与计划任务，保留data并私有备份；13:55:13计划任务启动主PID30392，health204、8765/8766同PID。备份 `artifacts/bridge-before-wifi-fix-20261008-135500.exe` / `bridge-before-wifi-fix-20261008-135500.private.zip`；未直接改生产state、未提交。
+- 正常MCP应用服务 `use_current` 按当前主机wd21-wo/本地revision1显式重试home；13:56:04 BLE发送原协议新事务 **w3_000000000000004a** activate/home/v8，13:56:06 handoff applied，设备连wd21-la/IP192.168.3.177。MCP status 查询同事务后completed/operation_result/error null/receipt_ack_pending=false，connection connected/http_ready=true/attempts0；历史从32正常回收到25，并非手工删除。
+- 13:57:34直接认证HTTP（-NoProxy）再次核对MAC **7C:4F:AD:B9:34:08**、FW **0.18.69-note4**、wifi_connected=true/RSSI -20、http.ready=true/IP192.168.3.177，boot_id4fc7df6e93b3ac8ae099f560e054ee17/reset_reason8。普通PowerShell请求一次503，经NoProxy直连成功，不归因成设备拒绝或MAC异常；Bridge日志亦有HTTP200及部分有界超时。本轮无USB/复位/刷机，ROM与SHA沿既有.69记录（artifacts/ble-info-panic-20261007/note4-0.18.69.bin，11990BB19076EF5841A827BA5A9616259759B2485AAA26320AA31771F8A92F73）。已证当前联网与事务完成，长期多轮RF/电池及macOS仍待验。
+- 证据 `artifacts/wifi-bridge-{deployment,retry,recovery-proof}-20261008.json` / `wifi-after-update-view-20261008.json` / `wifi-bridge-update-{tests,app-test,build}-20261008.log`；修复与复现记录 `project-workflow/bridge-macos/wifi-activate-fake-20261008-plan.md`。剩余工作归backlog B6。
+
+## 2026-10-08 Fake ROM 已复现 Wi-Fi 恢复阻挡链（未部署修复）
+
+- 复现使用同源 `wifi_setup.cpp`、真实 Bridge core/HTTP 客户端与 app `automatic_on_link`/BLE 客户端；隔离 target `bridge/target-note4-deploy`、临时数据、LAA MAC `0200000000D1`/`D2`/`D3` 与合成凭据，不接入真实设备或生产 Bridge。
+- **容量问题已运行证明**：32 次 Fake ROM activate 均完成、设备回执退役、Bridge ACK 标记清除；重开 PlatformService 并推进到超出 24h TTL，第 33 次仍报 `wifi_job_capacity`。已确认历史永久占用队列是实现 bug，非仍有未知提交必须保留的正常情况。
+- **未发即耗尽已联测证明**：app 测试预置相同的已确认历史，再经同源 Fake ROM BLE 的真实 match/owner 查询进入自动启用；三轮容量拒绝均返回 Ok、attempts 递增至 3，Fake RF 的 begin 计数始终 0，下一轮返回 `wifi_retry_exhausted`。历史预置本身使用合成 committed 回复；前一独立测试已通过真实设备回执产生全部 32 条，不混称本测试从零 RF 完成 32 次。
+- **设备状态机对照**：save 本身 begin=0；合法 activate 的延迟 poll 调用 begin=1、目标 SSID/候选凭据匹配；无 IP 保持待确认，25s 期限后 durable rejection `dhcp_timeout`；注入关联+IP 才 committed；同 ID 重放不增加 begin；直接调用生产窗口约束返回 `window_closed`、关闭连接但保留 active=home。已选配置不等于当前联网。尚未复现合法 activate 完全不执行，不据此证明 ESP32 RF/整个 main.cpp 生命周期无 bug。
+- **Fake 边界**：通用 `/api/status` 的 wifi_connected/http.ready 写死 true，失败注入下与生产事务待确认相矛盾；新增仅控制 token 可读的 RF 计数/SSID/阶段/凭据匹配布尔观测及窗口约束注入，不输出密码、不修改固件状态机。Fake 依旧不模拟真实 AP、DHCP、全 main.cpp 电源联动；无必要 HTTP 工作仍重复新 activate 的调度路径尚未完成复现。
+- 新增复现为刻画现有错误的断言，测试通过不表示错误已修复。Wi-Fi相关回归 app 6/6、device-sim 8/8，另 app 显式外部Fake联测 1/1 通过，git diff --check 通过；修正一个按旧4条存储容量构造拒绝的测试夹具，保留整批回滚/持久回执验收。输出 `artifacts/wifi-activate-fake-{device,bridge,regression}-20261008.log`，命令/局限见 `project-workflow/bridge-macos/wifi-activate-fake-20261008-plan.md`。生产 Bridge/FW/运行 data 未改，ROM 路径/hash 沿下节 .69 现场；未刷机、重启或提交。
+
+## 2026-10-08 Note4 Wi-Fi再次离线：已完成任务32条堵住重连（只读诊断）
+
+- **追加Bridge改网日志审计**：最近可证保存10-06 03:42:25 BLE wifi_save/w3_23（home→wd21-la，随后v8）；10-07 17:56–19:01共24次BLE wifi_activate，持久jobs全部home/v8/completed，无切CMCC或改SSID/密码证据。最后w3_49于19:01:08发送，handoff applied/19:01:53完成；19:02:25 Plan2045 ACK0s、随后sync complete及HTTP离线。此后至10-08本次核查无新BLE Wi-Fi写/启用、无HTTP/api/wifi/command发送，只有查询/claim/Plan等。HTTP统一路径日志缺业务op/部分request ID，不能单看200判定改网；对照事务得上述结论，不宣称审计其他Bridge。详见诊断记录，未新发设备命令/修改代码/部署。
+
+- **用户纠正后补USB与设备配置证据（12:21）**：初轮任务容量只能解释恢复阻挡，不能单独作设备选错网/密码失败根因。COM5 USB Composite MAC7C4FADB93408，原生不改DCB/DTR/RTS采集status/log/diag/timers；.69/ota_1/WIFI OFF/ip-/RSSI0、日志明确awaiting Bridge-selected network。追加串口pair打开120s原BLE窗口，无新配对/配置改写/手动activate/claim。实时加密原绑定wifi_active=home/v8/r39，带元数据与密码摘要的wifi_match=matches true/active true/connected false/stage saved，无失败reason；目标wd21-wo→wd21-la。已证配置与当前Bridge缓存一致、当前未连接等待启用，不证明路由器此刻接受密码或初次RF掉线原因。完整状态/配置分页读超时不混称Wi-Fi失败；成功帧证据artifacts/wifi-device-match-proof-20261008.json，串口原文wifi-usb{-contact}-20261008.private.log，详见诊断记录。未构建/复位/刷机/重启Bridge；样本无ROM reset/panic但未取得完整前后boot证明。
+
+- **明确阻挡**：运行Wi-Fi jobs恰好32条，全部completed/may_have_committed=true/receipt_ack_pending=false。queue清理无条件保留may_have_committed，容量32返回wifi_job_capacity；automatic_on_link先扣attempts再用if let Ok吞掉入队错误。三次未派发activate的本地失败使attempts3/retry_exhausted，error仍null。已确认历史永久保留与入队失败误计预算为独立问题，不能当昨天成功HTTP归零修复未部署。
+- **现场**：电脑wd21-wo/192.168.3.111，Bridge health204/exe SHA256 BDC2818BA2EF3DB65482AF94230B366CFD89C512967E5D463C654468EB158F52与既有部署相同；Note4登记7C4FADB93408/192.168.3.177公开状态超时。最后完整HTTP认证10-07 19:02:25为.69/reset8/Wi-Fi连通，其后plan2045 ACK0s，三次120s窗口HTTP未恢复且日志无新activate发送；10-08 12:12仍有BLE认证/claim/plan2334 ACK147s。当前完整设备状态属旧缓存，不冒充实时RF/新panic证明。
+- **证据/边界**：`project-workflow/bridge-macos/wifi-diagnostic-20261008.md`。仅读取网络/MCP被动视图/运行state脱敏统计/日志与源码；未改运行data/凭据/代码，未串口复位、重启、刷ROM或提交。运行固件ROM/hash沿下节.69记录。安全退役历史、明确容量反馈及未派发不扣预算/实机恢复待办已入backlog B6。
+
+## 2026-10-08 Bridge—设备协议分层文档已整理
+
+- 用户确认日常联系范围：设备主动提供联系机会；本轮BLE能力/预算可完成则只走BLE，不启动Wi-Fi/HTTP，不进入ready/handoff。确需HTTP的授权工作或缺必要合同才准备HTTP；已有HTTP请求继续直达。该方向已补场景/协议与实现边界，未新增统一交换报文或宣称全调度已符合；本轮仅文档。
+- Slate 只读协议比较：新增 `docs/bridge-device-slate-protocol-comparison.md`，核对同父目录 slate 共享schema、poll/manifest/ETag、HTTP client、错误filter、暂存提交与小智MQTT/WebSocket边界。可参考集中合同、统一错误、分层摘要、按场景缩小工作集及client机会收尾；不直接移植设备pull模型/语音框架。明确trace ID≠幂等事务ID、后端结构化错误≠固件bool全链路反馈、先暂存逐帧提交≠整组A/B原子恢复。MAC无认证重注册转移归属与401清secret不适用于本项目claim/token合同。未改slate、未运行其测试/设备通信，当前协议与代码未变；文档链接/diff check通过。
+- 历史定向对账完成：新增 `docs/bridge-device-protocol-history-audit.md`。区分先关BLE再开网/断链即取消/BOOT-only普通管理/禁密码缓存与创建者只读等过期条款，以及旧8s/20s预算、未部署标题和旧现场；Bundle v3、字体增量草案保留为C1/C5未来方案，不冒充现行。补S15–S20：主机→设备网络映射、按需诊断、保存/启用/HTTP可达分离、有限失败预算与成功归零、冻结准入先读后complete、取消/过期保留未知提交。协议补WFS4序号/回执退役围栏、快照TTL及显式旧槽迁移。源码仍有non-unified兼容取消分支，协议取代不等于兼容退役；完整RF/PM/跨平台矩阵仍未以本轮文档审阅验收。历史原件和backlog待办未批量改写，未运行测试/设备通信。
+- 追加分层：用户要求将下层执行逻辑与具体协议分开。新增 `docs/bridge-device-communication-scenarios.md`（S01–S14 应有行为）及 `docs/bridge-device-communication-implementation.md`（源码符合度与未证明边界）；协议文档只保留载体映射并链接二者。正常交汇转交为保留 BLE→必要时准备 HTTP→认证确认可用→转交确认→关闭普通 BLE；失败/到期有界关闭不冒充成功交接，物理恢复窗口独立管理。已核对固件 local ready 不等于 Bridge 认证 ready；现有 proof/handoff/丢ACK查询/锁释放及有界close 分支存在，未将源码存在当全入口/故障矩阵已验收。本轮未运行测试或实机通信。
+- 文档：`docs/bridge-device-protocol.md`，导航已加入 `docs/README.md`；整理计划及范围见 `project-workflow/bridge-macos/bridge-device-protocol-doc-plan.md`。按当前固件路由、BLE dispatcher、共享决策函数及 Bridge HTTP/GATT 客户端核对。
+- 结论及用户澄清：高层业务合同不按 Wi-Fi/BLE 分叉；Data/Plan、Wi-Fi 控制及 claim 核心共享。Bundle/OTA/模板 Activate 使用 HTTP 是正确载体分工；HTTP 已可用且 BLE 未启用时直接通信，不要求开启蓝牙、交汇或 handoff。通道恢复、交汇、载体能力/编码及执行时机属于下层，不据此认定高层未解耦。失败入口是否明确返回独立于载体分工，仍不宣称全链路验收。记录通用命令已拒绝 protocol/rv、Data 请求 seq/ACK data_seq，以及 Wi-Fi HTTP protocol 的兼容例外。
+- 本轮仅文档变更，无构建、重启、设备读写、刷 ROM 或提交；设备与运行 Bridge 现场及 ROM/hash 沿用下节。文档链接与 diff check 已核查；软件/实机验证不由此次文档整理替代，待办仍以 backlog 为准。
+
 ## 2026-10-07 Bridge Wi-Fi连续失败预算修复已部署，实机认证成功归零
 
 - **修复**：成功HTTP此前只改connected而累计attempts不归零，后台认证状态路径也绕过app侧更新，导致正常断网后3次预算永久耗尽。现在统一Connection.confirm_http，并在严格验证MAC/状态序号/大小后的认证HTTP状态处理入口与状态原子持久化；持久化失败回滚，BLE通知/拒绝的状态不清零，requested新意图保留。成功确认后下一轮断网仍有有限3次机会，连续失败继续停止。

@@ -344,8 +344,8 @@ void wifiSetupPoll(uint64_t now, const String &peer, uint32_t generation, bool e
         wifiSetupAbort(failure); return;
     }
     if (deferredSelection && !selectionStarted) {
-        // Wi-Fi must associate while BLE is alive so HTTP can prove readiness
-        // before handoff closes BLE. The existing absolute deadline still wins.
+        // The accepted transaction survives ordinary BLE release. Start RF
+        // only when the main loop has ended the rendezvous BLE exchange.
         selectionStarted = true;
         stage = "connecting";
         if (WiFi.status() != WL_CONNECTED || WiFi.SSID() != String(candidate.ssid)) {

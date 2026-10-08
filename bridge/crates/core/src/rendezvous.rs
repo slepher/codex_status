@@ -2,7 +2,7 @@
 use crate::platform::wifi::Job;
 use std::time::{Duration, Instant};
 
-pub const HTTP_HANDOFF_BUDGET: Duration = Duration::from_secs(30);
+pub const HTTP_PROOF_BUDGET: Duration = Duration::from_secs(30);
 pub const WIFI_WORK_BUDGET: Duration = Duration::from_secs(30);
 pub const CLOSE_BUDGET: Duration = Duration::from_secs(2);
 

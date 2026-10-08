@@ -199,11 +199,37 @@ pub struct Job {
     pub command: Option<Value>,
 }
 impl Job {
+    fn safe_to_retire(&self) -> bool {
+        self.terminal() && !self.receipt_ack_pending && (!self.may_have_committed ||
+            matches!(self.confirmation.as_deref(),Some("durable_receipt"|"operation_result"|"durable_rejection"|"receipt_and_readback"|"verified_post_state")))
+    }
     pub fn terminal(&self) -> bool {
         matches!(self.state.as_str(), "completed" | "cancelled" | "expired" | "failed")
     }
     pub fn runnable(&self, now: u64) -> bool {
         !self.terminal() && self.state != "conflict" && now < self.expires_at && now >= self.next_attempt_at
+    }
+}
+
+#[cfg(test)]
+mod retirement_tests {
+    use super::*;
+    #[test]
+    fn wifi_retirement_preserves_unknown_submissions_and_pending_receipt_acks() {
+        let mut state=WifiState::default();
+        let job=state.queue("0200000000D4","bridge-test","activate",vec!["home".into()],100,"first".into(),BTreeMap::new()).unwrap();
+        let mut template=job;template.state="completed".into();template.sent=true;template.may_have_committed=true;
+        template.confirmation=Some("operation_result".into());template.receipt_ack_pending=true;
+        state.jobs=(0..32).map(|i|{let mut j=template.clone();j.job_id=format!("protected-{i}");j.request_id=j.job_id.clone();
+            if i%2==0{j.state="expired".into();j.confirmation=None;j.receipt_ack_pending=false;}j}).collect();
+        let before=serde_json::to_value(&state.jobs).unwrap();
+        assert!(state.queue("0200000000D4","bridge-test","activate",vec!["home".into()],1_000_000,"next".into(),BTreeMap::new()).unwrap_err().to_string().contains("wifi_job_capacity"));
+        assert_eq!(serde_json::to_value(&state.jobs).unwrap(),before);
+        state.jobs[1].receipt_ack_pending=false;
+        state.queue("0200000000D4","bridge-test","activate",vec!["home".into()],1_000_000,"next".into(),BTreeMap::new()).unwrap();
+        assert_eq!(state.jobs.len(),32);
+        assert!(!state.jobs.iter().any(|j|j.job_id=="protected-1"));
+        assert!(state.jobs.iter().any(|j|j.job_id=="protected-0"));
     }
 }
 impl WifiState {
@@ -276,7 +302,14 @@ impl WifiState {
             return Ok(j.clone());
         }
         if matches!(kind,"sync"|"recovery_save") && self.jobs.iter().any(|j| matches!(j.kind.as_str(),"sync"|"recovery_save") && !j.terminal()) { bail!("wifi_sync_busy"); }
-        self.jobs.retain(|j| !j.terminal() || j.may_have_committed || now.saturating_sub(j.updated_at) < INTENT_TTL_S);
+        self.jobs.retain(|j| !j.safe_to_retire() || now.saturating_sub(j.updated_at) < INTENT_TTL_S);
+        // Keep recent history when possible; confirmed, acknowledged results
+        // must not prevent new work. Unknown submissions and pending ACKs stay.
+        while self.jobs.len() >= 32 {
+            let Some(index)=self.jobs.iter().enumerate().filter(|(_,j)|j.safe_to_retire())
+                .min_by_key(|(_,j)|j.updated_at).map(|(i,_)|i) else{break;};
+            self.jobs.remove(index);
+        }
         if self.jobs.len() >= 32 { bail!("wifi_job_capacity"); }
         let before = self.snapshot.as_ref().map(|s| s.networks.iter().filter(|n| n.writable && selected.contains(&n.network.network_id))
             .map(|n| (n.network.network_id.clone(), n.network.metadata())).collect()).unwrap_or_default();

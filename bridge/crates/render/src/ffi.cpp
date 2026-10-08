@@ -5,6 +5,7 @@
 #include "v2_runtime.h"
 #include "v2_data_command.h"
 #include "v2_plan_command.h"
+#include "rendezvous_protocol.h"
 #include "v2_bundle_command.h"
 #include "v2_activate_command.h"
 #include "v2_claim_command.h"
@@ -26,6 +27,19 @@
 #include <cstdio>
 #include <string>
 #include <vector>
+
+extern "C" int codex_compact_frame_golden(uint8_t *out, int cap) {
+    if (!out || cap < int(COMPACT_FRAME_HEADER + 2)) return 0;
+    CompactFrameHeader header;
+    header.op = 3; header.payloadLen = 2;
+    memcpy(header.session, "0123456789abcdef", 16);
+    header.requestNo = 0x0102030405060708ULL;
+    memcpy(header.context, "0123456789abcdef", 16);
+    if (!compactFrameEncode(header, out)) return 0;
+    out[48] = '{'; out[49] = '}';
+    CompactFrameHeader decoded;
+    return compactFrameDecode(out, 50, decoded, 50) && decoded.requestNo == header.requestNo ? 50 : 0;
+}
 
 SerialClass Serial;
 DevLogger DevLog;
@@ -835,6 +849,23 @@ uint32_t codex_v2_fields_crc(const char *fieldsJson) {
     return v2DataFieldsCrc(fields);
 }
 
+void *codex_rv_new(void) { return new RendezvousProtocol(); }
+void codex_rv_free(void *p) { delete (RendezvousProtocol *)p; }
+void codex_rv_begin(void *p, uint64_t now, uint32_t advertise_ms) {
+    ((RendezvousProtocol *)p)->begin(now, advertise_ms);
+}
+void codex_rv_connected(void *p, uint64_t now) { ((RendezvousProtocol *)p)->connected(now); }
+void codex_rv_plan(void *p) { ((RendezvousProtocol *)p)->planReceived(); }
+void codex_rv_await_network(void *p, uint64_t now, uint64_t legal_until) {
+    ((RendezvousProtocol *)p)->awaitNetworkStart(now, legal_until);
+}
+void codex_rv_admit_http(void *p, uint64_t now, uint64_t legal_until) {
+    ((RendezvousProtocol *)p)->admitHttp(now, legal_until);
+}
+void codex_rv_http_ready(void *p) { ((RendezvousProtocol *)p)->httpReady(); }
+int codex_rv_phase(void *p) { return (int)((RendezvousProtocol *)p)->phase(); }
+uint64_t codex_rv_deadline(void *p) { return ((RendezvousProtocol *)p)->deadline(); }
+int codex_rv_tick(void *p, uint64_t now) { return ((RendezvousProtocol *)p)->tick(now); }
 void *codex_v2_plan_new(void) { return new V2PlanState(); }
 void codex_v2_plan_free(void *p) { delete (V2PlanState *)p; }
 

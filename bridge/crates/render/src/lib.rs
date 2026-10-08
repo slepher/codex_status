@@ -389,6 +389,17 @@ pub const ROW_BYTES: usize = (WIDTH as usize + 7) / 8;
 pub const BUF_LEN: usize = ROW_BYTES * HEIGHT as usize;
 
 extern "C" {
+    fn codex_rv_new() -> *mut std::ffi::c_void;
+    fn codex_rv_free(p:*mut std::ffi::c_void);
+    fn codex_rv_begin(p:*mut std::ffi::c_void,now:u64,advertise_ms:u32);
+    fn codex_rv_connected(p:*mut std::ffi::c_void,now:u64);
+    fn codex_rv_plan(p:*mut std::ffi::c_void);
+    fn codex_rv_await_network(p:*mut std::ffi::c_void,now:u64,legal_until:u64);
+    fn codex_rv_admit_http(p:*mut std::ffi::c_void,now:u64,legal_until:u64);
+    fn codex_rv_http_ready(p:*mut std::ffi::c_void);
+    fn codex_rv_phase(p:*mut std::ffi::c_void)->i32;
+    fn codex_rv_deadline(p:*mut std::ffi::c_void)->u64;
+    fn codex_rv_tick(p:*mut std::ffi::c_void,now:u64)->i32;
     fn codex_sim_sync_append_wake(p: *mut std::ffi::c_void, json: *const c_char) -> c_int;
     fn codex_sim_sync_history(p: *mut std::ffi::c_void, since: u32, limit: u32, out: *mut c_char, cap: c_int) -> c_int;
 
@@ -401,7 +412,9 @@ extern "C" {
     fn codex_sim_wifi_read_page(input:*const c_char,peer:*const c_char,generation:u32,text:*const c_char,out:*mut c_char,cap:c_int)->c_int;
     fn codex_sim_wifi_poll(now: u64, peer: *const c_char, generation: u32, encrypted: c_int, outcome: c_int) -> c_int;
     fn codex_sim_wifi_storage_failure(fail: c_int);
+    fn codex_sim_wifi_constrain(now:u64,until:u64,owner_allowed:c_int);
     fn codex_sim_wifi_storage_status(out:*mut c_char,cap:c_int)->c_int;
+    fn codex_sim_wifi_observe(out:*mut c_char,cap:c_int)->c_int;
 
     #[cfg(test)]
     fn codex_sync_core_check() -> c_int;
@@ -520,6 +533,7 @@ extern "C" {
     fn codex_rgn_on_full() -> c_int;
     fn codex_rgn_dump(out: *mut c_char, out_len: c_int) -> c_int;
     fn codex_ble_wire(kind: *const c_char, input: *const c_char, out: *mut c_char, cap: c_int) -> c_int;
+    fn codex_compact_frame_golden(out: *mut u8, cap: c_int) -> c_int;
     fn codex_v2_status_snapshot(input: *const c_char, out: *mut c_char, cap: c_int) -> c_int;
     fn codex_v2_plan_new() -> *mut std::ffi::c_void;
     fn codex_v2_plan_free(p: *mut std::ffi::c_void);
@@ -795,6 +809,14 @@ impl Drop for SimulatorBundle {
     fn drop(&mut self) { unsafe { codex_sim_bundle_free(self.state) }; }
 }
 
+/// Cross-language fixed frame vector from the firmware encoder and decoder.
+pub fn simulator_compact_frame_golden() -> anyhow::Result<[u8; 50]> {
+    let mut out = [0; 50];
+    let rc = unsafe { codex_compact_frame_golden(out.as_mut_ptr(), out.len() as c_int) };
+    anyhow::ensure!(rc == 50, "firmware compact frame vector failed");
+    Ok(out)
+}
+
 /// Build a BLE attribute using the SAME firmware encoder. Return its exact
 /// serialized bytes; callers must not parse/serialize before storing them.
 pub fn simulator_ble_wire(kind: &str, input: &serde_json::Value) -> anyhow::Result<Vec<u8>> {
@@ -885,6 +907,54 @@ pub fn simulator_command_check(
         )
     };
     simulator_ffi_json(rc, &out, "command session check")
+}
+
+/// The firmware's pure BLE-to-HTTP rendezvous state machine. The caller
+/// supplies its own monotonic device clock and owns the simulated radio.
+pub struct SimulatorRendezvous { state:*mut std::ffi::c_void }
+unsafe impl Send for SimulatorRendezvous {}
+impl SimulatorRendezvous {
+    pub fn new(now:u64,advertise_ms:u32)->anyhow::Result<Self> {
+        let state=unsafe{codex_rv_new()};
+        anyhow::ensure!(!state.is_null(),"rendezvous allocation failed");
+        unsafe{codex_rv_begin(state,now,advertise_ms)};
+        Ok(Self{state})
+    }
+    pub fn begin(&mut self,now:u64,advertise_ms:u32){unsafe{codex_rv_begin(self.state,now,advertise_ms)}}
+    pub fn connected(&mut self,now:u64){unsafe{codex_rv_connected(self.state,now)}}
+    pub fn plan_received(&mut self){unsafe{codex_rv_plan(self.state)}}
+    pub fn await_network(&mut self,now:u64,legal_until:u64){
+        unsafe{codex_rv_await_network(self.state,now,legal_until)}
+    }
+    pub fn admit_http(&mut self,now:u64,legal_until:u64){
+        unsafe{codex_rv_admit_http(self.state,now,legal_until)}
+    }
+    pub fn http_ready(&mut self){unsafe{codex_rv_http_ready(self.state)}}
+    pub fn phase(&self)->i32{unsafe{codex_rv_phase(self.state)}}
+    pub fn deadline(&self)->u64{unsafe{codex_rv_deadline(self.state)}}
+    pub fn tick(&mut self,now:u64)->bool{unsafe{codex_rv_tick(self.state,now)==1}}
+}
+impl Drop for SimulatorRendezvous {
+    fn drop(&mut self){unsafe{codex_rv_free(self.state)}}
+}
+
+#[test]
+fn simulator_rendezvous_uses_firmware_network_deadline_without_renewal() {
+    let mut rv=SimulatorRendezvous::new(1_000,4_000).unwrap();
+    rv.connected(1_100);
+    rv.plan_received();
+    rv.await_network(1_200,50_000);
+    let deadline=rv.deadline();
+    assert!(deadline<=50_000 && deadline>1_200);
+    rv.admit_http(1_300,50_000);
+    assert_eq!(rv.phase(),2);
+    rv.admit_http(1_400,80_000);
+    assert_eq!(rv.deadline(),deadline,"repeat may not extend the original window");
+    rv.http_ready();
+    assert_eq!(rv.phase(),3);
+    assert!(!rv.tick(deadline-1));
+    assert!(rv.tick(deadline));
+    assert_eq!(rv.phase(),5);
 }
 
 pub struct SimulatorPlan {
@@ -1412,6 +1482,13 @@ impl SimulatorWifi {
         simulator_ffi_json(rc,&out,"wifi_storage_status")
     }
     pub fn storage_failure(&mut self, fail: bool) { unsafe { codex_sim_wifi_storage_failure(fail as c_int) }; }
+    pub fn constrain(&mut self,now:u64,until:u64,owner_allowed:bool) {
+        unsafe{codex_sim_wifi_constrain(now,until,owner_allowed as c_int)};
+    }
+    pub fn observe(&self)->anyhow::Result<serde_json::Value> {
+        let mut out=vec![0i8;2048];let rc=unsafe{codex_sim_wifi_observe(out.as_mut_ptr(),out.len() as c_int)};
+        simulator_ffi_json(rc,&out,"wifi_observe")
+    }
 }
 
 #[test]

@@ -2,12 +2,13 @@ use serde_json::Value;
 use base64::Engine;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     fs,
     io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpStream},
     path::PathBuf,
     process::{Child, Command, Stdio},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{atomic::{AtomicUsize, Ordering}, Mutex, OnceLock},
     time::Duration,
 };
 
@@ -16,6 +17,200 @@ const DEVICE: &str = "device-test-secret";
 const CONTROL: &str = "control-test-secret";
 static BLE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
+#[derive(Clone, Copy)]
+struct TestBleFrame { session:[u8;16], next:u64, generation:u64 }
+static BLE_FRAMES: OnceLock<Mutex<HashMap<SocketAddr,TestBleFrame>>> = OnceLock::new();
+
+// Characterization of the reported failure, using the production Wi-Fi engine
+// and real HTTP client. HTTP here is the test carrier, not evidence of RF.
+fn wifi_activate_repro_fixture(mac: &str) -> (Simulator, Value) {
+    let sim = Simulator::start(mac, &["--wifi-unified-test"]);
+    assert_eq!(set_time(&sim, Some(CONTROL), &serde_json::json!({"op":"rate","rate_ppm":0})).0, 200);
+    assert_eq!(request(sim.address(), "POST", "/sim/power", Some(CONTROL), br#"{"plugged":true}"#).0, 200);
+    assert_eq!(claim(&sim, "id=bridge-test", Some(DEVICE)).0, 200);
+    let status = bridge_core::device_client::status(&sim.address().to_string(), ENDPOINT, Duration::from_secs(3)).unwrap();
+    let saved = wifi_activate_repro_command(&sim, &status, "apply", serde_json::json!({
+        "request_id":"fixture-save", "expected_revision":0,
+        "changes":[{"network_id":"home","host_ssid":"FakeHost","ssid":"FakeDevice","credential":"replace","password":"synthetic-only-password"}]
+    })).unwrap();
+    assert_eq!(saved["outcome"], "committed");
+    assert_eq!(wifi_activate_repro_command(&sim, &status, "active", serde_json::json!({})).unwrap()["network_id"], "");
+    (sim, status)
+}
+
+fn wifi_activate_repro_command(sim: &Simulator, status: &Value, op: &str, body: Value) -> anyhow::Result<Value> {
+    bridge_core::device_client::wifi_command(&sim.address().to_string(), ENDPOINT,
+        sim.ready["mac"].as_str().unwrap(), "bridge-test", op,
+        status["session_nonce"].as_str().unwrap(), body, Duration::from_secs(3))
+}
+
+fn wifi_activate_repro_poll(sim: &Simulator, outcome: i32) -> Value {
+    let response = request(sim.address(), "POST", "/sim/wifi", Some(CONTROL),
+        serde_json::json!({"outcome":outcome}).to_string().as_bytes());
+    assert_eq!(response.0, 200);
+    json_body(&response.1)
+}
+
+#[test]
+fn same_source_rendezvous_waits_for_ble_release_and_real_ip() {
+    let _env_guard = BLE_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mac = "02:00:00:00:00:7A";
+    let (sim, initial) = wifi_activate_repro_fixture(mac);
+    assert_eq!(post_plan(&sim, Some(ENDPOINT),
+        &plan_message(&initial, "bridge-test", "light-prep", 1, "light", Some(120))).1["result"], "applied");
+    let registry = serde_json::json!({"02000000007A":format!("http://{}",sim.address())}).to_string();
+    std::env::set_var("CODEX_STATUS_SIM_BLE_ENDPOINTS", registry);
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let mut link = bridge_ble::DeviceConnection::connect("02000000007A", ENDPOINT, "bridge-test")
+            .await.unwrap().expect("fake BLE advertisement");
+        let status = link.command("status", serde_json::json!({})).await.unwrap();
+        let plan = plan_message(&status, "bridge-test", "light-network", 2, "light", Some(120));
+        assert_eq!(link.command("plan", plan).await.unwrap()["result"], "applied");
+        let started = link.command("network_start", serde_json::json!({
+            "device_mac":mac,"session_nonce":status["session_nonce"],"bridge_id":"bridge-test",
+            "plan_id":2,"origin_request_no":3,"bridge_addr":"192.0.2.1","bridge_port":8765
+        })).await.unwrap();
+        assert_eq!(started["result"], "accepted", "network_start ACK: {started}");
+        let before = bridge_core::device_client::status(&sim.address().to_string(), ENDPOINT,
+            Duration::from_secs(3)).unwrap();
+        assert_eq!(before["rendezvous"]["ready"], false);
+        assert_eq!(before["transports"]["http"]["ready"], false);
+        let activated = wifi_activate_repro_command(&sim, &initial, "activate", serde_json::json!({
+            "request_id":"network-activate","network_id":"home","version":1
+        })).unwrap();
+        assert_eq!(activated["stage"], "accepted", "{activated}");
+        let no_ip = wifi_activate_repro_poll(&sim, 2);
+        assert_eq!(no_ip["radio"]["has_ip"], false);
+        assert_eq!(bridge_core::device_client::status(&sim.address().to_string(), ENDPOINT,
+            Duration::from_secs(3)).unwrap()["transports"]["http"]["ready"], false);
+        wifi_activate_repro_poll(&sim, 1);
+        wifi_activate_repro_poll(&sim, 1);
+        let still_ble = bridge_core::device_client::status(&sim.address().to_string(), ENDPOINT,
+            Duration::from_secs(3)).unwrap();
+        assert_eq!(still_ble["radio"]["wifi_connected"], true);
+        assert_eq!(still_ble["rendezvous"]["ready"], false);
+        assert_eq!(still_ble["transports"]["http"]["ready"], false);
+        link.close().await;
+        let after = bridge_core::device_client::status(&sim.address().to_string(), ENDPOINT,
+            Duration::from_secs(3)).unwrap();
+        assert_eq!(after["rendezvous"]["ready"], true, "{after}");
+        assert_eq!(after["transports"]["http"]["ready"], true);
+        assert_eq!(set_time(&sim, Some(CONTROL),
+            &serde_json::json!({"op":"step","delta_ms":121000})).0, 200);
+        let expired = bridge_core::device_client::status(&sim.address().to_string(), ENDPOINT,
+            Duration::from_secs(3)).unwrap();
+        assert_eq!(expired["rendezvous"]["ready"], false);
+        assert_eq!(expired["rendezvous"]["remaining_ms"], 0);
+    });
+    std::env::remove_var("CODEX_STATUS_SIM_BLE_ENDPOINTS");
+}
+
+#[test]
+fn wifi_activate_repro_pending_dhcp_timeout_and_same_id_success() {
+    use bridge_core::platform::{service::PlatformService, model::{DeviceIdentity, DeviceCapabilities}};
+    use std::collections::BTreeMap;
+    let mac = "0200000000D1";
+    let (sim, status) = wifi_activate_repro_fixture(mac);
+    let root = temp_data_dir();
+    let svc = PlatformService::open(&root).unwrap();
+    svc.device_upsert(DeviceIdentity::new(mac, "Activate repro").unwrap(), DeviceCapabilities::ssd1681_154g()).unwrap();
+    let saved_radio=wifi_activate_repro_poll(&sim, 0);
+    assert_eq!(saved_radio["radio"]["begins"],0,"saving alone must not start RF");
+    assert_eq!(saved_radio["radio"]["connected"],false);
+    let body = serde_json::json!({"network_id":"home","version":1});
+    let job = svc.wifi_queue_control(mac, "bridge-test", "activate", body.clone(), 100).unwrap();
+    let mut calls = vec![];
+    let pending = svc.wifi_attempt(mac, &job.job_id, Some("authenticated_http"), &BTreeMap::new(), 100,
+        |op, body| { calls.push(op.to_owned()); wifi_activate_repro_command(&sim, &status, op, body) }).unwrap().unwrap();
+    assert_eq!(pending.state, "awaiting_confirmation");
+    // Deferred begin happens on the first poll; the next injects association without DHCP.
+    let started=wifi_activate_repro_poll(&sim, 2);
+    assert_eq!(started["radio"]["begins"],1);
+    assert_eq!(started["radio"]["ssid"],"FakeDevice");
+    assert_eq!(started["radio"]["candidate_credentials_used"],true);
+    let no_ip=wifi_activate_repro_poll(&sim, 2);
+    assert_eq!(no_ip["busy"], true);
+    assert_eq!(no_ip["radio"]["connected"],true);
+    assert_eq!(no_ip["radio"]["has_ip"],false);
+    let pending = svc.wifi_attempt(mac, &job.job_id, None, &BTreeMap::new(), 106,
+        |op, body| { calls.push(op.to_owned()); assert_eq!(body["query_id"], job.request_id); wifi_activate_repro_command(&sim, &status, op, body) }).unwrap().unwrap();
+    assert_eq!(pending.state, "awaiting_confirmation");
+    assert_eq!(calls, ["activate", "result"]);
+    let no_dhcp = bridge_core::device_client::status(&sim.address().to_string(), ENDPOINT, Duration::from_secs(3)).unwrap();
+    assert_eq!(no_dhcp["radio"]["wifi_connected"], false);
+    assert_eq!(no_dhcp["transports"]["http"]["ready"], false);
+    assert_eq!(set_time(&sim, Some(CONTROL), &serde_json::json!({"op":"step","delta_ms":26000})).0, 200);
+    wifi_activate_repro_poll(&sim, 0);
+    let failed = svc.wifi_attempt(mac, &job.job_id, None, &BTreeMap::new(), 122,
+        |op, body| wifi_activate_repro_command(&sim, &status, op, body)).unwrap().unwrap();
+    assert_eq!(failed.state, "failed");
+    assert_eq!(failed.error_code.as_deref(), Some("dhcp_timeout"));
+    assert_eq!(wifi_activate_repro_command(&sim, &status, "active", serde_json::json!({})).unwrap()["network_id"], "");
+    eprintln!("REPRO: accepted is not activation success; DHCP deadline yields durable rejection dhcp_timeout and no active selection.");
+    let next = svc.wifi_queue_control(mac, "bridge-test", "activate", body, 130).unwrap();
+    svc.wifi_attempt(mac, &next.job_id, Some("authenticated_http"), &BTreeMap::new(), 130,
+        |op, body| wifi_activate_repro_command(&sim, &status, op, body)).unwrap();
+    wifi_activate_repro_poll(&sim, 1);
+    assert_eq!(wifi_activate_repro_poll(&sim, 1)["busy"], false);
+    let done = svc.wifi_attempt(mac, &next.job_id, None, &BTreeMap::new(), 136,
+        |op, body| wifi_activate_repro_command(&sim, &status, op, body)).unwrap().unwrap();
+    assert_eq!(done.state, "completed");
+    let before_replay=wifi_activate_repro_poll(&sim,1)["radio"]["begins"].clone();
+    let replay = wifi_activate_repro_command(&sim, &status, "activate", serde_json::json!({"request_id":next.request_id,"network_id":"home","version":1})).unwrap();
+    assert_eq!(replay["outcome"], "committed");
+    assert_eq!(wifi_activate_repro_poll(&sim,1)["radio"]["begins"],before_replay,"same-ID replay must not start RF again");
+    assert_eq!(wifi_activate_repro_command(&sim, &status, "active", serde_json::json!({})).unwrap()["network_id"], "home");
+    eprintln!("REPRO: association plus IP commits activation; same request ID returns its original committed receipt.");
+    let close=wifi_activate_repro_command(&sim,&status,"activate",serde_json::json!({"request_id":"window-close","network_id":"home","version":1})).unwrap();
+    assert_eq!(close["ok"],true);
+    let closed=request(sim.address(),"POST","/sim/wifi",Some(CONTROL),br#"{"outcome":0,"window_ms":0}"#);
+    assert_eq!(closed.0,200);
+    assert_eq!(json_body(&closed.1)["radio"]["connected"],false);
+    let rejected=wifi_activate_repro_command(&sim,&status,"result",serde_json::json!({"query_id":"window-close"})).unwrap();
+    assert_eq!(rejected["outcome"],"rejected");assert_eq!(rejected["error"],"window_closed");
+    assert_eq!(wifi_activate_repro_command(&sim,&status,"active",serde_json::json!({})).unwrap()["network_id"],"home");
+    eprintln!("REPRO: production window constraint aborts RF with window_closed but retains selected home; active selection is not a live connection.");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn wifi_activate_repro_32_completed_acked_jobs_allow_next_activation() {
+    use bridge_core::platform::{service::PlatformService, model::{DeviceIdentity, DeviceCapabilities}};
+    use std::collections::BTreeMap;
+    let mac = "0200000000D2";
+    let (sim, status) = wifi_activate_repro_fixture(mac);
+    let root = temp_data_dir();
+    let svc = PlatformService::open(&root).unwrap();
+    svc.device_upsert(DeviceIdentity::new(mac, "Queue repro").unwrap(), DeviceCapabilities::ssd1681_154g()).unwrap();
+    for i in 0..32 {
+        let now = 100 + i * 10;
+        let job = svc.wifi_queue_control(mac, "bridge-test", "activate", serde_json::json!({"network_id":"home","version":1}), now).unwrap();
+        let pending = svc.wifi_attempt(mac, &job.job_id, Some("authenticated_http"), &BTreeMap::new(), now,
+            |op, body| wifi_activate_repro_command(&sim, &status, op, body)).unwrap().unwrap();
+        assert_eq!(pending.state, "awaiting_confirmation");
+        wifi_activate_repro_poll(&sim, 1);
+        wifi_activate_repro_poll(&sim, 1);
+        let done = svc.wifi_attempt(mac, &job.job_id, None, &BTreeMap::new(), now + 6,
+            |op, body| wifi_activate_repro_command(&sim, &status, op, body)).unwrap().unwrap();
+        assert_eq!(done.state, "completed");
+        assert_eq!(wifi_activate_repro_command(&sim, &status, "result_ack", serde_json::json!({"query_id":job.request_id})).unwrap()["outcome"], "retired");
+        svc.wifi_receipt_acked(mac, &job.job_id).unwrap();
+    }
+    drop(svc);
+    let svc = PlatformService::open(&root).unwrap();
+    let state = svc.wifi_state(mac);
+    assert_eq!(state.jobs.len(), 32);
+    assert!(state.jobs.iter().all(|j| j.state == "completed" && j.may_have_committed && !j.receipt_ack_pending));
+    let next=svc.wifi_queue_control(mac,"bridge-test","activate",serde_json::json!({"network_id":"home","version":1}),500).unwrap();
+    assert_eq!(svc.wifi_state(mac).jobs.len(),32);
+    assert!(!svc.wifi_state(mac).jobs.iter().any(|j|j.request_id==state.jobs[0].request_id));
+    svc.wifi_finish(mac,&next.job_id,"cancelled",None,501).unwrap();
+    let after_ttl=svc.wifi_queue_control(mac,"bridge-test","activate",serde_json::json!({"network_id":"home","version":1}),1_000_000).unwrap();
+    assert_ne!(next.request_id,after_ttl.request_id);
+    assert_eq!(svc.wifi_state(mac).jobs.len(),1);
+    eprintln!("FIX VERIFIED: 32 real acknowledged activations no longer block new work after restart or aging.");
+    fs::remove_dir_all(root).unwrap();
+}
 
 struct Simulator {
     child: Option<Child>,
@@ -94,17 +289,13 @@ fn temp_data_dir() -> PathBuf {
     ))
 }
 
-fn request(
+fn wire_request(
     address: SocketAddr,
     method: &str,
     path: &str,
     token: Option<&str>,
     body: &[u8],
 ) -> (u16, Vec<u8>) {
-    if path == "/sim/ble/command" {
-        let result = request(address, "GET", "/sim/ble/info", token, b"");
-        if result.0 != 200 { return result; }
-    }
     let mut stream = TcpStream::connect(address).expect("connect simulator");
     // Advancing an hour executes 60 persistent reboots synchronously. Keep the
     // ordinary device deadline at 3s, but give this control operation time to
@@ -135,19 +326,147 @@ fn request(
         .parse()
         .unwrap();
     let bytes = response[split + 4..].to_vec();
-    if status == 200 && path == "/sim/ble/command" {
-        // Test carrier explicitly reads Status after transport acceptance. The
-        // simulator route itself NEVER returns a business ACK.
-        assert_eq!(json_body(&bytes)["result"], "accepted");
-        return request(address, "GET", "/sim/ble/status", token, b"");
-    }
     (status, bytes)
 }
 
+fn wire_frame_request(address:SocketAddr,path:&str,frame:&[u8],content_type:bool) -> (u16,Vec<u8>) {
+    let mut stream=TcpStream::connect(address).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    write!(stream,"POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAuthorization: Bearer {ENDPOINT}\r\nContent-Length: {}\r\n",frame.len()).unwrap();
+    if content_type {write!(stream,"Content-Type: application/vnd.codex-status.frame\r\n").unwrap();}
+    write!(stream,"\r\n").unwrap();stream.write_all(frame).unwrap();
+    let mut response=Vec::new();stream.read_to_end(&mut response).unwrap();
+    let split=response.windows(4).position(|w|w==b"\r\n\r\n").unwrap();
+    let code=String::from_utf8_lossy(&response[..split]).lines().next().unwrap()
+        .split_whitespace().nth(1).unwrap().parse().unwrap();
+    (code,response[split+4..].to_vec())
+}
+
+fn test_ble_send(address:SocketAddr, token:&str, message:&Value, frame:TestBleFrame) -> (u16,Vec<u8>) {
+    use bridge_core::compact_frame::{Header,operation};
+    let op=message["op"].as_str().unwrap_or("");
+    let Some(op_no)=operation(op) else{return (400,br#"{"error":"operation"}"#.to_vec());};
+    let payload=serde_json::to_vec(message).unwrap();
+    if payload.len()+48>8192{return (413,br#"{"error":"length"}"#.to_vec());}
+    let mut context=[0u8;16];
+    if let Some(text)=message["active_context_id"].as_str().filter(|s|s.len()==16 && s.bytes().all(|b|b.is_ascii_hexdigit())){
+        context.copy_from_slice(text.as_bytes());
+    }
+    let mut raw=Header{kind:0,op:op_no,result:0,payload_len:payload.len() as u16,
+        session:if op=="status"{[0;16]}else{frame.session},request_no:frame.next,
+        context}.encode().unwrap().to_vec();
+    raw.extend_from_slice(&payload);
+    let result=wire_request(address,"POST","/sim/ble/command",Some(token),&raw);
+    if result.0!=200{return result;}
+    wire_request(address,"GET","/sim/ble/status",Some(token),b"")
+}
+
+fn request(address:SocketAddr, method:&str, path:&str, token:Option<&str>, body:&[u8]) -> (u16,Vec<u8>) {
+    if (path.starts_with("/api/") || path=="/claim") &&
+        (method=="POST" || matches!(path.split('?').next(),Some("/api/status"|"/api/ota/image"))) {
+        match bridge_core::device_client::raw_frame_request(
+            &address.to_string(),path,token.unwrap_or(""),body,Duration::from_secs(3)) {
+            Ok(result)=>return result,
+            Err(error) if error.chain().any(|cause|cause.downcast_ref::<bridge_core::device_client::HttpStatus>()
+                .is_some_and(|status|status.0==401))=>return (401,br#"{"result":"unauthorized","error":"unauthorized"}"#.to_vec()),
+            Err(error) if error.to_string().contains("frame exceeds 4096")=>
+                return (413,br#"{"result":"rejected","error":"frame_limit"}"#.to_vec()),
+            Err(error) if !error.to_string().contains("unregistered device HTTP operation")=>
+                return (400,br#"{"error":"frame_error"}"#.to_vec()),
+            Err(_)=>{}
+        }
+    }
+    if path=="/sim/ble/command" && method=="POST" {
+        let info=wire_request(address,"GET","/sim/ble/info",token,b"");
+        if info.0!=200{return info;}
+        let generation=json_body(&wire_request(address,"GET","/sim/ble/attributes",Some(CONTROL),b"").1)
+            ["generation"].as_u64().unwrap_or(0);
+        let Ok(message)=serde_json::from_slice::<Value>(body) else{return wire_request(address,method,path,token,body);};
+        let cells=BLE_FRAMES.get_or_init(||Mutex::new(HashMap::new()));
+        let existing={cells.lock().unwrap().get(&address).copied()};
+        let frame=if let Some(frame)=existing.filter(|f|f.generation==generation){frame}else{
+            let mac=json_body(&info.1)["mac"].as_str().unwrap_or("").to_owned();
+            let hello=serde_json::json!({"op":"status","request_id":"test-session-open",
+                "token":token.unwrap_or(""),"device_mac":mac,"bridge_id":"bridge-test",
+                "session_nonce":""});
+            let first=test_ble_send(address,token.unwrap_or(""),&hello,TestBleFrame{session:[0;16],next:1,generation});
+            let Ok((header,_))=bridge_core::compact_frame::Header::decode(&first.1,512) else{return first;};
+            let frame=TestBleFrame{session:header.session,next:2,generation};
+            cells.lock().unwrap().insert(address,frame);
+            frame
+        };
+        let result=test_ble_send(address,token.unwrap_or(""),&message,frame);
+        cells.lock().unwrap().insert(address,TestBleFrame{session:frame.session,next:frame.next+1,generation});
+        return result;
+    }
+    if path=="/sim/ble/close" {
+        if let Some(cells)=BLE_FRAMES.get(){cells.lock().unwrap().remove(&address);}
+    }
+    wire_request(address,method,path,token,body)
+}
+
 fn json_body(body: &[u8]) -> Value {
+    let body=if body.first()==Some(&bridge_core::compact_frame::MARKER) {
+        bridge_core::compact_frame::Header::decode(body,8192).expect("frame response").1
+    } else {body};
     let value: Value = serde_json::from_slice(body).expect("JSON response");
     if value.get("ble_wire").is_some() { bridge_ble::decode_wire(body).expect("BLE wire response") }
     else { value }
+}
+
+#[test]
+fn fixed_frame_http_rejects_malformed_identity_and_retired_requests() {
+    use bridge_core::compact_frame::Header;
+    let sim=Simulator::start("02:00:00:00:00:4C",&[]);
+    let make=|header:Header,payload:&[u8]|{
+        let mut bytes=header.encode().unwrap().to_vec();bytes.extend_from_slice(payload);bytes
+    };
+    let status_payload=br#"{"compact":true}"#;
+    let mut status=Header{kind:0,op:1,result:0,payload_len:status_payload.len() as u16,
+        session:[0xA1;16],request_no:1,context:[0;16]};
+    let opening=make(status,status_payload);
+    let (code,reply)=wire_frame_request(sim.address(),"/api/status",&make(status,status_payload),true);
+    assert_eq!(code,200);
+    let (opened,body)=Header::decode(&reply,4096).unwrap();
+    assert_ne!(opened.session,[0;16]);
+    assert_eq!(serde_json::from_slice::<Value>(body).unwrap()["status_projection"],"compact");
+    let (replay_code,replay)=wire_frame_request(sim.address(),"/api/status",&opening,true);
+    assert_eq!(replay_code,409);
+    assert_eq!(json_body(&replay)["error"],"retired",
+        "a reply over the 512-byte retention budget must not reopen the session");
+    status.op=3;status.request_no=2;status.session=opened.session;
+    let invalid=br#"{"op":"plan","request_id":"synthetic-invalid"}"#;
+    status.payload_len=invalid.len() as u16;
+    let frame=make(status,invalid);
+    let (first_code,first)=wire_frame_request(sim.address(),"/api/plan",&frame,true);
+    assert!(matches!(first_code,200|400|409));
+    let (replay_code,replay)=wire_frame_request(sim.address(),"/api/plan",&frame,true);
+    assert_eq!(replay_code,200);
+    assert_eq!(replay,first,"the retained identical result must be returned verbatim");
+    let (old_open_code,old_open)=wire_frame_request(sim.address(),"/api/status",&opening,true);
+    assert_eq!(old_open_code,409);
+    assert_eq!(json_body(&old_open)["error"],"retired");
+    let changed=br#"{"op":"plan","request_id":"different-payload"}"#;
+    status.payload_len=changed.len() as u16;
+    let (code,body)=wire_frame_request(sim.address(),"/api/plan",&make(status,changed),true);
+    assert_eq!(code,409);assert_eq!(json_body(&body)["error"],"request_conflict");
+    status.request_no=1;status.payload_len=invalid.len() as u16;
+    let (code,body)=wire_frame_request(sim.address(),"/api/plan",&make(status,invalid),true);
+    assert_eq!(code,409);assert_eq!(json_body(&body)["error"],"retired");
+    status.request_no=3;status.session=[0xFF;16];
+    assert_eq!(wire_frame_request(sim.address(),"/api/plan",&make(status,invalid),true).0,409);
+    status.session=opened.session;status.context=*b"aaaaaaaaaaaaaaaa";
+    assert_eq!(wire_frame_request(sim.address(),"/api/plan",&make(status,invalid),true).0,409);
+    status.context=[0;16];
+    let valid=make(status,invalid);
+    assert_eq!(wire_frame_request(sim.address(),"/api/plan",&valid,false).0,415);
+    let mut bad=valid.clone();bad[0]=0;
+    assert_eq!(wire_frame_request(sim.address(),"/api/plan",&bad,true).0,400);
+    let mut bad=valid.clone();bad[7]=bad[7].wrapping_add(1);
+    assert_eq!(wire_frame_request(sim.address(),"/api/plan",&bad,true).0,400);
+    assert_eq!(wire_frame_request(sim.address(),"/api/data",&valid,true).0,400);
+    let mut bad=valid;bad[1]=2;
+    assert_eq!(wire_frame_request(sim.address(),"/api/plan",&bad,true).0,400);
 }
 
 #[test]
@@ -1048,14 +1367,21 @@ fn ota_pending_survives_process_death_before_delayed_reboot() {
 }
 
 fn claim(sim: &Simulator, query: &str, token: Option<&str>) -> (u16, Value) {
-    let (code, body) = request(
-        sim.address(),
-        "POST",
-        &format!("/claim?{query}"),
-        token,
-        b"",
-    );
-    (code, json_body(&body))
+    let mut input=serde_json::Map::new();
+    for (key,value) in form_urlencoded::parse(query.as_bytes()) {
+        input.insert(key.into_owned(),serde_json::json!(value.into_owned()));
+    }
+    for flag in ["force","release"] {
+        if let Some(value)=input.get_mut(flag) {*value=serde_json::json!(value!="0");}
+    }
+    let (code,body)=match bridge_core::device_client::claim(&sim.address().to_string(),ENDPOINT,
+        token.unwrap_or(""),&Value::Object(input),Duration::from_secs(3)) {
+        Ok(response)=>response,
+        Err(error) if error.chain().any(|cause|cause.downcast_ref::<bridge_core::device_client::HttpStatus>()
+            .is_some_and(|status|status.0==401))=>(401,r#"{"error":"unauthorized","owner":null}"#.into()),
+        Err(error)=>panic!("claim transport: {error}"),
+    };
+    (code,json_body(body.as_bytes()))
 }
 
 fn sim_state(sim: &Simulator) -> Value {
@@ -1815,10 +2141,13 @@ fn ble_request_limits_and_disconnect_clear_the_real_reassembly_path() {
     request(sim.address(), "POST", "/sim/ble/close", Some(ENDPOINT), b"");
     request(sim.address(), "GET", "/sim/ble/info", Some(ENDPOINT), b"");
     assert_eq!(request(sim.address(), "POST", &format!("/sim/ble/fragment?offset={}&final=1", partial.len()), Some(ENDPOINT), b"tail").0, 409);
-    // Complete JSON is dispatched even without the fake final flag.
-    let payload = serde_json::json!({"op":"status","request_id":"json-complete","token":ENDPOINT}).to_string();
-    assert_eq!(json_body(&request(sim.address(), "POST", "/sim/ble/fragment?offset=0&final=0", Some(ENDPOINT), payload.as_bytes()).1)["result"], "more");
-    assert_eq!(json_body(&request(sim.address(), "GET", "/sim/ble/status", Some(ENDPOINT), b"").1)["request_id"], "json-complete");
+    // A complete fixed frame is dispatched even without the fake final flag.
+    let payload = serde_json::json!({"op":"status","request_id":"frame-complete","token":ENDPOINT}).to_string();
+    let mut frame=bridge_core::compact_frame::Header {kind:0,op:1,result:0,
+        payload_len:payload.len() as u16,session:[0;16],request_no:1,context:[0;16]}.encode().unwrap().to_vec();
+    frame.extend_from_slice(payload.as_bytes());
+    assert_eq!(json_body(&request(sim.address(), "POST", "/sim/ble/fragment?offset=0&final=0", Some(ENDPOINT), &frame).1)["result"], "more");
+    assert_eq!(json_body(&request(sim.address(), "GET", "/sim/ble/status", Some(ENDPOINT), b"").1)["request_id"], "frame-complete");
 }
 
 #[test]
@@ -2109,13 +2438,10 @@ fn writes_require_their_domain_token_then_reject_unconfigured_commands() {
     }
     let (code, body) = request(sim.address(), "POST", "/claim", Some(ENDPOINT), b"{}");
     assert_eq!(code, 401);
-    assert_eq!(
-        json_body(&body),
-        serde_json::json!({"error":"unauthorized","owner":null})
-    );
+    assert_eq!(json_body(&body)["error"],"unauthorized");
     let (code, body) = request(sim.address(), "POST", "/claim", Some(DEVICE), b"{}");
-    assert_eq!(code, 400);
-    assert_eq!(json_body(&body), serde_json::json!({"error":"args"}));
+    assert_eq!(code, 401);
+    assert_eq!(json_body(&body)["error"],"unauthorized");
 }
 
 #[test]
@@ -2338,6 +2664,39 @@ fn plan_acks_share_firmware_decisions_and_replays_keep_the_deadline() {
     assert_eq!(accepted_sleep["result"], "applied");
     assert_eq!(accepted_sleep["plan_id"], 2);
     assert_eq!(accepted_sleep["accepted_remaining_s"], 0);
+}
+
+#[test]
+fn joint_plan_keeps_valid_power_when_optional_data_is_rejected() {
+    let sim = Simulator::start("02:00:00:00:00:2A", &[]);
+    let status = json_body(&request(sim.address(), "GET", "/api/status", Some(ENDPOINT), b"").1);
+    let mut plan = plan_message(&status, "bridge-a", "joint-1", 1, "light", Some(120));
+    plan["data"] = serde_json::json!({"seq":1,"active_context_id":"bad-context",
+        "crc":"00000000","fields":[]});
+    let (code, ack) = post_plan(&sim, Some(ENDPOINT), &plan);
+    assert_eq!(code, 200);
+    assert_eq!(ack["result"], "applied");
+    assert_eq!(ack["plan_id"], 1);
+    assert_eq!(ack["data"]["result"], "rejected");
+    assert_eq!(ack["data"]["error"], "unconfigured");
+    assert_eq!(sim_state(&sim)["plan"]["plan_id"], 1);
+    let mut next = plan_message(&status, "bridge-a", "joint-ble", 2, "light", Some(120));
+    next["op"] = "plan".into();
+    next["token"] = ENDPOINT.into();
+    next["data"] = plan["data"].clone();
+    let (ble_code, ble_body) = request(sim.address(), "POST", "/sim/ble/command",
+        Some(ENDPOINT), next.to_string().as_bytes());
+    assert_eq!(ble_code, 200);
+    let ble_ack = json_body(&ble_body);
+    assert_eq!(ble_ack["result"], "applied");
+    assert_eq!(ble_ack["data"]["error"], "unconfigured");
+    assert_eq!(sim_state(&sim)["plan"]["plan_id"], 2);
+    let mut invalid = plan_message(&status, "bridge-a", "joint-bad", 2, "light", Some(120));
+    invalid["session_nonce"] = "invalid".into();
+    invalid["data"] = plan["data"].clone();
+    let (_, rejected) = post_plan(&sim, Some(ENDPOINT), &invalid);
+    assert_eq!(rejected["result"], "rejected");
+    assert_eq!(sim_state(&sim)["plan"]["plan_id"], 2);
 }
 
 #[test]
@@ -2943,8 +3302,11 @@ fn wifi_fake_full_projection_freezes_pages_and_preserves_bond_legacy_and_atomic_
     let bad=bridge_core::device_client::wifi_request(&address,ENDPOINT,mac,"bridge-test","apply",serde_json::json!({
         "request_id":"invalid-batch","expected_revision":1,"permit":permit,"changes":[
             {"network_id":"n0","host_ssid":"Renamed","ssid":"Changed","credential":"keep"},
-            {"network_id":"extra","host_ssid":"Extra","ssid":"Extra","credential":"open"}]}),Duration::from_secs(3)).unwrap();
-    assert_eq!(bad["error"],"capacity");
+            // The shared store now holds 12 rows; a fifth stored row is valid.
+            // Missing credentials for a new row rejects after validating n0,
+            // preserving the durable-rejection and partial-update rollback check.
+            {"network_id":"extra","host_ssid":"Extra","ssid":"Extra","credential":"keep"}]}),Duration::from_secs(3)).unwrap();
+    assert_eq!(bad["error"],"credentials_required");
     let receipt=bridge_core::device_client::wifi_request(&address,ENDPOINT,mac,"bridge-test","result",serde_json::json!({"query_id":"invalid-batch"}),Duration::from_secs(3)).unwrap();
     assert_eq!(receipt["outcome"],"rejected");assert_eq!(receipt["revision"],1);
     assert_eq!(bridge_core::device_client::wifi_snapshot(&address,ENDPOINT,mac,"bridge-test",Some(&permit),"",Duration::from_secs(3)).unwrap().networks[0].network.host_ssid,"Host0");

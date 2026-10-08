@@ -16,9 +16,9 @@ struct OwnerRec {
 
 void ownerBegin();                          // restore only verifiable deep-sleep lease
 bool ownerGet(OwnerRec &out);               // valid (non-expired) owner only
-bool ownerAllows(const String &bridgeId);   // free or matching id (touches lease)
+bool ownerAllows(const String &bridgeId);   // free or matching id (touches lastSeen only)
 uint32_t ownerRemainingS();                 // RTC deadline, sleep included
-void ownerTouch();                          // refresh lastSeen in RAM
+void ownerTouch();                          // refresh lastSeen in RAM, never lease
 bool ownerClaim(const OwnerRec &in, bool keepSince);
 struct V2ClaimArgs;
 struct OwnerClaimResult { int status = 400; String body; bool newClaim = false; };

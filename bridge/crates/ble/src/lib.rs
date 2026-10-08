@@ -680,17 +680,6 @@ impl Pusher {
     fn endpoint_payload_for(host: &str,port:u16,token:&str,principal:&str)->Vec<u8> {
         json!({"schema":2,"host":host,"port":port,"token":token,"bridge_id":principal}).to_string().into_bytes()
     }
-    fn endpoint_payload(host: &str, port: u16, token: &str) -> Vec<u8> {
-        json!({
-            "schema": 1,
-            "host": host,
-            "port": port,
-            "token": token,
-        })
-        .to_string()
-        .into_bytes()
-    }
-
     /// Connect to an advertising device and read its info JSON
     /// (`{schema,model,fw,proto,mac,ip,http_port,templates,...}`). Used by the
     /// explicit `device_discover via=ble` fallback; no usage/template writes.
@@ -868,6 +857,9 @@ pub struct DeviceConnection {
     token: String,
     bridge_id: String,
     nonce: String,
+    session: [u8; 16],
+    next_request_no: u64,
+    context_id: String,
     device_mac: String,
     auth_ready: bool,
     wake_identity: Option<WakeIdentity>,
@@ -1014,7 +1006,7 @@ impl DeviceConnection {
                     peripheral: None, fake_url: Some(url.trim_end_matches('/').to_owned()),
                     rf_deadline: info["rf_remaining_ms"].as_u64().map(|ms| info_started + Duration::from_millis(ms)),
                     token: token.to_owned(), bridge_id: bridge_id.to_owned(),
-                    nonce: String::new(), device_mac,
+                    nonce: String::new(), session: [0; 16], next_request_no: 1, context_id: String::new(), device_mac,
                     auth_ready: Pusher::peer_encrypted_bonded(&info),
                     wake_identity: wake_identity(&info),
                     wake_cause: text_field(&info, &["wake_cause"]).unwrap_or_default(),
@@ -1148,6 +1140,9 @@ impl DeviceConnection {
                 token: token.to_owned(),
                 bridge_id: bridge_id.to_owned(),
                 nonce: String::new(),
+                session: [0; 16],
+                next_request_no: 1,
+                context_id: String::new(),
                 device_mac,
                 auth_ready: Pusher::peer_encrypted_bonded(&info),
                 wake_identity: initial_wake_identity,
@@ -1269,7 +1264,33 @@ impl DeviceConnection {
         body["device_mac"] = json!(self.device_mac);
         body["token"] = json!(self.token);
         stamp_clock(&mut body, &self.device_mac);
-        let bytes = serde_json::to_vec(&body)?;
+        let payload = serde_json::to_vec(&body)?;
+        let frame_op = bridge_core::compact_frame::operation(op)
+            .with_context(|| format!("unregistered BLE operation {op}"))?;
+        let session = if op == "status" { [0; 16] } else {
+            anyhow::ensure!(self.session != [0; 16], "BLE session is not established");
+            self.session
+        };
+        let mut context = [0; 16];
+        let context_text = body["active_context_id"].as_str()
+            .unwrap_or_else(|| if self.context_id.len() == 16 &&
+                self.context_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+                &self.context_id
+            } else { "" });
+        if !context_text.is_empty() {
+            anyhow::ensure!(context_text.len() == 16, "invalid BLE context length");
+            context.copy_from_slice(context_text.as_bytes());
+        }
+        let request_no = self.next_request_no;
+        self.next_request_no = self.next_request_no.checked_add(1)
+            .context("BLE request number exhausted")?;
+        let header = bridge_core::compact_frame::Header {
+            kind: 0, op: frame_op, result: 0,
+            payload_len: payload.len().try_into().context("BLE payload too large")?,
+            session, request_no, context,
+        };
+        let mut bytes = header.encode().map_err(anyhow::Error::msg)?.to_vec();
+        bytes.extend_from_slice(&payload);
         let wifi_limit=if self.info["wifi_management"]==3 {4096}else{1024};
         if op.starts_with("wifi_") && bytes.len() > wifi_limit { bail!("Wi-Fi BLE command exceeds {wifi_limit} bytes"); }
         if bytes.len() > 8192 {
@@ -1328,7 +1349,21 @@ impl DeviceConnection {
                     return Err(anyhow!("device BLE ACK timed out"));
                 }
             };
-            if let Ok(reply) = decode_wire(&raw) {
+            if let Ok((reply_header, reply_payload)) = bridge_core::compact_frame::Header::decode(&raw, 512) {
+                if reply_header.kind != 1 || reply_header.op != frame_op ||
+                    reply_header.request_no != request_no ||
+                    (op != "status" && reply_header.session != session) {
+                    // A stale readable characteristic is not a fresh reply.
+                    // Bound polling on both a real radio and the Fake transport.
+                    tokio::time::sleep_until((tokio::time::Instant::now() +
+                        Duration::from_millis(20)).min(deadline)).await;
+                    continue;
+                }
+                let Ok(reply) = decode_wire(reply_payload) else {
+                    tokio::time::sleep_until((tokio::time::Instant::now() +
+                        Duration::from_millis(20)).min(deadline)).await;
+                    continue;
+                };
                 if reply["ack"] == if op.starts_with("wifi_") { "wifi" } else { "command" } && reply["request_id"] == id {
                     let ack_identity = wake_identity(&reply);
                     let mac_matches = reply["device_mac"].as_str().map_or(!op.starts_with("wifi_"), |mac|
@@ -1353,10 +1388,14 @@ impl DeviceConnection {
                         self.device_last_stage = stage;
                     }
                     if op == "status" && reply["result"] == "applied" {
+                        anyhow::ensure!(reply_header.session != [0; 16], "BLE session missing");
+                        self.session = reply_header.session;
                         self.nonce = reply["session_nonce"]
                             .as_str()
                             .context("session nonce")?
                             .to_owned();
+                        self.context_id = reply["active_context_id"]
+                            .as_str().unwrap_or("").to_owned();
                     }
                     let ms = started.elapsed().as_millis();
                     self.timings.push((op.to_string(), ms));
@@ -1375,12 +1414,13 @@ impl DeviceConnection {
                     return Ok(reply);
                 }
             }
+            tokio::time::sleep_until((tokio::time::Instant::now() +
+                Duration::from_millis(20)).min(deadline)).await;
             if tokio::time::Instant::now() >= deadline {
                 self.log_failure(&id, op, "ack", "timeout");
                 tracing::warn!(device_mac = %self.device_mac, op, request_id = %id, stage = "ack", category = error_category("ack"), duration_ms = started.elapsed().as_millis(), "BLE command ACK failed");
                 bail!("device BLE ACK timed out");
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
@@ -1669,16 +1709,18 @@ mod tests {
 
     #[test]
     fn endpoint_payload_contains_current_bridge_credentials() {
-        let payload: serde_json::Value = serde_json::from_slice(&Pusher::endpoint_payload(
+        let payload: serde_json::Value = serde_json::from_slice(&Pusher::endpoint_payload_for(
             "192.168.1.2",
             8765,
             "bridge-token",
+            "bridge-test",
         ))
         .unwrap();
-        assert_eq!(payload["schema"], 1);
+        assert_eq!(payload["schema"], 2);
         assert_eq!(payload["host"], "192.168.1.2");
         assert_eq!(payload["port"], 8765);
         assert_eq!(payload["token"], "bridge-token");
+        assert_eq!(payload["bridge_id"], "bridge-test");
     }
 
     #[test]
@@ -1814,7 +1856,8 @@ mod tests {
         let mut link = super::DeviceConnection {
             info: json!({}), peripheral: None, fake_url: None,
             rf_deadline: Some(now + Duration::from_secs(1)), token: String::new(),
-            bridge_id: String::new(), nonce: String::new(), device_mac: String::new(),
+            bridge_id: String::new(), nonce: String::new(), session: [0; 16], device_mac: String::new(),
+            next_request_no: 1, context_id: String::new(),
             auth_ready: true, wake_identity: None, wake_cause: String::new(),
             device_last_stage: String::new(), timings: vec![],
         };

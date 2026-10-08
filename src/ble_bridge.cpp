@@ -4,6 +4,7 @@
 #include <ArduinoJson.h>
 #include "ble_wire.h"
 #include "v2_state.h"
+#include "v2_command_envelope.h"
 #include <Preferences.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
@@ -27,6 +28,7 @@ static uint32_t pairingUntil   = 0;
 static bool     advertising    = false;
 static String   endpointBuf;
 static String   tplCtrlBuf;
+static uint32_t tplCtrlStartedMs = 0;
 static String   authBuf;
 static String   fwVersion      = "?";
 static String   infoExtra;
@@ -64,6 +66,7 @@ static bool jsonComplete(const String &s) {
 static void clearReceiveBuffers() {
     endpointBuf = "";
     tplCtrlBuf = "";
+    tplCtrlStartedMs = 0;
     authBuf = "";
 }
 
@@ -143,6 +146,40 @@ static bool appendJson(String &buf, const std::string &value, size_t limit,
     return true;
 }
 
+static bool appendCommandFrame(String &buf, const std::string &value) {
+    const uint32_t now = millis();
+    if (buf.length() && (uint32_t)(now - tplCtrlStartedMs) > 2000) {
+        buf = "";
+        ++connectionGeneration;
+    }
+    if (!buf.length()) tplCtrlStartedMs = now;
+    if (value.empty() || buf.length() + value.size() > 8192 ||
+        !buf.concat(value.data(), value.size())) {
+        buf = "";
+        ++connectionGeneration;
+        return false;
+    }
+    if (buf.length() < COMPACT_FRAME_HEADER) return false;
+    const uint8_t *bytes = reinterpret_cast<const uint8_t *>(buf.c_str());
+    const size_t expected = COMPACT_FRAME_HEADER + (size_t(bytes[6]) << 8 | bytes[7]);
+    if (bytes[0] != COMPACT_FRAME_MARKER || expected > 8192 || buf.length() > expected) {
+        buf = "";
+        ++connectionGeneration;
+        return false;
+    }
+    if (buf.length() < expected) return false;
+    CompactFrameHeader header;
+    if (!compactFrameDecode(bytes, buf.length(), header, 8192) || header.kind != 0) {
+        buf = "";
+        ++connectionGeneration;
+        return false;
+    }
+    String complete = buf;
+    buf = "";
+    dispatchTemplateCtrl(complete);
+    return true;
+}
+
 // A shared last gate for ALL INFO/Status writes, including auth/endpoint.
 // NimBLE setValue returns void: verify the stored length before notifying.
 static bool writeAttribute(NimBLECharacteristic *characteristic, const String &bytes, const char *name) {
@@ -155,11 +192,20 @@ static bool writeAttribute(NimBLECharacteristic *characteristic, const String &b
     const auto stored = characteristic->getValue();
     const bool written = stored.size() == bytes.length() && !memcmp(stored.data(), bytes.c_str(), bytes.length());
     JsonDocument metadata;
+    if (bytes.length() >= COMPACT_FRAME_HEADER && (uint8_t)bytes[0] == COMPACT_FRAME_MARKER) {
+        CompactFrameHeader frame;
+        if (compactFrameDecode(reinterpret_cast<const uint8_t *>(bytes.c_str()), bytes.length(), frame, 512)) {
+            DevLog.printf("[ble-wire] chr=%s op=%u request=%llu bytes=%u result=%s\n", name,
+                (unsigned)frame.op, (unsigned long long)frame.requestNo,
+                (unsigned)bytes.length(), written ? "written" : "write_failed");
+            return written;
+        }
+    }
     deserializeJson(metadata, bytes);
     const char *category = metadata["ack"] | "info";
     const char *op = metadata["op"] | category;
     const bool known = !strcmp(op,"status") || !strcmp(op,"data") || !strcmp(op,"plan") ||
-        !strcmp(op,"handoff") || !strcmp(op,"sync_config") || !strcmp(op,"sync_open") || !strcmp(op,"wifi") ||
+        !strcmp(op,"network_start") || !strcmp(op,"sync_config") || !strcmp(op,"sync_open") || !strcmp(op,"wifi") ||
         !strcmp(op,"auth") || !strcmp(op,"endpoint") || !strcmp(op,"info");
     // Hash only correlation; never log the frame, token, password or input op.
     String rid = metadata["rid"] | "";
@@ -299,8 +345,7 @@ class TplCtrlCallbacks : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic *c, PEER_ARG) override {
         if (!writeAllowed(desc)) return;
         std::string v = c->getValue();
-        appendJson(tplCtrlBuf, v, 8192, "template-control",
-                   [](const String &json) { dispatchTemplateCtrl(json); });
+        appendCommandFrame(tplCtrlBuf, v);
     }
 };
 

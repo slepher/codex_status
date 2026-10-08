@@ -1,6 +1,7 @@
 pub mod activity;
 pub mod codex;
 pub mod compile;
+pub mod compact_frame;
 pub mod coordinator;
 pub mod datasource;
 pub mod device_clock;

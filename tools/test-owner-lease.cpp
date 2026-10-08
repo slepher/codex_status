@@ -20,8 +20,10 @@ int main() {
  deepWake(60000000);assert(!ownerGet(out));assert(ownerTestStrings.empty());
  claim();ownerTestRtcUs+=299999999;assert(ownerGet(out)&&ownerRemainingS()==1);
  ++ownerTestRtcUs;assert(!ownerGet(out));
- claim();ownerTestRtcUs+=100000000;assert(ownerAllows("A"));assert(ownerRemainingS()==300);
- deepWake(310000000);assert(!ownerGet(out));
+ claim();const auto touchedDeadline=ownerDeadline.untilUs;
+ ownerTestRtcUs+=100000000;assert(ownerAllows("A"));
+ assert(ownerDeadline.untilUs==touchedDeadline && ownerRemainingS()==200);
+ deepWake(200000000);assert(!ownerGet(out));
  // Cold/soft reset cannot reuse a valid-looking RTC record as a new grant.
  claim();ownerTestReset=ESP_RST_SW;ownerBegin();assert(!ownerGet(out));
  claim();ownerTestReset=ESP_RST_POWERON;ownerBegin();assert(!ownerGet(out));

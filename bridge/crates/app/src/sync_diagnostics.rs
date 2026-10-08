@@ -523,8 +523,7 @@ pub fn transfer_with_budget(data_root: &Path, link: &DeviceLink, budget: bridge_
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{BufRead, BufReader, Read, Write};
-    use std::net::TcpStream;
+    use std::io::{BufRead, BufReader, Read};
     use std::process::{Command, Stdio};
 
     // Run explicitly with CODEX_STATUS_SYNC_TEST_SIM_EXE set to the isolated
@@ -550,31 +549,25 @@ mod tests {
             let ready: Value = serde_json::from_str(&line).context("Fake ROM startup ready JSON")?;
             let address = ready["http"].as_str().context("fake ROM address")?
                 .trim_start_matches("http://").to_owned();
-            let http = |method: &str, path: &str, token: &str, body: &Value| -> Result<Value> {
-                let bytes = if body.is_null() { Vec::new() } else { serde_json::to_vec(body)? };
-                let mut socket = TcpStream::connect(&address)?;
-                socket.set_read_timeout(Some(Duration::from_secs(5)))?;
-                write!(socket, "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n", bytes.len())?;
-                socket.write_all(&bytes)?;
-                let mut response = Vec::new();
-                socket.read_to_end(&mut response)?;
-                let start = response.windows(4).position(|part| part == b"\r\n\r\n")
-                    .context("fake ROM HTTP response")? + 4;
-                Ok(serde_json::from_slice(&response[start..]).with_context(|| format!("Fake ROM {method} {path} response JSON ({} bytes)", response.len()-start))?)
-            };
-            let claim = http("POST", "/claim?id=bridge-test&lease=120", "sync-device", &Value::Null)?;
+            let (claim_code,claim_body)=bridge_core::device_client::claim(
+                &address,"sync-endpoint","sync-device",
+                &json!({"id":"bridge-test","lease":"120"}),Duration::from_secs(3))?;
+            anyhow::ensure!(claim_code==200,"Fake ROM claim HTTP {claim_code}");
+            let claim:Value=serde_json::from_str(&claim_body)?;
             anyhow::ensure!(claim["owner"]["id"] == "bridge-test", "Fake ROM claim failed: {claim}");
-            let status = http("GET", "/api/status", "sync-endpoint", &Value::Null)?;
-            let config = json!({"op":"sync_config","request_id":"config-1",
-                "token":"sync-endpoint","device_mac":"02:00:00:00:00:B2",
-                "session_nonce":status["session_nonce"],"bridge_id":"bridge-test","enabled":true});
-            // The current carrier separates INFO connection, write acceptance
-            // and Status business ACK; use that protocol in this older fixture.
-            let _ = http("GET", "/sim/ble/info", "sync-endpoint", &Value::Null)?;
-            let accepted = http("POST", "/sim/ble/command", "sync-endpoint", &config)?;
-            anyhow::ensure!(accepted["result"] == "accepted", "Fake ROM transport failed");
-            let wire = http("GET", "/sim/ble/status", "sync-endpoint", &Value::Null)?;
-            let ack = bridge_ble::decode_wire(&serde_json::to_vec(&wire)?)?;
+            std::env::set_var("CODEX_STATUS_SIM_BLE_ENDPOINTS",
+                json!({"0200000000B2":ready["http"]}).to_string());
+            let runtime=tokio::runtime::Runtime::new()?;
+            let ack=runtime.block_on(async {
+                let mut link=bridge_ble::DeviceConnection::connect(
+                    "0200000000B2","sync-endpoint","bridge-test").await?
+                    .context("Fake ROM BLE endpoint unavailable")?;
+                link.command("status",json!({})).await?;
+                let ack=link.command("sync_config",json!({"enabled":true})).await?;
+                link.close_bounded(Duration::from_millis(200)).await;
+                Ok::<Value,anyhow::Error>(ack)
+            })?;
+            std::env::remove_var("CODEX_STATUS_SIM_BLE_ENDPOINTS");
             anyhow::ensure!(ack["result"] == "applied", "Fake ROM config failed: {ack}");
             let link = DeviceLink { mac: "0200000000B2".into(), ip: address,
                 token: "sync-endpoint".into(), bridge_id: "bridge-test".into() };

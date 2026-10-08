@@ -186,7 +186,7 @@ void ownerTouch() {
     if (!haveOwner) return;
     if (!deadlineValid(esp_rtc_get_time_us())) { ownerClear(true); return; }
     owner.lastSeen = millis() / 1000;
-    renewDeadline();
+    // Only an explicit authenticated claim/renew may extend the RTC lease.
 }
 
 bool ownerGet(OwnerRec &out) {

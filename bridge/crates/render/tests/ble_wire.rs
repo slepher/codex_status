@@ -40,7 +40,7 @@ fn production_info_and_all_ack_classes_are_bounded() {
     assert_eq!(serde_json::from_slice::<Value>(&info).unwrap()["wc"],1);
     println!("max INFO bytes={}", info.len());
     assert!(info.len() <= 512);
-    for op in ["data","plan","sync_config","sync_open","handoff","command"] {
+    for op in ["data","plan","sync_config","sync_open","network_start","command"] {
         for result in ["applied","rejected"] {
             let mut input = envelope();
             input["op"] = json!(op); input["result"] = json!(result);

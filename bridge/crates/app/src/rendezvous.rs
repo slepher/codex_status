@@ -1,7 +1,24 @@
-//! One rendezvous transaction: BLE exchange, authenticated HTTP proof,
-//! handoff, lock release/close and the frozen admitted HTTP work set.
+//! One rendezvous transaction: BLE exchange, early close, authenticated HTTP
+//! verification and the frozen admitted HTTP work set.
 use super::*;
-use bridge_core::rendezvous::{Budget, CLOSE_BUDGET, HTTP_HANDOFF_BUDGET};
+use bridge_core::rendezvous::{Budget, CLOSE_BUDGET, HTTP_PROOF_BUDGET};
+
+fn report_route(target: &str) -> Result<std::net::Ipv4Addr, String> {
+    let device = target.split(':').next().unwrap_or(target)
+        .parse::<std::net::Ipv4Addr>().map_err(|_| "report_device_address_invalid")?;
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0")
+        .map_err(|_| "report_route_unavailable")?;
+    socket.connect((device, 80)).map_err(|_| "report_route_unavailable")?;
+    let local = match socket.local_addr().map_err(|_| "report_route_unavailable")?.ip() {
+        std::net::IpAddr::V4(ip) => ip,
+        _ => return Err("report_route_unavailable".into()),
+    };
+    if local.is_unspecified() || local.is_multicast() ||
+        (local.is_loopback() && std::env::var_os("CODEX_STATUS_SIM_BLE_ENDPOINTS").is_none()) {
+        return Err("report_route_unavailable".into());
+    }
+    Ok(local)
+}
 
 // Explicit claim is required before BLE provisioning can create the HTTP path.
 // Reuses the HTTP claim permission/decision contract on capable firmware.
@@ -61,8 +78,8 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             .and_then(DeviceIdentity::normalized_mac)
             == Some(mac.clone())
     });
-    // Fetch the token before the exchange budget; legacy devices may close
-    // after Plan ACK, while rendezvous-v1 devices wait for HTTP handoff.
+    // Fetch the token before the exchange budget so a short BLE window can
+    // close immediately after the accepted network-start command.
     if still_registered {
         cache_device_token_if_missing(ctx, &link, &mac).await;
     }
@@ -105,46 +122,18 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             }
         }
         let decision = service(ctx).next_delivery(&mac, true, device_now(&mac));
-        if decision["decision"] == "ble_data" {
-            if let Some(body) = service(ctx).data_message_body(&mac) {
-                let ack = link.command("data", body.clone()).await.map_err(err_text)?;
-                let applied = ack["result"] == "applied"
-                    && ack["data_seq"] == body["seq"]
-                    && ack["active_context_id"] == body["active_context_id"];
-                let ack_category = if ack["result"] != "applied" {
-                    "ack_rejected"
-                } else if !applied {
-                    "ack_mismatch"
-                } else {
-                    "none"
-                };
-                let outcome = service(ctx).note_ack(
-                    &mac,
-                    DeliveryKind::BleData,
-                    body["seq"].as_u64().unwrap_or(0),
-                    body["crc"].as_str().unwrap_or(""),
-                    applied,
-                    ack["display_state"].as_str().unwrap_or("unchanged"),
-                );
-                tracing::info!(
-                    event = "ack",
-                    device_mac = mac,
-                    seq = body["seq"].as_u64().unwrap_or(0),
-                    data_seq = ack["data_seq"].as_u64().unwrap_or(0),
-                    result = ack["result"].as_str().unwrap_or("unknown"),
-                    display_state = ack["display_state"].as_str().unwrap_or("unknown"),
-                    error_category = ack_category,
-                    outcome = outcome["outcome"].as_str().unwrap_or("unknown"),
-                    transport = "ble",
-                    "device data acknowledgement"
-                );
-            }
-        }
+        let pending_data = (decision["decision"] == "ble_data")
+            .then(|| service(ctx).data_message_body(&mac)).flatten();
+        let needs_http = !admitted_wifi.is_empty()
+            || service(ctx).wifi_state(&mac).connection.is_some_and(|c| c.state == "requested")
+            || matches!(decision["decision"].as_str(), Some("light_data" | "bundle" | "activate"))
+            || (sync_enabled && state["sync"]["retry_skip"] == 0
+                && (state["sync"]["due"] == true || state["sync"]["pending"] == true));
         let remaining = state["power"]["provisional_remaining_s"]
             .as_u64()
             .unwrap_or(0) as u32;
-        // Probe authenticated HTTP first; only failed access needs BLE diagnostics.
-        let reachable = if let Some(target) = device_link_for_mac(ctx, &mac) {
+        // A reachable HTTP service can complete admitted work directly.
+        let reachable = if !needs_http { false } else if let Some(target) = device_link_for_mac(ctx, &mac) {
             let expected = mac.clone();
             let probe = blocking(move || {
                 match device_client::status(&target.ip, &target.token, Duration::from_millis(400)) {
@@ -157,10 +146,12 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             match probe { Ok(ready) => ready, Err(error) => { crate::wifi::http_failed(ctx, &mac, &error); return Err(error); } }
         } else { false };
         state["_http_reachable"] = json!(reachable);
+        state["_need_http"] = json!(needs_http);
+        state["_http_reachable"] = json!(reachable);
         let requested = service(ctx).wifi_state(&mac).connection.is_some_and(|c| c.state=="requested");
-        state["_wifi_repair"] = json!(!reachable || requested);
+        state["_wifi_repair"] = json!(needs_http && (!reachable || requested));
         if reachable && !requested { crate::wifi::http_ready(ctx, &mac); }
-        else {
+        else if needs_http {
             let _=tokio::time::timeout(Duration::from_millis(700),crate::wifi::prepare_connection(ctx,&mac,&mut link,remaining>0)).await;
             if !reachable { crate::wifi::http_failed(ctx,&mac,"http_unavailable"); }
         }
@@ -179,6 +170,10 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             )
             .map_err(err_text)?;
         let mut plan_body = serde_json::to_value(&plan).map_err(err_text)?;
+        plan_body["need_http"] = json!(needs_http && !reachable);
+        if let Some(data) = &pending_data {
+            plan_body["data"] = data.clone();
+        }
         if !sync_enabled && wake_history_sync_due(&mac, &state) {
             plan_body["history_sync_ms"] = json!(2500);
         }
@@ -221,6 +216,24 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
         } else {
             json!({"outcome":"unknown"})
         };
+        if let Some(body) = &pending_data {
+            let data_ack = &ack["data"];
+            let applied = accepted && data_ack["result"] == "applied"
+                && data_ack["data_seq"] == body["seq"]
+                && data_ack["active_context_id"] == body["active_context_id"];
+            if !ack_unknown {
+                let outcome = service(ctx).note_ack(&mac, DeliveryKind::BleData,
+                    body["seq"].as_u64().unwrap_or(0),
+                    body["crc"].as_str().unwrap_or(""), applied,
+                    data_ack["display_state"].as_str().unwrap_or("unchanged"));
+                tracing::info!(event="ack", device_mac=%mac,
+                    seq=body["seq"].as_u64().unwrap_or(0),
+                    data_seq=data_ack["data_seq"].as_u64().unwrap_or(0),
+                    result=data_ack["result"].as_str().unwrap_or("unknown"),
+                    outcome=outcome["outcome"].as_str().unwrap_or("unknown"),
+                    transport="ble", "joint Plan/Data acknowledgement");
+            }
+        }
         tracing::info!(
             event = "ack",
             device_mac = mac,
@@ -298,16 +311,14 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             _ => Err("BLE rendezvous timed out".to_owned()),
         },
     };
-    let shared_tail = Budget::at(admitted_at, HTTP_HANDOFF_BUDGET).capped(http_window.remaining());
+    let shared_tail = Budget::at(admitted_at, HTTP_PROOF_BUDGET).capped(http_window.remaining());
     let mut http_budget = http_window;
     let mut wifi_repair_error = None;
-    if let Ok((state, _, opened, light)) = &normal_result {
-        if *opened || *light {
+    if let Ok((state, _, opened, light)) = &mut normal_result {
+        if *opened || (*light && state["_need_http"] == true) {
             let plan_id = state["_sent_plan"]["plan_id"].as_u64().unwrap_or(0);
-            let explicit = state["rendezvous_v"] == 1;
             let unknown = state["_plan_ack_unknown"] == true || state["_sync_open_unknown"] == true;
-            // These optional commands consume a short shared tail; none gets
-            // a new unbounded maintenance window before handoff.
+            // These optional commands consume a short shared tail.
             if !admitted_wifi.is_empty() {
                 // Cancelling a fragmented write leaves a partial JSON frame.
                 // Use the shared deadline; on timeout never reuse this link.
@@ -334,32 +345,35 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
                 )
                 .await { wifi_repair_error = Some(error); }
             }
-            if (explicit || unknown) && wifi_repair_error.is_none() {
-                match ready_and_handoff(
-                    ctx,
-                    &mac,
-                    &mut link,
-                    state,
-                    plan_id,
-                    explicit,
-                    shared_tail,
-                    http_window,
-                )
-                .await
-                {
-                    Ok((status, observed_budget, sampled_at)) => {
-                        http_budget = observed_budget;
-                        if let Err(error) =
-                            service(ctx).note_device_status_at(&mac, &status, "http", sampled_at)
-                        {
-                            normal_result = Err(err_text(error));
-                        } else if let Ok((_, _, opened, light)) = &mut normal_result {
-                            *light = status["power"]["mode"] == "light"
-                                && status["power"]["remaining_s"].as_u64().unwrap_or(0) > 0;
-                            *opened = status["sync"]["phase"] == "WIFI_SYNC_ONCE";
+            if state["_need_http"] == true && state["_http_reachable"] != true &&
+                wifi_repair_error.is_none() {
+                // A lost SyncOpen reply does not make the already acknowledged
+                // Plan uncertain or block its independently admitted HTTP work.
+                let confirmed = if state["_plan_ack_unknown"] == true {
+                    link.command("status", json!({})).await.ok().is_some_and(|check|
+                        check["power"]["plan_id"].as_u64()==Some(plan_id))
+                } else { true };
+                if confirmed {
+                    let attempt = device_link_for_mac(ctx,&mac)
+                        .ok_or_else(||"report_device_address_missing".to_owned())
+                        .and_then(|target| report_route(&target.ip));
+                    if let Ok(route) = attempt {
+                        let fields=json!({"plan_id":plan_id,"bridge_addr":route.to_string(),
+                            "bridge_port":ctx.config.port,"origin_request_no":plan_id});
+                        let accepted=tokio::time::timeout(shared_tail.remaining(),
+                            link.command("network_start",fields)).await;
+                        let applied=matches!(&accepted,Ok(Ok(reply)) if reply["result"]=="accepted");
+                        let uncertain=!matches!(&accepted,Ok(Ok(_)));
+                        state["_network_start_accepted"] = json!(applied);
+                        state["_network_start_unknown"] = json!(uncertain);
+                        if !applied && !uncertain {
+                            wifi_repair_error=Some("network_start_rejected".into());
                         }
+                    } else {
+                        wifi_repair_error=Some(attempt.unwrap_err());
                     }
-                    Err(error) => { crate::wifi::http_failed(ctx, &mac, &error); normal_result = Err(error); },
+                } else {
+                    wifi_repair_error=Some("plan_unconfirmed".into());
                 }
             } else {
                 http_budget = http_window.capped(Duration::from_secs(
@@ -390,12 +404,6 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             .await;
         }
     }
-    // An ACK lost after apply can become a normal confirmed contact via HTTP.
-    let sync_opened = normal_result
-        .as_ref()
-        .is_ok_and(|(_, enabled, opened, light)| *opened || (*enabled && *light));
-    let may_continue = normal_result.as_ref().is_ok_and(|(_, _, _, light)| *light);
-    let result = normal_result.map(|_| ());
     // Release both delivery locks before link cleanup. A hanging
     // `peripheral.disconnect()` (btleplug on macOS after a natural link loss)
     // must not block HTTP delivery for this MAC or the next rendezvous for any
@@ -404,6 +412,35 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
     drop(_device_delivery);
     drop(_delivery);
     link.close_bounded(CLOSE_BUDGET).await;
+    if let Ok((state, _, opened, light)) = &mut normal_result {
+        if state["_need_http"] == true &&
+            (state["_http_reachable"] == true ||
+             state["_network_start_accepted"] == true || state["_network_start_unknown"] == true) {
+            let plan_id=state["_sent_plan"]["plan_id"].as_u64().unwrap_or(0);
+            let explicit=state["rendezvous_v"]==1;
+            let proof_budget=if state["_http_reachable"]==true {
+                Budget::new(Duration::from_secs(3)).capped(http_window.remaining())
+            } else {shared_tail};
+            match wait_for_device_http(ctx,&mac,state,plan_id,explicit,proof_budget,http_window).await {
+                Ok((status,budget,sampled_at)) => {
+                    http_budget=budget;
+                    if let Err(error)=service(ctx).note_device_status_at(&mac,&status,"http",sampled_at) {
+                        normal_result=Err(err_text(error));
+                    } else {
+                        *light=status["power"]["mode"]=="light" &&
+                            status["power"]["remaining_s"].as_u64().unwrap_or(0)>0;
+                        *opened=status["sync"]["phase"]=="WIFI_SYNC_ONCE";
+                    }
+                }
+                Err(error) => {crate::wifi::http_failed(ctx,&mac,&error);normal_result=Err(error);}
+            }
+        }
+    }
+    let sync_opened = normal_result.as_ref()
+        .is_ok_and(|(_, enabled, opened, light)| *opened || (*enabled && *light));
+    let may_continue = normal_result.as_ref().is_ok_and(|(state, _, _, light)|
+        *light && state["_need_http"] == true);
+    let result = normal_result.map(|_| ());
     if sync_opened || (may_continue && !admitted_wifi.is_empty()) {
         // `sync_http_inner` does not take the lock itself; re-acquire only the
         // per-MAC lock to keep admitted HTTP work serialized.
@@ -420,7 +457,9 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             .iter()
             .filter(|j| admitted_wifi.contains(&j.job_id))
             .all(|j| j.terminal());
-        if may_continue || reads_done {
+        // An admitted read that is still waiting owns the current window;
+        // diagnostic complete would close it before the original job finishes.
+        if reads_done {
             sync_http_inner_budget(ctx, &mac, may_continue, http_budget).await;
         }
     }
@@ -481,7 +520,6 @@ fn matching_http(
         if rv["v"] != 1
             || rv["ready"] != true
             || rv["id"].as_str().is_none_or(str::is_empty)
-            || rv["challenge"].as_str().is_none_or(str::is_empty)
         {
             return Err("http_not_ready".into());
         }
@@ -489,10 +527,9 @@ fn matching_http(
     Ok(())
 }
 
-async fn ready_and_handoff(
+async fn wait_for_device_http(
     ctx: &AppCtx,
     mac: &str,
-    link: &mut bridge_ble::DeviceConnection,
     ble: &Value,
     plan_id: u64,
     explicit: bool,
@@ -500,29 +537,15 @@ async fn ready_and_handoff(
     work_budget: Budget,
 ) -> Result<(Value, Budget, u64), String> {
     let mut last = "http_unavailable".to_owned();
-    let mut wifi_sample=tokio::time::Instant::now()-Duration::from_secs(2);
     loop {
         if budget.remaining().is_zero() {
             return Err(last);
         }
-        // INFO supplies a freshly associated IP and the device's new RF phase
-        // deadline. Only this verified peripheral/wake can update the bound.
-        if explicit {
-            let _ = link
-                .refresh_info(budget.remaining().min(Duration::from_millis(500)))
-                .await;
-        }
-        let Some(mut target) = device_link_for_mac(ctx, mac) else {
-            return Err("http_endpoint_missing".into());
+        // The ready report may have supplied a new IP after BLE closed.
+        let Some(target) = device_link_for_mac(ctx, mac) else {
+            tokio::time::sleep(budget.remaining().min(Duration::from_millis(100))).await;
+            continue;
         };
-        if explicit {
-            if let Some(ip) = link.info["ip"]
-                .as_str()
-                .filter(|ip| ip.parse::<std::net::Ipv4Addr>().is_ok())
-            {
-                target.ip = ip.to_owned();
-            }
-        }
         let ip = target.ip.clone();
         let token = target.token.clone();
         let timeout = budget.remaining().min(Duration::from_secs(1));
@@ -536,21 +559,6 @@ async fn ready_and_handoff(
         if let Ok(status) = observed {
             match matching_http(&status, mac, ble, plan_id, explicit) {
                 Ok(()) => {
-                    // HTTP on an old network cannot fulfill an admitted
-                    // activation. Query its minimal result while that intent
-                    // remains pending, then require association + durable active.
-                    if ble["_wifi_repair"] == true {
-                        if let Some(connection) = service(ctx).wifi_state(mac).connection {
-                            if connection.state != "connected" {
-                                if connection.state == "connection_failed" { return Err(connection.error.unwrap_or("wifi_connection_failed".into())); }
-                                let _=tokio::time::timeout(budget.remaining().min(Duration::from_millis(500)),crate::wifi::refresh_connection(ctx,mac,link)).await;
-                                if service(ctx).wifi_state(mac).connection.is_some_and(|c|c.state!="connected") {
-                                    last="wifi_activation_pending".into();
-                                    tokio::time::sleep(budget.remaining().min(Duration::from_millis(100))).await;continue;
-                                }
-                            }
-                        }
-                    }
                     let remaining = status["power"]["remaining_s"].as_u64().unwrap_or(0);
                     let observed_budget = if remaining > 0 {
                         Budget::at(
@@ -566,57 +574,16 @@ async fn ready_and_handoff(
                         Budget::at(sample_start, limit.saturating_sub(Duration::from_secs(1)))
                             .capped(work_budget.remaining())
                     };
-                    if explicit {
-                        // Handoff retains strict owner matching. Idle devices
-                        // are occupied only through the existing token-gated
-                        // explicit claim, after authenticated HTTP proof.
-                        service(ctx)
-                            .note_device_endpoint(mac, &target.ip)
-                            .map_err(err_text)?;
-                        if status["owner_id"] != ctx.bridge_id {
-                            let limit = budget
-                                .remaining()
-                                .min(observed_budget.remaining())
-                                .min(Duration::from_secs(2));
-                            let claim = tokio::time::timeout(
-                                limit,
-                                crate::post_claim_for_mac(ctx, false, false, mac),
-                            )
-                            .await;
-                            match claim {
-                                Ok(Ok(Some(owner))) if owner["id"] == ctx.bridge_id => {}
-                                _ => return Err("handoff_claim_unconfirmed".into()),
-                            }
-                        }
-                        let fields = json!({"plan_id":plan_id,"rendezvous_id":status["rendezvous"]["id"],
-                            "challenge":status["rendezvous"]["challenge"],"wake_generation":status["wake_generation"],"wake_seq":status["wake_seq"]});
-                        let ack = tokio::time::timeout(
-                            budget
-                                .remaining()
-                                .min(observed_budget.remaining())
-                                .min(Duration::from_secs(2)),
-                            link.command("handoff", fields),
-                        )
-                        .await;
-                        if !matches!(ack, Ok(Ok(ref value)) if value["result"] == "applied") {
-                            // Applied-but-lost handoff ACK is recoverable by the
-                            // same authenticated proof. Never open a new window.
-                            let ip = target.ip.clone();
-                            let token = target.token.clone();
-                            let limit = budget
-                                .remaining()
-                                .min(observed_budget.remaining())
-                                .min(Duration::from_secs(1));
-                            let check = blocking(move || {
-                                device_client::status(&ip, &token, limit).map_err(err_text)
-                            })
-                            .await?;
-                            matching_http(&check, mac, ble, plan_id, true)?;
-                            if check["rendezvous"]["id"] != status["rendezvous"]["id"]
-                                || check["rendezvous"]["handoff"] != true
-                            {
-                                return Err("handoff_unconfirmed".into());
-                            }
+                    if status["owner_id"] != ctx.bridge_id {
+                        // Occupancy is renewed only by an explicit claim after
+                        // the authenticated device response.
+                        let limit=budget.remaining().min(observed_budget.remaining())
+                            .min(Duration::from_secs(2));
+                        service(ctx).note_device_endpoint(mac,&target.ip).map_err(err_text)?;
+                        let claim=tokio::time::timeout(limit,
+                            crate::post_claim_for_mac(ctx,false,false,mac)).await;
+                        if !matches!(claim,Ok(Ok(Some(ref owner))) if owner["id"]==ctx.bridge_id) {
+                            return Err("claim_unconfirmed".into());
                         }
                     }
                     service(ctx)
@@ -636,10 +603,6 @@ async fn ready_and_handoff(
                 Err(error) => last = error,
             }
         }
-        if wifi_sample.elapsed()>=Duration::from_secs(1) {
-            let _=tokio::time::timeout(budget.remaining().min(Duration::from_millis(500)),crate::wifi::refresh_connection(ctx,mac,link)).await;
-            wifi_sample=tokio::time::Instant::now();
-        }
         tokio::time::sleep(budget.remaining().min(Duration::from_millis(100))).await;
     }
 }
@@ -648,10 +611,10 @@ async fn ready_and_handoff(
 mod tests {
     use super::*;
     #[test]
-    fn handoff_proof_rejects_wrong_device_session_wake_and_plan() {
+    fn device_http_status_rejects_wrong_session_wake_and_plan() {
         let ble = json!({"session_nonce":"boot","wake_generation":2,"wake_seq":9,"_sent_plan":{"mode":"light"}});
         let status = json!({"device_mac":"7C4FADB93408","session_nonce":"boot","wake_generation":2,"wake_seq":9,
-            "power":{"plan_id":101,"mode":"light","remaining_s":100},"rendezvous":{"v":1,"ready":true,"id":"rv","challenge":"proof"}});
+            "power":{"plan_id":101,"mode":"light","remaining_s":100},"rendezvous":{"v":1,"ready":true,"id":"rv"}});
         assert!(matching_http(&status, "7C4FADB93408", &ble, 101, true).is_ok());
         for (key, value) in [
             ("device_mac", json!("70041DD7A340")),

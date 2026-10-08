@@ -1,5 +1,7 @@
 # PowerPlan 与 Data 同轮联合下发执行计划
 
+2026-10-08 用户新约束：本文旧设备兼容/能力降级建议不再实施，最终合同与顺序以 [精简协议实施计划](bridge-device-compact-protocol-implementation-plan.md) 为准；Plan-first/partial及原事务不续租语义继续沿用。Bridge/设备分别更新软件版本，不提供协议版本历史。
+
 日期：2026-10-05。状态：计划已编写，尚未实现、构建或部署。待办唯一归属：[backlog A9](../../docs/roadmap/backlog.md#a9-powerplan-与-data-同轮联合下发2026-10-05)。
 
 ## 1. 目标与已确认现场

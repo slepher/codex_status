@@ -113,8 +113,12 @@
 
 - 用户已确认：真实push变化时，Bridge发送前冻结电源意图；小数据与PowerPlan同请求，大数据先Plan再经合法HTTP窗口投递。Data ACK成功不立即撤销活跃窗口，丢ACK不阻断Plan下放；重试不续租、不换原事务ID。
 - 现场weekly余量65（usedPercent35），14:18:27检测usage变化；14:20/14:22/14:24 BLE data ACK超时，最后确认仍Plan1274/sleep/0s；设备后报applied_seq97，Bridge原seq97仍待确认。已证明Bridge先Data后Plan的编排缺口；ACK丢失的RF/设备原因未确定。
-- 执行计划：[powerplan-data-execution-plan.md](../../project-workflow/bridge-macos/powerplan-data-execution-plan.md)，P1–P6覆盖能力协商、复用plan可选data、分项结果、持久冻结、context/CRC/Plan核对、大小包/旧设备兼容、生产组合失败矩阵与资源门禁。当前仅计划，未实现/构建/部署。
+- 执行计划：[精简协议实施计划](../../project-workflow/bridge-macos/bridge-device-compact-protocol-implementation-plan.md)取代旧A9中的能力协商与兼容建议；Plan-first可选Data、分项结果已在候选代码实现并通过合成部分拒绝测试，尚未部署。旧[执行计划](../../project-workflow/bridge-macos/powerplan-data-execution-plan.md)保留A9原业务背景，不作为最终wire方案。
 - 完成判据：小数据联合下放及大数据交接通过；ACK丢失仍能确认原Plan/Data；拒绝/冲突/过期/未知有明确有界反馈；原期限不被重试延长；授权后的Note4自然会合、BLE OFF/实际PM及到期deep实机验收分别留证。沿默认Note4构建约束，1.54与其他实例不自动纳入发布。
+
+- 2026-10-08 新协议设计已由Astra High审核；**P0–P5已接工作树生产代码，Fake设备主动report→Bridge接收→认证回读闭环与实机验收未完成，不能部署**。48 B最终唯一信封已进入设备HTTP/BLE和Bridge客户端、设备→Bridge报告，旧handoff已删除；Plan-first分项ACK、BLE先释放/HTTP后ready、900s精简Status及owner不隐式续lease已实现。跨语言golden、core128/128、render各测试集共53、BLE17/17、app73/73及两项显式app→同源Fake测试通过；Fake bootstrap57/57（含HTTP打开标识退休、OTA重启及同源C++会合/真实Wi-Fi HAL决定ready）通过。丢ACK旧属性无节流使Windows loopback产生15717 TIME_WAIT/socket10048，已加20ms有界节流和读取次数断言，完整app重测全绿且连接数降至约1578；迟到report事实检查加强为有效Light、HTTP ready、精确owner。现有Fake监听loopback与生产报告接收器的非loopback源/IP匹配要求冲突，报告完整网络闭环及丢失/迟到/重启、双向不可达组合仍需验收；不能把分层通过称为该闭环。最新候选ROM 1,881,312 B/SHA256 1BFA8CB990E378E78B3B5247E11D0FF6A7CBE4227815C345416CC8AEC9735F9E，匹配Note4 ELF栈门禁全PASS（无条件dispatcher单帧976/1024、最长本地链3440/4096）；未部署，实机RF/功耗/动态RAM与掉电未验。分阶段/资源/故障门禁见 [精简协议实施计划](../../project-workflow/bridge-macos/bridge-device-compact-protocol-implementation-plan.md)，审核见 [Astra High审核](../../project-workflow/bridge-macos/bridge-device-compact-protocol-review.md)；B6配置事务、C4功耗和C8诊断验收仍独立保留。
+
+- 用户追加约束：Bridge/设备分别更新软件版本，不提供协议版本历史或旧协议兼容；实施计划已取消能力降级、双协议和回退重发，最终一次性替换。信封采用固定marker，不维护协议版本号。
 
 ### A3. 修掉 Note4 深睡时钟残影（唯一影响日常观感的显示缺陷）
 - **2026-09-30 进展**：ExtraLight 200 Bundle job `5d798bd9` 已成功；`0.18.40-note4-b-display1` OTA job `10ec4b37` 已认证 `image_verified`，设备新回报 `display_state=displayed`、`epd_busy_fails=0`。源码以成功写入计数优先于局刷失败计数，宿主覆盖“局刷失败后整刷成功”及真正未写入失败。仍需将局刷失败原因分型（影子帧、分配、BUSY/阶段）并确认有无硬件侧间歇 BUSY 故障；旧 `failed` 不能当作模板提交失败。
@@ -184,6 +188,8 @@
 - 2026-10-03 用户确认本环境仅携带 Note4，1.54 不在现场：当前实机验收以 Note4 为范围，保留双设备软件身份回归；Windows 对照、Note4 每平台 ≥30 个自然会合及 macOS ≥24 h soak 按后续可用现场验证。1.54 实机与另一 CPU 架构另标未验，不为本轮要求用户取回设备，也不据 Note4 结果宣称全硬件已验。当前会话为 macOS 14.8.9 / x86_64，macOS 15+ 权限现场尚未验证。
 
 ### B6. 离线 BLE 配 Wi-Fi 与 BOOT 蓝牙恢复入口（2026-10-03 新开）
+
+- **2026-10-08容量与误扣预算修复已部署、实机恢复通过。** Fake已复现32条已确认历史永久占队列及未发激活扣完预算；现已安全回收确认/已ACK终态、保护未知提交/待ACK与序号围栏，容量错误明确返回、首次实际发送才扣预算，33项相关测试通过。Bridge SHA38B7CE11…已部署，正常应用服务重试home/v8，w3_4a完成/回执退役；Note4 .69认证HTTP已连wd21-la/.177/attempts0，无需刷ROM。诊断/修复见`project-workflow/bridge-macos/wifi-activate-fake-20261008-plan.md`与PROGRESS。剩余：长期多轮RF/电池与Mac部署验收；Fake通用状态硬编码wifi_connected/http.ready，须补RF/HTTP及完整main生命周期适配；无实际HTTP工作仍重复启用路径待独立复现。
 
 - **2026-10-07 后续实体验收**：Bridge连续失败预算生命周期/耗尽反馈/显式重试已修复并部署，后台及主动认证HTTP实机归零、原事务保留，移交PROGRESS；.68 INFO重复释放修复与.69运行SHA亦已验证。长期电池/RF多轮、Mac原生UI/部署仍待验。Windows跳过pyserial_update_*不足以保现场，serialwin32仍SetCommState，补不写DCB的原生监听及boot对照；不以USB reset11当panic。
 

@@ -15,7 +15,7 @@ fn router() -> Router {
 /// App supplies its own hint handler; health-only core remains unchanged.
 pub async fn serve_with_router(addr:SocketAddr,app:Router)->Result<()> {
     let listener=tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener,router().merge(app)).await?;Ok(())
+    axum::serve(listener,router().merge(app).into_make_service_with_connect_info::<SocketAddr>()).await?;Ok(())
 }
 
 pub async fn serve(addr: SocketAddr) -> Result<()> {

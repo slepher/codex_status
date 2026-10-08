@@ -23,6 +23,8 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <vector>
+#include <memory>
+#include <new>
 #include <algorithm>
 #include <esp_sleep.h>
 #include <esp_ota_ops.h>
@@ -1110,7 +1112,26 @@ static String         v2PlanReason = "init";
 // first frame in startNormalMode). Other BLE paths keep their immediate render.
 static bool           v2InRendezvous = false;
 static RendezvousProtocol v2Rv;
-static String v2RvId, v2RvChallenge, v2RvBridge;
+static String v2RvId;
+static bool v2RvNetworkExpected = false;
+static bool v2RvNetworkRequested = false;
+static uint64_t v2RvBleReleaseAtMs = 0;
+struct ReadyReportState {
+    IPAddress bridge;
+    uint16_t port = 0;
+    int8_t endpointIndex = -1;
+    String principal;
+    String originSession;
+    uint64_t originRequestNo = 0;
+    uint64_t planId = 0;
+    String dataResult;
+    String httpSession;
+    String reportBody;
+    uint8_t attempts = 0;
+    uint64_t nextAtMs = 0;
+    bool received = false;
+};
+static ReadyReportState readyReport;
 static bool v2RvHttpStarted = false, v2RvBleReleased = false;
 static uint64_t nextBleContactMs = 0;
 static bool httpServicesStarted = false;
@@ -1160,9 +1181,14 @@ static void epdFlush(bool forceFull = false);
 static int  batteryPercent();
 static bool requestAuthorized();
 static void handleWifiManagement(const char *op);
+static void v2HttpRawHandler();
+static void v2HttpRoute(uint16_t op, void (*handler)());
+static void v2Response(int status, const String &body);
+static String v2HttpBody;
 static String wifiManagementRequest(JsonDocument &request, const char *op);
 static void wifiDeviceStatus(JsonDocument &doc,const EndpointRec *endpoint=nullptr);
 static void servicePresence();
+static void serviceReadyReport();
 static void deepSleepFor(uint32_t sec);
 static void renderCurrent();
 static void persistMode();
@@ -2433,12 +2459,12 @@ static void startConfigMode() {
     screen({"WIFI SETUP", "", "AP:   " + apSsid, "PASS: " AP_PASSWORD, "", "Open http://", "192.168.4.1"});
     server.on("/", HTTP_GET, handleConfigRoot);
     server.on("/save", HTTP_POST, handleConfigSave);
-    server.on("/api/wifi/apply", HTTP_POST, [] { handleWifiManagement("apply"); });
-    server.on("/api/wifi/result", HTTP_POST, [] { handleWifiManagement("result"); });
-    server.on("/api/wifi/result_ack", HTTP_POST, [] { handleWifiManagement("result_ack"); });
-    server.on("/api/wifi/command", HTTP_POST, [] { handleWifiManagement("command"); });
+    server.on("/api/wifi/apply", HTTP_POST, [] { v2HttpRoute(15, [] { handleWifiManagement("apply"); }); }, v2HttpRawHandler);
+    server.on("/api/wifi/result", HTTP_POST, [] { v2HttpRoute(16, [] { handleWifiManagement("result"); }); }, v2HttpRawHandler);
+    server.on("/api/wifi/result_ack", HTTP_POST, [] { v2HttpRoute(17, [] { handleWifiManagement("result_ack"); }); }, v2HttpRawHandler);
+    server.on("/api/wifi/command", HTTP_POST, [] { v2HttpRoute(18, [] { handleWifiManagement("command"); }); }, v2HttpRawHandler);
     server.on("/clear", HTTP_GET, [] { server.send(410, "text/plain", "Use authenticated Wi-Fi transactions; GET cannot clear configuration."); });
-    const char *headers[] = {"Authorization"}; server.collectHeaders(headers, 1);
+    const char *headers[] = {"Authorization", "Content-Type"}; server.collectHeaders(headers, 2);
     server.begin();
 }
 
@@ -3342,23 +3368,31 @@ static bool requestAuthorized() {
 }
 
 static void handleClaim() {
-    if (!requestAuthorized()) {
-        server.send(401, "application/json",
-                    String("{\"error\":\"unauthorized\",\"owner\":") + ownerJson() + "}");
+    if (!authValid() || server.header("X-Device-Token") != authToken) {
+        v2Response(401, "{\"result\":\"rejected\",\"error\":\"unauthorized\",\"stage\":\"claim\"}");
+        return;
+    }
+    JsonDocument doc;
+    if (deserializeJson(doc, v2HttpBody)) {
+        v2Response(400, "{\"result\":\"rejected\",\"error\":\"payload\",\"stage\":\"claim\"}");
         return;
     }
     V2ClaimArgs args = v2PrepareClaim(
-        server.arg("id"), server.arg("name"), server.arg("host"),
-        server.arg("port"), server.arg("lease"), server.hasArg("lease"),
-        server.hasArg("force") && server.arg("force") != "0",
-        server.hasArg("release") && server.arg("release") != "0");
+        doc["id"].as<String>(), doc["name"].as<String>(), doc["host"].as<String>(),
+        doc["port"].as<String>(), doc["lease"].as<String>(), !doc["lease"].isNull(),
+        doc["force"] | false, doc["release"] | false);
     if (!args.validId) {
-        server.send(400, "application/json", "{\"error\":\"args\"}");
+        v2Response(400, "{\"result\":\"rejected\",\"error\":\"args\",\"stage\":\"claim\"}");
         return;
     }
     const OwnerClaimResult reply = ownerApplyClaim(args, true);
     if (reply.newClaim) noteActivity("claim");
-    server.send(reply.status, "application/json", reply.body);
+    JsonDocument result;
+    deserializeJson(result, reply.body);
+    result["result"] = reply.status == 200 ? "applied" : "rejected";
+    result["stage"] = "claim";
+    String payload; serializeJson(result, payload);
+    v2Response(reply.status, payload);
 }
 
 static void handleBleAuth(const String &json) {
@@ -3661,6 +3695,40 @@ static String syncOpenId, syncOpenReason;
 static bool syncSkippedThisWake = false;
 static uint8_t syncVisibleSkip = 0;
 static uint16_t syncBlockedError = 0;
+static bool v2BleFrameActive = false;
+static bool v2BleCacheReply = false;
+static CompactFrameHeader v2BleFrame;
+static uint32_t v2BleSessionGeneration = 0;
+static uint64_t v2BleHighestRequest = 0;
+static uint8_t v2BleLastDigest[32] = {};
+static uint8_t v2BleCurrentDigest[32] = {};
+static String v2BleLastFrame;
+static bool v2HttpFrameActive = false;
+static bool v2HttpRawOverflow = false;
+static String v2HttpRaw, v2HttpToken, v2HttpLastFrame;
+static CompactFrameHeader v2HttpFrame;
+static uint8_t v2HttpSession[16] = {};
+static uint8_t v2HttpOpenNonce[16] = {};
+static bool v2HttpOpenValid = false;
+static uint64_t v2HttpHighestRequest = 0;
+static uint8_t v2HttpLastDigest[32] = {}, v2HttpCurrentDigest[32] = {};
+static bool v2HttpCacheReply = false;
+static const String &v2Nonce();
+static void compactDigest(const String &bytes, uint8_t digest[32]) {
+    mbedtls_sha256(reinterpret_cast<const unsigned char *>(bytes.c_str()), bytes.length(), digest, 0);
+}
+static bool compactSessionFromHex(const String &text, uint8_t out[16]) {
+    if (text.length() != 32) return false;
+    for (unsigned i = 0; i < 16; ++i) {
+        const char a = text[i * 2], b = text[i * 2 + 1];
+        if (!isxdigit((unsigned char)a) || !isxdigit((unsigned char)b)) return false;
+        auto nibble = [](char c) -> uint8_t {
+            return c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10;
+        };
+        out[i] = (nibble(a) << 4) | nibble(b);
+    }
+    return true;
+}
 static void syncRecordOutcome(uint8_t result, uint16_t error, uint64_t serial = 0) {
     syncAppendResult(syncRtc, syncLogWakeSeq, millis(), result,
                      (uint8_t)((syncRtc.flags & 1 ? 1 : 0) | syncRtc.reasonBits),
@@ -3670,6 +3738,40 @@ static void syncRecordOutcome(uint8_t result, uint16_t error, uint64_t serial = 
 }
 static void v2BleNotify(JsonDocument &doc) {
     String reply = bleBuildReply(doc, v2RequestId, rtcWakeGeneration, rtcTraceCurrentSeq);
+    if (v2BleFrameActive) {
+        const bool limited = !reply.length() || reply.length() > 512 - COMPACT_FRAME_HEADER;
+        if (limited) {
+            JsonDocument limit;
+            limit["ack"] = doc["ack"] | "command";
+            limit["op"] = doc["op"] | "command";
+            limit["request_id"] = v2RequestId;
+            limit["result"] = "unknown";
+            limit["error"] = "reply_limit";
+            limit["stage"] = "frame";
+            limit["query"] = "original_business_id";
+            reply = "";
+            serializeJson(limit, reply);
+        }
+        CompactFrameHeader response = v2BleFrame;
+        response.kind = 1;
+        const char *result = doc["result"] | "";
+        response.result = limited ? 3 : !strcmp(result, "accepted") ? 1 :
+            !strcmp(result, "unknown") ? 3 :
+            !strcmp(result, "rejected") || doc["ok"] == false ? 2 : 0;
+        response.payloadLen = reply.length();
+        compactSessionFromHex(v2Nonce(), response.session);
+        uint8_t header[COMPACT_FRAME_HEADER];
+        if (!compactFrameEncode(response, header)) return;
+        String bytes(reinterpret_cast<const char *>(header), COMPACT_FRAME_HEADER);
+        bytes.concat(reply.c_str(), reply.length());
+        if (v2BleCacheReply) {
+            v2BleHighestRequest = v2BleFrame.requestNo;
+            memcpy(v2BleLastDigest, v2BleCurrentDigest, sizeof(v2BleLastDigest));
+            v2BleLastFrame = bytes;
+        }
+        bleNotifyStatusQuiet(bytes);
+        return;
+    }
     const char *op = doc["op"] | (doc["ack"] == "wifi" ? "wifi" : "command");
     const bool known = !strcmp(op, "status") || !strcmp(op, "data") || !strcmp(op, "plan") ||
         !strcmp(op, "sync_config") || !strcmp(op, "sync_open") || !strcmp(op, "wifi");
@@ -3681,7 +3783,36 @@ static void v2BleNotify(JsonDocument &doc) {
     bleNotifyStatusQuiet(reply);
 }
 static void v2Response(int status, const String &body) {
-    if (!v2ReplyOverBle) { server.send(status, "application/json", body); return; }
+    if (!v2ReplyOverBle) {
+        if (!v2HttpFrameActive) { server.send(status, "application/json", body); return; }
+        String payload = body;
+        if (payload.length() > 4096 - COMPACT_FRAME_HEADER) {
+            payload = "{\"result\":\"unknown\",\"error\":\"reply_limit\",\"stage\":\"frame\",\"query\":\"original_business_id\"}";
+        }
+        CompactFrameHeader response = v2HttpFrame;
+        response.kind = 1;
+        response.payloadLen = payload.length();
+        memcpy(response.session, v2HttpSession, 16);
+        JsonDocument result;
+        deserializeJson(result, payload);
+        const char *value = result["result"] | "";
+        response.result = !strcmp(value, "accepted") ? 1 :
+            !strcmp(value, "unknown") ? 3 :
+            status >= 400 || !strcmp(value, "rejected") || result["ok"] == false ? 2 : 0;
+        uint8_t header[COMPACT_FRAME_HEADER];
+        if (!compactFrameEncode(response, header)) {
+            server.send(500, "application/json", "{\"error\":\"frame_encode\"}"); return;
+        }
+        String bytes(reinterpret_cast<const char *>(header), COMPACT_FRAME_HEADER);
+        bytes.concat(payload.c_str(), payload.length());
+        if (v2HttpCacheReply) {
+            v2HttpHighestRequest = v2HttpFrame.requestNo;
+            memcpy(v2HttpLastDigest, v2HttpCurrentDigest, sizeof(v2HttpLastDigest));
+            v2HttpLastFrame = bytes.length() <= 512 ? bytes : String();
+        }
+        server.send(status, "application/vnd.codex-status.frame", bytes);
+        return;
+    }
     JsonDocument doc;
     if (deserializeJson(doc, body)) return;
     traceSetTransport(1);
@@ -3723,7 +3854,6 @@ static bool v2Command(const String &body, JsonDocument &doc) {
         v2Ack("command", "rejected", "unchanged", "ram", "json", -1, 0, nullptr, UINT32_MAX);
         return false;
     }
-    if (!v2OwnerOk(doc["bridge_id"] | "")) return false;
     const char *request = doc["request_id"] | "";
     v2RequestId = request;
     String currentMac = macText();
@@ -3736,6 +3866,7 @@ static bool v2Command(const String &body, JsonDocument &doc) {
         v2Ack("command", "rejected", "unchanged", "ram", "session", -1, 0, nullptr, UINT32_MAX);
         return false;
     }
+    if (!v2OwnerOk(doc["bridge_id"] | "")) return false;
     traceSetTransport(v2ReplyOverBle ? 1 : 2);
     traceSetRequest(request);
     traceSetStage(TRACE_STAGE_COMMAND);
@@ -3757,6 +3888,107 @@ static bool syncParseNumber(const char *text, uint64_t &value) {
         value = value * 10 + (*p - '0');
     }
     return true;
+}
+
+static void v2HttpRawHandler() {
+    HTTPRaw &raw = server.raw();
+    if (raw.status == RAW_START) { v2HttpRaw = ""; v2HttpRawOverflow = false; return; }
+    if (raw.status == RAW_ABORTED) { v2HttpRaw = ""; v2HttpRawOverflow = true; return; }
+    if (raw.status == RAW_WRITE) {
+        if (v2HttpRawOverflow) return;
+        if (v2HttpRaw.length() + raw.currentSize > 4096 ||
+            !v2HttpRaw.concat(reinterpret_cast<const char *>(raw.buf), raw.currentSize)) {
+            v2HttpRaw = "";
+            v2HttpRawOverflow = true;
+        }
+    }
+}
+
+static bool v2HttpBegin(uint16_t op) {
+    v2HttpFrameActive = false;
+    v2HttpCacheReply = false;
+    if (server.header("Content-Type") != "application/vnd.codex-status.frame") {
+        server.send(415, "application/json", "{\"error\":\"content_type\",\"stage\":\"frame\"}");
+        return false;
+    }
+    CompactFrameHeader request;
+    if (v2HttpRawOverflow || !compactFrameDecode(reinterpret_cast<const uint8_t *>(v2HttpRaw.c_str()),
+                            v2HttpRaw.length(), request, 4096) ||
+        request.kind != 0 || request.op != op) {
+        server.send(400, "application/json", "{\"error\":\"protocol_mismatch\",\"stage\":\"frame\"}");
+        return false;
+    }
+    String token = server.header("Authorization");
+    if (!token.startsWith("Bearer ")) {
+        server.send(401, "application/json", "{\"error\":\"unauthorized\"}"); return false;
+    }
+    token.remove(0, 7);
+    EndpointRec endpoint;
+    if (!storeAuthenticate(token, endpoint) &&
+        !(op == 19 && authValid() && token == authToken)) {
+        server.send(401, "application/json", "{\"error\":\"unauthorized\"}"); return false;
+    }
+    v2HttpFrame = request;
+    v2HttpFrameActive = true;
+    compactDigest(v2HttpRaw, v2HttpCurrentDigest);
+    v2HttpBody = op == 11 ? String() :
+        String(v2HttpRaw.c_str() + COMPACT_FRAME_HEADER, request.payloadLen);
+    uint8_t zeroSession[16] = {};
+    if (op == 1 || (op == 19 && v2HttpBody == "{\"open\":true}")) {
+        uint8_t zero[16] = {};
+        if (!memcmp(request.session, zero, 16)) {
+            v2Response(409, "{\"result\":\"rejected\",\"error\":\"session\"}"); return false;
+        }
+        if (v2HttpOpenValid && v2HttpToken == token &&
+            !memcmp(request.session, v2HttpOpenNonce, 16)) {
+            if (request.requestNo == v2HttpHighestRequest && v2HttpLastFrame.length() &&
+                !memcmp(v2HttpCurrentDigest, v2HttpLastDigest, sizeof(v2HttpLastDigest))) {
+                server.send(200, "application/vnd.codex-status.frame", v2HttpLastFrame);
+            } else {
+                v2Response(409, request.requestNo == v2HttpHighestRequest ?
+                    "{\"result\":\"rejected\",\"error\":\"request_conflict\",\"query\":\"original_business_id\"}" :
+                    "{\"result\":\"rejected\",\"error\":\"retired\",\"query\":\"original_business_id\"}");
+            }
+            return false;
+        }
+        memcpy(v2HttpOpenNonce, request.session, 16);
+        v2HttpOpenValid = true;
+        for (size_t i = 0; i < 16; i += 4) {
+            uint32_t random = esp_random();
+            memcpy(v2HttpSession + i, &random, 4);
+        }
+        v2HttpToken = token;
+        v2HttpHighestRequest = 0;
+        v2HttpLastFrame = "";
+    } else if (v2HttpToken != token || memcmp(request.session, v2HttpSession, 16)) {
+        v2Response(409, "{\"result\":\"rejected\",\"error\":\"session\"}"); return false;
+    }
+    uint8_t zero[16] = {};
+    if (memcmp(request.context, zero, 16) &&
+        (strlen(v2Profile.contextId) != 16 || memcmp(request.context, v2Profile.contextId, 16))) {
+        v2Response(409, "{\"result\":\"rejected\",\"error\":\"context\"}"); return false;
+    }
+    if (request.requestNo <= v2HttpHighestRequest) {
+        if (request.requestNo == v2HttpHighestRequest && v2HttpLastFrame.length() &&
+            !memcmp(v2HttpCurrentDigest, v2HttpLastDigest, sizeof(v2HttpLastDigest))) {
+            server.send(200, "application/vnd.codex-status.frame", v2HttpLastFrame);
+        } else {
+            v2Response(409, request.requestNo == v2HttpHighestRequest ?
+                "{\"result\":\"rejected\",\"error\":\"request_conflict\",\"query\":\"original_business_id\"}" :
+                "{\"result\":\"rejected\",\"error\":\"retired\",\"query\":\"original_business_id\"}");
+        }
+        return false;
+    }
+    v2HttpCacheReply = true;
+    return true;
+}
+
+static void v2HttpRoute(uint16_t op, void (*handler)()) {
+    if (v2HttpBegin(op)) handler();
+    v2HttpFrameActive = false;
+    v2HttpCacheReply = false;
+    v2HttpBody = "";
+    v2HttpRaw = "";
 }
 
 static void syncReply(const char *op, const char *result, const char *error,
@@ -3795,7 +4027,7 @@ static bool syncCommand(const char *op, JsonDocument &doc) {
     if (!endpointTokenAuthorized(endpoint)) {
         syncReply(op, "rejected", "unauthorized", 401); return false;
     }
-    String body = server.arg("plain");
+    String body = v2HttpBody;
     if (body.length() > 4096) {
         syncReply(op, "rejected", "body_limit", 413); return false;
     }
@@ -3907,21 +4139,135 @@ static __attribute__((noinline)) void servicePresence() {
         client.addHeader("Content-Type","application/json");client.addHeader("Authorization",String("Bearer ")+endpoint.token);client.POST(body);client.end();
     }
 }
+
+static __attribute__((noinline)) void serviceReadyReport() {
+    const uint64_t now = v2NowMs();
+    if (!readyReport.port || readyReport.received || readyReport.attempts >= 3 ||
+        now < readyReport.nextAtMs || WiFi.status() != WL_CONNECTED ||
+        !httpServicesStarted || !v2Rv.ready()) return;
+    const uint64_t legalUntil = v2Plan.lightActive(now) ? v2Plan.deadlineMs() :
+        syncOpenThisWake ? syncOpenAnsweredAt + 90000 : 0;
+    const uint64_t deadline = std::min(v2Rv.deadline(), legalUntil);
+    if (deadline <= now + 1000) return;
+    auto ioTimeout = [deadline]() -> uint16_t {
+        const uint64_t current = v2NowMs();
+        return current >= deadline ? 0 :
+            (uint16_t)std::min<uint64_t>(1000, (deadline - current) / 2);
+    };
+    EndpointRec endpoint;
+    if (readyReport.endpointIndex < 0 || !storeGet(readyReport.endpointIndex, endpoint) ||
+        endpoint.principal != readyReport.principal || !endpoint.token.length()) return;
+    ++readyReport.attempts;
+    const String base = String("http://") + readyReport.bridge.toString() +
+        ":" + String(readyReport.port) + "/api/device/";
+    if (!readyReport.httpSession.length()) {
+        JsonDocument hello;
+        hello["device_mac"] = macText(); hello["boot_id"] = v2Nonce();
+        hello["principal"] = readyReport.principal;
+        hello["instance_id"] = readyReport.principal;
+        String body; serializeJson(hello, body);
+        const uint16_t limit = ioTimeout();
+        if (!limit) return;
+        HTTPClient client; client.setConnectTimeout(limit); client.setTimeout(limit);
+        if (client.begin(base + "session")) {
+            client.addHeader("Content-Type", "application/json");
+            client.addHeader("Authorization", String("Bearer ") + endpoint.token);
+            const int code = client.POST(body);
+            if (code == 200 && client.getSize() > 0 && client.getSize() <= 256) {
+                JsonDocument reply;
+                if (!deserializeJson(reply, client.getString()) && reply["result"] == "applied" &&
+                    String(reply["instance_id"] | "") == readyReport.principal) {
+                    const char *id = reply["session_id"] | "";
+                    if (strlen(id) == 32) readyReport.httpSession = id;
+                }
+            }
+            client.end();
+        }
+    }
+    if (readyReport.httpSession.length()) {
+        if (!readyReport.reportBody.length()) {
+            JsonDocument report;
+            report["device_mac"] = macText(); report["boot_id"] = v2Nonce();
+            report["principal"] = readyReport.principal;
+            report["instance_id"] = readyReport.principal;
+            report["origin_session"] = readyReport.originSession;
+            report["origin_request_no"] = readyReport.originRequestNo;
+            report["business_id"] = syncNumber(readyReport.planId);
+            report["context_id"] = v2BundleReady ? v2Profile.contextId : "";
+            report["ip"] = WiFi.localIP().toString(); report["port"] = 80;
+            report["http_ready"] = true;
+            report["plan_result"] = "applied";
+            report["data_result"] = readyReport.dataResult.length() ? readyReport.dataResult : "none";
+            report["network_result"] = "ready";
+            report["remaining_ms"] = (uint32_t)std::min<uint64_t>(deadline - now, 90000);
+            serializeJson(report, readyReport.reportBody);
+        }
+        const uint16_t limit = ioTimeout();
+        if (!limit) return;
+        HTTPClient client; client.setConnectTimeout(limit); client.setTimeout(limit);
+        if (client.begin(base + "report")) {
+            CompactFrameHeader request;
+            request.kind = 2;
+            request.op = 20;
+            request.requestNo = 1;
+            request.payloadLen = readyReport.reportBody.length();
+            if (!compactSessionFromHex(readyReport.httpSession, request.session)) {
+                client.end(); return;
+            }
+            if (v2BundleReady && strlen(v2Profile.contextId) == 16)
+                memcpy(request.context, v2Profile.contextId, 16);
+            uint8_t header[COMPACT_FRAME_HEADER];
+            if (!compactFrameEncode(request, header) ||
+                COMPACT_FRAME_HEADER + readyReport.reportBody.length() > 4096) {
+                client.end(); return;
+            }
+            String frame(reinterpret_cast<const char *>(header), COMPACT_FRAME_HEADER);
+            frame.concat(readyReport.reportBody.c_str(), readyReport.reportBody.length());
+            client.addHeader("Content-Type", "application/vnd.codex-status.frame");
+            client.addHeader("Authorization", String("Bearer ") + endpoint.token);
+            const int code = client.POST(reinterpret_cast<uint8_t *>(const_cast<char *>(frame.c_str())), frame.length());
+            if (code == 202 && client.getSize() >= COMPACT_FRAME_HEADER && client.getSize() <= 256) {
+                String response = client.getString();
+                CompactFrameHeader ack;
+                if (compactFrameDecode(reinterpret_cast<const uint8_t *>(response.c_str()),
+                    response.length(), ack, 256) && ack.kind == 1 && ack.op == 20 &&
+                    ack.result == 1 && ack.requestNo == request.requestNo &&
+                    !memcmp(ack.session, request.session, 16)) {
+                    JsonDocument reply;
+                    if (!deserializeJson(reply, String(response.c_str() + COMPACT_FRAME_HEADER, ack.payloadLen)) &&
+                        reply["result"] == "report_received") readyReport.received = true;
+                }
+            } else if (code == 409 || code == 401) {
+                // A Bridge restart invalidates the hint session. The business
+                // attempt and its original identifiers stay frozen.
+                readyReport.httpSession = "";
+                readyReport.reportBody = "";
+            }
+            client.end();
+        }
+    }
+    if (!readyReport.received) {
+        const uint32_t backoff = readyReport.attempts == 1 ? 250 : 1000;
+        const uint64_t current = v2NowMs();
+        readyReport.nextAtMs = current + std::min<uint64_t>(backoff,
+            deadline > current ? deadline - current : 0);
+    }
+}
 // No owner/plan mutation. Auth is resolved independently of payload bridge_id.
 static void handleWifiManagement(const char *op) {
     String header=server.header("Authorization");EndpointRec endpoint;
     if(!header.startsWith("Bearer ") || !storeAuthenticate(header.substring(7),endpoint)) {
-        server.send(401,"application/json","{\"ok\":false,\"error\":\"unauthorized\"}");return;
+        v2Response(401,"{\"ok\":false,\"error\":\"unauthorized\"}");return;
     }
-    JsonDocument request;const String body=server.arg("plain");
+    JsonDocument request;const String body=v2HttpFrameActive ? v2HttpBody : server.arg("plain");
     if(body.length()>8192 || deserializeJson(request,body) || String(request["device_mac"]|"")!=macText()) {
-        server.send(400,"application/json","{\"ok\":false,\"error\":\"shape\"}");return;
+        v2Response(400,"{\"ok\":false,\"error\":\"shape\"}");return;
     }
     if(strcmp(op,"command"))request["op"]=op;
     auto context=wifiControlContext(endpoint,request);
     String response=wifiControlCommand(request,context,v2NowMs());
     JsonDocument outcome;deserializeJson(outcome,response);
-    server.send(200,"application/json",response);
+    v2Response(200,response);
 }
 
 static String wifiManagementRequest(JsonDocument &request,const char *op) {
@@ -3940,11 +4286,11 @@ static void handleV2Status() {
     String mac;
     if (!endpointTokenAuthorized(mac)) {
         traceMarkHttp(false, 401);
-        server.send(401, "application/json", "{\"result\":\"unauthorized\"}");
+        v2Response(401, "{\"result\":\"unauthorized\"}");
         return;
     }
     traceMarkHttp(true, 200);
-    markSynced();   // authenticated bridge contact (v2 HTTP channel)
+    // Read-only Status does not advance the Data contact clock or owner lease.
     V2StatusSnapshot snapshot;
     snapshot.mac = macText();
     snapshot.firmwareVersion = FW_VERSION;
@@ -3994,8 +4340,6 @@ static void handleV2Status() {
     rendezvous["v"] = 1;
     rendezvous["id"] = v2RvId;
     rendezvous["ready"] = v2Rv.ready() && WiFi.status() == WL_CONNECTED;
-    rendezvous["handoff"] = v2Rv.handedOff();
-    rendezvous["challenge"] = v2Rv.ready() ? v2RvChallenge : "";
     rendezvous["wake_generation"] = rtcWakeGeneration;
     rendezvous["wake_seq"] = rtcTraceCurrentSeq;
     rendezvous["remaining_ms"] = v2Rv.active() && v2Rv.deadline() > v2NowMs() ? v2Rv.deadline()-v2NowMs() : 0;
@@ -4045,9 +4389,18 @@ static void handleV2Status() {
     sync["confirmation_pending"] = false;
     wifiSchemesStorageStatus(doc["wifi_storage"].to<JsonObject>());
     writeClockStatus(doc["clock_rtc"].to<JsonObject>());
+    JsonDocument options;
+    if (!deserializeJson(options, v2HttpBody) && options["compact"] == true) {
+        doc["status_projection"] = "compact";
+        doc.remove("data_contract");
+        doc.remove("wifi_storage");
+        doc.remove("clock_rtc");
+        doc.remove("sync");
+        doc.remove("radio");
+    }
     String out;
     serializeJson(doc, out);
-    server.send(200, "application/json", out);
+    v2Response(200, out);
 }
 
 static JsonDocument syncFrozenSnapshot() {
@@ -4114,14 +4467,14 @@ static void handleSyncComplete() { handleSyncTransfer("sync_complete"); }
 // hash with that file after reboot.
 static void handleOtaImage() {
     if (!requestAuthorized()) {
-        server.send(401, "application/json", "{\"error\":\"unauthorized\"}"); return;
+        v2Response(401, "{\"error\":\"unauthorized\"}"); return;
     }
     const esp_partition_t *running = esp_ota_get_running_partition();
     String sizeText = server.arg("image_bytes");
     char *end = nullptr;
     unsigned long length = strtoul(sizeText.c_str(), &end, 10);
     if (!running || !sizeText.length() || !end || *end || !length || length > running->size) {
-        server.send(400, "application/json", "{\"error\":\"range\"}"); return;
+        v2Response(400, "{\"error\":\"range\"}"); return;
     }
     mbedtls_sha256_context sha;
     mbedtls_sha256_init(&sha);
@@ -4136,7 +4489,7 @@ static void handleOtaImage() {
     }
     if (okay) mbedtls_sha256_finish(&sha, hash);
     mbedtls_sha256_free(&sha);
-    if (!okay) { server.send(503, "application/json", "{\"error\":\"storage\"}"); return; }
+    if (!okay) { v2Response(503, "{\"error\":\"storage\"}"); return; }
     char hex[65];
     syncHex(hash, 32, hex);
     JsonDocument reply;
@@ -4149,23 +4502,16 @@ static void handleOtaImage() {
     reply["fw"] = FW_VERSION;
     String body;
     serializeJson(reply, body);
-    server.send(200, "application/json", body);
+    v2Response(200, body);
 }
 
-// POST /api/data: atomic complete snapshot inside the current context.
-static void applyV2Data(const String &body) {
-    JsonDocument peek;
-    if (!v2Command(body, peek)) return;
+// Both standalone Data and Plan's optional Data use this exact state transition.
+static V2DataDecision applyV2DataAuthorized(const String &body, JsonDocument &peek) {
     uint64_t seq = peek["seq"] | 0ULL;
     V2DataDecision decision = v2DecideData(v2BundleReady && v2CtValid,
                                             v2CtValid ? &v2Ct : nullptr, body, seq,
                                             v2Profile.contextId, v2DataSeq);
-    if (!decision.firstApplied) {
-        v2Ack("data", decision.result, decision.display, "ram",
-              decision.error.length() ? decision.error.c_str() : nullptr, decision.seq, 0,
-              decision.includeContext ? v2Profile.contextId : nullptr, UINT32_MAX, decision.includeContext);
-        return;
-    }
+    if (!decision.firstApplied) return decision;
     const String &usage = decision.usage;
     v2AppliedFields = "";
     serializeJson(peek["fields"], v2AppliedFields);
@@ -4196,25 +4542,37 @@ static void applyV2Data(const String &body) {
             display = "failed";
         }
     }
-    v2Ack("data", "applied", display, "ram", nullptr, (int64_t)seq, 0, v2Profile.contextId,
-          UINT32_MAX, true);
+    decision.display = display;
+    return decision;
+}
+
+// POST /api/data: atomic complete snapshot inside the current context.
+static void applyV2Data(const String &body) {
+    JsonDocument peek;
+    if (!v2Command(body, peek)) return;
+    markSynced();
+    const V2DataDecision decision = applyV2DataAuthorized(body, peek);
+    v2Ack("data", decision.result, decision.display, "ram",
+          decision.error.length() ? decision.error.c_str() : nullptr, decision.seq, 0,
+          decision.includeContext ? v2Profile.contextId : nullptr, UINT32_MAX,
+          decision.includeContext);
 }
 
 static void handleV2Data() {
     DevLog.printf("[platform] req data heap=%u", (unsigned)ESP.getFreeHeap());
     String mac;
     if (!endpointTokenAuthorized(mac)) {
-        server.send(401, "application/json", "{\"result\":\"unauthorized\"}");
+        v2Response(401, "{\"result\":\"unauthorized\"}");
         return;
     }
-    markSynced();   // authenticated bridge contact (v2 HTTP channel)
-    applyV2Data(server.arg("plain"));
+    applyV2Data(v2HttpBody);
 }
 
 // POST /api/plan: the only way to change the light deadline.
 static void applyV2Plan(const String &body) {
     JsonDocument doc;
     if (!v2Command(body, doc)) return;
+    markSynced();
     V2PlanDecision decision = v2DecidePlan(doc, v2Plan, v2NowMs(), v2Provisional);
     // Local: the requested history window is recorded as soon as the plan shape is
     // valid -- before the accept result is known -- mirroring the pre-refactor
@@ -4230,7 +4588,13 @@ static void applyV2Plan(const String &body) {
               UINT32_MAX);
         return;
     }
-    if (v2InRendezvous) { v2Rv.planReceived(); v2RvBridge = doc["bridge_id"] | ""; }
+    if (v2InRendezvous) {
+        v2Rv.planReceived();
+        v2RvNetworkExpected = doc["need_http"] == true;
+        if (v2RvNetworkExpected)
+            v2Rv.awaitNetworkStart(v2NowMs(), v2Plan.lightActive(v2NowMs()) ?
+                v2Plan.deadlineMs() : v2NowMs() + RV_NETWORK_MS);
+    }
     const V2PowerPlan &plan = decision.plan;
     v2PlanReason = "bridge";
     if (plan.mode == V2_PLAN_LIGHT) {
@@ -4251,20 +4615,35 @@ static void applyV2Plan(const String &body) {
     if (v2ReplyOverBle && v2HistorySyncMs) {
         v2HistorySyncUntilMs = v2NowMs() + v2HistorySyncMs;
     }
-    v2Ack("plan", decision.result, decision.display, "ram", decision.error,
-          -1, decision.planId, decision.includeContext ? v2Profile.contextId : nullptr,
-          decision.grantedS);
+    JsonDocument ack;
+    deserializeJson(ack, v2BuildAck("plan", decision.result, decision.display, "ram",
+        decision.error, -1, decision.planId, v2Profile.contextId, decision.grantedS, FW_TARGET_ID));
+    if (!doc["data"].isNull()) {
+        JsonDocument data;
+        data.set(doc["data"]);
+        String dataBody;
+        serializeJson(data, dataBody);
+        V2DataDecision applied = applyV2DataAuthorized(dataBody, data);
+        JsonObject dataAck = ack["data"].to<JsonObject>();
+        dataAck["result"] = applied.result;
+        dataAck["display_state"] = applied.display;
+        if (applied.error.length()) dataAck["error"] = applied.error;
+        if (applied.seq >= 0) dataAck["data_seq"] = (uint64_t)applied.seq;
+        if (applied.includeContext) dataAck["active_context_id"] = v2Profile.contextId;
+        readyReport.dataResult = applied.result;
+    }
+    String response; serializeJson(ack, response);
+    v2Response(200, response);
 }
 
 static void handleV2Plan() {
     DevLog.printf("[platform] req plan heap=%u", (unsigned)ESP.getFreeHeap());
     String mac;
     if (!endpointTokenAuthorized(mac)) {
-        server.send(401, "application/json", "{\"result\":\"unauthorized\"}");
+        v2Response(401, "{\"result\":\"unauthorized\"}");
         return;
     }
-    markSynced();   // authenticated bridge contact (v2 HTTP channel)
-    applyV2Plan(server.arg("plain"));
+    applyV2Plan(v2HttpBody);
 }
 
 // One activation result per boot session. Expected context prevents delayed
@@ -4274,11 +4653,11 @@ static String v2ActivateTemplate, v2ActivateContext;
 static void handleV2Activate() {
     String mac;
     if (!endpointTokenAuthorized(mac)) {
-        server.send(401, "application/json", "{\"result\":\"unauthorized\"}");
+        v2Response(401, "{\"result\":\"unauthorized\"}");
         return;
     }
     JsonDocument doc;
-    if (!v2Command(server.arg("plain"), doc)) return;
+    if (!v2Command(v2HttpBody, doc)) return;
     V2ActivateDecision decision = v2DecideActivate(
         doc, v2BundleReady, v2Profile, v2ActivateRequest.c_str(),
         v2ActivateOwner.c_str(), v2ActivateTemplate.c_str(),
@@ -4314,10 +4693,10 @@ static void v2BundleError(const char *error) {
 static void handleV2BundleBegin() {
     String mac;
     if (!endpointTokenAuthorized(mac)) {
-        server.send(401, "application/json", "{\"result\":\"unauthorized\"}"); return;
+        v2Response(401, "{\"result\":\"unauthorized\"}"); return;
     }
     JsonDocument doc;
-    if (!v2Command(server.arg("plain"), doc)) return;
+    if (!v2Command(v2HttpBody, doc)) return;
     const String nonce = v2Nonce();
     const uint64_t nowMs = v2NowMs();
     const V2BundleFingerprint committed{
@@ -4342,113 +4721,61 @@ static void handleV2BundleBegin() {
         f.close();
         v2Rx = decision.candidate;
     }
-    server.send(200, "application/json", String("{\"result\":\"applied\",\"next_offset\":") +
+    v2Response(200, String("{\"result\":\"applied\",\"next_offset\":") +
                 String(decision.nextOffset) + "}");
 }
 
-// WebServer's ordinary POST parser duplicates the complete body several times
-// before calling the handler. On the BLE-enabled Note4 its internal heap is
-// too small for repeated 4096-byte chunks. The raw callback streams from the
-// parser's fixed 1436-byte buffer directly to LittleFS.
-static File v2ChunkFile;
-static bool v2ChunkOk = false;
-static bool v2ChunkReplay = false;
-static bool v2ChunkWriting = false;
-static uint32_t v2ChunkOffset = 0;
-static uint32_t v2ChunkBytes = 0;
-static const char *v2ChunkFailure = "session";
-
-static void handleV2BundleChunkRaw() {
-    HTTPRaw &raw = server.raw();
-    if (raw.status == RAW_START) {
-        if (v2ChunkFile) v2ChunkFile.close();
-        v2ChunkOk = false;
-        v2ChunkWriting = false;
-        v2ChunkBytes = 0;
-        v2ChunkFailure = "session";
-        String mac;
-        if (!endpointTokenAuthorized(mac)) { v2ChunkFailure = "unauthorized"; return; }
-        if (!ownerAllows(v2Rx.owner)) { v2ChunkFailure = "occupied"; return; }
-        String request = server.header("X-Request-Id");
-        String nonce = server.header("X-Session-Nonce");
-        String offsetText = server.header("X-Offset");
-        V2BundleChunkStartDecision decision = v2DecideBundleChunkStart(
-            v2Rx, request.c_str(), nonce.c_str(), offsetText.c_str(), v2NowMs());
-        if (!decision.allowed) { v2ChunkFailure = decision.error; return; }
-        v2ChunkOffset = decision.offset;
-        v2ChunkReplay = decision.replay;
-        v2ChunkWriting = !v2ChunkReplay;
-        v2ChunkFile = LittleFS.open(v2RxPath, v2ChunkReplay ? "r" : "a");
-        if (!v2ChunkFile || (v2ChunkReplay && !v2ChunkFile.seek(v2ChunkOffset))) {
-            v2ChunkFailure = "open"; return;
-        }
-        v2ChunkOk = true;
-        return;
-    }
-    if (raw.status == RAW_WRITE && v2ChunkOk) {
-        V2BundleChunkWriteDecision decision = v2DecideBundleChunkWrite(
-            v2Rx, v2ChunkOffset, v2ChunkReplay, v2ChunkBytes,
-            (uint32_t)raw.currentSize);
-        if (!decision.allowed) {
-            v2ChunkFailure = decision.error;
-            v2ChunkOk = false;
-            return;
-        }
-        if (v2ChunkReplay) {
-            for (size_t i = 0; i < raw.currentSize; ++i) {
-                if (v2ChunkFile.read() != raw.buf[i]) {
-                    v2ChunkFailure = "chunk_conflict";
-                    v2ChunkOk = false;
-                    break;
-                }
-            }
-        } else if (v2ChunkFile.write(raw.buf, raw.currentSize) != raw.currentSize) {
-            v2ChunkFailure = "write";
-            v2ChunkOk = false;
-        }
-        if (v2ChunkOk) v2ChunkBytes += raw.currentSize;
-        return;
-    }
-    if (raw.status == RAW_ABORTED) {
-        v2ChunkFailure = "aborted";
-        v2ChunkOk = false;
-    }
-    if (raw.status == RAW_END || raw.status == RAW_ABORTED) {
-        if (v2ChunkFile) v2ChunkFile.close();
-        if (v2ChunkOk) {
-            V2BundleChunkEndDecision decision = v2DecideBundleChunkEnd(
-                v2Rx, v2ChunkOffset, v2ChunkReplay, v2ChunkBytes, v2NowMs());
-            if (!decision.allowed) {
-                v2ChunkFailure = decision.error;
-                v2ChunkOk = false;
-            } else {
-                v2Rx.offset = decision.nextOffset;
-            }
-        }
-        if (!v2ChunkOk && v2ChunkWriting) v2Rx.deadline = 0;
-    }
-}
-
 static void handleV2BundleChunk() {
-    if (!v2ChunkOk) {
-        if (!strcmp(v2ChunkFailure, "unauthorized")) {
-            server.send(401, "application/json", "{\"result\":\"unauthorized\"}");
-        } else {
-            v2BundleError(v2ChunkFailure);
-        }
-        return;
+    String mac;
+    if (!endpointTokenAuthorized(mac)) {
+        v2Response(401, "{\"result\":\"unauthorized\"}"); return;
     }
-    server.send(200, "application/json", String("{\"result\":\"applied\",\"next_offset\":") +
-                String(v2Rx.offset) + "}");
+    if (!ownerAllows(v2Rx.owner)) { v2BundleError("occupied"); return; }
+    const String request = server.header("X-Request-Id");
+    const String nonce = server.header("X-Session-Nonce");
+    const String offsetText = server.header("X-Offset");
+    const V2BundleChunkStartDecision start = v2DecideBundleChunkStart(
+        v2Rx, request.c_str(), nonce.c_str(), offsetText.c_str(), v2NowMs());
+    if (!start.allowed) { v2BundleError(start.error); return; }
+    const V2BundleChunkWriteDecision write = v2DecideBundleChunkWrite(
+        v2Rx, start.offset, start.replay, 0, v2HttpFrame.payloadLen);
+    if (!write.allowed) { v2BundleError(write.error); return; }
+    File file = LittleFS.open(v2RxPath, start.replay ? "r" : "a");
+    if (!file || (start.replay && !file.seek(start.offset))) {
+        if (file) file.close();
+        v2BundleError("open"); return;
+    }
+    const uint8_t *payload = reinterpret_cast<const uint8_t *>(v2HttpRaw.c_str()) + COMPACT_FRAME_HEADER;
+    bool okay = true;
+    if (start.replay) {
+        for (size_t i = 0; i < v2HttpFrame.payloadLen; ++i)
+            if (file.read() != payload[i]) { okay = false; break; }
+    } else {
+        okay = file.write(payload, v2HttpFrame.payloadLen) == v2HttpFrame.payloadLen;
+    }
+    file.close();
+    if (!okay) {
+        if (!start.replay) v2Rx.deadline = 0;
+        v2BundleError(start.replay ? "chunk_conflict" : "write"); return;
+    }
+    const V2BundleChunkEndDecision end = v2DecideBundleChunkEnd(
+        v2Rx, start.offset, start.replay, v2HttpFrame.payloadLen, v2NowMs());
+    if (!end.allowed) {
+        if (!start.replay) v2Rx.deadline = 0;
+        v2BundleError(end.error); return;
+    }
+    v2Rx.offset = end.nextOffset;
+    v2Response(200, String("{\"result\":\"applied\",\"next_offset\":") +
+               String(v2Rx.offset) + "}");
 }
 
 static void handleV2BundleCommit() {
     String mac;
     if (!endpointTokenAuthorized(mac)) {
-        server.send(401, "application/json", "{\"result\":\"unauthorized\"}"); return;
+        v2Response(401, "{\"result\":\"unauthorized\"}"); return;
     }
     JsonDocument doc;
-    if (!v2Command(server.arg("plain"), doc)) return;
+    if (!v2Command(v2HttpBody, doc)) return;
     const String nonce = v2Nonce();
     const uint64_t nowMs = v2NowMs();
     const String bridgeIdFallback = server.arg("bridge_id");
@@ -4546,6 +4873,87 @@ static void __attribute__((noinline)) handleBleClaim(JsonDocument &doc) {
     v2BleNotify(out);
 }
 
+static void __attribute__((noinline)) handleBleWifiCapabilities(
+    JsonDocument &doc, const String &identity, uint32_t generation) {
+    JsonDocument caps;
+    caps["fw_target"] = FW_TARGET_ID; caps["render_target"] = RENDER_TARGET_ID;
+    caps["width"] = TARGET_WIDTH; caps["height"] = TARGET_HEIGHT;
+    caps["pixel_format"] = TARGET_PIXEL_FORMAT; caps["colors"] = TARGET_COLORS;
+    caps["partial"] = bool(TARGET_PARTIAL); caps["hardware_verified"] = bool(TARGET_VERIFIED);
+    caps["max_templates"] = 8; caps["max_bundle_bytes"] = BS_MAX_BUNDLE_BYTES;
+    caps["compiler_abi"] = CT_ABI;
+#ifdef CODEX_TARGET_NOTE4
+    caps["bundle_font_protocol"] = 1;
+#endif
+    String text; serializeJson(caps, text);
+    JsonDocument reply;
+    deserializeJson(reply, wifiSetupReadPage(doc, identity, generation, text));
+    v2BleNotify(reply);
+}
+
+static void __attribute__((noinline)) handleBleWifiMigration(
+    JsonDocument &doc, const String &identity, uint64_t now, bool allowed) {
+    EndpointRec mapping;
+    if (!storeAuthenticate(doc["token"] | "", mapping) || !allowed) {
+        JsonDocument out;
+        out["ack"] = "wifi"; out["request_id"] = doc["request_id"];
+        out["device_mac"] = macText(); out["ok"] = false; out["error"] = "claim_required";
+        v2BleNotify(out); return;
+    }
+    String endpointNamespace = mapping.nameSpace;
+    // Resolve an earlier uncertain commit from durable storage before retry.
+    if (!wifiSetupBusy()) wifiSchemesBegin();
+    std::unique_ptr<WifiNetwork[]> slots(new(std::nothrow) WifiNetwork[MAX_SLOTS]{});
+    if (!slots) {
+        JsonDocument out; out["ack"] = "wifi"; out["request_id"] = doc["request_id"];
+        out["device_mac"] = macText(); out["ok"] = false; out["error"] = "allocation";
+        v2BleNotify(out); return;
+    }
+    size_t count = 0;
+    String preferred = WiFi.status() == WL_CONNECTED ? WiFi.SSID() : String();
+    Preferences oldPrefs;
+    bool opened = oldPrefs.begin("wifi", true);
+    if (opened) {
+        uint8_t last = oldPrefs.getUChar("last", 0);
+        for (int i = 0; i < MAX_SLOTS; ++i) {
+            String ssid = oldPrefs.getString(("s" + String(i)).c_str(), "");
+            if (!ssid.length()) continue;
+            String password = oldPrefs.getString(("p" + String(i)).c_str(), "");
+            auto &n = slots[count++];
+            n.id.set((String("wifi-slot-") + String(i)).c_str());
+            // Length errors must reject rather than truncate credentials.
+            if (ssid.length() > 32 || password.length() > 64 ||
+                strlen(ssid.c_str()) != ssid.length() || strlen(password.c_str()) != password.length()) n.id.clear();
+            else { n.ssid.set(ssid.c_str()); n.password.set(password.c_str()); }
+            if (!preferred.length() && i == last) preferred = ssid;
+            if (password.length()) memset(const_cast<char *>(password.c_str()), 0, password.length());
+        }
+        oldPrefs.end();
+    }
+    if (!preferred.length() && count) preferred = slots[0].ssid.c_str();
+    JsonDocument out;
+    if (!opened) {
+        out["ack"] = "wifi"; out["request_id"] = doc["request_id"];
+        out["device_mac"] = macText(); out["ok"] = false; out["error"] = "storage";
+    } else deserializeJson(out, wifiSchemesMigrate(doc, endpointNamespace, slots.get(), count,
+        preferred, now, bleRecovery.until, allowed));
+    if (out["persisted"] == true) {
+        bool retired = oldPrefs.begin("wifi", false);
+        if (retired) {
+            for (int i = 0; i < MAX_SLOTS; ++i) {
+                for (const char *prefix : {"s", "p"}) {
+                    String key = String(prefix) + String(i);
+                    if (oldPrefs.isKey(key.c_str()) && !oldPrefs.remove(key.c_str())) retired = false;
+                }
+            }
+            oldPrefs.end();
+        }
+        out["retired"] = retired;
+        if (!retired) { out["ok"] = false; out["error"] = "retirement_pending"; }
+    }
+    v2BleNotify(out);
+}
+
 static void serviceV2Ble() {
     if (!v2BleQueue) return;
     V2BleMessage *message = nullptr;
@@ -4556,8 +4964,62 @@ static void serviceV2Ble() {
     delete message;
     if (!blePeerIsBonded() || !blePeerIsEncrypted() || peer != blePeerAddress() ||
         identity != blePeerIdentity() || generation != bleConnectionGeneration()) return;
+    struct FrameScope { ~FrameScope() { v2BleFrameActive = false; v2BleCacheReply = false; v2ReplyOverBle = false; } } frameScope;
+    if (generation != v2BleSessionGeneration) {
+        v2BleSessionGeneration = generation;
+        v2SessionNonce = "";
+        v2BleHighestRequest = 0;
+        memset(v2BleLastDigest, 0, sizeof(v2BleLastDigest));
+        v2BleLastFrame = "";
+    }
+    CompactFrameHeader frame;
+    if (!compactFrameDecode(reinterpret_cast<const uint8_t *>(body.c_str()), body.length(), frame, 8192) ||
+        frame.kind != 0) return;
+    v2BleFrame = frame;
+    v2BleFrameActive = true;
+    v2ReplyOverBle = true;
+    compactDigest(body, v2BleCurrentDigest);
+    body = String(body.c_str() + COMPACT_FRAME_HEADER, frame.payloadLen);
     JsonDocument doc;
-    if (deserializeJson(doc, body)) return;
+    if (deserializeJson(doc, body)) {
+        v2Ack("command", "rejected", "unchanged", "ram", "payload", -1, 0, nullptr, UINT32_MAX);
+        return;
+    }
+    const char *frameOp = doc["op"] | "";
+    if (compactOperation(frameOp) != frame.op) {
+        v2Ack("command", "rejected", "unchanged", "ram", "operation", -1, 0, nullptr, UINT32_MAX);
+        return;
+    }
+    uint8_t expectedSession[16] = {};
+    if (frame.op == 1) {
+        uint8_t empty[16] = {};
+        if (memcmp(frame.session, empty, 16)) {
+            v2Ack("command", "rejected", "unchanged", "ram", "session", -1, 0, nullptr, UINT32_MAX);
+            return;
+        }
+    } else if (!compactSessionFromHex(v2SessionNonce, expectedSession) ||
+               memcmp(frame.session, expectedSession, 16)) {
+        v2Ack("command", "rejected", "unchanged", "ram", "session", -1, 0, nullptr, UINT32_MAX);
+        return;
+    }
+    uint8_t noContext[16] = {};
+    if (memcmp(frame.context, noContext, 16) &&
+        (strlen(v2Profile.contextId) != 16 || memcmp(frame.context, v2Profile.contextId, 16))) {
+        v2Ack("command", "rejected", "unchanged", "ram", "context", -1, 0, nullptr, UINT32_MAX);
+        return;
+    }
+    if (frame.requestNo <= v2BleHighestRequest) {
+        if (frame.requestNo == v2BleHighestRequest && v2BleLastFrame.length() &&
+            !memcmp(v2BleCurrentDigest, v2BleLastDigest, sizeof(v2BleLastDigest))) {
+            bleNotifyStatusQuiet(v2BleLastFrame);
+        } else {
+            v2Ack("command", "rejected", "unchanged", "ram",
+                frame.requestNo == v2BleHighestRequest ? "request_conflict" : "retired",
+                -1, 0, nullptr, UINT32_MAX);
+        }
+        return;
+    }
+    v2BleCacheReply = true;
     JsonString request = doc["request_id"].as<JsonString>();
     if (!request || request.size() != strlen(request.c_str())) return;
     v2RequestId = doc["request_id"].as<String>();
@@ -4628,73 +5090,12 @@ static void serviceV2Ble() {
             return;
         }
         if (operation == "wifi_capabilities") {
-            JsonDocument caps;
-            caps["fw_target"] = FW_TARGET_ID; caps["render_target"] = RENDER_TARGET_ID;
-            caps["width"] = TARGET_WIDTH; caps["height"] = TARGET_HEIGHT;
-            caps["pixel_format"] = TARGET_PIXEL_FORMAT; caps["colors"] = TARGET_COLORS;
-            caps["partial"] = bool(TARGET_PARTIAL); caps["hardware_verified"] = bool(TARGET_VERIFIED);
-            caps["max_templates"] = 8; caps["max_bundle_bytes"] = BS_MAX_BUNDLE_BYTES;
-            caps["compiler_abi"] = CT_ABI;
-#ifdef CODEX_TARGET_NOTE4
-            caps["bundle_font_protocol"] = 1;
-#endif
-            String text; serializeJson(caps, text);
-            JsonDocument reply;
-            deserializeJson(reply, wifiSetupReadPage(doc, identity, generation, text));
-            v2BleNotify(reply);
+            handleBleWifiCapabilities(doc, identity, generation);
             return;
         }
         if (operation == "wifi_migrate") {
-            EndpointRec mapping;if(!storeAuthenticate(doc["token"]|"",mapping) || !allowed){
-                JsonDocument out;out["ack"]="wifi";out["request_id"]=doc["request_id"];out["device_mac"]=macText();out["ok"]=false;out["error"]="claim_required";v2BleNotify(out);return;
-            }
-            String endpointNamespace=mapping.nameSpace;
-            // Resolve an earlier uncertain commit from durable storage before retry.
-            if (!wifiSetupBusy()) wifiSchemesBegin();
-            WifiNetwork slots[MAX_SLOTS] = {};
-            size_t count = 0;
-            String preferred = WiFi.status() == WL_CONNECTED ? WiFi.SSID() : String();
-            Preferences oldPrefs;
-            bool opened = oldPrefs.begin("wifi", true);
-            if (opened) {
-                uint8_t last = oldPrefs.getUChar("last", 0);
-                for (int i = 0; i < MAX_SLOTS; ++i) {
-                    String ssid = oldPrefs.getString(("s" + String(i)).c_str(), "");
-                    if (!ssid.length()) continue;
-                    String password = oldPrefs.getString(("p" + String(i)).c_str(), "");
-                    auto &n = slots[count++];
-                    n.id.set((String("wifi-slot-") + String(i)).c_str());
-                    // Length errors must reject rather than truncate credentials.
-                    if (ssid.length() > 32 || password.length() > 64 ||
-                        strlen(ssid.c_str()) != ssid.length() || strlen(password.c_str()) != password.length()) n.id.clear();
-                    else { n.ssid.set(ssid.c_str()); n.password.set(password.c_str()); }
-                    if (!preferred.length() && i == last) preferred = ssid;
-                    if (password.length()) memset(const_cast<char *>(password.c_str()), 0, password.length());
-                }
-                oldPrefs.end();
-            }
-            if (!preferred.length() && count) preferred = slots[0].ssid.c_str();
-            JsonDocument out;
-            if (!opened) {
-                out["ack"] = "wifi"; out["request_id"] = doc["request_id"];
-                out["device_mac"] = macText(); out["ok"] = false; out["error"] = "storage";
-            } else deserializeJson(out, wifiSchemesMigrate(doc, endpointNamespace, slots, count,
-                preferred, now, bleRecovery.until, allowed));
-            if (out["persisted"] == true) {
-                bool retired = oldPrefs.begin("wifi", false);
-                if (retired) {
-                    for (int i = 0; i < MAX_SLOTS; ++i) {
-                        for (const char *prefix : {"s", "p"}) {
-                            String key = String(prefix) + String(i);
-                            if (oldPrefs.isKey(key.c_str()) && !oldPrefs.remove(key.c_str())) retired = false;
-                        }
-                    }
-                    oldPrefs.end();
-                }
-                out["retired"] = retired;
-                if (!retired) { out["ok"] = false; out["error"] = "retirement_pending"; }
-            }
-            v2BleNotify(out); return;
+            handleBleWifiMigration(doc, identity, now, allowed);
+            return;
         }
         if(operation=="wifi_setup" || operation=="wifi_select" || operation=="wifi_scheme_delete") {
             JsonDocument out;out["ack"]="wifi";out["request_id"]=doc["request_id"];out["device_mac"]=macText();out["ok"]=false;out["error"]="retired_operation";v2BleNotify(out);return;
@@ -4725,11 +5126,11 @@ static void serviceV2Ble() {
         // rendezvous command (status/plan/data); adopt them before any handler
         // renders or replies. Missing fields keep the local RTC fallback.
         if (!doc["server_time"].isNull()) adoptServerTimeForce(doc);
-        // An authenticated rendezvous command is a successful bridge contact:
-        // refresh the sync timestamp that drives the offline_mins row.
-        markSynced();
         const char *op = doc["op"] | "";
         if (!strcmp(op, "status")) {
+            // Status itself is authenticated; later commands validate their
+            // own session before changing data freshness or device state.
+            // Status is only observation; Data/Plan retain their own contact clock.
             if (!v2InRendezvous && !v2RvBleReleased) v2RendezvousBegin();
             BleStatusSnapshot snapshot;
             snapshot.mac = macText(); snapshot.nonce = v2Nonce();
@@ -4818,21 +5219,42 @@ static void serviceV2Ble() {
                 v2Ack("sync_open", "applied", "unchanged", "ram", nullptr, -1, 0,
                       nullptr, UINT32_MAX);
             }
-        } else if (!strcmp(op, "handoff")) {
+        } else if (!strcmp(op, "network_start")) {
+            JsonDocument request;
+            if (!v2Command(body, request)) { v2ReplyOverBle = false; return; }
             OwnerRec current;
-            const auto session = v2CheckCommandSession(doc, macText(), &v2Nonce());
-            RendezvousHandoffProof proof;
-            proof.sessionAccepted = session.accepted;
-            proof.ownerAccepted = ownerGet(current) && current.id == (doc["bridge_id"] | "");
-            proof.bridge = doc["bridge_id"] | ""; proof.expectedBridge = v2RvBridge.c_str();
-            proof.id = doc["rendezvous_id"] | ""; proof.expectedId = v2RvId.c_str();
-            proof.challenge = doc["challenge"] | ""; proof.expectedChallenge = v2RvChallenge.c_str();
-            proof.planId = doc["plan_id"] | 0ULL; proof.acceptedPlanId = v2Plan.acceptedId();
-            proof.generation = doc["wake_generation"] | 0u; proof.expectedGeneration = rtcWakeGeneration;
-            proof.wakeSeq = doc["wake_seq"] | 0u; proof.expectedWakeSeq = rtcTraceCurrentSeq;
-            const bool accepted = v2Rv.handoff(v2NowMs(), rendezvousProofMatches(proof));
-            v2Ack("handoff", accepted ? "applied" : "rejected", "unchanged", "ram",
-                  accepted ? nullptr : "handoff_proof", -1, v2Plan.acceptedId(), nullptr, UINT32_MAX);
+            const uint64_t now = v2NowMs();
+            const bool owned = ownerGet(current) && current.id == String(request["bridge_id"] | "");
+            const uint64_t legalUntil = v2Plan.lightActive(now) ? v2Plan.deadlineMs() :
+                syncOpenThisWake ? syncOpenAnsweredAt + 90000 : 0;
+            IPAddress bridge;
+            const char *addr = request["bridge_addr"] | "";
+            const uint32_t port = request["bridge_port"] | 0u;
+            const uint64_t requestNo = request["origin_request_no"] | 0ULL;
+            int8_t endpointIndex = -1;
+            for (int i = 0; i < storeCount(); ++i) {
+                EndpointRec endpoint;
+                if (storeGet(i, endpoint) && endpoint.principal == current.id &&
+                    endpoint.token == String(request["token"] | "")) { endpointIndex = i; break; }
+            }
+            const char *error = !owned ? "claim_required" :
+                !v2InRendezvous || !v2Rv.hasPlan() || legalUntil <= now ||
+                (request["plan_id"] | 0ULL) != v2Plan.acceptedId() ? "plan_window" :
+                !bridge.fromString(addr) || bridge[0] == 0 || bridge[0] == 127 ||
+                bridge[0] >= 224 || !port || port > UINT16_MAX || !requestNo ? "report_route" :
+                endpointIndex < 0 ? "report_binding" : nullptr;
+            if (!error && !v2RvNetworkRequested) {
+                readyReport.bridge = bridge; readyReport.port = (uint16_t)port;
+                readyReport.endpointIndex = endpointIndex;
+                readyReport.principal = current.id;
+                readyReport.originSession = v2RvId;
+                readyReport.originRequestNo = requestNo;
+                readyReport.planId = v2Plan.acceptedId();
+                v2RvNetworkRequested = true;
+                v2RvBleReleaseAtMs = now + RV_ACK_GRACE_MS;
+            }
+            v2Ack("network_start", error ? "rejected" : "accepted", "unchanged", "ram",
+                  error, -1, v2Plan.acceptedId(), v2Profile.contextId, UINT32_MAX);
         } else if (!strcmp(op, "history")) {
             if (v2HistorySyncMs) v2HistorySyncUntilMs = v2NowMs() + v2HistorySyncMs;
             const uint32_t since = doc["since"] | 0u;
@@ -4867,8 +5289,12 @@ static void v2RendezvousBegin(bool deep) {
     snprintf(identity, sizeof(identity), "%08lx%08lx%08lx%08lx",
              (unsigned long)esp_random(), (unsigned long)esp_random(),
              (unsigned long)esp_random(), (unsigned long)esp_random());
-    v2RvId = identity; v2RvChallenge = ""; v2RvBridge = "";
+    v2RvId = identity;
     v2RvWifiPhase = 0;
+    v2RvNetworkExpected = false;
+    v2RvNetworkRequested = false;
+    v2RvBleReleaseAtMs = 0;
+    readyReport = {};
     if (deep && syncStoreAvailable()) {
         syncCountDeepRendezvous(syncRtc);
         syncSkippedThisWake = syncRtc.retrySkip != 0;
@@ -4898,16 +5324,12 @@ static void rendezvousWifiTick() {
     if (wifiSetupBusy()) return;
     if (WiFi.status() == WL_CONNECTED && !(WiFi.localIP() == IPAddress(0,0,0,0))) {
         wifiUp = true;
-        if (!v2Rv.ready()) {
-            char challenge[17];
-            snprintf(challenge, sizeof(challenge), "%08lx%08lx", (unsigned long)esp_random(), (unsigned long)esp_random());
-            v2RvChallenge = challenge;
-            v2Rv.httpReady(); updateInfoExtra();
-        }
+        if (!v2Rv.ready()) { v2Rv.httpReady(); updateInfoExtra(); }
+        serviceReadyReport();
         return;
     }
-    // Configure before association completes; handoff must not trigger a new
-    // association after the Bridge has proved the HTTP path.
+    // Configure before association completes; report handling does not start
+    // another association after the accepted Plan window.
     wifi_config_t cfg = {};
     if (esp_wifi_get_config(WIFI_IF_STA, &cfg) == ESP_OK && cfg.sta.listen_interval != 10) {
         cfg.sta.listen_interval = 10; esp_wifi_set_config(WIFI_IF_STA, &cfg);
@@ -4920,28 +5342,36 @@ static void v2RendezvousTick() {
     if (bleIsConnected()) v2Rv.connected(now);
     const bool light = v2Plan.lightActive(now);
     const bool syncGuard = syncEnabled && (syncRtc.flags & 1) && !syncOpenThisWake && !syncSkippedThisWake;
-    if ((v2Rv.hasPlan() && light) || syncOpenThisWake) {
+    if (v2RvNetworkRequested && ((v2Rv.hasPlan() && light) || syncOpenThisWake)) {
         const uint64_t legalUntil = light ? v2Plan.deadlineMs() : syncOpenAnsweredAt + 90000;
         v2Rv.admitHttp(now, legalUntil);
         if (v2Rv.needsHttp()) {
+            if (bleOn && !v2ManualBleHoldActive()) {
+                if (now < v2RvBleReleaseAtMs) return;
+                v2RvBleReleased = true;
+                bleOff("network accepted");
+            }
             if (!v2RvWifiPhase) rendezvousWifiBegin();
             rendezvousWifiTick();
+            if (readyReport.received || readyReport.attempts >= 3)
+                v2Rv.finishExchange(now, v2HistorySyncUntilMs);
         }
-    } else if (v2Rv.hasPlan() && !syncGuard) {
+    } else if (v2Rv.hasPlan() && !v2RvNetworkExpected && !syncGuard) {
         v2Rv.finishExchange(now, v2HistorySyncUntilMs);
     }
     v2RfDeadlineMs = v2Rv.deadline();
-    if (v2Rv.active() && bleOn && !v2BatteryPowerOff(plugged, batteryPercent()) && !configMode) {
+    if (v2Rv.active() && (bleOn || v2Rv.needsHttp() ||
+         v2Rv.phase() == RendezvousPhase::AckGrace) &&
+        !v2BatteryPowerOff(plugged, batteryPercent()) && !configMode) {
         if (!v2Rv.tick(now)) return;
     } else v2Rv.cancel();
-    const bool handedOff = v2Rv.handedOff();
     // Physical recovery has its own fixed deadline. Ordinary/USB auto BLE is
-    // released for this window and cannot reopen behind a completed handoff.
-    if (!v2ManualBleHoldActive()) { v2RvBleReleased = true; bleOff(handedOff ? "HTTP handoff" : "rendezvous deadline"); }
+    // released for this window and cannot reopen behind a network task.
+    if (!v2ManualBleHoldActive()) { v2RvBleReleased = true; bleOff("rendezvous deadline"); }
     v2InRendezvous = false; v2RfDeadlineMs = 0;
     wakeResult = light ? WAKE_RV_LIGHT : WAKE_RV_SLEEP;
     rtcNetCycles++;
-    DevLog.printf("[platform] rendezvous handoff=%d light=%d elapsed=%ums\n", handedOff, light, (unsigned)(now-v2RvStartMs));
+    DevLog.printf("[platform] rendezvous network=%d light=%d elapsed=%ums\n", v2RvNetworkRequested, light, (unsigned)(now-v2RvStartMs));
     v2RendezvousRender(light);
     nextBleContactMs = now + (uint64_t)V2_RENDEZVOUS_S * 1000ULL;
     if (light || syncOpenThisWake || v2ManualBleHoldActive() || (plugged && !rtcDeepOnUsb)) startNormalMode();
@@ -5018,8 +5448,8 @@ static void registerHttpRoutes() {
     static bool registered = false;
     if (registered) return;
     registered = true;
-    const char *bundleHeaders[] = {"X-Request-Id", "X-Session-Nonce", "X-Offset", "Authorization"};
-    server.collectHeaders(bundleHeaders, 4);
+    const char *bundleHeaders[] = {"X-Request-Id", "X-Session-Nonce", "X-Offset", "Authorization", "Content-Type", "X-Device-Token"};
+    server.collectHeaders(bundleHeaders, 6);
     server.on("/", HTTP_GET, handleStatus);
     server.on("/status.json", HTTP_GET, handleStatusJson);
     server.on("/log", HTTP_GET, handleLog);
@@ -5027,27 +5457,27 @@ static void registerHttpRoutes() {
     server.on("/pmstats", HTTP_GET, handlePmStats);
     server.on("/frame", HTTP_GET, handleFrame);
     server.on("/diag", HTTP_POST, handleDiag);
-    server.on("/claim", HTTP_POST, handleClaim);
+    server.on("/claim", HTTP_POST, [] { v2HttpRoute(4, handleClaim); }, v2HttpRawHandler);
     // v2 platform protocol: authenticated business endpoints (token + owner);
     // none of them extend the light deadline implicitly.
-    server.on("/api/status", HTTP_GET, handleV2Status);
-    server.on("/api/wifi/snapshot", HTTP_POST, [] { handleWifiManagement("snapshot"); });
-    server.on("/api/wifi/apply", HTTP_POST, [] { handleWifiManagement("apply"); });
-    server.on("/api/wifi/result", HTTP_POST, [] { handleWifiManagement("result"); });
-    server.on("/api/wifi/result_ack", HTTP_POST, [] { handleWifiManagement("result_ack"); });
-    server.on("/api/wifi/command", HTTP_POST, [] { handleWifiManagement("command"); });
-    server.on("/api/sync/begin", HTTP_POST, handleSyncBegin);
-    server.on("/api/sync/page", HTTP_POST, handleSyncPage);
-    server.on("/api/sync/ack", HTTP_POST, handleSyncAck);
-    server.on("/api/sync/complete", HTTP_POST, handleSyncComplete);
-    server.on("/api/ota/image", HTTP_GET, handleOtaImage);
-    server.on("/api/data", HTTP_POST, handleV2Data);
-    server.on("/api/plan", HTTP_POST, handleV2Plan);
-    server.on("/api/activate", HTTP_POST, handleV2Activate);
+    server.on("/api/status", HTTP_POST, [] { v2HttpRoute(1, handleV2Status); }, v2HttpRawHandler);
+    server.on("/api/wifi/snapshot", HTTP_POST, [] { v2HttpRoute(14, [] { handleWifiManagement("snapshot"); }); }, v2HttpRawHandler);
+    server.on("/api/wifi/apply", HTTP_POST, [] { v2HttpRoute(15, [] { handleWifiManagement("apply"); }); }, v2HttpRawHandler);
+    server.on("/api/wifi/result", HTTP_POST, [] { v2HttpRoute(16, [] { handleWifiManagement("result"); }); }, v2HttpRawHandler);
+    server.on("/api/wifi/result_ack", HTTP_POST, [] { v2HttpRoute(17, [] { handleWifiManagement("result_ack"); }); }, v2HttpRawHandler);
+    server.on("/api/wifi/command", HTTP_POST, [] { v2HttpRoute(18, [] { handleWifiManagement("command"); }); }, v2HttpRawHandler);
+    server.on("/api/sync/begin", HTTP_POST, [] { v2HttpRoute(6, handleSyncBegin); }, v2HttpRawHandler);
+    server.on("/api/sync/page", HTTP_POST, [] { v2HttpRoute(7, handleSyncPage); }, v2HttpRawHandler);
+    server.on("/api/sync/ack", HTTP_POST, [] { v2HttpRoute(8, handleSyncAck); }, v2HttpRawHandler);
+    server.on("/api/sync/complete", HTTP_POST, [] { v2HttpRoute(9, handleSyncComplete); }, v2HttpRawHandler);
+    server.on("/api/ota/image", HTTP_POST, [] { v2HttpRoute(19, handleOtaImage); }, v2HttpRawHandler);
+    server.on("/api/data", HTTP_POST, [] { v2HttpRoute(2, handleV2Data); }, v2HttpRawHandler);
+    server.on("/api/plan", HTTP_POST, [] { v2HttpRoute(3, handleV2Plan); }, v2HttpRawHandler);
+    server.on("/api/activate", HTTP_POST, [] { v2HttpRoute(13, handleV2Activate); }, v2HttpRawHandler);
 
-    server.on("/api/bundle/begin", HTTP_POST, handleV2BundleBegin);
-    server.on("/api/bundle/chunk", HTTP_POST, handleV2BundleChunk, handleV2BundleChunkRaw);
-    server.on("/api/bundle/commit", HTTP_POST, handleV2BundleCommit);
+    server.on("/api/bundle/begin", HTTP_POST, [] { v2HttpRoute(10, handleV2BundleBegin); }, v2HttpRawHandler);
+    server.on("/api/bundle/chunk", HTTP_POST, [] { v2HttpRoute(11, handleV2BundleChunk); }, v2HttpRawHandler);
+    server.on("/api/bundle/commit", HTTP_POST, [] { v2HttpRoute(12, handleV2BundleCommit); }, v2HttpRawHandler);
     server.on("/update", HTTP_GET, handleUpdatePage);
     server.on("/doUpdate", HTTP_POST,
         []() {
@@ -5832,8 +6262,9 @@ void loop() {
     }
     if (wifiSetupBusy() && selectingBridge.length() && ownerGet(wifiOwner) && wifiOwner.id != selectingBridge)
         wifiSetupAbort("occupied");
-    wifiSetupPoll(v2NowMs(), blePeerIdentity(), bleConnectionGeneration(),
-                  bleIsConnected() && blePeerIsBonded() && blePeerIsEncrypted());
+    if (!(v2InRendezvous && bleOn && v2RvNetworkExpected))
+        wifiSetupPoll(v2NowMs(), blePeerIdentity(), bleConnectionGeneration(),
+                      bleIsConnected() && blePeerIsBonded() && blePeerIsEncrypted());
     static bool wasSettingUp = false;
     if (wasSettingUp && !wifiSetupBusy() && WiFi.status() == WL_CONNECTED) {
         wifiSchemesCredentials(wifiSsid, wifiPass);
