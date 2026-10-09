@@ -673,9 +673,17 @@ void v2RendezvousTick() {
     diagnostics::state.wakeResult = light ? WAKE_RV_LIGHT : WAKE_RV_SLEEP;
     diagnostics::retained.rtcNetCycles++;
     DevLog.printf("[platform] rendezvous network=%d light=%d elapsed=%ums\n", state.v2RvNetworkRequested, light, (unsigned)(now-v2RvStartMs));
-    display::v2RendezvousRender(light);
     state.nextBleContactMs = now + (uint64_t)V2_RENDEZVOUS_S * 1000ULL;
-    if (light || sync::state.syncOpenThisWake || power::v2ManualBleHoldActive() || (power::state.plugged && !power::retained.rtcDeepOnUsb)) startNormalMode();
+    const bool stayAwake = light || sync::state.syncOpenThisWake || power::v2ManualBleHoldActive() || (power::state.plugged && !power::retained.rtcDeepOnUsb);
+    if (!stayAwake && power::retained.rtcMode != MODE_DEEP) {
+        // Transition through the common mode/persistence/full sleep-frame path.
+        // enterDeep renders the latest snapshot, so do not draw a Light frame first.
+        platform::state.v2WakeRenderPending = false;
+        power::enterDeep("rendezvous");
+        return;
+    }
+    display::v2RendezvousRender(light);
+    if (stayAwake) startNormalMode();
     else {
         power::retained.rtcNextContactS = V2_RENDEZVOUS_S;
         power::retained.rtcNextNetAt = clock::timeKnown() ? (uint32_t)time(nullptr)+power::retained.rtcNextContactS : 0;

@@ -331,7 +331,7 @@ void wifiSetupRadioClosed(const char *reason) {
     // can finish in the formal light Wi-Fi window after normal BLE closes.
     if (!deferredSelection && !transactionUnified) wifiSetupAbort(reason);
 }
-void wifiSetupPoll(uint64_t now, const String &peer, uint32_t generation, bool encrypted) {
+void wifiSetupPoll(uint64_t now, const String &peer, uint32_t generation, bool encrypted, bool startAllowed) {
     if (!running) return;
     if (!transactionUnified && !deferredSelection && (!encrypted || peer != transactionPeer || generation != transactionGeneration)) {
         wifiSetupAbort("disconnected"); return;
@@ -344,6 +344,7 @@ void wifiSetupPoll(uint64_t now, const String &peer, uint32_t generation, bool e
         wifiSetupAbort(failure); return;
     }
     if (deferredSelection && !selectionStarted) {
+        if (!startAllowed) return;
         // The accepted transaction survives ordinary BLE release. Start RF
         // only when the main loop has ended the rendezvous BLE exchange.
         selectionStarted = true;
@@ -587,7 +588,8 @@ String wifiSetupCommand(JsonDocument &doc, const String &peer, uint32_t generati
         replaceNetwork = doc["replace"] | false;
         deadline = std::min(until, now + 25000);
         running = true;
-        if (!deferredSelection) {
+        if (!deferredSelection && (WiFi.status() != WL_CONNECTED ||
+            WiFi.SSID() != String(candidate.ssid) || WiFi.localIP() == IPAddress(0,0,0,0))) {
             WiFi.disconnect(false);
             WiFi.mode(WiFi.getMode() == WIFI_AP ? WIFI_AP_STA : WIFI_STA);
             wifiSetupConnectionStarted(String(candidate.ssid));

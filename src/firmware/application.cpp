@@ -353,9 +353,11 @@ void tick() {
     }
     if (wifiSetupBusy() && selectingBridge.length() && ownerGet(wifiOwner) && wifiOwner.id != selectingBridge)
         wifiSetupAbort("occupied");
-    if (!(radio::state.v2InRendezvous && radio::state.bleOn && radio::state.v2RvNetworkExpected))
-        wifiSetupPoll(clock::v2NowMs(), blePeerIdentity(), bleConnectionGeneration(),
-                      bleIsConnected() && blePeerIsBonded() && blePeerIsEncrypted());
+    // Defer a new RF association until ordinary BLE releases, but always
+    // finish an already started activation (including physical BLE recovery).
+    wifiSetupPoll(clock::v2NowMs(), blePeerIdentity(), bleConnectionGeneration(),
+                  bleIsConnected() && blePeerIsBonded() && blePeerIsEncrypted(),
+                  !(radio::state.v2InRendezvous && radio::state.bleOn && radio::state.v2RvNetworkExpected));
     static bool wasSettingUp = false;
     if (wasSettingUp && !wifiSetupBusy() && WiFi.status() == WL_CONNECTED) {
         wifiSchemesCredentials(radio::state.wifiSsid, radio::state.wifiPass);

@@ -429,7 +429,8 @@ void enterDeep(const char *reason) {
     // controller), so the glyph could be left half-drawn or missing.
     display::state.epdPartialReady = false;
     display::renderCurrent();
-    diagnostics::retained.rtcDeepGlyph |= 4;
+    if (display::state.epdBaselineTrusted && !display::state.networkGlyph.pending)
+        diagnostics::retained.rtcDeepGlyph |= 4;
     diagnostics::captureFrameToFs("enter-deep");
     diagnostics::setStage(20);
     diagnostics::histAdd(HIST_ENTER_DEEP, retained.rtcNextContactS);

@@ -412,7 +412,7 @@ extern "C" {
     fn codex_sim_wifi_control(input:*const c_char,principal:*const c_char,name_space:*const c_char,generation:u32,
         now:u64,until:u64,physical:u64,claimed:c_int,session_valid:c_int,out:*mut c_char,cap:c_int)->c_int;
     fn codex_sim_wifi_read_page(input:*const c_char,peer:*const c_char,generation:u32,text:*const c_char,out:*mut c_char,cap:c_int)->c_int;
-    fn codex_sim_wifi_poll(now: u64, peer: *const c_char, generation: u32, encrypted: c_int, outcome: c_int) -> c_int;
+    fn codex_sim_wifi_poll(now: u64, peer: *const c_char, generation: u32, encrypted: c_int, outcome: c_int, start_allowed: c_int) -> c_int;
     fn codex_sim_wifi_storage_failure(fail: c_int);
     fn codex_sim_wifi_constrain(now:u64,until:u64,owner_allowed:c_int);
     fn codex_sim_wifi_storage_status(out:*mut c_char,cap:c_int)->c_int;
@@ -447,6 +447,7 @@ extern "C" {
         boot_id: u64, wake_cause: *const c_char) -> *mut std::ffi::c_void;
     fn codex_sim_bundle_free(p: *mut std::ffi::c_void);
     fn codex_sim_bundle_set_wall(p: *mut std::ffi::c_void, epoch_secs: i64) -> c_int;
+    fn codex_sim_bundle_display(p: *mut std::ffi::c_void, deep: c_int, wifi_up: c_int, contact: c_int) -> c_int;
     fn codex_sim_bundle_status(p: *mut std::ffi::c_void, out: *mut c_char, cap: c_int) -> c_int;
     fn codex_sim_bundle_frame(p: *mut std::ffi::c_void, out: *mut u8, cap: c_int) -> c_int;
     fn codex_sim_store_budget(p: *mut std::ffi::c_void, budget: i64) -> c_int;
@@ -691,6 +692,16 @@ pub struct SimulatorBundle {
 unsafe impl Send for SimulatorBundle {}
 
 impl SimulatorBundle {
+    pub fn note_bridge_contact(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(unsafe { codex_sim_bundle_display(self.state, -1, -1, 1) } == 1,
+            "simulator contact unavailable");
+        Ok(())
+    }
+    pub fn display_state(&mut self, deep: bool, wifi_up: bool, contact: bool) -> anyhow::Result<()> {
+        anyhow::ensure!(unsafe { codex_sim_bundle_display(self.state, deep as c_int, wifi_up as c_int, contact as c_int) } == 1,
+            "simulator display state unavailable");
+        Ok(())
+    }
     pub fn set_wall_secs(&mut self, epoch_secs: i64) -> anyhow::Result<()> {
         anyhow::ensure!(unsafe { codex_sim_bundle_set_wall(self.state, epoch_secs) } == 1,
             "simulator wall clock unavailable");
@@ -1476,8 +1487,11 @@ impl SimulatorWifi {
         let rc=unsafe{codex_sim_wifi_read_page(input.as_ptr(),peer.as_ptr(),generation,text.as_ptr(),out.as_mut_ptr(),out.len() as c_int)};simulator_ffi_json(rc,&out,"wifi_status_page")
     }
     pub fn poll(&mut self, now: u64, peer: &str, generation: u32, encrypted: bool, outcome: i32) -> anyhow::Result<bool> {
+        self.poll_with_start_allowed(now,peer,generation,encrypted,outcome,true)
+    }
+    pub fn poll_with_start_allowed(&mut self, now: u64, peer: &str, generation: u32, encrypted: bool, outcome: i32, start_allowed: bool) -> anyhow::Result<bool> {
         let peer = CString::new(peer)?;
-        Ok(unsafe { codex_sim_wifi_poll(now, peer.as_ptr(), generation, encrypted as c_int, outcome) } == 1)
+        Ok(unsafe { codex_sim_wifi_poll(now, peer.as_ptr(), generation, encrypted as c_int, outcome,start_allowed as c_int) } == 1)
     }
     pub fn storage_status(&mut self)->anyhow::Result<serde_json::Value> {
         let mut out=vec![0i8;2048];let rc=unsafe{codex_sim_wifi_storage_status(out.as_mut_ptr(),out.len() as c_int)};
@@ -1700,5 +1714,34 @@ fn shared_wifi_old_duplicate_ids_are_preserved_and_explicitly_rejected() {
     let activate=serde_json::json!({"op":"activate","bridge_id":"new","request_id":"ambiguous-activate","network_id":"same","version":1,"device_mac":"AABBCCDDEEFF"});
     assert_eq!(sim.control(&activate,"new","new",1,1000,30000,0,true,true).unwrap()["error"],"ambiguous_network_id");
     assert_eq!(sim.storage_status().unwrap()["networks"],2);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn physical_ble_hold_finishes_wifi_activation_without_starting_deferred_rf() {
+    let _guard=WIFI_PERMISSION_TEST_LOCK.lock().unwrap();
+    let dir=std::env::temp_dir().join(format!("codex-wifi-hold-{}",std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();let mut sim=SimulatorWifi::new(&dir).unwrap();
+    let seed=serde_json::json!({"op":"apply","bridge_id":"test","request_id":"seed","device_mac":"AABBCCDDEEFF","expected_revision":0,
+        "changes":[{"network_id":"home","host_ssid":"Host","ssid":"Device","credential":"open"}]});
+    assert_eq!(sim.control(&seed,"test","bond",1,1000,300000,300000,true,true).unwrap()["outcome"],"committed");
+    let activation=|id:&str|serde_json::json!({"op":"activate","bridge_id":"test","request_id":id,"device_mac":"AABBCCDDEEFF","network_id":"home","version":1});
+    assert_eq!(sim.control(&activation("hold"),"test","bond",1,1100,300000,300000,true,true).unwrap()["ok"],true);
+    // Physical hold keeps BLE active; association has already started. The
+    // ROM must still poll completion, commit the receipt and preserve Wi-Fi.
+    assert!(!sim.poll_with_start_allowed(1200,"bond",1,true,1,false).unwrap());
+    let query=serde_json::json!({"op":"result","bridge_id":"test","request_id":"query","query_id":"hold","device_mac":"AABBCCDDEEFF"});
+    assert_eq!(sim.control(&query,"test","bond",1,1300,300000,300000,true,true).unwrap()["outcome"],"committed");
+    assert_eq!(sim.observe().unwrap()["connected"],true);
+    let begins=sim.observe().unwrap()["begins"].clone();
+    assert_eq!(sim.control(&activation("healthy"),"test","bond",1,1350,300000,300000,true,true).unwrap()["ok"],true);
+    assert_eq!(sim.observe().unwrap()["connected"],true,"explicit activation must preserve the matching healthy link");
+    assert!(!sim.poll_with_start_allowed(1360,"bond",1,true,0,false).unwrap());
+    assert_eq!(sim.observe().unwrap()["begins"],begins,"no repeated association for the same connected network");
+    // Ordinary BLE defers a NEW association, then permits it after release.
+    assert_eq!(sim.control(&activation("deferred"),"test","bond",1,1400,300000,0,true,true).unwrap()["ok"],true);
+    assert!(sim.poll_with_start_allowed(1500,"bond",1,true,0,false).unwrap());
+    assert_eq!(sim.control(&serde_json::json!({"op":"result","bridge_id":"test","request_id":"query2","query_id":"deferred","device_mac":"AABBCCDDEEFF"}),"test","bond",1,1600,300000,0,true,true).unwrap()["outcome"],"accepted");
+    assert!(!sim.poll_with_start_allowed(1700,"bond",1,false,1,true).unwrap());
     std::fs::remove_dir_all(dir).unwrap();
 }

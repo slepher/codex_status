@@ -369,10 +369,19 @@ fn fresh_connection(state: &WifiState, target: &Network, now: u64) -> Connection
     })
 }
 fn note_match(ctx: &AppCtx, mac: &str, target: &Network, reply: &Value) -> Option<Connection> {
-    if reply["ok"]!=true || reply["network_id"]!=target.network_id {return None;}
+    if reply["ok"]!=true || reply["network_id"]!=target.network_id {
+        let error=reply["error"].as_str().filter(|e|e.len()<=64&&e.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'_')).unwrap_or("invalid_match_reply");
+        tracing::warn!(device_mac=mac,error_code=error,"device Wi-Fi match rejected");
+        return None;
+    }
     let state=platform::service(ctx).wifi_state(mac);let now=crate::device_now_secs(mac).max(0) as u64;
     if state.matching_target(&target.host_ssid).is_none_or(|current|current!=target){return None;}
-    let mut result=fresh_connection(&state,target,now);
+    let result=project_match(&state,target,reply,now)?;
+    if let Some(error)=result.error.as_deref() {tracing::warn!(device_mac=mac,error_code=error,next_attempt_at=result.next_attempt_at,"device Wi-Fi failure observed");}
+    platform::service(ctx).wifi_note_connection(mac,result.clone()).ok()?;Some(result)
+}
+fn project_match(state:&WifiState,target:&Network,reply:&Value,now:u64)->Option<Connection> {
+    let mut result=fresh_connection(state,target,now);
     let version=reply["version"].as_u64()?;
     if result.version!=version {result.attempts=0;result.next_attempt_at=0;result.http_ready=false;}
     result.version=version;result.observed_at=now;
@@ -382,13 +391,13 @@ fn note_match(ctx: &AppCtx, mac: &str, target: &Network, reply: &Value) -> Optio
     else if reply["connected"]==true {result.state="connected".into();result.error=None;result.http_ready=false;}
     else if reply["stage"]=="failed" {
         let error=reply["error"].as_str().unwrap_or("connect_timeout");
-        if !matches!(error,"authentication_failed"|"handshake_timeout"|"network_not_found"|"security_mismatch"|"signal_weak"|"association_failed"|"dhcp_timeout"|"connect_timeout"|"occupied"|"disconnected"|"storage"|"cancelled"){return None;}
+        let error=if !error.is_empty() && error.len()<=64 && error.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'_') {error} else {"invalid_device_error"};
         let new_failure=result.state!="connection_failed" || result.error.as_deref()!=Some(error);
         result.state="connection_failed".into();result.error=Some(error.into());result.reason=reply["reason"].as_u64().and_then(|n|u16::try_from(n).ok()).unwrap_or(0);result.http_ready=false;
         if new_failure {result.next_attempt_at=result.next_attempt_at.max(now+60);}
     } else if matches!(reply["stage"].as_str(),Some("connecting"|"accepted")){result.state="connecting".into();result.http_ready=false;}
     else if result.state!="connection_failed" {result.state="waiting_for_window".into();result.http_ready=false;}
-    platform::service(ctx).wifi_note_connection(mac,result.clone()).ok()?;Some(result)
+    Some(result)
 }
 fn queue_current_recovery(ctx:&AppCtx,mac:&str,state:&WifiState,target:&Network,now:u64,_physical_window:bool)->Option<bridge_core::platform::wifi::Job> {
     let svc=platform::service(ctx);
@@ -499,7 +508,9 @@ pub async fn automatic_on_link(ctx: &AppCtx,mac:&str,link:&mut bridge_ble::Devic
             return Ok(());
         }
         if reply["connected"]==true || matches!(reply["stage"].as_str(),Some("connecting"|"accepted")){return Ok(());}
-        if matches!(connection.error.as_deref(),Some("authentication_failed"|"security_mismatch")){return Err(connection.error.clone().unwrap());}
+        if let Some(error)=connection.error.as_deref() {
+            if !matches!(error,"window_closed"|"handshake_timeout"|"network_not_found"|"signal_weak"|"association_failed"|"dhcp_timeout"|"connect_timeout"|"disconnected"|"cancelled") {return Err(error.to_owned());}
+        }
         if connection.attempts>=3 {return Err("wifi_retry_exhausted".into());}
         if now<connection.next_attempt_at {return Err("wifi_retry_backoff".into());}
         let fresh=current_host(ctx).await;
@@ -802,6 +813,19 @@ pub async fn recover_on_link_budget(ctx: &AppCtx, mac: &str, link: &mut bridge_b
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn window_closed_updates_connecting_state_and_keeps_retry_backoff() {
+        let target:Network=serde_json::from_value(json!({"network_id":"home","host_ssid":"Host","ssid":"Device","version":1})).unwrap();
+        let mut state=WifiState::default();state.targets.push(target.clone());
+        let mut initial=fresh_connection(&state,&target,100);initial.version=1;initial.state="connecting".into();initial.attempts=1;state.connection=Some(initial);
+        let mut reply=json!({"ok":true,"network_id":"home","version":1,"matches":true,"connected":false,"stage":"failed","error":"window_closed"});
+        let failed=project_match(&state,&target,&reply,120).unwrap();
+        assert_eq!(failed.state,"connection_failed");assert_eq!(failed.error.as_deref(),Some("window_closed"));assert_eq!(failed.next_attempt_at,180);assert!(!failed.http_ready);
+        state.connection=Some(failed);
+        let again=project_match(&state,&target,&reply,150).unwrap();assert_eq!(again.next_attempt_at,180);assert_eq!(again.attempts,1);
+        reply["error"]=json!("future_device_error");assert_eq!(project_match(&state,&target,&reply,150).unwrap().error.as_deref(),Some("future_device_error"));
+        reply["error"]=json!("bad error text");assert_eq!(project_match(&state,&target,&reply,150).unwrap().error.as_deref(),Some("invalid_device_error"));
+    }
     #[test]
     fn retry_exhaustion_preserves_actionable_failures_and_unknown_results() {
         let mut c:Connection=serde_json::from_value(json!({"host_ssid":"Host","network_id":"home","local_revision":1,"version":8,

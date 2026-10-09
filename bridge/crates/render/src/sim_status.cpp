@@ -14,6 +14,14 @@ int sim_status_page(void *p, const char *body, const char *token, const char *id
     memcpy(out, reply.c_str(), reply.length()); out[reply.length()] = 0; return reply.length();
 }
 int sim_network_display_test() {
+    const uint32_t contact = 1700000000;
+    if (bridgeOfflineMinutes(contact+60,contact,true,6,0) != -1) return 8;
+    if (bridgeOfflineMinutes(contact+420,contact,true,6,-1) != 7) return 9;
+    if (bridgeOfflineMinutes(contact,0,false,6,0) != 0) return 10;
+    NetworkDisplayState bridge;
+    bridge.observe(false,7); bridge.rendered(true,0);
+    bridge.observe(false,-1); if (!bridge.due(0)) return 11;
+    bridge.rendered(true,0); bridge.observe(false,-1); if (bridge.due(0)) return 12;
     NetworkDisplayState glyph; glyph.observe(false); if (!glyph.due(0)) return 1;
     glyph.rendered(true,0); if (glyph.due(0)) return 2;
     glyph.observe(true); if (!glyph.due(0)) return 3;

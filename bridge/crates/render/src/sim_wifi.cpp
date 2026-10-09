@@ -30,10 +30,10 @@ extern "C" int codex_sim_wifi_command(const char *input, const char *peer, uint3
     memcpy(out, reply.c_str(), reply.length() + 1); return reply.length();
 }
 extern "C" int codex_sim_wifi_poll(uint64_t now, const char *peer, uint32_t generation,
-    int encrypted, int outcome) {
+    int encrypted, int outcome, int startAllowed) {
     if (running && outcome == 1) { WiFi.connected = WL_CONNECTED; WiFi.ipReady = true; }
     else if (running && outcome == 2) { WiFi.connected = WL_CONNECTED; WiFi.ipReady = false; }
-    wifiSetupPoll(now, peer, generation, encrypted != 0);
+    wifiSetupPoll(now, peer, generation, encrypted != 0, startAllowed != 0);
     return running ? 1 : 0;
 }
 extern "C" void codex_sim_wifi_storage_failure(int fail) { testNvsFail = fail != 0; }

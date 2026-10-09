@@ -185,7 +185,7 @@ fn update_device_owner_cache(cache: &mut HashMap<String, CachedDeviceStatus>, ma
 fn device_cycle_targets(
     devices: &[Value],
     cache: &HashMap<String, CachedDeviceStatus>,
-    now: i64,
+    probe: bool,
 ) -> Vec<String> {
     devices
         .iter()
@@ -197,10 +197,9 @@ fn device_cycle_targets(
             if endpoint.is_empty() || endpoint == "0.0.0.0" {
                 return None;
             }
-            let status = cache.get(&mac)?;
-            let now = scheduled_now(&mac, now);
-            (status.online && device_status_fresh(&mac, status, now, 30))
-                .then_some(mac)
+            // Freshness gates claim/data, not the refresh that restores it.
+            // Otherwise one slow cycle permanently removes an online device.
+            (probe || cache.get(&mac).is_some_and(|status| status.online)).then_some(mac)
         })
         .collect()
 }
@@ -3402,7 +3401,7 @@ async fn run_services(ctx: Arc<AppCtx>) {
                 let devices = automatic_devices(&ctx);
                 let targets = {
                     let cache = ctx.device_status_cache.lock().unwrap();
-                    device_cycle_targets(&devices, &cache, now_secs())
+                    device_cycle_targets(&devices, &cache, tick % 6 == 0)
                 };
                 for target_mac in targets {
                     if platform::device_link_for_mac(&ctx, &target_mac).is_none() {
@@ -3411,10 +3410,16 @@ async fn run_services(ctx: Arc<AppCtx>) {
                     if ctx.status.lock().unwrap().paused {
                         break;
                     }
+                    let refresh = tick % 3 == 0 || {
+                        let cache = ctx.device_status_cache.lock().unwrap();
+                        cache.get(&target_mac).is_none_or(|status|
+                            !device_status_fresh(&target_mac, status,
+                                scheduled_now(&target_mac, now_secs()), 30))
+                    };
                     platform::cycle(
                         &ctx,
                         &target_mac,
-                        tick % 3 == 0,
+                        refresh,
                         auto_deliver && tick % 6 == 0,
                     )
                     .await;
@@ -4163,9 +4168,15 @@ mod device_status_cache_tests {
         );
 
         assert_eq!(
-            device_cycle_targets(&devices, &cache, 100),
-            vec!["AABBCCDDEE01"]
+            device_cycle_targets(&devices, &cache, false),
+            vec!["AABBCCDDEE01", "AABBCCDDEE02"]
         );
+        update_device_status_cache(&mut cache, mac_b, false, None, 101);
+        assert_eq!(device_cycle_targets(&devices, &cache, false), vec!["AABBCCDDEE01"]);
+        assert_eq!(device_cycle_targets(&devices, &cache, true),
+            vec!["AABBCCDDEE01", "AABBCCDDEE02"]);
+        assert_eq!(device_cycle_targets(&devices, &HashMap::new(), true),
+            vec!["AABBCCDDEE01", "AABBCCDDEE02"]);
     }
 
     #[test]

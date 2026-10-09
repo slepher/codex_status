@@ -13,6 +13,7 @@
 #include "ble_wire.h"
 #include "v2_status_snapshot.h"
 #include "display_result.h"
+#include "network_display_state.h"
 #include "v2_sync.h"
 #include "v2_sync_store.h"
 #include "bundle_store.h"
@@ -102,6 +103,9 @@ struct SimBundleDevice {
     const char *refreshKind = "none";
     long long wallEpochSecs = 0;
     bool hasWallEpoch = false;
+    bool deep = false, wifiUp = true;
+    uint32_t lastBridgeContact = 0;
+    int bridgeOffline = -1;
 };
 
 const char *simRender(SimBundleDevice &device) {
@@ -114,8 +118,10 @@ const char *simRender(SimBundleDevice &device) {
     env.channel = "PULL";
     env.syncHHMM = "--:--";
     env.battery = 75;
-    env.state = "WIFI ON";
-    env.mode = "light";
+    env.state = device.deep ? "DEEP" : (device.wifiUp ? "WIFI ON" : "WIFI OFF");
+    env.mode = device.deep ? "deep" : "light";
+    env.offlineMins = bridgeOfflineMinutes((uint32_t)device.wallEpochSecs,
+        device.lastBridgeContact, device.hasWallEpoch, 6, -1);
     env.hasNowEpoch = device.hasWallEpoch;
     env.nowEpochSecs = device.wallEpochSecs;
     if (!tplDrawCt(device.compiled, device.usage.length() ? device.usage : String("{}"), env)) {
@@ -128,6 +134,7 @@ const char *simRender(SimBundleDevice &device) {
     RfnDecision decision = rgnDecide(device.regions, previous, device.candidate.data(),
                                      device.frameTrusted, false, false);
     if (decision.action == RFN_NONE) {
+        device.bridgeOffline = env.offlineMins;
         device.displayState = 1;
         device.refreshKind = "none";
         return "unchanged";
@@ -143,6 +150,7 @@ const char *simRender(SimBundleDevice &device) {
     else rgnOnFull(device.regions);
     device.frame = device.candidate;
     device.frameTrusted = true;
+    device.bridgeOffline = env.offlineMins;
     device.refreshKind = rfnActionName(decision.action);
     device.displayWrites++;
     device.displayState = 1;
@@ -327,6 +335,9 @@ int codex_sim_bundle_status(void *p, char *out, int cap) {
     doc["commit_seq"] = bsCommitSeq();
     doc["applied_seq"] = device.dataSeq.appliedSeq();
     doc["data_crc"] = device.dataSeq.appliedCrc();
+    doc["bridge_contact_epoch"] = device.lastBridgeContact;
+    doc["display_wall_epoch"] = device.wallEpochSecs;
+    doc["bridge_offline_mins"] = device.bridgeOffline;
     doc["display_state_code"] = device.displayState;
     doc["frame_crc"] = device.frame.empty() ? 0 : v2Crc32(device.frame.data(), device.frame.size());
     doc["candidate_crc"] = device.candidate.empty() ? 0 :
@@ -517,6 +528,8 @@ int codex_sim_data(void *p, const char *message, char *out, int cap) {
         device.compiledValid ? &device.compiled : nullptr, String(message), seq,
         device.profile.contextId, device.dataSeq);
     const char *display = decision.display ? decision.display : "unchanged";
+    if (!strcmp(decision.result, "applied"))
+        device.lastBridgeContact = (uint32_t)device.wallEpochSecs;
     if (decision.firstApplied) {
         device.usage = decision.usage;
         V2DataCheckpoint checkpoint{};
@@ -532,6 +545,23 @@ int codex_sim_data(void *p, const char *message, char *out, int cap) {
         decision.error.length() ? decision.error.c_str() : nullptr, decision.seq, 0,
         decision.includeContext ? device.profile.contextId : nullptr,
         UINT32_MAX, device.firmwareTarget.c_str(), decision.includeContext), out, cap);
+}
+
+// Host power/RF facts feed the same freshness rule and compiled renderer as ROM.
+int codex_sim_bundle_display(void *p, int deep, int wifi_up, int contact) {
+    if (!p) return 0;
+    auto &device = *(SimBundleDevice *)p;
+    if (contact) device.lastBridgeContact = (uint32_t)device.wallEpochSecs;
+    if (deep < 0) deep = device.deep;
+    if (wifi_up < 0) wifi_up = device.wifiUp;
+    const int offline = bridgeOfflineMinutes((uint32_t)device.wallEpochSecs,
+        device.lastBridgeContact, device.hasWallEpoch, 6, -1);
+    const uint8_t sleepGlyph = (device.frameTrusted ? 4 : 0) | (device.bridgeOffline >= 0 ? 8 : 0);
+    const bool changed = device.deep != bool(deep) || device.wifiUp != bool(wifi_up)
+        || (deep ? sleepFrameNeedsRefresh(sleepGlyph, offline) : device.bridgeOffline != offline);
+    device.deep = deep; device.wifiUp = wifi_up;
+    if (changed && device.compiledValid) simRender(device);
+    return 1;
 }
 
 int codex_sim_activate(void *p, const char *message, uint64_t now_ms,

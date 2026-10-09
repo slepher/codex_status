@@ -909,9 +909,16 @@ fn rotate_session(state: &SimState) -> Result<SimSession> {
 
 fn reboot_device(state: &SimState, cause: &str) -> Result<SimSession> {
     *state.ready_report.lock().unwrap() = None;
+    // Deep/button wakes retain the ROM's last-contact RTC fact. Resetting it
+    // here would make every no-Data Sleep rendezvous forget Bridge freshness.
+    let contact = if matches!(cause,"deep"|"button") {
+        state.bundle.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .status()?["bridge_contact_epoch"].as_i64().unwrap_or(0)
+    } else {0};
     let session = rotate_session(state)?;
-    let bundle = bridge_render::SimulatorBundle::new(&state.data_dir, &state.target,
+    let mut bundle = bridge_render::SimulatorBundle::new(&state.data_dir, &state.target,
         session.boot_id, cause)?;
+    if contact > 0 {bundle.set_wall_secs(contact)?;bundle.note_bridge_contact()?;}
     *state.bundle.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = bundle;
     let sync = bridge_render::SimulatorSync::new(&state.data_dir, &state.mac,
         &state.target, state.seed, session.boot_id, cause)?;
@@ -1532,8 +1539,17 @@ async fn sim_state(State(state): State<SimState>, request: Request<Body>) -> Res
 async fn sim_frame(State(state): State<SimState>, request: Request<Body>) -> Response {
     if !bearer(&request, &state.control_token) { return unauthorized(); }
     if let Err(response) = consume_body(request).await { return response; }
-    match state.bundle.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-        .frame_bits() {
+    let Some(clock) = clock_snapshot(&state) else { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); };
+    let Ok(power) = reconcile_power(&state, clock.monotonic_ms) else { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); };
+    let wifi_up = {
+        let wifi = state.wifi.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if wifi.unified { wifi.engine.observe().is_ok_and(|s| s["connected"] == true) }
+        else { power.light }
+    };
+    let mut bundle = state.bundle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if bundle.set_wall_secs((clock.wall_ms / 1000) as i64).is_err() { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); }
+    if bundle.display_state(!power.light, wifi_up, false).is_err() { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); }
+    match bundle.frame_bits() {
         Ok(bits) if !bits.is_empty() =>
             ([(header::CONTENT_TYPE, "application/octet-stream")], bits).into_response(),
         Ok(_) => StatusCode::NOT_FOUND.into_response(),
@@ -2332,6 +2348,13 @@ async fn plan_impl(state: SimState, request: Request<Body>, gate: bool) -> Respo
     ) {
         Ok(mut ack) => {
             if ack["result"] == "applied" {
+                let mut bundle = state.bundle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if bundle.set_wall_secs((clock.wall_ms / 1000) as i64).is_err()
+                    || bundle.note_bridge_contact().is_err() {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"result":"unknown",
+                        "error":"display_contact","stage":"plan_applied"}))).into_response();
+                }
+                drop(bundle);
                 let _ = reconcile_power(&state, clock.monotonic_ms);
                 if let Some(data) = serde_json::from_str::<Value>(message).ok()
                     .and_then(|payload| payload.get("data").cloned()) {
@@ -2894,8 +2917,11 @@ async fn sim_ble_command(State(state): State<SimState>, request: Request<Body>) 
         .body(Body::from(payload.to_vec())).unwrap();
     let response = sim_ble_business(State(state.clone()), request).await;
     // A business refusal is a device ACK too, not an HTTP upload failure.
-    let Ok(bytes) = to_bytes(response.into_body(), BODY_LIMIT).await else { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); };
-    let Ok(mut ack) = serde_json::from_slice::<Value>(&bytes) else { return Json(json!({"result":"accepted"})).into_response(); };
+    let business_status = response.status();
+    let Ok(business_bytes) = to_bytes(response.into_body(), BODY_LIMIT).await else { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); };
+    let mut ack = serde_json::from_slice::<Value>(&business_bytes).unwrap_or_else(|_| json!({
+        "op":op,"result":"rejected","error":"invalid_request","stage":"request_validation",
+        "http_status":business_status.as_u16()}));
     if op=="plan" && ack["result"]=="applied" {
         let (mode,granted,accepted_at)={
             let plan=state.plan.lock().unwrap();
@@ -2909,13 +2935,17 @@ async fn sim_ble_command(State(state): State<SimState>, request: Request<Body>) 
         rv.plan_received();
         rv.await_network(clock.monotonic_ms,legal_until);
     }
-    ack["request_id"] = message["request_id"].clone();
+    ack["request_id"] = message["request_id"].as_str().filter(|id| !id.is_empty())
+        .map(|id| json!(id)).unwrap_or_else(|| json!(format!("frame-{:016x}",frame.request_no)));
     ack["wake_generation"] = json!(session_snapshot(&state).boot_id);
     ack["wake_seq"] = json!(state.power.lock().unwrap().wake_count);
     let now = clock_snapshot(&state).unwrap().monotonic_ms;
-    let _ = ble_frame_reply(&state,frame,
+    if ble_frame_reply(&state,frame,
         if matches!(op,"status"|"plan"|"data"|"sync_config"|"sync_open") {op} else {"command"},
-        &ack,&bytes,now);
+        &ack,&bytes,now).is_err() {
+        return (StatusCode::INTERNAL_SERVER_ERROR,Json(json!({"result":"unknown",
+            "error":"ack_encoding","stage":"business_complete"}))).into_response();
+    }
     Json(json!({"result":"accepted"})).into_response()
 }
 

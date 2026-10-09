@@ -4047,7 +4047,7 @@ mod ble_close_lock_tests {
         let address=format!("{ip}:80");
         let mut child=std::process::Command::new(exe).args(["--listen",&address,"--mac",MAC,"--data-dir"])
             .arg(sim_dir.path()).env("CODEX_STATUS_SIM_ENDPOINT_TOKEN",TOKEN)
-            .env("CODEX_STATUS_SIM_DEVICE_TOKEN","synthetic-device-token")
+            .env("CODEX_STATUS_SIM_DEVICE_TOKEN","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
             .env("CODEX_STATUS_SIM_CONTROL_TOKEN","synthetic-control-token")
             .env("CODEX_STATUS_SIM_WIFI_PROTOCOL","3").env("CODEX_STATUS_SIM_WIFI_PRINCIPAL","bridge-lock-repro")
             .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::inherit()).spawn().unwrap();
@@ -4056,7 +4056,7 @@ mod ble_close_lock_tests {
         let client=reqwest::Client::builder().no_proxy().build().unwrap();
         assert!(client.post(format!("{url}/sim/power")).bearer_auth("synthetic-control-token").json(&json!({"plugged":true})).send().await.unwrap().status().is_success());
         let endpoint=address.clone();
-        let (code,_)=tokio::task::spawn_blocking(move||bridge_core::device_client::claim(&endpoint,TOKEN,"synthetic-device-token",
+        let (code,_)=tokio::task::spawn_blocking(move||bridge_core::device_client::claim(&endpoint,TOKEN,"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &json!({"id":"bridge-lock-repro","lease":"300"}),Duration::from_secs(3)).unwrap()).await.unwrap();assert_eq!(code,200);
         let listener=tokio::net::TcpListener::bind((ip,0)).await.unwrap();
         let mut ctx=test_ctx_with_ip(dir.path(),MAC,&ip.to_string());ctx.config.port=listener.local_addr().unwrap().port();let ctx=Arc::new(ctx);
@@ -4102,6 +4102,36 @@ mod ble_close_lock_tests {
         let after:Value=client.post(format!("{url}/sim/wifi")).bearer_auth("synthetic-control-token").json(&json!({"outcome":1})).send().await.unwrap().json().await.unwrap();
         assert_eq!(after["radio"]["begins"],begins,"completed HTTP work must not authorize a later activation");
         assert!(!service(&ctx).wifi_state(MAC).jobs.iter().any(|j|j.kind=="activate"));
+        // An authenticated online cache can expire during slow onboarding or
+        // OTA. Exercise the production scheduler -> HTTP -> shared ROM path,
+        // including a second source change without an explicit push action.
+        let source:Value=serde_json::from_str(include_str!("../../../../tools/test-bridge/templates/quad.json")).unwrap();
+        bridge_mcp::save_device_token(&crate::mcp_config(&ctx),MAC,"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let svc=service(&ctx);let now=device_now(MAC);
+        svc.template_save("quad",bridge_core::platform::model::RENDER_TARGET_154G,&source,now).unwrap();
+        let mut profile=bridge_core::platform::model::Profile::draft(MAC);
+        profile.template_ids=vec!["quad".into()];profile.initial_active_id=Some("quad".into());profile.sync_enabled=true;
+        svc.profile_save(profile,now).unwrap();svc.publish(MAC,now).unwrap();
+        assert_eq!(deliver(&ctx,MAC).await["ack"]["result"],"applied");
+        assert_eq!(refresh_status(&ctx,MAC).await["result"],"ok");
+        let mut previous_seq=0;
+        for used in [30,35] {
+            note_envelope(&ctx,&json!({"schema":1,"server_time":device_now(MAC),"account":{"plan":"plus"},
+                "buckets":[{"id":"codex","windows":[{"kind":"weekly","usedPercent":used,"resetsAt":2000000000,"windowMins":10080}]}]}));
+            {
+                let mut cache=ctx.device_status_cache.lock().unwrap();let stale=cache.get_mut(MAC).unwrap();
+                stale.fetched_at-=31;stale.fetched_mono_ms=None;
+                assert!(!crate::device_status_fresh(MAC,stale,crate::scheduled_now(MAC,crate::now_secs()),30));
+                assert_eq!(crate::device_cycle_targets(&svc.devices(),&cache,false),vec![MAC]);
+            }
+            cycle(&ctx,MAC,true,true).await;
+            let read=refresh_status(&ctx,MAC).await;assert_eq!(read["result"],"ok");
+            let seq=read["status"]["applied_seq"].as_u64().unwrap();assert!(seq>previous_seq,"{read}");previous_seq=seq;
+            let summary=svc.coordinator_summary(MAC,device_now(MAC)).unwrap();
+            assert!(summary["in_flight"].is_null());assert_eq!(summary["context"]["last_applied_seq"],seq);
+            assert_eq!(summary["context"]["acked_push"],true);
+            assert_eq!(summary["acked_push_fp"],summary["push_fp"]);
+        }
         server.abort();
     }
 

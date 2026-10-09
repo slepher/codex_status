@@ -13,7 +13,7 @@ void wifiSetupConnectionStarted(const String &ssid = String());
 String wifiSetupCommand(JsonDocument &doc, const String &peer, uint32_t generation,
                         uint64_t now, uint64_t physicalUntil, uint64_t lightUntil,
                         bool selectAllowed, bool unified=false);
-void wifiSetupPoll(uint64_t now, const String &peer, uint32_t generation, bool encrypted);
+void wifiSetupPoll(uint64_t now, const String &peer, uint32_t generation, bool encrypted, bool startAllowed = true);
 void wifiSetupAbort(const char *reason);
 void wifiSetupRadioClosed(const char *reason);
 String wifiSetupSelectingBridge();

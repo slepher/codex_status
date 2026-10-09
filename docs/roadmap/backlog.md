@@ -111,8 +111,17 @@
 
 ### A9. PowerPlan 与 Data 同轮联合下发（2026-10-05）
 
+- **17:33 自动数据投递修复已部署Bridge**：30秒过期状态不能阻断自身刷新；登记IP每分钟有界恢复探测、认证/owner投递闸门保留。实机源used24→余76，自动seq377 applied/displayed且直接认证双序号377，确认指纹匹配最新源。Fake真实HTTP连续两次源变化/过期缓存恢复通过；ROM保持.74，实体多周期矩阵仍待验。
+
+- **2026-10-09 16:30 重新打开手动激活/显示验收**：.73 实机仍报告 Sleep 无 Bridge；16:17 激活的设备最终回执为 `window_closed`。代码发现深睡无新 Data 仅刷新时钟而跳过联系恢复图标、EPD失败仍更新睡眠/失联标记，以及物理 BLE hold 与激活完成轮询互相等待的路径（现场 hold 条件待核对）。已有 Fake 按状态重绘全帧未覆盖真实会合调度；需补上述调度和显示失败回归，不能以 .73 部署宣称本场景完成。现场及下一步见[专项](../../project-workflow/bridge-macos/wifi-idle-activate-20261008-plan.md)。
+- **16:39 USB/恢复补证**：COM5/MAC匹配，实机串口 .73确实WIFI OFF；busy_fails23是RTC累计，局刷回退且trusted1，不据此断言全屏损坏。Bridge note_match遗漏合法window_closed错误并return None，导致失败后不更新Connection/不恢复，16:39仍保留16:17 connecting；多轮network_start而无新activate已见日志。需追加错误投影及有界恢复回归，ca最初超时触发条件仍待验证。
+- **17:08 .74修复已部署**：BLE hold仅限制新关联、不阻塞激活完成；健康同配置激活不先断网，Bridge有界错误投影/恢复、Sleep无Data联系标记重画和确认帧失败处理已实施。Fake补深睡RTC联系保留/新session BLE恢复/失败像素重试，最终62/62、app/shared render通过；Note4认证.74/ota_0与完整ROM hash一致，原home配置已真实恢复，OTA原job1172f92d单次上传image_verified。初始ca物理hold触发条件、实体Sleep目视及长期RF/功耗/EPD矩阵仍不因此结案。证据与资源见专项最新收尾及PROGRESS。
+- **2026-10-09 .73追加部署**：自动短读/闲置联系复用仍有效的已ACK Light原ID，保留绝对期限；显式hold按剩余时间而非每轮600秒，显式Sleep仍可提前结束。Bridge图标按跨BLE/HTTP有效联系独立计算和重画；会合Light→深睡走enterDeep持久模式/睡眠全帧，不绕过Zzz。Note4认证运行 .73/ota_1、完整镜像127345E2…DA9450；OTA原事务单次image_verified，排队后约142秒确认，超两分钟继续核验，未重传。共享回归与Fake场景/剩余实体边界见专项及PROGRESS；书桌屏不升级。以下待修描述为定位时点，相关三个实现问题已由本段关闭。
+
+- **14:06数据后Light期限被提前覆盖（已修复，.73部署）**：Data369+Plan2963 ACK600 s，本应至约14:16；后续2964/2965改120 s，2966在14:10:58发Sleep。coordinator普通note_plan_ack只更新accepted记录，仅pending_explicit_light确认会hold_light；note_ack成功清push_dirty后service重新按工作选择120/Sleep，未保护自动数据授予的原期限。修正须区分数据驻留、临时读网及显式提前睡眠，冻结/保留实际确认期限；短任务结束/重试/下一次空闲会合不缩短也不无限续租，重启/读回恢复同一窗口。配置/caps当前600 s；14:10用户所见数值变化的精确时点仍以日志为准，本轮已确证14:05源变化→14:06投递及提前覆盖，未改生产计划。
 - **2026-10-09新实机缺陷已修复并仅Note4部署 .72**：完整Status4048 B以上冻结有界分页，不裁剪合同；业务错误识别、整体HTTP期限（含session锁）及独立Bridge错误状态已落地。会合成功清除连接动画，Wi-Fi变化独立重绘并有界全刷重试。Fake大Status→同源C++→生产客户端闭环及总预算拒绝、最终bootstrap58/58、app75/core132/HTTP7及显式3项联测通过；实机完整Status、Wi-Fi connected/HTTP ready、运行完整镜像SHA与发布ROM一致，原b0事务正常completed。剩余：多周期实体RF/电池/掉电/动态堆峰值和显示故障矩阵；可信驱动基线不替代屏幕目视。macOS原生UI需在有Swift/WKWebView的主机验收。本次现场/资源/哈希见PROGRESS顶节，不因此结A9/B6。
 - 2026-10-09用户明确Wi-Fi/Bridge状态独立：驱动关联/IP/实际关网决定Wi-Fi事实；Bridge认证、协议、Status超帧及结果未知只改变Bridge层，不能反推Wi-Fi断开或触发无根据的重配/重关联。修正需保留独立电源窗口关网语义，并验证Wi-Fi已连接但Bridge认证/回读失败时Wi-Fi状态与图标不变；当前Bridge连接流程state混入bridge_unreachable需分层处理，固件offlineMins的Bridge失联标记不能当Wi-Fi图标。
+- **14:06–14:12照片/日志复查仍有固件显示语义bug**：BLE联合Data seq369 ACK applied，但`renderActiveUsage`仍以`wifiUp ? -1 : 0`生成Bridge失联字段，模板`exists=true`显示断开及OFF 0M；.72只修网络重绘和Bridge应用模型，未解耦此固件分支。后续应依据跨HTTP/BLE的有效Bridge联系计算失联，不因实际Wi-Fi关网直接设失联，覆盖最近BLE更新+Wi-Fi关闭、真实联系过期、连接中/深睡继承及恢复重画。Wi-Fi图标依据驱动另验，不为消除图标强制常驻Wi-Fi。照片无Zzz不证明light；Sleep Plan2966/2967 ACK且Light剩余0不等于已进入深睡。本轮直连超时、旧认证缓存stale_boot，实时RF/物理睡眠未知，未新增刷机或提交。
 - 图标独立刷新追加缺陷：会合Wi-Fi ready先写wifiUp=true却不重画，后续pollWifi丢失上升沿；无新Data的light会合/深睡无sleep glyph标志路径可能保留WIFI OFF旧帧。须补同源“联网成功+Bridge读回失败/无Data”图标更新回归并修正，不依赖业务同步触发Wi-Fi状态绘制；EPD局刷回退另验。
 
 - 用户已确认：真实push变化时，Bridge发送前冻结电源意图；小数据与PowerPlan同请求，大数据先Plan再经合法HTTP窗口投递。Data ACK成功不立即撤销活跃窗口，丢ACK不阻断Plan下放；重试不续租、不换原事务ID。
@@ -141,10 +150,8 @@
 - **具体动作**：把 `bugs.md` 改成结案记录（写明修复点与证据），或整体归档到 `docs/history/bugs-2026-09-22.md`；不要留着一个看起来"均未修复"的文件误导下一轮。
 - **完成判据**：`bugs.md` 不再声称未修复；修复点有文件行号指向。
 
-### A5. 把 `PROGRESS.md` 从 89 KB 降到可读规模（本项已完成，见 §5）
-- 这项已由本轮动手执行：`PROGRESS.md` 只剩最新现场 + 归档索引，其余进
-  `docs/history/progress-archive-*.md`。以后每次里程碑只往 `PROGRESS.md` 追加**一节**并
-  在超过 ~15 KB 时把旧节下沉到归档。
+### A5. ~~降低 `PROGRESS.md` 的交接读取成本~~ → **已完成（2026-10-09）**
+- 主文件现在是约 2 KB 的当前交接卡；详细进度按日期归档，待办仍只维护在本 backlog。维护规则见 `AGENTS.md`「交接与工作流」。
 
 ### A6. ~~别让族发布把 1.54 的 `sync_enabled=true` 覆盖回 false~~ → **已关闭（2026-09-25 核实）**
 - **原判断（错）**："源码已修但未构建进运行桥"。用产物时间戳复核后证伪：

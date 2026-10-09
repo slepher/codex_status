@@ -663,6 +663,20 @@ impl Coordinator {
         light_s: u32,
         reason: &str,
     ) -> PowerPlan {
+        // Automatic work may extend a window, but a short read or idle contact
+        // must not replace an acknowledged Light plan before its deadline.
+        // Reuse the original ID: sending a new duration would restart the clock.
+        if let Some(last) = &self.plan.last_sent {
+            let remaining = self.plan.last_accepted_remaining_s.saturating_sub(
+                now.saturating_sub(self.plan.last_accepted_at).min(u32::MAX as u64) as u32);
+            if matches!(reason, "rendezvous" | "boot")
+                && last.mode == PlanMode::Light && last.plan_id == self.plan.last_accepted_id
+                && last.plan_id >= self.device_plan_high && remaining > 0
+                && (!want_light || light_s <= remaining)
+            {
+                return last.clone();
+            }
+        }
         let light_s = light_s.clamp(
             MIN_LIGHT_S,
             MAX_LIGHT_S.min(self.caps.max_light_s),
@@ -1268,6 +1282,22 @@ mod tests {
         assert_ne!(b, a2);
         assert!(!c.accepts_context(&a1));
         assert!(c.accepts_context(&a2));
+    }
+
+    #[test]
+    fn acknowledged_data_light_survives_short_reads_idle_and_restore_without_renewal() {
+        let mut c = coord();
+        let p = c.plan_for(1000, true, 600, "rendezvous");
+        c.note_plan_ack(p.plan_id, 600, false, 1000);
+        assert_eq!(c.plan_for(1100, true, 120, "rendezvous").plan_id, p.plan_id);
+        assert_eq!(c.plan_for(1300, false, 0, "rendezvous").plan_id, p.plan_id);
+        c.plan = serde_json::from_value(serde_json::to_value(&c.plan).unwrap()).unwrap();
+        c.note_plan_ack(p.plan_id, 600, false, 1500);
+        assert_eq!(c.plan.last_accepted_remaining_s, 100);
+        assert_eq!(c.plan_for(1599, false, 0, "rendezvous").plan_id, p.plan_id);
+        let sleep = c.plan_for(1600, false, 0, "rendezvous");
+        assert_eq!(sleep.mode, PlanMode::Sleep);
+        assert!(sleep.plan_id > p.plan_id);
     }
 
     #[test]

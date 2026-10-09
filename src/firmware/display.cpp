@@ -856,6 +856,12 @@ static void renderUsage(const String &json, const char *channel) {
                   wk.used, fh.used, channel ? channel : "");
 }
 
+static int currentBridgeOfflineMinutes() {
+    return bridgeOfflineMinutes((uint32_t)time(nullptr), radio::retained.rtcLastSyncEpoch,
+                                clock::timeKnown(), BRIDGE_LOST_MIN,
+                                (diagnostics::retained.rtcDeepGlyph & 8) ? 0 : -1);
+}
+
 void renderActiveUsage(const String &json, const char *channel) {
     if (!state.frame) return;
     bool ready = platform::state.v2BundleReady ? platform::v2ActiveLoad() : platform::tplCacheLoad();
@@ -867,27 +873,18 @@ void renderActiveUsage(const String &json, const char *channel) {
     env.battery  = power::batteryPercent();
     env.state    = (power::retained.rtcMode == MODE_DEEP) ? "DEEP" : radio::templateStateText();
     env.mode     = (power::retained.rtcMode == MODE_DEEP) ? "deep" : "light";
-    // A wake has no Wi-Fi verdict yet. Keep the Bridge glyph from the sleep
-    // frame until the connection attempt finishes; deep clock wakes also keep it.
-    if (radio::state.wifiConnActive || (power::retained.rtcMode == MODE_DEEP && !radio::state.wifiUp && !radio::state.wifiLostHandled)) {
-        env.offlineMins = (diagnostics::retained.rtcDeepGlyph & 8) ? 0 : -1;
-    } else {
-        env.offlineMins = radio::state.wifiUp ? -1 : 0;
-        if (radio::state.wifiUp && radio::retained.rtcLastSyncEpoch > 1600000000 && clock::timeKnown()) {
-            long mins = ((long)time(nullptr) - (long)radio::retained.rtcLastSyncEpoch) / 60;
-            // The row means "bridge unreachable": the bridge pushes at least every
-            // 5 minutes, so only expose the value once contact is clearly lost.
-            if (mins > BRIDGE_LOST_MIN) env.offlineMins = (int)mins;
-        }
-        if (env.offlineMins >= 0) diagnostics::retained.rtcDeepGlyph |= 8;
-        else diagnostics::retained.rtcDeepGlyph &= ~8;
-    }
+    env.offlineMins = currentBridgeOfflineMinutes();
     Paint_SelectImage(state.frame);
     Paint_Clear(WHITE);
     bool drawn = platform::state.v2CtValid ? tplDrawCt(platform::state.v2Ct, json, env)
                            : tplDraw(platform::state.activeTplJson, json, env);
     if (drawn) {
         epdFlush(false);
+        if (state.epdBaselineTrusted && state.lastDisplayedFrame &&
+            memcmp(state.lastDisplayedFrame, state.frame, EPD_FB_BYTES) == 0) {
+            if (env.offlineMins >= 0) diagnostics::retained.rtcDeepGlyph |= 8;
+            else diagnostics::retained.rtcDeepGlyph &= ~8;
+        }
         if (state.epdBaselineTrusted) clkCaptureFromFramebuffer();
         else retained.clkPixelsValid = false;
         DevLog.printf("[tpl] rendered %s (%s)\n", platform::state.activeTplId.c_str(), channel ? channel : "");
@@ -901,14 +898,14 @@ void renderActiveUsage(const String &json, const char *channel) {
 void renderCurrent() {
     if (platform::state.lastUsage.length()) renderActiveUsage(platform::state.lastUsage, platform::state.lastChannel.c_str());
     else screenStatus();
-    state.networkGlyph.observe(radio::state.wifiUp);
+    state.networkGlyph.observe(radio::state.wifiUp, currentBridgeOfflineMinutes());
     const bool confirmed = state.epdBaselineTrusted && state.lastDisplayedFrame && state.frame &&
         memcmp(state.lastDisplayedFrame, state.frame, EPD_FB_BYTES) == 0;
     state.networkGlyph.rendered(confirmed, clock::v2NowMs());
 }
 
 void serviceNetworkGlyph() {
-    state.networkGlyph.observe(radio::state.wifiUp);
+    state.networkGlyph.observe(radio::state.wifiUp, currentBridgeOfflineMinutes());
     if (!state.networkGlyph.due(clock::v2NowMs()) || radio::state.wifiConnActive || transport::state.otaInProgress) return;
     if (state.networkGlyph.attempts) state.forceCleanRefresh = true;
     renderCurrent();
@@ -984,6 +981,15 @@ void v2RendezvousRender(bool light) {
     if (light) {
         // The clock rides in the light first frame (startNormalMode).
         DevLog.println("[platform] rendezvous light plan; clock in the first light frame");
+        return;
+    }
+    // A clock-only write cannot clear a stale Bridge glyph. RTC bits describe
+    // the last confirmed panel frame, including across deep-sleep restarts.
+    if (sleepFrameNeedsRefresh(diagnostics::retained.rtcDeepGlyph, currentBridgeOfflineMinutes())) {
+        state.forceCleanRefresh = true;
+        renderCurrent();
+        if (state.epdBaselineTrusted && !state.networkGlyph.pending)
+            diagnostics::retained.rtcDeepGlyph |= 4;
         return;
     }
     v2RendezvousClockRender();

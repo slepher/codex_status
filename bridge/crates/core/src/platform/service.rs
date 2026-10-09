@@ -2608,8 +2608,7 @@ impl PlatformService {
             .coordinators
             .get(&mac)
             .map(|c| {
-                now < c.plan.light_hold_until
-                    || (contract_known && c.sync_enabled && c.data.push_dirty)
+                (contract_known && c.sync_enabled && c.data.push_dirty)
                     || c.data.in_flight.is_some()
                     || c.pending_activate.is_some()
                     || c.job
@@ -2622,8 +2621,9 @@ impl PlatformService {
         let work_want_light = other_work_want_light || wifi_window_wanted;
         let c = inner.coordinators.get_mut(&mac).context("unknown device")?;
         let manual_remaining = c.manual_remaining(now);
+        let hold_remaining = c.plan.light_hold_until.saturating_sub(now).min(u32::MAX as u64) as u32;
         let want_light =
-            work_want_light || manual_remaining >= crate::coordinator::MIN_LIGHT_S;
+            work_want_light || manual_remaining.max(hold_remaining) >= crate::coordinator::MIN_LIGHT_S;
         let plan = match manual_boot {
             Some(t_boot) => c.boot_plan(
                 now,
@@ -2642,9 +2642,9 @@ impl PlatformService {
                 } else if wifi_window_wanted {
                     crate::coordinator::WIFI_READ_LIGHT_S
                 } else {
-                    manual_remaining
+                    manual_remaining.max(hold_remaining)
                 };
-                c.plan_for(now, want_light, light_s, "rendezvous")
+                c.plan_for(now, want_light, light_s.max(hold_remaining), "rendezvous")
             }
         };
         Self::persist(&inner, &self.state_path())?;
@@ -4134,7 +4134,8 @@ mod tests {
         // physical-wake deadline instead of cutting it to an early sleep.
         let follow = svc.plan_for_rendezvous(mac, now + 60, "rendezvous", 0).unwrap();
         assert_eq!(follow.mode, PlanMode::Light);
-        assert_eq!(follow.light_duration_s, 225);
+        assert_eq!(follow.plan_id, boot.plan_id); // replay keeps the original deadline
+        assert_eq!(follow.light_duration_s, 285);
         // One second past the window the ordinary sleep decision returns.
         let after = svc.plan_for_rendezvous(mac, now + 301, "rendezvous", 0).unwrap();
         assert_eq!(after.mode, PlanMode::Sleep);
