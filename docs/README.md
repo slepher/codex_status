@@ -7,11 +7,12 @@
 
 | 你要做什么 | 依次读 |
 |---|---|
-| 接手项目、想知道现状 | `AGENTS.md`（操作约定）→ `PROGRESS.md`（最新现场与归档入口）→ `docs/roadmap/backlog.md`（唯一待办来源） |
+| 接手项目、想知道现状 | `AGENTS.md`（操作约定）→ `PROGRESS.md`（当前交接卡）→ 按需查 `docs/roadmap/backlog.md` 相关条目（唯一待办来源） |
+| 构建、Bridge 启停/数据路径、模板缺省或串口/dump 操作 | [Agent 操作细则](agent-operations.md) 中对应节；从精简前 AGENTS 原文提取，历史现场不代替当前交接卡 |
 | 决定下一步做什么 | `docs/roadmap/backlog.md` §2 紧急 / §3 暂缓 |
 | 查某个已结项专项做了什么 | `docs/roadmap/archive-digest-legacy.md` / `archive-digest-recent.md` → 需要细节再进 `docs/history/workflow/<name>/` |
 | 查历史里程碑（0.13–0.18 各轮实机修复） | `docs/history/progress-archive-2026-09-23.md`（≤09-22）、`docs/history/progress-archive-2026-09-25.md`（09-24 及合并过程）、[2026-10-03 归档](history/progress-archive-2026-10-03.md)（09-25 至 10-03 较早记录） |
-| 改协议/模板/渲染 | `docs/generic-display-platform-design.md`（权威架构）+ `AGENTS.md` §关键不变量 |
+| 改协议/模板/渲染 | `docs/generic-display-platform-design.md`（权威架构）+ `AGENTS.md` §协议与产品不变量 |
 | 改固件启动/调度或查 main 胶水层后的模块归属 | [固件模块化计划](../project-workflow/firmware-modularization/plan.md) → [边界与验收](../project-workflow/firmware-modularization/review.md)；代码在 `src/firmware/` |
 | 查 Bridge—设备协议分层、HTTP/BLE 映射与当前差异 | [bridge-device-protocol.md](bridge-device-protocol.md)（2026-10-08 按源码核对；先业务合同，后载体绑定） |
 | 查 HTTP 直达、BLE 交汇及先 ready 后关闭 BLE 的应有行为 | [bridge-device-communication-scenarios.md](bridge-device-communication-scenarios.md)（场景合同）→ [bridge-device-communication-implementation.md](bridge-device-communication-implementation.md)（源码证据与验收边界） |
@@ -52,7 +53,8 @@
 
 | 位置 | 内容 |
 |---|---|
-| [docs/history/progress-archive-2026-10-03.md](history/progress-archive-2026-10-03.md) | 2026-09-25 至 2026-10-03 较早的 68 节；正文完整保留，当前部署记录留在 PROGRESS.md |
+| [docs/history/progress-archive-2026-10-09.md](history/progress-archive-2026-10-09.md) | 截至 2026-10-09 的详细进度原文；当前现场仅看 `PROGRESS.md` |
+| [docs/history/progress-archive-2026-10-03.md](history/progress-archive-2026-10-03.md) | 2026-09-25 至 2026-10-03 较早的 68 节；正文完整保留 |
 | `docs/history/progress-archive-2026-09-23.md` | 2026-09-22 及更早的进度节（48 节） |
 | `docs/history/progress-archive-2026-09-25.md` | 2026-09-24 及更早的历史节 + 合并/包隔离过程细节（原 `PROGRESS.md` 111 行起，逐字节保留） |
 | `docs/history/generic-display-platform-design-v1.md` | 早期架构，已被现行设计取代，仅留决策史 |
@@ -104,7 +106,7 @@ Fake ROM D/E/F 已结项并归档；下表只列仍需推进的专项。
 
 ## 维护约定
 
-- `PROGRESS.md` 只保留**最新现场**；每次里程碑追加一节，超过约 15 KB 就把最旧的节下沉到新的 `docs/history/progress-archive-<date>.md`。
+- `PROGRESS.md` 是不超过约 2 KB 的当前交接卡，不追加过程日志；每个里程碑更新卡片，详细记录按日期归档到 `docs/history/progress-archive-<date>.md`。
 - 待办只写在 `docs/roadmap/backlog.md`；不要在 `PROGRESS.md`、`AGENTS.md` 或 `status.md` 里另开一份待办清单。
 - 专项完成后：把结论与证据搬进 `PROGRESS.md`，从 backlog 删除该条，专项目录按上面的判据归档。
 
