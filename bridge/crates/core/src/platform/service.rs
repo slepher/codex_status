@@ -274,7 +274,11 @@ impl PlatformService {
             // Old Rust render-plan records migrate from their retained source.
             // Saving the migration never publishes a bundle.
             if crate::compile::validate(&t.compiled).is_err() {
-                t.compiled = crate::compile::compile(&t.source, &t.key.render_target)?;
+                match crate::compile::compile(&t.source, &t.key.render_target) {
+                    Ok(compiled) => t.compiled = compiled,
+                    Err(error) => tracing::warn!(template = %t.key.template_id, %error,
+                        "stored template is unsupported; retain for editing, reject publication"),
+                }
             }
             templates.insert(t.key.clone(), t);
         }
@@ -1241,6 +1245,11 @@ impl PlatformService {
                     )
                 })?
                 .clone();
+            crate::template::validate_template(&template.source)
+                .map_err(anyhow::Error::msg)
+                .with_context(|| format!("template {id} is unsupported; edit and save before publishing"))?;
+            crate::compile::validate(&template.compiled)
+                .with_context(|| format!("template {id} compiled content is invalid; save before publishing"))?;
             if template.source["elements"].as_array().is_some_and(|elements|
                 elements.iter().any(|element| element.get("digit_x").is_some())) {
                 let required = template.compiled.min_fw.as_deref()
@@ -4106,6 +4115,31 @@ mod tests {
             .clone();
         assert_eq!(bundle.profile.template_ids.len(), 8);
         assert_eq!(bundle.templates.len(), 8);
+    }
+
+    #[test]
+    fn unsupported_stored_template_keeps_bridge_available_and_blocks_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = service_with_device(dir.path());
+        svc.template_save("quad", "epd-ssd1681-200x200-1bpp", &quad_source(), 1000).unwrap();
+        let mut profile = Profile::draft("AA:BB:CC:DD:EE:FF");
+        profile.template_ids = vec!["quad".into()];
+        profile.initial_active_id = Some("quad".into());
+        svc.profile_save(profile, 1000).unwrap();
+        drop(svc);
+        let path = dir.path().join("platform/state.json");
+        let mut saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        saved["templates"][0]["source"]["elements"][0]["when"] = json!({"bind":"device.state","exists":false});
+        saved["templates"][0]["compiled"]["compiler_abi"] = json!(0);
+        std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        let svc = PlatformService::open(dir.path()).unwrap();
+        assert_eq!(svc.inner.lock().unwrap().templates.values().next().unwrap().source,
+            saved["templates"][0]["source"]);
+        let error = svc.publish("AA:BB:CC:DD:EE:FF", 1001).unwrap_err();
+        assert!(error.to_string().contains("unsupported"), "{error:#}");
+        assert!(svc.job("AA:BB:CC:DD:EE:FF").is_none());
+        svc.template_save("quad", "epd-ssd1681-200x200-1bpp", &quad_source(), 1002).unwrap();
+        svc.publish("AA:BB:CC:DD:EE:FF", 1003).unwrap();
     }
 
     #[test]
