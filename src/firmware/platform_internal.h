@@ -15,12 +15,14 @@ struct State {
     bool   activeTplHasNow = false;
     bool   activeTplHasMode = false;
 
-    // v2 platform runtime: one committed Bundle (A/B), one compiled active
+    // v2 platform runtime: one content file, one compiled active
     // template, one active context, Bridge-owned PowerPlan.
     CtTemplate     v2Ct;
     bool           v2CtValid = false;
     BsProfile      v2Profile;
     bool           v2BundleReady = false;
+    bool           bundleMaintenance = false;
+    String         bundleError;
     V2DataSeq      v2DataSeq;
     V2ContextGen   v2CtxGen;
     uint64_t       v2LastAckAtMs = 0;
@@ -57,5 +59,6 @@ void handleV2Activate();
 void handleV2BundleBegin();
 void handleV2BundleChunk();
 void handleV2BundleCommit();
+bool bundleUpdating();
 
 } // namespace firmware::platform

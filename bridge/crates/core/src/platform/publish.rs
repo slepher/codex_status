@@ -164,7 +164,6 @@ fn insert_object(objects: &mut BTreeMap<String, Object>, object: Object) -> Resu
 pub struct CommittedRefs {
     pub active_target_id: Option<String>,
     pub active_manifest_id: Option<String>,
-    pub rollback_manifest_id: Option<String>,
     pub object_ids: BTreeSet<String>,
 }
 
@@ -203,23 +202,21 @@ pub fn plan(frozen: &FrozenPublish, refs: &CommittedRefs, capacity: &Capacity) -
     let mut missing = Vec::new();
     let mut reused = Vec::new();
     let (mut transfer_bytes, mut reused_bytes, mut font_bytes, mut template_bytes) = (0, 0, 0, 0);
-    let mut max_object = 0;
     for object in &frozen.objects {
         if object.length > capacity.max_object_bytes { bail!("{} exceeds device max_object_bytes", object.id); }
         if refs.object_ids.contains(&object.id) {
             reused.push(object.id.clone()); reused_bytes += object.length;
         } else {
             missing.push(object.id.clone()); transfer_bytes += object.length;
-            max_object = max_object.max(object.length);
             if object.kind == "font" { font_bytes += object.length; } else { template_bytes += object.length; }
         }
     }
-    // Reserve the new objects, one temporary copy of the largest object, two
-    // manifest writes, and filesystem overhead per new file. Active/rollback
-    // objects are retained and are not counted as free space.
-    let peak_new_bytes = transfer_bytes.saturating_add(max_object)
-        .saturating_add(2 * frozen.manifest_bytes.len() as u64)
-        .saturating_add(capacity.filesystem_overhead_bytes.saturating_mul(missing.len() as u64 + 2));
+    // One manifest and direct writes to missing objects. Device capacity must
+    // account for reclaiming unreferenced content after entering maintenance;
+    // retained shared objects are represented by refs.object_ids, not rollback.
+    let peak_new_bytes = transfer_bytes
+        .saturating_add(frozen.manifest_bytes.len() as u64)
+        .saturating_add(capacity.filesystem_overhead_bytes.saturating_mul(missing.len() as u64 + 1));
     if peak_new_bytes > capacity.free_bytes || peak_new_bytes > capacity.install_peak_bytes {
         bail!("insufficient space: peak {peak_new_bytes}, free {}, install budget {}", capacity.free_bytes, capacity.install_peak_bytes);
     }
@@ -313,6 +310,10 @@ mod tests {
         switches: u32,
     }
     impl HostDevice {
+        fn begin(&mut self) {
+            self.active = None;
+            self.committed_job = None;
+        }
         fn chunk(&mut self, object: &Object, offset: usize, bytes: &[u8], crc: u32) -> Result<usize> {
             if crc32fast::hash(bytes) != crc { bail!("bad_crc"); }
             let entry = self.staged.entry(object.id.clone()).or_default();
@@ -336,13 +337,14 @@ mod tests {
     fn host_transaction_interruption_crc_power_loss_and_lost_ack() {
         let frozen = sample(b"new-template", b"new-font");
         let mut device = HostDevice { active: Some("old-manifest".into()), ..Default::default() };
+        device.begin();
         let first = &frozen.objects[0];
         let split = first.bytes.len() / 2;
         assert_eq!(device.chunk(first, 0, &first.bytes[..split], crc32fast::hash(&first.bytes[..split])).unwrap(), split);
-        assert_eq!(device.active.as_deref(), Some("old-manifest"));
+        assert_eq!(device.active, None);
         assert!(device.chunk(first, split, &first.bytes[split..], 0).is_err());
         assert_eq!(device.staged[&first.id].len(), split);
-        // Simulated power loss retains staged offsets; old manifest stays active.
+        // Simulated interruption leaves maintenance mode; there is no old manifest.
         assert!(device.commit(&frozen).is_err());
         for object in &frozen.objects {
             let at = device.staged.get(&object.id).map_or(0, Vec::len);

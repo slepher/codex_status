@@ -1,18 +1,8 @@
-// v2 complete Bundle storage with A/B slots and tear-proof commit records.
-//
-// Layout on littlefs (`storage` partition, shared with the legacy template
-// store which keeps its own files):
-//   /bundle/a.bin, /bundle/b.bin   complete self-contained bundles
-//   /bundle/m0.bin, /bundle/m1.bin commit records (double copies, alternating)
-//
-// Guarantees (docs/generic-display-platform-design.md §9):
-//  - the current slot always stays usable; a new bundle is written to the other
-//    slot only;
-//  - a slot is only committed after a full read-back + CRC check;
-//  - power loss leaves either the complete old or the complete new bundle;
-//  - insufficient space rejects the publish without deleting the valid copy;
-//  - commit records are chosen by the highest sequence number;
-//  - the previous complete bundle is recovery-only (no history UI).
+// One committed content.bin (raw JSON or CSZ1 + compiled table), a small checked
+// state.bin, and a temporary incoming.bin while downloading. Download failure
+// keeps the current application; replacement failure uses built-in recovery.
+// There is no previous-content slot or automatic rollback. Native ROM OTA is
+// independent. See project-workflow/single-copy-updates/design.md.
 #pragma once
 
 #include <Arduino.h>
@@ -20,7 +10,6 @@
 #include "template_engine.h"
 
 #define BS_MAX_TEMPLATES 8
-#define BS_MAX_BUNDLE_BYTES 262144
 #define BS_CTX_LEN 33
 #define BS_ID_LEN 17
 #define BS_JOB_LEN 17
@@ -39,15 +28,15 @@ struct BsProfile {
 // Mount the filesystem and load the committed bundle header (if any).
 bool bsBegin();
 
-// Install a complete Bundle payload (canonical JSON) into the inactive slot.
+// Install a downloaded complete Bundle; replace only after preflight succeeds.
 // `expectedFirmware`/`expectedRender` guard against wrong-target images.
 bool bsInstall(const String &bundleJson, const char *expectedFirmware,
                const char *expectedRender, const char *newContextId, String &err);
 bool bsInstall(File &bundleFile, uint32_t bundleLength, uint32_t bundleCrc,
                const char *expectedFirmware, const char *expectedRender,
-               const char *newContextId, String &err);
+               const char *newContextId, String &err, void (*beforeReplace)() = nullptr);
 
-// Load one compiled template from the active slot (bounded, validated).
+// Load one compiled template from the current content file (bounded, validated).
 bool bsLoadCompiled(uint8_t index, CtTemplate &out, String &err);
 
 // The committed profile (order + initial active + context/job ids).
@@ -68,3 +57,17 @@ bool bsHasSource(uint8_t index);
 uint32_t bsCommitSeq();
 const char *bsLastError();
 size_t bsFreeBytes();
+
+// Temporary download file; current content keeps running during transfer.
+const char *bsReceivePath();
+size_t bsMaxBundleBytes();
+uint32_t bsDecodedLimit();
+uint32_t bsCompressionProtocol();
+// Authenticated download admission. Does not stop or invalidate current content.
+bool bsStartReceive(uint32_t length, String &err,
+                    const char *owner = "", const char *request = "");
+struct BsReceipt {
+    char owner[65] = {}, request[65] = {}, context[BS_CTX_LEN] = {};
+    uint32_t length = 0, crc = 0;
+};
+bool bsReceipt(BsReceipt &out);

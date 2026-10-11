@@ -15,7 +15,8 @@ use crate::compile::{CompiledTemplate, COMPILER_ABI};
 
 pub const MAX_PROFILE_TEMPLATES: usize = 8;
 pub const MAX_TEMPLATE_BYTES: usize = 32768;
-pub const MAX_BUNDLE_BYTES: usize = 512 * 1024;
+// Wire arithmetic guard, not a device capacity. Admission uses live capabilities.
+pub const MAX_BUNDLE_BYTES: usize = (u32::MAX / 2) as usize;
 pub const MAX_SNAPSHOT_BYTES: usize = 8192;
 
 pub const RENDER_TARGET_154G: &str = "epd-ssd1681-200x200-1bpp";
@@ -38,6 +39,13 @@ pub struct DeviceCapabilities {
     pub compiler_abi: u32,
     pub max_templates: u32,
     pub max_bundle_bytes: u64,
+    /// 0/1: legacy complete A/B; 2: single content file, dynamic capacity.
+    #[serde(default)]
+    pub bundle_storage_protocol: u32,
+    #[serde(default)]
+    pub bundle_compression: u32,
+    #[serde(default)]
+    pub max_bundle_decoded_bytes: u64,
     #[serde(default)]
     pub bundle_font_protocol: u32,
     #[serde(default)]
@@ -82,6 +90,9 @@ impl DeviceCapabilities {
             compiler_abi: COMPILER_ABI,
             max_templates: MAX_PROFILE_TEMPLATES as u32,
             max_bundle_bytes: 262_144,
+            bundle_storage_protocol: 0,
+            bundle_compression: 0,
+            max_bundle_decoded_bytes: 0,
             bundle_font_protocol: 0,
             asset_publish_protocol: 0,
             max_object_bytes: 0,
@@ -113,6 +124,9 @@ impl DeviceCapabilities {
             compiler_abi: COMPILER_ABI,
             max_templates: MAX_PROFILE_TEMPLATES as u32,
             max_bundle_bytes: 262_144,
+            bundle_storage_protocol: 0,
+            bundle_compression: 0,
+            max_bundle_decoded_bytes: 0,
             bundle_font_protocol: 0,
             asset_publish_protocol: 0,
             max_object_bytes: 0,
@@ -131,7 +145,23 @@ impl DeviceCapabilities {
         }
     }
 
+    pub fn bundle_limit(&self) -> u64 {
+        if self.bundle_storage_protocol == 2 {
+            self.max_bundle_bytes.min(MAX_BUNDLE_BYTES as u64)
+        } else {
+            self.max_bundle_bytes.min(256 * 1024)
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
+        if self.bundle_compression > 1 || (self.bundle_compression == 1 &&
+            (self.bundle_storage_protocol != 2 || self.max_bundle_decoded_bytes == 0 ||
+             self.max_bundle_decoded_bytes > MAX_BUNDLE_BYTES as u64)) {
+            bail!("capabilities: unsupported Bundle compression/decoded limit");
+        }
+        if self.bundle_storage_protocol > 2 {
+            bail!("capabilities: unsupported bundle_storage_protocol");
+        }
         if self.firmware_target.is_empty() || self.render_target.is_empty() {
             bail!("capabilities: empty target id");
         }
@@ -480,6 +510,9 @@ pub struct PublishJob {
     pub job_id: String,
     pub device_mac: String,
     pub frozen_bundle: Bundle,
+    /// Exact compressed wire bytes, base64; absent for legacy/raw jobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frozen_wire: Option<String>,
     pub state: PublishState,
     pub last_error: Option<String>,
     pub created_at: u64,
@@ -528,8 +561,7 @@ pub struct BundleResource {
 pub struct BundleFont {
     pub name: String,
     pub font_id: String,
-    /// Complete CSFN container. Stored inside the A/B Bundle so its font and
-    /// template become active or roll back together.
+    /// Complete CSFN container; committed with its templates in the single Bundle.
     pub data: String,
 }
 

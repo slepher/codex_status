@@ -71,11 +71,13 @@ public:
         out.write((const char *)bytes.data(), (std::streamsize)bytes.size());
         out.flush();
         if (!out.good()) return false;
-        const bool slot = path == "/bundle/a.bin" || path == "/bundle/b.bin";
-        const bool meta = path == "/bundle/m0.bin" || path == "/bundle/m1.bin";
+        const bool slot = path == "/bundle/content.bin";
+        const bool download = path == "/bundle/incoming.bin";
+        const bool meta = path == "/bundle/state.tmp";
         const bool syncBlob = path == "/sync/b0.bin" || path == "/sync/b1.bin";
         const bool syncMeta = path == "/sync/m0.bin" || path == "/sync/m1.bin";
         if (((crashAfterSyncKind == "slot" && slot) ||
+             (crashAfterSyncKind == "download" && download) ||
              (crashAfterSyncKind == "meta" && meta) ||
              (crashAfterSyncKind == "sync_blob" && syncBlob) ||
              (crashAfterSyncKind == "sync_meta" && syncMeta)) &&

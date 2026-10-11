@@ -863,6 +863,11 @@ static int currentBridgeOfflineMinutes() {
 }
 
 void renderActiveUsage(const String &json, const char *channel) {
+    if (platform::state.bundleMaintenance) {
+        screen({"CONTENT UPDATE", platform::state.bundleError,
+                platform::bundleUpdating() ? "Receiving..." : "Publish from Bridge"});
+        return;
+    }
     if (!state.frame) return;
     bool ready = platform::state.v2BundleReady ? platform::v2ActiveLoad() : platform::tplCacheLoad();
     if (!ready) { screenStatus(); return; }
@@ -898,7 +903,11 @@ void renderActiveUsage(const String &json, const char *channel) {
 }
 
 void renderCurrent() {
-    if (platform::state.lastUsage.length()) renderActiveUsage(platform::state.lastUsage, platform::state.lastChannel.c_str());
+    if (platform::state.bundleMaintenance) {
+        screen({"CONTENT UPDATE", platform::state.bundleError,
+                platform::bundleUpdating() ? "Receiving..." : "Publish from Bridge"});
+    }
+    else if (platform::state.lastUsage.length()) renderActiveUsage(platform::state.lastUsage, platform::state.lastChannel.c_str());
     else screenStatus();
     state.networkGlyph.observe(radio::state.wifiUp, currentBridgeOfflineMinutes(), radio::wifiPhase(),
                                radio::state.wifiConnActive ? (radio::state.wifiBlinkOn ? 1 : 0) : -1);

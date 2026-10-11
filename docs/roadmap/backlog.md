@@ -210,6 +210,8 @@
 
 ### B6. 离线 BLE 配 Wi-Fi 与 BOOT 蓝牙恢复入口（2026-10-03 新开）
 
+- **2026-10-11 后续调查与统一规划，未实施**：首次唤醒与手动GATT常开混用、模板缺独立手动状态、交汇中的刷新遗漏、阻塞期间短按漏采风险；另有版本页/停滞、BLE瞬时认证失败及低堆线索。用户确认图标只反映手动GATT窗口，健康Light只走HTTP。C9 .80/Bridge已部署认证，旧.78证据不能直接作为新版本结论。新增正式计划跨重启、Light/USB直接HTTP、Sleep一次BLE、OTA确认竞态与USB准入G8–G11；按用户要求先合并方案，与G1–G7统一实施，本轮新增代码草稿已备份撤回。执行顺序与验收见 [BOOT/GATT执行文档](../../project-workflow/bridge-macos/note4-boot-gatt-followup-20261011.md)，原始调查见 [现场记录](../../project-workflow/bridge-macos/note4-stall-20261011.md)。
+
 - 2026-10-08 新协议空闲重复activate实现bug已在同源Fake复现并修正，Note4/默认Bridge已协调升级，.71运行hash与原OTA单次image_verified核对。软件闭环与剩余实体边界见PROGRESS顶节、A9及[周期activate计划](../../project-workflow/bridge-macos/wifi-idle-activate-20261008-plan.md)；书桌屏暂停后台连接、未刷ROM，不以此结B6。
 - **2026-10-08容量与误扣预算修复已部署、实机恢复通过。** Fake已复现32条已确认历史永久占队列及未发激活扣完预算；现已安全回收确认/已ACK终态、保护未知提交/待ACK与序号围栏，容量错误明确返回、首次实际发送才扣预算，33项相关测试通过。Bridge SHA38B7CE11…已部署，正常应用服务重试home/v8，w3_4a完成/回执退役；Note4 .69认证HTTP已连wd21-la/.177/attempts0，无需刷ROM。诊断/修复见`project-workflow/bridge-macos/wifi-activate-fake-20261008-plan.md`与PROGRESS。剩余：长期多轮RF/电池与Mac部署验收；Fake通用状态硬编码wifi_connected/http.ready，须补RF/HTTP及完整main生命周期适配；无实际HTTP工作仍重复启用路径待独立复现。
 
@@ -295,10 +297,16 @@
 
 ## 4. 战略/长线（C 级：需要独立 initiative，不在近期窗口）
 
+### C9. 取消项目自管A/B、动态容量与内置更新界面
+
+- **2026-10-11 源码实现与候选验证**：共享固件 Bundle 改为单份内容与短小回执，Bridge 使用动态容量；原生固件 OTA 双槽保留，覆盖全部共享固件目标。用户进一步明确允许临时下载文件，下载期间继续运行，完成后才停用内容并覆盖。
+- 更新覆盖失败进入内置恢复，身份/配对/owner/认证重传保留。动态容量含下载、缓存与预留，旧设备仍使用其能力上限。资产发布模型移除 rollback manifest；AP01 独立应用尚无可运行实现，保持同一设计。
+- Note4 **0.18.80** 已完成统一CSZ1分块zlib并于16:27配套部署Bridge：复用ROM miniz、压缩正文按块读取、Bridge冻结传输字节，动态物理容量与原文处理上限分开。359项回归通过/3条件忽略，匹配ELF栈检查通过；OTA单次上传、运行镜像SHA256认证一致，旧模板迁移和Data显示正常，压缩安装实机峰值/掉电矩阵未验。证据、ROM哈希和实机待验见[实施交接](../../project-workflow/single-copy-updates/status.md)。AP01仅确定兼容格式，解压入口/实机仍待调查；C1 dense编码未实现，不以压缩代替其验收。
+
 ### C1. Bundle v3（manifest + 原始 dense 对象）
 - 设计已定稿（`docs/history/workflow/bundle-v3/design.md`）：`CSB3` 容器 + `ct-dense-v1` 对象，`mini+quad` 从 55.3 KB 降到约 16.2 KB（省 ~71%）。
 - **为什么重要**：1.54 是 8 MB flash，55 KB Bundle 的十六进制编码（45 KB 十六进制字符）是它最容易 OOM/超时的环节，也是 A2 的根因候选。
-- 需改：固件（新格式解析 + A/B 原子安装 + 拒绝路径）、桥编译器（canonical dense 编码器）、Python 测试桥哈希三方同步；设备能力加 `bundle_format: 3`；v3 ROM 把 pre-v3 Bundle 视为不存在。
+- 需改：固件（新格式解析 + 按C9单份安装/内置恢复 + 拒绝路径）、桥编译器（canonical dense 编码器）、Python 测试桥哈希三方同步；设备能力加 `bundle_format: 3`；v3 ROM 把 pre-v3 Bundle 视为不存在。C9共享实现已改为单份；现场部署仍以交接卡为准。
 
 ### C3. 唤醒会合诊断记录（wake-contact-trace）
 - **代码已实现并已合入 master**（先前记录"仅计划"是错的）：`bridge/crates/app/src/wake_history.rs`、
@@ -330,7 +338,7 @@
 ### C5. 字体资产增量发布
 - 单一字体注册表 + CSFN 容器已交付；Profile 版本选择经完整 A/B Bundle 发布与重启恢复，Note4 已安装 18 px ExtraLight 200（job `5d798bd9`、commit 355）。Bridge 模板页预览使用 Profile 资产；实体字形待目视核对。
 - 未定稿：`docs/history/workflow/note4-bridge-publish/protocol.md`（manifest/CSFN 增量发布合同）仍是**待双方确认草案**；设备侧无增量端点、仍是 ABI 1 时代的 48 KiB/8 字体实现。
-- 结论：在 C1（Bundle v3）定案前不要启动，否则两套编码器要一起改。
+- 结论：在 C1（Bundle v3）定案前不要启动，否则两套编码器要一起改；未来清单持久化遵循C9单份策略，不再规划当前/回退两份内容集合。
 
 ### C6. 多 env / packages 目录隔离收尾
 - `tools/pio-target.ps1` 已落地，**两侧都已实测**（2026-09-25）：`.pio-pkgs/note4` 与 `.pio-pkgs/154g` 各 2 real（两个冲突 framework 包，69 MB + 2057 MB）+ 15 junction，各 ≈2126 MB。

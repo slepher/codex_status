@@ -582,7 +582,10 @@ void handleStatusJson() {
     doc["partial"] = bool(TARGET_PARTIAL);
     doc["hardware_verified"] = bool(TARGET_VERIFIED);
     doc["max_templates"] = 8;
-    doc["max_bundle_bytes"] = BS_MAX_BUNDLE_BYTES;
+    doc["max_bundle_bytes"] = bsMaxBundleBytes();
+    doc["bundle_storage_protocol"] = 2;
+    doc["bundle_compression"] = bsCompressionProtocol();
+    doc["max_bundle_decoded_bytes"] = bsDecodedLimit();
     doc["asset_publish_protocol"] = 0; // Existing complete Bundle path only.
 #ifdef CODEX_TARGET_NOTE4
     doc["bundle_font_protocol"] = 1;
@@ -594,7 +597,7 @@ void handleStatusJson() {
     doc["active_context_id"] = platform::state.v2Profile.contextId;
     doc["active_template_id"] = (platform::state.v2BundleReady && platform::state.v2Profile.count)
                                     ? String(platform::state.v2Profile.ids[platform::state.v2Profile.initial])
-                                    : tplStoreActive();
+                                    : String();
     doc["committed_job_id"] = platform::state.v2Profile.jobId;
     doc["data_seq"] = platform::state.v2DataSeq.appliedSeq();
     doc["applied_seq"] = platform::state.v2DataSeq.appliedSeq();
@@ -1243,6 +1246,13 @@ static __attribute__((noinline)) void buildPlatformStatus(JsonDocument &doc) {
     wake.cause = wakeCauseName(application::state.bootWakeCause);
     snapshot.wake = &wake;
     deserializeJson(doc, v2BuildStatusSnapshot(snapshot));
+    doc["bundle_storage_protocol"] = 2;
+    doc["bundle_compression"] = bsCompressionProtocol();
+    doc["max_bundle_decoded_bytes"] = bsDecodedLimit();
+    doc["max_bundle_bytes"] = bsMaxBundleBytes();
+    doc["content_state"] = platform::bundleUpdating() ? "downloading"
+        : platform::state.bundleMaintenance ? "waiting_for_publish" : "ready";
+    doc["content_error"] = platform::state.bundleError;
 }
 
 // GET /api/status: authenticated authoritative state (the beacon only points).

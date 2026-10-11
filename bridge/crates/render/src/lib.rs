@@ -3,6 +3,7 @@
 
 use std::ffi::CString;
 mod status_pages;
+pub mod bundle_codec;
 pub use status_pages::SimulatorStatusPages;
 use std::os::raw::{c_char, c_int};
 use std::sync::mpsc::{sync_channel, Receiver, Sender, SyncSender};

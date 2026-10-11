@@ -18,6 +18,7 @@
 | 查 HTTP 直达、BLE 交汇及先 ready 后关闭 BLE 的应有行为 | [bridge-device-communication-scenarios.md](bridge-device-communication-scenarios.md)（场景合同）→ [bridge-device-communication-implementation.md](bridge-device-communication-implementation.md)（源码证据与验收边界） |
 | 判断历史协议哪些已过期、哪些遗漏或仍是草案 | [bridge-device-protocol-history-audit.md](bridge-device-protocol-history-audit.md)（定向历史对账，当前源码/现场交叉核对） |
 | 查同父目录 Slate 的协议参考及适用边界 | [bridge-device-slate-protocol-comparison.md](bridge-device-slate-protocol-comparison.md)（schema、错误、摘要、生命周期；只读比较） |
+| 查 CUKTECH 控制器与 AP01 ROM 对当前平台的价值 | [cuktech-ap01-repository-value-analysis.md](cuktech-ap01-repository-value-analysis.md)（三仓库对照、可复用接口、显示交接、完整接入成本） |
 | 改电源/唤醒/占用 | `docs/power-state.md` + `docs/generic-display-platform-design.md` §7 |
 | 改休眠设备的状态页、模板/OTA 延后投递 | `docs/generic-display-platform-design.md` + `project-workflow/sleep-aware-bridge/design.md` / `task.md` |
 | 实施 PowerPlan 与 Data 同轮联合下发 | `project-workflow/bridge-macos/powerplan-data-execution-plan.md`（P1–P6；仅计划，待办 A9） |
@@ -30,6 +31,7 @@
 | 实施设备页离线 BLE 配网、绑定独立方案与 BOOT 恢复 | `project-workflow/bridge-macos/wifi-redesign.md`（最新全量管理/UI 重设计）→ `remaining-plan.md` R0–R4 / `wifi-protocol.md`；统一协议已配套部署，完整 RF/跨平台/双板矩阵仍待验，仅 Note4 在场，见 backlog B6 |
 | 改模拟器/实验时钟 | `docs/fake-rom-simulator-design.md` + `docs/history/workflow/fake-rom-simulator-def/evidence.md`（D/E/F 已结项） |
 | 改字体资产 | `docs/font-asset-format.md` + `project-workflow/note4-bridge-publish/protocol.md`（**草案，未定稿**） |
+| 改单份 Bundle/应用更新与动态容量，查 AP01 压缩预算 | `project-workflow/single-copy-updates/status.md` → `design.md`（C9，候选实现与待验项） |
 | 查缺陷结案 | `docs/history/bugs-2026-09-22.md`（原 `bugs.md`，已结案） |
 
 ## 活跃文档（`docs/` 根目录，仍在演进）

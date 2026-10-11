@@ -288,7 +288,7 @@ struct V2BundleRx {
                uint32_t len, uint32_t sum, uint64_t now) {
         if (!*bridge || !*id || !*session || strlen(bridge) >= sizeof(owner) ||
             strlen(id) >= sizeof(request) || strlen(session) >= sizeof(nonce) ||
-            !len || len > 262144) return false;
+            !len || len > UINT32_MAX / 2) return false; // arithmetic bound; storage admits at BEGIN
         strcpy(owner, bridge); strcpy(request, id); strcpy(nonce, session);
         length = len; crc = sum; offset = 0; deadline = now + 120000;
         return true;

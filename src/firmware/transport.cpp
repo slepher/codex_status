@@ -595,7 +595,10 @@ static void __attribute__((noinline)) handleBleWifiCapabilities(
     caps["width"] = TARGET_WIDTH; caps["height"] = TARGET_HEIGHT;
     caps["pixel_format"] = TARGET_PIXEL_FORMAT; caps["colors"] = TARGET_COLORS;
     caps["partial"] = bool(TARGET_PARTIAL); caps["hardware_verified"] = bool(TARGET_VERIFIED);
-    caps["max_templates"] = 8; caps["max_bundle_bytes"] = BS_MAX_BUNDLE_BYTES;
+    caps["max_templates"] = 8; caps["max_bundle_bytes"] = bsMaxBundleBytes();
+    caps["bundle_storage_protocol"] = 2;
+    caps["bundle_compression"] = bsCompressionProtocol();
+    caps["max_bundle_decoded_bytes"] = bsDecodedLimit();
     caps["compiler_abi"] = CT_ABI;
 #ifdef CODEX_TARGET_NOTE4
     caps["bundle_font_protocol"] = 1;

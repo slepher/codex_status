@@ -1,5 +1,6 @@
 #include "v2_bundle_command.h"
 #include "bundle_store.h"
+#include "bundle_payload.h"
 #include "v2_runtime.h"
 
 #include <LittleFS.h>
@@ -14,6 +15,9 @@ struct CommittedReplay {
     const char *context = nullptr;
     const char *error = nullptr;
 };
+// Storage owns the durable strings; decisions use this scratch until the next
+// serialized command, just as they use the caller's in-memory fingerprint.
+BsReceipt durableReceipt;
 
 CommittedReplay checkCommittedReplay(JsonDocument &doc,
                                      const V2BundleFingerprint &committed) {
@@ -22,16 +26,23 @@ CommittedReplay checkCommittedReplay(JsonDocument &doc,
     const char *request = doc["request_id"] | "";
     const char *committedOwner = committed.owner ? committed.owner : "";
     const char *committedRequest = committed.request ? committed.request : "";
-    if (strcmp(owner, committedOwner) || strcmp(request, committedRequest)) return result;
+    uint32_t committedCrc = committed.crc, committedLength = committed.length;
+    const char *committedContext = committed.context;
+    if (strcmp(owner, committedOwner) || strcmp(request, committedRequest)) {
+        if (!bsReceipt(durableReceipt) || strcmp(owner, durableReceipt.owner) ||
+            strcmp(request, durableReceipt.request)) return result;
+        committedCrc = durableReceipt.crc; committedLength = durableReceipt.length;
+        committedContext = durableReceipt.context;
+    }
 
     result.matched = true;
     result.length = doc["length"] | 0u;
     if (!v2ParseCrc(doc["content_crc"] | "", result.crc) ||
-        result.crc != committed.crc || result.length != committed.length) {
+        result.crc != committedCrc || result.length != committedLength) {
         result.error = "request_conflict";
     } else {
         result.replay = true;
-        result.context = committed.context;
+        result.context = committedContext;
     }
     return result;
 }
@@ -141,13 +152,17 @@ V2BundleCommitDecision v2DecideBundleCommit(
         return decision;
     }
 
+    BundlePayload payload(file);
+    if (!payload.begin(0, current.length, LittleFS.totalBytes()) || !payload.verify()) {
+        decision.error = "compression"; return decision;
+    }
     // The bundle's own `bridge_id` must match the command; fall back to the
     // query/form value when the payload is not readable as JSON. Filtered parses
     // keep only the two keys we need, so the cost stays bounded.
     JsonDocument ownerFilter, ownerDoc;
     ownerFilter["bridge_id"] = true;
     const char *bodyOwner = bridgeIdFallback ? bridgeIdFallback : "";
-    if (file.seek(0) && !deserializeJson(ownerDoc, file, DeserializationOption::Filter(ownerFilter))) {
+    if (payload.seek(0) && !deserializeJson(ownerDoc, payload, DeserializationOption::Filter(ownerFilter))) {
         const char *id = ownerDoc["bridge_id"] | "";
         if (*id) bodyOwner = id;
     }
@@ -159,7 +174,7 @@ V2BundleCommitDecision v2DecideBundleCommit(
 
     JsonDocument idFilter, idDoc;
     idFilter["job_id"] = true;
-    if (!file.seek(0) || deserializeJson(idDoc, file, DeserializationOption::Filter(idFilter))) {
+    if (!payload.seek(0) || deserializeJson(idDoc, payload, DeserializationOption::Filter(idFilter))) {
         file.close();
         decision.error = "json";
         return decision;

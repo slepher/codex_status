@@ -595,6 +595,7 @@ impl Coordinator {
             }
         }
         self.job = Some(PublishJob {
+            frozen_wire: None,
             job_id: bundle.job_id.clone(),
             device_mac: self.mac.clone(),
             frozen_bundle: bundle,

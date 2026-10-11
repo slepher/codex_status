@@ -904,7 +904,7 @@ fn shared_bundle_begin_decision_preserves_rx_for_replay_and_rejection() {
         assert_eq!(bad_crc["action"], "reject");
         assert_eq!(bad_crc["error"], "crc");
         assert_eq!(bad_crc["current"], before);
-        let bad_size = decide(p, message("owner", "request-b", 262_145, "12345678"), 121_000);
+        let bad_size = decide(p, message("owner", "request-b", u32::MAX, "12345678"), 121_000);
         assert_eq!(bad_size["action"], "reject");
         assert_eq!(bad_size["error"], "size");
         assert_eq!(bad_size["current"], before);

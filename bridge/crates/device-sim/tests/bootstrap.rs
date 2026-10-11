@@ -1547,8 +1547,8 @@ fn data_bound_frame_matches_shared_preview_after_value_change() {
 }
 
 #[test]
-fn bundle_hard_exit_during_slot_or_metadata_sync_restores_prior_job() {
-    for kind in ["slot", "meta"] {
+fn bundle_hard_exit_during_content_or_commit_enters_recovery() {
+    for kind in ["download", "slot", "meta"] {
         let mut sim = Simulator::start("02:00:00:00:00:1B", &[]);
         let mut source: Value = serde_json::from_str(include_str!(
             "../../../../tools/test-bridge/templates/quad.json"
@@ -1591,9 +1591,20 @@ fn bundle_hard_exit_during_slot_or_metadata_sync_restores_prior_job() {
         let (code, body) = request(recovered.address(), "GET", "/api/status", Some(ENDPOINT), b"");
         assert_eq!(code, 200);
         let status = json_body(&body);
-        assert_eq!(status["configured"], true, "{kind}: {status}");
-        assert_eq!(status["committed_job_id"], "old-job", "{kind}: {status}");
-        assert_eq!(status["template_ids"].as_array().unwrap().len(), 1);
+        if kind == "download" {
+            assert_eq!(status["configured"], true);
+            assert_eq!(status["committed_job_id"], "old-job");
+            assert!(!status["data_contract"].is_null());
+        } else {
+            assert_eq!(status["configured"], false, "{kind}: {status}");
+            assert_eq!(status["committed_job_id"], "", "{kind}: {status}");
+            assert!(status["data_contract"].is_null());
+            assert_eq!(status["template_ids"].as_array().unwrap().len(), 0);
+        }
+        let retry = bridge_core::device_client::install_bundle(
+            &recovered.address().to_string(), ENDPOINT, "02:00:00:00:00:1B",
+            "bridge-test", &new_bytes, 4096, Duration::from_secs(3)).unwrap();
+        assert_eq!(retry["result"], "applied", "{kind}: {retry}");
     }
 }
 
@@ -1643,7 +1654,8 @@ fn real_device_client_installs_one_and_eight_template_bundles() {
             "profile": {"template_ids": ids, "initial_active_id": "quad0"},
             "templates": templates, "resources": [], "bindings": []
         });
-        let bytes = bridge_core::template::canonical_bytes(&bundle);
+        let raw = bridge_core::template::canonical_bytes(&bundle);
+        let bytes = if count == 8 { bridge_render::bundle_codec::encode(&raw).unwrap() } else { raw };
         let ack = bridge_core::device_client::install_bundle(
             &sim.address().to_string(), ENDPOINT, "02:00:00:00:00:31",
             "bridge-test", &bytes, 4096, Duration::from_secs(10)
@@ -1769,8 +1781,10 @@ fn real_device_client_installs_one_and_eight_template_bundles() {
             let recovered = Simulator::start_with_dir("02:00:00:00:00:31", &[], data_dir, true);
             let after_torn = json_body(&request(recovered.address(), "GET", "/api/status",
                 Some(ENDPOINT), b"").1);
-            assert_eq!(after_torn["committed_job_id"], "job-1");
-            assert_ne!(after_torn["active_context_id"], before_restart["active_context_id"]);
+            assert_eq!(after_torn["configured"], false);
+            assert_eq!(after_torn["committed_job_id"], "");
+            assert_eq!(after_torn["active_context_id"], "");
+            assert!(after_torn["data_contract"].is_null());
         }
     }
 }
@@ -2187,7 +2201,7 @@ fn committed_bundle_survives_a_lost_ack_and_replays_the_same_job() {
             "render_target":"epd-ssd1681-200x200-1bpp"},
             "source":source,"compiled":compiled}],"resources":[],"bindings":[]
     });
-    let bytes = bridge_core::template::canonical_bytes(&bundle);
+    let bytes = bridge_render::bundle_codec::encode(&bridge_core::template::canonical_bytes(&bundle)).unwrap();
     assert_eq!(request(sim.address(), "POST", "/sim/fault", Some(CONTROL),
         br#"{"stall_ack_after":"bundle_commit"}"#).0, 200);
     let lost = bridge_core::device_client::install_bundle(&sim.address().to_string(), ENDPOINT,
@@ -2210,6 +2224,11 @@ fn committed_bundle_survives_a_lost_ack_and_replays_the_same_job() {
     let restarted = Simulator::start_with_dir("02:00:00:00:00:36", &[], data_dir, true);
     assert_eq!(json_body(&request(restarted.address(), "GET", "/api/status",
         Some(ENDPOINT), b"").1)["committed_job_id"], "lost-ack-job");
+    let before_replay = sim_state(&restarted)["bundle"]["commit_seq"].clone();
+    let replay = bridge_core::device_client::install_bundle(&restarted.address().to_string(), ENDPOINT,
+        "02:00:00:00:00:36", "bridge-test", &bytes, 4096, Duration::from_secs(3)).unwrap();
+    assert_eq!(replay["result"], "applied");
+    assert_eq!(sim_state(&restarted)["bundle"]["commit_seq"], before_replay);
 }
 
 #[test]

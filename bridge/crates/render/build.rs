@@ -42,6 +42,7 @@ fn main() {
         .include(&arduinojson)
         .define("ARDUINOJSON_ENABLE_ARDUINO_STRING", "1")
         .define("CODEX_RENDER_NOTE4_FONTS", "1")
+        .define("CODEX_BUNDLE_HOST", "1")
         .warnings(false)
         .flag_if_supported("/utf-8")
         .file(firmware.join("template_engine.cpp"))
@@ -59,6 +60,7 @@ fn main() {
         .file(firmware.join("v2_sync_store.cpp"))
         .file(firmware.join("v2_sync_protocol.cpp"))
         .file(firmware.join("bundle_store.cpp"))
+        .file(firmware.join("bundle_payload.cpp"))
         .file(firmware.join("refresh_policy.cpp"))
         .file(firmware.join("font_asset.cpp"))
         .file(firmware.join("font_store.cpp"))
@@ -94,7 +96,7 @@ fn main() {
                     "v2_sync.h", "v2_sync.cpp",
                     "v2_sync_store.h", "v2_sync_store.cpp",
                     "v2_sync_protocol.h", "v2_sync_protocol.cpp",
-                    "bundle_store.h", "bundle_store.cpp", "fonts.h",
+                    "bundle_store.h", "bundle_store.cpp", "bundle_payload.h", "bundle_payload.cpp", "fonts.h",
                     "font_noto.h", "font_noto_nt16.h", "font_noto_nt30.h",
                     "font_noto_ntthin18.h", "font_noto_ntreg64.h",
                     "font_noto_ntreg96.h",

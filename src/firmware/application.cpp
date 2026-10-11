@@ -219,10 +219,10 @@ void initialize(const char *firmwareVersion, const char *imageIdentity) {
 
     tplStoreBegin();
     tplXferBegin(application::state.firmwareVersion, []() { platform::state.pendingTplChanged = true; });
-    // v2 Bundle store: a committed A/B bundle takes over the active template
-    // path; without one the legacy store continues to serve templates.
+    // One committed content file; missing/corrupt content uses built-in recovery.
     platform::state.v2CtxGen.seed(esp_random());
     platform::state.v2BundleReady = bsBegin();
+    platform::state.bundleMaintenance = !platform::state.v2BundleReady;
     if (!syncStoreBegin()) DevLog.println("[sync] frozen store unavailable");
     // Old ROMs persisted an OTA arm that could block recovery after A/B rollback.
     Preferences oldOta;
@@ -245,7 +245,7 @@ void initialize(const char *firmwareVersion, const char *imageIdentity) {
                       platform::state.v2Profile.jobId, platform::state.v2Profile.ids[platform::state.v2Profile.initial],
                       (unsigned)platform::state.v2Profile.count, platform::state.v2Profile.contextId,
                       (unsigned)bsCommitSeq());
-        platform::v2ActiveLoad();
+        platform::state.bundleMaintenance = !platform::v2ActiveLoad();
         if (!deepClockOnlyBoot) {
             platform::state.v2DataSeq.beginContext(clock::v2NowMs(), 1);
             if (esp_reset_reason() == ESP_RST_DEEPSLEEP) {
@@ -275,7 +275,7 @@ void initialize(const char *firmwareVersion, const char *imageIdentity) {
     if (deepClockOnlyBoot) {
         bool clockTemplateReady = platform::state.v2BundleReady
             ? platform::state.v2CtValid && platform::state.activeTplHasNow
-            : platform::tplCacheLoad() && platform::state.activeTplHasNow;
+            : false;
         if (clockTemplateReady && platform::state.lastUsage.length()) {
             display::renderActiveUsage(platform::state.lastUsage, "RTC");
         }

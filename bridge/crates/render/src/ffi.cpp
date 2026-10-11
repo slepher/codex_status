@@ -268,10 +268,6 @@ void *codex_sim_bundle_new(const char *data_dir, const char *target,
     LittleFS.capacity = 1024 * 1024;
     LittleFS.writeBudget = -1;
     bool restored = bsBegin();
-    if (!restored && (LittleFS.exists("/bundle/a.bin") ||
-                      LittleFS.exists("/bundle/b.bin") ||
-                      LittleFS.exists("/bundle/m0.bin") ||
-                      LittleFS.exists("/bundle/m1.bin"))) return nullptr;
     auto *device = new SimBundleDevice();
     device->firmwareTarget = target;
     device->renderTarget = note4 ? "epd-ssd2683-400x300-1bpp" : "epd-ssd1681-200x200-1bpp";
@@ -347,6 +343,10 @@ int codex_sim_bundle_status(void *p, char *out, int cap) {
     doc["display_writes"] = device.displayWrites;
     doc["refresh_kind"] = device.refreshKind;
     doc["free_bytes"] = bsFreeBytes();
+    doc["max_bundle_bytes"] = bsMaxBundleBytes();
+    doc["bundle_storage_protocol"] = 2;
+    doc["bundle_compression"] = bsCompressionProtocol();
+    doc["max_bundle_decoded_bytes"] = bsDecodedLimit();
     doc["write_budget"] = LittleFS.writeBudget;
     JsonArray ids = doc["template_ids"].to<JsonArray>();
     for (uint8_t i = 0; i < device.profile.count; ++i) ids.add(device.profile.ids[i]);
@@ -374,7 +374,7 @@ int codex_sim_store_budget(void *p, long long budget) {
 int codex_sim_store_crash_after_sync(void *p, const char *kind, int count) {
     if (!p || !kind || count < 1 || count > 100 ||
         (strcmp(kind, "slot") && strcmp(kind, "meta") &&
-         strcmp(kind, "sync_blob") && strcmp(kind, "sync_meta"))) return 0;
+         strcmp(kind, "download") && strcmp(kind, "sync_blob") && strcmp(kind, "sync_meta"))) return 0;
     LittleFS.crashAfterSyncKind = kind;
     LittleFS.crashAfterSyncCount = count;
     return 1;
@@ -424,9 +424,11 @@ int codex_sim_bundle_begin(void *p, const char *message, const char *nonce,
     if (decision.action == V2_BUNDLE_BEGIN_REPLAY)
         return simCopy(simBundleAck(device, "applied", "unchanged", nullptr, decision.replayContext), out, cap);
     if (decision.action == V2_BUNDLE_BEGIN_START) {
-        File file = LittleFS.open("/bundle/rx.tmp", "w");
-        if (!file) return simCopy(simBundleAck(device, "rejected", "unchanged", "open"), out, cap);
-        file.close();
+        String error;
+        if (decision.candidate.length > bsMaxBundleBytes())
+            return simCopy(simBundleAck(device, "rejected", "unchanged", "size"), out, cap);
+        if (!bsStartReceive(decision.candidate.length, error, decision.candidate.owner, decision.candidate.request))
+            return simCopy(simBundleAck(device, "rejected", device.configured ? "unchanged" : "failed", error.c_str()), out, cap);
         device.rx = decision.candidate;
     }
     JsonDocument ack;
@@ -448,7 +450,7 @@ int codex_sim_bundle_chunk(void *p, const char *request, const char *nonce,
     V2BundleChunkWriteDecision write = v2DecideBundleChunkWrite(
         device.rx, start.offset, start.replay, 0, (uint32_t)length);
     if (!write.allowed) return simCopy(simBundleAck(device, "rejected", "unchanged", write.error), out, cap);
-    File file = LittleFS.open("/bundle/rx.tmp", start.replay ? "r" : "a");
+    File file = LittleFS.open(bsReceivePath(), start.replay ? "r" : "a");
     if (!file) return simCopy(simBundleAck(device, "rejected", "unchanged", "open"), out, cap);
     bool ok = true;
     if (start.replay) {
@@ -481,20 +483,30 @@ int codex_sim_bundle_commit(void *p, const char *message, const char *nonce,
     if (deserializeJson(doc, message)) return simCopy(simBundleAck(device, "rejected", "unchanged", "json"), out, cap);
     V2BundleCommitDecision decision = v2DecideBundleCommit(
         doc, device.rx, simFingerprint(device), nonce, now_ms,
-        "/bundle/rx.tmp", doc["bridge_id"] | "");
+        bsReceivePath(), doc["bridge_id"] | "");
     if (decision.action == V2_BUNDLE_COMMIT_REJECT)
         return simCopy(simBundleAck(device, "rejected", "unchanged", decision.error), out, cap);
     if (decision.action == V2_BUNDLE_COMMIT_REPLAY)
         return simCopy(simBundleAck(device, "applied", "unchanged", nullptr, decision.replayContext), out, cap);
     if (decision.action == V2_BUNDLE_COMMIT_INSTALL) {
-        File file = LittleFS.open("/bundle/rx.tmp", "r");
+        File file = LittleFS.open(bsReceivePath(), "r");
         if (!file || file.size() != decision.length)
             return simCopy(simBundleAck(device, "rejected", "unchanged", "length"), out, cap);
         String error;
         bool installed = bsInstall(file, decision.length, decision.crc,
             device.firmwareTarget.c_str(), device.renderTarget.c_str(), context, error);
         file.close();
-        if (!installed) return simCopy(simBundleAck(device, "rejected", "unchanged", error.c_str()), out, cap);
+        if (!installed) {
+            device.rx.deadline = 0;
+            device.configured = bsProfile(device.profile);
+            if (!device.configured) {
+                device.compiledValid = false;
+                device.profile = BsProfile{};
+                device.usage = device.committedRequest = device.activateRequest = "";
+                device.dataSeq.beginContext(now_ms, 1);
+            }
+            return simCopy(simBundleAck(device, "rejected", "unchanged", error.c_str()), out, cap);
+        }
     }
     if (!bsProfile(device.profile))
         return simCopy(simBundleAck(device, "rejected", "unchanged", "profile"), out, cap);
@@ -505,7 +517,10 @@ int codex_sim_bundle_commit(void *p, const char *message, const char *nonce,
     device.committedLength = decision.length;
     device.committedContext = device.profile.contextId;
     device.rx.deadline = 0;
-    LittleFS.remove("/bundle/rx.tmp");
+    if (decision.action == V2_BUNDLE_COMMIT_ALREADY_ACTIVE) {
+        LittleFS.remove(bsReceivePath());
+        return simCopy(simBundleAck(device, "applied", "unchanged", nullptr, device.profile.contextId), out, cap);
+    }
     String error;
     device.compiledValid = bsLoadCompiled(device.profile.initial, device.compiled, error);
     if (!device.compiledValid)
@@ -609,52 +624,121 @@ void codex_set_canvas(int w, int h) {
     tplSetCanvas(w, h);
 }
 
+int codex_bundle_compressed_check(const char *json, const uint8_t *packed, size_t size) {
+    JsonDocument document, filter; filter["firmware_target"] = true; filter["render_target"] = true;
+    if (deserializeJson(document, json, DeserializationOption::Filter(filter))) return 11;
+    const char *fw = document["firmware_target"] | "", *rt = document["render_target"] | "";
+    LittleFS.root.clear(); LittleFS.files.clear(); LittleFS.capacity = 2 * 1024 * 1024;
+    LittleFS.writeBudget = -1; bsBegin(); String err;
+    if (!bsInstall(String(json), fw, rt, "old", err)) return 1;
+    const auto original = LittleFS.files;
+    // Outer transport CRC is recomputed: rejects must come from actual decoder checks.
+    for (size_t index : {size_t(4), size_t(8), size_t(12), size_t(16), size_t(20), size_t(24), size - 1, size}) {
+        LittleFS.files = original; bsBegin();
+        std::vector<uint8_t> bad(packed, packed + size);
+        if (index == size) bad.push_back(0); else bad[index] ^= 0x80;
+        if (!bsStartReceive(bad.size(), err)) return 2;
+        File f = LittleFS.open(bsReceivePath(), "w"); f.write(bad.data(), bad.size()); f.close();
+        f = LittleFS.open(bsReceivePath(), "r");
+        if (bsInstall(f, bad.size(), v2Crc32(bad.data(), bad.size()), fw, rt, "bad", err)) return 3;
+        BsProfile p; if (!bsProfile(p) || strcmp(p.contextId, "old") ||
+            LittleFS.files["/bundle/content.bin"] != original.at("/bundle/content.bin")) return 4;
+    }
+    LittleFS.files = original; bsBegin();
+    if (!bsStartReceive(size, err, "bridge-test", "compressed")) return 5;
+    File f = LittleFS.open(bsReceivePath(), "w"); f.write(packed, size); f.close();
+    f = LittleFS.open(bsReceivePath(), "r");
+    if (!bsInstall(f, size, v2Crc32(packed, size), fw, rt, "new", err)) { fprintf(stderr, "compressed install: %s\n", err.c_str()); return 6; }
+    f.close(); BsProfile p;
+    if (!bsBegin() || !bsProfile(p) || strcmp(p.contextId, "new")) return 7;
+    CtTemplate ct;
+    for (uint8_t i = 0; i < p.count; ++i) if (!bsLoadCompiled(i, ct, err)) return 8;
+    const auto &content = LittleFS.files["/bundle/content.bin"];
+    if (content.size() != size + p.count * (17 + 4 + 12 + tplCtSize()) ||
+        memcmp(content.data(), packed, size)) return 9;
+    BsReceipt receipt;
+    if (!bsReceipt(receipt) || receipt.length != size || receipt.crc != v2Crc32(packed, size)) return 10;
+    return 0;
+}
+
 int codex_bundle_store_check(const char *json) {
-    LittleFS.files.clear(); LittleFS.capacity = 1024 * 1024; LittleFS.writeBudget = -1;
+    LittleFS.root.clear();
+    LittleFS.files.clear(); LittleFS.capacity = 2 * 1024 * 1024; LittleFS.writeBudget = -1;
     bsBegin();
     String err;
-    if (!bsInstall(String(json), "codex-status-154g", "epd-ssd1681-200x200-1bpp", "ctx-a", err)) return 1;
+    auto install = [&](const char *ctx) {
+        return bsInstall(String(json), "codex-status-154g", "epd-ssd1681-200x200-1bpp", ctx, err);
+    };
+    if (!install("ctx-a")) return 1;
     BsProfile profile;
     if (!bsHasSource(0) || !bsProfile(profile)) return 2;
     CtTemplate ct;
     if (!bsLoadCompiled(0, ct, err)) return 3;
     const auto original = LittleFS.files;
-    const auto slot = LittleFS.files["/bundle/a.bin"];
-    if (!bsSetActive(0, "ctx-b", err) || LittleFS.files["/bundle/a.bin"] != slot) return 4;
+    const auto content = LittleFS.files["/bundle/content.bin"];
+    if (LittleFS.files.count("/bundle/a.bin") || LittleFS.files.count("/bundle/rx.bin")) return 14;
+    if (!bsSetActive(0, "ctx-b", err) || LittleFS.files["/bundle/content.bin"] != content) return 4;
     if (!bsBegin() || !bsProfile(profile) || strcmp(profile.contextId, "ctx-b")) return 5;
-    // A torn activation record must leave the previous activation usable.
+    // Only a small activation receipt remains atomic. It never copies content.
     const auto activated = LittleFS.files;
     LittleFS.writeBudget = 20;
     if (bsSetActive(0, "ctx-c", err)) return 6;
     LittleFS.writeBudget = -1;
     if (!bsBegin() || !bsProfile(profile) || strcmp(profile.contextId, "ctx-b")) return 7;
 
-    // Measure the write count, then cut power inside the slot, its patched
-    // header, and the final commit record. Always recover the previous bundle.
-    LittleFS.files = original; bsBegin(); LittleFS.writeBudget = 1000000;
-    if (!bsInstall(String(json), "codex-status-154g", "epd-ssd1681-200x200-1bpp", "ctx-new", err)) return 8;
-    long long totalWrites = 1000000 - LittleFS.writeBudget;
-    for (long long cut : {0LL, 128LL, (long long)slot.size(), totalWrites - 1}) {
+    LittleFS.files = original; bsBegin(); LittleFS.writeBudget = 2000000;
+    if (!install("ctx-new")) return 8;
+    long long totalWrites = 2000000 - LittleFS.writeBudget;
+    for (long long cut : {0LL, 128LL, (long long)strlen(json), totalWrites - 1}) {
         LittleFS.files = original; LittleFS.writeBudget = -1; bsBegin();
         LittleFS.writeBudget = cut;
-        if (bsInstall(String(json), "codex-status-154g", "epd-ssd1681-200x200-1bpp", "ctx-new", err)) return 9;
+        if (install("ctx-new")) return 9;
         LittleFS.writeBudget = -1;
-        if (!bsBegin() || !bsProfile(profile) || strcmp(profile.contextId, "ctx-a")) return 10;
+        if (cut < (long long)strlen(json)) { if (!bsBegin() || !bsProfile(profile) || strcmp(profile.contextId, "ctx-a")) return 10; }
+        else if (bsBegin() || bsProfile(profile)) return 10; // replacement failure uses built-in recovery
+        if (!install("ctx-retry") || !bsBegin()) return 15;
     }
+    // A tight filesystem can reuse the existing file's space. An unrelated
+    // file is never reclaimed; exceeding the advisory limit is non-destructive.
     LittleFS.files = activated; bsBegin();
-    LittleFS.capacity = LittleFS.usedBytes() + 10;
-    if (bsInstall(String(json), "codex-status-154g", "epd-ssd1681-200x200-1bpp", "ctx-new", err)) return 11;
-    if (LittleFS.files["/bundle/a.bin"] != slot) return 12;
-    LittleFS.capacity = 1024 * 1024;
-
-    // The current compiled cache is corrupt; rebuild from the independently
-    // checksummed complete source payload retained in that same slot.
-    auto &bytes = LittleFS.files["/bundle/a.bin"];
-    bool found = false;
-    for (size_t i = 0; i + 12 < bytes.size(); ++i) {
-        if (!memcmp(bytes.data() + i, "CTP1", 4)) { bytes[i + 6] ^= 0x40; found = true; break; }
-    }
-    if (!found || !bsLoadCompiled(0, ct, err)) return 13;
+    LittleFS.files["/unrelated"] = std::vector<uint8_t>(1024, 42);
+    LittleFS.capacity = content.size() + strlen(json) + 155000;
+    if (bsMaxBundleBytes() < strlen(json) || !install("ctx-tight")) return 11;
+    if (LittleFS.files["/unrelated"] != std::vector<uint8_t>(1024, 42)) return 12;
+    auto before = LittleFS.files;
+    if (bsStartReceive(uint32_t(bsMaxBundleBytes() + 1), err) || LittleFS.files != before) return 16;
+    LittleFS.capacity = 2 * 1024 * 1024;
+    // Corruption is not permission to restore an older package.
+    LittleFS.files["/bundle/content.bin"].back() ^= 1;
+    if (bsBegin()) return 13;
+    if (!install("ctx-fixed")) return 17;
+    // Convert a real legacy CAB1/SBM1 layout by moving its active slot.
+    const auto current = LittleFS.files["/bundle/content.bin"];
+    const size_t n = strlen(json);
+    std::vector<uint8_t> legacy(130, 0);
+    auto put = [](std::vector<uint8_t> &b, size_t at, uint32_t v) {
+        for (int i=0; i<4; ++i) b[at+i] = uint8_t(v >> (8*i));
+    };
+    put(legacy, 0, 0x31424143); legacy[4] = 1; legacy[7] = 1;
+    bsProfile(profile);
+    memcpy(legacy.data()+8, profile.jobId, BS_JOB_LEN);
+    memcpy(legacy.data()+25, profile.contextId, BS_CTX_LEN);
+    memcpy(legacy.data()+58, profile.firmwareTarget, 32);
+    memcpy(legacy.data()+90, profile.renderTarget, 32);
+    put(legacy, 122, v2Crc32((const uint8_t *)json,n)); put(legacy,126,n);
+    legacy.insert(legacy.end(),current.begin()+n,current.end());
+    legacy.insert(legacy.end(),current.begin(),current.begin()+n);
+    std::vector<uint8_t> meta(138,0);
+    put(meta,0,0x314d4253); put(meta,4,7); meta[10]=1; meta[11]=0x80;
+    put(meta,12,legacy.size()); put(meta,16,v2Crc32(legacy.data(),legacy.size()));
+    memcpy(meta.data()+37, profile.contextId, BS_CTX_LEN);
+    put(meta,134,v2Crc32(meta.data(),134));
+    LittleFS.files.clear(); LittleFS.files["/bundle/a.bin"]=legacy;
+    LittleFS.files["/bundle/m0.bin"]=meta;
+    if (!bsBegin()) return 18;
+    if (!bsLoadCompiled(0,ct,err)) { fprintf(stderr, "legacy load: %s\n", err.c_str()); return 19; }
+    if (LittleFS.files.count("/bundle/a.bin")) return 20;
+    if (LittleFS.files["/bundle/content.bin"] != legacy) return 21;
     return 0;
 }
 
@@ -1507,7 +1591,7 @@ int codex_v2_checkpoint_check() {
 
 int codex_v2_bundle_rx_check() {
     V2BundleRx rx;
-    if (rx.begin("owner", "req", "nonce", 262145, 1, 0)) return 1;
+    if (rx.begin("owner", "req", "nonce", UINT32_MAX, 1, 0)) return 1;
     if (!rx.begin("owner", "req", "nonce", 100, 1, 10)) return 2;
     if (rx.matches("other", "req", "nonce") || rx.matches("owner", "old", "nonce") ||
         rx.matches("owner", "req", "old")) return 3;

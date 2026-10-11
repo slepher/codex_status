@@ -18,7 +18,9 @@ static String         v2AppliedFields;           // bounded last applied Data fi
 
 static V2BundleRx     v2Rx;
 
-static String         v2RxPath = "/bundle/rx.bin";
+static String         v2RxPath = bsReceivePath();
+
+bool bundleUpdating() { return v2Rx.live(clock::v2NowMs()); }
 
 // One activation result per boot session. Expected context prevents delayed
 // commands from activating after a local switch or a subsequent publication.
@@ -33,7 +35,7 @@ static uint32_t v2CommittedCrc = 0, v2CommittedLength = 0;
 
 static void usageCacheSave(const String &json);
 static V2DataDecision applyV2DataAuthorized(const String &body, JsonDocument &peek);
-static void v2BundleError(const char *error);
+static void v2BundleError(const char *error, const char *stage = "receive");
 
 bool usageCacheLoad(String &out) {
     Preferences p;
@@ -135,6 +137,7 @@ bool v2SwitchActive(uint8_t index) {
 }
 
 void nextTemplate() {
+    if (state.bundleMaintenance) return;
     // v2 Bundle: every installed template participates in the key cycle, and a
     // switch generates a new unreusable context (v2 §4/§10).
     if (state.v2BundleReady && state.v2Profile.count > 0) {
@@ -351,9 +354,32 @@ void handleV2Activate() {
           state.v2Profile.contextId, UINT32_MAX);
 }
 
-static void v2BundleError(const char *error) {
-    transport::v2Ack("bundle", "rejected", "unchanged", "flash", error, -1, 0,
-          state.v2Profile.contextId, UINT32_MAX);
+static void v2BundleError(const char *error, const char *stage) {
+    state.bundleError = error ? error : "update_failed";
+    if (state.bundleMaintenance) display::renderCurrent();
+    JsonDocument ack;
+    deserializeJson(ack, v2BuildAck("bundle", "rejected", state.bundleMaintenance ? "failed" : "unchanged", "flash", error, -1, 0,
+          state.v2Profile.contextId, UINT32_MAX, FW_TARGET_ID));
+    ack["stage"] = stage;
+    String body; serializeJson(ack, body);
+    transport::v2Response(200, body);
+}
+
+static void beginBundleReplacement() {
+    // Called after download/CRC/target checks on the loop task, immediately
+    // before replacement. No content renderer may keep old font pointers.
+    state.bundleMaintenance = true;
+    state.v2BundleReady = state.v2CtValid = false;
+    state.v2Profile = BsProfile{};
+    state.activeTplId = state.activeTplJson = "";
+    state.activeTplHasNow = state.activeTplHasMode = false;
+    state.lastUsage = v2AppliedFields = "";
+    state.v2WakeRenderPending = false;
+    state.v2DataSeq.beginContext(clock::v2NowMs(), 1);
+    display::retained.clkPixelsValid = false;
+    rgnReset(display::state.rgnSet);
+    v2ActivateRequest = v2CommittedRequest = "";
+    display::screen({"CONTENT UPDATE", "", "Installing..."});
 }
 
 void handleV2BundleBegin() {
@@ -381,11 +407,14 @@ void handleV2BundleBegin() {
         return;
     }
     if (decision.action == V2_BUNDLE_BEGIN_START) {
-        if (!LittleFS.exists("/bundle")) LittleFS.mkdir("/bundle");
-        File f = LittleFS.open(v2RxPath, "w");
-        if (!f) { v2BundleError("open"); return; }
-        f.close();
+        if (decision.candidate.length > bsMaxBundleBytes()) { v2BundleError("size"); return; }
         v2Rx = decision.candidate;
+        state.bundleError = "";
+        String error;
+        if (!bsStartReceive(decision.candidate.length, error, v2Rx.owner, v2Rx.request)) {
+            v2Rx.deadline = 0;
+            v2BundleError(error.c_str()); return;
+        }
     }
     transport::v2Response(200, String("{\"result\":\"applied\",\"next_offset\":") +
                 String(decision.nextOffset) + "}");
@@ -453,7 +482,7 @@ void handleV2BundleCommit() {
         doc, v2Rx, committed, nonce.c_str(), nowMs, v2RxPath.c_str(),
         bridgeIdFallback.c_str());
     if (decision.action == V2_BUNDLE_COMMIT_REJECT) {
-        v2BundleError(decision.error);
+        v2BundleError(decision.error, "commit_validate");
         return;
     }
     if (decision.action == V2_BUNDLE_COMMIT_REPLAY) {
@@ -481,24 +510,31 @@ void handleV2BundleCommit() {
     File f = LittleFS.open(v2RxPath, "r");
     if (!f || f.size() != decision.length) {
         if (f) f.close();
-        v2BundleError("length");
+        v2BundleError("length", "commit_validate");
         return;
     }
-    if (!bsInstall(f, decision.length, decision.crc, FW_TARGET_ID, RENDER_TARGET_ID, ctx, err)) {
+    if (!bsInstall(f, decision.length, decision.crc, FW_TARGET_ID, RENDER_TARGET_ID, ctx, err, beginBundleReplacement)) {
         f.close();
-        v2BundleError(err.c_str()); return;
+        v2Rx.deadline = 0;
+        // A failed preflight or failed invalidation can still leave old content
+        // intact. Only restore it when the store confirms its current commit.
+        if (bsProfile(state.v2Profile)) {
+            state.v2BundleReady = true;
+            state.bundleMaintenance = !v2ActiveLoad();
+        }
+        v2BundleError(err.c_str(), "install"); return;
     }
     f.close();
     v2CommittedOwner = decision.owner; v2CommittedRequest = decision.request;
     v2CommittedCrc = decision.crc; v2CommittedLength = decision.length;
     v2CommittedContext = ctx;
     v2Rx.deadline = 0;
-    LittleFS.remove(v2RxPath);
     bsProfile(state.v2Profile);
     state.v2BundleReady = true;
+    state.bundleError = "";
     state.v2DataSeq.beginContext(clock::v2NowMs(), 1);
     v2AppliedFields = "";
-    v2ActiveLoad();
+    state.bundleMaintenance = !v2ActiveLoad();
     uint32_t busyBefore = display::retained.rtcEpdBusyFails;
     uint32_t writesBefore = display::state.epdWriteCount;
     display::renderCurrent();

@@ -2,7 +2,7 @@
 
 ## 项目与阅读入口
 
-ESP32-S3 本地渲染墨水屏；Rust/Tauri Bridge 经 `codex app-server` 取数，Wi-Fi HTTP 为主、BLE 为备选。平台使用 CompiledTemplate、完整 A/B Bundle、单一 active context、Bridge 生成的 PowerPlan；Codex 只是 DataSource。
+ESP32-S3 本地渲染墨水屏；Rust/Tauri Bridge 经 `codex app-server` 取数，Wi-Fi HTTP 为主、BLE 为备选。平台使用 CompiledTemplate、单份完整 Bundle（允许临时下载包，覆盖时进入内置界面）、单一 active context、Bridge 生成的 PowerPlan；原生固件 OTA 双槽保留，Codex 只是 DataSource。现场是否已升级以 PROGRESS.md 为准。
 
 - 接手先读 `PROGRESS.md` 当前交接卡；待办唯一来源是 `docs/roadmap/backlog.md`，只查相关条目。导航见 `docs/README.md`，不要通读历史或全部专项。
 - 构建/烧录前读 `docs/agent-operations.md`「构建与工具」；启停/重建 Bridge 前读「Bridge 启停与实例」；运行数据、模板缺省、串口/dump 操作各读其对应节。该文档保留原 AGENTS 操作细则，不需每轮全读。

@@ -6,6 +6,7 @@ static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 extern "C" {
     fn codex_bundle_store_check(bundle: *const std::os::raw::c_char) -> i32;
+    fn codex_bundle_compressed_check(bundle: *const std::os::raw::c_char, packed: *const u8, size: usize) -> i32;
     fn codex_bundle_font_install(bundle: *const std::os::raw::c_char, reset: i32) -> i32;
     fn codex_bundle_font_reboot() -> i32;
 }
@@ -17,7 +18,7 @@ fn firmware_consumes_bridge_binary_and_survives_torn_storage_writes() {
         "../../../../tools/test-bridge/templates/quad.json"
     )).unwrap();
     let compiled = bridge_core::compile::compile(&source, "epd-ssd1681-200x200-1bpp").unwrap();
-    let bundle = json!({
+    let mut bundle = json!({
         "job_id": "job-test", "firmware_target": "codex-status-154g",
         "render_target": "epd-ssd1681-200x200-1bpp", "compiler_abi": bridge_core::compile::COMPILER_ABI,
         "profile": {"template_ids": ["quad"], "initial_active_id": "quad"},
@@ -28,6 +29,12 @@ fn firmware_consumes_bridge_binary_and_survives_torn_storage_writes() {
     let bytes = bridge_core::template::canonical_bytes(&bundle);
     let text = CString::new(bytes).unwrap();
     assert_eq!(unsafe { codex_bundle_store_check(text.as_ptr()) }, 0);
+    // Exceeds both old product limits; storage/streaming, not a 256/512 KiB cap.
+    bundle["resources"] = json!([{"id": "large", "data": "x".repeat(600 * 1024)}]);
+    let large = CString::new(bridge_core::template::canonical_bytes(&bundle)).unwrap();
+    assert_eq!(unsafe { codex_bundle_store_check(large.as_ptr()) }, 0);
+    let packed = bridge_render::bundle_codec::encode(large.as_bytes()).unwrap();
+    assert_eq!(unsafe { codex_bundle_compressed_check(large.as_ptr(), packed.as_ptr(), packed.len()) }, 0);
 }
 
 #[test]
@@ -52,6 +59,9 @@ fn profile_font_is_installed_with_bundle_and_restored_after_boot() {
     let baseline = bridge_render::render_bits(&source.to_string(), "", &bridge_render::Env::default()).unwrap();
     let payload = CString::new(bundle.to_string()).unwrap();
     assert_eq!(unsafe { codex_bundle_font_install(payload.as_ptr(), 1) }, 0);
+    let packed = bridge_render::bundle_codec::encode(payload.as_bytes()).unwrap();
+    println!("Note4 font Bundle: {} -> {} bytes (CSZ1)", payload.as_bytes().len(), packed.len());
+    assert_eq!(unsafe { codex_bundle_compressed_check(payload.as_ptr(), packed.as_ptr(), packed.len()) }, 0);
     let extra_light = bridge_render::render_bits(&source.to_string(), "", &bridge_render::Env::default()).unwrap();
     assert_ne!(baseline, extra_light);
     assert_eq!(unsafe { codex_bundle_font_reboot() }, 0);
@@ -59,6 +69,7 @@ fn profile_font_is_installed_with_bundle_and_restored_after_boot() {
     bundle["fonts"][0]["font_id"] = json!("deadbeef");
     let bad = CString::new(bundle.to_string()).unwrap();
     assert_eq!(unsafe { codex_bundle_font_install(bad.as_ptr(), 0) }, 1);
-    assert_eq!(extra_light, bridge_render::render_bits(&source.to_string(), "", &bridge_render::Env::default()).unwrap());
+    assert_ne!(extra_light, bridge_render::render_bits(&source.to_string(), "", &bridge_render::Env::default()).unwrap());
+    assert_ne!(unsafe { codex_bundle_font_reboot() }, 0);
     bridge_render::font_clear_assets();
 }

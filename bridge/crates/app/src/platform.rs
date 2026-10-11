@@ -1757,6 +1757,12 @@ pub fn caps_from_status(raw: &Value) -> Result<DeviceCapabilities, String> {
         )?,
         max_templates,
         max_bundle_bytes,
+        bundle_compression: checked_u32(raw.get("bundle_compression").and_then(Value::as_u64).unwrap_or(0), "bundle_compression")?,
+        max_bundle_decoded_bytes: raw.get("max_bundle_decoded_bytes").and_then(Value::as_u64).unwrap_or(0),
+        bundle_storage_protocol: checked_u32(
+            raw.get("bundle_storage_protocol").and_then(Value::as_u64).unwrap_or(0),
+            "bundle_storage_protocol",
+        )?,
         bundle_font_protocol: checked_u32(
             raw.get("bundle_font_protocol").and_then(Value::as_u64).unwrap_or(0),
             "bundle_font_protocol",

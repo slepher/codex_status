@@ -20,12 +20,26 @@ use crate::platform::model::{
     DeviceDataContract,
     AuthenticatedStatus, DeviceRecord, FamilyProfile, FieldRequirement, PlanMode, PowerPlan, Profile, PublishState, StatusAttempt,
     SourceSnapshot,
-    Template, TemplateKey, PublishJob, MAX_PROFILE_TEMPLATES,
+    Template, TemplateKey, PublishJob, MAX_PROFILE_TEMPLATES, MAX_BUNDLE_BYTES,
 };
 use crate::platform::store;
 use crate::platform::wifi::{WifiState, Network as WifiNetwork, Job as WifiJob, Snapshot as WifiSnapshot};
 use crate::platform::fonts::{FontLibrary, FontPlan};
 use crate::platform::publish::{FrozenPublish, Capacity, CommittedRefs};
+
+fn freeze_wire(bundle: &Bundle, caps: &DeviceCapabilities) -> Result<Option<String>> {
+    caps.validate()?;
+    let raw = bundle.canonical_bytes()?;
+    let packed = if caps.bundle_compression == 1 {
+        if raw.len() as u64 > caps.max_bundle_decoded_bytes { bail!("bundle exceeds device decoded limit"); }
+        bridge_render::bundle_codec::encode(&raw)
+    } else { None };
+    let length = packed.as_ref().map_or(raw.len(), Vec::len);
+    if length as u64 > caps.bundle_limit() {
+        bail!("bundle wire is {length} bytes, device limit is {}", caps.bundle_limit());
+    }
+    Ok(packed.map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssetJob {
@@ -1160,7 +1174,7 @@ impl PlatformService {
         if record.capabilities.asset_publish_protocol != 1 {
             return Ok(json!({"route": "full_bundle", "render_target": profile.render_target,
                 "profile_order": profile.template_ids, "font_dependencies": fonts,
-                "max_bundle_bytes": record.capabilities.max_bundle_bytes.min(256 * 1024),
+                "max_bundle_bytes": record.capabilities.bundle_limit(),
                 "can_publish_fonts": record.capabilities.bundle_font_protocol == 1,
                 "source_conversion": "unavailable", "note": "CSFN fonts travel inside the complete A/B Bundle when the device advertises bundle_font_protocol 1"}));
         }
@@ -1314,9 +1328,7 @@ impl PlatformService {
             crc: String::new(),
         }
         .seal()?;
-        if u64::from(bundle.total_len) > caps.max_bundle_bytes.min(256 * 1024) {
-            bail!("bundle is {} bytes, device full-bundle limit is {}", bundle.total_len, caps.max_bundle_bytes.min(256 * 1024));
-        }
+        let frozen_wire = freeze_wire(&bundle, &caps)?;
         inner.asset_jobs.remove(&mac);
         let coordinator = inner
             .coordinators
@@ -1326,6 +1338,7 @@ impl PlatformService {
             .enqueue_bundle(bundle, now)
             .map_err(|e| anyhow::anyhow!(e))?;
         coordinator.full_sync_s = profile.full_sync_s.max(60);
+        coordinator.job.as_mut().unwrap().frozen_wire = frozen_wire;
         let summary = coordinator.job_snapshot().unwrap_or(Value::Null);
         inner.jobs.push(summary.clone());
         store::prune(&mut inner.jobs, MAX_JOB_SUMMARIES);
@@ -1341,7 +1354,10 @@ impl PlatformService {
             .get(&mac.to_uppercase())
             .and_then(|c| c.job.as_ref())
             .context("no publish job for device")?;
-        job.frozen_bundle.canonical_bytes()
+        match &job.frozen_wire {
+            Some(encoded) => base64::engine::general_purpose::STANDARD.decode(encoded).context("frozen Bundle wire"),
+            None => job.frozen_bundle.canonical_bytes(),
+        }
     }
 
     /// Bind pre-existing uncommitted Bundles that were frozen before the
@@ -1352,8 +1368,7 @@ impl PlatformService {
         }
         let mut inner = self.inner.lock().unwrap();
         let mac = mac.to_uppercase();
-        let limit = inner.devices.get(&mac).context("unknown device")?
-            .capabilities.max_bundle_bytes.min(256 * 1024);
+        let caps = inner.devices.get(&mac).context("unknown device")?.capabilities.clone();
         let job = inner.coordinators.get_mut(&mac)
             .and_then(|c| c.job.as_mut()).context("no publish job for device")?;
         if job.frozen_bundle.bridge_id == bridge_id {
@@ -1365,9 +1380,7 @@ impl PlatformService {
         let mut bundle = job.frozen_bundle.clone();
         bundle.bridge_id = bridge_id.to_string();
         bundle = bundle.seal()?;
-        if u64::from(bundle.total_len) > limit {
-            bail!("bundle is {} bytes, device full-bundle limit is {limit}", bundle.total_len);
-        }
+        job.frozen_wire = freeze_wire(&bundle, &caps)?;
         job.frozen_bundle = bundle;
         job.updated_at = crate::device_clock::wall_secs(&mac);
         Self::refresh_bundle_history(&mut inner, &mac);
@@ -2276,7 +2289,31 @@ impl PlatformService {
         if let Some(previous)=record.last_authenticated.as_ref() {
             if previous.body["boot_id"]==status["boot_id"] && previous.body["status_seq"].as_u64().zip(status["status_seq"].as_u64()).is_some_and(|(old,new)|new<old){bail!("stale_device_status");}
         }
+        let storage_capacity = match status.get("bundle_storage_protocol") {
+            Some(value) => {
+                let protocol = value.as_u64().filter(|v| *v <= 2)
+                    .context("unsupported bundle_storage_protocol")? as u32;
+                let limit = status["max_bundle_bytes"].as_u64()
+                    .filter(|v| *v <= crate::platform::model::MAX_BUNDLE_BYTES as u64)
+                    .context("invalid dynamic Bundle capacity")?;
+                Some((protocol, limit))
+            }
+            None => None,
+        };
+        let compression_capacity = if transport == "http" || status.get("bundle_compression").is_some() {
+            let protocol = status.get("bundle_compression").map(|v| v.as_u64().filter(|n| *n <= 1)
+                .context("unsupported bundle_compression")).transpose()?.unwrap_or(0) as u32;
+            let decoded = if protocol == 1 {
+                if storage_capacity.map_or(record.capabilities.bundle_storage_protocol, |(v, _)| v) != 2 {
+                    bail!("Bundle compression requires single-copy storage");
+                }
+                status["max_bundle_decoded_bytes"].as_u64()
+                    .filter(|n| *n > 0 && *n <= MAX_BUNDLE_BYTES as u64).context("invalid Bundle decoded limit")?
+            } else { 0 };
+            Some((protocol, decoded))
+        } else { None };
         let contract = match status.get("data_contract").filter(|value| !value.is_null()) {
+            _ if status["configured"] == false => None,
             Some(value) => {
                 let table: DeviceDataContract = serde_json::from_value(value.clone())?;
                 table.validate(&record.capabilities)?;
@@ -2299,6 +2336,14 @@ impl PlatformService {
         let contract_changed = record.data_contract != contract ||
             record.observed.active_template_id.as_deref() != Some(reported);
         if let Some(record) = inner.devices.get_mut(&mac) {
+            if let Some((protocol, limit)) = storage_capacity {
+                record.capabilities.bundle_storage_protocol = protocol;
+                record.capabilities.max_bundle_bytes = limit;
+            }
+            if let Some((protocol, decoded)) = compression_capacity {
+                record.capabilities.bundle_compression = protocol;
+                record.capabilities.max_bundle_decoded_bytes = decoded;
+            }
             record.data_contract = contract;
             record.last_authenticated_contact_at = Some(now);
             record.observed.observed_at = Some(now);
@@ -2334,6 +2379,14 @@ impl PlatformService {
                 .map(str::to_string);
         }
         if let Some(c) = inner.coordinators.get_mut(&mac) {
+            if let Some((protocol, limit)) = storage_capacity {
+                c.caps.bundle_storage_protocol = protocol;
+                c.caps.max_bundle_bytes = limit;
+            }
+            if let Some((protocol, decoded)) = compression_capacity {
+                c.caps.bundle_compression = protocol;
+                c.caps.max_bundle_decoded_bytes = decoded;
+            }
             c.note_status(status, now);
             if let Some(seq) = c.session.data_seq.or(c.session.applied_seq) {
                 if let Some(context) = c.context.as_mut() {
@@ -3466,6 +3519,38 @@ mod tests {
     }
 
     #[test]
+    fn single_copy_status_refreshes_capacity_and_clears_contract_in_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = PlatformService::open(dir.path()).unwrap();
+        let mac = "AABBCCDDEEFF";
+        let mut caps = DeviceCapabilities::ssd1681_154g();
+        caps.max_bundle_bytes = 800_000;
+        assert_eq!(caps.bundle_limit(), 256 * 1024); // old firmware stays bounded
+        svc.device_upsert(DeviceIdentity::new(mac, "Test").unwrap(), caps).unwrap();
+        let mut status = json!({"device_mac":mac,"configured":true,
+            "bundle_storage_protocol":2,"max_bundle_bytes":700_000,
+            "bundle_compression":1,"max_bundle_decoded_bytes":2*1024*1024,
+            "active_context_id":"ctx-a","active_template_id":"quad",
+            "data_contract":{"template_id":"quad","compiler_abi":2,"source_crc":"12345678",
+                "requirements":[{"index":0,"field":"account.plan","kind":"text","missing":"hide","local":false}]}});
+        svc.note_device_status_at(mac, &status, "http", 100).unwrap();
+        assert_eq!(svc.inner.lock().unwrap().devices[mac].capabilities.bundle_limit(), 700_000);
+        assert_eq!(svc.inner.lock().unwrap().devices[mac].capabilities.bundle_compression, 1);
+        status["configured"] = json!(false);
+        status["max_bundle_bytes"] = json!(0);
+        status["data_contract"] = Value::Null;
+        status["active_context_id"] = json!(""); status["active_template_id"] = json!("");
+        svc.note_device_status_at(mac, &status, "http", 101).unwrap();
+        assert!(svc.device_get(mac).unwrap()["data_contract"].is_null());
+        assert_eq!(svc.inner.lock().unwrap().devices[mac].capabilities.bundle_limit(), 0);
+        status["bundle_compression"] = json!(99);
+        assert!(svc.note_device_status_at(mac, &status, "http", 102).is_err());
+        status["bundle_compression"] = json!(1);
+        status["bundle_storage_protocol"] = json!(99);
+        assert!(svc.note_device_status_at(mac, &status, "http", 102).is_err());
+    }
+
+    #[test]
     fn device_contract_ignores_local_drafts_and_expires_on_ble_context_switch() {
         let dir = tempfile::tempdir().unwrap();
         let svc = PlatformService::open(dir.path()).unwrap();
@@ -4065,6 +4150,33 @@ mod tests {
         let summary = persisted.jobs.iter().find(|entry| entry["job_id"] == job["job_id"]).unwrap();
         assert_eq!(summary["state"], "succeeded");
         assert_eq!(summary["crc"], expected_crc);
+    }
+
+    #[test]
+    fn compressed_publish_uses_wire_capacity_and_freezes_across_capability_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = service_with_device(dir.path());
+        let mac = "AA:BB:CC:DD:EE:FF";
+        {
+            let mut inner = svc.inner.lock().unwrap();
+            let caps = &mut inner.devices.get_mut(mac).unwrap().capabilities;
+            caps.bundle_storage_protocol = 2;
+            caps.bundle_compression = 1;
+            caps.max_bundle_decoded_bytes = 1024*1024;
+            caps.max_bundle_bytes = 8192;
+        }
+        svc.template_save("quad", "epd-ssd1681-200x200-1bpp", &quad_source(), 1000).unwrap();
+        let mut profile = Profile::draft(mac);
+        profile.template_ids = vec!["quad".into()];
+        svc.profile_save(profile, 1000).unwrap();
+        svc.publish(mac, 1000).unwrap();
+        let wire = svc.bundle_payload(mac).unwrap();
+        assert!(wire.starts_with(b"CSZ1") && wire.len() < 8192);
+        assert!(bridge_render::bundle_codec::decode(&wire, 1024*1024).unwrap().len() > 8192);
+        drop(svc);
+        let resumed = PlatformService::open(dir.path()).unwrap();
+        resumed.inner.lock().unwrap().devices.get_mut(mac).unwrap().capabilities.bundle_compression = 0;
+        assert_eq!(resumed.bundle_payload(mac).unwrap(), wire);
     }
 
     #[test]

@@ -17,7 +17,7 @@ use crate::platform::model::DeviceIdentity;
 use serde_json::{json, Value};
 
 pub const BUNDLE_CHUNK_BYTES: usize = 4048;
-const MAX_BUNDLE_BYTES: usize = 262_144;
+const MAX_BUNDLE_BYTES: usize = crate::platform::model::MAX_BUNDLE_BYTES;
 
 #[derive(Debug)]
 pub struct HttpStatus(pub u16);
@@ -623,7 +623,10 @@ pub fn install_bundle(
     let chunk_bytes = chunk_bytes.clamp(256, BUNDLE_CHUNK_BYTES);
     let (nonce, device_mac) = session_nonce(ip, token, expected_mac, timeout)?;
     let content_crc = format!("{:08x}", crc32fast::hash(payload));
-    let bundle: Value = serde_json::from_slice(payload).context("bundle JSON")?;
+    // Service freezes CSZ1 bytes at publish time; retries send those exact bytes.
+    let decoded = bridge_render::bundle_codec::decode(payload, 16 * 1024 * 1024)
+        .map_err(|e| anyhow::anyhow!("bundle encoding: {e}"))?;
+    let bundle: Value = serde_json::from_slice(&decoded).context("bundle JSON")?;
     let job_id = bundle["job_id"].as_str().filter(|s| !s.is_empty())
         .context("bundle job_id")?;
     let request_id = format!("bundle-{job_id}");

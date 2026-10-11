@@ -1199,7 +1199,10 @@ async fn public_status(State(state): State<SimState>) -> Response {
         "height": if note4 {300} else {200},
         "pixel_format": "1bpp", "colors": "bw", "partial": true,
         "hardware_verified": false,
-        "max_templates": 8, "max_bundle_bytes": 262144,
+        "max_templates": 8, "max_bundle_bytes": bundle["max_bundle_bytes"],
+        "bundle_storage_protocol": 2,
+        "bundle_compression": 1,
+        "max_bundle_decoded_bytes": bundle["max_bundle_decoded_bytes"],
         "asset_publish_protocol": 0,
         "free_bytes": bundle["free_bytes"],
         "uptime_s": clock.monotonic_ms.saturating_sub(boot_ms) / 1000,
@@ -1441,6 +1444,10 @@ async fn status_impl(state: SimState, request: Request<Body>, gate: bool) -> Res
                 vec!["sha256-running-prefix-v1"]
             } else { vec![] });
             status["sync"] = sync;
+            status["bundle_storage_protocol"] = json!(2);
+            status["bundle_compression"] = json!(1);
+            status["max_bundle_decoded_bytes"] = bundle["max_bundle_decoded_bytes"].clone();
+            status["max_bundle_bytes"] = bundle["max_bundle_bytes"].clone();
             let padding = *state.status_padding_bytes.lock().unwrap();
             if padding > 0 { status["synthetic_status_padding"] = json!("x".repeat(padding)); }
             status["sync"]["phase"] = json!(if power.sync_open {"WIFI_SYNC_ONCE"}
