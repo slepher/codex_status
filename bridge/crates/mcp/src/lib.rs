@@ -588,13 +588,15 @@ fn env_from_args(args: &Value) -> bridge_render::Env<'static> {
             .get("battery")
             .and_then(|v| v.as_i64())
             .unwrap_or(bridge_render::DEFAULT_BATTERY as i64) as i32,
-        state: Box::leak(
-            args.get("state")
+        wifi_state: Box::leak(
+            args.get("wifi_state")
                 .and_then(|v| v.as_str())
-                .unwrap_or("BLE OFF")
+                .unwrap_or("connected")
                 .to_string()
                 .into_boxed_str(),
         ),
+        wifi_blink: args.get("wifi_blink").and_then(Value::as_i64).unwrap_or(-1) as i32,
+        ble_manual_active: args.get("ble_manual_active").and_then(Value::as_i64).unwrap_or(0) != 0,
         offline_mins: args
             .get("offline_mins")
             .and_then(|v| v.as_i64())
@@ -633,7 +635,9 @@ fn tool_definitions() -> Value {
                     "ip": {"type": "string"},
                     "sync_hhmm": {"type": "string"},
                     "battery": {"type": "integer"},
-                    "state": {"type": "string", "description": "设备状态字：AP / BLE ON / BLE OFF / WIFI OFF"},
+                    "wifi_state": {"type": "string", "enum": ["idle", "connecting", "connected", "off"]},
+                    "wifi_blink": {"type": "integer", "enum": [-1, 0, 1]},
+                    "ble_manual_active": {"type": "integer", "enum": [0, 1]},
                     "offline_mins": {"type": "integer", "description": "距上次成功同步的分钟数；负数表示未知（隐藏）"}
                 },
                 "required": ["json"],
