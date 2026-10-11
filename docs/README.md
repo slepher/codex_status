@@ -20,6 +20,7 @@
 | 判断历史协议哪些已过期、哪些遗漏或仍是草案 | [bridge-device-protocol-history-audit.md](bridge-device-protocol-history-audit.md)（定向历史对账，当前源码/现场交叉核对） |
 | 查同父目录 Slate 的协议参考及适用边界 | [bridge-device-slate-protocol-comparison.md](bridge-device-slate-protocol-comparison.md)（schema、错误、摘要、生命周期；只读比较） |
 | 查 CUKTECH 控制器与 AP01 ROM 对当前平台的价值 | [cuktech-ap01-repository-value-analysis.md](cuktech-ap01-repository-value-analysis.md)（三仓库对照、可复用接口、显示交接、完整接入成本） |
+| 查 AP01 逆向、首次安装、资源预算与应用 OTA | [AP01 研究入口](../project-workflow/ap01/README.md)（本仓库维护；第三方克隆只读参考） |
 | 改电源/唤醒/占用 | `docs/power-state.md` + `docs/generic-display-platform-design.md` §7 |
 | 改休眠设备的状态页、模板/OTA 延后投递 | `docs/generic-display-platform-design.md` + `project-workflow/sleep-aware-bridge/design.md` / `task.md` |
 | 实施 PowerPlan 与 Data 同轮联合下发 | `project-workflow/bridge-macos/powerplan-data-execution-plan.md`（P1–P6；仅计划，待办 A9） |

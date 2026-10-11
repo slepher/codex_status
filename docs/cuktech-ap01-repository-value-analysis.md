@@ -1,16 +1,16 @@
 # CUKTECH 控制器与 AP01 ROM 对当前项目的价值
 
-2026-10-11。结论：`cuktech-screen-controller` 对 AP01 原厂接口复用和显示交接有较高价值，对当前 Note4 的业务协议价值有限；应结合 `cuktech-ap01-firmware-tools` 的现有接入设计使用。AP01 完整接入仍需新增设备端服务、认证绑定、持久存储和显示适配，图片下载方案只能验证显示路径。
+2026-10-12 文档复核。结论：`cuktech-screen-controller` 对 AP01 原厂接口复用和显示交接有较高价值，对当前 Note4 的业务协议价值有限；应结合本仓库的 AP01 接入设计使用。AP01 完整接入仍需新增设备端服务、认证绑定、持久存储和显示适配，图片下载方案只能验证显示路径。
 
 ## 对照版本与三者关系
 
 | 仓库 | 本次基线 | 主要职责 |
 | --- | --- | --- |
 | [cuktech-screen-controller](https://github.com/wqytommy666/cuktech-screen-controller/tree/87db85df0075e1e07de03e9f7a9576c6e663d291) | `87db85df0075e1e07de03e9f7a9576c6e663d291`，已克隆到同父目录 | 电脑采集额度、生成图片；AP01 下载图片到内存文件并显示；另有首次安装工具和双平台桌面界面 |
-| [cuktech-ap01-firmware-tools](https://github.com/andy-JustSayWhen/cuktech-ap01-firmware-tools/tree/3bd98a8ca4fb35a9f8869121b13961d405b16dff) | `3bd98a8ca4fb35a9f8869121b13961d405b16dff`，另有本地分析文件 | 原厂固件逆向、修改包制作与安装、四页看板，以及接入当前 Bridge 的设计和资源试算 |
-| 当前 `codex_status` | `02f096506fe833187415b800192fcbe85d74c638`，工作区有未提交改动 | 多数据源、设备本地编译模板、完整 A/B Bundle、活动上下文、显式发布、设备认证及 PowerPlan |
+| [cuktech-ap01-firmware-tools](https://github.com/andy-JustSayWhen/cuktech-ap01-firmware-tools/tree/3bd98a8ca4fb35a9f8869121b13961d405b16dff) | `3bd98a8ca4fb35a9f8869121b13961d405b16dff`，仅作为只读上游参考 | 原厂固件修改包制作与安装、四页看板；本项目接入研究见下方本地文档 |
+| 当前 `codex_status` | 2026-10-12 本地源码复核；候选与部署版本以 [PROGRESS](../PROGRESS.md) 为准 | 多数据源、设备本地编译模板、完整单份 Bundle、下载暂存、活动上下文、显式发布、设备认证及 PowerPlan |
 
-ROM 仓库已经引用控制器，并在[许可说明](../../cuktech-ap01-firmware-tools/开源项目引用与许可.md)登记所参考的旧版本 `c3ac158…`。因此两者不是两份独立验证材料；新克隆可用于核对当前控制器实现和后续差异，但本次没有逐提交审查旧引用版本到当前版本的全部变化。ROM 仓库本地的[接入预算](../../cuktech-ap01-firmware-tools/reference/DESIGN/AP01-Bridge接入与资源预算.md)和[逆向报告](../../cuktech-ap01-firmware-tools/project-workflow/bridge-port-analysis/report.md)比其简短 README 更能说明接入当前项目的实际进度。
+ROM 仓库已经引用控制器，并在[许可说明](https://github.com/andy-JustSayWhen/cuktech-ap01-firmware-tools/blob/3bd98a8ca4fb35a9f8869121b13961d405b16dff/%E5%BC%80%E6%BA%90%E9%A1%B9%E7%9B%AE%E5%BC%95%E7%94%A8%E4%B8%8E%E8%AE%B8%E5%8F%AF.md)登记所参考的旧版本 `c3ac158…`。因此两者不是两份独立验证材料；新克隆可用于核对当前控制器实现和后续差异，但本次没有逐提交审查旧引用版本到当前版本的全部变化。本仓库的[接入预算](../project-workflow/ap01/design.md)和[逆向报告](../project-workflow/ap01/report.md)比其简短 README 更能说明接入当前项目的实际进度。
 
 控制器走“电脑画完整图片 → AP01 主动下载 → 原厂图形库解码”；ROM 仓库的四页看板走“电脑生成四页结果包 → AP01 下载并按旋钮切页”；当前项目走“Bridge 发布模板和资源 → 设备接收字段快照 → 设备本地绘制”。三者可以共享原厂接口证据和数据源经验，显示产物与业务协议并不兼容。
 
@@ -42,7 +42,7 @@ ROM 仓库已经引用控制器，并在[许可说明](../../cuktech-ap01-firmwa
 
 ## 与现有 AP01 ROM 的差异
 
-ROM 仓库[结果包实现](../../cuktech-ap01-firmware-tools/features/agents_dashboard/result_package.py)使用 APAG v2：64 字节包头、固定四页、单页最多 96 KiB、整包最多 384 KiB，带长度与校验。其[设备加载器](../../cuktech-ap01-firmware-tools/features/agents_dashboard_firmware/result_loader.c)进一步检查页面和校验，并处理原厂页面与旋钮行为。它比单图片入口更接近完整内容发布，但仍是四页远程生成结果，不是当前项目的 1–8 个设备本地模板。
+ROM 仓库[结果包实现](https://github.com/andy-JustSayWhen/cuktech-ap01-firmware-tools/blob/3bd98a8ca4fb35a9f8869121b13961d405b16dff/features/agents_dashboard/result_package.py)使用 APAG v2：64 字节包头、固定四页、单页最多 96 KiB、整包最多 384 KiB，带长度与校验。其[设备加载器](https://github.com/andy-JustSayWhen/cuktech-ap01-firmware-tools/blob/3bd98a8ca4fb35a9f8869121b13961d405b16dff/features/agents_dashboard_firmware/result_loader.c)进一步检查页面和校验，并处理原厂页面与旋钮行为。它比单图片入口更接近完整内容发布，但仍是四页远程生成结果，不是当前项目的 1–8 个设备本地模板。
 
 当前[HTTP 帧实现](../bridge/crates/core/src/compact_frame.rs)已有 48 字节信封和 4096 字节单帧上限，以及会话、请求编号、上下文和分块提交操作。APAG 大包和 `/screen.gif` 都不能直接交给此接口，也不能用一次 HTTP 200 作为 Bundle 安装完成。控制器的图片读取接口没有当前平台的设备身份、端点令牌、owner 和事务校验。
 
@@ -50,23 +50,29 @@ ROM 仓库[结果包实现](../../cuktech-ap01-firmware-tools/features/agents_da
 
 ## 完整接入的主要成本
 
-ROM 仓库现有设计选择 AP01 供电期间 Wi-Fi 常驻、米家管理网络、BLE 只用于 Bridge 安全绑定。业务断网后不转 BLE 传送数据。这是该目标的接入设计，尚非当前 Bridge 已实现的能力；不能复制 Note4 的限时会合和休眠策略，也不能从控制器每五分钟下载推导正式 PowerPlan。
+本仓库接入设计选择 AP01 供电期间 Wi-Fi 常驻、米家管理网络、BLE 只用于 Bridge 安全绑定。业务断网后不转 BLE 传送数据。这是该目标的接入设计，尚非当前 Bridge 已实现的能力；不能复制 Note4 的限时会合和休眠策略，也不能从控制器每五分钟下载推导正式 PowerPlan。
 
 | 成本 | 当前依据 | 仍需解决 |
 | --- | --- | --- |
 | 设备服务与认证 | 原厂客户端下载已找到；当前 Bridge 主动访问设备 | 设备 HTTP 服务入口、绑定凭据发放、MAC 校验、显式 claim、租约、重放防护和结构化错误 |
 | 320×240 显示目标 | 当前能力校验只认 200×200 与 400×300 | 新目标、编译画布、字体验证、共享绘制及设备输出；仅增加目标字符串不足够 |
-| 持久存储 | 0031 静态分区分析报告 `/data` 为 64 KiB；当前 Bundle 上限 256 KiB | 两份完整包、原厂数据共存、事务记录、掉电恢复；不能把内存图片文件当持久仓库 |
-| 常驻与峰值内存 | ROM 预算建议新增常驻约 160–400 KiB、安装恢复峰值 384–768 KiB | 真机空闲堆、最大连续块、栈和网络/图形库峰值；预算是目标，不是运行测量 |
+| 持久存储 | 0031 静态配置 `/data` 为 64 KiB、`/resource` 为 1.25 MiB，实际空闲未知；Bundle 按设备报告动态准入 | 一份已安装内容加下载暂存、原厂数据共存、事务记录与内置恢复；下载前不能把旧内容算作可回收空间 |
+| 常驻与峰值内存 | 早期 256 KiB 正文样例估算新增常驻约 160–400 KiB、安装恢复峰值 384–768 KiB | 按实际字体、编译缓存、解压器重算，并测空闲堆、最大连续块、栈和网络/图形库峰值；样例不是动态大包的保证 |
 | 代码与运行时 | 当前已分析注入空间约 59.5 KiB；现有载荷链接布局主要放代码和常量 | 扩展代码空间、可写状态初始化、C++ 运行支持及任务启动，不可直接链接全部现有固件源码 |
 
-320×240 单色画面每帧 9,600 字节，两帧 19,200 字节；完整 RGB565 彩色帧每帧 153,600 字节。初版沿用单色模板、分行转换到彩色屏有节省内存的依据，但最终显示接口是否支持这种提交方式仍需验证。
+320×240 单色画面每帧 9,600 字节，两帧 19,200 字节；完整 RGB565 彩色帧每帧 153,600 字节。初版沿用单色模板、分行转换到彩色屏有节省内存的依据，但最终显示接口是否支持这种提交方式仍需验证。显示帧缓冲和上游图片轮转用于绘制交接，与项目自管内容的持久更新策略分别核算。
 
 控制器[兼容记录](../../cuktech-screen-controller/docs/AP01_FIRMWARE_STATUS.md)说明 0031 可用其安装路径，0041 拒绝当前未签名加载器且已知路径不能降级。这是作者记录，不能推广为任意 AP01 出厂版本或当前可刷状态；传输中继也不能解决设备验签。
 
+## 当前更新与协议要求
+
+更新顺序引用 [C9 单份更新设计](../project-workflow/single-copy-updates/design.md)：旧应用在下载及预检期间继续运行，完成后进入内置界面、停止并覆盖；覆盖失败通过稳定底座接受认证重传。原生固件 OTA 双槽保留。Note4 的单份存储、动态容量与 CSZ1 分块压缩已有 [部署记录](../project-workflow/single-copy-updates/status.md)，AP01 解压接口和独立应用加载仍待实现。
+
+接入时按 [当前协议](bridge-device-protocol.md) 核对认证状态、设备报告的数据合同和原事务回执。传输容量与解压后处理容量分别由设备报告；历史 256 KiB 是兼容上限或预算样例。当前源码已支持随 Bundle 下发的 CSFN v2 字体及 UTF-8 文本，候选与实机验证情况见 [字体专项](../project-workflow/bridge-macos/release-fonts-status.md)；AP01 须适配并声明能力，不能直接视为已支持。
+
 ## 建议采用方式
 
-保持 ROM 仓库已有的完整接入方向，把新克隆作为原厂接口与实现参考：先交叉核对网络、任务启动和显示线程调用，再完成认证状态与帧协议，随后接本地绘制和完整 Bundle。完整接入顺序、资源测量和实机验证沿用 ROM 仓库的接入设计；本次不另立一份实施待办。
+保持本仓库 AP01 设计的完整接入方向，把新克隆作为原厂接口与实现参考：先交叉核对网络、任务启动和显示线程调用，再完成认证状态与帧协议，随后接本地绘制和完整 Bundle。完整接入顺序、资源测量和实机验证沿用本仓库的接入设计；本次不另立一份实施待办。
 
 若只需短期验证 AP01 能显示当前 Bridge 的画面，可以另行设计电脑渲染图片的展示实验，但它不覆盖本地模板、按键切换、设备身份、持久提交和 PowerPlan 验收。控制器默认服务端口也是 8765，与当前运行 Bridge 冲突，后续实验必须使用独立端口。
 
@@ -74,4 +80,4 @@ MIT 许可允许复用，但复制代码或实质内容须保留作者和许可�
 
 ## 本次验证范围
 
-已完成同父目录完整克隆、提交和远端核对，以及三仓库相关源码与设计对照。未构建、未安装依赖、未启动新服务、未读取设备账号、未连接或刷写设备；上述判断属于源码和设计分析，实机容量、显示与恢复能力以 ROM 专项后续证据为准。
+已完成同父目录完整克隆、提交和远端核对，以及三仓库相关源码与设计对照。未构建、未安装依赖、未启动新服务、未读取设备账号、未连接或刷写设备；上述判断属于源码和设计分析，实机容量、显示与恢复能力以本仓库 AP01 专项后续证据为准。

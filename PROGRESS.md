@@ -1,6 +1,6 @@
 # Codex Status 当前交接
 
-更新时间：2026-10-11 23:12（香港时间）
+更新时间：2026-10-12（香港时间；AP01 研究成果迁入）
 
 ## 部署与工作区
 
@@ -13,6 +13,8 @@
 - **未部署 Note4 0.18.84-note4**：`artifacts/release-fonts-20261011/codex-status-0.18.84-note4.bin`，1,838,880 B，SHA256 `7a2e009a512111660a1e51168bcf880075c554be664f7b5682d7c12037847b94`。
 - **未部署 1.54 0.18.36-bw**：`artifacts/release-fonts-20261011/codex-status-0.18.36-bw.bin`，1,820,816 B，SHA256 `285fc9051e855de9ff9b05ab48473cc015ef140879ca84909e28c76f5d3b31b6`。
 - 两份候选同名 json/USB zip 保存匹配 ELF、分区和哈希。完整回归 309 passed / 3 ignored；最终字体专项 19 项通过；两 ROM 各 64 项 Wi-Fi 栈门禁通过；中文 JSON/CT/序列化恢复像素差 0。最终隔离目标 Note4。资源、ELF 哈希及主 agent 精读结论见[本轮状态](project-workflow/bridge-macos/release-fonts-status.md)与[审查](project-workflow/bridge-macos/release-fonts-review.md)。
+
+- C9/AP01：逆向报告、接入设计、知识记录及分析脚本迁入本仓库，[研究入口](project-workflow/ap01/README.md)。单份更新要求已同步；原始证据保留于 artifacts/ap01-research，第三方克隆仅作只读来源。迁移验证见[记录](project-workflow/ap01/migration.md)，无构建或设备操作。
 
 ## 风险与下一步
 
