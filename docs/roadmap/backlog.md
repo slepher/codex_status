@@ -111,6 +111,8 @@
 
 ### A9. PowerPlan 与 Data 同轮联合下发（2026-10-05）
 
+- **2026-10-11 22:09配套部署完成与恢复缺口**：最新.83哈希/v5/最终Bridge均认证核验，见PROGRESS与[部署记录](../../project-workflow/bridge-macos/device-fields-deploy-20261011.md)。新Bridge拒绝旧设备合同，需先交接有效模板；本次原Bridge完成交接后恢复新版。BLE网络准入提前把Bundle标Sending、重启变Unknown后挡住OTA且不自动查询原BEGIN；本次按原ID/冻结字节查询并续传成功。后续补发送前与未知结果恢复，不以本次人工闭环代替自动恢复验收。
+
 - **2026-10-11 当前设备字段收敛（候选未部署）**：删除模板 `device.state` 兼容，使用独立 Wi-Fi/BLE/mode 字段；已持久化 CT 在加载时校验未知绑定、编号一致性和字符串边界，失效进入内置恢复界面，保留文件直到显式发布替换。[实施与回归](../../project-workflow/bridge-macos/device-fields-only-20261011.md)。实际 v4 模板升级前须配套准备有效 v5 Bundle，不以宿主测试代替实机验收。
 
 - **2026-10-11 BOOT网络/图标修正候选（未部署，关联B6/C8）**：Bridge失败不拆除已有Wi-Fi关联，BOOT/正式/临时期限不变；presence反向验证待定不冒充不可达；Bridge明确错误立即OFF；真实布局v5模板使Wi-Fi与BLE独立；boot_id与会话nonce分离，补正常事件诊断。[实现、Luna回归与主agent审查](../../project-workflow/bridge-macos/boot-network-fix-20261011.md)。未刷机/未发布模板，实体RF/EPD/重连矩阵仍待验，不结项。当前实际部署为.83+配套Bridge，以PROGRESS为准，下方“未部署/.82”仅为当时记录。

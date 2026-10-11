@@ -67,7 +67,7 @@ git diff --check                   # 提交前必查
 
 ## 模板缺省显示
 
-- 2026-10-11最新字段候选：device.state已退役，JSON/持久CT/Bridge/预览均拒绝，不自动兼容；只使用wifi_state、wifi_blink、ble_manual_active、mode等独立字段。旧已安装模板加载不支持时进入内置恢复并报告content_error，文件保留，需显式发布替换。模板候选为quad v14、Note4 codex-status-a v5；现场仍v4，暂不刷固件/发布，见PROGRESS。
+- 2026-10-11最新字段候选：device.state已退役，JSON/持久CT/Bridge/预览均拒绝，不自动兼容；只使用wifi_state、wifi_blink、ble_manual_active、mode等独立字段。旧已安装模板加载不支持时进入内置恢复并报告content_error，文件保留，需显式发布替换。模板为quad v14、Note4 codex-status-a v5；2026-10-11 22:09 Note4新.83镜像、实际v5与配套Bridge已部署并认证核验，见PROGRESS。旧合同升级需先交接有效模板，再切最终Bridge。
 
 - Note4 .81新增本地数值绑定 `device.ble_manual_active=0/1`：图标只表示手动GATT窗口，自动BLE和实际射频状态另记。实际codex-status-a v4已发布（保留用户原布局）；仓库夹具不能直接替代实际模板。数据字段表在同名模板发布后也可能变化，Bridge须认证回读新data_contract再发Data。
 
