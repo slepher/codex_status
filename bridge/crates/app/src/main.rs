@@ -266,6 +266,7 @@ struct AppCtx {
     envelope: Arc<RwLock<Option<Value>>>,
     library: Arc<RwLock<Library>>,
     force_ble: Arc<Notify>,
+    ota_work: Arc<Notify>,
     device_delivery: tokio::sync::Mutex<()>,
     sim_control: tokio::sync::Mutex<()>,
     per_mac_delivery: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -3275,7 +3276,10 @@ async fn refresh_http_status(ctx: &Arc<AppCtx>, mac: &str, ip: &str) {
 async fn device_status_poll_loop(ctx: Arc<AppCtx>) {
     let mut last_status = std::collections::HashMap::<String,tokio::time::Instant>::new();
     loop {
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(10)) => {},
+            _ = ctx.ota_work.notified() => {},
+        }
         if ctx.status.lock().unwrap().paused {
             continue;
         }
@@ -3292,6 +3296,10 @@ async fn device_status_poll_loop(ctx: Arc<AppCtx>) {
             // No inferred endpoint: the registered identity must carry an IP,
             // and the shared endpoint token must be present.
             if platform::device_link_for_mac(&ctx, &mac).is_none() {
+                continue;
+            }
+            if device["ota_job"]["state"] == "awaiting_confirmation" {
+                platform::refresh_status(&ctx, &mac).await;
                 continue;
             }
             let pending = device["ota_job"]["state"] == "queued"
@@ -3724,6 +3732,7 @@ fn main() {
         envelope: Arc::new(RwLock::new(None)),
         library: Arc::new(RwLock::new(library)),
         force_ble: Arc::new(Notify::new()),
+        ota_work: Arc::new(Notify::new()),
         device_delivery: tokio::sync::Mutex::new(()),
         sim_control: tokio::sync::Mutex::new(()),
         per_mac_delivery: Mutex::new(HashMap::new()),

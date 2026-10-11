@@ -24,6 +24,7 @@ class String {
 public:
     String() = default;
     String(const char *s) : s_(s ? s : "") {}
+    String(const char *s, size_t n) : s_(s, n) {}
     String(const std::string &s) : s_(s) {}
     String(char c) : s_(1, c) {}
     String(int v) { char b[32]; std::snprintf(b, sizeof(b), "%d", v); s_ = b; }

@@ -37,6 +37,7 @@ struct Job {
     state: String,
     wifi_state: String,
     wifi_blink: i32,
+    ble_manual_active: bool,
     offline_mins: i32,
     mode: String,
     blob: Vec<u8>,
@@ -209,6 +210,7 @@ fn run_job(job: &Job, out: &mut [u8], message: &mut String) -> i32 {
                 state.as_ptr(),
                 wifi_state.as_ptr(),
                 job.wifi_blink,
+                i32::from(job.ble_manual_active),
                 job.offline_mins,
                 mode.as_ptr(),
                 out.as_mut_ptr(),
@@ -231,6 +233,7 @@ fn run_job(job: &Job, out: &mut [u8], message: &mut String) -> i32 {
             state.as_ptr(),
             wifi_state.as_ptr(),
             job.wifi_blink,
+            i32::from(job.ble_manual_active),
             job.offline_mins,
             mode.as_ptr(),
             out.as_mut_ptr(),
@@ -275,6 +278,7 @@ fn base_job(template: &str, env: &Env<'_>) -> Job {
         state: env.state.to_string(),
         wifi_state: env.wifi_state.to_string(),
         wifi_blink: env.wifi_blink,
+        ble_manual_active: env.ble_manual_active,
         offline_mins: env.offline_mins,
         mode: env.mode.to_string(),
         blob: Vec::new(),
@@ -494,6 +498,7 @@ extern "C" {
         state: *const c_char,
         wifi_state: *const c_char,
         wifi_blink: c_int,
+        ble_manual: c_int,
         offline_mins: c_int,
         mode: *const c_char,
         out: *mut u8,
@@ -510,6 +515,7 @@ extern "C" {
         state: *const c_char,
         wifi_state: *const c_char,
         wifi_blink: c_int,
+        ble_manual: c_int,
         offline_mins: c_int,
         mode: *const c_char,
         out: *mut u8,
@@ -1345,6 +1351,7 @@ pub struct Env<'a> {
     pub wifi_state: &'a str,
     /// 0/1 only while connecting; -1 means absent.
     pub wifi_blink: i32,
+    pub ble_manual_active: bool,
     /// Minutes since the last successful sync; negative = unknown.
     pub offline_mins: i32,
     /// Device mode word: `deep` / `light` (bind `device.mode`, v0.14).
@@ -1361,6 +1368,7 @@ impl Default for Env<'_> {
             state: "BLE OFF",
             wifi_state: "idle",
             wifi_blink: -1,
+            ble_manual_active: false,
             offline_mins: -1,
             mode: "light",
         }

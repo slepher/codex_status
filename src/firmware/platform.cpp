@@ -168,6 +168,9 @@ void nextTemplate() {
 
 void factoryReset() {
     display::screen({"FACTORY RESET", "", "clearing..."});
+    if (!power::state.planStore.clear()) {
+        display::screen({"RESET FAILED", "Plan storage", "Retry factory reset"}); return;
+    }
     bleClearBonds();
     storeClear();
     tplStoreClear();
@@ -250,7 +253,8 @@ void applyV2Plan(const String &body) {
     JsonDocument doc;
     if (!transport::v2Command(body, doc)) return;
     radio::markSynced();
-    V2PlanDecision decision = v2DecidePlan(doc, power::state.v2Plan, clock::v2NowMs(), power::state.v2Provisional);
+    V2PlanDecision decision = power::state.planStore.apply(doc, power::state.v2Plan,
+        clock::v2NowMs(), clock::planUtc(), power::state.v2Provisional);
     // Local: the requested history window is recorded as soon as the plan shape is
     // valid -- before the accept result is known -- mirroring the pre-refactor
     // path, which set it right after its own shape check and before v2Plan.accept().
@@ -293,7 +297,7 @@ void applyV2Plan(const String &body) {
         sync::state.v2HistorySyncUntilMs = clock::v2NowMs() + sync::state.v2HistorySyncMs;
     }
     JsonDocument ack;
-    deserializeJson(ack, v2BuildAck("plan", decision.result, decision.display, "ram",
+    deserializeJson(ack, v2BuildAck("plan", decision.result, decision.display, "nvs",
         decision.error, -1, decision.planId, state.v2Profile.contextId, decision.grantedS, FW_TARGET_ID));
     if (!doc["data"].isNull()) {
         JsonDocument data;

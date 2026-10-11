@@ -111,6 +111,7 @@ fn main() -> anyhow::Result<()> {
         state: &args.state,
         wifi_state: &args.wifi_state,
         wifi_blink: args.wifi_blink,
+        ble_manual_active: false,
         offline_mins: args.offline_mins,
         mode: &args.mode,
     };

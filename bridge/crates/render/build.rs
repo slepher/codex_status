@@ -22,6 +22,8 @@ fn find_arduinojson(root: &Path) -> PathBuf {
 }
 
 fn main() {
+    println!("cargo:rerun-if-changed=../../../src/battery_display.h");
+    println!("cargo:rerun-if-changed=src/battery_display_test.cpp");
     println!("cargo:rerun-if-changed=../../../src/status_pages.h");
     println!("cargo:rerun-if-changed=../../../src/network_display_state.h");
     println!("cargo:rerun-if-changed=src/sim_status.cpp");
@@ -50,6 +52,9 @@ fn main() {
         .file(firmware.join("rendezvous_protocol.cpp"))
         .file(firmware.join("v2_data_command.cpp"))
         .file(firmware.join("v2_plan_command.cpp"))
+        .file(firmware.join("plan_store.cpp"))
+        .file(manifest.join("src/plan_store_test.cpp"))
+        .file(manifest.join("src/battery_display_test.cpp"))
         .file(firmware.join("v2_bundle_command.cpp"))
         .file(firmware.join("v2_activate_command.cpp"))
         .file(firmware.join("v2_claim_command.cpp"))
@@ -87,6 +92,7 @@ fn main() {
                     "rendezvous_protocol.h", "rendezvous_protocol.cpp",
                     "v2_data_command.h", "v2_data_command.cpp",
                     "v2_plan_command.h", "v2_plan_command.cpp",
+                    "plan_store.h", "plan_store.cpp", "boot_capture.h",
                     "v2_bundle_command.h", "v2_bundle_command.cpp",
                     "v2_activate_command.h", "v2_activate_command.cpp",
                     "v2_claim_command.h", "v2_claim_command.cpp",
@@ -106,6 +112,7 @@ fn main() {
         println!("cargo:rerun-if-changed={}", firmware.join(tracked).display());
     }
     println!("cargo:rerun-if-changed={}", ffi.display());
+    println!("cargo:rerun-if-changed={}", manifest.join("src/plan_store_test.cpp").display());
     println!("cargo:rerun-if-changed={}", manifest.join("src/sim_sync.cpp").display());
     println!("cargo:rerun-if-changed={}", manifest.join("src/sim_wifi.cpp").display());
     println!("cargo:rerun-if-changed={}", root.join("tools/wifi-setup-test-hal.h").display());

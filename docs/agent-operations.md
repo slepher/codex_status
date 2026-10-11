@@ -67,6 +67,8 @@ git diff --check                   # 提交前必查
 
 ## 模板缺省显示
 
+- Note4 .81新增本地数值绑定 `device.ble_manual_active=0/1`：图标只表示手动GATT窗口，自动BLE和实际射频状态另记。实际codex-status-a v4已发布（保留用户原布局）；仓库夹具不能直接替代实际模板。数据字段表在同名模板发布后也可能变化，Bridge须认证回读新data_contract再发Data。
+
 - Wi-Fi元数据（2026-10-11源码候选）：`device.wifi_state=idle/connecting/connected/off`；`device.wifi_blink=0/1`仅connecting存在。固件不决定图形；quad v13、Note4 codex-status-a v3由when实现等待隐藏、连接交替闪烁、成功常亮、终态OFF。Bridge图标仍仅依联系新鲜度，不从Wi-Fi阶段推断。新模板需对应支持新绑定的固件，保存不等于发布；.75部署状态见交接卡。
 
 - 显示规则：配额/账号缺失的表现是**模板属性**，由各变体自己的 `when` 分支决定，不用全局规则统一。已实现的两种：200×200 `quad` 在 5h 桶不存在时显示静态 `100` 并隐藏其重置时间；400×300 `codex-status-a` 在 5h 桶不存在时隐藏 5h 块并把 weekly 提升到主位。共享的数据侧约定：桥在 `resetCredits.availableCount<=0` 时不下发该字段，模板按 `exists` 隐藏 RC 行；`bridge.label` 取不到用户名时模板不绘制该行。新增变体按该 target 的产品意图选择分支，并同步更新本行。

@@ -67,6 +67,7 @@ struct State {
     bool bridgeReachable = false;
     bool failureReportPending = false;
     const char *networkError = nullptr;
+    const char *startupContact = "ble";
 };
 extern State state;
 
@@ -114,5 +115,6 @@ String wifiManagementRequest(JsonDocument &request, const char *op);
 void v2RendezvousBegin(bool deep = false);
 void v2RendezvousTick();
 void startNormalMode();
+void resumeLightNetwork();
 
 } // namespace firmware::radio

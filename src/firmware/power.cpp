@@ -26,7 +26,6 @@ static uint32_t lastActivityMs = 0;
 
 static uint32_t pendingWindowUntilMs = 0;
 
-static uint32_t lastBootAction = 0;
 
 static uint32_t ledPulseUntil = 0;
 
@@ -182,10 +181,21 @@ uint32_t batteryMilliVolts() {
 }
 
 int batteryPercent() {
-    uint32_t vbat = batteryMilliVolts();
-    if (vbat >= 4200) return 100;
-    if (vbat <= 3300) return 0;
-    return (int)((vbat - 3300) * 100 / 900);
+    return batteryPercentFromMilliVolts(batteryMilliVolts());
+}
+
+void serviceBatteryDisplay() {
+#if defined(CODEX_TARGET_NOTE4)
+    state.batteryDisplay.poll(millis(), batteryMilliVolts);
+#endif
+}
+
+int displayBatteryPercent() {
+#if defined(CODEX_TARGET_NOTE4)
+    return state.batteryDisplay.percent();
+#else
+    return batteryPercent();
+#endif
 }
 
 // Deep-sleep wake sources: RTC timer plus BOOT (GPIO0) and PWR (GPIO18),
@@ -346,21 +356,25 @@ void checkBattery() {
     }
 }
 
-void handleBootClick() {
-    if (millis() - lastBootAction < 1000) return;   // 1 s throttle
-    lastBootAction = millis();
-    if (state.bleRecovery.toggle(clock::v2NowMs())) {
-        state.v2BootMs = clock::v2NowMs();
+void handleBootClick(uint32_t physicalMs) {
+    const uint64_t now = clock::v2NowMs();
+    const uint64_t at = physicalMs ? now - (uint32_t)(millis() - physicalMs) : now;
+    // Hardware capture has already debounced/classified this physical event.
+    if (state.bleRecovery.toggle(at)) {
+        state.v2BootMs = at;
         state.v2Provisional = true;
         retained.rtcMode = MODE_LIGHT;
         persistMode();
-        radio::enterBleOn(true);
+        if (state.bleRecovery.active(now)) radio::enterBleOn(true);
+        bleOpenPairingWindow(state.bleRecovery.remaining(now) * 1000UL);
     } else {
         // Withdraw the open-window preference; an in-flight protocol exchange
         // owns the radio until its ordinary bounded completion.
         bleOpenPairingWindow(0);
         radio::serviceBleSession();
     }
+    DevLog.printf("[boot] manual=%d light_remaining=%u gatt_remaining=%u\n",
+        state.bleRecovery.active(now),state.bleRecovery.lightRemaining(now),state.bleRecovery.remaining(now));
 }
 
 // Deep sleep uses minute clock wakes and a bounded BLE rendezvous on contact

@@ -3,6 +3,8 @@
 // Firmware integration only: state is owned here; never copy it as a snapshot.
 #include "config.h"
 #include "dependencies.h"
+#include "plan_store.h"
+#include "battery_display.h"
 
 namespace firmware::power {
 
@@ -43,6 +45,9 @@ struct State {
     bool     plugged = false;          // PC USB host present (SOF)
     int      batteryPct = -1;
     uint32_t lastBattCheck = 0;
+#if defined(CODEX_TARGET_NOTE4)
+    BatteryDisplay batteryDisplay;
+#endif
 #if defined(CODEX_PM) && CONFIG_PM_LIGHT_SLEEP_CALLBACKS
     SleepDiag sleepDiag = {};
 #endif
@@ -55,6 +60,7 @@ struct State {
     // POST /diag?loop_delay=N retunes the idle value at runtime (token-gated).
     uint32_t loopDelayMs = 25;
     V2PlanState    v2Plan;
+    PlanStore     planStore;
     uint64_t       v2BootMs = 0;              // physical wake instant
     bool           v2Provisional = false;     // BOOT 300 s window active
     uint64_t       v2LightDeadlineMs = 0;     // accepted plan deadline (monotonic)
@@ -98,6 +104,8 @@ uint32_t v2ManualBleHoldRemainingS();
 bool v2ManualBleHoldActive();
 uint32_t batteryMilliVolts();
 int  batteryPercent();
+int  displayBatteryPercent();
+void serviceBatteryDisplay();
 void releaseWakeHolds();
 void deepSleepFor(uint32_t sec);
 void ledSet(bool on);
@@ -105,7 +113,7 @@ void ledFlash();
 void serviceLed();
 void pollPlug();
 void checkBattery();
-void handleBootClick();
+void handleBootClick(uint32_t physicalMs = 0);
 void persistMode();
 void noteActivity(const char *reason);
 bool deepNetDue();

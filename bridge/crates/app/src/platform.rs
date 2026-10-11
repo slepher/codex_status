@@ -1108,6 +1108,11 @@ pub async fn deliver(ctx: &AppCtx, mac: &str) -> Value {
                         service(ctx).retry_job(mac, &job_id, true, device_now(&mac));
                         if !ctx_id.is_empty() {
                             let _ = service(ctx).adopt_activation_context(mac, ctx_id, device_now(&mac));
+                            // The next Data must use the newly installed indexed contract.
+                            let observed = refresh_status(ctx, mac).await;
+                            if observed["result"] != "ok" {
+                                return json!({"result":"bundle","ack":ack,"next_stage":"read_device_contract","status":observed});
+                            }
                         }
                     } else {
                         let _ = service(ctx).retry_job(mac, &job_id, false, device_now(&mac));
@@ -1145,6 +1150,10 @@ pub async fn deliver(ctx: &AppCtx, mac: &str) -> Value {
                     if ack["result"] == "applied" {
                         if let Some(ctx_id) = ack["active_context_id"].as_str() {
                             let _ = service(ctx).note_activate_done(mac, ctx_id, device_now(&mac));
+                            let observed = refresh_status(ctx, mac).await;
+                            if observed["result"] != "ok" {
+                                return json!({"result":"activate","ack":ack,"next_stage":"read_device_contract","status":observed});
+                            }
                         }
                     }
                     json!({"result": "activate", "ack": ack})
@@ -1200,6 +1209,7 @@ pub async fn deliver(ctx: &AppCtx, mac: &str) -> Value {
                         result = ack["result"].as_str().unwrap_or("unknown"),
                         display_state = ack["display_state"].as_str().unwrap_or("unknown"),
                         error_category = ack_category,
+                        device_error = ack["error"].as_str().unwrap_or(""),
                         outcome = outcome["outcome"].as_str().unwrap_or("unknown"),
                         transport = "http",
                         "device data acknowledgement"
@@ -1378,6 +1388,19 @@ pub async fn refresh_compact_status(ctx: &AppCtx, mac: &str) -> Value {
     refresh_status_mode(ctx, mac, true).await
 }
 
+fn ota_online_window(status: &Value) -> bool {
+    status["presence"]["mode"] == "continuous" ||
+        (status["power"]["mode"] == "light" && status["power"]["remaining_s"].as_u64().unwrap_or(0) >= 120)
+}
+
+fn ota_old_boot(job: &bridge_core::platform::service::OtaJob, status: &Value) -> bool {
+    job.before_boot_id.as_deref().is_some_and(|before| status["boot_id"].as_str() == Some(before))
+}
+
+fn ota_confirmation_expired(job: &bridge_core::platform::service::OtaJob, now: u64) -> bool {
+    now.saturating_sub(job.confirmation_started_at.or(job.last_attempt_at).unwrap_or(job.created_at)) >= 120
+}
+
 async fn refresh_status_mode(ctx: &AppCtx, mac: &str, compact: bool) -> Value {
     let Some(link) = device_link_for_mac(ctx, mac) else {
         crate::update_device_status_cache(
@@ -1423,9 +1446,15 @@ async fn refresh_status_mode(ctx: &AppCtx, mac: &str, compact: bool) -> Value {
             if let Err(e) = service(ctx).note_authenticated_status_at(mac, &status, received_at) {
                 return json!({"result": "error", "error": format!("persist authenticated status: {e}")});
             }
-            let _ = service(ctx).ota_note_authenticated_version(mac, &status);
+            if let Some(job) = service(ctx).ota_job(mac).filter(|j|j.state == "awaiting_confirmation" && ota_old_boot(j,&status)) {
+                if ota_confirmation_expired(&job, device_now(mac)) {
+                    let _ = service(ctx).ota_note_confirmation_miss(mac);
+                }
+            } else {
+                let _ = service(ctx).ota_note_authenticated_version(mac, &status);
+            }
             if let Some(job) = service(ctx).ota_job(mac).filter(|job|
-                job.state == "awaiting_confirmation") {
+                job.state == "awaiting_confirmation" && !ota_old_boot(job,&status)) {
                 let can_check_image = job.upload_ack &&
                     status["image_identity"].as_array().is_some_and(|items|
                         items.iter().any(|item| item == "sha256-running-prefix-v1"));
@@ -1507,6 +1536,10 @@ async fn refresh_status_mode(ctx: &AppCtx, mac: &str, compact: bool) -> Value {
             let outcome = if e.contains("401") || e.contains("403") || e.contains("409") {
                 "blocked"
             } else { "offline" };
+            if service(ctx).ota_job(mac).is_some_and(|j|
+                j.state == "awaiting_confirmation" && ota_confirmation_expired(&j,device_now(mac))) {
+                let _ = service(ctx).ota_note_confirmation_miss(mac);
+            }
             let _ = service(ctx).note_status_attempt(mac, outcome, Some(&e));
             crate::update_device_status_cache(
                 &mut ctx.device_status_cache.lock().unwrap(),
@@ -1517,79 +1550,6 @@ async fn refresh_status_mode(ctx: &AppCtx, mac: &str, compact: bool) -> Value {
             );
             json!({"result": "offline", "error": e})
         }
-    }
-}
-
-/// Post-OTA window. The fresh firmware keeps a minimum light window on its own
-/// (`rtcPostOtaHoldS`, 300 s); this is the bridge taking control: raise the
-/// coordinator light hold and, once the rebooted device answers HTTP, send one
-/// explicit 300 s light PowerPlan. Run from a spawned task: the bounded wait
-/// (reboot + Wi-Fi) must not delay the MCP response.
-pub async fn post_ota_window(ctx: &AppCtx, requested_mac: &str, secs: u32) {
-    let Some(mac) = DeviceIdentity::normalized_mac(requested_mac) else {
-        tracing::warn!("post-OTA window skipped: invalid device MAC");
-        return;
-    };
-    if let Err(e) = service(ctx).hold_light(&mac, device_now(&mac) + secs as u64) {
-        tracing::debug!("post-OTA hold: {e}");
-        return;
-    }
-    let mut online = false;
-    for _ in 0..20 {
-        if refresh_status(ctx, &mac).await["result"].as_str() == Some("ok") {
-            online = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_secs(3)).await;
-    }
-    if !online {
-        tracing::info!(
-            "post-OTA window: device did not answer HTTP; hold stays for the next rendezvous"
-        );
-        return;
-    }
-    let Ok(plan) = service(ctx).explicit_plan(
-        &mac,
-        bridge_core::platform::model::PlanMode::Light,
-        secs,
-        "post-ota",
-    ) else {
-        return;
-    };
-    let Some(link) = device_link_for_mac(ctx, &mac) else {
-        return;
-    };
-    let mut body = serde_json::to_value(&plan).unwrap_or(Value::Null);
-    body["bridge_id"] = json!(ctx.bridge_id);
-    let (ip, token, expected_mac) = (link.ip.clone(), link.token.clone(), link.mac.clone());
-    let sent = body.clone();
-    match blocking(move || {
-        device_client::plan(&ip, &token, &expected_mac, &sent, timeout()).map_err(err_text)
-    })
-    .await
-    {
-        Ok(ack) => {
-            if ack["result"] == "applied" {
-                let _ = service(ctx).note_plan_ack(
-                    &mac,
-                    plan.plan_id,
-                    ack["accepted_remaining_s"].as_u64().unwrap_or(0) as u32,
-                    false,
-                    device_now(&mac),
-                );
-            }
-            tracing::info!(
-                event = "ack",
-                device_mac = mac,
-                plan_id = plan.plan_id,
-                result = ack["result"].as_str().unwrap_or("unknown"),
-                ack_plan_id = ack["plan_id"].as_u64().unwrap_or(0),
-                accepted_remaining_s = ack["accepted_remaining_s"].as_u64().unwrap_or(0),
-                "post-OTA light plan acknowledgement"
-            );
-        }
-        Err(e) => tracing::warn!(event = "result", device_mac = mac, plan_id = plan.plan_id,
-            error_category = safe_protocol_error_category(&e), "post-OTA light plan failed"),
     }
 }
 
@@ -2074,11 +2034,11 @@ pub async fn cycle(ctx: &AppCtx, mac: &str, refresh: bool, deliver_now: bool) {
     if service(ctx).device_get(&mac).is_none() {
         return;
     }
-    if refresh {
-        if refresh_status(ctx, &mac).await["result"].as_str() != Some("ok") {
-            return;
-        }
-    }
+    let refreshed = if refresh {
+        let reply = refresh_status(ctx, &mac).await;
+        if reply["result"] != "ok" { return; }
+        reply["status"].clone()
+    } else { Value::Null };
     match crate::device_occupancy_gate(ctx, &mac).await {
         crate::Occupancy::Owned => {}
         crate::Occupancy::Yielded => return,
@@ -2112,8 +2072,8 @@ pub async fn cycle(ctx: &AppCtx, mac: &str, refresh: bool, deliver_now: bool) {
     if ota_first && bridge_mcp::load_device_token_at(&crate::mcp_config(ctx).data_root, &mac).is_none() {
         return;
     }
-    let mut ota_window = false;
-    if refresh {
+    let mut ota_window = ota_online_window(&refreshed);
+    if refresh && !(ota_first && ota_window) {
         // Formal plan for the current rendezvous: the Bridge is the only source
         // of light/sleep decisions. A BOOT wake is answered with the *remaining*
         // provisional window; everything else is a fresh decision. Repeats are
@@ -2168,6 +2128,7 @@ pub fn enqueue_ota(ctx: &AppCtx, mac: &str, args: &Value) -> Result<Value, Strin
     let request_id = args.get("request_id").and_then(Value::as_str).ok_or("missing request_id")?;
     let job = service(ctx).queue_ota(mac, &ctx.bridge_id, request_id, &path, version, target)
         .map_err(err_text)?;
+    ctx.ota_work.notify_one();
     Ok(json!({"accepted": true, "job_id": job.job_id, "state": job.state, "device_mac": mac,
         "sha256": job.sha256, "size": job.size, "expected_version": job.expected_version}))
 }
@@ -2233,10 +2194,7 @@ async fn deliver_ota(ctx: &AppCtx, mac: &str) -> Value {
         }
     }
     let _ = service(ctx).ota_await_confirmation(mac, result.is_ok(), result.as_ref().err().map(String::as_str));
-    if result.is_ok() {
-        drop(_delivery);
-        post_ota_window(ctx, mac, 300).await;
-    }
+    ctx.ota_work.notify_one(); // Confirm independently; a reboot never renews the plan.
     json!({"result": "awaiting_confirmation", "upload_ack": result.is_ok(), "error": result.err()})
 }
 
@@ -2536,6 +2494,26 @@ mod ble_close_lock_tests {
     use axum::routing::{get, post};
     use axum::{Json, Router};
     use serde::Deserialize;
+
+    #[test]
+    fn ota_usb_window_and_reboot_confirmation_guard() {
+        assert!(ota_online_window(&json!({"presence":{"mode":"continuous"},"power":{"mode":"sleep","remaining_s":0}})));
+        assert!(ota_online_window(&json!({"power":{"mode":"light","remaining_s":120}})));
+        assert!(!ota_online_window(&json!({"power":{"mode":"light","remaining_s":119}})));
+        let mut job: bridge_core::platform::service::OtaJob=serde_json::from_value(json!({
+            "job_id":"job","request_id":"request","device_mac":"AABBCCDDEEFF","bridge_id":"bridge",
+            "created_at":100,"state":"awaiting_confirmation","firmware_target":"note4","expected_version":"next",
+            "sha256":"hash","size":1024,"blob":"blob","upload_ack":true,"cancel_requested":false,
+            "before_boot_id":"old-boot","confirmation_started_at":110
+        })).unwrap();
+        assert!(ota_old_boot(&job,&json!({"boot_id":"old-boot","fw":"next"})));
+        assert!(!ota_old_boot(&job,&json!({"boot_id":"new-boot","fw":"next"})));
+        assert!(!ota_confirmation_expired(&job,229));
+        assert!(ota_confirmation_expired(&job,230));
+        job.confirmation_started_at=None; job.last_attempt_at=Some(105);
+        assert!(!ota_confirmation_expired(&job,224));
+        assert!(ota_confirmation_expired(&job,225));
+    }
 
     /// `CODEX_STATUS_SIM_BLE_ENDPOINTS` is process-wide; keep the two tests apart.
     static SIM_ENV: Mutex<()> = Mutex::new(());
@@ -2843,6 +2821,7 @@ mod ble_close_lock_tests {
                 bridge_core::template::Library::default(),
             )),
             force_ble: Arc::new(tokio::sync::Notify::new()),
+            ota_work: Arc::new(tokio::sync::Notify::new()),
             device_delivery: tokio::sync::Mutex::new(()),
             sim_control: tokio::sync::Mutex::new(()),
             per_mac_delivery: Mutex::new(HashMap::new()),

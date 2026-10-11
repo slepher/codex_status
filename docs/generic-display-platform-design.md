@@ -83,6 +83,9 @@ UI 和 MCP 调用同一套保存、预览、发布、同步开关、激活、cla
 
 模板本地元数据补充（2026-10-11源码候选）：`device.wifi_state`提供idle/connecting/connected/off生命周期，`device.wifi_blink`只在connecting时提供0/1相位。均为local_dependencies，不进入Bridge Data要求或上下文数据快照；模板选择视觉表达，固件仅使阶段/相位变化触发重绘。等待BLE/开网不等于连接失败，WIFI OFF不作中间态。状态语义见[电源状态 §7](power-state.md#7-屏幕状态字与模板协议)。
 
+.81 统一合同：`device.ble_manual_active` 是数字 0/1，本地依赖，不向 Bridge 索取 Data 字段；它仅表示物理短按开启的手动 GATT 窗口，首次唤醒临时 BLE、自动交汇及实际射频均不冒充该值。CompiledTemplate 追加绑定编号 21，既有编号及 ABI 2 不变；固件/宿主解析、序列化和数字条件一致。新模板发布仍冻结完整 Bundle，保存与 OTA 不等于发布。正式 PowerPlan 的 PPL1 持久化、时间连续性和 BOOT/USB/OTA 优先级见 [电源合同](power-state.md)，重复请求不重算 Light 期限。
+
+
 `DeviceCapabilities` 至少报告：firmware_target、render_target、尺寸、像素格式/颜色或灰阶、compiler ABI、最大模板数/包字节/字段数/快照字节、保留能力、BLE/Wi-Fi 能力、功耗协议与安全最大期限。设备对收到的 target 自行校验，Bridge 预检不能替代设备拒绝。
 
 | 边界 | 责任 |

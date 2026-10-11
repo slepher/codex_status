@@ -395,13 +395,14 @@ const char *resetReasonName() {
     case ESP_RST_DEEPSLEEP: return "deep-sleep";
     case ESP_RST_BROWNOUT:  return "brownout";
     case ESP_RST_SDIO:      return "sdio";
+    case ESP_RST_USB:       return "usb";
     default:                return "unknown";
     }
 }
 
 const char *wakeCauseName(esp_sleep_wakeup_cause_t cause) {
     switch (cause) {
-    case ESP_SLEEP_WAKEUP_UNDEFINED: return "power-on";
+    case ESP_SLEEP_WAKEUP_UNDEFINED: return "undefined";
     case ESP_SLEEP_WAKEUP_EXT0:      return "ext0";
     case ESP_SLEEP_WAKEUP_EXT1:      return "ext1";
     case ESP_SLEEP_WAKEUP_TIMER:     return "timer";
@@ -492,8 +493,14 @@ void handleStatusJson() {
     doc["channel"] = platform::state.lastChannel;
     doc["pm_light_sleep"] = power::state.pmLightSleep;
     doc["ota"] = transport::state.otaInProgress;
-    doc["battery"] = power::batteryPercent();
-    doc["battery_mv"] = power::batteryMilliVolts();
+    const uint32_t batteryMv = power::batteryMilliVolts();
+    doc["battery"] = batteryPercentFromMilliVolts(batteryMv);
+    doc["battery_mv"] = batteryMv;
+#if defined(CODEX_TARGET_NOTE4)
+    doc["battery_display"] = power::displayBatteryPercent();
+    doc["battery_sample_mv"] = power::state.batteryDisplay.rawMilliVolts();
+    doc["battery_sample_ms"] = power::state.batteryDisplay.sampledAt();
+#endif
     doc["heap"] = ESP.getFreeHeap();
 #if defined(CODEX_TARGET_NOTE4)
     doc["heap_max_alloc"] = ESP.getMaxAllocHeap();
@@ -1302,6 +1309,8 @@ void handleV2Status() {
     else doc["sampled_wall"] = nullptr;
     doc["heap_free"] = ESP.getFreeHeap();
     doc["heap_min"] = ESP.getMinFreeHeap();
+    doc["heap_largest"] = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    doc["loop_stack_free"] = uxTaskGetStackHighWaterMark(nullptr);
     JsonObject radio = doc["radio"].to<JsonObject>();
     radio["wifi_connected"] = WiFi.status() == WL_CONNECTED;
     radio["wifi_state"] = wifiPhaseText(radio::wifiPhase());
@@ -1309,6 +1318,8 @@ void handleV2Status() {
     else radio["wifi_blink"] = nullptr;
     radio["rssi"] = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0;
     radio["ble_connected"] = bleIsConnected();
+    radio["ble_manual_active"] = power::state.bleRecovery.active(clock::v2NowMs());
+    radio["ble_radio_on"] = radio::state.bleOn;
     JsonObject display = doc["display"].to<JsonObject>();
     display["epd_writes"] = display::state.epdWriteCount;
     display["epd_busy_fails"] = display::retained.rtcEpdBusyFails;
@@ -1465,6 +1476,7 @@ void handleSerialCli() {
             DevLog.printf("[cli] battery=%d%% (%u mV)\n", power::batteryPercent(),
                           (unsigned)power::batteryMilliVolts());
         } else if (line == "pair") {
+            power::state.bleRecovery.open(clock::v2NowMs());
             radio::enterBleOn(true);
             DevLog.println("[cli] BLE session on, pairing window 120s");
         } else if (line == "deep") {

@@ -101,7 +101,7 @@ void handleBleEndpoint(const String &json) {
         bleNotifyStatus(bleBuildEndpoint(false)); return;
     }
     char ns[17];snprintf(ns,sizeof(ns),"%08lx%08lx",(unsigned long)esp_random(),(unsigned long)esp_random());
-    const char *failure=storeUpsert(mac,host,port,token,principal,identity,String(ns),power::state.bleRecovery.until>clock::v2NowMs());
+    const char *failure=storeUpsert(mac,host,port,token,principal,identity,String(ns),power::state.bleRecovery.physicalUntil()>clock::v2NowMs());
     if (failure) { bleNotifyStatus(bleBuildEndpoint(false));return; }
     diagnostics::traceSetTransport(1);
     diagnostics::traceSetStage(TRACE_STAGE_COMMAND);
@@ -654,7 +654,7 @@ static void __attribute__((noinline)) handleBleWifiMigration(
         out["ack"] = "wifi"; out["request_id"] = doc["request_id"];
         out["device_mac"] = radio::macText(); out["ok"] = false; out["error"] = "storage";
     } else deserializeJson(out, wifiSchemesMigrate(doc, endpointNamespace, slots.get(), count,
-        preferred, now, power::state.bleRecovery.until, allowed));
+        preferred, now, power::state.bleRecovery.physicalUntil(), allowed));
     if (out["persisted"] == true) {
         bool retired = oldPrefs.begin("wifi", false);
         if (retired) {
@@ -794,7 +794,7 @@ void serviceV2Ble() {
             v2BleNotify(out);return;
         }
         if (operation == "wifi_authorize") {
-            String result = wifiManagementAuthorize(doc, identity, now, power::state.bleRecovery.until,
+            String result = wifiManagementAuthorize(doc, identity, now, power::state.bleRecovery.physicalUntil(),
                 authenticated && allowed ? wifiWindowUntil : 0);
             JsonDocument out; deserializeJson(out, result); v2BleNotify(out); return;
         }
@@ -818,7 +818,7 @@ void serviceV2Ble() {
         if(operation=="wifi_setup" || operation=="wifi_select" || operation=="wifi_scheme_delete") {
             JsonDocument out;out["ack"]="wifi";out["request_id"]=doc["request_id"];out["device_mac"]=radio::macText();out["ok"]=false;out["error"]="retired_operation";v2BleNotify(out);return;
         }
-        String result = wifiSetupCommand(doc, identity, generation, now, power::state.bleRecovery.until,
+        String result = wifiSetupCommand(doc, identity, generation, now, power::state.bleRecovery.physicalUntil(),
             authenticated && allowed ? wifiWindowUntil : 0, allowed);
         if (wifiSetupBusy()) radio::state.wifiUp = false;
         if (operation == "wifi_scheme_delete") radio::loadPreferredWifiCredentials();
@@ -1087,11 +1087,7 @@ void registerHttpRoutes() {
                 if (Update.end(true)) {
                     DevLog.printf("[ota] success %u bytes, rebooting shortly\n", (unsigned)up.totalSize);
                     display::screen({"OTA success", "Rebooting..."});
-                    // 5 min light window for the bridge (NVS survives the OTA).
-                    Preferences p;
-                    p.begin("pm", false);
-                    p.putUShort("post_ota_s", 300);
-                    p.end();
+                    // The accepted plan survives OTA; do not mint a fresh Light window.
                     state.otaRebootPending = true;
                     state.otaRebootAt = millis() + 1500;
                 } else {

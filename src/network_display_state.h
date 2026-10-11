@@ -37,8 +37,10 @@ struct NetworkDisplayState {
     int bridgeOffline = -1;
     WifiPhase wifiPhase = WifiPhase::Idle;
     int wifiBlink = -1;
-    void observe(bool up, int offline = -1, WifiPhase phase = WifiPhase::Idle, int blink = -1) {
-        if (!known || connected != up || bridgeOffline != offline || wifiPhase != phase || wifiBlink != blink) {
+    bool bleManual = false;
+    void observe(bool up, int offline = -1, WifiPhase phase = WifiPhase::Idle, int blink = -1, bool manual = false) {
+        if (!known || connected != up || bridgeOffline != offline || wifiPhase != phase || wifiBlink != blink || bleManual != manual) {
+            bleManual = manual;
             wifiPhase = phase; wifiBlink = blink;
             bridgeOffline = offline;
             known = true; connected = up; pending = true; attempts = 0; nextAt = 0;

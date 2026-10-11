@@ -63,6 +63,10 @@ pub struct OtaJob {
     pub expected_version: String,
     #[serde(default)]
     pub before_version: Option<String>,
+    #[serde(default)]
+    pub before_boot_id: Option<String>,
+    #[serde(default)]
+    pub confirmation_started_at: Option<u64>,
     pub sha256: String,
     pub size: usize,
     pub blob: String,
@@ -1562,6 +1566,7 @@ impl PlatformService {
             request_id: request_id.into(), device_mac: mac.clone(), bridge_id: bridge_id.into(),
             created_at: now, updated_at: now, state: "queued".into(), firmware_target: firmware_target.into(),
             expected_version: expected_version.into(), before_version: None,
+            before_boot_id: None, confirmation_started_at: None,
             sha256: digest, size: bytes.len(), blob,
             last_error: None, upload_ack: false, confirmation: None, attempt_count: 0,
             last_attempt_at: None, cancel_requested: false,
@@ -1649,12 +1654,16 @@ impl PlatformService {
             Self::persist(&inner, &self.state_path())?;
             bail!("frozen ROM hash/length mismatch");
         }
+        let before_boot_id = inner.devices.get(&mac)
+            .and_then(|d|d.last_authenticated.as_ref())
+            .and_then(|s|s.body["boot_id"].as_str().map(str::to_string));
         let before_version = inner.devices.get(&mac)
             .and_then(|d| d.last_authenticated.as_ref())
             .and_then(|s| s.body["fw"].as_str().map(str::to_string));
         let job = inner.ota_jobs.get_mut(&mac).unwrap();
         job.state = "transferring".into();
         job.before_version = before_version;
+        job.before_boot_id = before_boot_id;
         job.attempt_count = job.attempt_count.saturating_add(1);
         job.last_attempt_at = Some(crate::device_clock::wall_secs(&mac));
         job.updated_at = crate::device_clock::wall_secs(&mac);
@@ -1668,6 +1677,7 @@ impl PlatformService {
         let job = inner.ota_jobs.get_mut(&mac).context("no OTA job")?;
         job.state = "awaiting_confirmation".into();
         job.upload_ack = upload_ack;
+        job.confirmation_started_at = Some(crate::device_clock::wall_secs(&mac));
         if upload_ack { job.confirmation = Some("upload_ack".into()); }
         job.last_error = error.map(str::to_string);
         job.updated_at = crate::device_clock::wall_secs(&mac);
@@ -1861,6 +1871,13 @@ impl PlatformService {
     pub fn adopt_activation_context(&self, mac: &str, context_id: &str, now: u64) -> Result<()> {
         let mac = mac.to_uppercase();
         let mut inner = self.inner.lock().unwrap();
+        // Commit/Activate ACK carries a context, not its indexed field table.
+        // Even the same template id may have a different contract after publish.
+        if let Some(record) = inner.devices.get_mut(&mac) {
+            if record.observed.active_context_id.as_deref() != Some(context_id) {
+                record.data_contract = None;
+            }
+        }
         let template_id = inner
             .coordinators
             .get(&mac)
@@ -3596,6 +3613,33 @@ mod tests {
     }
 
     #[test]
+    fn publish_ack_invalidates_same_template_contract_until_authenticated_readback() {
+        let dir=tempfile::tempdir().unwrap();
+        let svc=PlatformService::open(dir.path()).unwrap();
+        let mac="AABBCCDDEEFF";
+        svc.device_upsert(DeviceIdentity::new(mac,"Test").unwrap(),DeviceCapabilities::ssd1681_154g()).unwrap();
+        let mut status=json!({"device_mac":mac,"configured":true,
+            "active_context_id":"old","active_template_id":"quad",
+            "data_contract":{"template_id":"quad","compiler_abi":2,"source_crc":"12345678",
+                "requirements":[{"index":4,"field":"account.plan","kind":"text","missing":"hide","local":false}]}});
+        svc.note_device_status_at(mac,&status,"http",100).unwrap();
+        svc.set_data_sync(mac,true).unwrap();
+        svc.adopt_activation_context(mac,"published",101).unwrap();
+        assert!(svc.device_get(mac).unwrap()["data_contract"].is_null());
+        assert_eq!(svc.next_http_delivery(mac,true,101)["decision"],"waiting_for_device_contract");
+        drop(svc);
+        let svc=PlatformService::open(dir.path()).unwrap();
+        assert!(svc.device_get(mac).unwrap()["data_contract"].is_null());
+        status["active_context_id"]=json!("published");
+        status["data_contract"]["source_crc"]=json!("87654321");
+        status["data_contract"]["requirements"][0]["index"]=json!(5);
+        svc.note_device_status_at(mac,&status,"http",102).unwrap();
+        svc.adopt_activation_context(mac,"published",103).unwrap();
+        assert_eq!(svc.device_get(mac).unwrap()["data_contract"]["requirements"][0]["index"],5);
+        assert_eq!(svc.inner.lock().unwrap().coordinators[mac].requirements[0].index,5);
+    }
+
+    #[test]
     fn authenticated_snapshot_survives_failed_attempt_and_restart() {
         let dir = tempfile::tempdir().unwrap();
         let svc = PlatformService::open(dir.path()).unwrap();
@@ -3759,11 +3803,13 @@ mod tests {
         std::fs::remove_file(&source).unwrap();
         assert_eq!(svc.queue_ota(mac, "bridge", "request-1", &source, version, &target).unwrap().job_id, job.job_id);
         assert!(svc.queue_ota(mac, "bridge", "request-2", &svc.dir.join(&job.blob), version, &target).is_err());
+        svc.note_authenticated_status(mac, &json!({"device_mac":mac,"boot_id":"before-restart"})).unwrap();
         let frozen = svc.ota_begin(mac).unwrap().unwrap();
         assert_eq!(std::fs::read(frozen).unwrap(), bytes);
         drop(svc);
         let resumed = PlatformService::open(dir.path()).unwrap();
         assert_eq!(resumed.ota_job(mac).unwrap().state, "awaiting_confirmation");
+        assert_eq!(resumed.ota_job(mac).unwrap().before_boot_id.as_deref(), Some("before-restart"));
         assert!(resumed.ota_job(mac).unwrap().blocks_following_work());
         assert!(resumed.ota_begin(mac).unwrap().is_none());
         assert_eq!(resumed.ota_job(mac).unwrap().sha256, job.sha256);

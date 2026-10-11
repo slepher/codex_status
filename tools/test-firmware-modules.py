@@ -32,9 +32,16 @@ app = (firmware / "application.cpp").read_text(encoding="utf-8")
 display = (firmware / "display.cpp").read_text(encoding="utf-8")
 radio = (firmware / "radio.cpp").read_text(encoding="utf-8")
 assert "radio::pollWifi();\n    display::serviceNetworkGlyph();" in app
-assert "state.networkGlyph.observe(radio::state.wifiUp, currentBridgeOfflineMinutes(), phase, blink);" in display
+assert "state.networkGlyph.observe(radio::state.wifiUp, currentBridgeOfflineMinutes(), phase, blink, manual);" in display
 assert "memcmp(state.lastDisplayedFrame, state.frame, EPD_FB_BYTES) == 0" in display
 assert "if (state.networkGlyph.attempts) state.forceCleanRefresh = true;" in display
+assert "power::batteryPercent()" not in display
+assert display.count("power::displayBatteryPercent()") == 3
+assert app.count("power::serviceBatteryDisplay();") == 2
+power = (firmware / "power.cpp").read_text(encoding="utf-8")
+assert "state.batteryPct = batteryPercent();" in power
+assert "v2BatteryPowerOff(state.plugged, state.batteryPct)" in power
+assert "v2BatteryPowerOff(power::state.plugged, power::batteryPercent())" in radio
 rv = radio.split("static void rendezvousWifiTick() {", 1)[1].split("void v2RendezvousTick()", 1)[0]
 assert "WiFi.status() == WL_CONNECTED" in rv and "state.wifiConnActive = false;" in rv
 print("PASS: Arduino glue, state/RTC ownership, log boundary and independent network redraw integration")

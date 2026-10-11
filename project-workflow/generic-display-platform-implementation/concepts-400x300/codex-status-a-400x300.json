@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "id": "codex-status-a",
-  "version": 1,
+  "version": 4,
   "render_target": "epd-ssd2683-400x300-1bpp",
   "canvas": {
     "w": 400,
@@ -59,8 +59,8 @@
       "bits": "AAAAAABAAEAAQABADEAGQAHAAMAAwAHABkAMQABAAEAAQABAAAAAAA==",
       "color": "black",
       "when": {
-        "bind": "device.state",
-        "equals": "BLE ON"
+        "bind": "device.ble_manual_active",
+        "equals": 1
       }
     },
     {
@@ -72,8 +72,8 @@
       "bits": "AAAAAIAAwACwAJgAnACYAOAAwADAAOAAmACcAJgAsADAAIAAAAAAAA==",
       "color": "black",
       "when": {
-        "bind": "device.state",
-        "equals": "BLE ON"
+        "bind": "device.ble_manual_active",
+        "equals": 1
       }
     },
     {
@@ -85,8 +85,8 @@
       "bits": "AAAAAAAAA8AfwDwA8ADAwIfADwAcABAAAcADwAMAAAAAQABAAAAAAA==",
       "color": "black",
       "when": {
-        "bind": "device.state",
-        "equals": "BLE ON"
+        "bind": "device.ble_manual_active",
+        "equals": 1
       }
     },
     {
@@ -98,8 +98,8 @@
       "bits": "AAAAAAAA8AD+AA8AA8DAwPhAPAAOAAIA4ADwADAAAACAAIAAAAAAAA==",
       "color": "black",
       "when": {
-        "bind": "device.state",
-        "equals": "BLE ON"
+        "bind": "device.ble_manual_active",
+        "equals": 1
       }
     },
     {

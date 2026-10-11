@@ -309,10 +309,8 @@ void enterBleOn(bool userInitiated) {
     diagnostics::traceSetStage(TRACE_STAGE_WIRELESS);
     bleAdvertiseStart();
     diagnostics::traceSetStage(TRACE_STAGE_BLE_ADV);
-    if (userInitiated) {
-        power::state.bleRecovery.open(clock::v2NowMs());
-        bleOpenPairingWindow(power::state.bleRecovery.remaining(clock::v2NowMs()) * 1000UL);
-    }
+    const uint64_t now = clock::v2NowMs(), physicalUntil = power::state.bleRecovery.physicalUntil();
+    bleOpenPairingWindow(physicalUntil > now ? physicalUntil - now : 0);
     requestAnnounce(true);
     if (!state.v2InRendezvous) display::renderCurrent();
 }
@@ -321,7 +319,6 @@ void bleOff(const char *reason) {
     if (!state.bleOn) return;
     state.bleOn = false;
     diagnostics::traceSetStage(TRACE_STAGE_BLE_OFF);
-    power::state.bleRecovery.close();
     bleOpenPairingWindow(0);
     wifiSetupRadioClosed("session_expired");
     diagnostics::bleRadioMark(false);
@@ -409,6 +406,18 @@ void pollWifi() {
     }
 }
 
+void resumeLightNetwork() {
+    state.startupContact = "http";
+    WiFi.mode(WIFI_STA);
+    state.hostname = "codex-status-" + macSuffix();
+    WiFi.setHostname(state.hostname.c_str());
+    startNormalMode();
+    if (!startFallback()) {
+        networkFailed("resume_network_unavailable");
+        v2RendezvousBegin();
+    }
+}
+
 // No markSynced, owner claim or PowerPlan mutation: these borrow a live window.
 static uint64_t wifiPresenceUntil(uint64_t now) {
     if(power::state.plugged && !power::retained.rtcDeepOnUsb)return UINT64_MAX;
@@ -428,11 +437,13 @@ uint64_t wifiControlUntil(uint64_t now) {
 WifiControlContext wifiControlContext(const EndpointRec &endpoint,JsonDocument &request) {
     WifiControlContext context;context.principal=endpoint.principal;context.nameSpace=endpoint.nameSpace;
     OwnerRec owner;bool owned=ownerGet(owner);context.claimed=owned && owner.id==endpoint.principal;context.occupied=owned && owner.id!=endpoint.principal;
-    context.until=wifiControlUntil(clock::v2NowMs());context.physicalUntil=power::state.bleRecovery.until;
+    context.until=wifiControlUntil(clock::v2NowMs());context.physicalUntil=power::state.bleRecovery.physicalUntil();
     context.sessionValid=String(request["session_nonce"]|"")==transport::v2Nonce();return context;
 }
 
 void wifiDeviceStatus(JsonDocument &doc,const EndpointRec *endpoint) {
+    doc["power"]["plan_storage"] = power::state.planStore.status();
+    doc["network"]["startup_contact"] = state.startupContact;
     const uint64_t now=clock::v2NowMs(),until=wifiPresenceUntil(now),controlUntil=wifiControlUntil(now);
     const bool continuous=until==UINT64_MAX;
     const bool httpReady=state.wifiUp && WiFi.status()==WL_CONNECTED && WiFi.localIP()!=IPAddress(0,0,0,0);

@@ -36,3 +36,62 @@
 - 本轮及此前详细进度原文：[2026-10-09 归档](../history/progress-archive-2026-10-09.md)
 - 待办唯一来源：[backlog](../roadmap/backlog.md)
 - 文档导航：[docs/README.md](../README.md)
+
+
+## 17:42 更新前交接卡（.80基线）
+
+# Codex Status 当前交接
+
+更新时间：2026-10-11 16:40（香港时间）
+
+## 部署与工作区
+
+- Note4 `7C4FADB93408` 已认证运行 **0.18.80-note4 / ota_0**，登记IP `.177`，16:27:53完整镜像匹配。ROM `artifacts/note4-0.18.80-zlib-blocks.bin`，1,920,688 B，SHA256 `4CCD39B2C751C44DD6C89527742592656B3495F9700A4121D98BFDEB6C0A7B83`；同名ELF。OTA `0972b435` 单次上传，succeeded/image_verified。USB continuous/light，压缩能力1；旧模板迁移后Data441 displayed。
+- Windows默认Bridge已配套更新，PID63064，计划任务启动；exe SHA256 `BD641F1E5ADC0870063B329F77F6734C22F4E22F8AB418185C081850CBE7C2FB`。旧exe/data备份 `artifacts/bridge-before-c9-20261011.exe`、`bridge-before-c9-20261011-data.zip`（ZIP CRC通过）；书桌屏未升级。
+- 本轮协议、Wi-Fi元数据与BOOT/PWR修复一并提交；新模板Bundle未发布，当前屏仍用旧模板兼容路径。
+
+## 活跃事项（A9/B6/C8）
+
+- **B6追加交接**：诊断进程已停止设备访问；.80部署身份/结果见上方，BOOT/GATT图标与异常启动仍待[统一执行/验收](project-workflow/bridge-macos/note4-boot-gatt-followup-20261011.md)。手动窗口与自动BLE必须独立；16:08曾确认窗口有效而用户未见图标，异常启动根因仍未知。
+
+- BOOT/联网合同及短时入睡修复已部署：[实施](project-workflow/bridge-macos/boot-network-20261011.md)、[根因/修复](project-workflow/bridge-macos/boot-five-second-investigation-20261011.md)。PWR/BOOT统一300s下界，初始化GPIO0锁存去重，时钟/交汇/底层睡眠入口保窗。新增生产窗口/按键回归、固件模块、52项ELF栈门禁通过；配套Rust回归311通过/3忽略。认证HTTP持续正常、BLE关闭、automatic_ble=false；证据 `artifacts/boot-fix78-running.json`、`note4-fix78-verify-20261011.json`。真实PWR→BOOT重叠按键、timer竞态与功耗矩阵仍需实机验收。
+
+- [历史审核](project-workflow/bridge-macos/protocol-history-review-20261011.md)后完成五项修复：HTTP诊断尾部遵守准入；会合ready与HTTP能力分开；新写入401/403明确失败而历史未知仍查询原ID；保留409修订冲突；wifi_state合同报文本。316测试通过/3条件忽略，末次403补丁真实client7项通过；设备页、52项匹配ELF栈门禁通过。
+- 13:10自然恢复会合：ready_report verified→rendezvous complete，Data414 applied/displayed；认证HTTP可用且rv.ready=false，不再错误等待。OTA后此前有connect_timeout及三轮会合失败，原激活结果经查询后自动恢复，不能抹去或归因为新修复已覆盖全部RF故障。证据`artifacts/protocol-ota76-status.json`、`protocol-device-latest.private.json`。
+- **下一步/验收边界**：真实10轮自然会合、物理丢ACK/复位矩阵、屏幕闪烁与事件对齐未完成；长期RF/功耗/掉电/动态堆峰值未知。macOS原生通信与1.54未验，不结A9/B6/C8。详见[实施/矩阵](project-workflow/bridge-macos/protocol-implementation-20261011.md)、[计划](project-workflow/bridge-macos/protocol-followup-plan-20261011.md)。
+
+## 入口
+
+- **单份内容/统一压缩（C9）已部署**：Note4复用ROM miniz，CSZ1独立16KiB块、压缩驻留、Bridge冻结字节；下载后停内容覆盖，保留原生OTA。359项通过/3条件忽略，匹配ELF栈检查通过。[交接/限制](project-workflow/single-copy-updates/status.md)。未发布新模板或实测压缩安装峰值；旧故障根因未明。AP01实机/加载器待调查。
+- **BOOT/GATT与启动计划统一续项（B6/C8）**：正式计划跨重启、Light/USB走HTTP、Sleep一次BLE、OTA确认已按用户要求补入[统一执行文档](project-workflow/bridge-macos/note4-boot-gatt-followup-20261011.md)。当前仅规划；本轮未完成源码草稿已备份并撤回，未构建/部署.81。待统一实施，.78诊断仍用保存的.78 ELF。
+
+- 待办唯一来源：[backlog](docs/roadmap/backlog.md)
+- 前次现场/USB独立事故与详细里程碑：[10月11日归档](docs/history/progress-archive-2026-10-11.md)、[10月9日归档](docs/history/progress-archive-2026-10-09.md)
+- 导航与操作：[docs/README.md](docs/README.md)、[agent-operations](docs/agent-operations.md)
+
+
+## 17:55 更新前交接卡（.81与.82候选）
+
+# Codex Status 当前交接
+
+更新时间：2026-10-11 17:42（香港时间）
+
+## 部署与工作区
+
+- **电量平滑候选已构建，尚未刷入**：`artifacts/note4-0.18.82-battery-smoothing.bin`，1,926,256 B，SHA256 `B2C9E1C1FA8E8A01FE2CB66985875155E61B6F6ADF08F046E8B98C69D6E286E7`，同名ELF；12项定向测试/66项栈检查通过，下一步原Bridge OTA认证验证。[执行记录](project-workflow/bridge-macos/note4-battery-smoothing-20261011.md)。下方.81仍为当前部署。
+
+- Note4 `7C4FADB93408` 已认证运行 **0.18.81-note4 / ota_1**，登记IP `.177`。ROM `artifacts/note4-0.18.81-boot-plan.bin`，1,925,792 B；SHA256 `BC2ED81473FADC1EBC04DA96CE299550AFC527311FE28ED236FD392ADC109391`，同名匹配ELF。OTA `35c89bae` 单次上传、succeeded/image_verified。
+- 默认Bridge通过计划任务部署，exe SHA256 `3F53CFEB953A883C1637280E7332357CC54CC44C35E989DA7551B0160E3C759D`。exe/data备份见 `artifacts/bridge-before-contract-fix-20261011*`。书桌屏未刷机。
+- 基线已提交 `f822531`；后续统一实现仍在工作区。实际codex-status-a v4已发布，Bundle `53cab015` succeeded，认证applied_seq453/displayed。不要用本地夹具覆盖用户实际布局。
+
+## 活跃事项与验收边界（B6/C8，关联A9）
+
+- **BOOT/GATT、跨重启计划、OTA统一实现已部署**：[执行/测试/资源/剩余矩阵](project-workflow/bridge-macos/note4-boot-gatt-followup-20261011.md)。用户六次实体BOOT开关符合预期；手动图标独立于自动BLE。PPL1正式计划3490经一次明确USB工具复位仍同ID/restored_light，剩417/600秒，直接HTTP且自动BLE关闭。没有一次性OTA marker，报告不删除正式计划。
+- core/app等241测试、render/MCP/device-sim126测试通过，3条件忽略；固件模块及匹配ELF66项栈门禁通过。数据合同变更后旧索引失效、发布ACK后认证回读已修正并配套部署。首次模板短暂内置界面的拒绝码未保留，不将源码缺口当唯一已证根因。
+- **未结问题**：USB工具复位后启动/认证HTTP延迟、间歇超时，根因未知；被动串口对照未证明CDC因果，boot保持、模板已恢复。证据 `artifacts/note4-81-cdc-auth-meta.json`、`note4-81-final-auth.private.json`。不声称历史.78停滞已根治。
+- 无USB Sleep重启BLE、电池深睡/Light到期竞态、Flash掉电、长期RF/功耗、动态堆峰值及macOS/1.54未验；B6/C8不结项。电量95/96/97抖动已查本地Slate和GitHub CrossPoint：前者单次平均/充电显示策略，后者整数EMA；尚未改电量算法，证据与建议见同执行文档末节。
+
+## 入口
+
+- C9单份内容/CSZ1压缩随.80继承至.81：[交接](project-workflow/single-copy-updates/status.md)。原生双OTA分区保留；AP01实机/加载器后续调查。
+- 唯一待办：[backlog](docs/roadmap/backlog.md)；[当日历史](docs/history/progress-archive-2026-10-11.md)；[操作细则](docs/agent-operations.md)。

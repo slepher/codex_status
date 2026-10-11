@@ -22,7 +22,6 @@ static bool targetUnverified = false;
 static BootCapture bootCapture;
 static portMUX_TYPE bootCaptureMux = portMUX_INITIALIZER_UNLOCKED;
 static bool capturingBoot = false;
-static bool bootArmed = false;
 static void ARDUINO_ISR_ATTR startupBootEdge() {
     portENTER_CRITICAL_ISR(&bootCaptureMux);
     bootCapture.edge(digitalRead(0) == LOW, millis());
@@ -33,12 +32,12 @@ bool captureStartupBoot() {
     if (!capturingBoot) return false;
     portENTER_CRITICAL(&bootCaptureMux);
     const bool pressed = bootCapture.take(millis());
-    const uint32_t at = bootCapture.downAt;
+    const uint32_t at = bootCapture.takenAt;
     portEXIT_CRITICAL(&bootCaptureMux);
     if (!pressed) return false;
     power::state.v2BootMs = at;
     power::state.v2Provisional = true;
-    power::state.bleRecovery.open(at);
+    power::state.bleRecovery.startup(at);
     power::retained.rtcMode = MODE_LIGHT;
     power::state.deepWakePath = false;
     DevLog.println("[pm] startup BOOT captured: manual light window");
@@ -92,16 +91,25 @@ void initialize(const char *firmwareVersion, const char *imageIdentity) {
     power::state.v2BootMs = clock::v2NowMs();
     power::state.v2Provisional = cause == ESP_SLEEP_WAKEUP_EXT1;
     if (power::state.v2Provisional)
-        power::state.bleRecovery.lightUntil = power::state.v2BootMs + 300000;
+        power::state.bleRecovery.startup(power::state.v2BootMs);
     diagnostics::nvsStageMark(4);      // holds released without losing the VBAT latch
     power::state.plugged = usb_serial_jtag_is_connected();
     power::state.batteryPct = power::batteryPercent();
+    power::serviceBatteryDisplay();
     if (!clock::readExternalRtc(true)) {
         DevLog.printf("[clock] %s unavailable: %s; internal RTC fallback\n",
                       clock::state.externalRtc.model(), clock::state.externalRtc.status());
         if (power::retained.rtcMagic == 0xC0DE0001) clock::restoreTimeFromRtc();
         if (clock::timeKnown()) clock::state.timeSource = TIME_RTC;
     }
+
+    const uint64_t planUtc = clock::planUtc();
+    power::state.planStore.begin(power::state.v2Plan, clock::v2NowMs(), planUtc);
+    power::state.v2LightDeadlineMs = power::state.v2Plan.deadlineMs();
+    if (power::state.v2Plan.lightActive(clock::v2NowMs())) power::retained.rtcMode = MODE_LIGHT;
+    DevLog.printf("[plan] boot restore=%s id=%llu remaining=%us\n",
+        power::state.planStore.status(), power::state.v2Plan.acceptedId(),
+        power::state.v2Plan.remainingS(clock::v2NowMs()));
 
     // A deep timer wake before the next contact first tries the retained clock
     // window. If the panel lacks a usable baseline, setup falls through to the
@@ -181,14 +189,12 @@ void initialize(const char *firmwareVersion, const char *imageIdentity) {
                       (unsigned)V2_BOOT_PROVISIONAL_S);
     }
     if (power::state.plugged && !power::retained.rtcDeepOnUsb) power::retained.rtcMode = MODE_LIGHT;
+    if (power::state.v2Plan.lightActive(clock::v2NowMs())) power::retained.rtcMode = MODE_LIGHT;
     if (power::state.bootPostOtaS) {
         // Fresh firmware after an OTA: stay light for the minimum window so the
         // bridge can reach HTTP and install/refresh the formal light plan.
-        power::retained.rtcMode = MODE_LIGHT;
-        power::persistMode();
-        power::state.postOtaHoldUntilMs = millis() + (uint32_t)power::state.bootPostOtaS * 1000UL;
-        DevLog.printf("[ota] post-OTA light window %us (bridge may extend)\n",
-                      (unsigned)power::state.bootPostOtaS);
+        // Retire legacy .80's automatic hold; reboot never replaces a plan.
+        DevLog.println("[ota] retired legacy post-OTA hold; keep original plan");
         Preferences p;
         p.begin("pm", false);
         p.remove("post_ota_s");
@@ -302,22 +308,21 @@ void initialize(const char *firmwareVersion, const char *imageIdentity) {
     if (cause == ESP_SLEEP_WAKEUP_EXT1 &&
         (esp_sleep_get_ext1_wakeup_status() & (1ULL << 0))) {
         // GPIO0 itself woke the device: do not require a second click.
-        power::state.bleRecovery.open(power::state.v2BootMs);
-        radio::enterBleOn(true);
+        power::state.bleRecovery.startup(power::state.v2BootMs);
     }
     wifiSchemesBegin();
-    detachInterrupt(digitalPinToInterrupt(0));
-    bootCapture.edge(digitalRead(0) == LOW, millis());
     captureStartupBoot();
-    bootArmed = !bootCapture.low || !bootCapture.ignore;
     capturingBoot = false;
     if (power::v2ManualBleHoldActive()) radio::enterBleOn(true);
     if (cause != ESP_SLEEP_WAKEUP_TIMER) power::state.offlineBootGraceUntilMs = clock::v2NowMs() + 120000;
     if (!radio::hasWifiSlots() && !platform::state.lastUsage.length())
         display::screen({"CODEX STATUS", application::state.firmwareVersion, "BLE Wi-Fi setup", "Press BOOT to pair"});
-    // Every ordinary contact starts with bounded BLE, including cold startup.
-    // No saved-network scan/association may run before a Bridge is present.
-    radio::v2RendezvousBegin(power::state.deepWakePath);
+    // Physical wake gets its temporary configuration contact; ordinary Light
+    // and USB boots resume the existing network without opening manual GATT.
+    if (!power::state.v2Provisional && planBootHttp(power::state.plugged,
+            power::retained.rtcDeepOnUsb, power::state.v2Plan, clock::v2NowMs()))
+        radio::resumeLightNetwork();
+    else radio::v2RendezvousBegin(power::state.deepWakePath);
 }
 
 void tick() {
@@ -344,6 +349,7 @@ void tick() {
         delay(50);
         return;
     }
+    power::serviceBatteryDisplay();
     blePoll();
     diagnostics::tracePollConnection();
     transport::serviceV2Ble();
@@ -364,38 +370,23 @@ void tick() {
         pwrHandled = false;
     }
 
-    static uint32_t bootDownAt = 0;
-    static int      bootStage = 0;
-    // Arm the button only after GPIO0 has read HIGH once: a strapping/mux
-    // glitch that made it read LOW for the first seconds of boot otherwise
-    // looked like a long hold.
-    bool bootLow = (digitalRead(0) == LOW);
-    if (!bootArmed && !bootLow) bootArmed = true;
-    if (bootArmed && bootLow) {
-        if (!bootDownAt) bootDownAt = millis();
-        uint32_t held = millis() - bootDownAt;
-        if (bootStage < 1 && held > 2000) {
-            bootStage = 1;
-            platform::nextTemplate();     // 2 s: next local template (no BLE session)
-        }
-        if (bootStage < 2 && held > 15000) {
-            bootStage = 2;
-            radio::retained.rtcApReason = 2;
-            DevLog.println("[config] BOOT held 15s; entering AP mode");
-            radio::startConfigMode();
-            return;
-        }
-        if (bootStage < 3 && held > 30000) {
-            bootStage = 3;
-            platform::factoryReset();
-        }
-    } else {
-        if (bootDownAt) {
-            uint32_t held = millis() - bootDownAt;
-            if (bootStage == 0 && held > 50 && held < 2000) power::handleBootClick();
-            bootDownAt = 0;
-            bootStage = 0;
-        }
+    uint32_t buttonAt = 0;
+    portENTER_CRITICAL(&bootCaptureMux);
+    const BootCapture::Action button = bootCapture.action(millis(), buttonAt);
+    const uint8_t dropped = bootCapture.dropped;
+    bootCapture.dropped = 0;
+    portEXIT_CRITICAL(&bootCaptureMux);
+    if (dropped) DevLog.printf("[boot] edge queue overflow dropped=%u\n", dropped);
+    if (button != BootCapture::None)
+        DevLog.printf("[boot] action=%u physical_ms=%lu handled_ms=%lu\n",
+            (unsigned)button, (unsigned long)buttonAt, (unsigned long)millis());
+    switch (button) {
+    case BootCapture::Click: power::handleBootClick(buttonAt); break;
+    case BootCapture::Template: platform::nextTemplate(); break;
+    case BootCapture::Config:
+        radio::retained.rtcApReason = 2; radio::startConfigMode(); return;
+    case BootCapture::Reset: platform::factoryReset(); return;
+    default: break;
     }
 
     power::pollPlug();

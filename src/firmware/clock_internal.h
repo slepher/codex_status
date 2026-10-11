@@ -27,6 +27,7 @@ extern Retained retained;
 
 void applyTimezone();
 bool timeKnown();
+uint64_t planUtc();
 const char *timeSourceName(uint8_t src);
 void ntpTimeSynced(struct timeval *tv);
 void flushNtpRtcSync();

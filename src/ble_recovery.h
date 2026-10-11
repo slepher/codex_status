@@ -5,12 +5,16 @@
 struct BleRecoveryWindow {
     uint64_t until = 0;
     uint64_t lightUntil = 0;
+    uint64_t startupUntil = 0;
+    void startup(uint64_t now) { startupUntil = now + 120000; lightUntil = now + 300000; }
+    uint64_t physicalUntil() const { return until > startupUntil ? until : startupUntil; }
     bool active(uint64_t now) const { return until && now < until; }
     void open(uint64_t now) {
         if (!active(now)) { until = now + 120000; lightUntil = now + 300000; }
     }
     // Only a new physical OFF -> ON action renews either window.
     bool toggle(uint64_t now) {
+        startupUntil = 0;
         if (active(now)) { close(); return false; }
         open(now); return true;
     }

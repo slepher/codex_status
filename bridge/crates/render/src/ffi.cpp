@@ -768,7 +768,7 @@ int codex_bundle_font_reboot() {
 }
 
 int codex_render(const char *tmpl, const char *usage, const char *channel, const char *ip,
-                 const char *sync_hhmm, int battery, const char *state, const char *wifi_state, int wifi_blink, int offline_mins,
+                 const char *sync_hhmm, int battery, const char *state, const char *wifi_state, int wifi_blink, int ble_manual, int offline_mins,
                  const char *mode, uint8_t *out, int out_len) {
     if (!tmpl || !out || out_len < ((g_canvas_w + 7) / 8) * g_canvas_h) return -2;
     Paint_NewImage(out, g_canvas_w, g_canvas_h, ROTATE_0, WHITE);
@@ -781,6 +781,7 @@ int codex_render(const char *tmpl, const char *usage, const char *channel, const
     env.state = state ? state : "";
     env.wifiState = wifi_state ? wifi_state : "";
     env.wifiBlink = wifi_blink;
+    env.bleManualActive = ble_manual;
     env.offlineMins = offline_mins;
     env.mode = mode ? mode : "";
     return tplDraw(String(tmpl), String(usage ? usage : ""), env) ? 1 : 0;
@@ -815,7 +816,7 @@ int codex_compile(const char *tmpl, char *err, int err_len) {
 
 int codex_render_compiled(const char *usage, const char *channel, const char *ip,
                           const char *sync_hhmm, int battery, const char *state,
-                         const char *wifi_state, int wifi_blink,
+                         const char *wifi_state, int wifi_blink, int ble_manual,
                           int offline_mins, const char *mode, uint8_t *out, int out_len) {
     if (!out || out_len < ((g_canvas_w + 7) / 8) * g_canvas_h) return -2;
     if (!g_ct_valid) return -4;
@@ -829,6 +830,7 @@ int codex_render_compiled(const char *usage, const char *channel, const char *ip
     env.state = state ? state : "";
     env.wifiState = wifi_state ? wifi_state : "";
     env.wifiBlink = wifi_blink;
+    env.bleManualActive = ble_manual;
     env.offlineMins = offline_mins;
     env.mode = mode ? mode : "";
     return tplDrawCt(g_ct, String(usage ? usage : ""), env) ? 1 : 0;

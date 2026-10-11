@@ -34,7 +34,7 @@ enum BindKind {
     B_BUCKET_USED, B_BUCKET_REMAIN, B_BUCKET_RESET, B_BUCKET_WINMINS,
     B_DEV_CHANNEL, B_DEV_IP, B_DEV_SYNC, B_DEV_BATTERY,
     B_DEV_STATE, B_DEV_OFFLINE, B_DEV_NOW, B_DEV_MODE, B_DEV_DATE,
-    B_DEV_WIFI_STATE, B_DEV_WIFI_BLINK
+    B_DEV_WIFI_STATE, B_DEV_WIFI_BLINK, B_DEV_BLE_MANUAL
 };
 
 // The optional JSON "time_format" accepts exactly "date" (the compact local
@@ -104,6 +104,7 @@ static bool parseBind(const String &path, BindSpec &s) {
     if (path == "device.battery")              { s.kind = B_DEV_BATTERY; return true; }
     if (path == "device.state")                { s.kind = B_DEV_STATE; return true; }
     if (path == "device.wifi_state")           { s.kind = B_DEV_WIFI_STATE; return true; }
+    if (path == "device.ble_manual_active")    { s.kind = B_DEV_BLE_MANUAL; return true; }
     if (path == "device.wifi_blink")           { s.kind = B_DEV_WIFI_BLINK; return true; }
     if (path == "device.offline_mins")         { s.kind = B_DEV_OFFLINE; return true; }
     if (path == "device.now")                  { s.kind = B_DEV_NOW; return true; }
@@ -215,6 +216,7 @@ static bool evalBind(const BindSpec &s, TextTimeFormat format, JsonDocument &usa
         if (env.state.length() == 0) return false;
         out = env.state;
         return true;
+    case B_DEV_BLE_MANUAL: out = String(env.bleManualActive); return true;
     case B_DEV_WIFI_STATE:
         if (env.wifiState.length() == 0) return false;
         out = env.wifiState; return true;
@@ -287,6 +289,7 @@ static bool evalBind(const BindSpec &s, TextTimeFormat format, JsonDocument &usa
 
 static bool evalBindNum(const BindSpec &s, JsonDocument &usage,
                         const TplEnv &env, double &v) {
+    if (s.kind == B_DEV_BLE_MANUAL) { v = env.bleManualActive; return true; }
     if (s.kind == B_DEV_WIFI_BLINK) {
         if (env.wifiState != "connecting" || env.wifiBlink < 0) return false;
         v = env.wifiBlink; return true;
@@ -331,6 +334,7 @@ static bool bindExists(const BindSpec &s, JsonDocument &usage, const TplEnv &env
     case B_DEV_SYNC:    return env.syncHHMM.length() > 0 && env.syncHHMM != "--:--";
     case B_DEV_BATTERY: return env.battery >= 0;
     case B_DEV_STATE:   return env.state.length() > 0;
+    case B_DEV_BLE_MANUAL: return true;
     case B_DEV_WIFI_STATE: return env.wifiState.length() > 0;
     case B_DEV_WIFI_BLINK: return env.wifiState == "connecting" && env.wifiBlink >= 0;
     case B_DEV_OFFLINE: return env.offlineMins >= 0;

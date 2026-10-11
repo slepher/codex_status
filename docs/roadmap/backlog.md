@@ -210,7 +210,7 @@
 
 ### B6. 离线 BLE 配 Wi-Fi 与 BOOT 蓝牙恢复入口（2026-10-03 新开）
 
-- **2026-10-11 后续调查与统一规划，未实施**：首次唤醒与手动GATT常开混用、模板缺独立手动状态、交汇中的刷新遗漏、阻塞期间短按漏采风险；另有版本页/停滞、BLE瞬时认证失败及低堆线索。用户确认图标只反映手动GATT窗口，健康Light只走HTTP。C9 .80/Bridge已部署认证，旧.78证据不能直接作为新版本结论。新增正式计划跨重启、Light/USB直接HTTP、Sleep一次BLE、OTA确认竞态与USB准入G8–G11；按用户要求先合并方案，与G1–G7统一实施，本轮新增代码草稿已备份撤回。执行顺序与验收见 [BOOT/GATT执行文档](../../project-workflow/bridge-macos/note4-boot-gatt-followup-20261011.md)，原始调查见 [现场记录](../../project-workflow/bridge-macos/note4-stall-20261011.md)。
+- **2026-10-11 BOOT/GATT、计划恢复与OTA统一实现已部署**：Note4 .81/配套Bridge/实际手动BLE模板已部署，基线f822531后的统一实现随.82电量平滑按用户授权收尾提交。用户六次按键符合预期；计划3490经USB工具复位恢复同ID/原剩余期限并直接HTTP。367项软件测试通过、3条件忽略，匹配ELF66项栈检查通过；同名模板合同失效/发布后认证回读已修正。USB工具复位后认证HTTP延迟/超时及旧.78停滞根因仍未知；电池Sleep重启、RF/掉电/功耗完整矩阵未验，不结B6/C8。电量抖动研究后已按用户授权实施.82：5秒采样、显示专用90/10 EMA、原始保护/诊断独立，12定向回归及实机/用户按键验收通过，见[电量记录](../../project-workflow/bridge-macos/note4-battery-smoothing-20261011.md)。详见[执行与证据](../../project-workflow/bridge-macos/note4-boot-gatt-followup-20261011.md)及PROGRESS。
 
 - 2026-10-08 新协议空闲重复activate实现bug已在同源Fake复现并修正，Note4/默认Bridge已协调升级，.71运行hash与原OTA单次image_verified核对。软件闭环与剩余实体边界见PROGRESS顶节、A9及[周期activate计划](../../project-workflow/bridge-macos/wifi-idle-activate-20261008-plan.md)；书桌屏暂停后台连接、未刷ROM，不以此结B6。
 - **2026-10-08容量与误扣预算修复已部署、实机恢复通过。** Fake已复现32条已确认历史永久占队列及未发激活扣完预算；现已安全回收确认/已ACK终态、保护未知提交/待ACK与序号围栏，容量错误明确返回、首次实际发送才扣预算，33项相关测试通过。Bridge SHA38B7CE11…已部署，正常应用服务重试home/v8，w3_4a完成/回执退役；Note4 .69认证HTTP已连wd21-la/.177/attempts0，无需刷ROM。诊断/修复见`project-workflow/bridge-macos/wifi-activate-fake-20261008-plan.md`与PROGRESS。剩余：长期多轮RF/电池与Mac部署验收；Fake通用状态硬编码wifi_connected/http.ready，须补RF/HTTP及完整main生命周期适配；无实际HTTP工作仍重复启用路径待独立复现。
@@ -328,6 +328,7 @@
 - 前置：C3 的记录格式（否则没有可信的对照口径）。
 
 ### C8. 设备同步与诊断协议（device-sync-diagnostics）
+- **2026-10-11续项**：BOOT/GATT与跨重启PowerPlan、USB/Light直接HTTP、OTA独立镜像确认已随.81部署；发布后旧data_contract索引失效并认证回读已部署。软件与部分实机通过，认证HTTP间歇延迟、完整电池/RF/掉电矩阵仍开放；见[统一执行记录](../../project-workflow/bridge-macos/note4-boot-gatt-followup-20261011.md)，不因USB单轮通过结项。
 - `sync-v1` 实施合同见 `project-workflow/device-sync-diagnostics/design.md`。当前默认 Bridge 与双设备现场见 `docs/history/progress-archive-2026-10-03.md` 相关历史节：Note4 `0.18.38-note4-b-bridge2` 的运行分区前缀 SHA256 已由认证接口与候选 ROM 精确匹配；1.54 `0.18.34-bw-ota1` 已做 USB 写入后逐字节回读，运行分区的独立认证哈希仍待验。双设备 BLE status/config/plan/open、OTA 上传与重启换槽等先前实机证据保留。2026-09-29 后台隔离双 Fake ROM + 候选 Bridge 虚拟 24h 达到各 97 个连续批次和第 15 轮；独立 light 入/离场、进程重启及同 seed 1h 回放烟测通过，详见 `docs/history/progress-archive-2026-10-03.md`。一次性 Wi-Fi 续传修正及设备页/MCP 对等版已部署默认实例。Fake ROM S01–S14、设备页 U01–U20 完整矩阵、F3 延迟页/同磁盘快照回放、页中途强退、真实窗口视觉及其他实机故障矩阵仍未完成；Flash 断电恢复和 1.54 运行分区哈希证据仍须过门槛。
 - 当前设备协议作为唯一业务协议的一次性统一见 `project-workflow/device-sync-diagnostics/protocol-unification.md`：业务 HTTP 已收敛到 `/api/*`，旧 `protocol=2`、BLE `rv=2`/`ack="v2"` 与 MCP `_v2` 入口已移除。两台设备现已升级，临时旧 Bridge 已停、新版默认实例已恢复。1.54 的增量缓存复核已完成，结论与四次构建日志见 `docs/history/progress-archive-2026-10-03.md` 相关历史节；不并行运行两个 Bridge，也不保留长期双协议兼容。Bridge 本地 `state.json` 无损保留，不凭 wire 更名删除运行数据。
 - 实现每 15 次深睡 BLE 会合的一次性 Wi-Fi 同步，以及正式 light 入口和退出时的 Wi-Fi 同步；成功同步才重置计数。普通 BLE 保持精简，诊断日志按冻结批次经 Wi-Fi 增量同步，未确认内容保留。

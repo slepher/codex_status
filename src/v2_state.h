@@ -57,7 +57,7 @@ class V2PlanState {
         acceptedId_ = 0;
         acceptedMode_ = V2_PLAN_SLEEP;
         acceptedDurationS_ = 0;
-        acceptedAtMs_ = 0;
+        deadlineMs_ = 0;
         sourceBoot_ = false;
     }
 
@@ -89,7 +89,7 @@ class V2PlanState {
         requestedDurationS_ = plan.lightDurationS;
         requestedPeriodS_ = plan.rendezvousPeriodS;
         acceptedDurationS_ = duration;
-        acceptedAtMs_ = nowMs;
+        deadlineMs_ = nowMs + (uint64_t)duration * 1000ULL;
         sourceBoot_ = provisional;
         return V2_PLAN_ACCEPTED;
     }
@@ -101,13 +101,17 @@ class V2PlanState {
 
     uint32_t remainingS(uint64_t nowMs) const {
         if (!haveAccepted_ || acceptedMode_ != V2_PLAN_LIGHT) return 0;
-        uint64_t elapsedS = (nowMs - acceptedAtMs_) / 1000ULL;
-        if (elapsedS >= acceptedDurationS_) return 0;
-        return (uint32_t)(acceptedDurationS_ - elapsedS);
+        if (nowMs >= deadlineMs_) return 0;
+        return (uint32_t)((deadlineMs_ - nowMs + 999ULL) / 1000ULL);
     }
 
     uint32_t grantedS() const { return acceptedDurationS_; }
-    uint64_t deadlineMs() const { return acceptedAtMs_ + (uint64_t)acceptedDurationS_ * 1000ULL; }
+    uint64_t deadlineMs() const { return deadlineMs_; }
+    void restore(const V2PowerPlan &plan, uint32_t grant, uint32_t remaining, uint64_t nowMs) {
+        reset(); accept(plan, nowMs, false, V2_MAX_LIGHT_S);
+        acceptedDurationS_ = grant;
+        deadlineMs_ = nowMs + (uint64_t)remaining * 1000ULL;
+    }
     uint64_t acceptedId() const { return acceptedId_; }
     uint64_t highId() const { return highId_; }
     bool accepted() const { return haveAccepted_; }
@@ -128,7 +132,7 @@ class V2PlanState {
     uint32_t acceptedDurationS_ = 0;
     uint32_t requestedDurationS_ = 0;
     uint32_t requestedPeriodS_ = 0;
-    uint64_t acceptedAtMs_ = 0;
+    uint64_t deadlineMs_ = 0;
     bool sourceBoot_ = false;
 };
 

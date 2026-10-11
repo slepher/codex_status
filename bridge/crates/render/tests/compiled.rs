@@ -56,6 +56,7 @@ fn envs() -> Vec<Env<'static>> {
             state: "WIFI CONN",
             wifi_state: "connecting",
             wifi_blink: 1,
+            ble_manual_active: false,
             offline_mins: -1,
             mode: "light",
         },
@@ -67,6 +68,7 @@ fn envs() -> Vec<Env<'static>> {
             state: "WIFI OFF",
             wifi_state: "off",
             wifi_blink: -1,
+            ble_manual_active: false,
             offline_mins: 42,
             mode: "deep",
         },
@@ -249,5 +251,25 @@ fn wifi_metadata_controls_template_pixels_independently_of_legacy_state() {
         let mut custom: serde_json::Value = serde_json::from_str(&source).unwrap();
         custom["elements"][0]["when"]["bind"] = json!("device.wifi_unknown");
         assert!(compile(&custom.to_string()).is_err());
+    }
+}
+
+#[test]
+fn manual_gatt_icon_is_independent_of_wifi_and_automatic_ble() {
+    let _guard = SERIAL.lock().unwrap();
+    let mut source: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+        repo_root().join("bridge/crates/core/tests/fixtures/codex-status-a-400x300.json")).unwrap()).unwrap();
+    source["elements"].as_array_mut().unwrap().retain(|e| e["when"]["bind"] == "device.ble_manual_active");
+    assert!(!source["elements"].as_array().unwrap().is_empty());
+    let source=source.to_string();
+    let (w,h)=bridge_render::canvas_size(&source).unwrap();
+    compile(&source).unwrap();
+    for phase in ["idle","connecting","connected","off"] {
+        for active in [false,true] {
+            let env=Env {state:"BLE ON",wifi_state:phase,ble_manual_active:active,..Env::default()};
+            let pixels=render_bits(&source,"{}",&env).unwrap();
+            assert_eq!(pixels,render_compiled_bits_size("{}",&env,w,h).unwrap());
+            assert_eq!(pixels.iter().any(|b|*b!=255),active,"{phase}/{active}");
+        }
     }
 }

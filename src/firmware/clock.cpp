@@ -1,4 +1,5 @@
 #include "clock_internal.h"
+#include "power_internal.h"
 
 namespace firmware::clock {
 
@@ -47,6 +48,15 @@ static bool applyTzOffsetMin(long offsetMin) {
 
 bool timeKnown() { return time(nullptr) > 1600000000; }
 
+uint64_t planUtc() {
+#if defined(CODEX_TARGET_NOTE4)
+    time_t utc;
+    return state.externalRtc.read(utc) ? (uint64_t)utc : 0;
+#else
+    return timeKnown() ? (uint64_t)time(nullptr) : 0;
+#endif
+}
+
 const char *timeSourceName(uint8_t src) {
     return src == TIME_BLE ? "ble" : src == TIME_RTC ? "rtc" :
            src == TIME_EXTERNAL_RTC ? "external_rtc" : src == TIME_NTP ? "ntp" : "none";
@@ -56,6 +66,12 @@ const char *timeSourceName(uint8_t src) {
 // the internal-RC fallback here would turn offline drift into a new RTC anchor.
 static void writeExternalRtcFromSystem() {
     time_t utc = time(nullptr);
+    time_t previous;
+    if ((!state.externalRtc.read(previous) || previous > utc + 1 || utc > previous + 1) &&
+        !power::state.planStore.reanchor(power::state.v2Plan, v2NowMs(), (uint64_t)utc)) {
+        DevLog.println("[clock] RTC correction deferred: plan checkpoint not confirmed");
+        return;
+    }
     if (!state.externalRtc.write(utc)) {
         DevLog.printf("[clock] %s correction failed: %s\n", state.externalRtc.model(), state.externalRtc.status());
     }

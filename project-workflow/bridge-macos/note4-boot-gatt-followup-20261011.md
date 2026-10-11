@@ -4,6 +4,10 @@
 
 ## Status：现场与交接边界
 
+**17:42 实施交接**：基线提交 `f822531` 后，BOOT/GATT、PPL1计划恢复、启动通道及Bridge OTA调度已统一实现。Note4已认证运行 `0.18.81-note4 / ota_1`，OTA `35c89bae` 单次上传、`succeeded/image_verified`；默认Bridge与实际codex-status-a v4模板已配套部署。随后.82电量平滑已部署并获用户实体确认；两项按用户追加授权统一收尾提交，见[电量执行记录](note4-battery-smoothing-20261011.md)。具体产物、测试、资源和剩余实机边界见本文末尾；下文16:40及更早记录为历史基线，不代表当前部署。
+
+持久时间方案：PPL1单blob，显式LE字段/长度/CRC/实际principal；保存原授予时长及RTC绝对起止。运行中仍用单调截止；恢复仅转换剩余量并保守扣除RTC整秒不确定性。外部RTC发生校时跳变前，先用当前单调剩余量原子重锚，失败则不改外部RTC；失效/回拨无法证明连续时不恢复Light。身份/原请求字段用于重放围栏，不恢复owner租约。该格式无记录0 B，有记录固定48 B+实际principal字节，最多176 B（逻辑数据，不含NVS管理开销）；正常重复计划零写入。
+
 本轮只读调查对象为 **0.18.78-note4 / ota_1**，源码基准提交 `bda8313`，设备 Wi-Fi MAC `7C4FADB93408`。匹配 ROM/ELF、转储及原始证据见 [调查记录](note4-stall-20261011.md)。
 
 用户告知另一 agent 已准备好新 ROM、正在刷入。本 agent 自此不再打开串口、请求设备、构建、启停 Bridge 或烧录，以免争用现场。新版本、运行槽位、镜像哈希、刷入完成与认证核验结果由部署 agent 更新 PROGRESS；本文件不把候选或用户报告的进行中操作写成已部署成功。接手以最新交接卡为准，在新 ROM 上复核下述缺口，不覆盖并行的单份 Bundle/压缩实现。
@@ -134,8 +138,39 @@ G8/G9在同一启动路径实现：先恢复并验证计划，再合并USB/物�
 | 局刷失败 | 可核对补画/全刷，软件确认与实体显示分别验收 |
 | 异常版本页或停止响应复现 | 先保存身份、日志和任务现场；不先复位；真实复位原因与工具行为分账 |
 
-每例记录精确时间、固件/模板身份、boot_id、Wi-Fi与Bridge状态、手动窗口/自动原因/实际BLE、显示计数和肉眼结果。至少一轮健康联网开关测试连续10次，失败场景按有界周期验证；不得用 USB 常连结果替代电池深睡/功耗验证。
+每例记录精确时间、固件/模板身份、boot_id、Wi-Fi与Bridge状态、手动窗口/自动原因/实际BLE、显示计数和肉眼结果。用户已反馈健康USB联网下六次实体按键符合预期；采用这六次作为本轮人工验收，不再要求十次。失败场景按有界周期验证；不得用USB常连结果替代电池深睡/功耗验证。
 
 ## Review：收口标准
 
-G1–G5及G8–G11 经新基线复核、统一修复、生产测试与实机矩阵闭环后才可称行为修复完成。G6/G7 若未复现或缺证据，明确保留未知，不能用“新 ROM 正常一次”结案。详细状态与证据更新本专项，待办状态仅维护 backlog B6/C8；部署事实由 PROGRESS 的现场条目负责。当前仅完成调查和合并执行文档，尚未按本文统一实施或验收；.80/C9部署不代表本方案已落地。
+G1–G5及G8–G11已统一实现并完成下列软件验收和部分实体验证；完整电池/RF/掉电矩阵仍开放。G6/G7缺证据的历史异常保留未知，不用新ROM正常样本结案。待办状态仅维护backlog B6/C8，部署事实由PROGRESS负责。
+
+### 本轮部署与验证
+
+- ROM：`artifacts/note4-0.18.81-boot-plan.bin`及同名ELF，1,925,792 B，SHA256 `BC2ED81473FADC1EBC04DA96CE299550AFC527311FE28ED236FD392ADC109391`。唯一目标zectrix-note4-b，构建静态RAM119,308 B、Flash1,873,131 B。OTA原任务35c89bae认证目标镜像，无重复上传。
+- 默认Bridge exe SHA256 `3F53CFEB953A883C1637280E7332357CC54CC44C35E989DA7551B0160E3C759D`，通过计划任务部署；旧exe/data分别备份在 `artifacts/bridge-before-note4-81-20261011.*` 和 `bridge-before-contract-fix-20261011*`，ZIP校验通过。书桌屏未刷机。
+- BOOT ISR有界捕获短按，首次唤醒临时BLE与手动窗口分开；`device.ble_manual_active`为本地数值0/1，模板ABI2追加绑定。用户六次实体开/关符合预期。实际模板由原运行版本修改四处BLE条件，未用其他夹具覆盖用户布局；宿主JSON/compiled像素对拍一致。
+- 首次发布12fba505后Data449先被拒绝，约80秒后重试成功，期间用户看到内置界面。原拒绝未记录设备错误码，不能断言唯一根因。源码另确认同名模板发布后可能复用旧字段索引，已修正：上下文变更立即失效旧合同，发布/激活ACK后认证回读新合同，再允许Data；补设备错误日志。回归覆盖同名索引变化及Bridge重启。验证发布53cab015已succeeded；commit后立即认证读状态的日志存在，后续认证data/applied_seq=453、displayed。期间HTTP超时使Data ACK不完整，不宣称首次Data发送即成功。
+- 正式Light计划3490获600秒、ACK retention=nvs后，用esptool run进行一次明确的USB工具复位（无Flash/NVS写入）。新boot b923581cdb078739ba3e6a263b40c4c9、reset_reason=11，认证恢复同ID、restored_light、剩417秒，扣除了经过时间，没有重授600秒；startup_contact=http，automatic_ble=false。此后Bridge新正式计划3491属独立决策。计划不会在回报后删除，也没有设备端一次性OTA回报marker。
+- 测试：core/app及相关集成241 passed、3条件ignored；render/MCP/device-sim126 passed。后续boot_plan/compiled重复复核11 passed，不重复加入总数。固件模块检查、匹配ELF的66项栈门禁通过。证据：`artifacts/note4-81-contract-tests.log`、`note4-81-render-protocol-tests.log`、`note4-81-focused.log`、`note4-81-stack.log`、`note4-81-build.log`。
+
+### 资源与验收限制
+
+PPL1逻辑持久字节：空0、最小49、当前4字节principal为52、上限176；每条仅一个计划。NVS还需条目/页/GC开销，不能把这些逻辑长度当Flash总占用。正常同ID重放不写入；校时重锚另有必要写入。匹配ELF对象PlanStore48 B、BootCapture112 B、BleRecoveryWindow24 B；principal按实际字符串分配。存储/读回各176 B有界栈缓冲；PlanStore save栈帧416 B，applyV2Plan可静态解析局部链1376 B（不含平台和间接调用，不冒充完整动态峰值）。认证样本heap_free94,728、heap_min62,040、largest51,188 B，loop_stack_free6,324 B；不据单样本证明长期无泄漏。证据 `note4-81-object-sizes.log`、`note4-81-final-auth.private.json`。
+
+USB工具复位后启动和认证HTTP出现数秒延迟/超时，未出现新boot/panic证据。当前模板已恢复、认证data453已显示，延迟原因仍未知。HWCDC源码存在主机不读取时日志等待的可能性，但原生被动COM5读取对照没有证明因果：公共状态约0.16–0.59秒，认证回读约2.9–6秒且一次offline；后一次读取0字节。不得把它写成已确认CDC故障，也未据此再刷ROM。两次被动监听均未改DCB/DTR/RTS、未清缓冲/发送命令，认证boot_id保持。证据 `note4-81-cdc-drain-meta.json`、`note4-81-cdc-auth-meta.json`及私有串口原文。
+
+尚未实体完成：无USB的Sleep普通重启一次BLE、Light到期竞态、电池深睡首按、Flash掉电、长期RF/功耗/动态堆矩阵；这些不由USB样本或宿主模拟替代。历史.78停滞根因仍未知，B6/C8不结项。
+
+### 电量抖动资料调查（只读，未改电量算法）
+
+用户观察BLE OFF显示96，ON时95/96/97。当前Note4 `src/firmware/power.cpp` 每次8次ADC平均，VBAT按3300–4200mV线性换算，9mV约1个百分点；没有跨次历史滤波。BLE负载变化或采样噪声是可能解释，当前未对齐原始电压和射频事件，不能确认实际电量随开关瞬变。
+
+已按要求调用Luna runner检索GitHub，并复核本地 `D:/Documents/PlatformIO/Projects/slate`：
+
+| 实现 | 代码证据与行为 | 对Note4的价值 |
+|---|---|---|
+| Slate | `firmware/main/bsp/battery_adc.cc:49`每次10次校准ADC平均，间隔100µs，随后二次曲线换算；无跨次平滑。`firmware/main/ui/status_bar.cc:106`确认充电隐藏百分比、充满显示100%、未知显示--。charge_status另做GPIO去抖。 | 单次平均与曲线不能直接解决跨次跳动；充电显示策略需可靠充电状态，USB在场不足以判断。 |
+| CrossPoint X4 | [固定提交源码](https://github.com/crosspoint-reader/crosspoint-reader/blob/81ae9dd7797b998644cfdf54f08d687bb54c0e64/lib/hal/HalPowerManager.cpp#L118)：一个RAM整数保存放大10倍的值，EMA约90%历史+10%新读数，无NVS；每次getBatteryPercentage调用更新，无新增定时器。X3的I²C电量计另一路径。 | 最贴近现有抖动；不能原样随每次渲染推进滤波，应固定采样节奏；真0%不能兼作未初始化标志。 |
+| ESPHome墨水屏示例 | [原仓库配置](https://github.com/Bedacz/esphome-epaper-weather-display/blob/main/e_paper_weather_forecast.yaml)：电压曲线+0–100夹紧+最近4样本滑动平均，ADC每5分钟采样。 | 证明小窗口也是常用方式；示例周期不适合直接照搬当前交互。 |
+
+建议只对UI百分比添加轻量整数EMA，保留原始电压/百分比供低电保护与诊断；状态约一个整数及初始化/采样时间（估计8–16 B，非已构建实测），无须额外库、任务或NVS写入。初始化用首个有效读数；充电/USB策略单独核实。平滑改善显示稳定性，不等于校准真实荷电量；本轮没有修改或刷入电量算法。

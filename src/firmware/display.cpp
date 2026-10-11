@@ -145,7 +145,7 @@ static void screenStatus() {
     std::vector<String> lines;
     lines.push_back("CODEX STATUS");
     lines.push_back(radio::deviceStateText());
-    lines.push_back(String("BATT ") + power::batteryPercent() + "%");
+    lines.push_back(String("BATT ") + power::displayBatteryPercent() + "%");
     lines.push_back(String("IP ") + radio::ipText());
     lines.push_back(String("SYNC ") + clock::fmtEpoch((long long)radio::retained.rtcLastSyncEpoch, "%H:%M"));
     lines.push_back(String("FW ") + application::state.firmwareVersion);
@@ -835,7 +835,7 @@ static void renderUsage(const String &json, const char *channel) {
 
     String rcLine = (rc >= 0) ? String("RC ") + rc : String("RC --");
     std::vector<String> tr, bl;
-    int battery = power::batteryPercent();
+    int battery = power::displayBatteryPercent();
 
     tr.push_back(fitText(String(plan), 12));
     tr.push_back(fitText(String(label), 12));
@@ -875,9 +875,10 @@ void renderActiveUsage(const String &json, const char *channel) {
     env.channel  = channel ? channel : "";
     env.ip       = radio::ipText();
     env.syncHHMM = clock::nowHHMM();
-    env.battery  = power::batteryPercent();
+    env.battery  = power::displayBatteryPercent();
     env.state    = (power::retained.rtcMode == MODE_DEEP) ? "DEEP" : radio::templateStateText();
     env.wifiState = wifiPhaseText(radio::wifiPhase());
+    env.bleManualActive = power::state.bleRecovery.active(clock::v2NowMs()) ? 1 : 0;
     env.wifiBlink = radio::state.wifiConnActive ? (radio::state.wifiBlinkOn ? 1 : 0) : -1;
     env.mode     = (power::retained.rtcMode == MODE_DEEP) ? "deep" : "light";
     env.offlineMins = currentBridgeOfflineMinutes();
@@ -910,7 +911,8 @@ void renderCurrent() {
     else if (platform::state.lastUsage.length()) renderActiveUsage(platform::state.lastUsage, platform::state.lastChannel.c_str());
     else screenStatus();
     state.networkGlyph.observe(radio::state.wifiUp, currentBridgeOfflineMinutes(), radio::wifiPhase(),
-                               radio::state.wifiConnActive ? (radio::state.wifiBlinkOn ? 1 : 0) : -1);
+                               radio::state.wifiConnActive ? (radio::state.wifiBlinkOn ? 1 : 0) : -1,
+                               power::state.bleRecovery.active(clock::v2NowMs()));
     const bool confirmed = state.epdBaselineTrusted && state.lastDisplayedFrame && state.frame &&
         memcmp(state.lastDisplayedFrame, state.frame, EPD_FB_BYTES) == 0;
     state.networkGlyph.rendered(confirmed, clock::v2NowMs());
@@ -919,10 +921,11 @@ void renderCurrent() {
 void serviceNetworkGlyph() {
     const auto phase = radio::wifiPhase();
     const int blink = radio::state.wifiConnActive ? (radio::state.wifiBlinkOn ? 1 : 0) : -1;
+    const bool manual = power::state.bleRecovery.active(clock::v2NowMs());
     const bool blinkOnly = state.networkGlyph.known && phase == WifiPhase::Connecting &&
         state.networkGlyph.wifiPhase == phase && state.networkGlyph.wifiBlink != blink &&
-        state.networkGlyph.bridgeOffline == currentBridgeOfflineMinutes();
-    state.networkGlyph.observe(radio::state.wifiUp, currentBridgeOfflineMinutes(), phase, blink);
+        state.networkGlyph.bridgeOffline == currentBridgeOfflineMinutes() && state.networkGlyph.bleManual == manual;
+    state.networkGlyph.observe(radio::state.wifiUp, currentBridgeOfflineMinutes(), phase, blink, manual);
     if (!state.networkGlyph.due(clock::v2NowMs()) || transport::state.otaInProgress) return;
     state.rfnBlink = blinkOnly;
     if (state.networkGlyph.attempts) state.forceCleanRefresh = true;
