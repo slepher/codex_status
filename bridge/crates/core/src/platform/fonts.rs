@@ -59,6 +59,8 @@ pub const MAX_FONT_BYTES_PER_PROFILE: u64 = u64::MAX;
 /// glyph data. `id` is the content address, so a descriptor is immutable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FontDescriptor {
+    #[serde(default = "legacy_version")]
+    pub version: u16,
     /// `crc32` of the whole container, 8 lowercase hex digits.
     pub id: String,
     /// Template-visible name, e.g. `ntthin18`.
@@ -92,6 +94,8 @@ pub struct FontDescriptor {
     /// Whole container length in bytes.
     pub bytes: u32,
 }
+
+fn legacy_version() -> u16 { 1 }
 
 impl FontDescriptor {
     /// Mirror of the device's `fontAssetMatchesTarget`: a gray4 asset pushed to
@@ -188,8 +192,8 @@ impl FontLibrary {
             bail!("bad font magic 0x{magic:08x}: expected \"CSFN\" (0x{MAGIC:08x})");
         }
         let version = rd16(bytes, 4);
-        if version != VERSION {
-            bail!("unsupported font container version {version}: expected {VERSION}");
+        if version != VERSION && version != 2 {
+            bail!("unsupported font container version {version}: expected 1 or 2");
         }
         let header_bytes = rd16(bytes, 6) as usize;
         if header_bytes != HEADER_BYTES {
@@ -236,17 +240,21 @@ impl FontLibrary {
         if pixel_format == PIXEL_GRAY4 && bpp != BPP_GRAY4 {
             bail!("font bpp {bpp} does not match pixel format gray4 ({BPP_GRAY4}bpp)");
         }
-        if glyph_count != GLYPH_SLOTS as u32 {
+        if (version == 1 && glyph_count != GLYPH_SLOTS as u32)
+            || glyph_count < 95 || glyph_count > 4096 {
             bail!(
-                "unsupported font glyph count {glyph_count}: the engine's dense ASCII table has {GLYPH_SLOTS} slots"
+                "unsupported font glyph count {glyph_count}: v1 requires 95; v2 requires 95..4096"
             );
+        }
+        if version == 2 && (bpp != BPP_BW || pixel_format != PIXEL_BW || len > 48 * 1024) {
+            bail!("Unicode fonts require 1bpp and at most 48 KiB");
         }
         if line_height == 0 || base_line >= line_height {
             bail!("bad font line metrics: line height {line_height}, baseline {base_line}");
         }
-        if filled_glyphs as usize > GLYPH_SLOTS {
+        if filled_glyphs as u32 > glyph_count {
             bail!(
-                "font declares {filled_glyphs} filled glyphs, but only {GLYPH_SLOTS} slots exist"
+                "font declares {filled_glyphs} filled glyphs, but only {glyph_count} slots exist"
             );
         }
 
@@ -254,13 +262,14 @@ impl FontLibrary {
         // of the length fields) so the descriptor table starts on a 2-byte
         // boundary and can be pointed at directly (docs/font-asset-format.md).
         let pad = (name_len & 1) + (family_len & 1) + (coverage_len & 1);
-        let glyph_off = HEADER_BYTES + name_len + family_len + coverage_len + pad;
+        let codepoint_off = HEADER_BYTES + name_len + family_len + coverage_len + pad;
+        let glyph_off = codepoint_off + if version == 2 { glyph_count as usize * 4 } else { 0 };
         if glyph_off % 2 != 0 {
             bail!(
                 "font descriptor table would start at odd offset {glyph_off}: string sections must be padded to even lengths"
             );
         }
-        let glyph_table = GLYPH_SLOTS * GLYPH_BYTES;
+        let glyph_table = glyph_count as usize * GLYPH_BYTES;
         if glyph_off + glyph_table > len {
             bail!(
                 "font payload is {len} bytes, shorter than the declared sections ({} bytes of strings + {glyph_table} bytes of glyph descriptors)",
@@ -293,10 +302,21 @@ impl FontLibrary {
         if coverage.is_empty() {
             bail!("font coverage is empty");
         }
+        if version == 2 {
+            anyhow::ensure!(coverage == "unicode", "font coverage must be unicode");
+            let mut previous = 0;
+            for i in 0..glyph_count as usize {
+                let cp = rd32(bytes, codepoint_off + i * 4);
+                anyhow::ensure!((i >= 95 || cp == 32 + i as u32) && cp >= 32 &&
+                    !(127..=159).contains(&cp) && char::from_u32(cp).is_some() &&
+                    (i == 0 || cp > previous), "invalid font codepoint at {i}");
+                previous = cp;
+            }
+        }
 
         // Every box must fit inside the blob: a half-written container must
         // never look valid.
-        for slot in 0..GLYPH_SLOTS {
+        for slot in 0..glyph_count as usize {
             let at = glyph_off + slot * GLYPH_BYTES;
             let off = rd16(bytes, at) as usize;
             let box_w = bytes[at + 4];
@@ -316,6 +336,7 @@ impl FontLibrary {
         }
 
         Ok(FontDescriptor {
+            version,
             id: format!("{:08x}", crc32fast::hash(bytes)),
             name,
             family,
@@ -922,8 +943,8 @@ mod tests {
         assert!(error_of(&magic).contains("bad font magic"), "{}", error_of(&magic));
 
         let mut version = FontBuilder::new().build();
-        version[4] = 2;
-        assert!(error_of(&version).contains("unsupported font container version 2"), "{}", error_of(&version));
+        version[4] = 3;
+        assert!(error_of(&version).contains("unsupported font container version 3"), "{}", error_of(&version));
 
         let mut header = FontBuilder::new().build();
         header[6..8].copy_from_slice(&32u16.to_le_bytes());

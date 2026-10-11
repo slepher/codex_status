@@ -46,6 +46,7 @@ pub struct DeviceCapabilities {
     pub bundle_compression: u32,
     #[serde(default)]
     pub max_bundle_decoded_bytes: u64,
+    /// 0: unavailable; 1: CSFN v1; 2: v1 and Unicode subset v2.
     #[serde(default)]
     pub bundle_font_protocol: u32,
     #[serde(default)]
@@ -183,7 +184,7 @@ impl DeviceCapabilities {
         if self.asset_publish_protocol > 0 && (self.max_object_bytes == 0 || self.max_manifest_bytes == 0 || self.install_peak_bytes == 0 || self.free_bytes == 0) {
             bail!("capabilities: incremental publish limits missing");
         }
-        if self.bundle_font_protocol > 1 {
+        if self.bundle_font_protocol > 2 {
             bail!("capabilities: unsupported bundle_font_protocol");
         }
         if !(1..=COMPILER_ABI).contains(&self.compiler_abi) {

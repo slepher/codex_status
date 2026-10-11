@@ -9,6 +9,7 @@
 |---|---|
 | 接手项目、想知道现状 | `AGENTS.md`（操作约定）→ `PROGRESS.md`（当前交接卡）→ 按需查 `docs/roadmap/backlog.md` 相关条目（唯一待办来源） |
 | 构建、Bridge 启停/数据路径、模板缺省或串口/dump 操作 | [Agent 操作细则](agent-operations.md) 中对应节；从精简前 AGENTS 原文提取，历史现场不代替当前交接卡 |
+| clone 后编译/安装当前系统 Bridge，或让 Agent 完成 USB 分区刷机配网 | [构建与安装指南](build-install.md)：可复制提示词、Windows/macOS 原生构建、双 ROM CI 与逐阶段验收 |
 | 决定下一步做什么 | `docs/roadmap/backlog.md` §2 紧急 / §3 暂缓 |
 | 查某个已结项专项做了什么 | `docs/roadmap/archive-digest-legacy.md` / `archive-digest-recent.md` → 需要细节再进 `docs/history/workflow/<name>/` |
 | 查历史里程碑（0.13–0.18 各轮实机修复） | `docs/history/progress-archive-2026-09-23.md`（≤09-22）、`docs/history/progress-archive-2026-09-25.md`（09-24 及合并过程）、[2026-10-03 归档](history/progress-archive-2026-10-03.md)（09-25 至 10-03 较早记录） |
@@ -30,7 +31,7 @@
 | 验证 Wi-Fi 分 tab / 真实 macOS 布局 | `project-workflow/bridge-macos/wifi-tabs-plan.md`；`node tools/test-device-page.mjs` + `bash tools/test-wifi-ui.sh`，WKWebView 合成 IPC / 12 场景 / 截图审阅；设备通信另验 |
 | 实施设备页离线 BLE 配网、绑定独立方案与 BOOT 恢复 | `project-workflow/bridge-macos/wifi-redesign.md`（最新全量管理/UI 重设计）→ `remaining-plan.md` R0–R4 / `wifi-protocol.md`；统一协议已配套部署，完整 RF/跨平台/双板矩阵仍待验，仅 Note4 在场，见 backlog B6 |
 | 改模拟器/实验时钟 | `docs/fake-rom-simulator-design.md` + `docs/history/workflow/fake-rom-simulator-def/evidence.md`（D/E/F 已结项） |
-| 改字体资产 | `docs/font-asset-format.md` + `project-workflow/note4-bridge-publish/protocol.md`（**草案，未定稿**） |
+| 改字体资产 | `docs/font-asset-format.md`（CSFN v1/v2与完整Bundle）+ `docs/history/workflow/note4-bridge-publish/protocol.md`（增量发布历史草案，未定稿） |
 | 改单份 Bundle/应用更新与动态容量，查 AP01 压缩预算 | `project-workflow/single-copy-updates/status.md` → `design.md`（C9，Note4已部署与剩余实机边界） |
 | 查缺陷结案 | `docs/history/bugs-2026-09-22.md`（原 `bugs.md`，已结案） |
 

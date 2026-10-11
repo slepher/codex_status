@@ -612,7 +612,7 @@ static void __attribute__((noinline)) handleBleWifiCapabilities(
     caps["max_bundle_decoded_bytes"] = bsDecodedLimit();
     caps["compiler_abi"] = CT_ABI;
 #ifdef CODEX_TARGET_NOTE4
-    caps["bundle_font_protocol"] = 1;
+    caps["bundle_font_protocol"] = 2;
 #endif
     String text; serializeJson(caps, text);
     JsonDocument reply;

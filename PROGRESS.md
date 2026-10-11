@@ -1,18 +1,22 @@
 # Codex Status 当前交接
 
-更新时间：2026-10-11 22:09（香港时间）
+更新时间：2026-10-11 23:12（香港时间）
 
 ## 部署与工作区
 
-- 用户授权的提交、Note4刷机、v5发布及配套Bridge重启已完成。[部署记录](project-workflow/bridge-macos/device-fields-deploy-20261011.md)。实现ea69ae7；MCP字段补齐f73ee6d；Bridge旧模板启动恢复3cdd03f，平台服务55项通过。
-- Note4 `7C4FADB93408`（登记IP .177）认证运行 **0.18.83-note4 / ota_0**。ROM `artifacts/note4-0.18.83-device-fields-candidate.bin`，1,837,936 B，SHA256 `32486C0763DB240777758F549BCE386F8884A09547AD3BC89F4423E499664517`；同名ELF SHA256 `BCFAC9210A8D4FE19E5E442F3D0DA5CB8CA345DB318A2C8D226FD882745CD3DD`。文件名虽含candidate，**现已部署**。原OTA任务3e72f00f单次上传，succeeded/image_verified，独立认证哈希一致。
-- 实际codex-status-a **v5** 已发布：原任务b1d0c9a4 succeeded，设备committed_job一致，合同CRC `eb628a93`，content_state=ready/content_error空，Data applied_seq=477。保留原布局，Wi-Fi/BLE独立，无device.state。
-- 最终Bridge PID68572/watchdog56788，8765/8766正常；exe SHA256 `5A0AF5FE4EE3CC7F3535F43450DC7D8306E85BB09C0FC788E8C57D8BE143F6AE`。旧exe与完整data备份/证据 `artifacts/device-fields-deploy-20261011/`。Fake PID34328/18783仍为此前基线，书桌屏未部署。用户确认重启后界面正常、Bridge图标由OFF恢复ON。
+- 最近现场证据：Note4 `7C4FADB93408`（登记 IP .177）运行 **0.18.83-note4 / ota_0**，codex-status-a **v5** 已发布，合同 CRC `eb628a93`。已部署 ROM `artifacts/note4-0.18.83-device-fields-candidate.bin`，SHA256 `32486C0763DB240777758F549BCE386F8884A09547AD3BC89F4423E499664517`。详见[部署记录](project-workflow/bridge-macos/device-fields-deploy-20261011.md)。
+- 本轮只改源码、文档并做本地构建；未提交、未推 tag、未启动 CI、未访问/刷写设备、未重启 Bridge。原 Bridge/Fake 现场未重新测量，1.54 未部署。
 
-## 活跃事项与验收边界（A9/B6/C8）
+## 本轮里程碑与候选（C5/C6）
 
-- BOOT保持Wi-Fi、独立图标、绿灯数据活动及字段退役已上线。core模板8/render64/Fake64、预览7、Python、Note4构建及匹配ELF栈64项通过；RAM118916 B/Flash1786151 B。主agent审查；见[字段修复](project-workflow/bridge-macos/device-fields-only-20261011.md)、[网络修复](project-workflow/bridge-macos/boot-network-fix-20261011.md)。
-- 过渡需先排除旧device.state合同；本次短暂使用原Bridge完成同事务v5交接/OTA后恢复最终Bridge。网络准入提前将Bundle记Sending，重启后Unknown会阻止OTA；本次通过原BEGIN回执偏移续传完成，未换ID。一般自动恢复缺口保留A9。
-- 全量同步跨正式到期、自然sleep与真实RF/EPD/动态堆/长期功耗矩阵尚未完成；部署成功不等于实机矩阵通过。[同步记录](project-workflow/bridge-macos/sync-window-fix-20261011.md)。历史BOOT blink根因仍未证，20:43对照未复现；USB工具复位后认证延迟原因未知。
+- 中文 CSFN v2 字体随完整 Bundle 发布，模板支持 UTF-8；两 ROM 均不链接旧中文字表。Base64 复用已有库。发布工作流覆盖 Windows x64、macOS arm64/x64、Note4/1.54：v* 标签生成 draft Release，手动运行只产物。[构建安装指南](docs/build-install.md)提供 clone 后安装 Bridge、USB 分区/刷机/配网的 Agent 提示词。
+- **未部署 Note4 0.18.84-note4**：`artifacts/release-fonts-20261011/codex-status-0.18.84-note4.bin`，1,838,880 B，SHA256 `7a2e009a512111660a1e51168bcf880075c554be664f7b5682d7c12037847b94`。
+- **未部署 1.54 0.18.36-bw**：`artifacts/release-fonts-20261011/codex-status-0.18.36-bw.bin`，1,820,816 B，SHA256 `285fc9051e855de9ff9b05ab48473cc015ef140879ca84909e28c76f5d3b31b6`。
+- 两份候选同名 json/USB zip 保存匹配 ELF、分区和哈希。完整回归 309 passed / 3 ignored；最终字体专项 19 项通过；两 ROM 各 64 项 Wi-Fi 栈门禁通过；中文 JSON/CT/序列化恢复像素差 0。最终隔离目标 Note4。资源、ELF 哈希及主 agent 精读结论见[本轮状态](project-workflow/bridge-macos/release-fonts-status.md)与[审查](project-workflow/bridge-macos/release-fonts-review.md)。
+
+## 风险与下一步
+
+- C5/C6：中文渲染尚无实机证据，安装/典型/上限动态资源峰值未知；1.54 字体准入仍为 0，最新候选的 USB/OTA/配网闭环未验收。GitHub 矩阵首次实跑、干净 Windows 安装、macOS 两架构安装及签名/公证保留缺口。
+- A9/B6/C8：Sending/Unknown 一般自动恢复、跨正式到期同步、自然休眠、真实 RF/EPD/长期功耗矩阵仍未完成；历史 BOOT blink 根因未证。[同步记录](project-workflow/bridge-macos/sync-window-fix-20261011.md)。软件构建与宿主像素测试不代替实机验收。
 
 唯一待办：[backlog](docs/roadmap/backlog.md)；[当日归档](docs/history/progress-archive-2026-10-11.md)；[操作细则](docs/agent-operations.md)。

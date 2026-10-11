@@ -30,6 +30,8 @@ ascent (= lineHeight - baseLine) and descent (= baseLine) rather than FreeType's
 raw ascender/descender.
 
 Usage:
+  python rasterize_ttf.py asset-unicode <ttf> <size> <slot-name>
+                                   --chars <UTF8.txt> --asset <font.bin>
   python rasterize_ttf.py report   <ttf> <size> [--hint native|auto|none]
   python rasterize_ttf.py emit     <ttf> <size> <name> [--charset ascii|digits]
                                    [--out <dir>] [--hint ...]
@@ -287,7 +289,7 @@ PIXEL_FORMAT_BW1 = 0
 GLYPH_BYTES = 8
 
 
-def pack_container(name, family, coverage, face, size_px, blob, glyphs, filled):
+def pack_container(name, family, coverage, face, size_px, blob, glyphs, filled, codepoints=None):
     """Canonical font asset container (see docs/font-asset-format.md).
 
     Layout, little-endian, fixed 64-byte header then the payload:
@@ -338,11 +340,33 @@ def pack_container(name, family, coverage, face, size_px, blob, glyphs, filled):
         """
         return b + (b"\x00" if len(b) % 2 else b"")
 
-    payload = (even(name_b) + even(family_b) + even(coverage_b) + glyphs + blob)
+    count = len(ASCII) if codepoints is None else len(codepoints)
+    if len(glyphs) != count * GLYPH_BYTES:
+        raise ValueError("descriptor count mismatch")
+    cmap = b""
+    if codepoints is not None:
+        if (coverage != "unicode" or not 95 <= count <= 4096 or
+                codepoints[:95] != ASCII or codepoints != sorted(set(codepoints)) or
+                any(cp < 32 or 127 <= cp <= 159 or 0xD800 <= cp <= 0xDFFF or cp > 0x10FFFF
+                    for cp in codepoints)):
+            raise ValueError("invalid Unicode codepoint table")
+        cmap = b"".join(struct.pack("<I", cp) for cp in codepoints)
+    for value, limit in [(name_b, 24), (family_b, 32), (coverage_b, 16)]:
+        if not value or len(value) >= limit or any(b < 32 or b > 126 for b in value):
+            raise ValueError("invalid font metadata")
+    if not 0 < face.line_height <= 255 or not 0 <= face.base_line < face.line_height:
+        raise ValueError("invalid line metrics")
+    for i in range(count):
+        off, adv, w, h, ox, oy = struct.unpack_from("<HHBBbb", glyphs, i * GLYPH_BYTES)
+        if w and h and (w > 127 or h > 127 or off + ((w + 7) // 8) * h > len(blob)):
+            raise ValueError("invalid glyph bounds")
+    payload = (even(name_b) + even(family_b) + even(coverage_b) + cmap + glyphs + blob)
+    if codepoints is not None and CONTAINER_HEADER + len(payload) > 48 * 1024:
+        raise ValueError("Unicode font exceeds 48 KiB; reduce characters or pixel size")
     header = bytearray(CONTAINER_HEADER)
-    struct.pack_into("<4sHHIIII", header, 0, CONTAINER_MAGIC, 1, CONTAINER_HEADER,
+    struct.pack_into("<4sHHIIII", header, 0, CONTAINER_MAGIC, 1 if codepoints is None else 2, CONTAINER_HEADER,
                      CONTAINER_HEADER + len(payload), crc32(payload),
-                     len(blob), len(ASCII))
+                     len(blob), count)
     header[24] = 1                  # bpp
     header[25] = PIXEL_FORMAT_BW1   # pixel format
     header[26] = face.line_height
@@ -352,6 +376,33 @@ def pack_container(name, family, coverage, face, size_px, blob, glyphs, filled):
                      len(coverage_b), filled)
     header[42] = hint_code
     return bytes(header) + payload
+
+
+def emit_unicode(ttf, size, name, chars_file, asset, hint):
+    """Explicit UTF-8 subset -> Bundle asset only; never emit a ROM header."""
+    with open(chars_file, encoding="utf-8-sig") as fh:
+        text = fh.read()
+    cps = sorted(set(ASCII) | {ord(c) for c in text if c not in "\r\n\t"})
+    if len(cps) > 4096:
+        raise ValueError("at most 4096 glyphs; select a smaller subset")
+    f = Face(ttf, size, hint)
+    blob, glyphs = bytearray(), bytearray()
+    filled = 0
+    for cp in cps:
+        if not f.face.get_char_index(cp):
+            raise ValueError("source font lacks U+%04X" % cp)
+        packed, w, h, ox, oy, adv = f.pack(cp)
+        if len(blob) + len(packed) > 48 * 1024:
+            raise ValueError("glyph blob exceeds 48 KiB; reduce subset or size")
+        glyphs += struct.pack("<HHBBbb", len(blob), adv, w, h, ox, oy)
+        blob += packed
+        filled += bool(w and h)
+    container = pack_container(name, os.path.basename(ttf), "unicode", f, size,
+                               blob, glyphs, filled, cps)
+    with open(asset, "wb") as fh:
+        fh.write(container)
+    print("wrote %s (%d bytes, %d glyphs, font_id %08x)" %
+          (asset, len(container), len(cps), crc32(container)))
 
 
 def max_adv(glyphs):
@@ -398,6 +449,13 @@ def main():
     hint = opt(rest, "--hint", "native")
     if cmd == "report":
         report(ttf, size, hint)
+        return
+    if cmd == "asset-unicode":
+        # asset-unicode font.ttf 18 ntthin18 --chars subset.txt --asset font.bin
+        chars, asset = opt(rest, "--chars"), opt(rest, "--asset")
+        if not rest or not chars or not asset:
+            raise SystemExit("asset-unicode requires name --chars UTF8.txt --asset output.bin")
+        emit_unicode(ttf, size, rest[0], chars, asset, hint)
         return
     charset = opt(rest, "--charset", "ascii")
     if charset not in CHARSETS:

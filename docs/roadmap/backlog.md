@@ -345,11 +345,12 @@
 - 以 Fake ROM 验证绝大多数协议和故障场景（S01–S14）；实机只验证 RF/GATT、ESP32 Wi-Fi 入网与 HTTP、light/deep 切换、RTC/Flash/bootloader 等模拟器不能证明的部分（H01–H03）。详见 `project-workflow/device-sync-diagnostics/plan.md`。
 
 ### C5. 字体资产增量发布
-- 单一字体注册表 + CSFN 容器已交付；Profile 版本选择经完整 A/B Bundle 发布与重启恢复，Note4 已安装 18 px ExtraLight 200（job `5d798bd9`、commit 355）。Bridge 模板页预览使用 Profile 资产；实体字形待目视核对。
-- 未定稿：`docs/history/workflow/note4-bridge-publish/protocol.md`（manifest/CSFN 增量发布合同）仍是**待双方确认草案**；设备侧无增量端点、仍是 ABI 1 时代的 48 KiB/8 字体实现。
-- 结论：在 C1（Bundle v3）定案前不要启动，否则两套编码器要一起改；未来清单持久化遵循C9单份策略，不再规划当前/回退两份内容集合。
+- **2026-10-11 中文资产候选（未部署）**：用户要求保留中文支持但ROM不内置中文字库。CSFN v2有界Unicode子集、UTF-8静态/动态模板度量与渲染、既有完整Bundle安装恢复路径及Bridge能力预检已接入；旧ASCII/v1保留。旧CN绘制代码/表源码保留，ROM排除两份CN表。协议见[字体合同](../font-asset-format.md)，实施/验证见[记录](../../project-workflow/bridge-macos/release-fonts-status.md)。**缺口：中文引擎未实机测试；真实EPD字形/对齐/缺字、典型/上限资产安装峰值RAM/栈、掉电/重启恢复、长期刷新均未验。1.54仍未开放Bundle字体准入（报告0），不因ROM可构建就声称支持中文发布。**
+- 单一字体注册表与显式Profile字体选择经完整Bundle发布；历史Note4安装18px ExtraLight200见job `5d798bd9`/commit355。当前单份Bundle保留源与CT ABI2显式字体引用，设备单资产48KiB/最多8项；本轮中文扩展没有引入增量端点。
+- `docs/history/workflow/note4-bridge-publish/protocol.md`的manifest增量传输仍为草案。未来若实现，遵循C9单份内容策略，另验设备动态容量/流式解析，不恢复当前/回退双清单。
 
 ### C6. 多 env / packages 目录隔离收尾
+- **2026-10-11 发布矩阵与安装文档**：保留Note4/1.54两个ROM构建（串行、明确env、marker/版本/大小/SHA256/双槽容量），Windows x64与macOS arm64/x64 Bridge原生构建。标签触发draft Release，手动触发仅产物，必需目标失败阻止完整发布。缺口：尚未运行GitHub矩阵；macOS签名公证/干净主机安装未验；1.54最新候选虽本机构建通过，认证运行、OTA/USB/配网及发布闭环未验，不能用旧版本记录替代。克隆后Agent提示词和步骤见[构建安装](../build-install.md)，证据见[实施状态](../../project-workflow/bridge-macos/release-fonts-status.md)。
 - `tools/pio-target.ps1` 已落地，**两侧都已实测**（2026-09-25）：`.pio-pkgs/note4` 与 `.pio-pkgs/154g` 各 2 real（两个冲突 framework 包，69 MB + 2057 MB）+ 15 junction，各 ≈2126 MB。
 - **154g 构建成功**：`pio run -d <repo> -e esp32-s3-epaper-154g` → SUCCESS 102.38 s，无 banner、无重装；产物 `1,740,576 B / 91937B18…`（`0.18.23-bw`），另见 `docs/history/progress-archive-2026-10-03.md`「多 env 实测」节。
 - **判据 c/d/e 已实测（2026-09-25，两个阶段两种结论）**：

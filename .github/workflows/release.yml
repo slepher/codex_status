@@ -1,105 +1,127 @@
 name: release
-
 on:
+  workflow_dispatch:
   push:
-    tags:
-      - "v*"
-
+    tags: ["v*"]
 permissions:
-  contents: write
-
+  contents: read
 jobs:
   firmware:
-    runs-on: ubuntu-latest
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - target: note4
+            env: zectrix-note4-b
+          - target: 154g
+            env: esp32-s3-epaper-154g
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - uses: actions/cache@v4
-        with:
-          path: ~/.platformio
-          key: ${{ runner.os }}-pio-${{ hashFiles('platformio.ini') }}
-          restore-keys: ${{ runner.os }}-pio-
-      - run: pip install -U platformio
-      - name: Build firmware
-        run: pio run
-      - name: Check tag matches FW_VERSION
-        run: |
-          fw=$(grep -oP '#define FW_VERSION\s+"\K[^"]+' src/main.cpp)
-          tag="${{ github.ref_name }}"
-          tag="${tag#v}"
-          if [ "$fw" != "${tag}-bw" ] && [ "$fw" != "$tag" ]; then
-            echo "FW_VERSION ($fw) does not match tag (${{ github.ref_name }})"
-            exit 1
-          fi
-      - name: Stage ROM
-        run: |
-          ver="${{ github.ref_name }}"
-          ver="${ver#v}"
-          cp .pio/build/esp32-s3-epaper-154g/firmware.bin "codex-status-${ver}-bw.bin"
-          sha256sum "codex-status-${ver}-bw.bin"
+      - run: python -m pip install platformio
+      - name: Bootstrap only this target's packages
+        run: pio pkg install -e ${{ matrix.env }}
+      - name: Build isolated target
+        shell: pwsh
+        run: ./tools/pio-target.ps1 -Target ${{ matrix.target }}
+      - name: Verify marker, slot budget, and stage ROM
+        run: python tools/stage-release-rom.py --env ${{ matrix.env }} --out dist
       - uses: actions/upload-artifact@v4
         with:
-          name: firmware
-          path: codex-status-*-bw.bin
+          name: firmware-${{ matrix.target }}
+          path: dist/*
           if-no-files-found: error
-
+      - name: Report missing ROM explicitly
+        if: failure()
+        shell: pwsh
+        run: '"ROM release gap: ${{ matrix.env }} failed. Do not substitute another target or publish a complete release. See backlog C6." >> $env:GITHUB_STEP_SUMMARY'
   bridge:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            platform: windows-x64
+          - os: macos-15
+            platform: macos-arm64
+          - os: macos-15-intel
+            platform: macos-x64
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bblanchon/ArduinoJson
+          ref: v7.4.3
+          path: dependencies/ArduinoJson
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - uses: actions/cache@v4
-        with:
-          path: ~/.platformio
-          key: ${{ runner.os }}-pio-${{ hashFiles('platformio.ini') }}
-          restore-keys: ${{ runner.os }}-pio-
-      - run: pip install -U platformio
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: bridge
-      - name: Provide ArduinoJson to bridge-render
-        shell: pwsh
+      - name: Use host-only ArduinoJson headers
+        shell: bash
+        run: echo "CODEX_STATUS_ARDUINOJSON=$GITHUB_WORKSPACE/dependencies/ArduinoJson/src" >> "$GITHUB_ENV"
+      - name: Check font generator and ROM staging guards
         run: |
-          pio pkg install
-          $hit = Get-ChildItem .pio\libdeps -Recurse -Filter ArduinoJson.h -ErrorAction SilentlyContinue | Where-Object { $_.Directory.Name -eq 'src' } | Select-Object -First 1
-          if (-not $hit) {
-            pio run
-            $hit = Get-ChildItem .pio\libdeps -Recurse -Filter ArduinoJson.h -ErrorAction SilentlyContinue | Where-Object { $_.Directory.Name -eq 'src' } | Select-Object -First 1
-          }
-          if (-not $hit) { throw "ArduinoJson.h not found after pio pkg install / pio run" }
-          "CODEX_STATUS_ARDUINOJSON=$($hit.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-      - name: Build bridge-app
+          python tools/test-unicode-font.py
+          python tools/test-release-rom.py
+      - name: Test shared core, renderer and app
         working-directory: bridge
-        run: cargo build -p bridge-app --release --locked
-      - name: Package portable bundle
+        run: cargo test --locked -p bridge-core -p bridge-render -p bridge-app
+      - name: Build Windows release
+        if: runner.os == 'Windows'
+        working-directory: bridge
+        run: cargo build --locked -p bridge-app --release
+      - name: Package Windows portable app
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $ver = $env:GITHUB_REF_NAME -replace '^v',''
-          New-Item -ItemType Directory -Force dist\bundle\seed | Out-Null
-          Copy-Item bridge\target\release\bridge-app.exe dist\bundle\
-          Copy-Item tools\test-bridge\templates dist\bundle\seed\templates -Recurse
-          Copy-Item tools\test-bridge\profiles.seed.json dist\bundle\seed\
-          Copy-Item LICENSE, README.md dist\bundle\
-          Compress-Archive -Path dist\bundle\* -DestinationPath "dist\codex-status-bridge-$ver-windows-x64.zip"
+          New-Item -ItemType Directory -Force dist/bundle/seed | Out-Null
+          Copy-Item bridge/target/release/bridge-app.exe dist/bundle/
+          Copy-Item tools/test-bridge/templates dist/bundle/seed/templates -Recurse
+          Copy-Item LICENSE, README.md dist/bundle/
+          Compress-Archive -Path dist/bundle/* -DestinationPath dist/codex-status-bridge-windows-x64.zip
+          Get-FileHash dist/*.zip -Algorithm SHA256 | Format-Table -AutoSize
+      - name: Build and package macOS app (ad-hoc signed, not notarized)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          CODEX_STATUS_BUILD_PROFILE: release
+          CODEX_STATUS_APP_OUTPUT: ${{ github.workspace }}/dist/Codex Status Bridge.app
+        run: |
+          bash tools/build-bridge-macos.sh
+          codesign --verify --deep --strict "$CODEX_STATUS_APP_OUTPUT"
+          ditto -c -k --sequesterRsrc --keepParent "$CODEX_STATUS_APP_OUTPUT" "dist/codex-status-bridge-${{ matrix.platform }}.zip"
+          shasum -a 256 dist/*.zip
       - uses: actions/upload-artifact@v4
         with:
-          name: bridge-windows
+          name: bridge-${{ matrix.platform }}
           path: dist/*.zip
           if-no-files-found: error
-
   release:
+    # Manual runs produce artifacts only. Every platform/ROM must succeed.
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: [firmware, bridge]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+      - name: Hash all release assets
+        working-directory: dist
+        run: sha256sum *.bin *.json *.zip > SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+          fail_on_unmatched_files: true
+          draft: true
           generate_release_notes: true

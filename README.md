@@ -15,12 +15,12 @@ A portable e-paper companion for local Codex usage, supporting **Waveshare 1.54"
 | Waveshare 1.54" | 200×200 黑白，SSD1681 | ESP32-S3，8 MB Flash | `esp32-s3-epaper-154g` |
 | ZecTrix Note4 DevKit V1.0 | 400×300 黑白 | ESP32-S3，16 MB Flash，8 MB OPI PSRAM | `zectrix-note4-b` |
 
-两款设备共用模板引擎与显示平台，使用各自的固件和分辨率适配模板。200×200 提供 `quad`、`mini` 等布局；400×300 提供 `codex-status-a`。ROM 必须与设备 target 匹配，不能混刷。当前桌面桥面向 Windows。
+两款设备共用模板引擎与显示平台，使用各自的固件和分辨率适配模板。200×200 提供 `quad`、`mini` 等布局；400×300 提供 `codex-status-a`。ROM 必须与设备 target 匹配，不能混刷。桌面桥支持 Windows 与 macOS，构建、签名及验收边界见下方安装指南。
 
 ### 主要功能
 
 - **Codex 余量显示**：通过本机 `codex app-server` JSON-RPC 获取配额与重置时间，设备本地渲染。
-- **模板与按键切换**：每台设备的 Profile 包含 1–8 个有序模板，全部参与按键循环；保存只落盘，显式发布才下发完整 A/B Bundle。
+- **模板与按键切换**：每台设备的 Profile 包含 1–8 个有序模板，全部参与按键循环；保存只落盘，显式发布才下发完整 Bundle。
 - **双板、多设备管理**：Wi-Fi MAC 是设备身份，显示名可编辑；各设备独立维护 Profile、状态与发布任务。
 - **Wi-Fi / BLE 通信**：Wi-Fi HTTP 为主通道，BLE GATT 用于认证与备选会合；claim/lease 协议协调多个 Bridge 的占用。
 - **低功耗运行**：支持 light sleep、deep sleep 与离线时钟，由 Bridge 生成正式 PowerPlan；实际续航与长期残影仍需实机测量。
@@ -32,7 +32,7 @@ A portable e-paper companion for local Codex usage, supporting **Waveshare 1.54"
 本机 codex app-server
         │ JSON-RPC
         ▼
-Rust / Tauri Bridge（Windows 托盘）◀── 桌面 UI / MCP :8766
+Rust / Tauri Bridge（Windows 托盘 / macOS 菜单栏）◀── 桌面 UI / MCP :8766
         │ Wi-Fi HTTP / BLE GATT
         ├── ESP32-S3 → Waveshare 1.54" 200×200
         └── ESP32-S3 → ZecTrix Note4 400×300
@@ -42,6 +42,8 @@ Rust / Tauri Bridge（Windows 托盘）◀── 桌面 UI / MCP :8766
 Codex 是平台的数据源之一。Bridge 负责数据绑定、Profile、Bundle 发布与电源计划，固件负责校验、存储和渲染。默认 Bridge HTTP 端口为 `8765`，MCP 地址为 `http://127.0.0.1:8766/mcp`。
 
 ### 构建
+
+从 clone 到当前操作系统 Bridge 编译/安装，以及 USB 分区、刷机、配网的一句话 Agent 提示词，见 **[构建与安装指南](docs/build-install.md)**。包含 Windows、macOS、双 ROM 和 GitHub 标签/手动发布流程及验收边界。
 
 需要 Python、PlatformIO、PowerShell 7，以及 Rust stable（Windows MSVC 工具链和 Visual Studio C++ Build Tools）。Node.js 用于预览与场景校验脚本。仓库路径不要包含空格。
 

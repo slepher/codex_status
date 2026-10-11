@@ -1183,8 +1183,9 @@ impl PlatformService {
             return Ok(json!({"route": "full_bundle", "render_target": profile.render_target,
                 "profile_order": profile.template_ids, "font_dependencies": fonts,
                 "max_bundle_bytes": record.capabilities.bundle_limit(),
-                "can_publish_fonts": record.capabilities.bundle_font_protocol == 1,
-                "source_conversion": "unavailable", "note": "CSFN fonts travel inside the complete A/B Bundle when the device advertises bundle_font_protocol 1"}));
+                "can_publish_fonts": record.capabilities.bundle_font_protocol >= 1 &&
+                    fonts.required.iter().all(|f| u32::from(f.version) <= record.capabilities.bundle_font_protocol),
+                "source_conversion": "unavailable", "note": "CSFN fonts travel inside the complete Bundle; Unicode fonts require bundle_font_protocol 2"}));
         }
         let templates = profile.template_ids.iter().map(|id| {
             inner.templates.get(&TemplateKey::new(id, &record.capabilities.render_target)).cloned()
@@ -1226,6 +1227,11 @@ impl PlatformService {
             .context("device has no profile")?;
         profile.validate_publishable(&caps)?;
         let font_plan = self.profile_fonts(&inner, &profile)?;
+        for font in &font_plan.required {
+            if font.version == 2 && caps.bundle_font_protocol < 2 {
+                bail!("Unicode font {} requires device bundle_font_protocol 2; upgrade firmware first", font.name);
+            }
+        }
         if !profile.sync_enabled {
             // Publishing itself is explicit; data sync is a separate switch, so a
             // publish is allowed with sync off. Kept visible in the job summary.
@@ -1300,8 +1306,8 @@ impl PlatformService {
             Self::persist(&inner, &self.state_path())?;
             return Ok(summary);
         }
-        if !font_plan.required.is_empty() && caps.bundle_font_protocol != 1 {
-            bail!("device does not advertise bundle_font_protocol 1; selected fonts cannot be published");
+        if !font_plan.required.is_empty() && caps.bundle_font_protocol == 0 {
+            bail!("device does not advertise bundle font support; selected fonts cannot be published");
         }
         let library = self.font_library()?;
         let fonts = font_plan.required.iter().map(|font| {
@@ -4777,6 +4783,33 @@ mod tests {
         assert!(bundle.total_len <= 262_144);
         assert_eq!(bundle.profile.template_ids, ["codex-status-a"]);
         bundle.verify().unwrap();
+    }
+
+    #[test]
+    fn unicode_fonts_require_capability_before_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = service_with_device(dir.path());
+        let mac = "AA:BB:CC:DD:EE:FF";
+        let target = "epd-ssd1681-200x200-1bpp";
+        let source = json!({"schema":1,"id":"unicode","canvas":{"w":200,"h":200},
+            "elements":[{"type":"text","x":0,"y":0,"font":"ntthin18","text":"中文"}]});
+        svc.template_save("unicode", target, &source, 1000).unwrap();
+        let font = svc.font_library().unwrap().add(include_bytes!("../../tests/fixtures/unicode-subset.bin")).unwrap();
+        let mut profile = Profile::draft(mac);
+        profile.render_target = Some(target.into());
+        profile.template_ids = vec!["unicode".into()];
+        profile.initial_active_id = Some("unicode".into());
+        profile.font_ids.insert("ntthin18".into(), font.id);
+        svc.profile_save(profile, 1000).unwrap();
+        svc.inner.lock().unwrap().devices.get_mut(mac).unwrap().capabilities.bundle_font_protocol = 1;
+        assert_eq!(svc.publish_preview(mac).unwrap()["can_publish_fonts"], false);
+        assert!(svc.publish(mac, 1001).unwrap_err().to_string().contains("requires device bundle_font_protocol 2"));
+        assert!(svc.inner.lock().unwrap().coordinators.get(mac).and_then(|c| c.job.as_ref()).is_none());
+        svc.inner.lock().unwrap().devices.get_mut(mac).unwrap().capabilities.bundle_font_protocol = 2;
+        assert_eq!(svc.publish_preview(mac).unwrap()["can_publish_fonts"], true);
+        assert_eq!(svc.publish(mac, 1002).unwrap()["state"], "waiting");
+        let inner = svc.inner.lock().unwrap();
+        assert_eq!(inner.coordinators[mac].job.as_ref().unwrap().frozen_bundle.fonts.len(), 1);
     }
 
     #[test]

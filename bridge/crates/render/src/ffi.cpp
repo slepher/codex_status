@@ -1703,6 +1703,10 @@ int codex_font_bind_asset(const uint8_t *bytes, int len) {
 
 void codex_font_clear_assets() { tplFontClearAssets(); }
 
+int codex_font_text_width(const char *text) {
+    return tplFontPropWidth(tplFontIndexByName("ntthin18"), 1, text);
+}
+
 // Font store (font_store.cpp): host tests drive the real device store, including
 // its atomic write path, its inventory and its Profile pruning.
 void codex_font_store_reset() {

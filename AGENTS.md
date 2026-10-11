@@ -35,7 +35,7 @@ ESP32-S3 本地渲染墨水屏；Rust/Tauri Bridge 经 `codex app-server` 取数
 - push 可见值/缺失/质量变化发完整最新快照；pull-only 只改缓存，不推送、不改 PowerPlan。分类只在 Bridge，设备不接收；成功 ACK 才改确认指纹/full_sync_deadline。
 - 需求以设备认证 `/api/status` 的 data_contract 为准，不从本地模板/Profile 推导；设备级投递许可独立于本地库。BLE 同 context/active 可复用缓存，切换/未知合同先有界 Wi-Fi 读取，未知合同不发空字段包。
 - 只有正式 PowerPlan 改 light deadline；读/传输/claim/续约不延长。BOOT provisional 300s 从物理唤醒算，timer wake 不获得。
-- 固件/Rust canonical JSON/Python 模板哈希一致；未知 type/font/bind dry-run 整份拒绝。改协议同时改固件、`bridge/crates/core/template.rs` 和测试。宿主 render 共用 C++ 引擎，逐像素一致，默认 battery=75；绘制文本 ASCII 净化。
+- 固件/Rust canonical JSON/Python 模板哈希一致；未知 type/font/bind dry-run 整份拒绝。改协议同时改固件、`bridge/crates/core/template.rs` 和测试。宿主 render 共用 C++ 引擎，逐像素一致，默认 battery=75；内建/v1字体文本ASCII净化，CSFN v2资产按有界UTF-8渲染。中文字库只随完整Bundle发布、不内置ROM；中文实机未验归C5。
 - 缺配额/账号由模板 when 分支决定，不统一全局显示规则；现有 quad/codex-status-a、RC/label 行规则见操作细则，新增变体同步更新规则。
 - Wi-Fi 密码可保存本机 data 和设备 RAM/NVS，认证读取后复用缓存，编辑框支持显隐。有效 session+owner 可管理全部配置，创建者只作来源；配置 ID 冲突明拒，回执/重放围栏按 principal/namespace 隔离。密码/任何 token 不入库、不进日志；BLE token 受控存储/传输。
 - 运行数据位置遵循操作细则；CODEX_STATUS_DATA 优先，macOS 不写 `.app`。改 GATT 表后 Windows 需解除配对再重配；BLE 写入按 MTU 分片，Windows Python 桥设 PYTHONIOENCODING=utf-8。

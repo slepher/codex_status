@@ -6,9 +6,9 @@
 #if defined(CODEX_CLK_WINDOW_TEST)
 #define FW_VERSION    "0.13.9-clkwin"
 #elif defined(CODEX_TARGET_NOTE4)
-#define FW_VERSION    "0.18.83-note4"
+#define FW_VERSION    "0.18.84-note4"
 #else
-#define FW_VERSION    "0.18.35-bw-rtc1"
+#define FW_VERSION    "0.18.36-bw"
 #endif
 
 // Keep version and OTA marker together: Bridge validates this exact identity.

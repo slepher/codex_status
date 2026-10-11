@@ -43,7 +43,10 @@ bool fontAssetValidate(const uint8_t *bytes, size_t len, FontAssetInfo &info, St
     if (len < FONT_ASSET_HEADER_BYTES) { err = "font_short_header"; return false; }
     if (len > FONT_ASSET_MAX_BYTES) { err = "font_too_large"; return false; }
     if (rd32(bytes) != FONT_ASSET_MAGIC) { err = "font_magic"; return false; }
-    if (rd16(bytes + 4) != FONT_ASSET_VERSION) { err = "font_version"; return false; }
+    info.version = rd16(bytes + 4);
+    if (info.version != FONT_ASSET_VERSION && info.version != FONT_ASSET_UNICODE_VERSION) {
+        err = "font_version"; return false;
+    }
     if (rd16(bytes + 6) != FONT_ASSET_HEADER_BYTES) { err = "font_header_bytes"; return false; }
     const uint32_t fileBytes = rd32(bytes + 8);
     if (fileBytes != (uint32_t)len) { err = "font_length"; return false; }
@@ -71,12 +74,18 @@ bool fontAssetValidate(const uint8_t *bytes, size_t len, FontAssetInfo &info, St
     if (info.pixelFormat > FONT_PIXEL_GRAY4) { err = "font_pixel_format"; return false; }
     if (info.pixelFormat == FONT_PIXEL_BW1 && info.bpp != 1) { err = "font_bpp_format"; return false; }
     if (info.pixelFormat == FONT_PIXEL_GRAY4 && info.bpp != 2) { err = "font_bpp_format"; return false; }
-    if (info.glyphCount != FONT_ASSET_GLYPH_COUNT) { err = "font_glyph_count"; return false; }
+    if ((info.version == 1 && info.glyphCount != FONT_ASSET_GLYPH_COUNT) ||
+        info.glyphCount < FONT_ASSET_GLYPH_COUNT || info.glyphCount > FONT_ASSET_MAX_GLYPHS) {
+        err = "font_glyph_count"; return false;
+    }
+    if (info.version == 2 && (info.bpp != 1 || info.pixelFormat != FONT_PIXEL_BW1)) {
+        err = "font_unicode_format"; return false;
+    }
     if (info.lineHeight == 0 || info.baseLine >= info.lineHeight) {
         err = "font_line_metrics";
         return false;
     }
-    if (info.filledGlyphs > FONT_ASSET_GLYPH_COUNT) { err = "font_filled"; return false; }
+    if (info.filledGlyphs > info.glyphCount) { err = "font_filled"; return false; }
 
     const uint16_t nameLen     = rd16(bytes + 34);
     const uint16_t familyLen   = rd16(bytes + 36);
@@ -87,9 +96,9 @@ bool fontAssetValidate(const uint8_t *bytes, size_t len, FontAssetInfo &info, St
                          (uint32_t)(coverageLen & 1);
     const uint32_t headerAndStrings = FONT_ASSET_HEADER_BYTES + nameLen + familyLen +
                                       coverageLen + pad;
-    const uint32_t glyphOff = headerAndStrings;
+    const uint32_t glyphOff = headerAndStrings + (info.version == 2 ? info.glyphCount * 4 : 0);
     if (glyphOff & 1u) { err = "font_align"; return false; }
-    const uint32_t glyphBytes = (uint32_t)FONT_ASSET_GLYPH_COUNT * FONT_ASSET_GLYPH_BYTES;
+    const uint32_t glyphBytes = info.glyphCount * FONT_ASSET_GLYPH_BYTES;
     const uint32_t blobOff = glyphOff + glyphBytes;
     if (blobOff > len || info.blobBytes > len - blobOff) { err = "font_payload_range"; return false; }
     // The declared payload must describe the file exactly: trailing slack would
@@ -104,6 +113,19 @@ bool fontAssetValidate(const uint8_t *bytes, size_t len, FontAssetInfo &info, St
     if (!copySection(p, coverageLen, info.coverage, sizeof(info.coverage))) { err = "font_coverage"; return false; }
     if (info.name[0] == 0) { err = "font_name_empty"; return false; }
     if (info.coverage[0] == 0) { err = "font_coverage_empty"; return false; }
+    if (info.version == 2) {
+        if (strcmp(info.coverage, "unicode")) { err = "font_coverage"; return false; }
+        uint32_t previous = 0;
+        for (uint32_t i = 0; i < info.glyphCount; ++i) {
+            uint32_t cp = rd32(bytes + headerAndStrings + i * 4);
+            if ((i < 95 && cp != 32 + i) || cp < 32 || cp == 127 ||
+                (cp >= 128 && cp <= 159) || cp > 0x10ffff ||
+                (cp >= 0xd800 && cp <= 0xdfff) || (i && cp <= previous)) {
+                err = "font_codepoint"; return false;
+            }
+            previous = cp;
+        }
+    }
 
     // Descriptor sanity: every box must fit inside the blob, and a filled glyph
     // must have a non-zero box. A half-written container must never look valid.
@@ -132,9 +154,9 @@ bool fontAssetView(const uint8_t *bytes, size_t len, const FontAssetInfo &info,
     const uint16_t coverageLen = rd16(bytes + 38);
     const uint32_t pad = (uint32_t)(nameLen & 1) + (uint32_t)(familyLen & 1) +
                          (uint32_t)(coverageLen & 1);
-    const uint32_t glyphOff = FONT_ASSET_HEADER_BYTES + nameLen + familyLen +
-                              coverageLen + pad;
-    const uint32_t blobOff = glyphOff + (uint32_t)FONT_ASSET_GLYPH_COUNT * FONT_ASSET_GLYPH_BYTES;
+    const uint32_t codepointOff = FONT_ASSET_HEADER_BYTES + nameLen + familyLen + coverageLen + pad;
+    const uint32_t glyphOff = codepointOff + (info.version == 2 ? info.glyphCount * 4 : 0);
+    const uint32_t blobOff = glyphOff + info.glyphCount * FONT_ASSET_GLYPH_BYTES;
     if (glyphOff & 1u) return false;
     if (blobOff + info.blobBytes > len) return false;
     font.blob       = bytes + blobOff;
@@ -142,6 +164,8 @@ bool fontAssetView(const uint8_t *bytes, size_t len, const FontAssetInfo &info,
     font.lineHeight = info.lineHeight;
     font.baseLine   = info.baseLine;
     font.maxAdv     = info.maxAdv;
+    font.codepoints = info.version == 2 ? bytes + codepointOff : nullptr;
+    font.glyphCount = info.glyphCount;
     return true;
 }
 

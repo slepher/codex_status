@@ -1,9 +1,9 @@
-// Font asset container (CSFN v1) — the device half of
+// Font asset container (CSFN v1 ASCII / v2 Unicode subset) — the device half of
 // `docs/font-asset-format.md`.
 //
 // Fonts are data: the same container is produced by
 // `tools/note4-fonts/rasterize_ttf.py`, served by the bridge font library and
-// stored per Profile on the device. The glyph descriptor table in the container
+// stored inside the complete Bundle on the device. The glyph descriptor table in the container
 // is laid out exactly like `Note4Glyph`, and the string sections are padded to
 // even lengths, so a validated container can be pointed at directly with no
 // conversion and no RAM copy of the glyph table.
@@ -16,6 +16,8 @@
 
 #define FONT_ASSET_MAGIC        0x4E465343u   // "CSFN"
 #define FONT_ASSET_VERSION      1
+#define FONT_ASSET_UNICODE_VERSION 2
+#define FONT_ASSET_MAX_GLYPHS    4096
 #define FONT_ASSET_HEADER_BYTES 64
 #define FONT_ASSET_GLYPH_COUNT  95            // dense ASCII 0x20..0x7E
 #define FONT_ASSET_GLYPH_BYTES  8             // == sizeof(Note4Glyph)
@@ -29,6 +31,7 @@
 #define FONT_PIXEL_GRAY4 1
 
 struct FontAssetInfo {
+    uint16_t version;
     char     id[9];        // crc32 of the whole container, lowercase hex
     char     name[FONT_ASSET_NAME_MAX];
     char     family[FONT_ASSET_FAMILY_MAX];

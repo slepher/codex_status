@@ -16,6 +16,9 @@ use crate::envelope::TemplateRef;
 /// FreeType-rasterized pair: Thin 100 @18 px for normal text and Regular 400
 /// @64 px tabular digits, and Note4-only Regular 400 @96 px tabular digits.
 /// The families are independent: a template picks one font per element.
+/// A Profile can bind a CSFN v2 Unicode subset to an existing proportional
+/// font name. Text remains UTF-8; the shared renderer chooses Unicode lookup
+/// only for that asset, and preserves ASCII sanitization for built-in fonts.
 pub const FONTS: [&str; 10] = [
     "f8", "f12", "f16", "f20", "f24", "nt16", "nt30", "ntthin18", "ntreg64", "ntreg96",
 ];
@@ -246,6 +249,14 @@ fn validate_element(
             let text = e.get("text").and_then(|v| v.as_str()).unwrap_or("");
             if bind.is_empty() && text.is_empty() {
                 return Err("text empty".into());
+            }
+            // Match CtOp's byte capacities, including its trailing NUL.
+            for (key, cap) in [("text", 48), ("prefix", 12), ("suffix", 12)] {
+                if let Some(value) = e.get(key).and_then(Value::as_str) {
+                    if value.len() >= cap || value.contains('\0') {
+                        return Err(format!("{key} exceeds compiled byte capacity or contains NUL"));
+                    }
+                }
             }
             if !bind.is_empty() && parse_bind(bind).is_none() {
                 return Err(format!("bind {bind}"));

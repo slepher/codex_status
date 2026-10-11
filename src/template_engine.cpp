@@ -475,12 +475,47 @@ static void drawScaledText(const String &value, sFONT *font, int x, int y,
 // placed from its box offset, so spacing matches the upstream font instead of
 // a fixed cell. Same pixel writes as the fixed path, so host and device agree.
 
+// Decode only asset-backed Unicode fonts. Legacy ASCII fonts keep their byte
+// sanitization behavior. Invalid UTF-8 consumes one byte and renders '?'.
+static uint32_t fontNextChar(const Note4PropFont &f, const char *text, size_t len, size_t &at) {
+    const uint8_t first = (uint8_t)text[at++];
+    if (first < 128 || !f.codepoints) return first;
+    unsigned n = first >= 0xc2 && first <= 0xdf ? 1 :
+                 first >= 0xe0 && first <= 0xef ? 2 :
+                 first >= 0xf0 && first <= 0xf4 ? 3 : 0;
+    if (!n || n > len - at) return '?';
+    uint32_t cp = first & (0x7f >> (n + 1));
+    for (unsigned i = 0; i < n; ++i) {
+        uint8_t b = (uint8_t)text[at + i];
+        if ((b & 0xc0) != 0x80) return '?';
+        cp = (cp << 6) | (b & 0x3f);
+    }
+    if (cp < (n == 1 ? 0x80u : n == 2 ? 0x800u : 0x10000u) ||
+        cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) return '?';
+    at += n;
+    return cp;
+}
+
+static const Note4Glyph &fontGlyph(const Note4PropFont &f, uint32_t cp) {
+    if (cp >= 32 && cp <= 126) return f.glyphs[cp - 32];
+    if (f.codepoints) {
+        size_t lo = 95, hi = f.glyphCount;
+        while (lo < hi) {
+            size_t mid = lo + (hi - lo) / 2;
+            const uint8_t *p = f.codepoints + mid * 4;
+            uint32_t value = uint32_t(p[0]) | uint32_t(p[1]) << 8 |
+                             uint32_t(p[2]) << 16 | uint32_t(p[3]) << 24;
+            if (value == cp) return f.glyphs[mid];
+            if (value < cp) lo = mid + 1; else hi = mid;
+        }
+    }
+    return f.glyphs['?' - ' '];
+}
+
 static int propTextWidth(const Note4PropFont &f, const String &value, int scale) {
     long adv = 0;
-    for (size_t i = 0; i < value.length(); i++) {
-        char c = value[i];
-        if (c < ' ' || c > '~') c = '?';
-        adv += f.glyphs[c - ' '].adv;
+    for (size_t i = 0; i < value.length();) {
+        adv += fontGlyph(f, fontNextChar(f, value.c_str(), value.length(), i)).adv;
     }
     return (int)((adv * scale + 8) / 16);
 }
@@ -491,10 +526,8 @@ static void drawPropText(const Note4PropFont &f, const String &value, int x, int
     if (scale < 1) scale = 1;
     int baseline = y + (int)f.lineHeight - (int)f.baseLine;
     long pen = (long)x << 4;   // 1/16 px fixed point
-    for (size_t i = 0; i < value.length(); i++) {
-        char c = value[i];
-        if (c < ' ' || c > '~') c = '?';
-        const Note4Glyph &g = f.glyphs[c - ' '];
+    for (size_t i = 0; i < value.length();) {
+        const Note4Glyph &g = fontGlyph(f, fontNextChar(f, value.c_str(), value.length(), i));
         int gx = (int)(pen >> 4) + g.ox;
         int gy = baseline - g.oy - g.h;
         int stride = (g.w + 7) / 8;
@@ -734,10 +767,8 @@ bool tplFontDrawClock(uint8_t *win, int bw, int rows, int xOff, int idx,
     if (!p) return false;
     const int baseline = (int)p->lineHeight - (int)p->baseLine;
     long pen = (long)xOff << 4;   // 1/16 px fixed point, same as drawPropText
-    for (int i = 0; text[i]; i++) {
-        char c = text[i];
-        if (c < ' ' || c > '~') c = '?';
-        const Note4Glyph &g = p->glyphs[c - ' '];
+    for (size_t i = 0, len = strlen(text); i < len;) {
+        const Note4Glyph &g = fontGlyph(*p, fontNextChar(*p, text, len, i));
         const int gx = (int)(pen >> 4) + g.ox;
         const int gy = baseline - g.oy - g.h;
         const int stride = (g.w + 7) / 8;
@@ -773,9 +804,8 @@ int tplFontPropWidth(int idx, int scale, const char *text) {
     const Note4PropFont *p = propFontByIndex(idx);
     if (!p) return 0;
     long adv = 0;
-    for (const char *c = text; *c; c++) {
-        const char ch = (*c < ' ' || *c > '~') ? '?' : *c;
-        adv += p->glyphs[ch - ' '].adv;
+    for (size_t i = 0, len = strlen(text); i < len;) {
+        adv += fontGlyph(*p, fontNextChar(*p, text, len, i)).adv;
     }
     return (int)((adv * scale + 8) / 16);
 }
@@ -892,6 +922,14 @@ static bool parseElementCompiled(JsonObject e, CtTemplate &ct, CtOp &op) {
         const char *bind = e["bind"] | "";
         const char *text = e["text"] | "";
         if (!strlen(bind) && !strlen(text)) return false;
+        // Compiled strings are bounded in bytes; never split a UTF-8 character
+        // by silently truncating source text during compilation.
+        for (const char *key : {"text", "prefix", "suffix"}) {
+            if (!e[key].is<const char *>()) continue;
+            JsonString value = e[key].as<JsonString>();
+            size_t cap = !strcmp(key, "text") ? sizeof(op.text) : sizeof(op.prefix);
+            if (value.size() >= cap || strlen(value.c_str()) != value.size()) return false;
+        }
         BindSpec spec;
         if (strlen(bind) && !parseBind(String(bind), spec)) return false;
         int scale = 1, rx = 0, ry = 0, rw = 0, rh = 0;
@@ -1034,7 +1072,8 @@ static bool drawCtOp(const CtTemplate &ct, const CtOp &op, JsonDocument &usage,
         } else {
             val = op.text;
         }
-        val = asciiOnly(String(op.prefix) + val + String(op.suffix));
+        val = String(op.prefix) + val + String(op.suffix);
+        if (!prop || !prop->codepoints) val = asciiOnly(val);
         bool hasRegion = (op.flags & 0x02) != 0;
         int scale = op.scale ? op.scale : 1;
         int fg = op.color, bg = op.bg == 0xFF ? 1 : op.bg;

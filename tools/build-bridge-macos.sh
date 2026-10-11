@@ -4,17 +4,23 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 build_root="$repo_root/artifacts/bridge-macos"
 target_root="$build_root/target"
+profile="${CODEX_STATUS_BUILD_PROFILE:-debug}"
+case "$profile" in
+  debug) build_args=() ;;
+  release) build_args=(--release) ;;
+  *) echo "CODEX_STATUS_BUILD_PROFILE must be debug or release" >&2; exit 2 ;;
+esac
 app_root="${CODEX_STATUS_APP_OUTPUT:-$build_root/Codex Status Bridge.app}"
 : "${CODEX_STATUS_ARDUINOJSON:?Set CODEX_STATUS_ARDUINOJSON to a pinned ArduinoJson src directory}"
 cd "$repo_root/bridge"
-cargo build --locked -p bridge-app --target-dir "$target_root"
-python3 - "$repo_root" "$target_root" "$app_root" <<'PY'
+cargo build --locked -p bridge-app --target-dir "$target_root" "${build_args[@]}"
+python3 - "$repo_root" "$target_root/$profile" "$app_root" <<'PY'
 import pathlib, plistlib, shutil, sys
 repo, target, app = map(pathlib.Path, sys.argv[1:])
 contents = app / 'Contents'
 (contents / 'MacOS').mkdir(parents=True, exist_ok=True)
 (contents / 'Resources').mkdir(exist_ok=True)
-shutil.copy2(target / 'debug/bridge-app', contents / 'MacOS/bridge-app')
+shutil.copy2(target / 'bridge-app', contents / 'MacOS/bridge-app')
 shutil.copytree(repo / 'tools/test-bridge/templates', contents / 'Resources/seed/templates', dirs_exist_ok=True)
 with (repo / 'bridge/crates/app/Info.plist').open('rb') as f:
     info = plistlib.load(f)

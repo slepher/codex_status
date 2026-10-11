@@ -594,7 +594,7 @@ void handleStatusJson() {
     doc["max_bundle_decoded_bytes"] = bsDecodedLimit();
     doc["asset_publish_protocol"] = 0; // Existing complete Bundle path only.
 #ifdef CODEX_TARGET_NOTE4
-    doc["bundle_font_protocol"] = 1;
+    doc["bundle_font_protocol"] = 2; // CSFN v1 ASCII + v2 Unicode subsets.
 #else
     doc["bundle_font_protocol"] = 0;
 #endif

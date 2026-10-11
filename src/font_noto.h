@@ -24,10 +24,12 @@ typedef struct {
 
 typedef struct {
     const uint8_t    *blob;
-    const Note4Glyph *glyphs;      // 95 entries, indexed by (c - 0x20)
+    const Note4Glyph *glyphs;      // first 95 entries = ASCII; v2 appends a subset
     uint8_t           lineHeight;
     uint8_t           baseLine;
     uint16_t          maxAdv;      // widest advance, 1/16 px (region estimates)
+    const uint8_t    *codepoints;  // CSFN v2 LE u32 table; null = dense ASCII
+    uint16_t          glyphCount; // v2 actual entries (v1 uses 95)
 } Note4PropFont;
 
 #include "font_noto_nt16.h"
