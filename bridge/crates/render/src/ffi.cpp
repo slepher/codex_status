@@ -118,9 +118,8 @@ const char *simRender(SimBundleDevice &device) {
     env.channel = "PULL";
     env.syncHHMM = "--:--";
     env.battery = 75;
-    env.state = device.deep ? "DEEP" : (device.wifiUp ? "WIFI ON" : "WIFI OFF");
     env.mode = device.deep ? "deep" : "light";
-    env.wifiState = device.deep ? "off" : (device.wifiUp ? "connected" : "idle");
+    env.wifiState = device.deep ? "idle" : (device.wifiUp ? "connected" : "idle");
     env.offlineMins = bridgeOfflineMinutes((uint32_t)device.wallEpochSecs,
         device.lastBridgeContact, device.hasWallEpoch, 6, -1);
     env.hasNowEpoch = device.hasWallEpoch;
@@ -220,6 +219,9 @@ int codex_sync_core_check() {
     flags = 0;
     if (syncSanitizeText(longText.c_str(), longText.size(), clean, flags) > 96 ||
         !(flags & SYNC_TEXT_TRUNCATED)) return 10;
+    for (const char *event : {"[boot] manual=0", "[ble] session off", "[ui] network glyph phase=connected", "[wifi] link lost"})
+        if (!syncDiagnosticText(event)) return 11;
+    if (syncDiagnosticText("[tpl] rendered example")) return 12;
     return 0;
 }
 
@@ -676,6 +678,33 @@ int codex_bundle_store_check(const char *json) {
     if (!bsLoadCompiled(0, ct, err)) return 3;
     const auto original = LittleFS.files;
     const auto content = LittleFS.files["/bundle/content.bin"];
+    {
+        // Model an upgrade with an already installed, CRC-valid old binding.
+        auto &stored = LittleFS.files["/bundle/content.bin"];
+        const auto metaBytes = LittleFS.files["/bundle/state.bin"];
+        JsonDocument meta;
+        if (deserializeJson(meta, metaBytes.data() + 12, metaBytes.size() - 12)) return 40;
+        ct.reqs[0].kind = 14; strcpy(ct.reqs[0].path, "device.state");
+        ct.reqs[0].bucket[0] = 0; ct.reqs[0].winMode = 0; ct.reqs[0].winIndex = 0;
+        std::vector<uint8_t> record(tplCtSize() + 12); size_t written = 0;
+        if (!tplCtSerialize(ct, record.data(), record.size(), written)) return 41;
+        size_t offset = meta["cache_offset"].as<size_t>() + BS_ID_LEN + 4;
+        if (offset + record.size() > stored.size()) return 42;
+        memcpy(stored.data() + offset, record.data(), record.size());
+        meta["crc"] = v2Crc32(stored.data(), stored.size());
+        String body; serializeJson(meta, body);
+        auto &savedMeta = LittleFS.files["/bundle/state.bin"];
+        savedMeta.resize(12 + body.length()); memcpy(savedMeta.data(), "BCS2", 4);
+        const uint32_t length = body.length(), crc = v2Crc32((const uint8_t *)body.c_str(), body.length());
+        memcpy(savedMeta.data() + 4, &length, 4); memcpy(savedMeta.data() + 8, &crc, 4);
+        memcpy(savedMeta.data() + 12, body.c_str(), body.length());
+        const auto beforeLoad = LittleFS.files;
+        if (!bsBegin() || !bsProfile(profile) || bsLoadCompiled(0, ct, err) || err != "ct_bind_unsupported") return 43;
+        if (LittleFS.files != beforeLoad) return 44; // rejection does not erase content
+        if (!install("ctx-repair") || !bsBegin() || !bsLoadCompiled(0, ct, err)) return 45;
+        LittleFS.files = original;
+        if (!bsBegin() || !bsLoadCompiled(0, ct, err)) return 46;
+    }
     if (LittleFS.files.count("/bundle/a.bin") || LittleFS.files.count("/bundle/rx.bin")) return 14;
     if (!bsSetActive(0, "ctx-b", err) || LittleFS.files["/bundle/content.bin"] != content) return 4;
     if (!bsBegin() || !bsProfile(profile) || strcmp(profile.contextId, "ctx-b")) return 5;
@@ -768,7 +797,7 @@ int codex_bundle_font_reboot() {
 }
 
 int codex_render(const char *tmpl, const char *usage, const char *channel, const char *ip,
-                 const char *sync_hhmm, int battery, const char *state, const char *wifi_state, int wifi_blink, int ble_manual, int offline_mins,
+                 const char *sync_hhmm, int battery, const char *wifi_state, int wifi_blink, int ble_manual, int offline_mins,
                  const char *mode, uint8_t *out, int out_len) {
     if (!tmpl || !out || out_len < ((g_canvas_w + 7) / 8) * g_canvas_h) return -2;
     Paint_NewImage(out, g_canvas_w, g_canvas_h, ROTATE_0, WHITE);
@@ -778,7 +807,6 @@ int codex_render(const char *tmpl, const char *usage, const char *channel, const
     env.ip = ip ? ip : "";
     env.syncHHMM = sync_hhmm ? sync_hhmm : "--:--";
     env.battery = battery;
-    env.state = state ? state : "";
     env.wifiState = wifi_state ? wifi_state : "";
     env.wifiBlink = wifi_blink;
     env.bleManualActive = ble_manual;
@@ -798,6 +826,36 @@ int codex_validate(const char *tmpl, char *err, int err_len) {
     return ok ? 1 : 0;
 }
 
+int codex_ct_binding_rejection_check() {
+    static CtTemplate ct, loaded;
+    String err;
+    const char *source = "{\"schema\":1,\"id\":\"binding-check\",\"canvas\":{\"w\":200,\"h\":200},\"elements\":[{\"type\":\"text\",\"x\":0,\"y\":0,\"font\":\"f12\",\"bind\":\"device.wifi_state\"}]}";
+    tplSetCanvas(200, 200);
+    if (!tplCompile(source, ct, err)) return 1;
+    const auto good = ct.reqs[0];
+    auto rejected = [&](const char *expected) {
+        std::vector<uint8_t> blob(tplCtSize() + 12); size_t written = 0;
+        // This writes a valid CRC, modelling a once-supported stored record,
+        // not random corruption caught by the checksum gate.
+        if (!tplCtSerialize(ct, blob.data(), blob.size(), written)) return false;
+        return !tplCtDeserialize(blob.data(), written, loaded, err) && err == expected &&
+               !tplDrawCt(ct, "{}", TplEnv{});
+    };
+    ct.reqs[0].kind = 14; strcpy(ct.reqs[0].path, "device.state");
+    if (!rejected("ct_bind_unsupported")) return 2;
+    ct.reqs[0] = good; strcpy(ct.reqs[0].path, "device.future_field");
+    if (!rejected("ct_bind_unsupported")) return 3;
+    ct.reqs[0] = good; ct.reqs[0].kind = 14;
+    if (!rejected("ct_bind_mismatch")) return 4;
+    ct.reqs[0] = good; memset(ct.reqs[0].path, 'x', sizeof(ct.reqs[0].path));
+    if (!rejected("ct_req")) return 5;
+    ct.reqs[0] = good; memset(ct.ops[0].prefix, 'x', sizeof(ct.ops[0].prefix));
+    if (!rejected("ct_string")) return 6;
+    memset(ct.ops[0].prefix, 0, sizeof(ct.ops[0].prefix));
+    if (!tplValidateCt(ct, err)) return 7;
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 // Compiled template path: compile once, render without parsing template JSON.
 // ---------------------------------------------------------------------------
@@ -815,7 +873,7 @@ int codex_compile(const char *tmpl, char *err, int err_len) {
 }
 
 int codex_render_compiled(const char *usage, const char *channel, const char *ip,
-                          const char *sync_hhmm, int battery, const char *state,
+                          const char *sync_hhmm, int battery,
                          const char *wifi_state, int wifi_blink, int ble_manual,
                           int offline_mins, const char *mode, uint8_t *out, int out_len) {
     if (!out || out_len < ((g_canvas_w + 7) / 8) * g_canvas_h) return -2;
@@ -827,7 +885,6 @@ int codex_render_compiled(const char *usage, const char *channel, const char *ip
     env.ip = ip ? ip : "";
     env.syncHHMM = sync_hhmm ? sync_hhmm : "--:--";
     env.battery = battery;
-    env.state = state ? state : "";
     env.wifiState = wifi_state ? wifi_state : "";
     env.wifiBlink = wifi_blink;
     env.bleManualActive = ble_manual;
@@ -971,6 +1028,7 @@ uint32_t codex_v2_fields_crc(const char *fieldsJson) {
     return v2DataFieldsCrc(fields);
 }
 
+uint64_t codex_rv_window_until(uint64_t now, uint64_t light, uint64_t sync) { return rendezvousWindowUntil(now, light, sync); }
 void *codex_rv_new(void) { return new RendezvousProtocol(); }
 void codex_rv_free(void *p) { delete (RendezvousProtocol *)p; }
 void codex_rv_begin(void *p, uint64_t now, uint32_t advertise_ms) {

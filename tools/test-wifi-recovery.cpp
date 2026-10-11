@@ -1,8 +1,10 @@
 #include "../src/ble_recovery.h"
 #include "../src/boot_capture.h"
 #include "../src/wifi_legacy.h"
+#include "../src/network_link_policy.h"
 #include <cassert>
 #include <cstdio>
+#include <initializer_list>
 
 int main() {
     BootCapture capture;
@@ -48,6 +50,28 @@ int main() {
     assert(recovery.lightUntil == 390000 && recovery.until == 210000);
     assert(!recovery.active(210000) && recovery.lightRemaining(210000) == 180);
     assert(recovery.lightRemaining(390000) == 0);
+    // Bridge outage after BOOT ON -> OFF must preserve the association and the
+    // original 300s hold, including repeated failures just before its deadline.
+    recovery = {};
+    recovery.toggle(1000); recovery.toggle(2000);
+    for (uint64_t now : {2000ULL, 120999ULL, 121000ULL, 300999ULL}) {
+        assert(!networkFailureDisconnects("bridge_http_unreachable", true));
+        assert(recovery.lightUntil == 301000 && recovery.lightRemaining(now) > 0);
+        assert(v2PowerSleepDecision(true, true, false, false, recovery.lightRemaining(now)>0,
+                                   plan, true, 0, 0, now) == V2_POWER_STAY_LIGHT);
+    }
+    assert(recovery.lightRemaining(301000) == 0);
+    assert(v2PowerSleepDecision(true, true, false, false, false,
+                               plan, true, 0, 0, 301000) == V2_POWER_BOOT_ENDED);
+    assert(networkFailureDisconnects("wifi_connect_failed", false));
+    assert(networkFailureDisconnects("wifi_link_lost", false));
+    assert(networkFailureDisconnects("bridge_http_unreachable", false));
+    // An accepted matching reply is reachable even with stale/missing reverse
+    // proof. Wrong principal, malformed rejection, and transport errors are not.
+    assert(bridgePresenceAccepted(202,true,true));
+    assert(!bridgePresenceAccepted(202,false,true));
+    assert(!bridgePresenceAccepted(202,true,false));
+    assert(!bridgePresenceAccepted(-1,true,true));
     WifiLegacySchemes schemes;
     WifiLegacyNetwork network;
     strcpy(network.bond, "aa:bb:cc:dd:ee:ff/1");

@@ -14,6 +14,8 @@ struct State {
     bool syncEnabled = false;
     String syncOwner;
     bool syncOpenThisWake = false;
+    bool syncDataPending = false;
+    uint64_t syncDataSeq = 0; // admitted periodic HTTP Data, not a formal Light grant
     uint32_t syncLastProgressMs = 0;
     uint32_t syncExitAtMs = 0;
     uint64_t syncOpenAnsweredAt = 0;
@@ -38,6 +40,8 @@ String syncNumber(uint64_t value);
 void syncReply(const char *op, const char *result, const char *error,
                       int httpStatus, JsonDocument *extra = nullptr);
 void syncBatchFields(JsonDocument &doc, const SyncStoreBatch &batch);
+uint64_t httpUntil(uint64_t now);
+void dataApplied(uint64_t seq);
 void handleSyncBegin();
 void handleSyncPage();
 void handleSyncAck();

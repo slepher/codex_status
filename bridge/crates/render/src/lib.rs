@@ -34,7 +34,6 @@ struct Job {
     ip: String,
     sync_hhmm: String,
     battery: i32,
-    state: String,
     wifi_state: String,
     wifi_blink: i32,
     ble_manual_active: bool,
@@ -187,10 +186,6 @@ fn run_job(job: &Job, out: &mut [u8], message: &mut String) -> i32 {
         Ok(value) => value,
         Err(_) => return -3,
     };
-    let state = match CString::new(job.state.as_str()) {
-        Ok(value) => value,
-        Err(_) => return -3,
-    };
     let wifi_state = match CString::new(job.wifi_state.as_str()) {
         Ok(value) => value,
         Err(_) => return -3,
@@ -207,7 +202,6 @@ fn run_job(job: &Job, out: &mut [u8], message: &mut String) -> i32 {
                 ip.as_ptr(),
                 sync.as_ptr(),
                 job.battery,
-                state.as_ptr(),
                 wifi_state.as_ptr(),
                 job.wifi_blink,
                 i32::from(job.ble_manual_active),
@@ -230,7 +224,6 @@ fn run_job(job: &Job, out: &mut [u8], message: &mut String) -> i32 {
             ip.as_ptr(),
             sync.as_ptr(),
             job.battery,
-            state.as_ptr(),
             wifi_state.as_ptr(),
             job.wifi_blink,
             i32::from(job.ble_manual_active),
@@ -275,7 +268,6 @@ fn base_job(template: &str, env: &Env<'_>) -> Job {
         ip: env.ip.to_string(),
         sync_hhmm: env.sync_hhmm.to_string(),
         battery: env.battery,
-        state: env.state.to_string(),
         wifi_state: env.wifi_state.to_string(),
         wifi_blink: env.wifi_blink,
         ble_manual_active: env.ble_manual_active,
@@ -408,6 +400,8 @@ pub const ROW_BYTES: usize = (WIDTH as usize + 7) / 8;
 pub const BUF_LEN: usize = ROW_BYTES * HEIGHT as usize;
 
 extern "C" {
+    #[cfg(test)]
+    fn codex_rv_window_until(now:u64, light:u64, sync:u64)->u64;
     fn codex_rv_new() -> *mut std::ffi::c_void;
     fn codex_rv_free(p:*mut std::ffi::c_void);
     fn codex_rv_begin(p:*mut std::ffi::c_void,now:u64,advertise_ms:u32);
@@ -495,7 +489,6 @@ extern "C" {
         ip: *const c_char,
         sync_hhmm: *const c_char,
         battery: c_int,
-        state: *const c_char,
         wifi_state: *const c_char,
         wifi_blink: c_int,
         ble_manual: c_int,
@@ -512,7 +505,6 @@ extern "C" {
         ip: *const c_char,
         sync_hhmm: *const c_char,
         battery: c_int,
-        state: *const c_char,
         wifi_state: *const c_char,
         wifi_blink: c_int,
         ble_manual: c_int,
@@ -976,6 +968,11 @@ impl Drop for SimulatorRendezvous {
 
 #[test]
 fn simulator_rendezvous_uses_firmware_network_deadline_without_renewal() {
+    unsafe {
+        assert_eq!(codex_rv_window_until(1000, 3000, 81000), 81000);
+        assert_eq!(codex_rv_window_until(3000, 3000, 81000), 81000);
+        assert_eq!(codex_rv_window_until(81000, 3000, 81000), 0);
+    }
     let mut rv=SimulatorRendezvous::new(1_000,4_000).unwrap();
     rv.connected(1_100);
     rv.plan_received();
@@ -1345,8 +1342,6 @@ pub struct Env<'a> {
     pub ip: &'a str,
     pub sync_hhmm: &'a str,
     pub battery: i32,
-    /// Device state word: `AP` / `BLE ON` / `BLE OFF` / `WIFI OFF` / `DEEP`.
-    pub state: &'a str,
     /// Local Wi-Fi lifecycle metadata, independent of BLE/contact state.
     pub wifi_state: &'a str,
     /// 0/1 only while connecting; -1 means absent.
@@ -1365,7 +1360,6 @@ impl Default for Env<'_> {
             ip: "0.0.0.0",
             sync_hhmm: "--:--",
             battery: -1,
-            state: "BLE OFF",
             wifi_state: "idle",
             wifi_blink: -1,
             ble_manual_active: false,

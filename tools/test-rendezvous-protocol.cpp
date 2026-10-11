@@ -1,6 +1,11 @@
 #include "rendezvous_protocol.h"
 #include <cassert>
 int main() {
+    // Temporary transfer windows are independent of formal Light expiry.
+    assert(rendezvousWindowUntil(1000, 3000, 81000) == 81000);
+    assert(rendezvousWindowUntil(3000, 3000, 81000) == 81000);
+    assert(rendezvousWindowUntil(81000, 3000, 81000) == 0);
+    assert(rendezvousWindowUntil(1000, 101000, 81000) == 101000);
     RendezvousProtocol rv;
     // No Bridge/Plan: the production protocol never enters HTTP and expires.
     rv.begin(0,4000);

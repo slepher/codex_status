@@ -95,3 +95,37 @@
 
 - C9单份内容/CSZ1压缩随.80继承至.81：[交接](project-workflow/single-copy-updates/status.md)。原生双OTA分区保留；AP01实机/加载器后续调查。
 - 唯一待办：[backlog](docs/roadmap/backlog.md)；[当日历史](docs/history/progress-archive-2026-10-11.md)；[操作细则](docs/agent-operations.md)。
+
+
+## 21:07交接卡归档（BOOT网络修复前）
+
+# Codex Status 当前交接
+
+更新时间：2026-10-11 21:07（香港时间；.83已部署，Fake回归完成，网络问题先调查不改）
+
+## 部署与工作区
+
+- Note4 `7C4FADB93408` 已认证运行 **0.18.83-note4 / ota_1**，登记IP `.177`。ROM `artifacts/note4-0.18.83-temporary-sync.bin`，1,927,024 B；SHA256 `6343FCDA4676509BEEB5025F79E991C6BDCFA399F88A4C8336902489AAD1207B`，同名匹配ELF。OTA `e5c08f9a` 单次上传、succeeded/image_verified，认证运行镜像哈希已核对；证据 `artifacts/note4-83-verify.private.json`。
+- 默认Bridge配套部署、通过计划任务运行，exe SHA256 `5A205444A78893ADBBA6629195EA447A14EB5B0C9A8101DA4B668CDBAC6D18EB`。exe/data备份见 `artifacts/bridge-before-83-20261011*`。20:31 PID75952、watchdog44608，8765/8766归前者。书桌屏未刷机。
+- 统一实现与电量平滑已提交 `9c38e45`（基线 `f822531`）。实际codex-status-a v4已发布，Bundle `53cab015` succeeded，认证applied_seq453/displayed。不要用本地夹具覆盖用户实际布局。
+
+## 活跃事项与验收边界（B6/C8，关联A9）
+
+- **BOOT blink调查/Fake回归完成**：[测试计划与覆盖](project-workflow/bridge-macos/boot-blink-fake-test-20261011.md)、[源码6项缺口](project-workflow/bridge-macos/boot-blink-code-review-20261011.md)。Luna有效回归64/64通过；Fake PID34328、127.0.0.1:18783保持运行，默认Bridge/watchdog与端口已复核。实体BOOT/自动BLE收尾/EPD/LED未被Fake覆盖。20:43关闭BLE只读对照未复现blink；历史逐按根因仍未知。Wi-Fi图标依赖BLE、Bridge失败主动断Wi-Fi、presence缓存误判、会话nonce兼作boot_id均列入调查，暂不修改网络行为。
+- **绿灯数据活动候选已实现、未部署**：[实现/测试/资源](project-workflow/bridge-macos/data-led-20261011.md)。宿主策略/模块测试、Note4构建及匹配ELF64项栈检查通过。ROM `artifacts/note4-0.18.83-data-led-candidate.bin` 1,836,832 B，SHA256 `31D734AE255A260ACDE30D696DE2FFDC2DEC84D877B31BBE34D07E483366632D`，同名ELF；版本沿用.83仅本地候选，勿与上方部署镜像混淆。GPIO/动态堆/功耗实测待验。
+
+- **周期全量同步临时Light修正已配套部署，完整实机矩阵未通过**：[实施/测试/资源](project-workflow/bridge-macos/sync-window-fix-20261011.md)、[部署与图标现场调查](project-workflow/bridge-macos/note4-radio-phenomena-20261011.md)。实机reason=data/seq463进入WIFI_SYNC_ONCE、同open重放ACK；跨到期测试因停Bridge移除ready接收方而无效，另受BOOT 300s下限干扰，不能报通过/失败。恢复Bridge后Data464 ACK、诊断457 complete。已确认bridge_http_unreachable主动断Wi-Fi、BOOT保持期限未阻止断网；Bridge图标只按>6min新鲜度而非明确不可达。用户要求Wi-Fi继续ON/Bridge OFF，暂不修。蓝牙消失正常、其后blink异常的具体逐按因果未知；不把连接中blink代码当作该现象的验收依据。
+
+- **BOOT/GATT、跨重启计划、OTA统一实现已部署**：[执行/测试/资源/剩余矩阵](project-workflow/bridge-macos/note4-boot-gatt-followup-20261011.md)。用户六次实体BOOT开关符合预期；手动图标独立于自动BLE。PPL1正式计划3490经一次明确USB工具复位仍同ID/restored_light，剩417/600秒，直接HTTP且自动BLE关闭。没有一次性OTA marker，报告不删除正式计划。
+- core/app等241测试、render/MCP/device-sim126测试通过，3条件忽略；固件模块及匹配ELF66项栈门禁通过。数据合同变更后旧索引失效、发布ACK后认证回读已修正并配套部署。首次模板短暂内置界面的拒绝码未保留，不将源码缺口当唯一已证根因。
+- **未结问题**：USB工具复位后启动/认证HTTP延迟、间歇超时，根因未知；被动串口对照未证明CDC因果，boot保持、模板已恢复。证据 `artifacts/note4-81-cdc-auth-meta.json`、`note4-81-final-auth.private.json`。不声称历史.78停滞已根治。
+- 无USB Sleep重启BLE、电池深睡/Light到期竞态、Flash掉电、长期RF/功耗、动态堆峰值及macOS/1.54未验；B6/C8不结项。电量95/96/97抖动已查本地Slate和GitHub CrossPoint：前者单次平均/充电显示策略，后者整数EMA；电量EMA已随.82落地，见下条。
+
+- **电量平滑已部署/用户验收通过**：[执行记录](project-workflow/bridge-macos/note4-battery-smoothing-20261011.md)。5秒采样、90/10整数EMA仅用于显示，原始电压/低电保护独立；RAM+16 B、BIN+464 B，无NVS/新库/新任务。12项定向回归和66项栈检查通过；20次实机观测原始95/96/97、采样约5秒，用户按键确认没有跳变。新boot `eb3cc78d6243e38e5feb871b29efcb77`，模板ready/displayed；证据 `artifacts/note4-82-ota-status.json`、`note4-82-battery-observation.json`。
+
+- **协议文档已按9c38e45同步**：[协议总览](docs/bridge-device-protocol.md)、[48 B编码](docs/bridge-device-compact-envelope-design.md)、[场景/实现对照](docs/bridge-device-communication-implementation.md)。更新PPL1/BOOT/OTA、单份CSZ1 Bundle、合同失效和实际POST/frame；仅文档，不改变部署或扩大验收结论。
+
+## 入口
+
+- C9单份内容/CSZ1压缩随.80继承至.81：[交接](project-workflow/single-copy-updates/status.md)。原生双OTA分区保留；AP01实机/加载器后续调查。
+- 唯一待办：[backlog](docs/roadmap/backlog.md)；[当日历史](docs/history/progress-archive-2026-10-11.md)；[操作细则](docs/agent-operations.md)。

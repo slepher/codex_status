@@ -53,7 +53,6 @@ fn envs() -> Vec<Env<'static>> {
             ip: "192.168.3.163",
             sync_hhmm: "12:34",
             battery: 75,
-            state: "WIFI CONN",
             wifi_state: "connecting",
             wifi_blink: 1,
             ble_manual_active: false,
@@ -65,7 +64,6 @@ fn envs() -> Vec<Env<'static>> {
             ip: "0.0.0.0",
             sync_hhmm: "--:--",
             battery: -1,
-            state: "WIFI OFF",
             wifi_state: "off",
             wifi_blink: -1,
             ble_manual_active: false,
@@ -128,7 +126,7 @@ fn compiled_render_is_pixel_identical_to_json_render() {
                 assert_eq!(
                     json_bits, ct_bits,
                     "{id} normal={normal} state={} mode={} differs",
-                    env.state, env.mode
+                    env.wifi_state, env.mode
                 );
             }
         }
@@ -237,7 +235,7 @@ fn wifi_metadata_controls_template_pixels_independently_of_legacy_state() {
         for (phase, blink, visible) in [("idle",-1,false),("connecting",0,false),
             ("connecting",1,true),("connected",-1,true),("off",-1,true)] {
             // Legacy OFF must not override the independent Wi-Fi facts.
-            let env = Env {state:"WIFI OFF",wifi_state:phase,wifi_blink:blink,..Env::default()};
+            let env = Env {wifi_state:phase,wifi_blink:blink,..Env::default()};
             let json = render_bits(&source,"{}",&env).unwrap();
             let compiled = render_compiled_bits_size("{}",&env,w,h).unwrap();
             assert_eq!(json,compiled,"{path} {phase}/{blink}");
@@ -266,10 +264,54 @@ fn manual_gatt_icon_is_independent_of_wifi_and_automatic_ble() {
     compile(&source).unwrap();
     for phase in ["idle","connecting","connected","off"] {
         for active in [false,true] {
-            let env=Env {state:"BLE ON",wifi_state:phase,ble_manual_active:active,..Env::default()};
+            let env=Env {wifi_state:phase,ble_manual_active:active,..Env::default()};
             let pixels=render_bits(&source,"{}",&env).unwrap();
             assert_eq!(pixels,render_compiled_bits_size("{}",&env,w,h).unwrap());
             assert_eq!(pixels.iter().any(|b|*b!=255),active,"{phase}/{active}");
         }
     }
+}
+
+#[test]
+fn note4_wifi_region_survives_boot_close_and_automatic_ble_closeout() {
+    let _guard = SERIAL.lock().unwrap();
+    let source = std::fs::read_to_string(repo_root().join(
+        "bridge/crates/core/tests/fixtures/codex-status-a-400x300.json")).unwrap();
+    compile(&source).unwrap();
+    let region = |bits: &[u8]| -> Vec<bool> {
+        (8..28).flat_map(|y| (272..292).map(move |x| bits[y*50+x/8] & (0x80 >> (x%8)) != 0)).collect()
+    };
+    for (phase, blink, visible) in [("idle",-1,false),("connecting",0,false),
+        ("connecting",1,true),("connected",-1,true),("off",-1,true)] {
+        let mut previous = None;
+        // Only the manual BLE fact enters the renderer. Automatic BLE has no
+        // legacy state-word input through which it could affect these pixels.
+        for manual in [true,false,false,true] {
+            let env = Env { wifi_state:phase, wifi_blink:blink,
+                ble_manual_active:manual, mode:"light", ..Env::default() };
+            let bits = render_bits(&source,&usage(true),&env).unwrap();
+            assert_eq!(bits,render_compiled_bits_size(&usage(true),&env,400,300).unwrap());
+            let pixels = region(&bits);
+            assert_eq!(pixels.iter().any(|v| !v),visible,"{phase}/{manual}");
+            if let Some(prior) = previous { assert_eq!(pixels,prior,"{phase}/{manual}"); }
+            previous = Some(pixels);
+        }
+    }
+}
+
+#[test]
+fn unsupported_fields_are_rejected_in_json_and_persisted_compiled_records() {
+    let _guard = SERIAL.lock().unwrap();
+    for bind in ["device.state", "device.future_field"] {
+        for condition in [false,true] {
+            let mut element = json!({"type":"text","x":0,"y":0,"font":"f12","text":"safe"});
+            if condition { element["when"] = json!({"bind":bind,"exists":false}); }
+            else { element.as_object_mut().unwrap().remove("text"); element["bind"] = json!(bind); }
+            let source = json!({"schema":1,"id":"unsupported","canvas":{"w":200,"h":200},"elements":[element]});
+            assert!(bridge_core::template::validate_template(&source).is_err());
+            assert!(compile(&source.to_string()).is_err());
+        }
+    }
+    extern "C" { fn codex_ct_binding_rejection_check() -> i32; }
+    assert_eq!(unsafe { codex_ct_binding_rejection_check() },0);
 }

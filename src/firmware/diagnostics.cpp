@@ -420,7 +420,7 @@ void handleStatus() {
             " (next OTA slot: " + String(next ? next->label : "?") + ")</li>";
     html += "<li>Reset reason: " + String(resetReasonName()) +
             " (uptime " + String(millis() / 1000) + "s)</li>";
-    html += "<li>State: " + String(radio::deviceStateText()) + " (BLE " + String(radio::state.bleOn ? "session" : "off") +
+    html += "<li>State: " + String(wifiPhaseText(radio::wifiPhase())) + " (BLE " + String(radio::state.bleOn ? "session" : "off") +
             ", USB " + String(power::state.plugged ? "plugged" : "battery") + ")</li>";
     html += "<li>SSID: " + WiFi.SSID() + "</li>";
     html += "<li>IP: " + WiFi.localIP().toString() + "</li>";
@@ -482,11 +482,10 @@ void handleStatusJson() {
     doc["ssid"] = radio::state.configMode ? radio::state.apSsid : WiFi.SSID();
     doc["ip"] = radio::ipText();
     doc["rssi"] = WiFi.RSSI();
-    doc["state"] = radio::deviceStateText();
+    doc["wifi_state"] = wifiPhaseText(radio::wifiPhase());
     doc["ble_on"] = radio::state.bleOn;
     doc["ble"] = bleIsConnected();
     doc["plugged"] = power::state.plugged;
-    doc["wifi_state"] = radio::wifiStateText();
     doc["retry_stage"] = power::retained.rtcRetryStage;
     doc["last_push"] = radio::retained.rtcLastSyncEpoch;
     doc["endpoints"] = storeCount();
@@ -1303,7 +1302,7 @@ void handleV2Status() {
     doc["firmware_target"] = FW_TARGET_ID;
     doc["running_slot"] = currentPartition ? currentPartition->label : nullptr;
     doc["reset_reason"] = (int)esp_reset_reason();
-    doc["boot_id"] = transport::v2Nonce();
+    doc["boot_id"] = transport::bootId();
     doc["uptime_ms"] = millis();
     if (clock::timeKnown()) doc["sampled_wall"] = (int64_t)time(nullptr);
     else doc["sampled_wall"] = nullptr;
@@ -1349,6 +1348,7 @@ void handleV2Status() {
                     power::retained.rtcMode == MODE_LIGHT ? "WIFI_LIGHT" : "DEEP";
     const uint64_t syncUntil = sync::state.syncOpenAnsweredAt + 90000;
     sync["remaining_ms"] = sync::state.syncOpenThisWake && syncUntil > clock::v2NowMs() ? syncUntil-clock::v2NowMs() : 0;
+    sync["data_pending_seq"] = sync::state.syncDataPending ? sync::state.syncDataSeq : 0;
     sync["rounds"] = sync::retained.syncRtc.rounds;
     sync["due"] = (sync::retained.syncRtc.flags & 1) != 0;
     sync["retry_skip"] = sync::retained.syncRtc.retrySkip;
@@ -1438,7 +1438,7 @@ void handleSerialCli() {
             Serial.println("Legacy Wi-Fi writes retired. Use Bridge bonded setup or authenticated wifi-json transactions.");
         } else if (line == "status") {
             DevLog.printf("[cli] fw=%s state=%s ip=%s rssi=%d heap=%u\n",
-                          application::state.firmwareVersion, radio::deviceStateText(), radio::ipText().c_str(),
+                          application::state.firmwareVersion, wifiPhaseText(radio::wifiPhase()), radio::ipText().c_str(),
                           WiFi.RSSI(), ESP.getFreeHeap());
 #if defined(CODEX_TARGET_NOTE4)
             const esp_partition_t *running = esp_ota_get_running_partition();

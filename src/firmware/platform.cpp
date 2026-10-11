@@ -74,6 +74,13 @@ bool tplCacheLoad() {
         rgnReset(display::state.rgnSet); display::state.rgnSet.wholeFrame = true;
         return false;
     }
+    String error;
+    // This fallback runs without an active Bundle; reuse its owned CT buffer.
+    if (!tplCompile(json, state.v2Ct, error)) {
+        state.activeTplJson = ""; state.activeTplId = "";
+        state.bundleMaintenance = true; state.bundleError = error;
+        return false;
+    }
     state.activeTplJson = json;
     state.activeTplId = id;
     // Scan the (multi-KB, possibly PSRAM-backed) template once per load, not
@@ -98,6 +105,8 @@ bool v2ActiveLoad() {
     if (!bsLoadCompiled(state.v2Profile.initial, state.v2Ct, err)) {
         DevLog.printf("[platform] active load failed: %s\n", err.c_str());
         state.v2CtValid = false;
+        state.bundleMaintenance = true;
+        state.bundleError = err;
         return false;
     }
     state.v2CtValid = true;
@@ -232,6 +241,7 @@ void applyV2Data(const String &body) {
     if (!transport::v2Command(body, peek)) return;
     radio::markSynced();
     const V2DataDecision decision = applyV2DataAuthorized(body, peek);
+    if (!strcmp(decision.result, "applied")) sync::dataApplied(peek["seq"] | 0ULL);
     transport::v2Ack("data", decision.result, decision.display, "ram",
           decision.error.length() ? decision.error.c_str() : nullptr, decision.seq, 0,
           decision.includeContext ? state.v2Profile.contextId : nullptr, UINT32_MAX,
@@ -305,6 +315,7 @@ void applyV2Plan(const String &body) {
         String dataBody;
         serializeJson(data, dataBody);
         V2DataDecision applied = applyV2DataAuthorized(dataBody, data);
+        if (!strcmp(applied.result, "applied")) sync::dataApplied(data["seq"] | 0ULL);
         JsonObject dataAck = ack["data"].to<JsonObject>();
         dataAck["result"] = applied.result;
         dataAck["display_state"] = applied.display;

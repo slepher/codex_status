@@ -20,10 +20,10 @@ fn hashes_match_python_test_bridge() {
     assert_eq!(full.version, 3);
     assert_eq!(mini.version, 2);
     let quad = library.get("quad").expect("quad template");
-    assert_eq!(quad.version, 13);
+    assert_eq!(quad.version, 14);
     assert_eq!(quad.min_fw.as_deref(), Some("0.18.75"));
     // Shared with tools/test-template-wifi-metadata.py; C++ hashes the same canonical bytes.
-    assert_eq!(quad.hash, "666c6404");
+    assert_eq!(quad.hash, "44fa7e21");
     let compiled = bridge_core::compile::compile(&quad.json, "epd-1bpp-200x200").unwrap();
     assert_eq!(compiled.source_crc, quad.hash);
 }
@@ -61,7 +61,7 @@ fn parse_bind_grammar() {
     assert_eq!(parse_bind("buckets[codex].yearly.usedPercent"), None);
     assert_eq!(parse_bind("buckets[].weekly.usedPercent"), None);
     assert_eq!(parse_bind("account.email"), None);
-    assert_eq!(parse_bind("device.state"), Some(BindSpec::DeviceState));
+    assert_eq!(parse_bind("device.state"), None);
     assert_eq!(
         parse_bind("device.offline_mins"),
         Some(BindSpec::DeviceOfflineMins)
@@ -170,20 +170,20 @@ fn validates_when_equals_condition() {
         })
     };
     assert!(
-        validate_template(&template(json!({"bind": "device.state", "equals": "WIFI OFF"})))
+        validate_template(&template(json!({"bind": "device.wifi_state", "equals": "off"})))
             .is_ok()
     );
     assert!(validate_template(&template(json!({"bind": "device.battery", "equals": 75}))).is_ok());
 
     for bad in [
-        json!({"bind": "device.state", "equals": "WIFI OFF", "exists": true}),
-        json!({"bind": "device.state", "equals": true}),
-        json!({"bind": "device.state", "equals": null}),
-        json!({"bind": "device.state", "equals": 1.5}),
-        json!({"bind": "device.state", "equals": ["WIFI OFF"]}),
-        json!({"bind": "device.state", "equals": {"value": "WIFI OFF"}}),
+        json!({"bind": "device.wifi_state", "equals": "off", "exists": true}),
+        json!({"bind": "device.wifi_state", "equals": true}),
+        json!({"bind": "device.wifi_state", "equals": null}),
+        json!({"bind": "device.wifi_state", "equals": 1.5}),
+        json!({"bind": "device.wifi_state", "equals": ["off"]}),
+        json!({"bind": "device.wifi_state", "equals": {"value": "off"}}),
         json!({"bind": "account.email", "equals": "x"}),
-        json!({"bind": "device.state", "equals": "x", "extra": 1}),
+        json!({"bind": "device.wifi_state", "equals": "x", "extra": 1}),
     ] {
         assert!(
             validate_template(&template(bad.clone())).is_err(),

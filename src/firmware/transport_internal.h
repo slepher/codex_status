@@ -47,6 +47,7 @@ void v2Ack(const char *op, const char *result, const char *display,
                   const char *retention, const char *error, int64_t seq, uint64_t planId,
                   const char *context, uint32_t acceptedRemainingS, bool fullSeq = false);
 const String &v2Nonce();
+const char *bootId();
 bool v2Command(const String &body, JsonDocument &doc);
 void v2HttpRawHandler();
 void v2HttpRoute(uint16_t op, void (*handler)());

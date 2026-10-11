@@ -2568,6 +2568,7 @@ impl PlatformService {
         if matches!(decision, Delivery::BleData(_) | Delivery::LightData(_)) {
             match c.note_delivery_started(&decision, now) {
                 Ok(flight) => {
+                    out["temporary_data"] = json!(c.data.acked_push_fp == Some(flight.push_fp));
                     out["data_seq"] = json!(flight.seq);
                     out["active_context_id"] = json!(flight.payload.active_context_id);
                     out["content_crc"] = json!(flight.content_crc);
@@ -2684,8 +2685,9 @@ impl PlatformService {
             .coordinators
             .get(&mac)
             .map(|c| {
-                (contract_known && c.sync_enabled && c.data.push_dirty)
-                    || c.data.in_flight.is_some()
+                (contract_known && c.sync_enabled && !c.sources.is_empty() && c.data.push_dirty)
+                    || c.data.in_flight.as_ref().is_some_and(|flight|
+                        c.data.acked_push_fp != Some(flight.push_fp))
                     || c.pending_activate.is_some()
                     || c.job
                         .as_ref()
@@ -4813,16 +4815,27 @@ mod tests {
             decision["fields"]["buckets[codex].weekly.resetsAt"]["value"],
             json!(9999)
         );
+        assert_eq!(decision["temporary_data"], false);
+        // The separate push regression covers formal Light intent; don't
+        // accept a Light plan here, so the periodic case starts without a hold.
         let seq2 = decision["data_seq"].as_u64().unwrap();
         let crc2 = decision["content_crc"].as_str().unwrap().to_string();
         assert_eq!(seq2, seq + 1);
         svc.note_ack(mac, DeliveryKind::BleData, seq2, &crc2, true, "displayed");
 
-        // Reaching the confirmed deadline schedules a complete sync.
-        assert!(matches!(
-            svc.next_delivery(mac, true, t + 1 + 61)["decision"].as_str(),
-            Some("ble_data")
-        ));
+        // A periodic full snapshot (including HTTP-sized/retried delivery)
+        // must not turn the pinned Data into a formal Light intent.
+        let periodic_at = t + 1 + 61;
+        let periodic = svc.next_delivery(mac, true, periodic_at);
+        assert_eq!(periodic["decision"], "ble_data");
+        assert_eq!(periodic["temporary_data"], true);
+        assert_eq!(svc.plan_for_rendezvous(mac, periodic_at, "rendezvous", 0).unwrap().mode, PlanMode::Sleep);
+        let retry = svc.next_http_delivery(mac, true, periodic_at + 1);
+        assert_eq!(retry["data_seq"], periodic["data_seq"]);
+        assert_eq!(retry["temporary_data"], true);
+        assert_eq!(svc.plan_for_rendezvous_network_work(mac, periodic_at + 1, "rendezvous", 0, true).unwrap().mode, PlanMode::Sleep);
+        let resumed = PlatformService::open(dir.path()).unwrap();
+        assert_eq!(resumed.plan_for_rendezvous(mac, periodic_at + 2, "rendezvous", 0).unwrap().mode, PlanMode::Sleep);
         // A stale ACK for the old content never confirms the new snapshot.
         let stale = svc.note_ack(mac, DeliveryKind::BleData, seq, &crc, true, "displayed");
         assert_eq!(stale["outcome"], "stale");

@@ -103,7 +103,7 @@ pub(crate) fn field_kind(spec: &BindSpec) -> crate::platform::model::FieldKind {
     use crate::platform::model::FieldKind;
     match spec {
         BindSpec::Plan | BindSpec::Label | BindSpec::HostId | BindSpec::DeviceIp |
-        BindSpec::DeviceSync | BindSpec::DeviceState | BindSpec::DeviceNow | BindSpec::DeviceDate |
+        BindSpec::DeviceSync | BindSpec::DeviceNow | BindSpec::DeviceDate |
         BindSpec::DeviceMode | BindSpec::DeviceChannel | BindSpec::DeviceWifiState => FieldKind::Text,
         BindSpec::DeviceWifiBlink => FieldKind::Number,
         _ => FieldKind::Number,

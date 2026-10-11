@@ -1,6 +1,6 @@
 # 通用多设备墨水屏平台：现行架构
 
-日期：2026-09-23；协议统一修订：2026-09-28。状态：现行权威设计；主体已在 200×200 SSD1681 设备实机验证，双策略会合仍是待 spike、未实现的候选扩展。本文件以累计确认需求为准；与旧设计冲突的容量、数据模型和功耗职责由本文替代。候选协议字段不表示现有接口已支持。
+修订：2026-10-11，基线9c38e45。状态：现行权威设计；设备部署/镜像/实机边界见PROGRESS。当前使用device_first及HTTP直达，bridge_first已废弃。本文件以累计确认需求为准；历史候选字段不表示现有接口支持。
 
 ## 1. 目标、非目标与现状
 
@@ -10,7 +10,7 @@
 
 本版不做模板版本历史、历史选择/回滚 UI、资源图/GC、Provider/Dataset 分层、通用脚本插件、增量数据补丁、多设备原子发布或通用历史数据库。不承诺一种 ROM 支持任意 MCU，不把屏幕尺寸缩放当作硬件适配，也不承诺 deep 中即时远程唤醒。
 
-现状依据：`PROGRESS.md` 记录平台主体已实现并在 200×200 SSD1681 上验证；`project-workflow/power-plan-c/status.md` 的 0.17.2-bw、rv2=1 属历史部署标记。双策略会合仅完成设计同步，尚未实现、构建或部署。本次未查询设备或重新核验 ROM。旧“最多 3 个 enabled”与旧 Wi-Fi pull 不属于当前协议；平台 Profile 为 1–8 个有序模板。
+现状依据：PROGRESS记录当前Note4 .82与Windows Bridge部署；旧0.17.2-bw/rv2=1及双策略会合属于历史阶段。当前为48 B frame、PPL1正式计划、单份Bundle及CSZ1压缩；Profile为1–8个有序模板。本次文档同步不新增设备核验，不推广为全部设备/平台验收。
 
 ## 2. 简化后的组件边界
 
@@ -81,7 +81,7 @@ UI 和 MCP 调用同一套保存、预览、发布、同步开关、激活、cla
 
 ## 5. 硬件适配与容量
 
-模板本地元数据补充（2026-10-11源码候选）：`device.wifi_state`提供idle/connecting/connected/off生命周期，`device.wifi_blink`只在connecting时提供0/1相位。均为local_dependencies，不进入Bridge Data要求或上下文数据快照；模板选择视觉表达，固件仅使阶段/相位变化触发重绘。等待BLE/开网不等于连接失败，WIFI OFF不作中间态。状态语义见[电源状态 §7](power-state.md#7-屏幕状态字与模板协议)。
+模板本地元数据补充（2026-10-11源码候选）：`device.wifi_state`提供idle/connecting/connected/off生命周期，`device.wifi_blink`只在connecting时提供0/1相位，`device.ble_manual_active`独立表示手动BLE窗口。均为local_dependencies，不进入Bridge Data要求或上下文数据快照。`device.state`已退役，固件与Bridge拒绝，不保留映射或自动迁移。codex-status-a v5、quad v14使用当前独立字段；深睡主动关闭为idle而非失败off。Bridge明确不可达立即提供offline_mins=0，恢复后回归原联系新鲜度策略。模板选择视觉表达，固件提供事实并触发重绘。已存储CT在每次加载和绘制前重新验证支持字段、序列化编号/路径一致性与字符串边界；不支持则停止使用并进入内置恢复界面，报告content_error，保留存储待显式发布替换。受支持字段的数据缺失由when处理，与未知字段不同。状态语义见[电源状态 §7](power-state.md#7-屏幕状态字与模板协议)。
 
 .81 统一合同：`device.ble_manual_active` 是数字 0/1，本地依赖，不向 Bridge 索取 Data 字段；它仅表示物理短按开启的手动 GATT 窗口，首次唤醒临时 BLE、自动交汇及实际射频均不冒充该值。CompiledTemplate 追加绑定编号 21，既有编号及 ABI 2 不变；固件/宿主解析、序列化和数字条件一致。新模板发布仍冻结完整 Bundle，保存与 OTA 不等于发布。正式 PowerPlan 的 PPL1 持久化、时间连续性和 BOOT/USB/OTA 优先级见 [电源合同](power-state.md)，重复请求不重算 Light 期限。
 
@@ -110,7 +110,7 @@ SSD2683 和某个板名不构成已验证面板/引脚/波形合同。第二块�
 
 运行字段需求由设备认证 `/api/status` 的 `data_contract` 报告，直接取当前已安装的 CompiledTemplate：包含模板 ID、compiler ABI、源 CRC，以及字段原始索引、路径、类型、missing/local。Bridge 的模板库、草稿 Profile 和是否曾在这台主机发布，不决定设备需要哪些字段；没有本地模板/Profile 也可按设备级许可投递。Bridge 负责将报告的字段匹配到数据源并决定 push/pull。
 
-Bridge 持久化设备字段表；BLE 沿用已有 context/active 摘要，只有与该缓存对应的同一上下文和 active 才复用。切换、冷启动新上下文或尚未读取合同，先通过正式有界 Wi-Fi 会话读取字段表，不将其扩进短窗口 GATT 状态。未知合同不发送空字段快照。Bridge 发送序号接续设备报告的 data/applied 序号，完整快照指纹仍只由成功 ACK 确认。
+Bridge 持久化设备字段表；BLE 沿用已有 context/active 摘要，只有与该缓存对应的同一上下文和 active 才复用。切换、冷启动新上下文或尚未读取合同，先通过正式有界 Wi-Fi 会话读取字段表，不将其扩进短窗口 GATT 状态。未知合同不发送空字段快照。发布/激活ACK产生新context时立即失效旧data_contract，即使template_id同名也必须认证回读字段表；失败返回read_device_contract阶段，不能沿用旧索引。Bridge 发送序号接续设备报告的 data/applied 序号，完整快照指纹仍只由成功 ACK 确认。
 
 Bridge 对当前 active_context 保存：最新完整快照、最新 push/full 指纹、最后确认应用的 push/full 指纹、`full_sync_deadline`、下一 data_seq。指纹以规范化有界字段内容计算，比较发现冲突时可再比较字节；无需把指纹构造成持久资源身份。
 
@@ -135,12 +135,7 @@ Bridge 时间到 full_sync_deadline → 排完整同步（可包含 pull 的新�
 
 Bridge 是正式 PowerPlan 唯一业务决策者。Bridge 根据待发布操作、push 活跃情况、用户功耗设置、当前可达性决定本轮 NOOP/SLEEP、BLE 更新、Bundle 更新或进入/继续 Wi-Fi light。pull-only 变化不改任何电源计划；完整同步到期可由 Bridge 决定传输所需计划，但不会让设备自行升档。
 
-会合发现支持两个可切换策略，但它们只分叉“怎样建立本轮可达机会”，不复制 coordinator、owner、Data、Bundle、PowerPlan 或业务 ACK：
-
-- `device_first`（默认与恢复）：设备发可连接广播，PC 扫描并作为 central 连接设备 GATT server；小 Data 可在既有认证 BLE 会话完成，大任务由正式 PowerPlan 转入 HTTP。
-- `bridge_first`（候选、需能力协商与 spike）：PC 在每个预定窗口都重复广播认证 RendezvousDirective，无工作也明确发送 ACCEPT_SLEEP；设备扫描、验证后每窗口重复发送一条冻结的认证 StatusBeacon，报告本轮结果与电量，Bridge 漏收不阻止设备按截止休眠。OPEN_WIFI 后设备连入局域网并主动请求 Bridge HTTP 服务；Bridge 并行监听机会性的 StatusBeacon 与设备入站请求，完成双向认证后进入同一 coordinator，不等待广播补包，也不主动探测设备 HTTP 端口。反向设备 HTTP 交换及其显式 claim 封装尚未实现；具体合同见 `project-workflow/power-plan-c/task-5-advert-rendezvous.md`。
-
-`bridge_first` 的广播是有界、目标明确、认证且防重放的会合控制面，不是公开 hint，也不是第二套业务消息通道。OPEN_WIFI 只允许本窗口的一次短时 HTTP 可达机会，不创建 owner、不设置或延长 light deadline、不获得 BOOT provisional，也不授权 Data/Bundle 写入；随后仍须在 HTTP 中核对完整 MAC、bridge、owner、endpoint token、context，并由正式 PowerPlan 决定继续在线期限。ACCEPT_SLEEP 只结束本轮 bootstrap，不撤销仍有效的正式 light/BOOT 期限。
+当前采用device_first：设备提供可连接广播机会，Bridge作为central连接GATT；小Data在BLE完成，需要HTTP的工作通过合法Plan/network_start及独立报告进入HTTP。HTTP已可用直接执行，不要求BLE前置。bridge_first及认证Directive/StatusBeacon方案已废弃，仅留历史设计；不维护第二套运行协议或能力协商。
 
 ```text
 DEEP --timer--> 本地必要时钟/维护 → RENDEZVOUS(strategy)
@@ -170,7 +165,7 @@ BOOT 的通知先走短 BLE 会合，Wi-Fi 连上后也上报 wake_reason；“�
 
 light deadline 使用设备单调时钟，`accepted_at + granted_duration`；Bridge 收到实际剩余期限后决定是否发送新 plan_id。新计划可延长、缩短或立即 sleep，重复计划返回原接受结果和当前剩余时长。校时不能移动期限。普通业务事务必须在接受前检查剩余期限，到点中止暂存并睡眠。`sync-v1` 已冻结诊断批次例外：到点后只进入 `WIFI_SYNC_ONCE` 的有进展 drain，直到持久 complete 或 90 秒无进展；不接收新的 Data/Bundle/OTA，PowerPlan 的正式期限仍如实报告。该例外不修改 light/BOOT 截止，细节见 `project-workflow/device-sync-diagnostics/design.md` §7；软件和实机验收状态以 `PROGRESS.md` 为准。
 
-owner lease 与 light lease 完全分开。空闲设备只能通过 token 保护的显式 POST /claim 建立 owner；不能借 BLE 数据创建 owner。owner 过期时，已绑定并通过设备 token 的 Bridge 可请求有限 light 会话以执行 HTTP claim，该例外只给电源机会，不给数据/Bundle 写权限；有效他人 owner 拒绝此机会和写入。claim 成功后仍需原来的同步/发布授权。owner 续约不影响电源期限。
+owner lease与Light期限完全分开。只由显式claim建立/转移；HTTP claim使用endpoint会话加设备操作token，BLE claim使用当前绑定加密peer/principal/session/MAC/operation_token并要求ble_claim=1，两者共用处理器。普通Data/Plan不创建owner；他人占用明确拒绝。claim成功不等于发布，不续电源期限；恢复持久Plan也不恢复已过期owner。
 
 双策略切换通过当前可用的认证通道提交完整配置并由设备持久化 ACK，在约定的未来窗口生效；Bridge 收到 ACK 或认证读取确认前不能显示“配置已接受”，生效前也不能显示已按新日程会合。默认始终为 device_first。`bridge_first` 的长期失配恢复属于该策略内部：连续两个窗口无有效指令或时基不可信后锁存 `BRIDGE_FIRST_RECOVERY`，每轮在固定无线预算内以认证广播挑战重新发现 Bridge、校准单调时间误差和新 epoch，并在明确未来窗口生效。Bridge 重启后开启不依赖旧相位的恢复入口；设备重启后废止无法证明连续的旧 anchor。未认证完成前只报告发现，不宣称已对齐；广播无法修复密钥、owner 或网络配置缺失。临时恢复不改用户持久策略、不创建 owner、不延长 PowerPlan/BOOT。正常策略及 BOOT 的 `device_first` 能力不等于在 `bridge_first` 恢复中切换协议。候选细节和证据边界见 `project-workflow/power-plan-c/task-5-advert-rendezvous.md` §9；当前仅 RF 原型，没有实现认证恢复。
 
@@ -184,16 +179,14 @@ Wi-Fi light 有效且链路可达期间，后续 push 可立即排完整数据�
 
 ## 8. 最小消息与幂等规则
 
-所有业务副作用命令在已认证会话执行，公共字段为 `protocol, device_mac, bridge_id, request_id, session_nonce`。session_nonce 绑定当前认证会话。公开发现 Beacon 仍只作 hint；bridge_first 另定义经过预配置密钥认证、防重放的紧凑 Directive/StatusBeacon，它只能选择本轮 SLEEP 或有界 OPEN_WIFI，不能承载业务数据、token、claim、Bundle、Data 或正式 PowerPlan。完整 MAC、上下文与能力仍通过认证 HTTP/GATT 状态握手核对。
+所有业务副作用在已认证会话执行。当前载体使用48 B二进制头，HTTP业务统一POST；业务JSON仍带device_mac/bridge_id/request_id/session_nonce，通用Data/Plan禁止protocol/rv。frame request_no与持久业务ID独立，具体映射以[协议总览](bridge-device-protocol.md)为准。公开发现只作hint；bridge_first及其Directive/StatusBeacon是已废弃方向，不属于当前入口。完整MAC/上下文/能力由认证状态核对。
 
 | 消息 | 必需业务字段 | 语义 |
 |---|---|---|
 | RendezvousBeacon / Status | wake_reason；认证 Status 含完整 active_context_id、active_template_id、已提交 job_id、data_seq、能力及剩余功耗期限 | Bridge 据此重建真实状态，摘要不构成授权 |
-| RendezvousDirective（候选） | 短目标、config_epoch、window_seq、ACCEPT_SLEEP/OPEN_WIFI、auth_tag | PC 每个 bridge_first 窗口冻结并重复同一指令；只决定是否开放本轮 Wi-Fi bootstrap |
-| RendezvousStatusBeacon（候选） | 短目标、同一 epoch/window、ACCEPT_SLEEP/WIFI_OPENING/NO_DIRECTIVE/REJECTED、reason、battery_pct、auth_tag | 设备每窗口冻结一条并在有界预算内重复发送；Bridge 收到可证明本窗口活跃并取得带采样时间的电量，漏收只记未确认；不代表 Wi-Fi ready 或业务 ACK |
 | NOOP | 可选校时与时区 | 不更新数据、不改期限；窗口结束回 deep |
 | PowerPlan | plan_id、mode=sleep/light、light_duration_s、rendezvous_period_s | 明确修改电源计划；SLEEP 是 mode=sleep 的同一命令，避免另造租约实体 |
-| Data | active_context_id、data_seq、完整 fields | 原子替换当前数据；字段索引按当前 CompiledTemplate 校验 |
+| Data | active_context_id、seq、完整 fields | 原子替换当前数据；字段索引按当前 CompiledTemplate 校验 |
 | Bundle | job_id、expected_active_context_id、完整包长度/校验/内容 | 对当前观察上下文条件提交；期间按键切换则冲突，由 Bridge 重新预检，不覆盖用户切换 |
 | Activate | expected_active_context_id、template_id | 显式远程激活；成功返回设备生成的新上下文 |
 | ACK | request_id、result、active_context_id；按操作附 job_id/data_seq/plan_id、display_state、retention、实际期限 | 一种业务结果，失败带有限 error_code；非多阶段发布事件流 |
@@ -202,9 +195,9 @@ Wi-Fi light 有效且链路可达期间，后续 push 可立即排完整数据�
 
 提交前再次检查身份、owner、上下文、长度、校验、类型和全部字段。相同 context+data_seq 且相同内容返回原结果，较旧 seq 拒绝，同 seq 不同内容冲突。seq 跳号允许合并中间快照。切模板产生新 context，旧包无论 BEGIN 或 COMMIT 在途都拒绝。
 
-plan_id 在设备认证会话内单调递增，设备保留最高已接受值及原期限；同值同内容幂等，同值不同内容冲突，旧值拒绝。新连接先核对当前最高值，不能重新编号来重放历史计划；冷重启废止旧会话 nonce，不能恢复旧 light 承诺。request_id 重试远程 Activate 需返回先前结果，不能生成第二个上下文。
+plan_id在已授权principal范围内单调递增，PPL1跨重启保存最高已接受值、原参数及原期限；同值同内容幂等且不续期，同值异内容冲突，旧值拒绝。新连接核对持久原计划，不能换号重放。重启废止旧认证会话，但时间可验证时恢复正式Light原剩余量；USB/有效Light直接HTTP，Sleep普通重启一次有界BLE，报告不删除计划。request_id 重试远程 Activate 需返回先前结果，不能生成第二个上下文。
 
-候选广播一窗口只允许一条冻结 Directive；相同 epoch/window 的重复同字节包返回同一决定，不重复开网或续任何截止，同序号不同内容、旧 epoch、过期/未来窗口和错目标全部拒绝。设备即使未收到有效 Directive 也发送基于本地预期窗口的 NO_DIRECTIVE。24B 候选包以 1B 电量与 1B 保留字段替换旧 2B `schedule_hint`，保留短身份、epoch/window 和 64-bit 认证标签；详情见上述专项协议。PC 分别记录 directive、StatusBeacon、电量观察、设备主动发来的双向认证 HTTP 联系和业务 ACK：WIFI_OPENING 不等于设备已接入局域网，TCP/HTTP 到达不等于身份通过，只有业务 ACK 更新指纹、deadline、job 或 plan 状态。
+原bridge_first候选广播格式仅保留于历史专项，不作为当前协议发送依据；现行device_first、HTTP直达及独立报告以通信场景为准。
 
 简单 ACK 区分 `result=applied/rejected` 和 `display_state=unchanged/displayed/pending/failed`；附 `retention=ram/rtc/flash`，不引入 received/validated/prepared 等产品状态。链路层 Write Response 不算业务 ACK。无线窗口不足时先应用并回 pending，之后本地完成显示；Bridge 下一次读取实际状态。显示失败由设备本地安全全刷恢复，同一 Data 重发不反复触发波形。
 
@@ -275,7 +268,7 @@ GATT 优先复用现有表并明确协议协商；修改特征表必须考虑 Wi
 
 **按键与在途数据。** active A/context X 的 data_seq=10 正在接收，用户切到 B/context Y。提交检查不匹配而拒绝 X 包；Bridge 得知 Y 后重建完整 B 数据。再次切 A 得 context Z，X 的包仍不能复用。没有缓存时 B 显示编译的缺失态，无 JSON 重解析。
 
-**owner 过期。** Bridge 在会合确认 owner 空闲，但不能 BLE 写数据；认证申请有限 light，HTTP token POST /claim，成功后投递已有授权的最新数据。claim 及后续数据都不增加 light 期限。若实际是另一 owner，停止写入，不自动接管。
+**owner过期。** Bridge在当前认证通道显式claim并取得成功后，才投递已授权副作用；BLE不能因数据通信隐式创建owner，显式BLE claim按上述独立安全条件执行。若存在另一有效owner，停止写入、不自动接管。claim及后续数据不增加Light期限。
 
 ## 13. 分阶段落地与验收
 
@@ -310,3 +303,7 @@ GATT 优先复用现有表并明确协议协商；修改特征表必须考虑 Wi
 - `project-workflow/power-plan-c/task-5-advert-rendezvous.md`：双策略会合候选的空口预算、Windows spike、切换恢复和故障注入细化；与本文冲突时以本文的业务、安全和电源边界为准。
 
 本文是通用平台唯一现行总设计。BLE 专项文档只提供仍适用的底层证据和实测方法，归档 v1 只保留决策历史；现状事实仍以最新交接和后续实测为准。
+
+### 2026-10-11 临时同步窗口修正（源码候选）
+
+周期全量Data不授予正式Light。BLE小快照在会合内完成，大快照用既有sync_open新增reason=data/data_seq准入临时90秒WIFI_SYNC_ONCE；该窗口与正式Light绝对截止独立，跨正式截止可继续，不续计划、不续窗口。正式/临时剩余预算取合法较晚截止后再受本轮工作预算约束；Data及冻结完整读取先于诊断complete，成功收尾或硬截止退出。报文新增sync.data_pending_seq状态；48 B头/模板格式/哈希不变。详细合同见[协议总览](bridge-device-protocol.md)，实施/测试/候选部署边界见[执行记录](../project-workflow/bridge-macos/sync-window-fix-20261011.md)；现场以PROGRESS为准。

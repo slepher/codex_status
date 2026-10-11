@@ -12,6 +12,21 @@ namespace firmware::sync {
 State state;
 RTC_DATA_ATTR Retained retained;
 
+uint64_t httpUntil(uint64_t now) {
+    return rendezvousWindowUntil(now,
+        power::state.v2Plan.lightActive(now) ? power::state.v2Plan.deadlineMs() : 0,
+        state.syncOpenThisWake ? state.syncOpenAnsweredAt + 90000 : 0);
+}
+
+void dataApplied(uint64_t seq) {
+    if (!state.syncDataPending || seq != state.syncDataSeq) return;
+    state.syncDataPending = false;
+    SyncStoreBatch pending;
+    if (state.syncOpenThisWake && !(retained.syncRtc.flags & 1) &&
+        !retained.syncRtc.reasonBits && !syncStoreActive(pending))
+        state.syncExitAtMs = millis() + 200;
+}
+
 void appendLog(const char *text, size_t count, uint8_t flags) {
     if (state.syncLogReady && syncDiagnosticText(text))
         syncAppend(retained.syncRtc, SYNC_TEXT, flags, state.syncLogWakeSeq, millis(),
@@ -182,7 +197,7 @@ static void handleSyncTransfer(const char *op) {
             (!strcmp(op, "sync_ack") && syncStoreAckedOffset() > before))
             state.syncLastProgressMs = millis();
     }
-    if (result.completed && state.syncOpenThisWake && !(retained.syncRtc.flags & 1))
+    if (result.completed && state.syncOpenThisWake && !state.syncDataPending && !(retained.syncRtc.flags & 1))
         state.syncExitAtMs = millis() + 200;
     syncReply(op, fields["result"] | "rejected",
               fields["error"] | nullptr, result.status, &fields);

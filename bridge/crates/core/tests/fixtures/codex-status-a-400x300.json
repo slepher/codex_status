@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "id": "codex-status-a",
-  "version": 4,
+  "version": 5,
   "min_fw": "0.18.75-note4",
   "render_target": "epd-ssd2683-400x300-1bpp",
   "canvas": {

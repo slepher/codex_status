@@ -982,7 +982,7 @@ fn sync_v1_s03_note4_frozen_pages_survive_light_deadline() {
             }
         }
         assert_eq!(set_time(&sim, Some(CONTROL),
-            &serde_json::json!({"op":"step","delta_ms":10000})).0, 200);
+            &serde_json::json!({"op":"step","delta_ms":if pages == 1 {61000} else {100}})).0, 200);
         let during = sim_state(&sim);
         assert_eq!(during["plan"]["accepted_at_ms"], before["plan"]["accepted_at_ms"]);
         assert_eq!(during["plan"]["granted_s"], before["plan"]["granted_s"]);
@@ -1438,8 +1438,7 @@ fn committed_frame_matches_shared_preview_bits_byte_for_byte() {
         assert_eq!(ack["result"], "applied", "{ack}");
         let (code, frame) = request(sim.address(), "GET", "/sim/frame", Some(CONTROL), b"");
         assert_eq!(code, 200);
-        let env = bridge_render::Env { channel:"PULL", battery:75, state:"WIFI ON",
-            ..bridge_render::Env::default() };
+        let env = bridge_render::Env { channel:"PULL", battery:75, ..bridge_render::Env::default() };
         let preview = bridge_render::render_bits(&bundle["templates"][0]["source"].to_string(),
             "{}", &env).unwrap();
         assert_eq!(frame.len(), ((width + 7) / 8 * height) as usize);
@@ -1538,8 +1537,7 @@ fn data_bound_frame_matches_shared_preview_after_value_change() {
         assert_eq!(ack["result"], "applied");
         let frame = request(sim.address(), "GET", "/sim/frame", Some(CONTROL), b"").1;
         let usage = serde_json::json!({"account":{"plan":plan}}).to_string();
-        let env = bridge_render::Env { channel:"PULL", battery:75, state:"WIFI ON",
-            ..bridge_render::Env::default() };
+        let env = bridge_render::Env { channel:"PULL", battery:75, ..bridge_render::Env::default() };
         let expected = bridge_render::render_bits(&bundle["templates"][0]["source"].to_string(),
             &usage, &env).unwrap();
         assert_eq!(frame, expected, "dynamic frame for {plan}");
@@ -3575,13 +3573,13 @@ fn note4_data_light_survives_short_read_and_idle_then_draws_sleep_without_false_
     assert_eq!(json_body(&request(sim.address(),"POST","/sim/ble/command",Some(ENDPOINT),data.to_string().as_bytes()).1)["result"],"applied");
     assert_eq!(sim_state(&sim)["bundle"]["applied_seq"],1);
     let source=include_str!("../../core/tests/fixtures/codex-status-a-400x300.json");
-    let check_glyphs=|state:&str,mode:&str,offline_mins:i32| {
+    let check_glyphs=|mode:&str,offline_mins:i32| {
         let actual=request(sim.address(),"GET","/sim/frame",Some(CONTROL),b"").1;
-        let expected=bridge_render::render_bits(source,"{}",&bridge_render::Env {channel:"PULL",battery:75,state,mode,offline_mins,
-            wifi_state:if mode=="deep" {"off"} else {"idle"},..Default::default()}).unwrap();
+        let expected=bridge_render::render_bits(source,"{}",&bridge_render::Env {channel:"PULL",battery:75,mode,offline_mins,
+            wifi_state:"idle",..Default::default()}).unwrap();
         for row in 8..28 { assert_eq!(&actual[row*50+31..row*50+40],&expected[row*50+31..row*50+40],"status glyph row {row}"); }
     };
-    check_glyphs("WIFI OFF","light",-1);
+    check_glyphs("light",-1);
     for (elapsed,want,duration) in [(100,true,120),(300,false,0),(599,false,0)] {
         let previous=if elapsed==100 {0}else if elapsed==300 {100}else{300};
         assert_eq!(set_time(&sim,Some(CONTROL),&serde_json::json!({"op":"step","delta_ms":(elapsed-previous)*1000})).0,200);
@@ -3590,12 +3588,12 @@ fn note4_data_light_survives_short_read_and_idle_then_draws_sleep_without_false_
         let ack=send(&plan);assert_eq!(ack["accepted_remaining_s"],600-elapsed);
         coordinator.note_plan_ack(plan.plan_id,(600-elapsed) as u32,false,1000+elapsed);
         assert_eq!(sim_state(&sim)["power"]["mode"],"light");
-        check_glyphs("WIFI OFF","light",-1);
+        check_glyphs("light",-1);
     }
     assert_eq!(set_time(&sim,Some(CONTROL),&serde_json::json!({"op":"step","delta_ms":1000})).0,200);
     assert_eq!(coordinator.plan_for(1600,false,0,"rendezvous").mode,bridge_core::platform::model::PlanMode::Sleep);
     assert_eq!(sim_state(&sim)["power"]["mode"],"deep");
-    check_glyphs("DEEP","deep",-1);
+    check_glyphs("deep",-1);
 }
 
 #[test]
@@ -3664,7 +3662,7 @@ fn note4_ble_contact_expiry_and_recovery_redraw_bridge_without_turning_wifi_on()
     let check=|offline:i32| {
         let actual=request(sim.address(),"GET","/sim/frame",Some(CONTROL),b"").1;
         let source=include_str!("../../core/tests/fixtures/codex-status-a-400x300.json");
-        let expected=bridge_render::render_bits(source,"{}",&bridge_render::Env {channel:"PULL",battery:75,state:"WIFI OFF",mode:"light",offline_mins:offline,..Default::default()}).unwrap();
+        let expected=bridge_render::render_bits(source,"{}",&bridge_render::Env {channel:"PULL",battery:75,mode:"light",offline_mins:offline,..Default::default()}).unwrap();
         for row in 8..28 {assert_eq!(&actual[row*50+34..row*50+40],&expected[row*50+34..row*50+40],"offline={offline} row={row} bundle={}",sim_state(&sim)["bundle"]);}
     };
     send(1);check(-1);
@@ -3699,7 +3697,7 @@ fn note4_sleep_contact_without_data_clears_bridge_glyph() {
     let check=|offline:i32| {
         let actual=request(sim.address(),"GET","/sim/frame",Some(CONTROL),b"").1;
         let source=include_str!("../../core/tests/fixtures/codex-status-a-400x300.json");
-        let expected=bridge_render::render_bits(source,"{}",&bridge_render::Env {channel:"PULL",battery:75,state:"DEEP",mode:"deep",offline_mins:offline,wifi_state:"off",..Default::default()}).unwrap();
+        let expected=bridge_render::render_bits(source,"{}",&bridge_render::Env {channel:"PULL",battery:75,mode:"deep",offline_mins:offline,wifi_state:"idle",..Default::default()}).unwrap();
         for row in 8..28 {assert_eq!(&actual[row*50+34..row*50+40],&expected[row*50+34..row*50+40],"offline={offline} row={row} state={}",sim_state(&sim));}
     };
     check(7);
@@ -3715,4 +3713,62 @@ fn note4_sleep_contact_without_data_clears_bridge_glyph() {
     check(-1);
     assert_eq!(sim_state(&sim)["bundle"]["applied_seq"],seq,"a Sleep plan alone clears the stale glyph");
     assert_eq!(sim_state(&sim)["power"]["mode"],"deep");
+}
+
+#[test]
+fn periodic_data_window_does_not_grant_formal_light_and_replay_cannot_extend_it() {
+    let mac="02:00:00:00:00:CE";
+    let sim=configured_note4_sync_sim(mac);
+    let status=json_body(&request(sim.address(),"GET","/api/status",Some(ENDPOINT),b"").1);
+    let short=plan_message(&status,"bridge-test","short-formal",55,"light",Some(30));
+    assert_eq!(post_plan(&sim,Some(ENDPOINT),&short).1["result"],"applied");
+    let command=serde_json::json!({"op":"status","request_id":"temp-status","token":ENDPOINT});
+    let current=json_body(&request(sim.address(),"POST","/sim/ble/command",Some(ENDPOINT),command.to_string().as_bytes()).1);
+    let open=serde_json::json!({"op":"sync_open","request_id":"temp-open","token":ENDPOINT,
+        "device_mac":mac,"session_nonce":current["session_nonce"],"bridge_id":"bridge-test",
+        "reason":"data","data_seq":999,"open_id":"0123456789abcdef0123456789abcdef",
+        "wake_generation":current["wake_generation"],"wake_seq":current["wake_seq"]});
+    assert_eq!(json_body(&request(sim.address(),"POST","/sim/ble/command",Some(ENDPOINT),open.to_string().as_bytes()).1)["result"],"applied");
+    let before=sim_state(&sim);
+    assert_eq!(set_time(&sim,Some(CONTROL),&serde_json::json!({"op":"step","delta_ms":1000})).0,200);
+    assert_eq!(json_body(&request(sim.address(),"POST","/sim/ble/command",Some(ENDPOINT),open.to_string().as_bytes()).1)["result"],"applied");
+    assert_eq!(set_time(&sim,Some(CONTROL),&serde_json::json!({"op":"step","delta_ms":30000})).0,200);
+    let during=sim_state(&sim);
+    assert_eq!(during["plan"]["accepted_at_ms"],before["plan"]["accepted_at_ms"]);
+    assert_eq!(during["power"]["sync_opened_at_ms"],before["power"]["sync_opened_at_ms"]);
+    assert_eq!(during["power"]["sync_open"],true);
+    let still=json_body(&request(sim.address(),"GET","/api/status",Some(ENDPOINT),b"").1);
+    assert_eq!(still["sync"]["phase"],"WIFI_SYNC_ONCE");
+    assert!(still["sync"]["remaining_ms"].as_u64().unwrap()>58000);
+    assert_eq!(set_time(&sim,Some(CONTROL),&serde_json::json!({"op":"step","delta_ms":59000})).0,200);
+    assert_eq!(sim_state(&sim)["power"]["sync_open"],false);
+}
+
+#[test]
+fn periodic_data_completes_over_http_with_a_sleep_plan_and_releases_the_window() {
+    let mac="02:00:00:00:00:CF";
+    let sim=configured_note4_sync_sim(mac);
+    let status=json_body(&request(sim.address(),"GET","/api/status",Some(ENDPOINT),b"").1);
+    let current=json_body(&request(sim.address(),"POST","/sim/ble/command",Some(ENDPOINT),
+        br#"{"op":"status","request_id":"temp-status","token":"endpoint-test-secret"}"#).1);
+    let open=serde_json::json!({"op":"sync_open","request_id":"temp-open","token":ENDPOINT,
+        "device_mac":mac,"session_nonce":current["session_nonce"],"bridge_id":"bridge-test",
+        "reason":"data","data_seq":1,"open_id":"1123456789abcdef0123456789abcdef",
+        "wake_generation":current["wake_generation"],"wake_seq":current["wake_seq"]});
+    assert_eq!(json_body(&request(sim.address(),"POST","/sim/ble/command",Some(ENDPOINT),open.to_string().as_bytes()).1)["result"],"applied");
+    let sleep=plan_message(&status,"bridge-test","periodic-sleep",55,"sleep",Some(0));
+    assert_eq!(post_plan(&sim,Some(ENDPOINT),&sleep).1["result"],"applied");
+    assert_eq!(sim_state(&sim)["power"]["sync_open"],true);
+    let fields:Vec<Value>=status["data_contract"]["requirements"].as_array().unwrap().iter()
+        .filter(|r|r["local"]!=true).map(|r|serde_json::json!({"i":r["index"],"k":r["field"],"v":null,"q":"missing"})).collect();
+    let data=serde_json::json!({"op":"data","device_mac":mac,"session_nonce":status["session_nonce"],
+        "bridge_id":"bridge-test","active_context_id":status["active_context_id"],"seq":1,
+        "crc":format!("{:08x}",bridge_core::coordinator::data_fields_crc(&fields)),"fields":fields});
+    let ack=bridge_core::device_client::data(&sim.address().to_string(),ENDPOINT,mac,&data,Duration::from_secs(3)).unwrap();
+    assert_eq!(ack["result"],"applied");
+    let after=sim_state(&sim);
+    assert_eq!(after["bundle"]["applied_seq"],1);
+    assert_eq!(after["plan"]["plan_id"],55);
+    assert_eq!(after["power"]["sync_open"],false);
+    assert_eq!(after["power"]["mode"],"deep");
 }

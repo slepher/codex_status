@@ -106,13 +106,13 @@ HTTP就绪、PowerPlan接受与CPU light-sleep分别记账。HTTP交接阶段20s
 
 ## 7. 屏幕状态字与模板协议
 
-- **2026-10-11 模板 Wi-Fi 元数据（.75源码候选，未部署）**：`device.wifi_state` 为 `idle`（尚未联网/等待开网）、`connecting`（实际关联或等待IP）、`connected`（已取得IP）、`off`（已结束失败/丢失处理/已决定深睡关网）。等待BLE不是关联，数据ACK不改变Wi-Fi事实。`device.wifi_blink`仅在connecting存在，值0/1，以配置间隔交替；其他阶段不存在。固件只提供状态/相位和触发重绘，不选图标。当前quad v13与Note4 codex-status-a v3按when隐藏idle/暗相位、显示亮相位/connected、独立OFF；Bridge图标只依据联系新鲜度。旧`device.state`保留兼容，等待返回WIFI WAIT、连接暗相位返回WIFI BLINK OFF，不再借WIFI OFF表示中间态。以此修订替代下方历史图标描述；模板保存不自动发布。
+2026-10-11修正候选（未部署，覆盖下方历史描述）：Bridge不可达只改变Bridge错误/可达状态，不主动断开已有IP的Wi-Fi；BOOT保持、正式Light、临时同步的截止时间均不因此修改，最后由电源策略正常关网入睡。Wi-Fi图标只绑定device.wifi_state/device.wifi_blink，不能绑定BLE手动状态或旧device.state。主动深睡关网为idle，只有实际失败/丢失处理才为off；明确Bridge错误立即显示Bridge OFF，不等待新鲜度阈值。实际codex-status-a v4需显式发布保留布局的v5候选后才获得修正，保存/编译不自动发布。
 
-- `device.state` 绑定值 = `BLE ON` / `BLE OFF` / `WIFI OFF` / `AP`
-  （WIFI OFF 优先于 BLE ON；正常 IDLE 显示 `BLE OFF`）。
+- 当前设备字段：`device.wifi_state=idle/connecting/connected/off`；主动关网/等待为idle，真实失败为off。`device.wifi_blink=0/1`仅connecting存在。`device.ble_manual_active=0/1`只表示实体BOOT开启的手动窗口；`device.mode=light/deep`表示电源模式。
+- **不兼容退役字段**：`device.state`不再接受，不提供旧状态字/自动转换。JSON编译及已存储CT加载均校验字段；旧字段/未知字段整份拒绝。已安装模板不支持时保留文件、进入内置恢复界面，认证status给出content_error，等待显式发布有效Bundle。有效字段但当前没有数据由when处理，不算未知字段。
 - **`when` 条件（0.13.5+）**：`{"bind":…,"exists":bool}`（值是否存在）或
   `{"bind":…,"equals":…}`（与绑定的渲染文本比较，支持字符串与整数，如
-  `device.state` equals `"WIFI OFF"`）；两种键互斥且只允许 `bind` + 其一，
+  `device.wifi_state` equals `"off"`）；两种键互斥且只允许 `bind` + 其一，
   未知键/类型整份拒绝。`equals` 模板需 `min_fw=0.13.5`。
 - **`device.now`（0.13.6+）**：设备本地时钟 `HH:MM`（由 `server_time` 同步、
   RTC走时；Note4现部署0.18.59优先板载独立RTC，1.54旧部署仍内部RTC；时间未知时不存在）。模板引用该绑定时设备每分钟局部重绘一次
@@ -121,10 +121,7 @@ HTTP就绪、PowerPlan接受与CPU light-sleep分别记账。HTTP交接阶段20s
   ~8KB 模板——会冲掉唤醒路径缓存、light sleep 碎片化）、分钟检查用
   `millis()` 门控 1Hz（勿每轮 `timeKnown()/time()`）；改回原写法实测
   SLEEP 26%/CPU_MAX 62%（正常 ~92%/7%）。
-- **默认 quad（v9）状态图标**：右上第一行 `[BT][WiFi][Bridge][时间]`——
-  时间为 `device.now`（每分钟走）；BT 仅 `device.state=BLE ON` 显示；WiFi 在
-  `WIFI OFF` 显示断弧+`!`；Bridge 在 `device.offline_mins` 存在或 `WIFI OFF`
-  时显示斜杠；原 `device.state` 文本行已移除，状态由图标表达。
+- 当前quad v14及Note4 codex-status-a v5只使用独立字段：BT看ble_manual_active，Wi-Fi看wifi_state/wifi_blink，Bridge看offline_mins，睡眠看mode。候选保存不自动发布；部署以PROGRESS为准。
 - **移除待机模板功能**：删除 `mode: idle/live` 元素语义（模板引擎/Rust
   canonical/Python 测试桥三端同步），模板改为单布局；`device.idle_reason`
   绑定删除；`device.offline_mins` = 联系不上 bridge 的分钟数：桥有 5min
@@ -409,3 +406,17 @@ DevLog/`/log`），用于证明 light sleep 生效。0.13.0 起同一文本也�
 Ownership expires on a checked RTC deadline, including time spent asleep. A 24-byte retained checkpoint contains renewal RTC microseconds, expiry RTC microseconds, the owner identity tag and OWL1 checksum over explicit fields. Deep sleep may restore the original deadline only after identity, checksum, lease length and clock continuity checks. A cold/software/USB reset without this proof clears occupancy; startup is never a renewal. Legacy uptime-only records cannot justify a new five-minute lease. Wall-clock synchronization does not change this deadline. `expires_in_s` uses the same RTC clock as permission decisions.
 
 Explicit HTTP `POST /claim` and capability `ble_claim=1`'s BLE `claim` share `ownerApplyClaim` and the existing decision contract. BLE additionally requires bonded encryption, current endpoint principal/token, command MAC/nonce validation and the device operation token; its new ordinary bootstrap request never accepts force/release. Bridge checks the authoritative owner and local yielded state first, sends claim once before Plan/provisioning, confirms the matching owner ACK, and returns unknown on missing ACK without resubmitting. Storage failure/readback mismatch is an explicit error. Valid foreign owners remain untouched. Existing HTTP force/release requires its existing explicit user action and device token. GATT characteristic layout is unchanged.
+
+## 2026-10-11 临时 Light 同步窗口合同（.83源码候选）
+
+自动全量Data同步允许在自然联系机会唤醒并进入**临时 Light 传输状态**，不创建、不续期600秒正式Light PowerPlan。真实push可见变化与用户显式Light仍按正式计划执行。full_sync_deadline、数据投递许可及设备认证合同不变；只有成功Data ACK推进确认指纹/全量同步期限。小Data在原BLE会合中完成并收尾，大Data通过既有sync_open开临时HTTP窗口；不能为周期快照、其in_flight或重试冒充真实push。
+
+临时窗口复用WIFI_SYNC_ONCE，从设备首次接受sync_open起最多90秒，保持单独的绝对截止。正式Light remaining归零不撤销该临时传输授权，也不允许无限延期：网络关联/ready报告、Bridge身份核对和分页工作受各自有限预算及临时总截止约束。两端采用有效正式Light截止与有效临时截止的较晚者，再受原交换/本轮工作预算限制；Bridge以认证采样时刻锚定并扣除1秒余量，不能重新授予或在每页重计90秒。USB/manual窗口与owner/低电规则仍独立。
+
+BLE sync_open支持reason=data和正整数data_seq，绑定当前MAC/principal/session/wake、原open_id与待投递Data seq。此准入不修改正式计划ID、期限或持久Light记录。相同open_id/原因/seq重放不重启计时，不同内容明确batch_conflict，已关闭原窗口重放明确window_closed；重启或后续自然联系仍须重新认证并在有界合法机会查询/继续原Data事务，不冒充ACK或换Data seq。
+
+窗口内先完成已冻结完整读取，再完成已准入Data，最后诊断complete；诊断完成不能抢先关掉尚未完成的Data/读取。绑定Data成功（含已应用同seq的确认）且无其他诊断义务时200ms收尾；诊断已完成且Data未完成则保留原临时窗口至完成/硬截止。没有正式Light/物理/USB下界时收尾进入Sleep；仍有正式Light时只结束临时窗口，保留原正式剩余量。失败/丢ACK保留原seq/批次及unknown查询，不隐式续期。恢复/认证/传输错误、权限撤销与低电仍可终止。
+
+状态报告以power.plan_id/remaining_s说明正式计划，以sync.phase=WIFI_SYNC_ONCE、sync.remaining_ms及sync.data_pending_seq说明临时传输。设备临时运行mode可为light且正式remaining_s=0；不得据mode推断存在正式Light授权。协议载体仍为48 B frame和现有同步路由；模板canonical哈希、CompiledTemplate格式及字段绑定未改变。
+
+实施、测试和资源边界见[执行记录](../project-workflow/bridge-macos/sync-window-fix-20261011.md)。当前部署以PROGRESS为准，不能将.83候选写成已部署。

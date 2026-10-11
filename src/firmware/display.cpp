@@ -144,7 +144,7 @@ static WinInfo findWindow(JsonDocument &doc, bool fiveHour) {
 static void screenStatus() {
     std::vector<String> lines;
     lines.push_back("CODEX STATUS");
-    lines.push_back(radio::deviceStateText());
+    lines.push_back(String("WIFI ") + wifiPhaseText(radio::wifiPhase()));
     lines.push_back(String("BATT ") + power::displayBatteryPercent() + "%");
     lines.push_back(String("IP ") + radio::ipText());
     lines.push_back(String("SYNC ") + clock::fmtEpoch((long long)radio::retained.rtcLastSyncEpoch, "%H:%M"));
@@ -857,9 +857,12 @@ static void renderUsage(const String &json, const char *channel) {
 }
 
 static int currentBridgeOfflineMinutes() {
+    // Explicit Bridge failure overrides recent Data freshness, without changing
+    // the Wi-Fi phase. Zero means known offline with no elapsed minute yet.
     return bridgeOfflineMinutes((uint32_t)time(nullptr), radio::retained.rtcLastSyncEpoch,
                                 clock::timeKnown(), BRIDGE_LOST_MIN,
-                                (diagnostics::retained.rtcDeepGlyph & 8) ? 0 : -1);
+                                (diagnostics::retained.rtcDeepGlyph & 8) ? 0 : -1,
+                                !radio::state.bridgeReachable && radio::state.networkError);
 }
 
 void renderActiveUsage(const String &json, const char *channel) {
@@ -870,13 +873,17 @@ void renderActiveUsage(const String &json, const char *channel) {
     }
     if (!state.frame) return;
     bool ready = platform::state.v2BundleReady ? platform::v2ActiveLoad() : platform::tplCacheLoad();
-    if (!ready) { screenStatus(); return; }
+    if (!ready) {
+        if (platform::state.bundleMaintenance)
+            screen({"CONTENT REQUIRED", platform::state.bundleError, "Publish from Bridge"});
+        else screenStatus();
+        return;
+    }
     TplEnv env;
     env.channel  = channel ? channel : "";
     env.ip       = radio::ipText();
     env.syncHHMM = clock::nowHHMM();
     env.battery  = power::displayBatteryPercent();
-    env.state    = (power::retained.rtcMode == MODE_DEEP) ? "DEEP" : radio::templateStateText();
     env.wifiState = wifiPhaseText(radio::wifiPhase());
     env.bleManualActive = power::state.bleRecovery.active(clock::v2NowMs()) ? 1 : 0;
     env.wifiBlink = radio::state.wifiConnActive ? (radio::state.wifiBlinkOn ? 1 : 0) : -1;
@@ -930,8 +937,9 @@ void serviceNetworkGlyph() {
     state.rfnBlink = blinkOnly;
     if (state.networkGlyph.attempts) state.forceCleanRefresh = true;
     renderCurrent();
-    DevLog.printf("[ui] network glyph connected=%d confirmed=%d attempts=%u\n",
-                  radio::state.wifiUp, !state.networkGlyph.pending, state.networkGlyph.attempts);
+    if (!blinkOnly) DevLog.printf("[ui] network glyph phase=%s manual=%d bridge_off=%d confirmed=%d tries=%u\n",
+                  wifiPhaseText(phase), manual, currentBridgeOfflineMinutes() >= 0,
+                  !state.networkGlyph.pending, state.networkGlyph.attempts);
 }
 
 // Put the sleep frame back without entering deep: used when a wake render

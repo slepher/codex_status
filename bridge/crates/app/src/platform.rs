@@ -3680,7 +3680,7 @@ mod ble_close_lock_tests {
             "wifi_management":2,"rendezvous":{"v":1,"id":"this-wake","challenge":"http-proof",
             // A ready-report ACK can finish rendezvous before this HTTP read.
             "ready":false,"remaining_ms":0},"transports":{"http":{"ready":true}},
-            "sync_v1":1,"sync":{"enabled":true,"phase":if f.ble.sync_opened.load(Ordering::SeqCst) {"WIFI_SYNC_ONCE"} else {"WIFI_LIGHT"},"due":!f.complete.load(Ordering::SeqCst),"reasons":[]}})).into_response()
+            "sync_v1":1,"sync":{"enabled":true,"phase":if f.ble.sync_opened.load(Ordering::SeqCst) {"WIFI_SYNC_ONCE"} else {"WIFI_LIGHT"},"remaining_ms":80000,"due":!f.complete.load(Ordering::SeqCst),"reasons":[]}})).into_response()
     }
     async fn full_claim(State(f): State<Arc<FullHttp>>, headers: axum::http::HeaderMap) -> Response {
         assert_eq!(headers.get("x-device-token").unwrap(), "a".repeat(32).as_str());

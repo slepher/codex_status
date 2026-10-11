@@ -33,7 +33,8 @@ enum BindKind {
     B_RESET_COUNT, B_RESET_EXPIRES,
     B_BUCKET_USED, B_BUCKET_REMAIN, B_BUCKET_RESET, B_BUCKET_WINMINS,
     B_DEV_CHANNEL, B_DEV_IP, B_DEV_SYNC, B_DEV_BATTERY,
-    B_DEV_STATE, B_DEV_OFFLINE, B_DEV_NOW, B_DEV_MODE, B_DEV_DATE,
+    // Serialized tag 14 is retired; never reuse it for another field.
+    B_DEV_OFFLINE = 15, B_DEV_NOW, B_DEV_MODE, B_DEV_DATE,
     B_DEV_WIFI_STATE, B_DEV_WIFI_BLINK, B_DEV_BLE_MANUAL
 };
 
@@ -102,7 +103,6 @@ static bool parseBind(const String &path, BindSpec &s) {
     if (path == "device.ip")                  { s.kind = B_DEV_IP; return true; }
     if (path == "device.sync_hhmm")           { s.kind = B_DEV_SYNC; return true; }
     if (path == "device.battery")              { s.kind = B_DEV_BATTERY; return true; }
-    if (path == "device.state")                { s.kind = B_DEV_STATE; return true; }
     if (path == "device.wifi_state")           { s.kind = B_DEV_WIFI_STATE; return true; }
     if (path == "device.ble_manual_active")    { s.kind = B_DEV_BLE_MANUAL; return true; }
     if (path == "device.wifi_blink")           { s.kind = B_DEV_WIFI_BLINK; return true; }
@@ -212,10 +212,6 @@ static bool evalBind(const BindSpec &s, TextTimeFormat format, JsonDocument &usa
     case B_DEV_IP:      out = env.ip; return true;
     case B_DEV_SYNC:    out = env.syncHHMM; return true;
     case B_DEV_BATTERY: out = env.battery >= 0 ? String(env.battery) : "--"; return true;
-    case B_DEV_STATE:
-        if (env.state.length() == 0) return false;
-        out = env.state;
-        return true;
     case B_DEV_BLE_MANUAL: out = String(env.bleManualActive); return true;
     case B_DEV_WIFI_STATE:
         if (env.wifiState.length() == 0) return false;
@@ -333,7 +329,6 @@ static bool bindExists(const BindSpec &s, JsonDocument &usage, const TplEnv &env
     case B_DEV_IP:      return env.ip.length() > 0;
     case B_DEV_SYNC:    return env.syncHHMM.length() > 0 && env.syncHHMM != "--:--";
     case B_DEV_BATTERY: return env.battery >= 0;
-    case B_DEV_STATE:   return env.state.length() > 0;
     case B_DEV_BLE_MANUAL: return true;
     case B_DEV_WIFI_STATE: return env.wifiState.length() > 0;
     case B_DEV_WIFI_BLINK: return env.wifiState == "connecting" && env.wifiBlink >= 0;
@@ -1142,9 +1137,13 @@ bool tplValidateCt(const CtTemplate &ct, String &err) {
     if (ct.abi != CT_ABI) { err = "ct_abi"; return false; }
     if (ct.opCount == 0 || ct.opCount > CT_MAX_OPS) { err = "ct_ops"; return false; }
     if (ct.reqCount > CT_MAX_REQS || ct.resCount > CT_MAX_RES) { err = "ct_bounds"; return false; }
-    if (ct.id[0] == 0) { err = "ct_id"; return false; }
+    if (ct.id[0] == 0 || !memchr(ct.id, 0, sizeof(ct.id))) { err = "ct_id"; return false; }
     for (int i = 0; i < ct.opCount; i++) {
         const CtOp &op = ct.ops[i];
+        if (!memchr(op.text, 0, sizeof(op.text)) || !memchr(op.prefix, 0, sizeof(op.prefix)) ||
+            !memchr(op.suffix, 0, sizeof(op.suffix)) || !memchr(op.whenEqStr, 0, sizeof(op.whenEqStr))) {
+            err = "ct_string"; return false;
+        }
         if (op.type > CT_ICON) { err = "ct_op_type"; return false; }
         if (op.bindIdx != CT_NONE_IDX && op.bindIdx >= ct.reqCount) { err = "ct_bind"; return false; }
         if (op.whenIdx != CT_NONE_IDX && op.whenIdx >= ct.reqCount) { err = "ct_when"; return false; }
@@ -1160,7 +1159,17 @@ bool tplValidateCt(const CtTemplate &ct, String &err) {
         }
     }
     for (int i = 0; i < ct.reqCount; i++) {
-        if (ct.reqs[i].path[0] == 0) { err = "ct_req"; return false; }
+        const CtReq &r = ct.reqs[i];
+        if (!r.path[0] || !memchr(r.path, 0, sizeof(r.path)) || !memchr(r.bucket, 0, sizeof(r.bucket))) {
+            err = "ct_req"; return false;
+        }
+        BindSpec spec;
+        if (!parseBind(r.path, spec)) { err = "ct_bind_unsupported"; return false; }
+        if (r.kind != spec.kind || r.winMode != spec.winMode || r.winIndex != spec.winIndex ||
+            strcmp(r.bucket, spec.bucket.c_str())) { err = "ct_bind_mismatch"; return false; }
+    }
+    for (int i = 0; i < ct.resCount; i++) {
+        if (!memchr(ct.res[i].bits, 0, sizeof(ct.res[i].bits))) { err = "ct_string"; return false; }
     }
     return true;
 }

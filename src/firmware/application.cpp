@@ -9,6 +9,7 @@
 #include "transport_internal.h"
 #include "application.h"
 #include "boot_capture.h"
+#include "data_activity_led.h"
 
 namespace firmware::application {
 
@@ -302,8 +303,15 @@ void initialize(const char *firmwareVersion, const char *imageIdentity) {
     WiFi.setAutoReconnect(false);
     transport::loadOrIssueAuthToken();
     // Initialize once for this wake, before BLE and button handling begin.
-    pinMode(0, INPUT_PULLUP); pinMode(18, INPUT_PULLUP); pinMode(3, OUTPUT);
-    digitalWrite(3, HIGH);
+    pinMode(0, INPUT_PULLUP); pinMode(18, INPUT_PULLUP);
+    dataLedBegin();
+    static MiddlewareFunction activityMiddleware([](WebServer &, Middleware::Callback next) {
+        dataLedActivity();
+        const bool handled = next();
+        dataLedActivity();
+        return handled;
+    });
+    transport::state.server.addMiddleware(&activityMiddleware);
     power::configurePowerManagement(); power::setupOtaPmLock();
     if (cause == ESP_SLEEP_WAKEUP_EXT1 &&
         (esp_sleep_get_ext1_wakeup_status() & (1ULL << 0))) {
@@ -391,7 +399,6 @@ void tick() {
 
     power::pollPlug();
     radio::serviceBleSession();
-    power::serviceLed();
     OwnerRec wifiOwner;
     const String selectingBridge = wifiSetupSelectingBridge();
     if(wifiSetupBusy()) {
@@ -431,7 +438,6 @@ void tick() {
         radio::v2RendezvousTick();
         if (radio::state.v2InRendezvous && power::retained.rtcMode != MODE_DEEP)
             display::serviceNetworkGlyph();
-        power::serviceLed();
         delay(5);
         return;
     }
@@ -456,6 +462,8 @@ void tick() {
     if (sync::state.syncOpenThisWake) {
         if (sync::state.syncExitAtMs && (int32_t)(millis() - sync::state.syncExitAtMs) >= 0) {
             sync::state.syncOpenThisWake = false;
+            sync::state.syncDataSeq = 0;
+            sync::state.syncDataPending = false;
             sync::state.syncExitAtMs = 0;
             if (!power::state.v2Plan.lightActive(clock::v2NowMs())) power::enterDeep("sync complete");
         } else if (clock::v2NowMs() >= sync::state.syncOpenAnsweredAt + 90000 ||
@@ -463,12 +471,13 @@ void tick() {
             sync::syncRecordOutcome(1, 3);
             syncFail(sync::retained.syncRtc);
             sync::state.syncOpenThisWake = false;
+            sync::state.syncDataSeq = 0;
+            sync::state.syncDataPending = false;
             DevLog.println("[sync] 90s window exhausted");
             if (!power::state.v2Plan.lightActive(clock::v2NowMs())) power::enterDeep("sync incomplete");
         }
     }
     radio::serviceAnnounce();
-    power::serviceLed();
 
     // v2: only a new formal PowerPlan moves the light deadline; reads, data,
     // claims and status polls never do. The BOOT provisional 300 s closes the

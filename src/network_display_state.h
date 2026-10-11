@@ -19,7 +19,8 @@ inline const char *wifiPhaseText(WifiPhase phase) {
 
 // Contact freshness includes both BLE and HTTP; RF state is a separate fact.
 inline int bridgeOfflineMinutes(uint32_t now, uint32_t lastContact, bool timeKnown,
-                                int lostMinutes, int unknownValue) {
+                                int lostMinutes, int unknownValue, bool knownUnavailable = false) {
+    if (knownUnavailable) return 0;
     if (!timeKnown || lastContact <= 1600000000) return unknownValue;
     const uint32_t minutes = now > lastContact ? (now - lastContact) / 60 : 0;
     return minutes > (uint32_t)lostMinutes ? (int)minutes : -1;

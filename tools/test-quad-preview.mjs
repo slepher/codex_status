@@ -7,7 +7,7 @@ import {
 } from './generate-quad-preview.mjs';
 
 const template = validateTemplate(loadTemplate());
-const env = { channel: 'WIFI', ip: '192.168.1.50', sync_hhmm: '23:59', battery: 78, state: 'BLE OFF' };
+const env = { channel: 'WIFI', ip: '192.168.1.50', sync_hhmm: '23:59', battery: 78, wifi_state: 'connected', wifi_blink: -1, ble_manual_active: 0 };
 const normal = render(template, usageFixture({ fiveHourUsed: 11 }), env);
 const full = render(template, usageFixture({ weeklyUsed: 0, fiveHourUsed: 0 }), env);
 const used100 = render(template, usageFixture({ weeklyUsed: 0, fiveHourUsed: 100 }), env);
@@ -15,7 +15,7 @@ const missingFiveHour = render(template, usageFixture({ weeklyUsed: 91, fiveHour
 const monthlyUsage = usageFixture({ weeklyUsed: 12, weeklyMins: 43200, fiveHourUsed: null, plan: 'free' });
 const monthly = render(template, monthlyUsage, env);
 const longNames = render(template, usageFixture({ weeklyUsed: 2, fiveHourUsed: 11, plan: 'pro', label: 'VERY-LONG-BRIDGE-LABEL' }), env);
-const offlineEnv = { ...env, state: 'WIFI OFF', offline_mins: 138 };
+const offlineEnv = { ...env, wifi_state: 'off', offline_mins: 138 };
 const offline = render(template, usageFixture({ fiveHourUsed: 11 }), offlineEnv);
 const offlineMissing = render(template, usageFixture({ weeklyUsed: 91, fiveHourUsed: null }), offlineEnv);
 
@@ -61,7 +61,7 @@ assert.ok(countColor(used100, 4, 158, 84, 12, 0) > 0, 'present 5h window shows i
 assert.equal(countColor(missingFiveHour, 4, 158, 84, 12, 0), 0, 'missing 5h hides its reset time');
 assert.deepEqual(render(template, usageFixture({ fiveHourUsed: 11 }), env).pixels, normal.pixels, 'same fixture is deterministic');
 assert.ok(different(normal, render(template, usageFixture({ fiveHourUsed: 11 }), { ...env, battery: 77 })), 'battery change changes visible pixels');
-assert.ok(different(normal, render(template, usageFixture({ fiveHourUsed: 11 }), { ...env, state: 'BLE ON' })), 'state change changes visible pixels');
+assert.ok(different(normal, render(template, usageFixture({ fiveHourUsed: 11 }), { ...env, ble_manual_active: 1 })), 'state change changes visible pixels');
 
 const rcBind = parseBind('resetCredits.availableCount');
 assert.equal(bindResult(rcBind, usageFixture(), env).exists, false, 'missing reset credits hide the RC line');
@@ -91,18 +91,15 @@ assert.deepEqual(bindResult(fiveHourBinding, usageFixture({ fiveHourUsed: 0 }), 
 assert.equal(bindResult(fiveHourBinding, usageFixture({ fiveHourUsed: null }), env).exists, false, 'missing 5h selects static 100');
 assert.equal(template.elements.filter((element) => element.type === 'text' && element.text === '100').length, 1, 'missing 5h has static 100 hero');
 
-const stateBind = parseBind('device.state');
+assert.equal(parseBind('device.state'), null, 'retired field is rejected');
 const offlineBind = parseBind('device.offline_mins');
-assert.equal(bindResult(stateBind, usageFixture(), env).value, 'BLE OFF', 'state bind renders the wire state');
-assert.equal(bindResult(stateBind, usageFixture(), { ...env, state: '' }).exists, false, 'empty state hides');
-assert.equal(bindResult(stateBind, usageFixture(), { ...env, state: 'WIFI OFF' }).value, 'WIFI OFF', 'WIFI OFF state renders');
-assert.equal(bindResult(stateBind, usageFixture(), { ...env, state: 'WIFI CONN' }).value, 'WIFI CONN', 'WIFI CONN blink state renders');
 assert.equal(bindResult(offlineBind, usageFixture(), offlineEnv).value, 138, 'offline minutes bind renders its value');
 assert.equal(bindResult(offlineBind, usageFixture(), env).exists, false, 'unknown offline minutes hide');
 assert.equal(bindResult(offlineBind, usageFixture(), { ...offlineEnv, offline_mins: -1 }).exists, false, 'negative offline minutes hide');
 assert.equal(bindResult(offlineBind, usageFixture(), { ...offlineEnv, offline_mins: 0 }).exists, true, 'zero is a valid value (device policy gates bridge-loss display)');
-const wifiOff = render(template, usageFixture({ fiveHourUsed: 11 }), { ...env, state: 'WIFI OFF' });
-const wifiConn = render(template, usageFixture({ fiveHourUsed: 11 }), { ...env, state: 'WIFI CONN' });
+const wifiOff = render(template, usageFixture({ fiveHourUsed: 11 }), { ...env, wifi_state: 'off' });
+const wifiConn = render(template, usageFixture({ fiveHourUsed: 11 }), { ...env, wifi_state: 'connecting', wifi_blink: 1 });
+const wifiDark = render(template, usageFixture({ fiveHourUsed: 11 }), { ...env, wifi_state: 'connecting', wifi_blink: 0 });
 const cellSlice = (raster, x, y) => {
   const out = [];
   for (let row = y; row < y + 16; row += 1) {
@@ -110,16 +107,17 @@ const cellSlice = (raster, x, y) => {
   }
   return out;
 };
-assert.equal(countColor(wifiOff, 121, 6, 16, 16, 0), 0, 'blink-off phase hides the Wi-Fi icon');
+assert.equal(countColor(wifiDark, 121, 6, 16, 16, 0), 0, 'blink-off phase hides the Wi-Fi icon');
+assert.ok(countColor(wifiOff, 121, 6, 16, 16, 0) > 0, 'terminal failure has its own OFF icon');
 assert.ok(countColor(wifiConn, 121, 6, 16, 16, 0) > 0, 'blink-on phase draws the Wi-Fi icon');
-assert.deepEqual(cellSlice(wifiConn, 141, 6), cellSlice(wifiOff, 141, 6), 'crossed link overlay stays steady while blinking');
-assert.notDeepEqual(cellSlice(wifiConn, 121, 6), cellSlice(wifiOff, 121, 6), 'blink toggles only the Wi-Fi icon cell');
-assert.deepEqual(cellSlice(wifiConn, 4, 4), cellSlice(wifiOff, 4, 4), 'blink leaves the usage tiles untouched');
+assert.deepEqual(cellSlice(wifiConn, 141, 6), cellSlice(wifiDark, 141, 6), 'Bridge icon stays steady while Wi-Fi blinks');
+assert.notDeepEqual(cellSlice(wifiConn, 121, 6), cellSlice(wifiDark, 121, 6), 'blink toggles only the Wi-Fi icon cell');
+assert.deepEqual(cellSlice(wifiConn, 4, 4), cellSlice(wifiDark, 4, 4), 'blink leaves the usage tiles untouched');
 const modeBind = parseBind('device.mode');
 assert.equal(modeBind?.kind, 'device.mode', 'device.mode is a known bind');
 assert.equal(bindResult(modeBind, usageFixture(), env).value, 'light', 'preview defaults to light mode');
 assert.equal(bindResult(modeBind, usageFixture(), { ...env, mode: 'deep' }).value, 'deep', 'deep mode renders its value');
-const deep = render(template, usageFixture({ fiveHourUsed: 11 }), { ...env, state: 'DEEP', mode: 'deep' });
+const deep = render(template, usageFixture({ fiveHourUsed: 11 }), { ...env, wifi_state: 'idle', mode: 'deep' });
 assert.ok(different(normal, deep), 'deep mode changes visible pixels');
 assert.ok(countColor(deep, 101, 6, 16, 16, 0) > 0, 'deep mode draws the sleep glyph in the BT cell');
 assert.equal(countColor(normal, 101, 6, 16, 16, 0), 0, 'light mode leaves the BT cell empty (BLE off)');

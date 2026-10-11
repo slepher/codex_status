@@ -1,6 +1,12 @@
 #pragma once
 #include <stdint.h>
 
+// A temporary transfer remains legal across the formal Light deadline.
+inline uint64_t rendezvousWindowUntil(uint64_t now, uint64_t lightUntil, uint64_t syncUntil) {
+    const uint64_t until = lightUntil > syncUntil ? lightUntil : syncUntil;
+    return until > now ? until : 0;
+}
+
 // Pure lifecycle. GPIO/radio/WebServer/PM operations belong to the adapter.
 constexpr uint32_t RV_NETWORK_MS = 30000;
 constexpr uint32_t RV_CONNECTED_MS = 6000;

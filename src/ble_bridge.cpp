@@ -1,5 +1,6 @@
 #include "ble_bridge.h"
 #include "dev_log.h"
+#include "data_activity_led.h"
 #include <NimBLEDevice.h>
 #include <ArduinoJson.h>
 #include "ble_wire.h"
@@ -113,6 +114,7 @@ class PeerRef {
 #endif
 
 static bool writeAllowed(PeerRef peer) {
+    dataLedActivity();
     if (peer.secure()) return true;
     DevLog.println("[ble] rejected unencrypted or unbonded write");
     return false;
@@ -235,12 +237,16 @@ static void refreshInfo() {
     writeAttribute(infoChr, bleBuildInfo(snapshot), "info");
 }
 
-class InfoCallbacks : public NimBLECharacteristicCallbacks {
+class ReadCallbacks : public NimBLECharacteristicCallbacks {
+    bool info;
+    void read() { dataLedActivity(); if (info) refreshInfo(); }
+public:
+    explicit ReadCallbacks(bool info) : info(info) {}
 #if CODEX_NIMBLE_V2
-    void onRead(NimBLECharacteristic *c, PEER_ARG) override { refreshInfo(); }
+    void onRead(NimBLECharacteristic *c, PEER_ARG) override { read(); }
 #else
-    void onRead(NimBLECharacteristic *c) override { refreshInfo(); }
-    void onRead(NimBLECharacteristic *c, PEER_ARG) override { refreshInfo(); }
+    void onRead(NimBLECharacteristic *c) override { read(); }
+    void onRead(NimBLECharacteristic *c, PEER_ARG) override { read(); }
 #endif
 };
 
@@ -379,7 +385,7 @@ void bleBegin(const String &deviceName, const String &fw) {
     NimBLEService *svc = bleServer->createService(BLE_SVC_UUID);
 
     infoChr = svc->createCharacteristic(BLE_CHR_INFO, NIMBLE_PROPERTY::READ);
-    infoChr->setCallbacks(new InfoCallbacks());
+    infoChr->setCallbacks(new ReadCallbacks(true));
     refreshInfo();
 
     NimBLECharacteristic *epChr = svc->createCharacteristic(BLE_CHR_ENDPT,
@@ -403,6 +409,7 @@ void bleBegin(const String &deviceName, const String &fw) {
     authChr->setCallbacks(new AuthCallbacks());
 
     statusChr = svc->createCharacteristic(BLE_CHR_STATUS, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+    statusChr->setCallbacks(new ReadCallbacks(false));
 
     svc->start();
 
@@ -511,8 +518,8 @@ void bleNotifyStatus(const String &json) { bleNotifyStatusQuiet(json); }
 
 void bleNotifyStatusQuiet(const String &json) {
     std::lock_guard<std::recursive_mutex> lock(infoMutex);
-    if (writeAttribute(statusChr, json, "status") && connected && peerEncrypted && peerBonded)
-        statusChr->notify();
+    if (writeAttribute(statusChr, json, "status") && connected && peerEncrypted && peerBonded &&
+        statusChr->notify()) dataLedActivity();
 }
 
 void blePoll() {

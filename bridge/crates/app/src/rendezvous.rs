@@ -126,6 +126,9 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             }
         }
         let decision = service(ctx).next_delivery(&mac, true, device_now(&mac));
+        let temporary_data_seq = (decision["decision"] == "light_data" && decision["temporary_data"] == true)
+            .then(|| decision["data_seq"].as_u64()).flatten();
+        state["_temporary_data_seq"] = json!(temporary_data_seq);
         let pending_data = (decision["decision"] == "ble_data")
             .then(|| service(ctx).data_message_body(&mac)).flatten();
         let remaining = state["power"]["provisional_remaining_s"]
@@ -265,11 +268,13 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             "device PowerPlan acknowledgement"
         );
         let mut sync_opened = false;
-        let should_open = !failure_report && sync_enabled
+        let should_open = !failure_report && (temporary_data_seq.is_some() || (sync_enabled
             && state["sync"]["retry_skip"] == 0
-            && (state["sync"]["due"] == true || state["sync"]["pending"] == true);
+            && (state["sync"]["due"] == true || state["sync"]["pending"] == true)));
         if should_open && !ack_unknown {
-            let reason = if state["sync"]["rounds"] == 15 && state["sync"]["pending"] != true {
+            let reason = if temporary_data_seq.is_some() {
+                "data"
+            } else if state["sync"]["rounds"] == 15 && state["sync"]["pending"] != true {
                 "periodic"
             } else {
                 "retry"
@@ -282,7 +287,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
                 .command(
                     "sync_open",
                     json!({
-                        "reason":reason, "open_id":open_id,
+                        "reason":reason, "open_id":open_id, "data_seq":temporary_data_seq,
                         "wake_generation":state["wake_generation"],
                         "wake_seq":state["wake_seq"],
                     }),
@@ -394,14 +399,9 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
                 } else {
                     wifi_repair_error=Some("plan_unconfirmed".into());
                 }
-            } else {
-                http_budget = http_window.capped(Duration::from_secs(
-                    state["_sent_plan"]["light_duration_s"]
-                        .as_u64()
-                        .unwrap_or(90)
-                        .max(1),
-                ));
             }
+            // Authenticated HTTP status below supplies the remaining formal
+            // and temporary windows; a Sleep plan's zero duration is no cap.
         }
     }
     if let Some(error) = wifi_repair_error { normal_result = Err(error); }
@@ -460,17 +460,37 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             state["_need_http"] == true && (*opened || (*enabled && *light)));
     let may_continue = normal_result.as_ref().is_ok_and(|(state, _, _, light)|
         *light && state["_need_http"] == true);
+    let temporary_data = normal_result.as_ref().is_ok_and(|(state, _, _, _)|
+        state["_temporary_data_seq"].as_u64().is_some());
     let result = normal_result.map(|_| ());
+    if sync_opened || (may_continue && !admitted_wifi.is_empty()) {
+        let lock = delivery_lock(ctx, &mac);
+        let _device_delivery = lock.lock().await;
+        // Reads must finish before a Data-only completion releases the window.
+        for job_id in &admitted_wifi {
+            crate::wifi::opportunity_admitted(ctx, &mac, job_id, http_budget).await;
+        }
+    }
+    if temporary_data && sync_opened {
+        if service(ctx).wifi_state(&mac).jobs.iter()
+            .any(|j| admitted_wifi.contains(&j.job_id) && !j.terminal()) {
+            return Ok(BleOpportunity::Connected { mac, result: Err("temporary_read_incomplete".into()) });
+        }
+        // Complete admitted Data before diagnostic complete can close the window.
+        // deliver serializes itself; do not hold the per-device lock here.
+        let delivered = tokio::time::timeout(http_budget.remaining(), deliver(ctx, &mac)).await;
+        match delivered {
+            Ok(reply) if reply["ack"]["result"] == "applied" => {},
+            Ok(reply) if reply["ack"]["result"] == "rejected" =>
+                return Ok(BleOpportunity::Connected { mac, result: Err("temporary_data_rejected".into()) }),
+            _ => return Ok(BleOpportunity::Connected { mac, result: Err("temporary_data_unknown".into()) }),
+        }
+    }
     if sync_opened || (may_continue && !admitted_wifi.is_empty()) {
         // `sync_http_inner` does not take the lock itself; re-acquire only the
         // per-MAC lock to keep admitted HTTP work serialized.
         let lock = delivery_lock(ctx, &mac);
         let _device_delivery = lock.lock().await;
-        // Finish frozen reads before diagnostic complete may release a
-        // temporary sync window. New jobs wait for the next admission.
-        for job_id in &admitted_wifi {
-            crate::wifi::opportunity_admitted(ctx, &mac, job_id, http_budget).await;
-        }
         let reads_done = service(ctx)
             .wifi_state(&mac)
             .jobs
@@ -557,6 +577,15 @@ fn matching_http(
     Ok(())
 }
 
+fn http_transfer_budget(status: &Value, sampled_at: std::time::Instant, work_budget: Budget) -> Budget {
+    let light = Duration::from_secs(status["power"]["remaining_s"].as_u64().unwrap_or(0));
+    let sync = if status["sync"]["phase"] == "WIFI_SYNC_ONCE" {
+        Duration::from_millis(status["sync"]["remaining_ms"].as_u64().unwrap_or(0))
+    } else { Duration::ZERO };
+    Budget::at(sampled_at, light.max(sync).saturating_sub(Duration::from_secs(1)))
+        .capped(work_budget.remaining())
+}
+
 async fn wait_for_device_http(
     ctx: &AppCtx,
     mac: &str,
@@ -589,21 +618,7 @@ async fn wait_for_device_http(
         if let Ok(status) = observed {
             match matching_http(&status, mac, ble, plan_id, explicit) {
                 Ok(()) => {
-                    let remaining = status["power"]["remaining_s"].as_u64().unwrap_or(0);
-                    let observed_budget = if remaining > 0 {
-                        Budget::at(
-                            sample_start,
-                            Duration::from_secs(remaining.saturating_sub(1)),
-                        )
-                        .capped(work_budget.remaining())
-                    } else {
-                        let limit = status["sync"]["remaining_ms"]
-                            .as_u64()
-                            .map(Duration::from_millis)
-                            .unwrap_or(Duration::from_secs(90));
-                        Budget::at(sample_start, limit.saturating_sub(Duration::from_secs(1)))
-                            .capped(work_budget.remaining())
-                    };
+                    let observed_budget = http_transfer_budget(&status, sample_start, work_budget);
                     if status["owner_id"] != ctx.bridge_id {
                         // Occupancy is renewed only by an explicit claim after
                         // the authenticated device response.
@@ -646,6 +661,23 @@ async fn wait_for_device_http(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn temporary_sync_budget_survives_formal_light_expiry() {
+        let start = std::time::Instant::now();
+        for remaining in [2, 1, 0] {
+            let status = json!({"power":{"remaining_s":remaining},
+                "sync":{"phase":"WIFI_SYNC_ONCE","remaining_ms":80000}});
+            let budget = http_transfer_budget(&status, start, Budget::new(Duration::from_secs(90)));
+            assert!(budget.remaining() > Duration::from_secs(78));
+        }
+        let status = json!({"power":{"remaining_s":2},
+            "sync":{"phase":"DEEP","remaining_ms":80000}});
+        assert!(http_transfer_budget(&status, start, Budget::new(Duration::from_secs(90))).remaining() <= Duration::from_secs(1));
+        let active = json!({"power":{"remaining_s":0},"sync":{"phase":"WIFI_SYNC_ONCE","remaining_ms":80000}});
+        assert!(http_transfer_budget(&active, start, Budget::new(Duration::from_secs(3))).remaining() <= Duration::from_secs(3));
+        assert!(http_transfer_budget(&active, start - Duration::from_secs(80), Budget::new(Duration::from_secs(90))).remaining().is_zero());
+    }
+
     #[test]
     fn protocol_http_remains_usable_after_ready_report_ack() {
         let ble=json!({"session_nonce":"boot","wake_generation":2,"wake_seq":9,

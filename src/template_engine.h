@@ -6,7 +6,6 @@ struct TplEnv {
     String ip;
     String syncHHMM;  // "--:--" when unknown
     int battery = -1; // percentage, or -1 when the device value is unknown
-    String state;                // AP / BLE ON / BLE OFF / WIFI OFF
     String wifiState;            // idle / connecting / connected / off; template owns presentation
     int bleManualActive = 0;     // 0/1: physical GATT window, independent of RF
     int wifiBlink = -1;          // connecting phase: 0/1; absent otherwise

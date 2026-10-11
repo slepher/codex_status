@@ -111,6 +111,12 @@
 
 ### A9. PowerPlan 与 Data 同轮联合下发（2026-10-05）
 
+- **2026-10-11 当前设备字段收敛（候选未部署）**：删除模板 `device.state` 兼容，使用独立 Wi-Fi/BLE/mode 字段；已持久化 CT 在加载时校验未知绑定、编号一致性和字符串边界，失效进入内置恢复界面，保留文件直到显式发布替换。[实施与回归](../../project-workflow/bridge-macos/device-fields-only-20261011.md)。实际 v4 模板升级前须配套准备有效 v5 Bundle，不以宿主测试代替实机验收。
+
+- **2026-10-11 BOOT网络/图标修正候选（未部署，关联B6/C8）**：Bridge失败不拆除已有Wi-Fi关联，BOOT/正式/临时期限不变；presence反向验证待定不冒充不可达；Bridge明确错误立即OFF；真实布局v5模板使Wi-Fi与BLE独立；boot_id与会话nonce分离，补正常事件诊断。[实现、Luna回归与主agent审查](../../project-workflow/bridge-macos/boot-network-fix-20261011.md)。未刷机/未发布模板，实体RF/EPD/重连矩阵仍待验，不结项。当前实际部署为.83+配套Bridge，以PROGRESS为准，下方“未部署/.82”仅为当时记录。
+
+- **2026-10-11 周期Data临时Light缺口修正（未部署）**：周期全量及其in_flight/重试不再形成正式Light意图；大Data以reason=data/data_seq准入独立90s临时HTTP窗口，正式Light到期不截断、同ID不续期，读取/Data/诊断完成后收尾。协议及权威电源文档已补充；[实施与候选证据](../../project-workflow/bridge-macos/sync-window-fix-20261011.md)。现场仍.82/原Bridge，实际无USB自然睡醒、超时/丢ACK/RF/功耗矩阵待验，关联B6/C8不结项。
+
 - **2026-10-11 行为缺口候选实现（关联 B6/C8）**：最终用户合同为 BOOT 开/关/再开窗口、健康 HTTP 禁自动 BLE、断网/Bridge HTTP 失败有界 BLE 汇报再回普通周期。[实施与验收](../../project-workflow/bridge-macos/boot-network-20261011.md)记录 .77 候选、311 测试通过/3 忽略及构建/栈门禁；未部署。后续[短时入睡调查](../../project-workflow/bridge-macos/boot-five-second-investigation-20261011.md)证实PWR唤醒6.977秒后深睡，收尾遗漏provisional；初始化BOOT漏按路径存在，具体物理时序未记录。后续 .78 已补两处缺口并通过原OTA单次上传认证镜像核验，配套Bridge已更新；实体按键重叠、RF/功耗/屏幕实机矩阵未验，不结项。
 
 - **2026-10-11 协议闭环实施**：诊断尾部沿用HTTP准入、ready报告ACK后验证持续HTTP事实已修复；扩展审核修复新写入401/403仍未知、409修订冲突误分类、wifi_state合同文本类型。316项通过/3条件忽略、设备页及52项栈门禁通过；新版Bridge已部署，.76 OTA原job86054e26单次上传并image_verified，独立认证运行hash一致；13:10自然恢复会合/Data414通过。真实10轮自然会合、物理故障矩阵及显示未验，不结A9/B6/C8；详见[实施记录](../../project-workflow/bridge-macos/protocol-implementation-20261011.md)。

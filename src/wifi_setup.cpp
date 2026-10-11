@@ -24,6 +24,7 @@ static size_t wifiInflate(void *out, size_t cap, const void *in, size_t size) {
 #include <algorithm>
 #include <memory>
 #include <new>
+#include <atomic>
 
 static WifiStore wifiStore;
 static WifiSchemes &schemes = wifiStore.schemes;
@@ -41,6 +42,10 @@ static bool selectionStarted = false;
 static String selectingBridge;
 static uint64_t selectionVersion = 0;
 static volatile uint16_t wifiDisconnectReason = 0;
+// The event task is the sole writer and never calls DevLog. Preserve reason and sequence
+// even if GOT_IP clears the transaction error before the main loop sees it.
+static std::atomic<uint32_t> wifiDisconnectEvent{0};
+uint32_t wifiSetupDisconnectEvent() { return wifiDisconnectEvent.load(std::memory_order_relaxed); }
 static String attemptedSsid;
 void wifiSetupConnectionStarted(const String &ssid) { attemptedSsid = ssid; wifiDisconnectReason = 0; if (!running) error = ""; }
 static const char *wifiConnectionFailure(uint16_t reason) {
@@ -127,6 +132,8 @@ bool wifiSchemesBegin() {
     if (!eventsInstalled) {
         WiFi.onEvent([](arduino_event_id_t, arduino_event_info_t info) {
             wifiDisconnectReason = info.wifi_sta_disconnected.reason;
+            const uint32_t next = (wifiDisconnectEvent.load(std::memory_order_relaxed) >> 16) + 1;
+            wifiDisconnectEvent.store((next << 16) | info.wifi_sta_disconnected.reason, std::memory_order_relaxed);
         }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
         WiFi.onEvent([](arduino_event_id_t, arduino_event_info_t) {
             wifiDisconnectReason = 0;

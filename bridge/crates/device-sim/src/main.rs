@@ -206,6 +206,9 @@ struct SimPower {
     sync_open: bool,
     sync_open_id: String,
     sync_last_progress_ms: u64,
+    sync_opened_at_ms: u64,
+    sync_data_seq: u64,
+    sync_data_pending: bool,
     sync_visible_skip: u8,
 }
 
@@ -220,7 +223,8 @@ impl SimPower {
             last_sleep_reason: String::new(),
             sync_open: false,
             sync_open_id: String::new(),
-            sync_last_progress_ms: 0,
+            sync_last_progress_ms: 0, sync_opened_at_ms: 0,
+            sync_data_seq: 0, sync_data_pending: false,
             sync_visible_skip: 0,
         }
     }
@@ -232,6 +236,7 @@ impl SimPower {
         self.ble_window_until_ms = None;
         self.last_sleep_reason = reason.to_owned();
         self.sync_open = false;
+        self.sync_data_pending = false;
         self.sync_open_id.clear();
     }
 
@@ -247,6 +252,8 @@ impl SimPower {
             "last_sleep_reason":self.last_sleep_reason,
             "sync_open":self.sync_open,
             "sync_last_progress_ms":self.sync_last_progress_ms,
+            "sync_opened_at_ms":self.sync_opened_at_ms,
+            "sync_data_pending":self.sync_data_pending,
             "sync_visible_skip":self.sync_visible_skip,
             "now_ms":now_ms})
     }
@@ -946,6 +953,7 @@ fn reset_power_after_reboot(state: &SimState, now_ms: u64, cause: &str) -> Resul
     power.wake_count += 1;
     power.sync_open = false;
     power.sync_open_id.clear();
+    power.sync_data_pending = false;
     power.sync_visible_skip = 0;
     if cause == "deep" {
         let mut sync = state.sync.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -985,10 +993,15 @@ fn reconcile_power(state: &SimState, now_ms: u64) -> Result<SimPower> {
     };
     let mut power = state.power.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if power.sync_open &&
-        now_ms.saturating_sub(power.sync_last_progress_ms) >= 90_000 {
+        (now_ms.saturating_sub(power.sync_opened_at_ms) >= 90_000 ||
+         now_ms.saturating_sub(power.sync_last_progress_ms) >= 90_000) {
         state.sync.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
             .fail(now_ms.saturating_sub(power.boot_ms) as u32)?;
-        power.enter_deep(now_ms, "sync incomplete");
+        power.sync_open = false;
+        power.sync_data_pending = false;
+        if !(plan_was_light && now_ms < plan_deadline) {
+            power.enter_deep(now_ms, "sync incomplete");
+        }
     }
     if configured && !power.configured {
         power.configured = true;
@@ -1007,7 +1020,7 @@ fn reconcile_power(state: &SimState, now_ms: u64) -> Result<SimPower> {
             3 => Some((power.safety_deadline_ms, "safety")),
             _ => None,
         };
-        if let Some((at, why)) = transition {
+        if let Some((at, why)) = transition.filter(|_| !power.sync_open) {
             let light_exit_sync = reason == 1 && plan_was_light && state.sync.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .status()?["enabled"] == true;
@@ -1018,6 +1031,7 @@ fn reconcile_power(state: &SimState, now_ms: u64) -> Result<SimPower> {
                 power.sync_open = true;
                 power.sync_open_id = "light-exit".into();
                 power.sync_last_progress_ms = now_ms;
+                power.sync_opened_at_ms = now_ms;
                 power.next_contact_ms = None;
                 power.ble_window_until_ms = None;
                 power.last_sleep_reason = "sync light_exit".into();
@@ -1302,10 +1316,10 @@ async fn sync_endpoint(state: SimState, request: Request<Body>, op: &'static str
     if op == "sync_complete" && reply["result"] == "applied" {
         let sync = state.sync.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
             .status().unwrap_or(serde_json::Value::Null);
-        if sync["due"] != true && sync["pending_batch"].is_null() {
+        if sync["due"] != true && sync["pending_batch"].is_null() &&
+            !state.power.lock().unwrap().sync_data_pending {
             let mut power = state.power.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             power.sync_open = false;
-            power.sync_open_id.clear();
             if !power.light { power.enter_deep(clock.monotonic_ms, "sync complete"); }
         }
     }
@@ -1450,6 +1464,8 @@ async fn status_impl(state: SimState, request: Request<Body>, gate: bool) -> Res
             status["max_bundle_bytes"] = bundle["max_bundle_bytes"].clone();
             let padding = *state.status_padding_bytes.lock().unwrap();
             if padding > 0 { status["synthetic_status_padding"] = json!("x".repeat(padding)); }
+            status["sync"]["remaining_ms"] = json!(if power.sync_open {power.sync_opened_at_ms.saturating_add(90000).saturating_sub(clock.monotonic_ms)} else {0});
+            status["sync"]["data_pending_seq"] = json!(if power.sync_data_pending {power.sync_data_seq} else {0});
             status["sync"]["phase"] = json!(if power.sync_open {"WIFI_SYNC_ONCE"}
                 else if power.light {"WIFI_LIGHT"} else {"DEEP"});
             if compact {
@@ -2127,6 +2143,19 @@ async fn device_command_impl(state: SimState, request: Request<Body>, operation:
     };
     match result {
         Ok(ack) => {
+            if operation == "data" && ack["result"] == "applied" {
+                let seq = serde_json::from_str::<Value>(message).ok().and_then(|v|v["seq"].as_u64());
+                let sync = state.sync.lock().unwrap().status().unwrap_or(Value::Null);
+                let mut power = state.power.lock().unwrap();
+                if power.sync_data_pending && seq == Some(power.sync_data_seq) {
+                    power.sync_data_pending = false;
+                    if sync["due"] != true && sync["pending_batch"].is_null() &&
+                        sync["reasons"].as_array().is_none_or(Vec::is_empty) {
+                        power.sync_open = false;
+                        if !power.light {power.enter_deep(clock.monotonic_ms,"data complete");}
+                    }
+                }
+            }
             let fault_name = if operation == "commit" { "bundle_commit" } else { operation };
             if let Some(duration_ms) = take_stalled_ack(&state, fault_name, ack["result"] == "applied") {
                 tokio::time::sleep(Duration::from_millis(duration_ms)).await;
@@ -2615,7 +2644,9 @@ async fn sim_ble_business(State(state): State<SimState>, request: Request<Body>)
                 (power.light || state.power.lock().unwrap().sync_open);
             let admitted=if valid {
                 let (_,_,_,granted,accepted_at)=state.plan.lock().unwrap().status_fields();
-                let legal_until=accepted_at.saturating_add((granted as u64).saturating_mul(1000));
+                let sync_power=state.power.lock().unwrap().clone();
+                let formal_until=sync_power.boot_ms.saturating_add(accepted_at).saturating_add((granted as u64).saturating_mul(1000));
+                let legal_until=formal_until.max(if sync_power.sync_open {sync_power.sync_opened_at_ms.saturating_add(90000)}else{0});
                 let mut rv=state.rendezvous.lock().unwrap();
                 rv.admit_http(clock.monotonic_ms,legal_until);
                 rv.phase()==2
@@ -2665,18 +2696,26 @@ async fn sim_ble_business(State(state): State<SimState>, request: Request<Body>)
                     .status().unwrap_or(serde_json::Value::Null);
                 let reason = message["reason"].as_str().unwrap_or("");
                 let open_id = message["open_id"].as_str().unwrap_or("");
-                let valid = sync["enabled"] == true && sync["retry_skip"] == 0 &&
+                let data_seq = message["data_seq"].as_u64().unwrap_or(0);
+                let data = reason == "data" && data_seq > 0;
+                let valid = sync["enabled"] == true && (data || sync["retry_skip"] == 0) &&
                     !open_id.is_empty() && open_id.len() <= 64 &&
                     message["wake_generation"] == session_snapshot(&state).boot_id &&
                     message["wake_seq"] == power.wake_count &&
-                    ((reason == "periodic" && sync["rounds"] == 15 && sync["due"] == true) ||
+                    (data || (reason == "periodic" && sync["rounds"] == 15 && sync["due"] == true) ||
                      (reason == "retry" && (sync["due"] == true ||
                        !sync["pending_batch"].is_null())));
                 let mut live = state.power.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                let valid = valid && live.sync_visible_skip == 0 &&
-                    (!live.sync_open || live.sync_open_id == open_id);
+                let valid = valid && (data || live.sync_visible_skip == 0) &&
+                    if live.sync_open { live.sync_open_id == open_id && (!data || live.sync_data_seq == data_seq) }
+                    else { live.sync_open_id != open_id };
                 if valid {
-                    if !live.sync_open { live.sync_last_progress_ms = clock.monotonic_ms; }
+                    if !live.sync_open {
+                        live.sync_last_progress_ms = clock.monotonic_ms;
+                        live.sync_opened_at_ms = clock.monotonic_ms;
+                        live.sync_data_seq = data_seq;
+                        live.sync_data_pending = data;
+                    }
                     live.sync_open = true;
                     live.sync_open_id = open_id.to_owned();
                     live.next_contact_ms = None;
@@ -2778,7 +2817,7 @@ fn wifi_control_until(state:&SimState,power:&SimPower,physical:u64,now:u64)->u64
     if power.plugged && !power.deep_on_usb {return u64::MAX;}
     let plan=state.plan.lock().unwrap();let (_,mode,_,seconds,accepted)=plan.status_fields();
     let formal=if mode=="light" {power.boot_ms.saturating_add(accepted).saturating_add(u64::from(seconds)*1000)}else{0};
-    let sync=if power.sync_open {power.sync_last_progress_ms.saturating_add(90000)}else{0};
+    let sync=if power.sync_open {power.sync_opened_at_ms.saturating_add(90000)}else{0};
     let until=physical.max(formal).max(sync);if until>now {until}else{0}
 }
 async fn wifi_http(State(state): State<SimState>, request: Request<Body>) -> Response {

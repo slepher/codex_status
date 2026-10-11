@@ -7,6 +7,7 @@
 #include "power_internal.h"
 #include "radio_internal.h"
 #include "sync_internal.h"
+#include "data_activity_led.h"
 
 namespace firmware::transport {
 
@@ -375,7 +376,16 @@ void v2Ack(const char *op, const char *result, const char *display,
                                planId, context, acceptedRemainingS, FW_TARGET_ID, fullSeq));
 }
 
-// Only authenticated status exposes this boot session nonce.
+// Boot identity stays stable across BLE connections; the security session nonce
+// below still rotates and continues to fence requests from old connections.
+const char *bootId() {
+    static char id[33] = {};
+    if (!id[0]) snprintf(id, sizeof(id), "%08x%08x%08x%08x", (unsigned)esp_random(),
+                        (unsigned)esp_random(), (unsigned)esp_random(), (unsigned)esp_random());
+    return id;
+}
+
+// Only authenticated status exposes this security session nonce.
 const String &v2Nonce() {
     if (!v2SessionNonce.length()) {
         char nonce[33];
@@ -416,6 +426,7 @@ void v2HttpRawHandler() {
     if (raw.status == RAW_START) { state.v2HttpRaw = ""; v2HttpRawOverflow = false; return; }
     if (raw.status == RAW_ABORTED) { state.v2HttpRaw = ""; v2HttpRawOverflow = true; return; }
     if (raw.status == RAW_WRITE) {
+        if (raw.currentSize) dataLedActivity();
         if (v2HttpRawOverflow) return;
         if (state.v2HttpRaw.length() + raw.currentSize > 4096 ||
             !state.v2HttpRaw.concat(reinterpret_cast<const char *>(raw.buf), raw.currentSize)) {
@@ -766,8 +777,7 @@ void serviceV2Ble() {
         OwnerRec owner;
         bool allowed = authenticated && ownerGet(owner) && owner.id == (doc["bridge_id"] | "");
         const uint64_t now = clock::v2NowMs();
-        const uint64_t admittedUntil = power::state.v2Plan.lightActive(now) ? power::state.v2Plan.deadlineMs() :
-            sync::state.syncOpenThisWake ? sync::state.syncOpenAnsweredAt + 90000 : 0;
+        const uint64_t admittedUntil = sync::httpUntil(now);
         const uint64_t wifiWindowUntil = radio::state.v2Rv.active() ? std::min(admittedUntil, radio::state.v2Rv.deadline()) : admittedUntil;
         if (!authenticated) {
             JsonDocument out; out["ack"]="wifi"; out["request_id"]=doc["request_id"];
@@ -912,6 +922,8 @@ void serviceV2Ble() {
             bool wakeValid = (doc["wake_generation"] | 0u) == diagnostics::retained.rtcWakeGeneration &&
                              (doc["wake_seq"] | 0u) == diagnostics::retained.rtcTraceCurrentSeq;
             SyncStoreBatch pending;
+            const uint64_t dataSeq = doc["data_seq"] | 0ULL;
+            bool data = reason == "data" && dataSeq > 0;
             bool retry = reason == "retry" &&
                          (syncStoreActive(pending) || (sync::retained.syncRtc.flags & 4) || sync::retained.syncRtc.reasonBits);
             bool periodic = reason == "periodic" && sync::retained.syncRtc.rounds == 15 && (sync::retained.syncRtc.flags & 1);
@@ -920,9 +932,11 @@ void serviceV2Ble() {
                                 current.id != (doc["bridge_id"] | "") ? "occupied" :
                                 !sync::state.syncEnabled || sync::state.syncOwner != current.id ? "disabled" :
                                 v2BatteryPowerOff(power::state.plugged, power::batteryPercent()) ? "low_battery" :
-                                sync::state.syncSkippedThisWake || sync::retained.syncRtc.retrySkip || (!periodic && !retry) ? "range" :
+                                !data && (sync::state.syncSkippedThisWake || sync::retained.syncRtc.retrySkip || (!periodic && !retry)) ? "range" :
+                                !sync::state.syncOpenThisWake && openId == sync::state.syncOpenId ? "window_closed" :
                                 sync::state.syncOpenThisWake &&
-                                (openId != sync::state.syncOpenId || reason != sync::state.syncOpenReason) ? "batch_conflict" : nullptr;
+                                (openId != sync::state.syncOpenId || reason != sync::state.syncOpenReason ||
+                                 (data && dataSeq != sync::state.syncDataSeq)) ? "batch_conflict" : nullptr;
             if (error) {
                 if (!strcmp(error, "low_battery")) sync::syncRecordOutcome(2, 7);
                 v2Ack("sync_open", "rejected", "unchanged", "ram", error, -1, 0,
@@ -930,11 +944,17 @@ void serviceV2Ble() {
             } else {
                 if (!sync::state.syncOpenThisWake) {
                     sync::state.syncOpenThisWake = true;
+                    sync::state.syncExitAtMs = 0;
+                    power::retained.rtcMode = MODE_LIGHT; // temporary only; never persist a Light plan
                     sync::state.syncBlockedError = 0;
                     sync::state.syncOpenId = openId;
                     sync::state.syncOpenReason = reason;
+                    sync::state.syncDataSeq = data ? dataSeq : 0;
+                    sync::state.syncDataPending = data;
                     sync::state.syncLastProgressMs = millis();
                     sync::state.syncOpenAnsweredAt = clock::v2NowMs();
+                    if (radio::state.v2InRendezvous && radio::state.v2RvNetworkExpected)
+                        radio::state.v2Rv.awaitNetworkStart(clock::v2NowMs(), sync::httpUntil(clock::v2NowMs()));
                 }
                 v2Ack("sync_open", "applied", "unchanged", "ram", nullptr, -1, 0,
                       nullptr, UINT32_MAX);
@@ -945,8 +965,7 @@ void serviceV2Ble() {
             OwnerRec current;
             const uint64_t now = clock::v2NowMs();
             const bool owned = ownerGet(current) && current.id == String(request["bridge_id"] | "");
-            const uint64_t legalUntil = power::state.v2Plan.lightActive(now) ? power::state.v2Plan.deadlineMs() :
-                sync::state.syncOpenThisWake ? sync::state.syncOpenAnsweredAt + 90000 : 0;
+            const uint64_t legalUntil = sync::httpUntil(now);
             IPAddress bridge;
             const char *addr = request["bridge_addr"] | "";
             const uint32_t port = request["bridge_port"] | 0u;
@@ -1046,6 +1065,7 @@ void registerHttpRoutes() {
         },
         []() {
             HTTPUpload &up = state.server.upload();
+            if (up.status == UPLOAD_FILE_WRITE && up.currentSize) dataLedActivity();
             if (up.status == UPLOAD_FILE_START) {
                 if (!requestAuthorized()) {
                     otaUploadDenied = true;

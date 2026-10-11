@@ -48,7 +48,7 @@ function parseBind(path) {
     'account.plan', 'bridge.label', 'bridge.hostId', 'server_time',
     'resetCredits.availableCount', 'resetCredits.nextExpiresAt',
     'device.channel', 'device.ip', 'device.sync_hhmm', 'device.battery',
-    'device.state', 'device.offline_mins', 'device.now', 'device.mode',
+    'device.wifi_state', 'device.wifi_blink', 'device.ble_manual_active', 'device.offline_mins', 'device.now', 'device.mode',
   ]);
   if (direct.has(path)) return { kind: path };
   const match = /^buckets\[([^\]]+)\]\.((?:weekly|monthly|5h|primary|secondary|windows\[\d+\]))\.(usedPercent|remaining|resetsAt|windowMins)$/.exec(path);
@@ -230,10 +230,15 @@ function bindResult(spec, usage, env, format = 'date') {
   if (spec.kind === 'device.battery') {
     return { exists: Number.isInteger(env.battery) && env.battery >= 0, value: env.battery >= 0 ? env.battery : '--' };
   }
-  if (spec.kind === 'device.state') {
-    const value = env.state;
+  if (spec.kind === 'device.wifi_state') {
+    const value = env.wifi_state;
     return { exists: typeof value === 'string' && value.length > 0, value: value || '--' };
   }
+  if (spec.kind === 'device.wifi_blink') {
+    const exists = env.wifi_state === 'connecting' && (env.wifi_blink === 0 || env.wifi_blink === 1);
+    return { exists, value: exists ? env.wifi_blink : '--' };
+  }
+  if (spec.kind === 'device.ble_manual_active') return { exists: true, value: env.ble_manual_active ? 1 : 0 };
   if (spec.kind === 'device.now') {
     const value = env.now_hhmm ?? env.sync_hhmm ?? '23:59';
     return { exists: true, value };
@@ -438,19 +443,18 @@ function writePreview(template, usage, env, name) {
 
 function generate() {
   const template = validateTemplate(loadTemplate());
-  const env = { channel: 'WIFI', ip: '192.168.1.50', sync_hhmm: '23:59', battery: 78, state: 'BLE OFF' };
+  const env = { channel: 'WIFI', ip: '192.168.1.50', sync_hhmm: '23:59', battery: 78, wifi_state: 'connected', wifi_blink: -1, ble_manual_active: 0 };
   writePreview(template, usageFixture({ fiveHourUsed: 11 }), env, 'quad-preview.png');
   writePreview(template, usageFixture({ weeklyUsed: 0, fiveHourUsed: 0 }), env, 'quad-preview-100.png');
   writePreview(template, usageFixture({ weeklyUsed: 91, fiveHourUsed: null }), env, 'quad-preview-missing-5h.png');
   writePreview(template, usageFixture({ weeklyUsed: 2, fiveHourUsed: 11, plan: 'pro', label: 'VERY-LONG-BRIDGE-LABEL', resetCount: 1 }), env, 'quad-preview-longnames.png');
-  const offlineEnv = { ...env, state: 'WIFI OFF', offline_mins: 138 };
+  const offlineEnv = { ...env, wifi_state: 'off', offline_mins: 138 };
   writePreview(template, usageFixture({ fiveHourUsed: 11 }), offlineEnv, 'quad-preview-offline.png');
   writePreview(template, usageFixture({ weeklyUsed: 91, fiveHourUsed: null }), { ...offlineEnv, battery: 21 }, 'quad-preview-offline-missing-5h.png');
-  // task-10 B: blink-on phase while associating (Wi-Fi icon visible, crossed
-  // link overlay steady); the WIFI OFF fixture above is the blink-off phase.
-  writePreview(template, usageFixture({ fiveHourUsed: 11 }), { ...env, state: 'WIFI CONN' }, 'quad-preview-conn.png');
+  // Connection blink is independent of terminal failure and manual BLE.
+  writePreview(template, usageFixture({ fiveHourUsed: 11 }), { ...env, wifi_state: 'connecting', wifi_blink: 1 }, 'quad-preview-conn.png');
   writePreview(template, usageFixture({ weeklyUsed: 12, weeklyMins: 43200, fiveHourUsed: null, plan: 'free' }), env, 'quad-preview-monthly.png');
-  const deepEnv = { ...env, state: 'DEEP', mode: 'deep' };
+  const deepEnv = { ...env, wifi_state: 'idle', mode: 'deep' };
   writePreview(template, usageFixture({ fiveHourUsed: 11 }), deepEnv, 'quad-preview-deep.png');
 }
 

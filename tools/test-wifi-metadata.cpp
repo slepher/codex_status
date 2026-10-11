@@ -1,6 +1,9 @@
 #include "network_display_state.h"
 #include <cassert>
 int main() {
+    assert(bridgeOfflineMinutes(1700000010,1700000000,true,6,-1,true)==0);
+    assert(bridgeOfflineMinutes(1700000010,1700000000,true,6,-1,false)==-1);
+    assert(bridgeOfflineMinutes(0,0,false,6,-1,true)==0);
     assert(wifiPhaseFor(false,false,false,false)==WifiPhase::Idle);
     assert(wifiPhaseFor(false,false,true,true)==WifiPhase::Idle);
     assert(wifiPhaseFor(true,false,true,false)==WifiPhase::Connecting);
@@ -22,4 +25,11 @@ int main() {
     display.rendered(true,5003);
     display.observe(false,-1,WifiPhase::Off,-1);
     assert(!display.pending);
+    display.observe(true,-1,WifiPhase::Connected,-1,false);
+    display.rendered(true,6000);
+    display.observe(true,0,WifiPhase::Connected,-1,false);
+    assert(display.pending && display.wifiPhase==WifiPhase::Connected);
+    display.rendered(true,6001);
+    display.observe(true,-1,WifiPhase::Connected,-1,false);
+    assert(display.pending); // recovery redraws Bridge without Wi-Fi transition
 }

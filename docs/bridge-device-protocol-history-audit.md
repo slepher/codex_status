@@ -1,6 +1,6 @@
 # Bridge—设备协议历史对账：过期、遗漏与尚未交付
 
-日期：2026-10-08。定向核对协议相关历史与阶段记录，不通读全部归档。本轮只改文档，无软件测试/设备通信/部署。当前导航：[业务与 wire](bridge-device-protocol.md)、[执行场景](bridge-device-communication-scenarios.md)、[实现对照](bridge-device-communication-implementation.md)。
+修订：2026-10-11（基线9c38e45）。定向核对协议相关历史与阶段记录，不通读全部归档。本轮只改文档，无软件测试/设备通信/部署。当前导航：[业务与 wire](bridge-device-protocol.md)、[执行场景](bridge-device-communication-scenarios.md)、[实现对照](bridge-device-communication-implementation.md)。
 
 ## 1. 如何判断历史条款
 
@@ -25,14 +25,24 @@
 | 同文：Bridge 不保存密码、禁止回读，其他绑定始终只读 | **已被用户修订及 .68 部署取代**。Bridge 本机 data 可缓存完整密码；有效 session+owner 共享配置权限，bond 是来源，回执仍隔离；不进入仓库/日志 |
 | 同文 W0：所有 8 项回执永久保留、没有退役 | **新事务已取代**。WFS4 序号围栏与 result_ack 可退役已确认终态；旧任意 ID 回执仍保留，不能全删 |
 | [会合评审](../project-workflow/bridge-macos/rendezvous-protocol-review.md) A5：HTTP 20s、Wi-Fi 工作 8s | **阶段预算已更新**。现行 Bridge 相关常量 30s，设备 handoff 30s，候选关联/DHCP 25s且受原截止约束；不回填为所有业务统一 30s TTL |
-| [会合计划](../project-workflow/bridge-macos/rendezvous-protocol-plan.md) /评审：.46 候选未部署、Bridge 停机、现场 .45 | **当时现场，不是当前未实施结论**。当前最新 Note4 .69 与 Bridge 见 PROGRESS；原记录的长期 RF/功耗边界仍有效 |
-| [旧平台设计状态](history/workflow/generic-display-platform-design/status.md)：implementation not started | **阶段状态过期**。现行 Profile 1–8、CompiledTemplate、完整 A/B Bundle、单 active context 已交付。v2 文件名现为导航 stub，不是另一套现行协议 |
+| [会合计划](../project-workflow/bridge-macos/rendezvous-protocol-plan.md) /评审：.46 候选未部署、Bridge 停机、现场 .45 | **当时现场，不是当前未实施结论**。当前Note4 .82与配套Bridge见PROGRESS；原记录的长期 RF/功耗边界仍有效 |
+| [旧平台设计状态](history/workflow/generic-display-platform-design/status.md)：implementation not started | **阶段状态过期**。现行Profile 1–8、CompiledTemplate、单active context已交付；内容A/B已由C9单份暂存后覆盖替代，原生ROM OTA双槽保留。v2 文件名现为导航 stub，不是另一套现行协议 |
 | [早期模板交付](history/workflow/live-template-delivery/plan.md)：HTTP GET 条件 hash/304、逐模板 BLE 传送、旧 IP/ROM | **旧业务通道与现场**。当前完整 Bundle 显式发布；保留 hash/结构校验、分片/ACK 原则，不恢复旧 ≤3 槽与 Usage/Template Data 写入口 |
 | 同文早期 missing `--` / infinity | **显示语义已被后续模板规则替代**。5h 缺失依 target 模板分支，不能从历史早期约束提炼全局规则 |
 | 现行平台设计仍保留的 bridge_first Directive/StatusBeacon 候选 | **候选已由用户废弃**。当前 device_first；它不是遗漏的现行广播业务协议 |
 | 泛化设计通用 `protocol` 与 Data 请求 `data_seq` | **wire 描述过期**。当前 Data/Plan 通用校验拒绝非空 protocol/rv，Data 请求为 seq、ACK 为 data_seq；Wi-Fi HTTP 仍有其兼容包装 |
 
 这些判断由后续用户决定、当前源码及最新交接共同支持；无需改写只读历史原件。
+
+### 2026-10-11 本次覆盖关系
+
+- 48 B信封从提案变为现行frame；认证Status/OTA image从旧GET改为POST，chunk有效载荷4048 B。外层头已经落地，删除业务JSON中的重复身份尚未完成，不能混写。
+- 保留普通BLE至handoff的旧正常路径，被network_start接纳后提前结束BLE、设备独立HTTP report和Bridge认证回读替代；ready_report接收不等于业务完成。
+- 正式计划仅RAM、任意OTA重启重授300秒的旧描述失效；PPL1保原ID/期限，USB/有效Light直接HTTP，Sleep普通重启一次BLE。报告后不清除计划，没有一次性OTA marker。
+- 首次唤醒临时BLE不等于手动GATT ON；手动窗/自动交汇/射频分开，模板使用device.ble_manual_active。
+- 项目自管Bundle/应用双副本取消；旧内容在暂存下载时继续运行，完成预检后覆盖单份；原生OTA双槽保留。AP01应用加载/退出仍未实体交付。
+- 同名模板也会改变data_contract；发布后必须先失效旧合同并认证回读，不复用旧字段索引。
+- .82电量EMA仅显示侧，原始电压/保护不变；它不是新增Bridge数据协议，也不改变充电判定。
 
 ## 3. 历史中仍有效、已补入现行整理的内容
 
@@ -53,7 +63,7 @@
 
 ## 4. 不能当作“过期”或“已到位”的内容
 
-- **Bundle v3 是待实现方案**：[原始设计](history/workflow/bundle-v3/design.md) 的 CSB3/dense 容器仍对应 backlog C1；其 `/v2/*` 路径是旧命名，不能据此认为格式已实现或整项作废。当前完整 JSON Bundle 的 begin/chunk/commit 不等于支持 CSB3。
+- **Bundle v3 是待实现方案**：[原始设计](history/workflow/bundle-v3/design.md) 的 CSB3/dense 容器仍对应 backlog C1；其 `/v2/*` 路径是旧命名，不能据此认为格式已实现或整项作废。当前完整JSON正文或CSZ1压缩正文的begin/chunk/commit不等于支持CSB3。
 - **字体增量发布是待定草案**：[历史草案](history/workflow/note4-bridge-publish/protocol.md) 与活跃专项存在关联，待办 C5。`asset_publish_protocol`、对象 PUT、manifest status、target_id 去重不能冒充现行端点。草案“asset font 在 full Bundle 路径拒绝”已被现行 full Bundle 字体交付覆盖，不能恢复该旧限制。
 - **统一 Wi-Fi 的兼容分支仍存在**：`wifiSetupPoll` 对非 unified 的旧候选仍有按 peer/generation/encryption 取消逻辑，`wifiSetupRadioClosed` 也保留兼容条件；统一事务绕开这些取消条件。旧规则对普通新协议过期，不等于兼容代码已彻底删除。兼容退役验收仍归 B6。
 - **普通 BLE 写静默失败仍是实现缺口证据**：未授权/畸形组包/队列满的入口未必产生结构化 ACK；历史成功样本不覆盖失败合同，不因分层整理而消失。

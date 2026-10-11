@@ -7,6 +7,9 @@
 #include "power_internal.h"
 #include "sync_internal.h"
 #include "transport_internal.h"
+#include "data_activity_led.h"
+#include "data_activity_client.h"
+#include "network_link_policy.h"
 
 namespace firmware::radio {
 
@@ -67,30 +70,10 @@ String macText() {
     return String(buf);
 }
 
-const char *deviceStateText() {
-    if (state.configMode) return "AP";
-    switch (wifiPhase()) {
-    case WifiPhase::Idle: return "WIFI WAIT";
-    case WifiPhase::Connecting: return "WIFI CONN";
-    case WifiPhase::Off: return "WIFI OFF";
-    default: break;
-    }
-    if (state.bleOn)      return "BLE ON";
-    return "BLE OFF";
-}
-
-// Compatibility for existing templates. New templates use independent Wi-Fi
-// lifecycle/phase metadata. A hidden phase must never masquerade as terminal OFF.
-const char *templateStateText() {
-    if (state.wifiConnActive && !state.wifiBlinkOn) return "WIFI BLINK OFF";
-    if (state.wifiConnActive) return "WIFI CONN";
-    return deviceStateText();
-}
-
 WifiPhase wifiPhase() {
     // The final sleep frame describes the committed radio closure, just as
     // device.mode describes the sleep entered immediately after that frame.
-    if (power::retained.rtcMode == MODE_DEEP && !state.v2InRendezvous) return WifiPhase::Off;
+    if (power::retained.rtcMode == MODE_DEEP && !state.v2InRendezvous) return WifiPhase::Idle;
     return wifiPhaseFor(state.wifiConnActive || wifiSetupConnecting(),
         WiFi.status() == WL_CONNECTED && WiFi.localIP() != IPAddress(0,0,0,0),
         wifiSetupBusy() || state.v2InRendezvous,
@@ -98,6 +81,15 @@ WifiPhase wifiPhase() {
 }
 
 void serviceWifiMetadata() {
+    static uint32_t seenDisconnect = 0;
+    const uint32_t event = wifiSetupDisconnectEvent();
+    if (event != seenDisconnect) {
+        // DevLog is loop-task owned. Multiple events may coalesce during EPD
+        // blocking; report their count instead of inventing intermediate reasons.
+        DevLog.printf("[wifi] link event reason=%u count=%u\n", event & 0xffff,
+                      uint16_t((event >> 16) - (seenDisconnect >> 16)));
+        seenDisconnect = event;
+    }
     // A retained transaction error is not a fresh link failure after recovery.
     const bool failed = wifiSetupFailed();
     if (failed && !state.wifiFailureObserved) state.wifiTerminal = true;
@@ -115,12 +107,6 @@ void serviceWifiMetadata() {
         state.wifiBlinkOn = !state.wifiBlinkOn;
         state.wifiBlinkAtMs = now;
     }
-}
-
-const char *wifiStateText() {
-    if (state.configMode) return "ap";
-    if (state.wifiUp)     return "connected";
-    return state.wifiLostHandled ? "lost" : "connecting";
 }
 
 static void setActiveMac(const String &mac) {
@@ -249,7 +235,7 @@ void sendAnnounce(bool bleFlag) {
                      mac.c_str(), ip[0], ip[1], ip[2], ip[3], bleFlag ? 1 : 0, application::state.firmwareVersion);
     announceUdp.beginPacket(IPAddress(255, 255, 255, 255), 8767);
     announceUdp.write((const uint8_t *)payload, n);
-    announceUdp.endPacket();
+    if (announceUdp.endPacket()) dataLedActivity();
     announcedIp = (uint32_t)ip;
     lastAnnounce = millis();
     DevLog.printf("[udp] announce %s ble=%d\n", ip.toString().c_str(), bleFlag ? 1 : 0);
@@ -300,8 +286,6 @@ void enterBleOn(bool userInitiated) {
     if (!state.bleOn) {
         state.bleOn = true;
         state.bleUserOff = false;
-        power::ledSet(true);
-        power::ledFlash();
         DevLog.println("[ble] session on");
     }
     diagnostics::bleRadioMark(true);
@@ -328,8 +312,6 @@ void bleOff(const char *reason) {
     if (WiFi.status() == WL_CONNECTED) configureWifiPowerSave();
     transport::V2BleMessage *pending = nullptr;
     while (transport::state.v2BleQueue && xQueueReceive(transport::state.v2BleQueue, &pending, 0) == pdTRUE) delete pending;
-    power::ledSet(false);
-    power::ledFlash();
     DevLog.printf("[ble] session off (%s)\n", reason ? reason : "");
     requestAnnounce(false);
     if (!state.v2InRendezvous) display::renderCurrent();
@@ -342,17 +324,20 @@ void serviceBleSession() {
 }
 
 static void networkFailed(const char *reason) {
-    WiFi.disconnect(false);
-    state.wifiUp = false;
-    state.wifiLostHandled = true;
+    const bool disconnect = networkFailureDisconnects(reason,
+        WiFi.status() == WL_CONNECTED && WiFi.localIP() != IPAddress(0,0,0,0));
+    if (disconnect) WiFi.disconnect(false);
+    state.wifiUp = !disconnect;
+    state.wifiLostHandled = disconnect;
     state.bridgeReachable = false;
     state.networkError = reason;
-    state.wifiTerminal = true;
+    state.wifiTerminal = disconnect;
     state.fallbackUntilMs = 0;
     state.wifiConnActive = false;
     state.failureReportPending = true;
     state.nextBleContactMs = clock::v2NowMs();
-    DevLog.printf("[wifi] attempt failed: %s; BLE report next\n", reason);
+    DevLog.printf("[wifi] attempt failed: %s; connected=%d boot_remaining=%u; BLE report next\n",
+                  reason, !disconnect, power::state.bleRecovery.lightRemaining(clock::v2NowMs()));
 }
 
 static bool startFallback() {
@@ -455,7 +440,7 @@ void wifiDeviceStatus(JsonDocument &doc,const EndpointRec *endpoint) {
     key+="|"+String(state.bridgeReachable)+"|"+String(state.networkError ? state.networkError : "");
     static uint32_t sequence=0;static String previous;
     if(!sequence || key!=previous){++sequence;previous=key;}
-    doc["boot_id"]=transport::v2Nonce();doc["status_seq"]=sequence;doc["device_mac"]=macText();
+    doc["boot_id"]=transport::bootId();doc["status_seq"]=sequence;doc["device_mac"]=macText();
     doc["wifi_management"]=3;
     doc["power"]["mode"]=power::retained.rtcMode==MODE_LIGHT?"light":"sleep";doc["power"]["plan_id"]=power::state.v2Plan.acceptedId();doc["power"]["remaining_s"]=power::state.v2Plan.remainingS(now);
     auto presence=doc["presence"].to<JsonObject>();presence["mode"]=continuous?"continuous":until>now?"window":"ending";
@@ -501,10 +486,11 @@ static __attribute__((noinline)) void servicePresence() {
             (owned && endpoint.principal != owner.id)) continue;
         found = true;
         JsonDocument event; event["event"]="presence"; event["device_mac"]=macText();
-        event["boot_id"]=transport::v2Nonce(); event["ip"]=ipText();
+        event["boot_id"]=transport::bootId(); event["ip"]=ipText();
         event["manual_remaining_s"]=power::state.bleRecovery.lightRemaining(now);
+        DataActivityClient connection;
         HTTPClient client; client.setConnectTimeout(750); client.setTimeout(750);
-        if (client.begin(String("http://")+endpoint.host+":"+String(endpoint.port)+"/api/device/presence")) {
+        if (client.begin(connection, String("http://")+endpoint.host+":"+String(endpoint.port)+"/api/device/presence")) {
             String body; serializeJson(event,body);
             client.addHeader("Content-Type","application/json");
             client.addHeader("Authorization",String("Bearer ")+endpoint.token);
@@ -512,8 +498,8 @@ static __attribute__((noinline)) void servicePresence() {
             if (code==202 && client.getSize()>0 && client.getSize()<=256) {
                 JsonDocument reply;
                 reached=!deserializeJson(reply,client.getString()) &&
-                    String(reply["bridge_id"]|"")==endpoint.principal &&
-                    reply["device_http_verified"]==true;
+                    bridgePresenceAccepted(code, String(reply["bridge_id"]|"")==endpoint.principal,
+                                           String(reply["result"]|"")=="accepted");
             }
             client.end();
         }
@@ -535,8 +521,7 @@ static __attribute__((noinline)) void serviceReadyReport() {
     if (!state.readyReport.port || state.readyReport.received || state.readyReport.attempts >= 3 ||
         now < state.readyReport.nextAtMs || WiFi.status() != WL_CONNECTED ||
         !state.httpServicesStarted || !state.v2Rv.ready()) return;
-    const uint64_t legalUntil = power::state.v2Plan.lightActive(now) ? power::state.v2Plan.deadlineMs() :
-        sync::state.syncOpenThisWake ? sync::state.syncOpenAnsweredAt + 90000 : 0;
+    const uint64_t legalUntil = sync::httpUntil(now);
     const uint64_t deadline = std::min(state.v2Rv.deadline(), legalUntil);
     if (deadline <= now + 1000) return;
     auto ioTimeout = [deadline]() -> uint16_t {
@@ -552,14 +537,15 @@ static __attribute__((noinline)) void serviceReadyReport() {
         ":" + String(state.readyReport.port) + "/api/device/";
     if (!state.readyReport.httpSession.length()) {
         JsonDocument hello;
-        hello["device_mac"] = macText(); hello["boot_id"] = transport::v2Nonce();
+        hello["device_mac"] = macText(); hello["boot_id"] = transport::bootId();
         hello["principal"] = state.readyReport.principal;
         hello["instance_id"] = state.readyReport.principal;
         String body; serializeJson(hello, body);
         const uint16_t limit = ioTimeout();
         if (!limit) return;
+        DataActivityClient connection;
         HTTPClient client; client.setConnectTimeout(limit); client.setTimeout(limit);
-        if (client.begin(base + "session")) {
+        if (client.begin(connection, base + "session")) {
             client.addHeader("Content-Type", "application/json");
             client.addHeader("Authorization", String("Bearer ") + endpoint.token);
             const int code = client.POST(body);
@@ -577,7 +563,7 @@ static __attribute__((noinline)) void serviceReadyReport() {
     if (state.readyReport.httpSession.length()) {
         if (!state.readyReport.reportBody.length()) {
             JsonDocument report;
-            report["device_mac"] = macText(); report["boot_id"] = transport::v2Nonce();
+            report["device_mac"] = macText(); report["boot_id"] = transport::bootId();
             report["principal"] = state.readyReport.principal;
             report["instance_id"] = state.readyReport.principal;
             report["origin_session"] = state.readyReport.originSession;
@@ -594,8 +580,9 @@ static __attribute__((noinline)) void serviceReadyReport() {
         }
         const uint16_t limit = ioTimeout();
         if (!limit) return;
+        DataActivityClient connection;
         HTTPClient client; client.setConnectTimeout(limit); client.setTimeout(limit);
-        if (client.begin(base + "report")) {
+        if (client.begin(connection, base + "report")) {
             CompactFrameHeader request;
             request.kind = 2;
             request.op = 20;
@@ -742,7 +729,7 @@ void v2RendezvousTick() {
     const bool light = power::state.v2Plan.lightActive(now);
     const bool syncGuard = sync::state.syncEnabled && (sync::retained.syncRtc.flags & 1) && !sync::state.syncOpenThisWake && !sync::state.syncSkippedThisWake;
     if (state.v2RvNetworkRequested && ((state.v2Rv.hasPlan() && light) || sync::state.syncOpenThisWake)) {
-        const uint64_t legalUntil = light ? power::state.v2Plan.deadlineMs() : sync::state.syncOpenAnsweredAt + 90000;
+        const uint64_t legalUntil = sync::httpUntil(now);
         state.v2Rv.admitHttp(now, legalUntil);
         if (state.v2Rv.needsHttp()) {
             if (state.bleOn && !power::v2ManualBleHoldActive()) {
@@ -867,6 +854,7 @@ void startNormalMode() {
             display::screen({"ArduinoOTA", "updating..."});
         });
         ArduinoOTA.onProgress([](unsigned int p, unsigned int t) {
+            if (p) dataLedActivity();
             DevLog.printf("[ota] %u%%\r", t ? p * 100 / t : 0);
         });
         ArduinoOTA.onEnd([]() {
@@ -903,7 +891,7 @@ void startNormalMode() {
     }
 
     DevLog.printf("[net] ready state=%s ip=%s host=%s.local endpoints=%d\n",
-                  deviceStateText(), ipText().c_str(), state.hostname.c_str(), storeCount());
+                  wifiPhaseText(wifiPhase()), ipText().c_str(), state.hostname.c_str(), storeCount());
 }
 
 } // namespace firmware::radio

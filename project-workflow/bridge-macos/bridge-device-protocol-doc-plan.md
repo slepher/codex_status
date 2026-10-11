@@ -1,5 +1,17 @@
 # Bridge—设备协议文档整理（2026-10-08）
 
+## 2026-10-11 同步续项
+
+用户要求将最近协议改动同步到此前文档。核对基线9c38e45、当前Note4 .82/Bridge部署和近期实施证据；仅修改文档，不构建或访问设备。范围：协议总览、48 B编码、通信场景/实现对照、历史对账、权威架构中的冲突条款及索引。
+
+Plan/Task：核对当前路由与frame客户端 → 更新48 B实际载体/认证/保留JSON边界 → 同步PPL1/BOOT/OTA、单份压缩Bundle与data_contract → 修正旧状态标签及源码入口 → 检查文档链接、字段/常量/路由和diff。
+
+Status：已同步完成。Review重点：不把48 B头当整包，不声称身份JSON已全部删除；普通BLE提前关闭不等于HTTP成功；单份覆盖不承诺旧包回退；计划持久化不恢复owner/旧会话；已有实机样本不扩大为全部RF/掉电/跨平台验收。
+
+Review结果：10份Markdown同步；111个本地链接存在、18个POST路由/op与源码对应、5项frame/chunk容量常量一致、代码围栏配对、git diff --check通过。证据 `artifacts/protocol-doc-sync-20261011-check.json`。无代码、构建、设备或部署操作；历史异常和实机边界继续保留。
+
+下文保留10月8日整理经过，当前合同以修订后的docs正文为准。
+
 范围：整理现行源码中的业务合同、HTTP/BLE 映射、认证、事务与会合流程；确认载体解耦程度。只改文档，不构建、部署或操作设备。
 
 追加范围（用户澄清）：将下层执行场景与具体报文协议分开，并独立记录实现符合度。先编写不依赖函数/字段/固定常量的场景合同，再按源码核对 HTTP ready→换接确认→BLE 释放、失败/超时和物理恢复例外；源码存在不等于运行验收。成果分别为 docs/bridge-device-communication-scenarios.md、docs/bridge-device-protocol.md、docs/bridge-device-communication-implementation.md。

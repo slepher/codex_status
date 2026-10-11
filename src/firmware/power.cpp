@@ -6,6 +6,7 @@
 #include "radio_internal.h"
 #include "transport_internal.h"
 #include "application_internal.h"
+#include "data_activity_led.h"
 
 namespace firmware::power {
 
@@ -27,10 +28,6 @@ static uint32_t lastActivityMs = 0;
 static uint32_t pendingWindowUntilMs = 0;
 
 
-static uint32_t ledPulseUntil = 0;
-
-static bool     ledState = false;         // logical LED: BLE ON
-
 #if defined(CODEX_PM) && CONFIG_PM_LIGHT_SLEEP_CALLBACKS
 static uint32_t sleepBucket(int64_t us);
 #endif
@@ -43,7 +40,6 @@ static esp_err_t sleepExitCb(int64_t slept_us, void *);
 static void armWakeSources(uint64_t timerUs);
 static void holdPinsForDeepSleep();
 static void deepSleepRaw(uint32_t sec);
-static void ledApply();
 static bool idleDeepDue();
 static void rememberActiveTemplate();
 
@@ -247,6 +243,7 @@ void releaseWakeHolds() {
 // path where those drivers were never initialized (an uninitialized
 // WiFi.disconnect(true) is a known hang risk).
 static void deepSleepRaw(uint32_t sec) {
+    dataLedStop();
     clock::flushNtpRtcSync();  // do not lose a successful SNTP correction at sleep/reset
     if (sec < 2) sec = 2;
     if (sec > 3600) sec = 3600;
@@ -298,30 +295,6 @@ void deepSleepFor(uint32_t sec) {
     deepSleepRaw(sec);
 }
 
-// GP3 green LED: active low, lit while the BLE session is on.
-static void ledApply() {
-    bool on = ledState;
-    if (ledPulseUntil && (int32_t)(millis() - ledPulseUntil) < 0) on = !on;
-    digitalWrite(3, on ? LOW : HIGH);
-}
-
-void ledSet(bool on) {
-    ledState = on;
-    ledApply();
-}
-
-void ledFlash() {
-    ledPulseUntil = millis() + 80;
-    ledApply();
-}
-
-void serviceLed() {
-    if (ledPulseUntil && (int32_t)(millis() - ledPulseUntil) >= 0) {
-        ledPulseUntil = 0;
-        ledApply();
-    }
-}
-
 void pollPlug() {
     static uint32_t lastPoll = 0;
     static uint32_t unplugStarted = 0;
@@ -336,7 +309,6 @@ void pollPlug() {
     if (now == state.plugged) return;
     state.plugged = now;
     DevLog.printf("[pm] usb %s\n", state.plugged ? "plugged" : "unplugged");
-    ledFlash();
     display::renderCurrent();
     if (state.plugged) {
         radio::state.bleUserOff = false;
@@ -499,6 +471,7 @@ bool deepThinWake() {
 // (GPIO17). On battery the MCU dies here; if USB/charger power keeps the board
 // alive the hold degrades to a clean restart so the device never sits inert.
 void powerOff() {
+    dataLedStop();
     DevLog.println("[pm] PWR held 3s: power off");
     display::epdPanelSleep();
     if (bleInitialized()) {

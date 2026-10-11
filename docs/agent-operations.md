@@ -67,6 +67,8 @@ git diff --check                   # 提交前必查
 
 ## 模板缺省显示
 
+- 2026-10-11最新字段候选：device.state已退役，JSON/持久CT/Bridge/预览均拒绝，不自动兼容；只使用wifi_state、wifi_blink、ble_manual_active、mode等独立字段。旧已安装模板加载不支持时进入内置恢复并报告content_error，文件保留，需显式发布替换。模板候选为quad v14、Note4 codex-status-a v5；现场仍v4，暂不刷固件/发布，见PROGRESS。
+
 - Note4 .81新增本地数值绑定 `device.ble_manual_active=0/1`：图标只表示手动GATT窗口，自动BLE和实际射频状态另记。实际codex-status-a v4已发布（保留用户原布局）；仓库夹具不能直接替代实际模板。数据字段表在同名模板发布后也可能变化，Bridge须认证回读新data_contract再发Data。
 
 - Wi-Fi元数据（2026-10-11源码候选）：`device.wifi_state=idle/connecting/connected/off`；`device.wifi_blink=0/1`仅connecting存在。固件不决定图形；quad v13、Note4 codex-status-a v3由when实现等待隐藏、连接交替闪烁、成功常亮、终态OFF。Bridge图标仍仅依联系新鲜度，不从Wi-Fi阶段推断。新模板需对应支持新绑定的固件，保存不等于发布；.75部署状态见交接卡。
@@ -90,7 +92,7 @@ git diff --check                   # 提交前必查
 - esptool 默认/`usb-reset` 进入 ROM 下载模式以及结束后的 `hard-reset` 是**工具主动复位**，与被动监听分开记账；`--before no-reset` 不会让正在运行的应用自动具备 flash 读取能力。打开/关闭串口前后记录时间、工具/参数、控制线策略、boot_id/uptime/reset_reason，并用 ROM reset 文本核验；公共 `reset=unknown` 不能替代 ROM 原因。固件 `panic` / 认证 `reset_reason=4`、WDT、brownout、深睡唤醒和工具 USB 复位分别判断。
 - 用户授权后可通过串口只读导出 dump：先保存可获取的网络现场，核对实际分区表及 MAC；当前 Note4 coredump 为 `0xB00000` 起、`0x100000` 字节。先私有保存原始 dump、实际分区表、匹配 ELF 与 SHA256，再校验完整性并解码；dump 可能含凭据，不提交、不完整打印。导出不得顺带擦 dump、写 ROM/分区/NVS；工具进入下载模式及恢复应用的复位单列记录。现有配置允许新 panic 覆盖旧 dump，应优先保全。
 - OTA：上传成功后延迟 1.5s 重启，HTTP 先返回 `UPDATE OK`（客户端超时属既有现象）；双槽 ota_0/ota_1 轮换。
-- 状态可读：`GET /status.json`（恢复/现场视图）、认证 `GET /api/status`（业务状态）、`GET /log`（统一诊断流视图）与 `GET /pmstats`（PM light-sleep 统计/锁，0.13.0+，只读免 token）。Bridge 注册须核对结构化状态和认证状态的 MAC；旧 HTML 状态页回退与 `claim_unsupported`（固件 <0.13.4）已删除。
+- 状态可读：`GET /status.json`（恢复/现场视图）、认证 `POST /api/status`（48 B frame业务状态，不能发送裸JSON）、`GET /log`（统一诊断流视图）与 `GET /pmstats`（PM light-sleep 统计/锁，0.13.0+，只读免 token）。Bridge 注册须核对结构化状态和认证状态的 MAC；旧 HTML 状态页回退与 `claim_unsupported`（固件 <0.13.4）已删除。
 - `cargo test --workspace` 可能因运行中的 `bridge-core.exe` 锁定 `target/debug` 失败（不是逻辑失败）；改用隔离 `CARGO_TARGET_DIR` 复测，或核实进程后由用户决定是否停桥。
 - Windows 控制台为 GBK：Python 桥启动时设 `PYTHONIOENCODING=utf-8`，避免 status notify 打印异常。
 - BLE 写入须按 MTU 分片（usage/模板），单次超 MTU 会 `Invalid Attribute Value Length`。

@@ -14,8 +14,8 @@
 | 查历史里程碑（0.13–0.18 各轮实机修复） | `docs/history/progress-archive-2026-09-23.md`（≤09-22）、`docs/history/progress-archive-2026-09-25.md`（09-24 及合并过程）、[2026-10-03 归档](history/progress-archive-2026-10-03.md)（09-25 至 10-03 较早记录） |
 | 改协议/模板/渲染 | `docs/generic-display-platform-design.md`（权威架构）+ `AGENTS.md` §协议与产品不变量 |
 | 改固件启动/调度或查 main 胶水层后的模块归属 | [固件模块化计划](../project-workflow/firmware-modularization/plan.md) → [边界与验收](../project-workflow/firmware-modularization/review.md)；代码在 `src/firmware/` |
-| 查 Bridge—设备协议分层、HTTP/BLE 映射与当前差异 | [bridge-device-protocol.md](bridge-device-protocol.md)（2026-10-08 按源码核对；先业务合同，后载体绑定） |
-| 查 HTTP 直达、BLE 交汇及先 ready 后关闭 BLE 的应有行为 | [bridge-device-communication-scenarios.md](bridge-device-communication-scenarios.md)（场景合同）→ [bridge-device-communication-implementation.md](bridge-device-communication-implementation.md)（源码证据与验收边界） |
+| 查 Bridge—设备协议分层、HTTP/BLE 映射与当前差异 | [bridge-device-protocol.md](bridge-device-protocol.md)（2026-10-11按9c38e45核对；先业务合同，后48 B frame绑定） |
+| 查HTTP直达、BLE提前结束与独立HTTP报告的应有行为 | [bridge-device-communication-scenarios.md](bridge-device-communication-scenarios.md)（场景合同）→ [bridge-device-communication-implementation.md](bridge-device-communication-implementation.md)（源码证据与验收边界） |
 | 判断历史协议哪些已过期、哪些遗漏或仍是草案 | [bridge-device-protocol-history-audit.md](bridge-device-protocol-history-audit.md)（定向历史对账，当前源码/现场交叉核对） |
 | 查同父目录 Slate 的协议参考及适用边界 | [bridge-device-slate-protocol-comparison.md](bridge-device-slate-protocol-comparison.md)（schema、错误、摘要、生命周期；只读比较） |
 | 查 CUKTECH 控制器与 AP01 ROM 对当前平台的价值 | [cuktech-ap01-repository-value-analysis.md](cuktech-ap01-repository-value-analysis.md)（三仓库对照、可复用接口、显示交接、完整接入成本） |
@@ -31,7 +31,7 @@
 | 实施设备页离线 BLE 配网、绑定独立方案与 BOOT 恢复 | `project-workflow/bridge-macos/wifi-redesign.md`（最新全量管理/UI 重设计）→ `remaining-plan.md` R0–R4 / `wifi-protocol.md`；统一协议已配套部署，完整 RF/跨平台/双板矩阵仍待验，仅 Note4 在场，见 backlog B6 |
 | 改模拟器/实验时钟 | `docs/fake-rom-simulator-design.md` + `docs/history/workflow/fake-rom-simulator-def/evidence.md`（D/E/F 已结项） |
 | 改字体资产 | `docs/font-asset-format.md` + `project-workflow/note4-bridge-publish/protocol.md`（**草案，未定稿**） |
-| 改单份 Bundle/应用更新与动态容量，查 AP01 压缩预算 | `project-workflow/single-copy-updates/status.md` → `design.md`（C9，候选实现与待验项） |
+| 改单份 Bundle/应用更新与动态容量，查 AP01 压缩预算 | `project-workflow/single-copy-updates/status.md` → `design.md`（C9，Note4已部署与剩余实机边界） |
 | 查缺陷结案 | `docs/history/bugs-2026-09-22.md`（原 `bugs.md`，已结案） |
 
 ## 活跃文档（`docs/` 根目录，仍在演进）
@@ -39,9 +39,9 @@
 | 文件 | 状态 | 说明 |
 |---|---|---|
 | `bridge-device-protocol.md` | 源码核对说明 | Bridge—设备业务合同、HTTP/BLE wire、认证/事务/会合、能力边界及旧设计差异 |
-| `bridge-device-compact-envelope-design.md` | 提案，未实施 | 固定 48 B 二进制信封、认证会话绑定、结果与上下文语义、HTTP/BLE 映射及迁移边界 |
-| `bridge-device-communication-scenarios.md` | 应有行为 | S01–S14 下层执行场景，独立于具体报文与实现 |
-| `bridge-device-communication-implementation.md` | 源码对照 | 场景的当前处理分支、ready/收尾差异及未验收边界 |
+| `bridge-device-compact-envelope-design.md` | 已实现编码合同 | 固定48 B头、认证会话、HTTP/BLE映射；业务JSON仍保留身份字段，完整实机矩阵未结项 |
+| `bridge-device-communication-scenarios.md` | 应有行为 | S01–S24下层执行场景，独立于具体报文与实现 |
+| `bridge-device-communication-implementation.md` | 源码对照 | 基线9c38e45的处理分支、HTTP报告/PPL1/单份Bundle/OTA与既有验收边界 |
 | `bridge-device-protocol-history-audit.md` | 历史对账 | 过期实现/现场、遗漏合同、待实现方案及验收边界分别记录 |
 | `bridge-device-slate-protocol-comparison.md` | 参考比较 | Slate 的可借鉴原则、已有等价机制与不能照搬的身份/事务/提交语义 |
 | `generic-display-platform-design.md` | **权威** | 通用显示平台现行架构。与它冲突的旧描述一律以它为准 |
@@ -80,7 +80,7 @@ Fake ROM D/E/F 已结项并归档；下表只列仍需推进的专项。
 | `clock-window-retention` | 1.54 时钟窗口保留修正已构建但未刷机、未实机复测 |
 | `bridge-multi-device-ui` | 按 MAC 推送与统一族发布菜单未实现 |
 | `sleep-aware-bridge` | S1–S4 已实现，S5 的硬件故障矩阵仍待验证；方案与现场见该目录和 PROGRESS |
-| `bridge-macos` | 仅规划；首版要求 Windows 已运行的 BLE/低功耗 `device_first` 对等，未实施 |
+| `bridge-macos` | 配套实现与多轮部署已进行；Windows/Note4当前基线见PROGRESS，macOS、RF/电池及长期矩阵仍开放 |
 | `bridge-family-sync-preservation` | 源码已修但未进入运行桥；未部署就有覆盖设备 `sync_enabled` 的风险 |
 | `ble-rendezvous-power` | stage 3–6 全部未实现 |
 | `power-plan-c` / `power-state` / `sleep-battery` | 功耗基线、整机硬件验收、M3 验收未闭环 |
@@ -112,4 +112,4 @@ Fake ROM D/E/F 已结项并归档；下表只列仍需推进的专项。
 - 待办只写在 `docs/roadmap/backlog.md`；不要在 `PROGRESS.md`、`AGENTS.md` 或 `status.md` 里另开一份待办清单。
 - 专项完成后：把结论与证据搬进 `PROGRESS.md`，从 backlog 删除该条，专项目录按上面的判据归档。
 
-协议精简及提前结束BLE的新设计，Astra High审核与分阶段实施见 [审核记录](../project-workflow/bridge-macos/bridge-device-compact-protocol-review.md) / [实施计划](../project-workflow/bridge-macos/bridge-device-compact-protocol-implementation-plan.md)；执行规则权威入口为通信场景，编码入口为48 B信封设计，当前实现证据独立保留。
+协议精简及提前结束BLE的原审核与分阶段实施经过见 [审核记录](../project-workflow/bridge-macos/bridge-device-compact-protocol-review.md) / [实施计划](../project-workflow/bridge-macos/bridge-device-compact-protocol-implementation-plan.md)；执行规则权威入口为通信场景，编码入口为48 B信封设计，当前实现与已部署/未验边界见实现对照，不把原计划中的“未实施”当今日状态。
