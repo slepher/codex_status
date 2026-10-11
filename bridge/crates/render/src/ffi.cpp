@@ -120,6 +120,7 @@ const char *simRender(SimBundleDevice &device) {
     env.battery = 75;
     env.state = device.deep ? "DEEP" : (device.wifiUp ? "WIFI ON" : "WIFI OFF");
     env.mode = device.deep ? "deep" : "light";
+    env.wifiState = device.deep ? "off" : (device.wifiUp ? "connected" : "idle");
     env.offlineMins = bridgeOfflineMinutes((uint32_t)device.wallEpochSecs,
         device.lastBridgeContact, device.hasWallEpoch, 6, -1);
     env.hasNowEpoch = device.hasWallEpoch;
@@ -683,7 +684,7 @@ int codex_bundle_font_reboot() {
 }
 
 int codex_render(const char *tmpl, const char *usage, const char *channel, const char *ip,
-                 const char *sync_hhmm, int battery, const char *state, int offline_mins,
+                 const char *sync_hhmm, int battery, const char *state, const char *wifi_state, int wifi_blink, int offline_mins,
                  const char *mode, uint8_t *out, int out_len) {
     if (!tmpl || !out || out_len < ((g_canvas_w + 7) / 8) * g_canvas_h) return -2;
     Paint_NewImage(out, g_canvas_w, g_canvas_h, ROTATE_0, WHITE);
@@ -694,6 +695,8 @@ int codex_render(const char *tmpl, const char *usage, const char *channel, const
     env.syncHHMM = sync_hhmm ? sync_hhmm : "--:--";
     env.battery = battery;
     env.state = state ? state : "";
+    env.wifiState = wifi_state ? wifi_state : "";
+    env.wifiBlink = wifi_blink;
     env.offlineMins = offline_mins;
     env.mode = mode ? mode : "";
     return tplDraw(String(tmpl), String(usage ? usage : ""), env) ? 1 : 0;
@@ -728,6 +731,7 @@ int codex_compile(const char *tmpl, char *err, int err_len) {
 
 int codex_render_compiled(const char *usage, const char *channel, const char *ip,
                           const char *sync_hhmm, int battery, const char *state,
+                         const char *wifi_state, int wifi_blink,
                           int offline_mins, const char *mode, uint8_t *out, int out_len) {
     if (!out || out_len < ((g_canvas_w + 7) / 8) * g_canvas_h) return -2;
     if (!g_ct_valid) return -4;
@@ -739,6 +743,8 @@ int codex_render_compiled(const char *usage, const char *channel, const char *ip
     env.syncHHMM = sync_hhmm ? sync_hhmm : "--:--";
     env.battery = battery;
     env.state = state ? state : "";
+    env.wifiState = wifi_state ? wifi_state : "";
+    env.wifiBlink = wifi_blink;
     env.offlineMins = offline_mins;
     env.mode = mode ? mode : "";
     return tplDrawCt(g_ct, String(usage ? usage : ""), env) ? 1 : 0;
@@ -1295,6 +1301,8 @@ int codex_ble_wire(const char *kind, const char *input, char *out, int cap) {
         snapshot.remainingS = doc["power"]["remaining_s"] | 0u;
         snapshot.provisionalS = doc["power"]["provisional_remaining_s"] | 0u;
         snapshot.rendezvousVersion = doc["rendezvous_v"] | 0;
+        snapshot.automaticContact = doc["automatic_contact"] | true;
+        snapshot.networkError = doc["network_error"] | (const char *)nullptr;
         snapshot.syncAvailable = doc["sync"]["v"] == 1; snapshot.syncEnabled = doc["sync"]["enabled"] | false;
         snapshot.rounds = doc["sync"]["rounds"] | 0; snapshot.retrySkip = doc["sync"]["retry_skip"] | 0;
         snapshot.due = doc["sync"]["due"] | false; snapshot.pending = doc["sync"]["pending"] | false;

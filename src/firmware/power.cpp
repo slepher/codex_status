@@ -5,6 +5,7 @@
 #include "platform_internal.h"
 #include "radio_internal.h"
 #include "transport_internal.h"
+#include "application_internal.h"
 
 namespace firmware::power {
 
@@ -269,6 +270,8 @@ static void deepSleepRaw(uint32_t sec) {
 // Full transition cleanup (light -> deep and the network-window paths): put
 // the panel to sleep, stop BLE and disconnect Wi-Fi if it was ever up.
 void deepSleepFor(uint32_t sec) {
+    application::captureStartupBoot();
+    if (state.bleRecovery.lightRemaining(clock::v2NowMs()) || v2ManualBleHoldActive()) return;
 #if defined(CODEX_TARGET_NOTE4)
     display::note4SaveFrameBaseline();
 #endif
@@ -328,7 +331,6 @@ void pollPlug() {
     if (state.plugged) {
         radio::state.bleUserOff = false;
         state.batteryPct = batteryPercent();
-        if (radio::state.wifiUp && !radio::state.bleOn && !retained.rtcDeepOnUsb && state.batteryPct > BLE_AUTO_PCT) radio::enterBleOn(false);
     }
 }
 
@@ -342,17 +344,22 @@ void checkBattery() {
         DevLog.println("[pm] battery <5%: power off");
         powerOff();
     }
-    if (state.plugged && !retained.rtcDeepOnUsb && radio::state.wifiUp && !radio::state.bleOn && !radio::state.bleUserOff && state.batteryPct > BLE_AUTO_PCT) radio::enterBleOn(false);
 }
 
 void handleBootClick() {
     if (millis() - lastBootAction < 1000) return;   // 1 s throttle
     lastBootAction = millis();
-    if (v2ManualBleHoldActive()) {
-        radio::state.bleUserOff = true;
-        radio::bleOff("user click");
-    } else {
+    if (state.bleRecovery.toggle(clock::v2NowMs())) {
+        state.v2BootMs = clock::v2NowMs();
+        state.v2Provisional = true;
+        retained.rtcMode = MODE_LIGHT;
+        persistMode();
         radio::enterBleOn(true);
+    } else {
+        // Withdraw the open-window preference; an in-flight protocol exchange
+        // owns the radio until its ordinary bounded completion.
+        bleOpenPairingWindow(0);
+        radio::serviceBleSession();
     }
 }
 
@@ -408,8 +415,10 @@ bool deepNetDue() {
 
 // Light -> deep transition: capture the clock window, mark the mode and sleep.
 void enterDeep(const char *reason) {
+    application::captureStartupBoot();
     // Every deep-sleep path must honor the PC USB keep-awake policy.
-    if ((state.plugged && !retained.rtcDeepOnUsb) || v2ManualBleHoldActive()) return;
+    if ((state.plugged && !retained.rtcDeepOnUsb) ||
+        state.bleRecovery.lightRemaining(clock::v2NowMs()) || v2ManualBleHoldActive()) return;
     diagnostics::setStage(19);
     if (display::retained.clkR.valid && display::state.lastDisplayedFrame) display::clkCaptureFromFramebuffer();
     retained.rtcNextContactS = V2_RENDEZVOUS_S;

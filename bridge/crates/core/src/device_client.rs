@@ -207,7 +207,7 @@ fn request(
     frame.extend_from_slice(payload);
     let (status, response) = transport_request(ip, "POST", path, token, Some(&frame),
         extra_headers, CONTENT_TYPE, deadline.saturating_duration_since(Instant::now()))?;
-    if status == 401 && op != 4 { return Err(HttpStatus(401).into()); }
+    if matches!(status, 401 | 403) && op != 4 { return Err(HttpStatus(status).into()); }
     let (ack, bytes) = Header::decode(&response, MAX_HTTP_FRAME)
         .map_err(|e| anyhow!("device protocol mismatch: {e}; update Bridge and device software"))?;
     if status == 409 && serde_json::from_slice::<Value>(bytes).ok()
@@ -332,6 +332,15 @@ fn post_json(ip: &str, path: &str, token: &str, body: &Value, timeout: Duration)
     );
     if status == 409 {
         let parsed: Value = serde_json::from_str(&response_body).unwrap_or(Value::Null);
+        // A protocol conflict is not necessarily an ownership conflict. Keep
+        // the device's rejection (including its identity and failure stage)
+        // so callers can handle stale revisions without discarding edits.
+        if (parsed["result"] == "rejected" || parsed["ok"] == false)
+            && parsed["error"].as_str().is_some_and(|code|
+                !code.is_empty() && code.len() <= 64 && code.bytes().all(|b|b.is_ascii_alphanumeric() || b == b'_'))
+        {
+            return Ok(parsed);
+        }
         return Ok(json!({"result": "rejected", "error": "occupied", "detail": parsed}));
     }
     if !(200..300).contains(&status) { return Err(HttpStatus(status).into()); }
@@ -850,9 +859,11 @@ mod tests {
         let mac = "AABBCCDDEEFF";
         for (status, body, expected) in [
             (401, json!({"secret":"must-not-expose"}).to_string(), ("failed", "unauthorized")),
+            (403, json!({"secret":"must-not-expose"}).to_string(), ("failed", "unauthorized")),
             (200, "{".into(), ("failed", "snapshot_shape")),
             (200, json!({"device_mac":mac,"ok":false,"error":"snapshot_expired"}).to_string(), ("waiting_rendezvous", "snapshot_expired")),
             (200, json!({"device_mac":mac,"ok":false,"error":"revision_conflict"}).to_string(), ("conflict", "revision_conflict")),
+            (409, json!({"device_mac":mac,"ok":false,"error":"revision_conflict","stage":"revision"}).to_string(), ("conflict", "revision_conflict")),
             (200, json!({"device_mac":"112233445566","ok":true}).to_string(), ("failed", "snapshot_mismatch")),
             (200, json!({"device_mac":mac,"ok":true,"schema":2,"snapshot_id":"s","revision":1,"total":2,"offset":1,"next_offset":2,"chunk":"{}","done":true}).to_string(), ("failed", "snapshot_mismatch")),
         ] {

@@ -824,6 +824,9 @@ impl Coordinator {
         self.session.display_state = text("display_state");
         self.session.last_status_at = Some(now);
         if let Some(power) = status.get("power") {
+            if let Some(remaining) = power["manual_remaining_s"].as_u64().filter(|s| *s > 0 && *s <= 300) {
+                self.note_manual_window(now.saturating_sub(300 - remaining));
+            }
             if let Some(plan_id) = power.get("plan_id").and_then(|v| v.as_u64()) {
                 self.device_plan_high = self.device_plan_high.max(plan_id);
             }
@@ -1359,6 +1362,19 @@ mod tests {
             c.boot_plan(1400, 1000, false, 300).mode,
             crate::platform::model::PlanMode::Sleep
         );
+    }
+
+    #[test]
+    fn authenticated_manual_window_survives_plan_and_only_new_boot_extends_it() {
+        let mut c=coord();
+        c.note_status(&serde_json::json!({"power":{"manual_remaining_s":295}}),1005);
+        assert_eq!(c.manual_remaining(1100),200);
+        c.note_status(&serde_json::json!({"power":{"plan_id":8,"manual_remaining_s":200}}),1100);
+        assert_eq!(c.manual_remaining(1200),100);
+        c.note_status(&serde_json::json!({"power":{"plan_id":8,"manual_remaining_s":300}}),1200);
+        assert_eq!(c.manual_remaining(1300),200);
+        c.note_status(&serde_json::json!({"power":{"manual_remaining_s":301}}),1300);
+        assert_eq!(c.manual_remaining(1500),0);
     }
 
     #[test]

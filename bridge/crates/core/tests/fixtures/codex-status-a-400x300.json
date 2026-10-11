@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "id": "codex-status-a",
-  "version": 2,
-  "min_fw": "0.18.36-note4-b-layout1",
+  "version": 3,
+  "min_fw": "0.18.75-note4",
   "render_target": "epd-ssd2683-400x300-1bpp",
   "canvas": {
     "w": 400,
@@ -86,8 +86,8 @@
       "bits": "AAAAAAAAA8AfwDwA8ADAwIfADwAcABAAAcADwAMAAAAAQABAAAAAAA==",
       "color": "black",
       "when": {
-        "bind": "device.state",
-        "equals": "BLE ON"
+        "bind": "device.wifi_state",
+        "equals": "connected"
       }
     },
     {
@@ -99,8 +99,8 @@
       "bits": "AAAAAAAA8AD+AA8AA8DAwPhAPAAOAAIA4ADwADAAAACAAIAAAAAAAA==",
       "color": "black",
       "when": {
-        "bind": "device.state",
-        "equals": "BLE ON"
+        "bind": "device.wifi_state",
+        "equals": "connected"
       }
     },
     {
@@ -112,8 +112,8 @@
       "bits": "AAAAAAAAA8AfwDwA8ADAwIfADwAcABAAAcADwAMAAAAAQABAAAAAAA==",
       "color": "black",
       "when": {
-        "bind": "device.state",
-        "equals": "BLE OFF"
+        "bind": "device.wifi_blink",
+        "equals": 1
       }
     },
     {
@@ -125,34 +125,8 @@
       "bits": "AAAAAAAA8AD+AA8AA8DAwPhAPAAOAAIA4ADwADAAAACAAIAAAAAAAA==",
       "color": "black",
       "when": {
-        "bind": "device.state",
-        "equals": "BLE OFF"
-      }
-    },
-    {
-      "type": "icon",
-      "x": 272,
-      "y": 8,
-      "w": 10,
-      "h": 20,
-      "bits": "AAAAAAAAA8AfwDwA8ADAwIfADwAcABAAAcADwAMAAAAAQABAAAAAAA==",
-      "color": "black",
-      "when": {
-        "bind": "device.state",
-        "equals": "WIFI CONN"
-      }
-    },
-    {
-      "type": "icon",
-      "x": 282,
-      "y": 8,
-      "w": 10,
-      "h": 20,
-      "bits": "AAAAAAAA8AD+AA8AA8DAwPhAPAAOAAIA4ADwADAAAACAAIAAAAAAAA==",
-      "color": "black",
-      "when": {
-        "bind": "device.state",
-        "equals": "WIFI CONN"
+        "bind": "device.wifi_blink",
+        "equals": 1
       }
     },
     {
@@ -164,8 +138,8 @@
       "bits": "AAAAAABAA0AfQDxA8EDAQIdAD0AcQBBAAQADAAMAAAAAQABAAAAAAA==",
       "color": "black",
       "when": {
-        "bind": "device.state",
-        "equals": "WIFI OFF"
+        "bind": "device.wifi_state",
+        "equals": "off"
       }
     },
     {
@@ -177,8 +151,8 @@
       "bits": "AAAAAIAAsAC+AI8Ag8CAwLhAvACOAIIAIAAwADAAAACAAIAAAAAAAA==",
       "color": "black",
       "when": {
-        "bind": "device.state",
-        "equals": "WIFI OFF"
+        "bind": "device.wifi_state",
+        "equals": "off"
       }
     },
     {

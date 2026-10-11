@@ -1294,6 +1294,9 @@ void handleV2Status() {
     doc["heap_min"] = ESP.getMinFreeHeap();
     JsonObject radio = doc["radio"].to<JsonObject>();
     radio["wifi_connected"] = WiFi.status() == WL_CONNECTED;
+    radio["wifi_state"] = wifiPhaseText(radio::wifiPhase());
+    if (radio::state.wifiConnActive) radio["wifi_blink"] = radio::state.wifiBlinkOn ? 1 : 0;
+    else radio["wifi_blink"] = nullptr;
     radio["rssi"] = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0;
     radio["ble_connected"] = bleIsConnected();
     JsonObject display = doc["display"].to<JsonObject>();

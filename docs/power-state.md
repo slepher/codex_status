@@ -53,8 +53,11 @@ v0.12 已于 0.12.x 实现（§1–§12 描述现行固件）；v0.14 deep/light
 
 ## 4. 按键与 LED
 
+**2026-10-11 最终修订（覆盖本文件后续旧 BLE 常驻/重试叙述）**：BOOT 从深睡建立 300s Light 和 120s 蓝牙开放窗口；清醒后短按交替关闭/开启开放配置，关闭不延期且不强制中断必要 BLE，再次打开从该按键重算 300s/120s，Wi-Fi 激活配置不变。首次先 BLE 获取不含密码的已存网络选择，无选择回退上次成功网络。Wi-Fi及Bridge HTTP正常只用主动HTTP，常开BLE仅供主动GATT；关联/DHCP或Bridge HTTP失败均走有界BLE报告/下一周期恢复。USB不自动常开BLE。见[最终合同与实施](../project-workflow/bridge-macos/boot-network-20261011.md)。
+
+
 - **BOOT 单击**（<2s 释放；1s 节流，屏幕始终反映最终状态）：
-  任意可操作态 → 固定 120s 物理恢复；恢复中再次短击关闭（不延长）。普通 USB BLE 已开时短击仍打开独立恢复授权。GPIO0 深睡唤醒直接进入该恢复，无需第二次按键；PWR 保留原 provisional。
+  任意可操作态 → 开启 120s 蓝牙窗口与 300s Light；窗口开启时再次短击撤销蓝牙开放要求，再次打开才重新计时。GPIO0 深睡唤醒直接建立两窗口，无需第二次按键；PWR 建立独立300s Light下界，不强制蓝牙常开。初始化期间GPIO0边沿锁存，达到50ms的按下保留人工意图；已作为GPIO0唤醒来源的同一次按下不重复处理。时钟快速路径和交汇收尾均不得绕过有效人工窗口。
 - **BOOT 2s**：切下一个本地模板（0.13.2 起不再顺带开 BLE 会话；需要 BLE
   用单击）。
 - **BOOT 15s**：进入 AP 配网模式。
@@ -93,6 +96,8 @@ HTTP就绪、PowerPlan接受与CPU light-sleep分别记账。HTTP交接阶段20s
 - Wi-Fi 恢复后：插电且 >20% → 回 BLE ON 常开；否则回 IDLE。
 
 ## 7. 屏幕状态字与模板协议
+
+- **2026-10-11 模板 Wi-Fi 元数据（.75源码候选，未部署）**：`device.wifi_state` 为 `idle`（尚未联网/等待开网）、`connecting`（实际关联或等待IP）、`connected`（已取得IP）、`off`（已结束失败/丢失处理/已决定深睡关网）。等待BLE不是关联，数据ACK不改变Wi-Fi事实。`device.wifi_blink`仅在connecting存在，值0/1，以配置间隔交替；其他阶段不存在。固件只提供状态/相位和触发重绘，不选图标。当前quad v13与Note4 codex-status-a v3按when隐藏idle/暗相位、显示亮相位/connected、独立OFF；Bridge图标只依据联系新鲜度。旧`device.state`保留兼容，等待返回WIFI WAIT、连接暗相位返回WIFI BLINK OFF，不再借WIFI OFF表示中间态。以此修订替代下方历史图标描述；模板保存不自动发布。
 
 - `device.state` 绑定值 = `BLE ON` / `BLE OFF` / `WIFI OFF` / `AP`
   （WIFI OFF 优先于 BLE ON；正常 IDLE 显示 `BLE OFF`）。

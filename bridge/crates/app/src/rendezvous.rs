@@ -113,6 +113,10 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
         service(ctx)
             .note_ble_contact_at(&mac, received_at)
             .map_err(err_text)?;
+        // BOOT may expose GATT while all normal contact remains on HTTP.
+        if state["automatic_contact"] == false {
+            return Ok((state, false, false, false));
+        }
         claim_on_ble(ctx, &mac, &mut link).await?;
         let sync_capable = state["sync"]["v"] == 1;
         let mut sync_enabled = state["sync"]["enabled"] == true;
@@ -124,22 +128,28 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
         let decision = service(ctx).next_delivery(&mac, true, device_now(&mac));
         let pending_data = (decision["decision"] == "ble_data")
             .then(|| service(ctx).data_message_body(&mac)).flatten();
-        let needs_http = !admitted_wifi.is_empty()
+        let remaining = state["power"]["provisional_remaining_s"]
+            .as_u64().unwrap_or(0).min(300) as u32;
+        let failure_report = state["network_error"].as_str().is_some();
+        let needs_http = !failure_report && (remaining > 0 ||
+            (state["power"]["mode"] == "light" && state["power"]["remaining_s"].as_u64().unwrap_or(0) > 0) || !admitted_wifi.is_empty()
             || service(ctx).wifi_state(&mac).connection.is_some_and(|c| c.state == "requested")
             || matches!(decision["decision"].as_str(), Some("light_data" | "bundle" | "activate" | "waiting_for_device_contract"))
             || service(ctx).ota_job(&mac).is_some_and(|job|
                 matches!(job.state.as_str(), "queued" | "awaiting_confirmation"))
             || (sync_enabled && state["sync"]["retry_skip"] == 0
-                && (state["sync"]["due"] == true || state["sync"]["pending"] == true));
+                && (state["sync"]["due"] == true || state["sync"]["pending"] == true)));
+        if failure_report {
+            tracing::info!(event="wifi_failure_report", device_mac=%mac,
+                reason=state["network_error"].as_str().unwrap_or("unknown"),
+                "device network attempt ended; next period may retry");
+        }
         tracing::info!(event="network_admission",device_mac=%mac,needs_http,
             delivery=decision["decision"].as_str().unwrap_or("unknown"),
             wifi_jobs=admitted_wifi.len(),
             ota_state=service(ctx).ota_job(&mac).map(|job|job.state).as_deref().unwrap_or("none"),
             diagnostics_due=state["sync"]["due"]==true,
             "rendezvous network work admission");
-        let remaining = state["power"]["provisional_remaining_s"]
-            .as_u64()
-            .unwrap_or(0) as u32;
         // A reachable HTTP service can complete admitted work directly.
         let reachable = if !needs_http { false } else if let Some(target) = device_link_for_mac(ctx, &mac) {
             let expected = mac.clone();
@@ -158,7 +168,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
         let requested = service(ctx).wifi_state(&mac).connection.is_some_and(|c| c.state=="requested");
         state["_wifi_repair"] = json!(needs_http && (!reachable || requested));
         if reachable && !requested { crate::wifi::http_ready(ctx, &mac); }
-        else if needs_http {
+        else if needs_http && remaining == 0 {
             let _=tokio::time::timeout(Duration::from_millis(700),crate::wifi::prepare_connection(ctx,&mac,&mut link,remaining>0)).await;
             if !reachable { crate::wifi::http_failed(ctx,&mac,"http_unavailable"); }
         }
@@ -255,7 +265,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             "device PowerPlan acknowledgement"
         );
         let mut sync_opened = false;
-        let should_open = sync_enabled
+        let should_open = !failure_report && sync_enabled
             && state["sync"]["retry_skip"] == 0
             && (state["sync"]["due"] == true || state["sync"]["pending"] == true);
         if should_open && !ack_unknown {
@@ -350,6 +360,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
                     &mac,
                     &mut link,
                     shared_tail,
+                    state["power"]["provisional_remaining_s"].as_u64().unwrap_or(0) > 0,
                 )
                 .await { wifi_repair_error = Some(error); }
             }
@@ -445,7 +456,8 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
         }
     }
     let sync_opened = normal_result.as_ref()
-        .is_ok_and(|(_, enabled, opened, light)| *opened || (*enabled && *light));
+        .is_ok_and(|(state, enabled, opened, light)|
+            state["_need_http"] == true && (*opened || (*enabled && *light)));
     let may_continue = normal_result.as_ref().is_ok_and(|(state, _, _, light)|
         *light && state["_need_http"] == true);
     let result = normal_result.map(|_| ());
@@ -532,8 +544,11 @@ fn matching_http(
             }
         }
         let rv = &status["rendezvous"];
+        // The report ACK moves rendezvous to AckGrace/Done; it does not revoke
+        // HTTP. The authenticated transport fact belongs to the same boot,
+        // wake and Plan checked above. Ownership is checked before any work.
         if rv["v"] != 1
-            || rv["ready"] != true
+            || status["transports"]["http"]["ready"] != true
             || rv["id"].as_str().is_none_or(str::is_empty)
         {
             return Err("http_not_ready".into());
@@ -610,12 +625,18 @@ async fn wait_for_device_http(
                 Err(error)
                     if matches!(
                         error.as_str(),
-                        "http_identity_mismatch" | "http_session_mismatch" | "http_wake_mismatch"
+                        "http_identity_mismatch" | "http_session_mismatch" | "http_wake_mismatch" | "plan_expired"
                     ) =>
                 {
                     return Err(error)
                 }
-                Err(error) => last = error,
+                Err(error) => {
+                    if error != last {
+                        tracing::info!(event="http_proof",device_mac=%mac,plan_id,
+                            stage="matching_status",error_category=%error,"HTTP proof not yet confirmed");
+                    }
+                    last = error;
+                },
             }
         }
         tokio::time::sleep(budget.remaining().min(Duration::from_millis(100))).await;
@@ -626,10 +647,21 @@ async fn wait_for_device_http(
 mod tests {
     use super::*;
     #[test]
+    fn protocol_http_remains_usable_after_ready_report_ack() {
+        let ble=json!({"session_nonce":"boot","wake_generation":2,"wake_seq":9,
+            "_sent_plan":{"mode":"light"}});
+        let mut status=json!({"device_mac":"7C4FADB93408","session_nonce":"boot",
+            "wake_generation":2,"wake_seq":9,"power":{"plan_id":101,"mode":"light","remaining_s":100},
+            "transports":{"http":{"ready":true}},"rendezvous":{"v":1,"ready":false,"id":"rv","remaining_ms":0}});
+        assert!(matching_http(&status,"7C4FADB93408",&ble,101,true).is_ok());
+        status["transports"]["http"]["ready"]=json!(false);
+        assert_eq!(matching_http(&status,"7C4FADB93408",&ble,101,true),Err("http_not_ready".into()));
+    }
+    #[test]
     fn device_http_status_rejects_wrong_session_wake_and_plan() {
         let ble = json!({"session_nonce":"boot","wake_generation":2,"wake_seq":9,"_sent_plan":{"mode":"light"}});
         let status = json!({"device_mac":"7C4FADB93408","session_nonce":"boot","wake_generation":2,"wake_seq":9,
-            "power":{"plan_id":101,"mode":"light","remaining_s":100},"rendezvous":{"v":1,"ready":true,"id":"rv"}});
+            "power":{"plan_id":101,"mode":"light","remaining_s":100},"transports":{"http":{"ready":true}},"rendezvous":{"v":1,"ready":true,"id":"rv"}});
         assert!(matching_http(&status, "7C4FADB93408", &ble, 101, true).is_ok());
         for (key, value) in [
             ("device_mac", json!("70041DD7A340")),

@@ -74,6 +74,9 @@ String bleBuildStatus(const BleStatusSnapshot &s) {
     JsonDocument doc;
     doc["op"] = "status"; doc["device_mac"] = s.mac;
     if (s.rendezvousVersion) doc["rendezvous_v"] = s.rendezvousVersion;
+    doc["ac"] = s.automaticContact;
+    if (s.networkError) doc["ne"] = !strcmp(s.networkError,"bridge_http_unreachable") ? 2 :
+        !strcmp(s.networkError,"wifi_link_lost") ? 3 : 1;
     JsonArray a = doc["s"].to<JsonArray>();
     a.add(s.nonce); a.add(encoded(s.context)); a.add(encoded(s.activeTemplate)); a.add(encoded(s.job));
     a.add(s.appliedSeq); a.add(s.light); a.add(s.planId); a.add(s.remainingS); a.add(s.provisionalS);

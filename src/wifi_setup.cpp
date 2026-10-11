@@ -176,6 +176,11 @@ void wifiSchemesStorageStatus(JsonObject out) {
     out["record_bytes"] = sizeof(WifiNetwork); out["receipt_bytes"] = sizeof(WifiReceipt);
 }
 bool wifiSetupBusy() { return running; }
+bool wifiSetupConnecting() {
+    return running && (!deferredSelection || selectionStarted) &&
+        (WiFi.status() != WL_CONNECTED || WiFi.localIP() == IPAddress(0,0,0,0));
+}
+bool wifiSetupFailed() { return !running && stage == "failed"; }
 bool wifiSetupActivated() { return persisted && !trialOnly; }
 String wifiSetupSelectingBridge() { return running && (transactionUnified || operation == "wifi_select" || operation == "wifi_activate") ? selectingBridge : String(); }
 

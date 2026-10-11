@@ -872,6 +872,8 @@ void renderActiveUsage(const String &json, const char *channel) {
     env.syncHHMM = clock::nowHHMM();
     env.battery  = power::batteryPercent();
     env.state    = (power::retained.rtcMode == MODE_DEEP) ? "DEEP" : radio::templateStateText();
+    env.wifiState = wifiPhaseText(radio::wifiPhase());
+    env.wifiBlink = radio::state.wifiConnActive ? (radio::state.wifiBlinkOn ? 1 : 0) : -1;
     env.mode     = (power::retained.rtcMode == MODE_DEEP) ? "deep" : "light";
     env.offlineMins = currentBridgeOfflineMinutes();
     Paint_SelectImage(state.frame);
@@ -898,15 +900,22 @@ void renderActiveUsage(const String &json, const char *channel) {
 void renderCurrent() {
     if (platform::state.lastUsage.length()) renderActiveUsage(platform::state.lastUsage, platform::state.lastChannel.c_str());
     else screenStatus();
-    state.networkGlyph.observe(radio::state.wifiUp, currentBridgeOfflineMinutes());
+    state.networkGlyph.observe(radio::state.wifiUp, currentBridgeOfflineMinutes(), radio::wifiPhase(),
+                               radio::state.wifiConnActive ? (radio::state.wifiBlinkOn ? 1 : 0) : -1);
     const bool confirmed = state.epdBaselineTrusted && state.lastDisplayedFrame && state.frame &&
         memcmp(state.lastDisplayedFrame, state.frame, EPD_FB_BYTES) == 0;
     state.networkGlyph.rendered(confirmed, clock::v2NowMs());
 }
 
 void serviceNetworkGlyph() {
-    state.networkGlyph.observe(radio::state.wifiUp, currentBridgeOfflineMinutes());
-    if (!state.networkGlyph.due(clock::v2NowMs()) || radio::state.wifiConnActive || transport::state.otaInProgress) return;
+    const auto phase = radio::wifiPhase();
+    const int blink = radio::state.wifiConnActive ? (radio::state.wifiBlinkOn ? 1 : 0) : -1;
+    const bool blinkOnly = state.networkGlyph.known && phase == WifiPhase::Connecting &&
+        state.networkGlyph.wifiPhase == phase && state.networkGlyph.wifiBlink != blink &&
+        state.networkGlyph.bridgeOffline == currentBridgeOfflineMinutes();
+    state.networkGlyph.observe(radio::state.wifiUp, currentBridgeOfflineMinutes(), phase, blink);
+    if (!state.networkGlyph.due(clock::v2NowMs()) || transport::state.otaInProgress) return;
+    state.rfnBlink = blinkOnly;
     if (state.networkGlyph.attempts) state.forceCleanRefresh = true;
     renderCurrent();
     DevLog.printf("[ui] network glyph connected=%d confirmed=%d attempts=%u\n",

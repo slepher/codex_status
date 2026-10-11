@@ -54,6 +54,8 @@ fn envs() -> Vec<Env<'static>> {
             sync_hhmm: "12:34",
             battery: 75,
             state: "WIFI CONN",
+            wifi_state: "connecting",
+            wifi_blink: 1,
             offline_mins: -1,
             mode: "light",
         },
@@ -63,6 +65,8 @@ fn envs() -> Vec<Env<'static>> {
             sync_hhmm: "--:--",
             battery: -1,
             state: "WIFI OFF",
+            wifi_state: "off",
+            wifi_blink: -1,
             offline_mins: 42,
             mode: "deep",
         },
@@ -212,4 +216,38 @@ fn invalid_template_is_rejected_with_a_reason() {
     let err = compile(r#"{"schema":1,"canvas":{"w":200,"h":200},"elements":[{"type":"bogus"}]}"#)
         .unwrap_err();
     assert!(!err.is_empty());
+}
+
+#[test]
+fn wifi_metadata_controls_template_pixels_independently_of_legacy_state() {
+    let _guard = SERIAL.lock().unwrap();
+    for path in ["tools/test-bridge/templates/quad.json",
+                 "bridge/crates/core/tests/fixtures/codex-status-a-400x300.json"] {
+        let mut source: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(repo_root().join(path)).unwrap()).unwrap();
+        source["elements"].as_array_mut().unwrap().retain(|e|
+            matches!(e["when"]["bind"].as_str(), Some("device.wifi_state" | "device.wifi_blink")));
+        assert!(!source["elements"].as_array().unwrap().is_empty());
+        let source = source.to_string();
+        let (w,h) = bridge_render::canvas_size(&source).unwrap();
+        compile(&source).unwrap();
+        let mut frames = Vec::new();
+        for (phase, blink, visible) in [("idle",-1,false),("connecting",0,false),
+            ("connecting",1,true),("connected",-1,true),("off",-1,true)] {
+            // Legacy OFF must not override the independent Wi-Fi facts.
+            let env = Env {state:"WIFI OFF",wifi_state:phase,wifi_blink:blink,..Env::default()};
+            let json = render_bits(&source,"{}",&env).unwrap();
+            let compiled = render_compiled_bits_size("{}",&env,w,h).unwrap();
+            assert_eq!(json,compiled,"{path} {phase}/{blink}");
+            assert_eq!(json.iter().any(|b|*b!=255),visible,"{path} {phase}/{blink}");
+            frames.push(json);
+        }
+        assert_eq!(frames[0],frames[1]);
+        assert_eq!(frames[2],frames[3]);
+        assert_ne!(frames[3],frames[4]);
+        // Templates can render arbitrary content from the same metadata.
+        let mut custom: serde_json::Value = serde_json::from_str(&source).unwrap();
+        custom["elements"][0]["when"]["bind"] = json!("device.wifi_unknown");
+        assert!(compile(&custom.to_string()).is_err());
+    }
 }

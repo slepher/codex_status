@@ -903,6 +903,18 @@ pub fn decode_wire(raw: &[u8]) -> Result<serde_json::Value> {
     let mut value: serde_json::Value = serde_json::from_slice(raw)?;
     let Some(version) = value.get("ble_wire") else { return Ok(value); };
     if version != 1 { bail!("unsupported BLE wire version"); }
+    if let Some(contact) = value.get("ac").cloned() {
+        if !contact.is_boolean() { bail!("invalid automatic contact flag"); }
+        value["automatic_contact"] = contact;
+    }
+    if let Some(error) = value.get("ne") {
+        value["network_error"] = json!(match error.as_u64() {
+            Some(1) => "wifi_connect_failed",
+            Some(2) => "bridge_http_unreachable",
+            Some(3) => "wifi_link_lost",
+            _ => bail!("invalid network failure category"),
+        });
+    }
     fn text(value: &serde_json::Value, max: usize) -> Result<String> {
         use base64::Engine;
         let encoded = value.as_str().context("BLE encoded identifier missing")?;

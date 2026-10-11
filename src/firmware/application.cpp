@@ -8,6 +8,7 @@
 #include "sync_internal.h"
 #include "transport_internal.h"
 #include "application.h"
+#include "boot_capture.h"
 
 namespace firmware::application {
 
@@ -18,6 +19,31 @@ State state;
 // panel contract is proven. Set CODEX_GRAY4_PANEL_CONFIRMED only after the
 // hardware facts (panel model, controller datasheet, pins, waveform) exist.
 static bool targetUnverified = false;
+static BootCapture bootCapture;
+static portMUX_TYPE bootCaptureMux = portMUX_INITIALIZER_UNLOCKED;
+static bool capturingBoot = false;
+static bool bootArmed = false;
+static void ARDUINO_ISR_ATTR startupBootEdge() {
+    portENTER_CRITICAL_ISR(&bootCaptureMux);
+    bootCapture.edge(digitalRead(0) == LOW, millis());
+    portEXIT_CRITICAL_ISR(&bootCaptureMux);
+}
+
+bool captureStartupBoot() {
+    if (!capturingBoot) return false;
+    portENTER_CRITICAL(&bootCaptureMux);
+    const bool pressed = bootCapture.take(millis());
+    const uint32_t at = bootCapture.downAt;
+    portEXIT_CRITICAL(&bootCaptureMux);
+    if (!pressed) return false;
+    power::state.v2BootMs = at;
+    power::state.v2Provisional = true;
+    power::state.bleRecovery.open(at);
+    power::retained.rtcMode = MODE_LIGHT;
+    power::state.deepWakePath = false;
+    DevLog.println("[pm] startup BOOT captured: manual light window");
+    return true;
+}
 
 
 void initialize(const char *firmwareVersion, const char *imageIdentity) {
@@ -57,6 +83,16 @@ void initialize(const char *firmwareVersion, const char *imageIdentity) {
     radio::loadHostMac();
     radio::state.hostname = "codex-status-" + radio::macSuffix();
     power::releaseWakeHolds();   // clear deep-sleep GPIO holds from the previous cycle
+    pinMode(0, INPUT_PULLUP);
+    const bool bootWasWake = cause == ESP_SLEEP_WAKEUP_EXT1 &&
+        (esp_sleep_get_ext1_wakeup_status() & (1ULL << 0));
+    bootCapture.begin(digitalRead(0) == LOW, bootWasWake, millis());
+    capturingBoot = true;
+    attachInterrupt(digitalPinToInterrupt(0), startupBootEdge, CHANGE);
+    power::state.v2BootMs = clock::v2NowMs();
+    power::state.v2Provisional = cause == ESP_SLEEP_WAKEUP_EXT1;
+    if (power::state.v2Provisional)
+        power::state.bleRecovery.lightUntil = power::state.v2BootMs + 300000;
     diagnostics::nvsStageMark(4);      // holds released without losing the VBAT latch
     power::state.plugged = usb_serial_jtag_is_connected();
     power::state.batteryPct = power::batteryPercent();
@@ -80,6 +116,9 @@ void initialize(const char *firmwareVersion, const char *imageIdentity) {
         diagnostics::state.wakeResult = WAKE_THIN;
         diagnostics::traceMarkThin();
         if (power::deepThinWake()) power::sleepToNextEvent();
+        if (power::state.bleRecovery.lightRemaining(clock::v2NowMs())) {
+            deepClockOnlyBoot = false; deepTimerBoot = false;
+        }
     }
 
     display::epdBegin(!woke);
@@ -128,8 +167,10 @@ void initialize(const char *firmwareVersion, const char *imageIdentity) {
     radio::state.lastPersistedSync = radio::retained.rtcLastSyncEpoch;
     // v2: the BOOT provisional window starts at the physical wake instant; a
     // timer wake never gets this fallback (docs/generic-display-platform-design §7).
-    power::state.v2BootMs = clock::v2NowMs();
-    power::state.v2Provisional = (cause == ESP_SLEEP_WAKEUP_EXT1);
+    captureStartupBoot();
+    if (power::state.bleRecovery.lightRemaining(clock::v2NowMs())) {
+        deepClockOnlyBoot = false; deepTimerBoot = false;
+    }
     if (cause == ESP_SLEEP_WAKEUP_EXT1) {
         // Manual wake (BOOT/PWR): leave deep and behave as light (docs §13.3).
         power::retained.rtcMode = MODE_LIGHT;
@@ -239,6 +280,16 @@ void initialize(const char *firmwareVersion, const char *imageIdentity) {
             display::renderActiveUsage(platform::state.lastUsage, "RTC");
         }
         power::sleepToNextEvent();   // no network, owner claim, or data-sequence change
+        // BOOT during the clock render vetoed sleep; finish normal setup.
+        deepClockOnlyBoot = false;
+        power::state.deepWakePath = false;
+        power::state.v2SafetyDeadlineMs = clock::v2NowMs() + (uint64_t)V2_MAX_LIGHT_S * 1000ULL;
+        if (platform::state.v2BundleReady) {
+            platform::state.v2DataSeq.beginContext(clock::v2NowMs(), 1);
+            platform::retained.v2DataCheckpoint.restore(platform::state.v2Profile.contextId, platform::state.v2DataSeq);
+            if (!platform::state.v2DataSeq.haveApplied() &&
+                !platform::v2SwitchActive(platform::state.v2Profile.initial)) platform::state.v2CtValid = false;
+        }
     }
 
     // All association is owned by bounded, explicit Wi-Fi transactions.
@@ -255,6 +306,12 @@ void initialize(const char *firmwareVersion, const char *imageIdentity) {
         radio::enterBleOn(true);
     }
     wifiSchemesBegin();
+    detachInterrupt(digitalPinToInterrupt(0));
+    bootCapture.edge(digitalRead(0) == LOW, millis());
+    captureStartupBoot();
+    bootArmed = !bootCapture.low || !bootCapture.ignore;
+    capturingBoot = false;
+    if (power::v2ManualBleHoldActive()) radio::enterBleOn(true);
     if (cause != ESP_SLEEP_WAKEUP_TIMER) power::state.offlineBootGraceUntilMs = clock::v2NowMs() + 120000;
     if (!radio::hasWifiSlots() && !platform::state.lastUsage.length())
         display::screen({"CODEX STATUS", application::state.firmwareVersion, "BLE Wi-Fi setup", "Press BOOT to pair"});
@@ -312,7 +369,6 @@ void tick() {
     // Arm the button only after GPIO0 has read HIGH once: a strapping/mux
     // glitch that made it read LOW for the first seconds of boot otherwise
     // looked like a long hold.
-    static bool     bootArmed = false;
     bool bootLow = (digitalRead(0) == LOW);
     if (!bootArmed && !bootLow) bootArmed = true;
     if (bootArmed && bootLow) {
@@ -370,6 +426,7 @@ void tick() {
         radio::updateInfoExtra();
     }
     wasSettingUp = wifiSetupBusy();
+    radio::serviceWifiMetadata();
     if (radio::state.configMode) {
         if (!power::state.plugged && millis() - radio::state.configStartedAt > CONFIG_IDLE_MS &&
             !power::v2ManualBleHoldActive()) {
@@ -381,6 +438,8 @@ void tick() {
     }
     if (radio::state.v2InRendezvous) {
         radio::v2RendezvousTick();
+        if (radio::state.v2InRendezvous && power::retained.rtcMode != MODE_DEEP)
+            display::serviceNetworkGlyph();
         power::serviceLed();
         delay(5);
         return;
@@ -395,7 +454,7 @@ void tick() {
     }
     radio::pollWifi();
     display::serviceNetworkGlyph();
-    if (!radio::state.wifiUp && !wifiSetupBusy() && !power::v2ManualBleHoldActive() &&
+    if (radio::automaticContactNeeded() && !wifiSetupBusy() && !radio::state.fallbackUntilMs &&
         radio::state.nextBleContactMs && clock::v2NowMs() >= radio::state.nextBleContactMs) {
         radio::v2RendezvousBegin();
         return;
@@ -425,7 +484,7 @@ void tick() {
     // radio when the Bridge stays unreachable (v2 §7/§12).
     if (power::retained.rtcMode == MODE_LIGHT && !sync::state.syncOpenThisWake && (!power::state.plugged || power::retained.rtcDeepOnUsb)) {
         switch (v2PowerSleepDecision(true, true, power::state.plugged, power::retained.rtcDeepOnUsb,
-                                     power::v2ManualBleHoldActive(), power::state.v2Plan, power::state.v2Provisional,
+                                     power::state.bleRecovery.lightRemaining(clock::v2NowMs()) > 0, power::state.v2Plan, power::state.v2Provisional,
                                      power::state.v2BootMs, power::state.v2SafetyDeadlineMs, clock::v2NowMs())) {
         case V2_POWER_PLAN_ENDED:
             DevLog.printf("[platform] formal light window ended (%s)\n", power::state.v2PlanReason.c_str());

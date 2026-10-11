@@ -104,7 +104,8 @@ pub(crate) fn field_kind(spec: &BindSpec) -> crate::platform::model::FieldKind {
     match spec {
         BindSpec::Plan | BindSpec::Label | BindSpec::HostId | BindSpec::DeviceIp |
         BindSpec::DeviceSync | BindSpec::DeviceState | BindSpec::DeviceNow | BindSpec::DeviceDate |
-        BindSpec::DeviceMode | BindSpec::DeviceChannel => FieldKind::Text,
+        BindSpec::DeviceMode | BindSpec::DeviceChannel | BindSpec::DeviceWifiState => FieldKind::Text,
+        BindSpec::DeviceWifiBlink => FieldKind::Number,
         _ => FieldKind::Number,
     }
 }
@@ -177,6 +178,11 @@ mod tests {
             .iter()
             .any(|r| r.field == "device.now" && r.local));
         assert!(!c.resources.is_empty());
+        for (field, kind) in [("device.wifi_state", crate::platform::model::FieldKind::Text),
+                              ("device.wifi_blink", crate::platform::model::FieldKind::Number)] {
+            assert!(c.requirements.iter().any(|r| r.field == field && r.local && r.kind == kind));
+            assert!(c.local_dependencies.iter().any(|r| r == field));
+        }
         // Deterministic and round-trips without pointers.
         let bytes = encode(&c);
         let back = decode(&bytes).unwrap();

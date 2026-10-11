@@ -755,7 +755,13 @@ impl PlatformService {
         match run {
             Ok(job) => Ok(Some(job)),
             Err(error) => {
-                if !job.sent && error.downcast_ref::<crate::rendezvous::NotDispatched>().is_some() {
+                // A definite auth rejection proves this write was not applied.
+                // Failure to query an older unknown write proves nothing about
+                // that original transaction: keep its ID and query-only fence.
+                let auth_rejected = error.chain().any(|cause|
+                    cause.downcast_ref::<crate::device_client::HttpStatus>()
+                        .is_some_and(|status| matches!(status.0, 401 | 403)));
+                if !job.sent && (auth_rejected || error.downcast_ref::<crate::rendezvous::NotDispatched>().is_some()) {
                     self.wifi_definite_rejection(mac,job_id)?;
                 }
                 let (state, code) = crate::rendezvous::wifi_error(&error);
@@ -2144,7 +2150,7 @@ impl PlatformService {
         }
         let mut body = record.last_authenticated.as_ref().map(|saved| saved.body.clone())
             .unwrap_or_else(|| json!({}));
-        for key in ["presence","transports","wifi_control","status_seq"] {
+        for key in ["presence","transports","wifi_control","status_seq","network"] {
             body.as_object_mut().unwrap().remove(key);
         }
         body["boot_id"] = status["boot_id"].clone();
@@ -2153,7 +2159,7 @@ impl PlatformService {
             ("identity", &["device_mac", "configured"]),
             ("firmware", &["fw", "firmware_target", "running_slot", "reset_reason",
                 "image_identity", "sync_v1", "diag_format", "diag_capacity", "wifi_management"]),
-            ("radio", &["radio", "presence", "transports", "wifi_control", "status_seq"]),
+            ("radio", &["radio", "presence", "transports", "wifi_control", "status_seq", "network"]),
             ("runtime", &["heap_free", "heap_min", "uptime_ms"]),
             ("display", &["display", "active_context_id", "active_template_id",
                 "template_ids", "display_state", "data_contract"]),
@@ -2165,7 +2171,7 @@ impl PlatformService {
             let mut available = false;
             for key in fields {
                 if let Some(value) = status.get(*key) {
-                    body[*key] = if matches!(*key,"presence"|"transports"|"wifi_control"|"status_seq") {value.clone()}
+                    body[*key] = if matches!(*key,"presence"|"transports"|"wifi_control"|"status_seq"|"network") {value.clone()}
                         else {merge_field(&body[*key], value, key, now, &status["boot_id"],transport,&mut field_samples)};
                     sampled = true;
                     available |= !value.is_null();
@@ -4228,6 +4234,30 @@ mod tests {
     }
 
     #[test]
+    fn protocol_auth_rejection_is_terminal_only_for_the_current_write() {
+        for code in [401,403] {
+            for previously_sent in [false,true] {
+                let dir=tempfile::tempdir().unwrap();let svc=service_with_device(dir.path());let mac="AABBCCDDEEFF";
+                let job=svc.wifi_queue_control(mac,"bridge","activate",json!({"network_id":"home","version":1}),100).unwrap();
+                if previously_sent {
+                    let unknown=svc.wifi_attempt(mac,&job.job_id,Some("authenticated_http"),&Default::default(),101,|op,_| {
+                        assert_eq!(op,"activate");Err(anyhow::anyhow!("transport_timeout"))
+                    }).unwrap().unwrap();
+                    assert_eq!(unknown.state,"awaiting_confirmation");
+                }
+                let result=svc.wifi_attempt(mac,&job.job_id,Some("authenticated_http"),&Default::default(),200,|op,_| {
+                    assert_eq!(op,if previously_sent {"result"} else {"activate"});
+                    Err(crate::device_client::HttpStatus(code).into())
+                }).unwrap().unwrap();
+                assert_eq!(result.request_id,job.request_id);
+                assert_eq!(result.sent,previously_sent);
+                assert_eq!(result.state,if previously_sent {"awaiting_confirmation"} else {"failed"});
+                assert_eq!(result.error_code.as_deref(),Some("unauthorized"));
+            }
+        }
+    }
+
+    #[test]
     fn wifi_only_local_non_dispatch_can_clear_this_attempt_sent_marker() {
         for local in [true,false] {
             let dir=tempfile::tempdir().unwrap();let svc=service_with_device(dir.path());let mac="AABBCCDDEEFF";
@@ -4543,7 +4573,7 @@ mod tests {
             crate::platform::model::AuthenticatedStatus { observed_at: 1000, transport: "wifi".into(), schema_version: 1,
                 body: json!({"fw":"0.18.35-note4-b-ota1"}) });
         assert!(svc.publish("7C4FADB93408", 1001).unwrap_err().to_string().contains("requires firmware"));
-        svc.inner.lock().unwrap().devices.get_mut("7C4FADB93408").unwrap().last_authenticated.as_mut().unwrap().body["fw"] = json!("0.18.36-note4-b-layout1");
+        svc.inner.lock().unwrap().devices.get_mut("7C4FADB93408").unwrap().last_authenticated.as_mut().unwrap().body["fw"] = json!("0.18.75-note4");
         let job = svc.publish("7C4FADB93408", 1001).unwrap();
         assert_eq!(job["state"], "waiting");
         let inner = svc.inner.lock().unwrap();

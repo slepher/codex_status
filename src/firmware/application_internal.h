@@ -12,6 +12,7 @@ struct State {
     const char *imageIdentity = "unknown";
 };
 extern State state;
+bool captureStartupBoot();
 
 
 } // namespace firmware::application

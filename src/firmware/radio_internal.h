@@ -3,6 +3,7 @@
 // Firmware integration only: state is owned here; never copy it as a snapshot.
 #include "config.h"
 #include "dependencies.h"
+#include "../network_display_state.h"
 
 namespace firmware::radio {
 
@@ -32,24 +33,23 @@ struct State {
     const char *AP_REASON_NAMES[3] = {"none", "no_slots", "boot_hold"};
     uint32_t configStartedAt = 0;
 
-    // task-10 B: the Wi-Fi icon blinks while a boot connect attempt is running.
-    // `wifiConnActive` switches the template state to WIFI CONN (blink on) /
-    // WIFI OFF (blink off); `rfnBlink` marks a blink tick so epdFlush keeps it a
-    // partial waveform and does not consume the region ghost budget.
+    // Local association and blink facts; templates choose their presentation.
     bool     wifiConnActive = false;
     bool     wifiBlinkOn = false;
     uint16_t wifiBlinkMs = WIFI_BLINK_MS;
     uint32_t blinkTicks = 0;
     bool     wifiUp = false;           // STA associated
     bool     wifiLostHandled = false;  // WIFI OFF policy already applied
+    bool     wifiTerminal = false;     // completed loss/close, not initial idle
+    bool     wifiFailureObserved = false;
+    uint64_t wifiBlinkAtMs = 0;
     String   wifiSsid, wifiPass;
     bool     bleOn = false;
     bool     bleUserOff = false;       // user switched BLE off while docked
     uint32_t lastPersistedSync = 0;
 
-    // Plan C: while the rendezvous window is open the screen is not touched; the
-    // single wake render happens after bleOff (clock window, or the light plan's
-    // first frame in startNormalMode). Other BLE paths keep their immediate render.
+    // Plan C defers the deep wake frame until exchange completion. In Light,
+    // local Wi-Fi metadata can invalidate the template during association.
     bool           v2InRendezvous = false;
     RendezvousProtocol v2Rv;
     String v2RvId;
@@ -60,6 +60,13 @@ struct State {
     bool v2RvHttpStarted = false, v2RvBleReleased = false;
     uint64_t nextBleContactMs = 0;
     bool httpServicesStarted = false;
+    uint64_t fallbackUntilMs = 0;
+    bool fallbackAttempted = false;
+    uint64_t presenceAttemptAtMs = 0;
+    uint8_t presenceFailures = 0;
+    bool bridgeReachable = false;
+    bool failureReportPending = false;
+    const char *networkError = nullptr;
 };
 extern State state;
 
@@ -83,6 +90,8 @@ String macText();
 const char *deviceStateText();
 const char *templateStateText();
 const char *wifiStateText();
+WifiPhase wifiPhase();
+void serviceWifiMetadata();
 void markSynced();
 String ipText();
 void updateInfoExtra();
@@ -96,6 +105,7 @@ void enterBleOn(bool userInitiated);
 void bleOff(const char *reason);
 void serviceBleSession();
 void pollWifi();
+bool automaticContactNeeded();
 uint64_t wifiControlUntil(uint64_t now);
 WifiControlContext wifiControlContext(const EndpointRec &endpoint,JsonDocument &request);
 void wifiDeviceStatus(JsonDocument &doc,const EndpointRec *endpoint=nullptr);

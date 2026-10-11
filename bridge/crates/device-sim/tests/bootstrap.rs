@@ -3558,7 +3558,8 @@ fn note4_data_light_survives_short_read_and_idle_then_draws_sleep_without_false_
     let source=include_str!("../../core/tests/fixtures/codex-status-a-400x300.json");
     let check_glyphs=|state:&str,mode:&str,offline_mins:i32| {
         let actual=request(sim.address(),"GET","/sim/frame",Some(CONTROL),b"").1;
-        let expected=bridge_render::render_bits(source,"{}",&bridge_render::Env {channel:"PULL",battery:75,state,mode,offline_mins,..Default::default()}).unwrap();
+        let expected=bridge_render::render_bits(source,"{}",&bridge_render::Env {channel:"PULL",battery:75,state,mode,offline_mins,
+            wifi_state:if mode=="deep" {"off"} else {"idle"},..Default::default()}).unwrap();
         for row in 8..28 { assert_eq!(&actual[row*50+31..row*50+40],&expected[row*50+31..row*50+40],"status glyph row {row}"); }
     };
     check_glyphs("WIFI OFF","light",-1);
@@ -3670,13 +3671,16 @@ fn note4_sleep_contact_without_data_clears_bridge_glyph() {
     assert_eq!(request(sim.address(),"POST","/sim/power",Some(CONTROL),br#"{"plugged":false}"#).0,200);
     let status=bridge_core::device_client::status(&sim.address().to_string(),ENDPOINT,Duration::from_secs(3)).unwrap();
     let sleep=|id|plan_message(&status,"bridge-test","sleep-contact",id,"sleep",None);
+    let requirements=status["data_contract"]["requirements"].as_array().unwrap();
+    assert_eq!(requirements.iter().find(|r|r["field"]=="device.wifi_state").unwrap()["kind"],"text");
+    assert_eq!(requirements.iter().find(|r|r["field"]=="device.wifi_blink").unwrap()["kind"],"number");
     assert_eq!(post_plan(&sim,Some(ENDPOINT),&sleep(1)).1["result"],"applied");
     let seq=sim_state(&sim)["bundle"]["applied_seq"].clone();
     assert_eq!(set_time(&sim,Some(CONTROL),&serde_json::json!({"op":"step","delta_ms":420000})).0,200);
     let check=|offline:i32| {
         let actual=request(sim.address(),"GET","/sim/frame",Some(CONTROL),b"").1;
         let source=include_str!("../../core/tests/fixtures/codex-status-a-400x300.json");
-        let expected=bridge_render::render_bits(source,"{}",&bridge_render::Env {channel:"PULL",battery:75,state:"DEEP",mode:"deep",offline_mins:offline,..Default::default()}).unwrap();
+        let expected=bridge_render::render_bits(source,"{}",&bridge_render::Env {channel:"PULL",battery:75,state:"DEEP",mode:"deep",offline_mins:offline,wifi_state:"off",..Default::default()}).unwrap();
         for row in 8..28 {assert_eq!(&actual[row*50+34..row*50+40],&expected[row*50+34..row*50+40],"offline={offline} row={row} state={}",sim_state(&sim));}
     };
     check(7);

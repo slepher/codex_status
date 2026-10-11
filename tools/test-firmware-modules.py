@@ -32,7 +32,7 @@ app = (firmware / "application.cpp").read_text(encoding="utf-8")
 display = (firmware / "display.cpp").read_text(encoding="utf-8")
 radio = (firmware / "radio.cpp").read_text(encoding="utf-8")
 assert "radio::pollWifi();\n    display::serviceNetworkGlyph();" in app
-assert "state.networkGlyph.observe(radio::state.wifiUp);" in display
+assert "state.networkGlyph.observe(radio::state.wifiUp, currentBridgeOfflineMinutes(), phase, blink);" in display
 assert "memcmp(state.lastDisplayedFrame, state.frame, EPD_FB_BYTES) == 0" in display
 assert "if (state.networkGlyph.attempts) state.forceCleanRefresh = true;" in display
 rv = radio.split("static void rendezvousWifiTick() {", 1)[1].split("void v2RendezvousTick()", 1)[0]

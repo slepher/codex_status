@@ -19,6 +19,8 @@ struct Args {
     sync: String,
     battery: i32,
     state: String,
+    wifi_state: String,
+    wifi_blink: i32,
     offline_mins: i32,
     mode: String,
 }
@@ -38,6 +40,8 @@ fn parse_args() -> Args {
         sync: "23:59".to_string(),
         battery: 78,
         state: "BLE OFF".to_string(),
+        wifi_state: "connected".to_string(),
+        wifi_blink: -1,
         offline_mins: -1,
         mode: "light".to_string(),
     };
@@ -58,6 +62,8 @@ fn parse_args() -> Args {
             "--sync" => args.sync = value(),
             "--battery" => args.battery = value().parse().expect("battery number"),
             "--state" => args.state = value(),
+            "--wifi-state" => args.wifi_state = value(),
+            "--wifi-blink" => args.wifi_blink = value().parse().expect("Wi-Fi phase number"),
             "--offline-mins" => args.offline_mins = value().parse().expect("offline minutes"),
             "--mode" => args.mode = value(),
             other => panic!("unknown flag {other}"),
@@ -103,6 +109,8 @@ fn main() -> anyhow::Result<()> {
         sync_hhmm: &args.sync,
         battery: args.battery,
         state: &args.state,
+        wifi_state: &args.wifi_state,
+        wifi_blink: args.wifi_blink,
         offline_mins: args.offline_mins,
         mode: &args.mode,
     };

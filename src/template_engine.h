@@ -7,6 +7,8 @@ struct TplEnv {
     String syncHHMM;  // "--:--" when unknown
     int battery = -1; // percentage, or -1 when the device value is unknown
     String state;                // AP / BLE ON / BLE OFF / WIFI OFF
+    String wifiState;            // idle / connecting / connected / off; template owns presentation
+    int wifiBlink = -1;          // connecting phase: 0/1; absent otherwise
     int offlineMins = -1;        // minutes since the last successful sync
     String mode;                 // "deep" / "light" (v0.14 device.mode)
     bool hasNowEpoch = false;    // host simulation supplies its experiment clock

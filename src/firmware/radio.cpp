@@ -17,10 +17,6 @@ static WiFiUDP     announceUdp;
 
 static uint32_t wifiLostSince = 0;
 
-static bool     lastBleAuto = false;      // keep-alive came from plug+charge
-
-static uint32_t bleOffDeadline = 0;
-
 static uint32_t announcedIp = 0;
 
 static uint32_t lastAnnounce = 0;
@@ -43,6 +39,12 @@ static uint64_t wifiPresenceUntil(uint64_t now);
 static void servicePresence();
 static void serviceReadyReport();
 static void rendezvousWifiBegin();
+static void networkFailed(const char *reason);
+static bool startFallback();
+
+bool automaticContactNeeded() {
+    return !state.bridgeReachable || WiFi.status() != WL_CONNECTED;
+}
 static void rendezvousWifiTick();
 static bool configureWifiPowerSave();
 
@@ -67,22 +69,52 @@ String macText() {
 
 const char *deviceStateText() {
     if (state.configMode) return "AP";
-    if (!state.wifiUp)    return "WIFI OFF";
+    switch (wifiPhase()) {
+    case WifiPhase::Idle: return "WIFI WAIT";
+    case WifiPhase::Connecting: return "WIFI CONN";
+    case WifiPhase::Off: return "WIFI OFF";
+    default: break;
+    }
     if (state.bleOn)      return "BLE ON";
     return "BLE OFF";
 }
 
-// Template-visible state. While a boot connect attempt is running the Wi-Fi
-// icon cell blinks at ~1 Hz (task-10 B): `WIFI CONN` is the visible phase.
-// Note4 uses `WIFI BLINK OFF` for the hidden phase so its Wi-Fi cell is blank;
-// sustained offline still uses `WIFI OFF` for the existing 20x20 off glyph.
-// The 1.54 target retains the historical `WIFI OFF` hidden phase.
+// Compatibility for existing templates. New templates use independent Wi-Fi
+// lifecycle/phase metadata. A hidden phase must never masquerade as terminal OFF.
 const char *templateStateText() {
-#if defined(CODEX_TARGET_NOTE4)
     if (state.wifiConnActive && !state.wifiBlinkOn) return "WIFI BLINK OFF";
-#endif
-    if (state.wifiConnActive) return state.wifiBlinkOn ? "WIFI CONN" : "WIFI OFF";
+    if (state.wifiConnActive) return "WIFI CONN";
     return deviceStateText();
+}
+
+WifiPhase wifiPhase() {
+    // The final sleep frame describes the committed radio closure, just as
+    // device.mode describes the sleep entered immediately after that frame.
+    if (power::retained.rtcMode == MODE_DEEP && !state.v2InRendezvous) return WifiPhase::Off;
+    return wifiPhaseFor(state.wifiConnActive || wifiSetupConnecting(),
+        WiFi.status() == WL_CONNECTED && WiFi.localIP() != IPAddress(0,0,0,0),
+        wifiSetupBusy() || state.v2InRendezvous,
+        state.wifiTerminal);
+}
+
+void serviceWifiMetadata() {
+    // A retained transaction error is not a fresh link failure after recovery.
+    const bool failed = wifiSetupFailed();
+    if (failed && !state.wifiFailureObserved) state.wifiTerminal = true;
+    state.wifiFailureObserved = failed;
+    if (wifiSetupBusy() || (WiFi.status() == WL_CONNECTED && WiFi.localIP() != IPAddress(0,0,0,0)))
+        state.wifiTerminal = false;
+    const bool connecting = wifiSetupConnecting() || (state.fallbackUntilMs &&
+        (WiFi.status()!=WL_CONNECTED || WiFi.localIP()==IPAddress(0,0,0,0)));
+    const uint64_t now = clock::v2NowMs();
+    if (connecting != state.wifiConnActive) {
+        state.wifiConnActive = connecting;
+        state.wifiBlinkOn = connecting;
+        state.wifiBlinkAtMs = now;
+    } else if (connecting && now - state.wifiBlinkAtMs >= state.wifiBlinkMs) {
+        state.wifiBlinkOn = !state.wifiBlinkOn;
+        state.wifiBlinkAtMs = now;
+    }
 }
 
 const char *wifiStateText() {
@@ -248,6 +280,7 @@ static uint32_t retryDelaySec(uint8_t stage) {
 }
 
 void enterBleOn(bool userInitiated) {
+    if (!userInitiated && !state.v2InRendezvous) return;
     if (userInitiated) state.v2RvBleReleased = false;
     if (state.v2RvBleReleased && !userInitiated) return;
     if (!power::setBleAwake(true)) {
@@ -280,9 +313,6 @@ void enterBleOn(bool userInitiated) {
         power::state.bleRecovery.open(clock::v2NowMs());
         bleOpenPairingWindow(power::state.bleRecovery.remaining(clock::v2NowMs()) * 1000UL);
     }
-    bool autoCond = power::state.plugged && !power::retained.rtcDeepOnUsb && power::state.batteryPct > BLE_AUTO_PCT;
-    lastBleAuto = autoCond;
-    bleOffDeadline = autoCond ? 0 : millis() + BLE_GRACE_MS;
     requestAnnounce(true);
     if (!state.v2InRendezvous) display::renderCurrent();
 }
@@ -294,11 +324,11 @@ void bleOff(const char *reason) {
     power::state.bleRecovery.close();
     bleOpenPairingWindow(0);
     wifiSetupRadioClosed("session_expired");
-    lastBleAuto = false;
     diagnostics::bleRadioMark(false);
     bleAdvertiseStop();
     bleDeinit();
     power::setBleAwake(false);
+    if (WiFi.status() == WL_CONNECTED) configureWifiPowerSave();
     transport::V2BleMessage *pending = nullptr;
     while (transport::state.v2BleQueue && xQueueReceive(transport::state.v2BleQueue, &pending, 0) == pdTRUE) delete pending;
     power::ledSet(false);
@@ -308,41 +338,59 @@ void bleOff(const char *reason) {
     if (!state.v2InRendezvous) display::renderCurrent();
 }
 
-// BLE keep-alive: infinite while plugged and >20%, otherwise 120 s after the
-// last connection/transfer or after the keep-alive condition ends.
+// Only the physical BOOT preference keeps GATT open outside a rendezvous.
 void serviceBleSession() {
     if (!state.bleOn || state.v2InRendezvous) return;
-    // Physical authorization never renews on connection/traffic or USB power.
-    if (power::state.bleRecovery.until) {
-        if (!power::v2ManualBleHoldActive()) bleOff("recovery expired");
-        return;
-    }
-    bool autoCond = power::state.plugged && !power::retained.rtcDeepOnUsb && power::state.batteryPct > BLE_AUTO_PCT;
-    if (bleIsConnected()) {
-        bleOffDeadline = millis() + BLE_GRACE_MS;
-        lastBleAuto = autoCond;
-        return;
-    }
-    if (autoCond) {
-        bleOffDeadline = 0;
-        lastBleAuto = true;
-        return;
-    }
-    if (lastBleAuto) {
-        lastBleAuto = false;
-        bleOffDeadline = millis() + BLE_GRACE_MS;
-    }
-    if (bleOffDeadline && (int32_t)(millis() - bleOffDeadline) >= 0) bleOff("grace expired");
+    if (!power::v2ManualBleHoldActive()) bleOff("open window ended");
+}
+
+static void networkFailed(const char *reason) {
+    WiFi.disconnect(false);
+    state.wifiUp = false;
+    state.wifiLostHandled = true;
+    state.bridgeReachable = false;
+    state.networkError = reason;
+    state.wifiTerminal = true;
+    state.fallbackUntilMs = 0;
+    state.wifiConnActive = false;
+    state.failureReportPending = true;
+    state.nextBleContactMs = clock::v2NowMs();
+    DevLog.printf("[wifi] attempt failed: %s; BLE report next\n", reason);
+}
+
+static bool startFallback() {
+    const uint64_t now = clock::v2NowMs(), until = wifiControlUntil(now);
+    if (state.fallbackAttempted || until <= now || wifiSetupBusy() || WiFi.status() == WL_CONNECTED ||
+        !wifiSchemesCredentials(state.wifiSsid, state.wifiPass)) return false;
+    state.fallbackAttempted = true;
+    state.fallbackUntilMs = std::min<uint64_t>(until, now + 15000);
+    state.wifiConnActive = true;
+    state.wifiTerminal = false;
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(false);
+    wifiSetupConnectionStarted(state.wifiSsid);
+    WiFi.begin(state.wifiSsid.c_str(), state.wifiPass.c_str());
+    return true;
 }
 
 void pollWifi() {
     if (wifiSetupBusy()) return;
     const bool nowUp = WiFi.status() == WL_CONNECTED;
+    if (state.fallbackUntilMs) {
+        if (nowUp && WiFi.localIP() != IPAddress(0,0,0,0)) {
+            state.fallbackUntilMs = 0; state.wifiConnActive = false;
+        } else if (clock::v2NowMs() >= state.fallbackUntilMs) {
+            networkFailed("wifi_connect_failed");
+            return;
+        } else return;
+    }
     if (nowUp) {
         if (!state.wifiUp) {
             state.wifiUp = true;
+            state.wifiTerminal = false;
             diagnostics::traceSetTransport(2); diagnostics::traceSetStage(TRACE_STAGE_WIFI_IP);
             state.wifiLostHandled = false; wifiLostSince = 0; power::retained.rtcRetryStage = 0;
+            state.presenceAttemptAtMs = 0; state.presenceFailures = 0;
             configureWifiPowerSave();
             sendAnnounce(state.bleOn); display::renderCurrent();
         }
@@ -354,11 +402,10 @@ void pollWifi() {
         display::renderCurrent();
     }
     if (!wifiLostSince) wifiLostSince = millis();
-    if (power::v2ManualBleHoldActive() || clock::v2NowMs() < power::state.offlineBootGraceUntilMs) return;
     if (!state.wifiLostHandled && millis() - wifiLostSince >= WIFI_LOST_MS) {
         state.wifiLostHandled = true;
         WiFi.disconnect(false); // stop the old association; never retry credentials
-        state.nextBleContactMs = clock::v2NowMs();
+        networkFailed("wifi_link_lost");
     }
 }
 
@@ -368,7 +415,7 @@ static uint64_t wifiPresenceUntil(uint64_t now) {
     uint64_t until=power::state.v2Plan.lightActive(now)?power::state.v2Plan.deadlineMs():0;
     if(sync::state.syncOpenThisWake)until=std::max(until,sync::state.syncOpenAnsweredAt+90000);
     if(power::state.v2Provisional)until=std::max(until,power::state.v2BootMs+300000);
-    until=std::max(until,power::state.bleRecovery.until);return until>now?until:0;
+    until=std::max(until,power::state.bleRecovery.lightUntil);return until>now?until:0;
 }
 
 uint64_t wifiControlUntil(uint64_t now) {
@@ -394,6 +441,7 @@ void wifiDeviceStatus(JsonDocument &doc,const EndpointRec *endpoint) {
         String("|")+String(power::state.v2Plan.deadlineMs())+String("|")+WiFi.localIP().toString()+"|"+(owned?owner.id:String())+"|"+String(wifiSetupBusy());
     wifiSchemesStorageStatus(doc["wifi_storage"].to<JsonObject>());
     key+="|"+String(doc["wifi_storage"]["revision"].as<uint64_t>())+"|"+String(doc["wifi_storage"]["receipts"].as<unsigned>())+"|"+String(controlUntil);
+    key+="|"+String(state.bridgeReachable)+"|"+String(state.networkError ? state.networkError : "");
     static uint32_t sequence=0;static String previous;
     if(!sequence || key!=previous){++sequence;previous=key;}
     doc["boot_id"]=transport::v2Nonce();doc["status_seq"]=sequence;doc["device_mac"]=macText();
@@ -402,6 +450,10 @@ void wifiDeviceStatus(JsonDocument &doc,const EndpointRec *endpoint) {
     auto presence=doc["presence"].to<JsonObject>();presence["mode"]=continuous?"continuous":until>now?"window":"ending";
     if(continuous)presence["remaining_ms"]=nullptr;else presence["remaining_ms"]=until>now?until-now:0;
     presence["window_id"]=transport::v2Nonce()+String("_")+String(sequence);
+    doc["power"]["manual_remaining_s"]=power::state.bleRecovery.lightRemaining(now);
+    doc["network"]["bridge_reachable"]=state.bridgeReachable;
+    doc["network"]["error"]=state.networkError;
+    doc["network"]["automatic_ble"]=automaticContactNeeded();
     presence["maintenance_remaining_ms"]=power::state.bleRecovery.until>now?power::state.bleRecovery.until-now:0;
     auto reasons=presence["reasons"].to<JsonArray>();
     if(continuous)reasons.add("usb");if(power::state.bleRecovery.until>now)reasons.add("boot");
@@ -424,20 +476,46 @@ void wifiDeviceStatus(JsonDocument &doc,const EndpointRec *endpoint) {
 }
 
 static __attribute__((noinline)) void servicePresence() {
-    if(!state.wifiUp || WiFi.status()!=WL_CONNECTED || transport::state.otaInProgress)return;
-    const uint64_t now=clock::v2NowMs(),until=wifiControlUntil(now);
-    if(until>now && until!=UINT64_MAX && until-now<1000)return;
-    static uint64_t lastSample=0,lastPass=0;static uint32_t prior=0;static int endpointIndex=0;
-    if(now-lastSample<1000)return;lastSample=now;
-    JsonDocument status;wifiDeviceStatus(status);uint32_t seq=status["status_seq"]|0u;
-    if(seq!=prior || now-lastPass>=30000){prior=seq;lastPass=now;endpointIndex=0;sendAnnounce(state.bleOn);}
-    EndpointRec endpoint;if(!storeGet(endpointIndex,endpoint))return;++endpointIndex;
-    if(!endpoint.principal.length())return;
-    JsonDocument event;event["event"]="presence";event["device_mac"]=macText();event["boot_id"]=transport::v2Nonce();
-    event["status_seq"]=seq;event["ip"]=ipText();event["trigger"]=status["presence"]["reasons"];event["transports"]=status["transports"];
-    String body;serializeJson(event,body);HTTPClient client;client.setConnectTimeout(150);client.setTimeout(150);
-    if(client.begin(String("http://")+endpoint.host+String(":")+String(endpoint.port)+"/api/device/presence")) {
-        client.addHeader("Content-Type","application/json");client.addHeader("Authorization",String("Bearer ")+endpoint.token);client.POST(body);client.end();
+    if (!state.wifiUp || WiFi.status() != WL_CONNECTED || wifiSetupBusy() || transport::state.otaInProgress ||
+        state.v2InRendezvous || state.failureReportPending) return;
+    const uint64_t now = clock::v2NowMs(), until = wifiControlUntil(now);
+    if (until <= now || (until != UINT64_MAX && until-now < 2000) ||
+        (state.presenceAttemptAtMs && now-state.presenceAttemptAtMs < 30000)) return;
+    state.presenceAttemptAtMs = now;
+    OwnerRec owner; const bool owned = ownerGet(owner);
+    bool found = false, reached = false;
+    for (int i=0; i<storeCount(); ++i) {
+        EndpointRec endpoint;
+        if (!storeGet(i,endpoint) || !endpoint.principal.length() ||
+            (owned && endpoint.principal != owner.id)) continue;
+        found = true;
+        JsonDocument event; event["event"]="presence"; event["device_mac"]=macText();
+        event["boot_id"]=transport::v2Nonce(); event["ip"]=ipText();
+        event["manual_remaining_s"]=power::state.bleRecovery.lightRemaining(now);
+        HTTPClient client; client.setConnectTimeout(750); client.setTimeout(750);
+        if (client.begin(String("http://")+endpoint.host+":"+String(endpoint.port)+"/api/device/presence")) {
+            String body; serializeJson(event,body);
+            client.addHeader("Content-Type","application/json");
+            client.addHeader("Authorization",String("Bearer ")+endpoint.token);
+            const int code=client.POST(body);
+            if (code==202 && client.getSize()>0 && client.getSize()<=256) {
+                JsonDocument reply;
+                reached=!deserializeJson(reply,client.getString()) &&
+                    String(reply["bridge_id"]|"")==endpoint.principal &&
+                    reply["device_http_verified"]==true;
+            }
+            client.end();
+        }
+        // One endpoint per period; do not multiply the radio budget by peers.
+        break;
+    }
+    if (reached) {
+        state.bridgeReachable=true;
+        state.presenceFailures=0; state.networkError=nullptr;
+        updateInfoExtra();
+    } else if (!found || ++state.presenceFailures >= 3) {
+        networkFailed("bridge_http_unreachable");
+        updateInfoExtra();
     }
 }
 
@@ -581,6 +659,7 @@ String wifiManagementRequest(JsonDocument &request,const char *op) {
 }
 
 void v2RendezvousBegin(bool deep) {
+    state.fallbackAttempted = false;
     state.v2InRendezvous = true;
     state.v2RvBleReleased = false;
     v2RvStartMs = clock::v2NowMs();
@@ -621,6 +700,14 @@ static void rendezvousWifiBegin() {
 
 static void rendezvousWifiTick() {
     if (wifiSetupBusy()) return;
+    if (!state.fallbackUntilMs && WiFi.status()!=WL_CONNECTED) startFallback();
+    if (state.fallbackUntilMs && clock::v2NowMs() >= state.fallbackUntilMs &&
+        (WiFi.status()!=WL_CONNECTED || WiFi.localIP()==IPAddress(0,0,0,0))) {
+        WiFi.disconnect(false);
+        state.fallbackUntilMs = 0;
+        state.v2Rv.finishExchange(clock::v2NowMs(), 0);
+        return;
+    }
     if (WiFi.status() == WL_CONNECTED && !(WiFi.localIP() == IPAddress(0,0,0,0))) {
         state.wifiUp = true;
         state.wifiConnActive = false;
@@ -669,12 +756,25 @@ void v2RendezvousTick() {
     // Physical recovery has its own fixed deadline. Ordinary/USB auto BLE is
     // released for this window and cannot reopen behind a network task.
     if (!power::v2ManualBleHoldActive()) { state.v2RvBleReleased = true; bleOff("rendezvous deadline"); }
+    const bool networkFailedThisRound = state.v2RvNetworkRequested &&
+        (!state.readyReport.received || WiFi.status()!=WL_CONNECTED);
     state.v2InRendezvous = false; v2RfDeadlineMs = 0;
+    if (state.readyReport.received) {
+        state.bridgeReachable=true;
+        state.networkError=nullptr; state.presenceFailures=0;
+    }
     diagnostics::state.wakeResult = light ? WAKE_RV_LIGHT : WAKE_RV_SLEEP;
     diagnostics::retained.rtcNetCycles++;
     DevLog.printf("[platform] rendezvous network=%d light=%d elapsed=%ums\n", state.v2RvNetworkRequested, light, (unsigned)(now-v2RvStartMs));
+    const bool reporting = state.failureReportPending;
+    state.failureReportPending = false;
     state.nextBleContactMs = now + (uint64_t)V2_RENDEZVOUS_S * 1000ULL;
-    const bool stayAwake = light || sync::state.syncOpenThisWake || power::v2ManualBleHoldActive() || (power::state.plugged && !power::retained.rtcDeepOnUsb);
+    if (!reporting && !state.v2RvNetworkRequested && !wifiSetupBusy() && WiFi.status()!=WL_CONNECTED &&
+        power::state.bleRecovery.lightRemaining(now)) startFallback();
+    if (networkFailedThisRound && !reporting) {
+        networkFailed(WiFi.status()==WL_CONNECTED ? "bridge_http_unreachable" : "wifi_connect_failed");
+    }
+    const bool stayAwake = state.failureReportPending || power::state.bleRecovery.lightRemaining(now) || light || sync::state.syncOpenThisWake || power::v2ManualBleHoldActive() || (power::state.plugged && !power::retained.rtcDeepOnUsb);
     if (!stayAwake && power::retained.rtcMode != MODE_DEEP) {
         // Transition through the common mode/persistence/full sleep-frame path.
         // enterDeep renders the latest snapshot, so do not draw a Light frame first.
@@ -683,7 +783,12 @@ void v2RendezvousTick() {
         return;
     }
     display::v2RendezvousRender(light);
-    if (stayAwake) startNormalMode();
+    if (stayAwake) {
+        startNormalMode();
+        // A timed-out network attempt gets one ordinary bounded report round
+        // before sleep; it cannot recursively retry networking in that round.
+        if (state.failureReportPending) v2RendezvousBegin();
+    }
     else {
         power::retained.rtcNextContactS = V2_RENDEZVOUS_S;
         power::retained.rtcNextNetAt = clock::timeKnown() ? (uint32_t)time(nullptr)+power::retained.rtcNextContactS : 0;
@@ -712,9 +817,8 @@ void startNormalMode() {
     // to clobber a bridge-synced timezone on every light start.
     esp_sntp_set_time_sync_notification_cb(clock::ntpTimeSynced);
     configTzTime(clock::state.deviceTz, "pool.ntp.org");
-    // Awaiting provisioning is offline, not a Wi-Fi association attempt.
-    state.wifiConnActive = wifiSetupBusy();
-    state.wifiBlinkOn = state.wifiConnActive;
+    // Awaiting provisioning is idle, not a Wi-Fi association attempt.
+    serviceWifiMetadata();
 
     // Deep wake: leave the sleep frame at once (Zzz gone) so BOOT has instant
     // feedback; the Wi-Fi cell starts visible and Bridge keeps its old glyph.
@@ -736,8 +840,7 @@ void startNormalMode() {
     // Normal mode only serves an already admitted connection. Network choice
     // and asynchronous association belong to authenticated BLE provisioning.
     state.wifiUp = WiFi.status() == WL_CONNECTED;
-    state.wifiConnActive = false;
-    state.wifiBlinkOn = false;
+    serviceWifiMetadata();
     if (!state.httpServicesStarted) { transport::registerHttpRoutes(); transport::state.server.begin(); state.httpServicesStarted = true; }
 
     if (state.wifiUp) {
@@ -773,7 +876,6 @@ void startNormalMode() {
         // drew the template while the state was still WIFI OFF). rtcDeepGlyph
         // bit0 = the last deep entry actually drew the sleep glyph.
         if (power::state.wokeFromDeep && (diagnostics::retained.rtcDeepGlyph & 1)) display::renderCurrent();
-        if (power::state.plugged && !power::retained.rtcDeepOnUsb && power::state.batteryPct > BLE_AUTO_PCT) enterBleOn(false);
         // Cold boot: never leave the boot/connecting page up when the first
         // pull failed. The cached usage (or the built-in status screen) is
         // rendered once the link is up, so the panel is never stale. An

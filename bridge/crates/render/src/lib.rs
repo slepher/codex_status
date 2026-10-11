@@ -34,6 +34,8 @@ struct Job {
     sync_hhmm: String,
     battery: i32,
     state: String,
+    wifi_state: String,
+    wifi_blink: i32,
     offline_mins: i32,
     mode: String,
     blob: Vec<u8>,
@@ -187,6 +189,10 @@ fn run_job(job: &Job, out: &mut [u8], message: &mut String) -> i32 {
         Ok(value) => value,
         Err(_) => return -3,
     };
+    let wifi_state = match CString::new(job.wifi_state.as_str()) {
+        Ok(value) => value,
+        Err(_) => return -3,
+    };
     let mode = match CString::new(job.mode.as_str()) {
         Ok(value) => value,
         Err(_) => return -3,
@@ -200,6 +206,8 @@ fn run_job(job: &Job, out: &mut [u8], message: &mut String) -> i32 {
                 sync.as_ptr(),
                 job.battery,
                 state.as_ptr(),
+                wifi_state.as_ptr(),
+                job.wifi_blink,
                 job.offline_mins,
                 mode.as_ptr(),
                 out.as_mut_ptr(),
@@ -220,6 +228,8 @@ fn run_job(job: &Job, out: &mut [u8], message: &mut String) -> i32 {
             sync.as_ptr(),
             job.battery,
             state.as_ptr(),
+            wifi_state.as_ptr(),
+            job.wifi_blink,
             job.offline_mins,
             mode.as_ptr(),
             out.as_mut_ptr(),
@@ -262,6 +272,8 @@ fn base_job(template: &str, env: &Env<'_>) -> Job {
         sync_hhmm: env.sync_hhmm.to_string(),
         battery: env.battery,
         state: env.state.to_string(),
+        wifi_state: env.wifi_state.to_string(),
+        wifi_blink: env.wifi_blink,
         offline_mins: env.offline_mins,
         mode: env.mode.to_string(),
         blob: Vec::new(),
@@ -479,6 +491,8 @@ extern "C" {
         sync_hhmm: *const c_char,
         battery: c_int,
         state: *const c_char,
+        wifi_state: *const c_char,
+        wifi_blink: c_int,
         offline_mins: c_int,
         mode: *const c_char,
         out: *mut u8,
@@ -493,6 +507,8 @@ extern "C" {
         sync_hhmm: *const c_char,
         battery: c_int,
         state: *const c_char,
+        wifi_state: *const c_char,
+        wifi_blink: c_int,
         offline_mins: c_int,
         mode: *const c_char,
         out: *mut u8,
@@ -1324,6 +1340,10 @@ pub struct Env<'a> {
     pub battery: i32,
     /// Device state word: `AP` / `BLE ON` / `BLE OFF` / `WIFI OFF` / `DEEP`.
     pub state: &'a str,
+    /// Local Wi-Fi lifecycle metadata, independent of BLE/contact state.
+    pub wifi_state: &'a str,
+    /// 0/1 only while connecting; -1 means absent.
+    pub wifi_blink: i32,
     /// Minutes since the last successful sync; negative = unknown.
     pub offline_mins: i32,
     /// Device mode word: `deep` / `light` (bind `device.mode`, v0.14).
@@ -1338,6 +1358,8 @@ impl Default for Env<'_> {
             sync_hhmm: "--:--",
             battery: -1,
             state: "BLE OFF",
+            wifi_state: "idle",
+            wifi_blink: -1,
             offline_mins: -1,
             mode: "light",
         }

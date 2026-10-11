@@ -111,6 +111,16 @@
 
 ### A9. PowerPlan 与 Data 同轮联合下发（2026-10-05）
 
+- **2026-10-11 行为缺口候选实现（关联 B6/C8）**：最终用户合同为 BOOT 开/关/再开窗口、健康 HTTP 禁自动 BLE、断网/Bridge HTTP 失败有界 BLE 汇报再回普通周期。[实施与验收](../../project-workflow/bridge-macos/boot-network-20261011.md)记录 .77 候选、311 测试通过/3 忽略及构建/栈门禁；未部署。后续[短时入睡调查](../../project-workflow/bridge-macos/boot-five-second-investigation-20261011.md)证实PWR唤醒6.977秒后深睡，收尾遗漏provisional；初始化BOOT漏按路径存在，具体物理时序未记录。后续 .78 已补两处缺口并通过原OTA单次上传认证镜像核验，配套Bridge已更新；实体按键重叠、RF/功耗/屏幕实机矩阵未验，不结项。
+
+- **2026-10-11 协议闭环实施**：诊断尾部沿用HTTP准入、ready报告ACK后验证持续HTTP事实已修复；扩展审核修复新写入401/403仍未知、409修订冲突误分类、wifi_state合同文本类型。316项通过/3条件忽略、设备页及52项栈门禁通过；新版Bridge已部署，.76 OTA原job86054e26单次上传并image_verified，独立认证运行hash一致；13:10自然恢复会合/Data414通过。真实10轮自然会合、物理故障矩阵及显示未验，不结A9/B6/C8；详见[实施记录](../../project-workflow/bridge-macos/protocol-implementation-20261011.md)。
+
+- **2026-10-11 Luna提交历史审核与协议闭环计划**：检查09-23以来85个提交、重点10项；主代理复核诊断尾部绕过HTTP准入、瞬时ready阻塞合法HTTP两项P1仍存在。依序补生产ble_cycle组合回归并修复、跨通道身份/事务换接、错误与未知结果全链审核、故障矩阵及Note4自然会合验收；关联B6/C8。[证据报告](../../project-workflow/bridge-macos/protocol-history-review-20261011.md)、[执行与结项闸门](../../project-workflow/bridge-macos/protocol-followup-plan-20261011.md)。本轮仅审核/规划，未修改生产代码；.75已部署，不把待实机验收误写为源码未修。
+
+- **2026-10-11 Wi-Fi模板元数据候选完成**：用户明确图形交给模板，新增本地wifi_state/wifi_blink及阶段/相位重绘，等待不冒充OFF；quad v13/Note4模板v3，.75候选构建/宿主像素/52项栈检查通过。未部署/发布，RF闪烁与会合刷新耗时仍待验；诊断HTTP准入和ready竞态另两项未改，见[实施记录](../../project-workflow/bridge-macos/wifi-template-metadata-20261011-plan.md)。
+
+- **2026-10-11 协议审核，待修复**：Note4 BLE seq398成功但本轮无需HTTP时仍执行约49s诊断HTTP尾部；会合ready瞬态与持续HTTP可用性混用，已认证verified仍超时。与B6共同验收WIFI OFF只作终态、冻结准入和迟到HTTP验证，见[审核与现场证据](../../project-workflow/bridge-macos/wifi-terminal-review-20261011.md)。本轮只读，未部署。
+
 - **17:33 自动数据投递修复已部署Bridge**：30秒过期状态不能阻断自身刷新；登记IP每分钟有界恢复探测、认证/owner投递闸门保留。实机源used24→余76，自动seq377 applied/displayed且直接认证双序号377，确认指纹匹配最新源。Fake真实HTTP连续两次源变化/过期缓存恢复通过；ROM保持.74，实体多周期矩阵仍待验。
 
 - **2026-10-09 16:30 重新打开手动激活/显示验收**：.73 实机仍报告 Sleep 无 Bridge；16:17 激活的设备最终回执为 `window_closed`。代码发现深睡无新 Data 仅刷新时钟而跳过联系恢复图标、EPD失败仍更新睡眠/失联标记，以及物理 BLE hold 与激活完成轮询互相等待的路径（现场 hold 条件待核对）。已有 Fake 按状态重绘全帧未覆盖真实会合调度；需补上述调度和显示失败回归，不能以 .73 部署宣称本场景完成。现场及下一步见[专项](../../project-workflow/bridge-macos/wifi-idle-activate-20261008-plan.md)。

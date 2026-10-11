@@ -1,6 +1,22 @@
 #pragma once
 #include <stdint.h>
 
+enum class WifiPhase : uint8_t { Idle, Connecting, Connected, Off };
+inline WifiPhase wifiPhaseFor(bool connecting, bool connected, bool pending, bool terminal) {
+    if (connecting) return WifiPhase::Connecting;
+    if (connected) return WifiPhase::Connected;
+    if (pending) return WifiPhase::Idle;
+    return terminal ? WifiPhase::Off : WifiPhase::Idle;
+}
+inline const char *wifiPhaseText(WifiPhase phase) {
+    switch (phase) {
+    case WifiPhase::Connecting: return "connecting";
+    case WifiPhase::Connected: return "connected";
+    case WifiPhase::Off: return "off";
+    default: return "idle";
+    }
+}
+
 // Contact freshness includes both BLE and HTTP; RF state is a separate fact.
 inline int bridgeOfflineMinutes(uint32_t now, uint32_t lastContact, bool timeKnown,
                                 int lostMinutes, int unknownValue) {
@@ -19,8 +35,11 @@ struct NetworkDisplayState {
     uint8_t attempts = 0;
     uint64_t nextAt = 0;
     int bridgeOffline = -1;
-    void observe(bool up, int offline = -1) {
-        if (!known || connected != up || bridgeOffline != offline) {
+    WifiPhase wifiPhase = WifiPhase::Idle;
+    int wifiBlink = -1;
+    void observe(bool up, int offline = -1, WifiPhase phase = WifiPhase::Idle, int blink = -1) {
+        if (!known || connected != up || bridgeOffline != offline || wifiPhase != phase || wifiBlink != blink) {
+            wifiPhase = phase; wifiBlink = blink;
             bridgeOffline = offline;
             known = true; connected = up; pending = true; attempts = 0; nextAt = 0;
         }

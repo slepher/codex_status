@@ -46,8 +46,8 @@
       "type": "icon",
       "w": 16,
       "when": {
-        "bind": "device.state",
-        "equals": "BLE OFF"
+        "bind": "device.wifi_state",
+        "equals": "connected"
       },
       "x": 121,
       "y": 6
@@ -59,11 +59,23 @@
       "type": "icon",
       "w": 16,
       "when": {
-        "bind": "device.state",
-        "equals": "BLE ON"
+        "bind": "device.wifi_state",
+        "equals": "off"
       },
       "x": 121,
       "y": 6
+    },
+    {
+      "type": "line",
+      "x1": 121,
+      "y1": 6,
+      "x2": 136,
+      "y2": 21,
+      "color": "black",
+      "when": {
+        "bind": "device.wifi_state",
+        "equals": "off"
+      }
     },
     {
       "bits": "AAADwB/4cA7AA4PBH/g4HCAEA8AH4AAAAAABgAGAAAA=",
@@ -72,8 +84,8 @@
       "type": "icon",
       "w": 16,
       "when": {
-        "bind": "device.state",
-        "equals": "WIFI CONN"
+        "bind": "device.wifi_blink",
+        "equals": 1
       },
       "x": 121,
       "y": 6
@@ -96,32 +108,6 @@
       "when": {
         "bind": "device.offline_mins",
         "exists": true
-      },
-      "x": 141,
-      "y": 6
-    },
-    {
-      "bits": "AAB//sAD2APMA8YDwwPBg8GDwAP//3/+AYAf+B/+AAY=",
-      "color": "black",
-      "h": 16,
-      "type": "icon",
-      "w": 16,
-      "when": {
-        "bind": "device.state",
-        "equals": "WIFI OFF"
-      },
-      "x": 141,
-      "y": 6
-    },
-    {
-      "bits": "AAB//sAD2APMA8YDwwPBg8GDwAP//3/+AYAf+B/+AAY=",
-      "color": "black",
-      "h": 16,
-      "type": "icon",
-      "w": 16,
-      "when": {
-        "bind": "device.state",
-        "equals": "WIFI CONN"
       },
       "x": 141,
       "y": 6
@@ -480,7 +466,7 @@
     }
   ],
   "id": "quad",
-  "min_fw": "0.14",
+  "min_fw": "0.18.75",
   "schema": 1,
-  "version": 12
+  "version": 13
 }

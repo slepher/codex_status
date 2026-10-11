@@ -13,7 +13,8 @@ void v2WriteDataContract(JsonObject out, const CtTemplate &compiled) {
         field["index"] = i;
         field["field"] = req.path;
         const bool text = req.kind <= 2 || req.kind == 10 || req.kind == 11 ||
-            req.kind == 12 || req.kind == 14 || req.kind == 16 || req.kind == 17 || req.kind == 18;
+            req.kind == 12 || req.kind == 14 || req.kind == 16 || req.kind == 17 || req.kind == 18 ||
+            req.kind == 19; // device.wifi_state; device.wifi_blink (20) is numeric.
         field["kind"] = text ? "text" : "number";
         field["missing"] = "hide";
         field["local"] = req.kind > 9;

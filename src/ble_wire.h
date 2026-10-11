@@ -21,6 +21,8 @@ struct BleStatusSnapshot {
     uint8_t rounds = 0, retrySkip = 0;
     bool due = false, pending = false;
     uint8_t rendezvousVersion = 0;
+    bool automaticContact = true;
+    const char *networkError = nullptr;
 };
 bool bleWireText(const String &value, size_t limit, bool allowEmpty = true);
 bool bleWireFits(const String &bytes);

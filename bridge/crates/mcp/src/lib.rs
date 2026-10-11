@@ -606,6 +606,7 @@ fn env_from_args(args: &Value) -> bridge_render::Env<'static> {
                 .to_string()
                 .into_boxed_str(),
         ),
+        ..bridge_render::Env::default()
     }
 }
 

@@ -10,6 +10,8 @@ fn production_ble_status_preserves_all_maximum_byte_identifiers() {
     let mut input = envelope();
     input["session_nonce"] = json!("f".repeat(32));
     input["rendezvous_v"] = json!(1);
+    input["automatic_contact"] = json!(false);
+    input["network_error"] = json!("bridge_http_unreachable");
     input["active_context_id"] = json!("\u{1}".repeat(32));
     input["active_template_id"] = json!("\\".repeat(16));
     input["committed_job_id"] = json!("é".repeat(8));
@@ -29,7 +31,15 @@ fn production_ble_status_preserves_all_maximum_byte_identifiers() {
     assert_eq!(doc["s"][4], u64::MAX);
     assert!(doc.get("data_contract").is_none());
     assert_eq!(doc["rendezvous_v"], 1);
+    assert_eq!(doc["ac"], false);
+    assert_eq!(doc["ne"], 2);
     assert_eq!(doc["s"].as_array().unwrap().len(), 16);
+    // Ordinary Bridge status uses an r + 16-hex request ID. Test its complete
+    // compact frame too; the adapter separately rejects oversized custom IDs.
+    input["request_id"] = json!("rffffffffffffffff");
+    let compact_payload=wire("status", &input).unwrap();
+    assert!(compact_payload.len()+48<=512);
+    println!("compact status with maximum fields={} bytes", compact_payload.len()+48);
 }
 #[test]
 fn production_info_and_all_ack_classes_are_bounded() {

@@ -81,6 +81,8 @@ UI 和 MCP 调用同一套保存、预览、发布、同步开关、激活、cla
 
 ## 5. 硬件适配与容量
 
+模板本地元数据补充（2026-10-11源码候选）：`device.wifi_state`提供idle/connecting/connected/off生命周期，`device.wifi_blink`只在connecting时提供0/1相位。均为local_dependencies，不进入Bridge Data要求或上下文数据快照；模板选择视觉表达，固件仅使阶段/相位变化触发重绘。等待BLE/开网不等于连接失败，WIFI OFF不作中间态。状态语义见[电源状态 §7](power-state.md#7-屏幕状态字与模板协议)。
+
 `DeviceCapabilities` 至少报告：firmware_target、render_target、尺寸、像素格式/颜色或灰阶、compiler ABI、最大模板数/包字节/字段数/快照字节、保留能力、BLE/Wi-Fi 能力、功耗协议与安全最大期限。设备对收到的 target 自行校验，Bridge 预检不能替代设备拒绝。
 
 | 边界 | 责任 |
@@ -125,6 +127,9 @@ Bridge 时间到 full_sync_deadline → 排完整同步（可包含 pull 的新�
 
 ## 7. Bridge 电源决策与设备状态机
 
+2026-10-11 用户修订：人工 BOOT 首次及后续蓝牙 OFF→ON 各建立该物理时刻起 300s Light、120s 蓝牙开放；ON→OFF 仅撤销开放偏好，不缩短 Light/中断必要交汇。设备独立保留人工截止，Bridge 从认证剩余时间重建窗口。Wi-Fi 与 Bridge HTTP 正常只走主动 HTTP；连接或 HTTP 失败允许 BLE 汇报/下一周期恢复。首次 BLE 选择不含密码，无有效选择回退上次成功网络。完整优先规则见[通信场景](bridge-device-communication-scenarios.md#2026-10-11-用户确认boothttp-与-ble-生命周期)。
+
+
 Bridge 是正式 PowerPlan 唯一业务决策者。Bridge 根据待发布操作、push 活跃情况、用户功耗设置、当前可达性决定本轮 NOOP/SLEEP、BLE 更新、Bundle 更新或进入/继续 Wi-Fi light。pull-only 变化不改任何电源计划；完整同步到期可由 Bridge 决定传输所需计划，但不会让设备自行升档。
 
 会合发现支持两个可切换策略，但它们只分叉“怎样建立本轮可达机会”，不复制 coordinator、owner、Data、Bundle、PowerPlan 或业务 ACK：
@@ -148,7 +153,7 @@ DEEP --timer--> 本地必要时钟/维护 → RENDEZVOUS(strategy)
 
 DEEP --BOOT--> 立即建立 provisional 截止(t_boot + 300s)
               → 手动 Beacon 通知 Bridge → 有界 Wi-Fi 连接 → WIFI_LIGHT
-              → 正式 PowerPlan 可缩短/保持/延长 provisional
+              → 正式 PowerPlan 保持/延长人工窗口；普通交汇不得缩短
 
 WIFI_LIGHT --新正式 PowerPlan--> 更新明确期限/模式
 WIFI_LIGHT --截止/通信失败硬限/低电--> 有界收尾 → 关无线 → DEEP/保护关机
@@ -156,7 +161,7 @@ WIFI_LIGHT --截止/通信失败硬限/低电--> 有界收尾 → 关无线 → 
 
 BOOT 的通知先走短 BLE 会合，Wi-Fi 连上后也上报 wake_reason；“立即”表示立即尝试通知，不保证 Bridge 已收到。provisional 从物理按键唤醒开始计时，包含 BLE、建连与事务时间；Bridge 不可达时最迟 300 秒结束在线状态，连接失败/低电可更早退出。不得以重连、重复通知或 timer wake 再获得 300 秒。Bridge 正式保持原兜底时发送剩余时长，不重置为新的 300 秒。
 
-**物理唤醒窗口是下界（取大）。** 一次按键/BOOT 唤醒建立 `t_boot + 300s` 后，后继正式 PowerPlan 只能保持或延长它：effective deadline = `max(plan, t_boot + 300s)`。设备只在首个正式 plan 被接受前上报 `provisional_remaining_s`，因此 **Bridge 必须自己记住该窗口**（`PlanState.manual_until`）并在其有效期内即使没有待办也不下发 sleep；只有显式入口（`explicit_plan` / `queue_explicit_light`）可以提前结束。没有待办时 Bridge 按剩余窗口下发 light（而不是 `MAX_LIGHT_S`），否则每 60 秒一次会合会把窗口无限延长。
+**物理唤醒窗口是下界（取大）。** BOOT 打开建立 `t_boot + 300s`，普通正式 PowerPlan 不缩短它：effective deadline = `max(plan, manual deadline)`。人工剩余窗口经 HTTP `power.manual_remaining_s` 及 BLE 剩余窗口持续报告，Bridge 记住绝对期限，不按每次通信重授 300 秒。BOOT 关闭只撤销 BLE 开放偏好、不延长 Light；下一次打开才从该物理按键续 300 秒/120 秒。没有待办时按剩余窗口下发 Light，人工联网不依赖待办队列。
 
 设备执行安全约束：最大 light lease、最大 rendezvous 周期/无线窗口、事务总截止及停滞截止、低电保护、重复计划幂等。它可以缩短或拒绝危险计划，并报告原因；不能根据数据内容或“用户大概仍活跃”续租。读取、数据传输、claim/owner renew 都不隐式改 light deadline。
 
@@ -259,7 +264,7 @@ GATT 优先复用现有表并明确协议协商；修改特征表必须考虑 Wi
 
 **deep 首次 push，随后实时变化。** t=0 会合结束，t=2 push 变化；Bridge 排最新完整包，设备仍 deep。约 t=60 下一机会，Bridge 可先 BLE 发小包并回 deep，或因配置的活跃窗口发正式 light 计划后 Wi-Fi 送包。light 中 t=65 再有 push 则立即排送；t=66 仅 pull 变化不送、不续期。原期限将到时，只有 Bridge 新 PowerPlan 能延长。
 
-**BOOT 与不可达 Bridge。** t=0 按 BOOT，设备建立 t=300 provisional 截止并广播 manual；t=3 Bridge 返回正式 60 秒 light，设备截止改为 t=63。重复该 plan_id 不把截止改为 t=66。若始终未收到正式计划，则无线最迟 t=300 关闭；timer 唤醒只走短会合。
+**BOOT 与不可达 Bridge。** t=0 按 BOOT，设备建立 t=300 provisional 截止并广播 manual；t=3 Bridge 返回正式 60 秒 light，人工窗口仍保持至 t=300。重复该 plan_id 不改变任一原截止。若始终未收到正式计划，则无线最迟 t=300 关闭；timer 唤醒只走短会合。
 
 **排队编辑与断电。** 用户发布模板 A/B 到设备，job 冻结当前两个源和绑定；等待期间又保存 A，只改变库。设备写入另一 Bundle 槽中途掉电，仍启动旧完整槽；重试原 job 仍发送冻结的 A/B。成功后下次显式发布才带新的 A。
 

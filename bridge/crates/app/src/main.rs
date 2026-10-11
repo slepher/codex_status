@@ -1098,17 +1098,24 @@ async fn mcp_handler(
 // Notification is a hint only. Registered MAC/IP and current endpoint token
 // restrict probes; authenticated status, never the event payload, updates truth.
 async fn presence_hint(axum::extract::State(ctx):axum::extract::State<Arc<AppCtx>>,
-    headers:axum::http::HeaderMap,axum::Json(hint):axum::Json<Value>)->axum::http::StatusCode {
+    headers:axum::http::HeaderMap,axum::Json(hint):axum::Json<Value>)-> (axum::http::StatusCode, axum::Json<Value>) {
     if headers.get(axum::http::header::AUTHORIZATION).and_then(|h|h.to_str().ok())!=Some(format!("Bearer {}",ctx.config.token).as_str()) {
-        return axum::http::StatusCode::UNAUTHORIZED;
+        return (axum::http::StatusCode::UNAUTHORIZED, axum::Json(json!({})));
     }
-    let Some(mac)=hint["device_mac"].as_str().and_then(bridge_core::platform::model::DeviceIdentity::normalized_mac) else{return axum::http::StatusCode::BAD_REQUEST;};
-    let Some(mut link)=platform::device_link_for_mac(&ctx,&mac) else{return axum::http::StatusCode::NOT_FOUND;};
-    let Some(candidate)=hint["ip"].as_str().filter(|ip|ip.parse::<std::net::Ipv4Addr>().is_ok()) else{return axum::http::StatusCode::BAD_REQUEST;};
+    let Some(mac)=hint["device_mac"].as_str().and_then(bridge_core::platform::model::DeviceIdentity::normalized_mac) else{return (axum::http::StatusCode::BAD_REQUEST, axum::Json(json!({})));};
+    let Some(mut link)=platform::device_link_for_mac(&ctx,&mac) else{return (axum::http::StatusCode::NOT_FOUND, axum::Json(json!({})));};
+    let Some(candidate)=hint["ip"].as_str().filter(|ip|ip.parse::<std::net::Ipv4Addr>().is_ok()) else{return (axum::http::StatusCode::BAD_REQUEST, axum::Json(json!({})));};
     let changed=candidate!=link.ip;link.ip=candidate.to_owned();
+    let saved=platform::service(&ctx).device_get(&mac).unwrap_or(Value::Null);
+    let sample=&saved["last_authenticated"];
+    let sampled_at=sample["observed_at"].as_i64().unwrap_or(0);
+    let verified=sample["transport"]=="http" && sample["body"]["boot_id"]==hint["boot_id"] && !hint["boot_id"].is_null() &&
+        sampled_at>0 && device_now_secs(&mac)>=sampled_at && device_now_secs(&mac)-sampled_at<45 &&
+        sample["body"]["transports"]["http"]["ready"]==true;
+    let reply=json!({"result":"accepted","bridge_id":ctx.bridge_id,"device_http_verified":verified});
     // try_lock coalesces repeated hints and bounds work independently per MAC.
     let lock=platform::delivery_lock(&ctx,&mac);
-    let Ok(guard)=lock.try_lock_owned() else{return axum::http::StatusCode::ACCEPTED;};
+    let Ok(guard)=lock.try_lock_owned() else{return (axum::http::StatusCode::ACCEPTED, axum::Json(reply));};
     tokio::spawn(async move {
         let sampled=std::time::Instant::now();let fetch=link.clone();
         if let Ok(Ok(status))=tokio::task::spawn_blocking(move||bridge_core::device_client::status(&fetch.ip,&fetch.token,Duration::from_secs(2))).await {
@@ -1122,7 +1129,7 @@ async fn presence_hint(axum::extract::State(ctx):axum::extract::State<Arc<AppCtx
         }
         drop(guard);
     });
-    axum::http::StatusCode::ACCEPTED
+    (axum::http::StatusCode::ACCEPTED, axum::Json(reply))
 }
 
 // The shared bearer permits a hint only. A fresh HTTP session binds the
@@ -2583,6 +2590,7 @@ async fn preview_template(
         ip: &ip,
         sync_hhmm: &sync,
         battery: bridge_render::DEFAULT_BATTERY,
+        wifi_state: "connected",
         ..Default::default()
     };
     let bits = bridge_render::render_bits(&template, &usage.to_string(), &env)
@@ -3551,6 +3559,11 @@ async fn run_services(ctx: Arc<AppCtx>) {
 fn device_ble_candidates(devices: &[Value], last_attempt: &HashMap<String, i64>, now: i64) -> Vec<String> {
     devices
         .iter()
+        .filter(|device| {
+            let at = device["last_authenticated"]["observed_at"].as_i64().unwrap_or(0);
+            !(device["last_authenticated"]["body"]["network"]["automatic_ble"] == false &&
+                at > 0 && now >= at && now-at < 45)
+        })
         .filter_map(|device| {
             device["device_mac"]
                 .as_str()
@@ -3571,6 +3584,17 @@ mod device_ble_candidate_tests {
 
     fn device(mac: &str) -> Value {
         json!({"device_mac": mac})
+    }
+
+    #[test]
+    fn healthy_http_suppresses_automatic_ble_but_stale_contact_recovers() {
+        let mut d=device("AABBCCDDEE01");
+        d["last_authenticated"]=json!({"observed_at":100,
+            "body":{"network":{"automatic_ble":false}}});
+        assert!(device_ble_candidates(&[d.clone()],&HashMap::new(),130).is_empty());
+        assert_eq!(device_ble_candidates(&[d.clone()],&HashMap::new(),146),["AABBCCDDEE01"]);
+        d["last_authenticated"]["body"]["network"]["automatic_ble"]=json!(true);
+        assert_eq!(device_ble_candidates(&[d],&HashMap::new(),130),["AABBCCDDEE01"]);
     }
 
     #[test]

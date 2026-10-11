@@ -2558,6 +2558,8 @@ mod ble_close_lock_tests {
         /// Device status reports `sync.due=true` / `enabled=true`, so a real
         /// `ble_cycle` takes its `sync_open` path (`sync_opened == true`).
         sync_due: bool,
+        provisional_remaining_s: AtomicU64,
+        status_extra: Mutex<Value>,
         closes: AtomicUsize,
         status_reads: AtomicUsize,
         fragments: Mutex<Vec<u8>>,
@@ -2650,6 +2652,10 @@ mod ble_close_lock_tests {
         fake.commands.lock().unwrap().push(command.clone());
         let op = command["op"].as_str().unwrap_or("");
         let mut reply = command_ack(&fake.mac, &command, fake.sync_due);
+        if op == "status" {
+            reply["power"]["provisional_remaining_s"] = json!(fake.provisional_remaining_s.load(Ordering::SeqCst));
+            for (key,value) in fake.status_extra.lock().unwrap().as_object().unwrap() { reply[key]=value.clone(); }
+        }
         if fake.protocol.load(Ordering::SeqCst) {
             fake.events.lock().unwrap().push(format!("ble:{op}"));
             reply["wake_generation"] = json!(2); reply["wake_seq"] = json!(9);
@@ -2700,7 +2706,12 @@ mod ble_close_lock_tests {
             (op == "network_start" && fake.lost_network_start.load(Ordering::SeqCst)) ||
             *fake.blocked_op.lock().unwrap() == op;
         if !blocked {
-            let payload=serde_json::to_vec(&reply).unwrap();
+            let payload=if op=="status" && fake.protocol.load(Ordering::SeqCst) {
+                let mut wire=reply.clone();
+                wire["device_mac"]=json!(fake.mac.as_bytes().chunks(2)
+                    .map(|part|std::str::from_utf8(part).unwrap()).collect::<Vec<_>>().join(":"));
+                bridge_render::simulator_ble_wire("status", &wire).unwrap()
+            } else { serde_json::to_vec(&reply).unwrap() };
             let response=bridge_core::compact_frame::Header{kind:1,op:frame.op,
                 result:if reply["result"]=="accepted" {1} else if reply["result"]=="rejected" {2}else{0},
                 payload_len:payload.len() as u16,
@@ -2758,6 +2769,8 @@ mod ble_close_lock_tests {
             claim_rejected: AtomicBool::new(false), lost_plan: AtomicBool::new(false), lost_network_start: AtomicBool::new(false),
             applied_plan: AtomicU64::new(0), apply_plan: AtomicBool::new(true), network_started: AtomicBool::new(false), sync_opened: AtomicBool::new(false), blocked_op: Mutex::new(String::new()),
             sync_due,
+            provisional_remaining_s: AtomicU64::new(0),
+            status_extra: Mutex::new(json!({})),
             closes: AtomicUsize::new(0),
             status_reads: AtomicUsize::new(0),
             fragments: Mutex::new(Vec::new()),
@@ -3282,6 +3295,40 @@ mod ble_close_lock_tests {
             "wifi_management": 0})
     }
 
+    #[tokio::test(flavor="multi_thread",worker_threads=4)]
+    async fn boot_network_manual_gatt_and_failure_report_have_distinct_admission() {
+        let _serial=SIM_ENV.lock().unwrap_or_else(|p|p.into_inner());
+        for mode in ["manual", "gatt", "failure"] {
+            let dir=tempfile::tempdir().unwrap();
+            let events=Arc::new(Mutex::new(Vec::new()));
+            let (ble,url)=start_fake_ble_with(HUNG_MAC,false,mode=="failure",events.clone()).await;
+            ble.protocol.store(true,Ordering::SeqCst);
+            ble.provisional_remaining_s.store(295,Ordering::SeqCst);
+            *ble.status_extra.lock().unwrap()=match mode {
+                "gatt"=>json!({"automatic_contact":false}),
+                "failure"=>json!({"network_error":"bridge_http_unreachable"}),
+                _=>json!({}),
+            };
+            // Deliberately incomplete HTTP identity: admission may attempt it,
+            // but must never convert this into a successful handover.
+            let (_http,ip)=start_fake_http(events.clone(),plain_status_body(HUNG_MAC),0,Duration::ZERO);
+            let ctx=test_ctx_with_ip(dir.path(),HUNG_MAC,&ip);
+            std::env::set_var("CODEX_STATUS_SIM_BLE_ENDPOINTS",json!({HUNG_MAC:url}).to_string());
+            let outcome=tokio::time::timeout(Duration::from_secs(5),ble_cycle(&ctx,&[HUNG_MAC.into()])).await;
+            std::env::remove_var("CODEX_STATUS_SIM_BLE_ENDPOINTS");
+            let ops=command_ops(&ble);
+            let used_http=events.lock().unwrap().iter().any(|e|e.starts_with("http:"));
+            if mode=="manual" {
+                assert!(used_http && ops.iter().any(|op|op=="plan"), "{outcome:?}, ops={ops:?}");
+                assert!(matches!(outcome,Ok(Ok(BleOpportunity::Connected{result:Err(_),..}))));
+            } else {
+                assert!(matches!(outcome,Ok(Ok(BleOpportunity::Connected{result:Ok(()),..}))),"{mode}: {outcome:?}");
+                assert!(!used_http && !ops.iter().any(|op|matches!(op.as_str(),"network_start"|"sync_open"|"wifi_activate")));
+                if mode=="gatt" { assert!(!ops.iter().any(|op|op=="plan")); }
+            }
+        }
+    }
+
     /// C13 — production order over one real `ble_cycle`:
     /// `link cleanup -> sync_http_inner (diagnostic drain) -> opportunity_locked`.
     ///
@@ -3312,6 +3359,28 @@ mod ble_close_lock_tests {
         assert!(!commands.iter().any(|c|matches!(c["op"].as_str(),Some("wifi_activate"|"wifi_match"|"handoff"|"sync_open"))));
         assert!(!events.lock().unwrap().iter().any(|e|e.starts_with("http:")),"idle BLE contacts must not probe HTTP");
         assert!(svc.wifi_state(HUNG_MAC).jobs.is_empty());assert_eq!(svc.wifi_state(HUNG_MAC).connection.unwrap().attempts,0);
+    }
+
+    #[tokio::test(flavor="multi_thread",worker_threads=4)]
+    async fn protocol_ble_only_light_does_not_enter_diagnostic_http_tail() {
+        let _serial=SIM_ENV.lock().unwrap_or_else(|p|p.into_inner());
+        let dir=tempfile::tempdir().unwrap();let events=Arc::new(Mutex::new(Vec::new()));
+        let (ble,url)=start_fake_ble_with(HUNG_MAC,false,false,events.clone()).await;
+        ble.protocol.store(true,Ordering::SeqCst);
+        let (_http,ip)=start_fake_http(events.clone(),plain_status_body(HUNG_MAC),0,Duration::ZERO);
+        let ctx=test_ctx_with_ip(dir.path(),HUNG_MAC,&ip);
+        service(&ctx).hold_light(HUNG_MAC,device_now(HUNG_MAC)+120).unwrap();
+        std::env::set_var("CODEX_STATUS_SIM_BLE_ENDPOINTS",json!({HUNG_MAC:url}).to_string());
+        let result=tokio::time::timeout(Duration::from_secs(5),ble_cycle(&ctx,&[HUNG_MAC.into()])).await;
+        std::env::remove_var("CODEX_STATUS_SIM_BLE_ENDPOINTS");
+        assert!(matches!(result,Ok(Ok(BleOpportunity::Connected{result:Ok(()),..}))),"{result:?}");
+        let commands=ble.commands.lock().unwrap();
+        assert!(commands.iter().any(|c|c["op"]=="sync_config"));
+        let plan=commands.iter().find(|c|c["op"]=="plan").unwrap();
+        assert_eq!(plan["mode"],"light");assert_eq!(plan["need_http"],false);
+        assert!(!commands.iter().any(|c|matches!(c["op"].as_str(),Some("network_start"|"sync_open"))));
+        assert!(!events.lock().unwrap().iter().any(|e|e.starts_with("http:")),
+            "BLE-only Light must preserve its successful ACK without diagnostic HTTP: {:?}",events.lock().unwrap());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3624,7 +3693,8 @@ mod ble_close_lock_tests {
             "wake_generation":2,"wake_seq":9,"owner_id":*f.owner.lock().unwrap(),
             "power":{"plan_id":f.ble.applied_plan.load(Ordering::SeqCst),"mode":"light","remaining_s":110},
             "wifi_management":2,"rendezvous":{"v":1,"id":"this-wake","challenge":"http-proof",
-            "ready":f.ble.network_started.load(Ordering::SeqCst)},
+            // A ready-report ACK can finish rendezvous before this HTTP read.
+            "ready":false,"remaining_ms":0},"transports":{"http":{"ready":true}},
             "sync_v1":1,"sync":{"enabled":true,"phase":if f.ble.sync_opened.load(Ordering::SeqCst) {"WIFI_SYNC_ONCE"} else {"WIFI_LIGHT"},"due":!f.complete.load(Ordering::SeqCst),"reasons":[]}})).into_response()
     }
     async fn full_claim(State(f): State<Arc<FullHttp>>, headers: axum::http::HeaderMap) -> Response {
@@ -4015,7 +4085,7 @@ mod ble_close_lock_tests {
         assert_eq!(link.info["wifi_management"],3);assert_eq!(link.info["wc"],1);
         for _ in 1..=3 {
             if let Some(mut c)=svc.wifi_state(HUNG_MAC).connection {c.next_attempt_at=0;svc.wifi_note_connection(HUNG_MAC,c).unwrap();}
-            let result=crate::wifi::automatic_on_link(&ctx,HUNG_MAC,&mut link,bridge_core::rendezvous::Budget::new(Duration::from_secs(3))).await;
+            let result=crate::wifi::automatic_on_link(&ctx,HUNG_MAC,&mut link,bridge_core::rendezvous::Budget::new(Duration::from_secs(3)),false).await;
             assert_eq!(result,Err("wifi_job_capacity".into()));
             let state=svc.wifi_state(HUNG_MAC);assert_eq!(state.jobs.len(),32);
             let connection=state.connection.unwrap();assert_eq!(connection.attempts,0);
@@ -4023,7 +4093,7 @@ mod ble_close_lock_tests {
             let receipt=link.command("wifi_result",json!({"query_id":"w3_0000000000000021"})).await.unwrap();
             assert_eq!(receipt["outcome"],"unknown","33rd activation never reached production Fake engine");
         }
-        let result=crate::wifi::automatic_on_link(&ctx,HUNG_MAC,&mut link,bridge_core::rendezvous::Budget::new(Duration::from_secs(3))).await;
+        let result=crate::wifi::automatic_on_link(&ctx,HUNG_MAC,&mut link,bridge_core::rendezvous::Budget::new(Duration::from_secs(3)),false).await;
         assert_eq!(result,Err("wifi_job_capacity".into()));
         assert_eq!(link.command("wifi_active",json!({})).await.unwrap()["network_id"],"");
         let radio:Value=client.post(format!("{url}/sim/wifi")).bearer_auth("synthetic-control-token").json(&json!({"outcome":0})).send().await.unwrap().json().await.unwrap();

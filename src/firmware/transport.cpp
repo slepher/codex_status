@@ -846,7 +846,7 @@ void serviceV2Ble() {
             // Status itself is authenticated; later commands validate their
             // own session before changing data freshness or device state.
             // Status is only observation; Data/Plan retain their own contact clock.
-            if (!radio::state.v2InRendezvous && !radio::state.v2RvBleReleased) radio::v2RendezvousBegin();
+            if (radio::automaticContactNeeded() && !radio::state.v2InRendezvous && !radio::state.v2RvBleReleased) radio::v2RendezvousBegin();
             BleStatusSnapshot snapshot;
             snapshot.mac = radio::macText(); snapshot.nonce = v2Nonce();
             snapshot.rendezvousVersion = 1;
@@ -856,7 +856,9 @@ void serviceV2Ble() {
             snapshot.commitSeq = bsCommitSeq();
             snapshot.light = power::state.v2Plan.lightActive(clock::v2NowMs()); snapshot.planId = power::state.v2Plan.acceptedId();
             snapshot.remainingS = power::state.v2Plan.remainingS(clock::v2NowMs());
-            snapshot.provisionalS = power::state.v2Provisional ? V2PlanState::bootProvisionalRemaining(power::state.v2BootMs, clock::v2NowMs()) : 0;
+            snapshot.provisionalS = std::max(power::state.bleRecovery.lightRemaining(clock::v2NowMs()), power::state.v2Provisional ? V2PlanState::bootProvisionalRemaining(power::state.v2BootMs, clock::v2NowMs()) : 0u);
+            snapshot.automaticContact = radio::automaticContactNeeded();
+            snapshot.networkError = radio::state.failureReportPending ? radio::state.networkError : nullptr;
             snapshot.syncAvailable = syncStoreAvailable();
             if (snapshot.syncAvailable) {
                 OwnerRec current;

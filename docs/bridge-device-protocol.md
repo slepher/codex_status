@@ -1,5 +1,7 @@
 # Bridge 与设备协议：业务合同及载体映射
 
+2026-10-11 BOOT/联网补充（候选，未部署）：BLE status 保持原 `s` 数组布局，新增 `ac` 布尔值映射 `automatic_contact`；false 表示健康 HTTP 下仅开放主动 GATT，Bridge 不启动普通交汇。可选 `ne` 映射 `network_error`：1=`wifi_connect_failed`、2=`bridge_http_unreachable`、3=`wifi_link_lost`；仅失败报告轮携带。旧报文缺少 `ac` 保留普通交汇语义。认证 HTTP status 新增 `power.manual_remaining_s` 与 `network.bridge_reachable/error/automatic_ble`；人工剩余时间持续报告，不随首个正式 Plan 消失。presence 的 202 JSON 回应包含 `bridge_id`、`device_http_verified`，后者仅由同 boot_id 的近期认证 HTTP 状态支持，发现提示自身不构成认证证据。最终窗口与恢复合同见[通信场景](bridge-device-communication-scenarios.md)及[实施验收](../project-workflow/bridge-macos/boot-network-20261011.md)。
+
 核对日期：2026-10-08。范围：当前工作树的固件及 Bridge；部署现场以 [PROGRESS](../PROGRESS.md) 最新节为准，当前已证 Note4 为 0.18.69-note4。本文不证明其他设备或 macOS 已部署同一实现。
 
 ## 1. 对“高层不区分 Wi-Fi / 蓝牙”的确认

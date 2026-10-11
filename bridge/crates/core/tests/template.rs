@@ -20,12 +20,12 @@ fn hashes_match_python_test_bridge() {
     assert_eq!(full.version, 3);
     assert_eq!(mini.version, 2);
     let quad = library.get("quad").expect("quad template");
-    assert_eq!(quad.version, 12);
-    assert_eq!(quad.min_fw.as_deref(), Some("0.14"));
-    // v12 adds the WIFI CONN blink phase (task-10 B): the Wi-Fi icon cell is
-    // drawn on WIFI CONN (blink on) / BLE ON / BLE OFF and hidden on WIFI OFF
-    // (blink off), so deep/connecting frames show no Wi-Fi icon.
-    assert_eq!(quad.hash, "430cc188");
+    assert_eq!(quad.version, 13);
+    assert_eq!(quad.min_fw.as_deref(), Some("0.18.75"));
+    // Shared with tools/test-template-wifi-metadata.py; C++ hashes the same canonical bytes.
+    assert_eq!(quad.hash, "666c6404");
+    let compiled = bridge_core::compile::compile(&quad.json, "epd-1bpp-200x200").unwrap();
+    assert_eq!(compiled.source_crc, quad.hash);
 }
 
 #[test]
@@ -38,6 +38,8 @@ fn canonical_json_is_sorted_and_compact() {
 
 #[test]
 fn parse_bind_grammar() {
+    assert_eq!(parse_bind("device.wifi_state"), Some(BindSpec::DeviceWifiState));
+    assert_eq!(parse_bind("device.wifi_blink"), Some(BindSpec::DeviceWifiBlink));
     assert_eq!(parse_bind("account.plan"), Some(BindSpec::Plan));
     assert_eq!(parse_bind("device.sync_hhmm"), Some(BindSpec::DeviceSync));
     assert_eq!(

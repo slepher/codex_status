@@ -6,6 +6,8 @@
 bool wifiSchemesBegin();
 bool wifiSchemesCredentials(String &ssid, String &password);
 bool wifiSetupBusy();
+bool wifiSetupConnecting();
+bool wifiSetupFailed();
 // Authenticated diagnostic projection; no credentials or transaction hashes.
 void wifiSchemesStorageStatus(JsonObject out);
 void wifiSetupConnectionStarted(const String &ssid = String());

@@ -473,10 +473,12 @@ fn opportunity_window(status: &Value, mac: &str) -> bool {
 }
 
 // Use the current host's saved target, within the existing rendezvous budget.
-pub async fn automatic_on_link(ctx: &AppCtx,mac:&str,link:&mut bridge_ble::DeviceConnection,budget:bridge_core::rendezvous::Budget) -> Result<(), String> {
+pub async fn automatic_on_link(ctx: &AppCtx,mac:&str,link:&mut bridge_ble::DeviceConnection,budget:bridge_core::rendezvous::Budget,selection_only:bool) -> Result<(), String> {
     tokio::time::timeout(budget.remaining(),async {
         let contact_host=current_host(ctx).await;
-        host_wifi::require_same_network(&contact_host,&contact_host)?;
+        if let Err(error)=host_wifi::require_same_network(&contact_host,&contact_host) {
+            return if selection_only { Ok(()) } else { Err(error) };
+        }
         if !matches!(link.info["wifi_management"].as_u64(),Some(2|3)) {return Ok(());}
         let svc=platform::service(ctx);
         if svc.ota_job(mac).is_some_and(|j|j.blocks_network_repair()) ||
@@ -486,7 +488,9 @@ pub async fn automatic_on_link(ctx: &AppCtx,mac:&str,link:&mut bridge_ble::Devic
         let host=current_host(ctx).await;
         host_wifi::require_same_network(&contact_host,&host)?;
         let state=platform::service(ctx).wifi_state(mac);
-        let Some(target)=current_target(&state,&host).cloned() else{return Err("network_mapping_required".into());};
+        let Some(target)=current_target(&state,&host).cloned() else{
+            return if selection_only { Ok(()) } else { Err("network_mapping_required".into()) };
+        };
         let now=crate::device_now_secs(mac).max(0) as u64;
         if link.info["wc"]!=1 {let mut c=fresh_connection(&state,&target,now);c.state="firmware_upgrade_required".into();let _=platform::service(ctx).wifi_note_connection(mac,c);return Ok(());}
         let Ok(reply)=link.command("wifi_match",target_query(&target)).await else{return Ok(());};
@@ -494,6 +498,9 @@ pub async fn automatic_on_link(ctx: &AppCtx,mac:&str,link:&mut bridge_ble::Devic
         // A new replace intent always needs a real input/confirmed write. Matching
         // public metadata cannot prove a password replacement was applied.
         if reply["matches"]!=true || target.credential=="replace" {
+            // Physical wake selects only a previously saved network. No password
+            // write or automatic provisioning; the device owns fallback.
+            if selection_only { return Ok(()); }
             if svc.ota_job(mac).is_some_and(|j|j.state=="awaiting_confirmation") {return Err("ota_confirmation_network_mismatch".into());}
             let svc=platform::service(ctx);
             let job=queue_current_recovery(ctx,mac,&state,&target,now,true);
