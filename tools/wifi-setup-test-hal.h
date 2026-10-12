@@ -46,6 +46,7 @@ inline int mbedtls_sha256(const unsigned char *data, size_t size, unsigned char 
 }
 static std::vector<uint8_t> testNvsBlob;
 static std::vector<uint8_t> testNvsLegacyBlob;
+static bool testNvsEmptyCurrentKey=false, testNvsEmptyLegacyKey=false;
 static bool testNvsFail = false;
 static bool testNvsCommitThenFail = false;
 static bool testNvsReadbackFail = false;
@@ -57,6 +58,7 @@ public:
     bool begin(const char *, bool) { return true; }
     void end() {}
     size_t freeEntries() { return 300; }
+    bool isKey(const char *key) { return !strcmp(key,"scheme") ? testNvsEmptyLegacyKey || !testNvsLegacyBlob.empty() : testNvsEmptyCurrentKey || !testNvsBlob.empty(); }
     size_t getBytesLength(const char *key) { return !strcmp(key,"scheme") ? testNvsLegacyBlob.size() : testNvsBlob.size(); }
     bool remove(const char *key) { if (testNvsRemoveFail) return false; if (!strcmp(key,"scheme")) testNvsLegacyBlob.clear(); return true; }
     size_t putBytes(const char *, const void *data, size_t size) {

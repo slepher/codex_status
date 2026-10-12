@@ -23,7 +23,7 @@ use crate::platform::model::{
     Template, TemplateKey, PublishJob, MAX_PROFILE_TEMPLATES, MAX_BUNDLE_BYTES,
 };
 use crate::platform::store;
-use crate::platform::wifi::{WifiState, Network as WifiNetwork, Job as WifiJob, Snapshot as WifiSnapshot};
+use crate::platform::wifi::{WifiState, Network as WifiNetwork, Job as WifiJob, Snapshot as WifiSnapshot, OperationReply, ReplySource};
 use crate::platform::fonts::{FontLibrary, FontPlan};
 use crate::platform::publish::{FrozenPublish, Capacity, CommittedRefs};
 
@@ -140,6 +140,7 @@ impl AssetJob {
 
 /// In-memory plus persisted platform state.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PersistedState {
     #[serde(default)]
     pub wifi: BTreeMap<String, WifiState>,
@@ -519,6 +520,7 @@ impl PlatformService {
         })
     }
     pub fn wifi_queue_control(&self,mac:&str,bridge:&str,kind:&str,body:Value,now:u64)->Result<WifiJob> {
+        anyhow::ensure!(!bridge.is_empty() && bridge.len()<=64,"invalid_wifi_intent");
         anyhow::ensure!(matches!(kind,"trial"|"activate"),"invalid_wifi_intent");
         anyhow::ensure!(body.is_object() && serde_json::to_vec(&body)?.len()<=4096,"invalid_wifi_intent");
         anyhow::ensure!(body.as_object().unwrap().keys().all(|k|matches!(k.as_str(),"network_id"|"version"|"host_ssid"|"ssid"|"password"|"replace")),"invalid_wifi_intent");
@@ -527,7 +529,7 @@ impl PlatformService {
         let mac=DeviceIdentity::normalized_mac(mac).context("invalid_device_mac")?;
         self.wifi_mutate(&mac,|s| {
             if let Some(job)=s.jobs.iter().find(|j|!j.terminal() && matches!(j.kind.as_str(),"trial"|"activate")) {
-                anyhow::ensure!(job.kind==kind && job.command.as_ref()==Some(&body),"wifi_control_busy");return Ok(job.clone());
+                anyhow::ensure!(job.bridge_id==bridge && job.kind==kind && job.command.as_ref()==Some(&body),"wifi_control_busy");return Ok(job.clone());
             }
             s.next_job_seq=s.next_job_seq.checked_add(1).context("wifi_id_exhausted")?;
             let job_id=crate::coordinator::new_context_id(&mac,now,s.next_job_seq);
@@ -535,12 +537,21 @@ impl PlatformService {
             job.command=Some(body);*s.jobs.iter_mut().find(|j|j.job_id==job.job_id).unwrap()=job.clone();Ok(job)
         })
     }
-    fn wifi_complete_control(&self,mac:&str,job_id:&str,reply:&Value,now:u64)->Result<WifiJob> {
+    fn wifi_complete_control(&self,mac:&str,job_id:&str,revision:Option<u64>,now:u64)->Result<WifiJob> {
         self.wifi_mutate(mac,|s| {
             let j=s.jobs.iter_mut().find(|j|j.job_id==job_id).context("wifi_job_not_found")?;
             j.state="completed".into();j.updated_at=now;j.last_stage="confirmed_operation".into();
             j.confirmation=Some("operation_result".into());j.error_code=None;j.receipt_ack_pending=j.request_id.starts_with("w3_");
-            j.confirmed_revision=reply["revision"].as_u64();Ok(j.clone())
+            j.confirmed_revision=revision;Ok(j.clone())
+        })
+    }
+    fn wifi_reject_receipt(&self, mac: &str, job_id: &str, code: &str, now: u64) -> Result<WifiJob> {
+        self.wifi_mutate(mac, |s| {
+            let j = s.jobs.iter_mut().find(|j| j.job_id == job_id).context("wifi_job_not_found")?;
+            j.state = "failed".into(); j.updated_at = now; j.may_have_committed = false;
+            j.confirmation = Some("durable_rejection".into()); j.last_stage = "confirmed_operation".into();
+            j.error_code = Some(code.into()); j.receipt_ack_pending = j.request_id.starts_with("w3_");
+            Ok(j.clone())
         })
     }
     pub fn wifi_queue_manual_sync(&self, mac: &str, bridge: &str, selected: Vec<String>, expected: u64,
@@ -555,15 +566,6 @@ impl PlatformService {
             job.host_ssid = Some(host.into());
             *s.jobs.iter_mut().find(|j| j.job_id == job.job_id).unwrap() = job.clone();
             Ok(job)
-        })
-    }
-    pub fn wifi_resume_authorized(&self, mac: &str, job: &str, now: u64) -> Result<()> {
-        self.wifi_mutate(mac, |s| {
-            let j=s.jobs.iter_mut().find(|j|j.job_id==job).context("wifi_job_not_found")?;
-            if j.state=="waiting_authorization" && !j.sent {
-                j.state="waiting_rendezvous".into();j.error_code=None;j.next_attempt_at=now;j.updated_at=now;
-            }
-            Ok(())
         })
     }
     /// An unsent whole-row intent can already be satisfied by another confirmed
@@ -586,12 +588,13 @@ impl PlatformService {
             Ok(j.clone())
         })
     }
-    pub fn wifi_confirm_receipt(&self, mac: &str, job: &str, revision: u64, bond: Option<&str>, now: u64) -> Result<WifiJob> {
+    fn wifi_confirm_receipt(&self, mac: &str, job: &str, revision: u64, bond: Option<&str>, now: u64) -> Result<WifiJob> {
         self.wifi_mutate(mac, |s| s.confirm_receipt(job, revision, bond, now))
     }
-    pub fn wifi_receipt_acked(&self,mac:&str,job:&str)->Result<()> {
+    pub fn wifi_receipt_acked(&self,mac:&str,job:&str,principal:&str,namespace:&str)->Result<()> {
         self.wifi_mutate(mac,|s| {
             let j=s.jobs.iter_mut().find(|j|j.job_id==job).context("wifi_job_not_found")?;
+            j.check_transaction_context(principal,namespace)?;
             anyhow::ensure!(j.terminal() && matches!(j.confirmation.as_deref(),Some("durable_receipt"|"operation_result"|"durable_rejection")),"receipt_not_confirmed");
             j.receipt_ack_pending=false;Ok(())
         })
@@ -626,7 +629,7 @@ impl PlatformService {
         }
         Ok(())
     }
-    pub fn wifi_definite_rejection(&self, mac: &str, job: &str) -> Result<()> {
+    fn wifi_definite_rejection(&self, mac: &str, job: &str) -> Result<()> {
         self.wifi_mutate(mac, |s| {
             let j=s.jobs.iter_mut().find(|j|j.job_id==job).context("wifi_job_not_found")?;
             j.sent=false;j.may_have_committed=false;Ok(())
@@ -635,78 +638,101 @@ impl PlatformService {
     pub fn wifi_mark_sent(&self, mac: &str, job: &str, now: u64) -> Result<()> {
         self.wifi_mutate(mac, |s| s.mark_sent(job, now))
     }
-    pub fn wifi_confirm_recovery(&self, mac: &str, job: &str, network: WifiNetwork, revision: u64, now: u64) -> Result<WifiJob> {
+    /// Freeze only from an authenticated carrier before the first dispatch.
+    /// Missing identity on a previously sent job must never be guessed.
+    pub fn wifi_bind_transaction(&self, mac: &str, job: &str, principal: &str, namespace: &str) -> Result<()> {
         self.wifi_mutate(mac, |s| {
             let j = s.jobs.iter_mut().find(|j| j.job_id == job).context("wifi_job_not_found")?;
-            if j.terminal() || !j.sent || j.kind != "recovery_save" || now >= j.expires_at { bail!("wifi_job_no_longer_active"); }
-            network.validate()?;
-            if network.metadata() != j.frozen[0].metadata() { bail!("target_unconfirmed"); }
-            j.state = "completed".into(); j.updated_at = now; j.last_stage = "bounded_recovery_readback".into();
-            j.confirmation = Some("receipt_and_readback".into()); j.confirmed_revision = Some(revision); j.error_code = None;
-            s.baseline.insert(network.network_id.clone(), network.metadata());
-            let result=j.clone();
-            if s.local_revision==result.local_revision {
-                if let Some(target)=s.targets.iter_mut().find(|n|n.network_id==network.network_id && n.metadata()==network.metadata()) {
-                    target.version=network.version;target.credential="keep".into();
-                }
+            if j.transaction_namespace.is_none() && !j.sent && !j.may_have_committed && !j.receipt_ack_pending {
+                j.transaction_namespace = Some(namespace.to_owned());
             }
-            Ok(result)
+            j.check_transaction_context(principal, namespace)
         })
     }
     /// One bounded opportunity, also exercised through Fake's real client path.
     /// Transport returns a full snapshot for "snapshot"; other calls are ACKs.
-    pub fn wifi_attempt(&self, mac: &str, job_id: &str, permit: Option<&str>, credentials: &BTreeMap<String, String>,
+    pub fn wifi_attempt(&self, mac: &str, job_id: &str, principal: &str, namespace: &str, write_allowed: bool, credentials: &BTreeMap<String, String>,
         now: u64, mut transport: impl FnMut(&str, Value) -> Result<Value>) -> Result<Option<WifiJob>> {
+        // This adapter only supplies Ready futures: no runtime, thread or nested
+        // executor is needed by blocking HTTP workers and synchronous fixtures.
+        use std::future::Future;
+        let mut attempt = std::pin::pin!(self.wifi_attempt_async(mac, job_id, principal, namespace,
+            write_allowed, credentials, now, &mut transport));
+        match attempt.as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop())) {
+            std::task::Poll::Ready(result) => result,
+            std::task::Poll::Pending => unreachable!("synchronous transport cannot suspend"),
+        }
+    }
+
+    pub async fn wifi_attempt_async(&self, mac: &str, job_id: &str, principal: &str, namespace: &str,
+        write_allowed: bool, credentials: &BTreeMap<String, String>, now: u64,
+        transport: &mut impl crate::platform::wifi::Transport) -> Result<Option<WifiJob>> {
         let Some(job) = self.wifi_begin(mac, job_id, now)? else { return Ok(None); };
-        let run = (|| -> Result<WifiJob> {
-            if matches!(job.kind.as_str(),"trial"|"activate") {
-                let reply=if job.sent {transport("result",json!({"query_id":job.request_id}))?} else {
-                    if permit.is_none(){return self.wifi_finish(mac,job_id,"waiting_rendezvous",Some("window_required"),now);}
-                    let mut body=job.command.clone().context("wifi_control_payload_required")?;body["request_id"]=json!(job.request_id);
-                    self.wifi_mutate(mac,|s|s.mark_sent(job_id,now))?;
-                    transport(&job.kind,body)?
+        // Dropping carrier I/O must also release the persisted in-progress state.
+        // A sent write remains query-only; cancellation is never proof of failure.
+        struct AttemptGuard<'a> { service: &'a PlatformService, mac: &'a str, id: &'a str, now: u64, armed: bool }
+        impl Drop for AttemptGuard<'_> {
+            fn drop(&mut self) {
+                if !self.armed { return; }
+                let sent=self.service.wifi_state(self.mac).jobs.iter().any(|j| j.job_id==self.id && j.sent);
+                if self.service.wifi_finish(self.mac,self.id,
+                    if sent {"awaiting_confirmation"} else {"waiting_rendezvous"},Some("attempt_cancelled"),self.now).is_err() {
+                    tracing::error!(event="wifi_cancel_persist_failed", "Cannot persist cancelled attempt; restart recovery required");
+                }
+            }
+        }
+        let mut guard=AttemptGuard {service:self,mac,id:job_id,now,armed:true};
+        if !matches!(job.kind.as_str(),"read"|"read_import") {
+            if let Err(error)=self.wifi_bind_transaction(mac,job_id,principal,namespace) {
+                guard.armed=false;
+                return self.wifi_finish(mac,job_id,if job.sent {"awaiting_confirmation"} else {"waiting_rendezvous"},Some(&error.to_string()),now).map(Some);
+            }
+        }
+        let run: Result<WifiJob> = async {
+            let control = matches!(job.kind.as_str(), "trial" | "activate");
+            if job.sent {
+                let reply = transport.exchange("result", json!({"query_id":job.request_id})).await?;
+                return match OperationReply::decode(ReplySource::ResultQuery, &reply)? {
+                    OperationReply::Committed { revision, bond } if !control =>
+                        self.wifi_confirm_receipt(mac, job_id, revision, bond, now),
+                    OperationReply::Committed { revision, .. } =>
+                        self.wifi_complete_control(mac, job_id, Some(revision), now),
+                    OperationReply::Completed { revision } if control =>
+                        self.wifi_complete_control(mac, job_id, revision, now),
+                    OperationReply::Rejected { code, durable: true } =>
+                        self.wifi_reject_receipt(mac, job_id, code, now),
+                    OperationReply::Pending { code } => self.wifi_finish(mac, job_id, "awaiting_confirmation",
+                        Some(code.unwrap_or(if control { "result_unknown" } else { "receipt_unknown" })), now),
+                    _ => self.wifi_finish(mac, job_id, "awaiting_confirmation", Some("receipt_unknown"), now),
                 };
-                if reply["ok"]==true && matches!(reply["outcome"].as_str(),Some("committed"|"completed")) {
-                    return self.wifi_complete_control(mac,job_id,&reply,now);
-                }
-                if reply["outcome"]=="rejected" {
-                    return self.wifi_mutate(mac,|s| {
-                        let j=s.jobs.iter_mut().find(|j|j.job_id==job_id).context("wifi_job_not_found")?;
-                        j.state="failed".into();j.updated_at=now;j.confirmation=Some("durable_rejection".into());
-                        j.error_code=Some(reply["error"].as_str().unwrap_or("wifi_rejected").into());j.receipt_ack_pending=j.request_id.starts_with("w3_");Ok(j.clone())
-                    });
-                }
-                if reply["ok"]==false && reply["error"]!="storage_unknown" {
-                    self.wifi_definite_rejection(mac,job_id)?;
-                    let code=reply["error"].as_str().unwrap_or("wifi_rejected");
-                    return self.wifi_finish(mac,job_id,if matches!(code,"window_required"|"claim_required"|"occupied"|"session_expired"|"busy"){"waiting_rendezvous"}else{"failed"},Some(code),now);
-                }
-                // A lost response, unknown reboot outcome or accepted operation
-                // is query-only forever; never restart RF with a different ID.
-                return self.wifi_finish(mac,job_id,"awaiting_confirmation",Some(if reply["outcome"]=="unknown" {"result_unknown"} else {"operation_pending"}),now);
+            }
+            if control {
+                if !write_allowed { return self.wifi_finish(mac,job_id,"waiting_rendezvous",Some("window_required"),now); }
+                let mut body=job.command.clone().context("wifi_control_payload_required")?;body["request_id"]=json!(job.request_id);
+                self.wifi_mark_sent(mac, job_id, now)?;
+                let reply = transport.exchange(&job.kind, body).await?;
+                return match OperationReply::decode(ReplySource::OriginalWrite, &reply)? {
+                    OperationReply::Committed { revision, .. } => self.wifi_complete_control(mac,job_id,Some(revision),now),
+                    OperationReply::Completed { revision } => self.wifi_complete_control(mac,job_id,revision,now),
+                    OperationReply::Rejected { code, durable: true } => self.wifi_reject_receipt(mac,job_id,code,now),
+                    OperationReply::Rejected { code, durable: false } => {
+                        self.wifi_definite_rejection(mac,job_id)?;
+                        self.wifi_finish(mac,job_id,if matches!(code,"window_required"|"claim_required"|"occupied"|"session_expired"|"busy")
+                            {"waiting_rendezvous"}else{"failed"},Some(code),now)
+                    }
+                    OperationReply::Pending { code } => self.wifi_finish(mac,job_id,"awaiting_confirmation",
+                        Some(code.unwrap_or(if reply["outcome"]=="unknown" {"result_unknown"}else{"operation_pending"})),now),
+                };
             }
             if !matches!(job.kind.as_str(), "sync" | "recovery_save") {
-                let snapshot: WifiSnapshot = serde_json::from_value(transport("snapshot", json!({}))?)?;
+                let snapshot: WifiSnapshot = serde_json::from_value(transport.exchange("snapshot", json!({})).await?)?;
                 return self.wifi_complete_read(mac, job_id, snapshot, now);
             }
-            if job.sent {
-                let result = transport("result", json!({"query_id":job.request_id}))?;
-                if result["ok"] == true && result["outcome"] == "rejected" {
-                    self.wifi_definite_rejection(mac, job_id)?;
-                    return self.wifi_finish(mac, job_id, "failed", Some(result["error"].as_str().unwrap_or("wifi_rejected")), now);
-                }
-                if result["ok"] == true && result["outcome"] == "committed" {
-                    let revision = result["revision"].as_u64().context("receipt_revision_required")?;
-                    return self.wifi_confirm_receipt(mac, job_id, revision, result["bond"].as_str(), now);
-                }
-                return self.wifi_finish(mac, job_id, "awaiting_confirmation", Some("receipt_unknown"), now);
-                // Unknown never permits another apply, even when a password is supplied again.
-            }
-            if permit.is_none() { return self.wifi_finish(mac, job_id, "waiting_rendezvous", Some("window_required"), now); }
+            if !write_allowed { return self.wifi_finish(mac, job_id, "waiting_rendezvous", Some("window_required"), now); }
             // Automatic whole-row provisioning needs only the current revision.
             // User edits still require their frozen full snapshot and conflict checks.
             let (revision, current) = if job.kind == "recovery_save" {
-                let active = transport("active", json!({}))?;
+                let active = transport.exchange("active", json!({})).await?;
                 anyhow::ensure!(active["ok"] == true, "revision_unavailable");
                 (active["revision"].as_u64().context("revision_unavailable")?, BTreeMap::new())
             } else {
@@ -756,25 +782,24 @@ impl PlatformService {
                 })?;
             }
             self.wifi_mutate(mac, |s| s.mark_sent(job_id, now))?;
-            let reply = transport("apply", json!({"request_id":job.request_id,"expected_revision":revision,
-                "permit":permit,"changes":changes}))?;
-            if reply["ok"] != true {
-                let code = reply["error"].as_str().unwrap_or("wifi_rejected");
-                let state = match code { "physical_required" | "window_required" => "waiting_rendezvous", "revision_conflict" => "conflict",
-                    "storage_unknown" => "awaiting_confirmation", "credentials_required" => "waiting_input", _ => "failed" };
-                if code != "storage_unknown" {
-                    self.wifi_mutate(mac, |s| {
-                        let j = s.jobs.iter_mut().find(|j| j.job_id == job_id).context("wifi_job_not_found")?;
-                        j.sent = false; j.may_have_committed = false; Ok(())
-                    })?;
+            let reply = transport.exchange("apply", json!({"request_id":job.request_id,"expected_revision":revision,
+                "changes":changes})).await?;
+            match OperationReply::decode(ReplySource::OriginalWrite, &reply)? {
+                OperationReply::Committed { revision, bond } => self.wifi_confirm_receipt(mac,job_id,revision,bond,now),
+                OperationReply::Rejected { code, durable: true } => self.wifi_reject_receipt(mac,job_id,code,now),
+                OperationReply::Rejected { code, durable: false } => {
+                    self.wifi_definite_rejection(mac,job_id)?;
+                    let state = match code {
+                        "physical_required" | "window_required" => "waiting_rendezvous",
+                        "revision_conflict" => "conflict", "credentials_required" => "waiting_input", _ => "failed",
+                    };
+                    self.wifi_finish(mac,job_id,state,Some(code),now)
                 }
-                // An uncertain storage write never permits reapplying.
-                return self.wifi_finish(mac, job_id, state, Some(code), now);
+                OperationReply::Pending { code } => self.wifi_finish(mac,job_id,"awaiting_confirmation",Some(code.unwrap_or("receipt_unknown")),now),
+                OperationReply::Completed { .. } => self.wifi_finish(mac,job_id,"awaiting_confirmation",Some("receipt_unknown"),now),
             }
-            if reply["outcome"] != "committed" { return self.wifi_finish(mac, job_id, "awaiting_confirmation", Some("receipt_unknown"), now); }
-            self.wifi_confirm_receipt(mac, job_id, reply["revision"].as_u64().context("receipt_revision_required")?, reply["bond"].as_str(), now)
-        })();
-        match run {
+        }.await;
+        let result = match run {
             Ok(job) => Ok(Some(job)),
             Err(error) => {
                 // A definite auth rejection proves this write was not applied.
@@ -802,7 +827,9 @@ impl PlatformService {
                 self.wifi_finish(mac, job_id, if current.sent { "awaiting_confirmation" } else { state },
                     Some(code), now).map(Some)
             }
-        }
+        };
+        guard.armed=false;
+        result
     }
 
     fn refresh_bundle_history(inner: &mut Inner, mac: &str) {
@@ -2977,7 +3004,7 @@ impl PlatformService {
 /// its TTL and past its retry backoff (W4-1). Dead/expired/blocked jobs must not
 /// keep the radio on.
 fn wifi_job_wants_window(job: &WifiJob, now: u64) -> bool {
-    crate::rendezvous::admit_wifi(job, now)
+    job.execution_active(now) && crate::rendezvous::admit_wifi(job, now)
 }
 
 fn collect_font_names(value: &Value, names: &mut Vec<String>) {
@@ -3275,8 +3302,9 @@ mod tests {
         targets[0].ssid="Later local draft".into();svc.wifi_save(mac,2,targets,105).unwrap();
         // The frozen cache is used; external revision changes must be rejected, never reread/rebase.
         let mut apply_count=0;
-        let result=svc.wifi_attempt(mac,&job.job_id,Some("permit"),&BTreeMap::new(),106,|op,body| {
+        let result=svc.wifi_attempt(mac,&job.job_id, &job.bridge_id, "own",true,&BTreeMap::new(),106,|op,body| {
             if op=="apply" {
+                assert!(body.get("permit").is_none(), "obsolete authorization must not enter the business request");
                 apply_count+=1;assert_eq!(body["changes"][0]["ssid"],"Approved");
                 assert_eq!(body["changes"][0]["label"],"Old label");assert_eq!(body["expected_revision"],1);
                 snapshot.networks[0].network.ssid="Approved".into();snapshot.revision=2;
@@ -3289,7 +3317,7 @@ mod tests {
         // A changed approved field pauses; no apply despite unrelated revision handling.
         let job=svc.wifi_queue_fields(mac,"bridge","sync",vec!["home".into()],BTreeMap::from([("home".into(),vec!["ssid".into()])]),107).unwrap();
         snapshot.networks[0].network.ssid="Changed by device".into();
-        let result=svc.wifi_attempt(mac,&job.job_id,Some("permit"),&BTreeMap::new(),108,|op,_| {
+        let result=svc.wifi_attempt(mac,&job.job_id, &job.bridge_id, "own",true,&BTreeMap::new(),108,|op,_| {
             assert_eq!(op,"apply");Ok(json!({"ok":false,"error":"revision_conflict"}))
         }).unwrap().unwrap();assert_eq!(result.state,"conflict");
     }
@@ -3301,7 +3329,7 @@ mod tests {
             svc.wifi_save(mac,0,targets,100).unwrap();
             let job=svc.wifi_queue(mac,"bridge","recovery_save",vec!["home".into()],101).unwrap();
             let mut ops=vec![];
-            let result=svc.wifi_attempt(mac,&job.job_id,Some("authenticated_ble"),&BTreeMap::new(),102,|op,body| {
+            let result=svc.wifi_attempt(mac,&job.job_id, &job.bridge_id, "own",true,&BTreeMap::new(),102,|op,body| {
                 ops.push(op.to_owned());
                 if op=="active" {return Ok(json!({"ok":true,"revision":7}));}
                 assert_eq!(op,"apply");assert_eq!(body["expected_revision"],7);assert_eq!(body["request_id"],job.request_id);
@@ -3311,7 +3339,7 @@ mod tests {
             assert_eq!(ops,vec!["active","apply"]);
             assert_eq!(result.state,match outcome {"lost"=>"awaiting_confirmation","conflict"=>"conflict",_=>"completed"});
             if outcome=="lost" {
-                let result=svc.wifi_attempt(mac,&job.job_id,Some("authenticated_ble"),&BTreeMap::new(),170,|op,_| {
+                let result=svc.wifi_attempt(mac,&job.job_id, &job.bridge_id, "own",true,&BTreeMap::new(),170,|op,_| {
                     assert_eq!(op,"result");Ok(json!({"ok":true,"outcome":"committed","revision":8,"bond":"own"}))
                 }).unwrap().unwrap();assert_eq!(result.state,"completed");
             }
@@ -3325,20 +3353,20 @@ mod tests {
         let read=svc.wifi_queue(mac,"bridge","read",vec![],100).unwrap();svc.wifi_complete_read(mac,&read.job_id,snapshot.clone(),101).unwrap();
         let targets=serde_json::from_value(json!([{"network_id":"new","host_ssid":"Host","ssid":"Device","credential":"replace"}])).unwrap();
         svc.wifi_save(mac,0,targets,102).unwrap();let j=svc.wifi_queue(mac,"bridge","sync",vec!["new".into()],103).unwrap();
-        assert_eq!(svc.wifi_attempt(mac,&j.job_id,None,&BTreeMap::new(),104,|op,_|{assert_eq!(op,"snapshot");Ok(serde_json::to_value(&snapshot)?)}).unwrap().unwrap().state,"waiting_rendezvous");
-        assert_eq!(svc.wifi_attempt(mac,&j.job_id,Some("permit"),&BTreeMap::new(),110,|op,_|{assert_eq!(op,"snapshot");Ok(serde_json::to_value(&snapshot)?)}).unwrap().unwrap().state,"waiting_input");
+        assert_eq!(svc.wifi_attempt(mac,&j.job_id, &j.bridge_id, "own",false,&BTreeMap::new(),104,|op,_|{assert_eq!(op,"snapshot");Ok(serde_json::to_value(&snapshot)?)}).unwrap().unwrap().state,"waiting_rendezvous");
+        assert_eq!(svc.wifi_attempt(mac,&j.job_id, &j.bridge_id, "own",true,&BTreeMap::new(),110,|op,_|{assert_eq!(op,"snapshot");Ok(serde_json::to_value(&snapshot)?)}).unwrap().unwrap().state,"waiting_input");
         let input=BTreeMap::from([("new".into(),(0..12).map(|i|char::from(b'a'+i)).collect::<String>())]);
-        let result=svc.wifi_attempt(mac,&j.job_id,Some("permit"),&input,126,|op,_|{
+        let result=svc.wifi_attempt(mac,&j.job_id, &j.bridge_id, "own",true,&input,126,|op,_|{
             assert_eq!(op,"apply");anyhow::bail!("lost_ack")
         }).unwrap().unwrap();assert_eq!(result.state,"awaiting_confirmation");
         drop(svc);let svc=PlatformService::open(dir.path()).unwrap();
         let mut matching=snapshot.clone();
         matching.networks=serde_json::from_value(json!([{"bond":"own","writable":true,"network":{"network_id":"new","host_ssid":"Host","ssid":"Device","credential":"device"}}])).unwrap();
-        let result=svc.wifi_attempt(mac,&j.job_id,Some("new-permit"),&input,187,|op,_|{
+        let result=svc.wifi_attempt(mac,&j.job_id, &j.bridge_id, "own",true,&input,187,|op,_|{
             if op=="result"{Ok(json!({"ok":true,"outcome":"unknown"}))}else{panic!("unexpected config reread: {op}")}
         }).unwrap().unwrap();assert_eq!(result.state,"awaiting_confirmation");assert_eq!(result.error_code.as_deref(),Some("receipt_unknown"));
         // A definite rejected receipt cannot be relabelled as an unknown success.
-        let result=svc.wifi_attempt(mac,&j.job_id,None,&BTreeMap::new(),248,|op,_| {
+        let result=svc.wifi_attempt(mac,&j.job_id, &j.bridge_id, "own",false,&BTreeMap::new(),248,|op,_| {
             assert_eq!(op,"result");Ok(json!({"ok":true,"outcome":"rejected","error":"capacity"}))
         }).unwrap().unwrap();assert_eq!(result.state,"failed");assert!(!result.may_have_committed);
         let cancelled=svc.wifi_queue(mac,"bridge","sync",vec!["new".into()],249).unwrap();
@@ -3346,9 +3374,9 @@ mod tests {
         assert_eq!(svc.wifi_state(mac).jobs.iter().find(|x|x.job_id==cancelled.job_id).unwrap().state,"waiting_input");
         svc.wifi_mark_sent(mac,&cancelled.job_id,249).unwrap();
         assert!(svc.wifi_finish(mac,&cancelled.job_id,"cancelled",None,250).unwrap().may_have_committed);
-        assert!(svc.wifi_attempt(mac,&cancelled.job_id,None,&input,251,|_,_|panic!("cancelled task sent")).unwrap().is_none());
+        assert!(svc.wifi_attempt(mac,&cancelled.job_id, &cancelled.bridge_id, "own",false,&input,251,|_,_|panic!("cancelled task sent")).unwrap().is_none());
         let next=svc.wifi_queue(mac,"bridge","read",vec![],300).unwrap();
-        assert!(svc.wifi_attempt(mac,&next.job_id,None,&BTreeMap::new(),86700,|_,_|panic!("expired task sent")).unwrap().is_none());
+        assert!(svc.wifi_attempt(mac,&next.job_id, &next.bridge_id, "own",false,&BTreeMap::new(),86700,|_,_|panic!("expired task sent")).unwrap().is_none());
     }
 
     fn quad_source() -> Value {
@@ -4438,9 +4466,323 @@ mod tests {
                 "complete":true,"observed_at":now,"networks":[],"capacity":{"total":12}})).unwrap();
             svc.wifi_complete_read(mac,&first.job_id,snapshot,now).unwrap();
             let job=svc.wifi_queue(mac,"bridge","read",vec![],now+1).unwrap();
-            let result=svc.wifi_attempt(mac,&job.job_id,None,&Default::default(),now+1,|_,_|Err(anyhow::anyhow!(message))).unwrap().unwrap();
+            let result=svc.wifi_attempt(mac,&job.job_id, &job.bridge_id, "own",false,&Default::default(),now+1,|_,_|Err(anyhow::anyhow!(message))).unwrap().unwrap();
             assert_eq!((result.state.as_str(),result.error_code.as_deref()),(state,Some(code)));
             assert_eq!(svc.wifi_state(mac).snapshot.unwrap().snapshot_id,"old");
+        }
+    }
+
+    #[test]
+    fn unknown_persisted_transaction_fields_are_rejected_without_rewriting_state() {
+        let dir=tempfile::tempdir().unwrap();let svc=service_with_device(dir.path());let mac="AABBCCDDEEFF";
+        let job=svc.wifi_queue_control(mac,"original","activate",json!({"network_id":"home"}),100).unwrap();
+        svc.wifi_mark_sent(mac,&job.job_id,101).unwrap();
+        let path=svc.state_path();let original=std::fs::read(&path).unwrap();
+        let state:Value=serde_json::from_slice(&original).unwrap();drop(svc);
+        for location in ["root","wifi","job"] {
+            let mut unknown=state.clone();
+            let object=match location {
+                "root"=>&mut unknown,
+                "wifi"=>&mut unknown["wifi"][mac],
+                _=>&mut unknown["wifi"][mac]["jobs"][0],
+            };
+            object["future_transaction_fence"]=json!({"blocked":true});
+            let bytes=serde_json::to_vec(&unknown).unwrap();std::fs::write(&path,&bytes).unwrap();
+            assert!(PlatformService::open(dir.path()).is_err(),"unknown {location} field must not be discarded");
+            assert_eq!(std::fs::read(&path).unwrap(),bytes);
+        }
+        std::fs::write(&path,&original).unwrap();
+        let svc=PlatformService::open(dir.path()).unwrap();
+        let restored=svc.wifi_state(mac).jobs[0].clone();
+        assert!(restored.confirmation_pending());assert!(restored.transaction_namespace.is_none());
+        assert!(svc.wifi_queue_control(mac,"original","activate",json!({"network_id":"other"}),102).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(),original);
+    }
+
+    #[test]
+    fn wifi_attempt_and_ack_require_original_identity_without_adapter_guards() {
+        for sent in [false,true] {
+            for (principal,namespace,code) in [("other","own","transaction_principal_changed"),
+                ("original","other-bond","transaction_namespace_changed"),
+                ("original","","transaction_namespace_invalid")] {
+                let dir=tempfile::tempdir().unwrap();let svc=service_with_device(dir.path());let mac="AABBCCDDEEFF";
+                let job=svc.wifi_queue_control(mac,"original","activate",json!({"network_id":"home"}),100).unwrap();
+                svc.wifi_bind_transaction(mac,&job.job_id,"original","own").unwrap();
+                if sent {svc.wifi_mark_sent(mac,&job.job_id,101).unwrap();svc.wifi_finish(mac,&job.job_id,"awaiting_confirmation",None,101).unwrap();}
+                let blocked=svc.wifi_attempt(mac,&job.job_id,principal,namespace,true,&Default::default(),200,
+                    |_,_|panic!("mismatched context must never reach transport")).unwrap().unwrap();
+                assert_eq!(blocked.error_code.as_deref(),Some(code));
+                assert_eq!(blocked.sent,sent);assert_eq!(blocked.confirmation_pending(),sent);
+                assert_eq!(blocked.request_id,job.request_id);
+                drop(svc);let svc=PlatformService::open(dir.path()).unwrap();
+                let done=svc.wifi_attempt(mac,&job.job_id,"original","own",true,&Default::default(),300,|op,body| {
+                    assert_eq!(op,if sent {"result"}else{"activate"});
+                    assert_eq!(body[if sent {"query_id"}else{"request_id"}],job.request_id);
+                    Ok(json!({"ok":true,"outcome":"completed","revision":1}))
+                }).unwrap().unwrap();
+                assert!(done.receipt_ack_pending);
+                assert!(svc.wifi_receipt_acked(mac,&job.job_id,principal,namespace).is_err());
+                assert!(svc.wifi_state(mac).jobs[0].receipt_ack_pending);
+                svc.wifi_receipt_acked(mac,&job.job_id,"original","own").unwrap();
+                assert!(!svc.wifi_state(mac).jobs[0].receipt_ack_pending);
+            }
+        }
+        let dir=tempfile::tempdir().unwrap();let svc=service_with_device(dir.path());let mac="AABBCCDDEEFF";
+        let job=svc.wifi_queue_control(mac,"original","activate",json!({"network_id":"home"}),100).unwrap();
+        svc.wifi_mark_sent(mac,&job.job_id,101).unwrap();
+        svc.wifi_finish(mac,&job.job_id,"awaiting_confirmation",None,101).unwrap();
+        let unknown=svc.wifi_attempt(mac,&job.job_id,"original","own",true,&Default::default(),200,
+            |_,_|panic!("legacy identity must not be guessed")).unwrap().unwrap();
+        assert_eq!(unknown.error_code.as_deref(),Some("transaction_identity_unknown"));
+        assert!(unknown.confirmation_pending());assert!(unknown.transaction_namespace.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_async_carrier_preserves_original_query_after_restart() {
+        struct SuspendedWrite { request_id: String, op: &'static str, entered: bool }
+        impl crate::platform::wifi::Transport for SuspendedWrite {
+            async fn exchange(&mut self, op: &str, body: Value) -> Result<Value> {
+                assert_eq!(op, self.op);
+                if op=="activate" { assert_eq!(body["request_id"], self.request_id); }
+                self.entered = true;
+                std::future::pending().await
+            }
+        }
+        let dir=tempfile::tempdir().unwrap();
+        let svc=service_with_device(dir.path());let mac="AABBCCDDEEFF";
+        let job=svc.wifi_queue_control(mac,"original","activate",json!({"network_id":"home"}),100).unwrap();
+        let mut carrier=SuspendedWrite {request_id:job.request_id.clone(),op:"activate",entered:false};
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(10),
+            svc.wifi_attempt_async(mac,&job.job_id,"original","own",true,&Default::default(),101,&mut carrier)).await.is_err());
+        assert!(carrier.entered);
+        assert!(svc.wifi_state(mac).jobs[0].confirmation_pending());
+        assert_eq!(svc.wifi_state(mac).jobs[0].state,"awaiting_confirmation");
+        let queried=svc.wifi_attempt(mac,&job.job_id,"original","own",false,&Default::default(),150,|op,body| {
+            assert_eq!(op,"result");assert_eq!(body["query_id"],job.request_id);
+            Ok(json!({"ok":true,"outcome":"unknown"}))
+        }).unwrap().unwrap();
+        assert!(queried.confirmation_pending());
+        drop(svc);
+        let svc=PlatformService::open(dir.path()).unwrap();
+        assert!(svc.wifi_queue_control(mac,"original","trial",json!({"ssid":"new"}),200).is_err());
+        let done=svc.wifi_attempt(mac,&job.job_id,"original","own",false,&Default::default(),200,|op,body| {
+            assert_eq!(op,"result");assert_eq!(body["query_id"],job.request_id);
+            Ok(json!({"ok":true,"outcome":"completed","revision":1}))
+        }).unwrap().unwrap();
+        assert!(!done.confirmation_pending());assert!(done.receipt_ack_pending);
+        let read=svc.wifi_queue(mac,"original","read",vec![],300).unwrap();
+        carrier.op="snapshot";carrier.entered=false;
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(10),
+            svc.wifi_attempt_async(mac,&read.job_id,"original","",false,&Default::default(),301,&mut carrier)).await.is_err());
+        assert!(carrier.entered);
+        let state=svc.wifi_state(mac);
+        let read_state=state.jobs.iter().find(|j|j.job_id==read.job_id).unwrap();
+        assert!(!read_state.sent);assert_eq!(read_state.state,"waiting_rendezvous");
+        assert!(svc.wifi_begin(mac,&read.job_id,400).unwrap().is_some());
+    }
+
+    #[test]
+    fn wifi_transaction_namespace_is_frozen_and_missing_sent_identity_is_not_guessed() {
+        for already_sent in [false, true] {
+            let dir=tempfile::tempdir().unwrap();
+            let svc=service_with_device(dir.path());
+            let mac="AABBCCDDEEFF";
+            let job=svc.wifi_queue_control(mac,"original","activate",json!({"network_id":"home"}),100).unwrap();
+            if already_sent {svc.wifi_mark_sent(mac,&job.job_id,101).unwrap();}
+            let before=serde_json::to_value(svc.wifi_state(mac)).unwrap();
+            for (principal,namespace,code) in [("other","bond-a","transaction_principal_changed"),
+                ("original","","transaction_namespace_invalid")] {
+                assert_eq!(svc.wifi_bind_transaction(mac,&job.job_id,principal,namespace).unwrap_err().to_string(),code);
+                assert_eq!(serde_json::to_value(svc.wifi_state(mac)).unwrap(),before);
+            }
+            if already_sent {
+                assert_eq!(svc.wifi_bind_transaction(mac,&job.job_id,"original","bond-a").unwrap_err().to_string(),"transaction_identity_unknown");
+                assert_eq!(serde_json::to_value(svc.wifi_state(mac)).unwrap(),before);
+            } else {
+                svc.wifi_bind_transaction(mac,&job.job_id,"original","bond-a").unwrap();
+                svc.wifi_mark_sent(mac,&job.job_id,101).unwrap();
+            }
+            drop(svc);
+            let svc=PlatformService::open(dir.path()).unwrap();
+            let restored=svc.wifi_state(mac).jobs[0].clone();
+            assert_eq!(restored.request_id,job.request_id);
+            assert!(restored.confirmation_pending());
+            if already_sent {
+                assert!(restored.transaction_namespace.is_none());
+                assert!(svc.wifi_bind_transaction(mac,&job.job_id,"original","bond-a").is_err());
+            } else {
+                assert_eq!(restored.transaction_namespace.as_deref(),Some("bond-a"));
+                svc.wifi_bind_transaction(mac,&job.job_id,"original","bond-a").unwrap();
+                assert_eq!(svc.wifi_bind_transaction(mac,&job.job_id,"original","bond-b").unwrap_err().to_string(),"transaction_namespace_changed");
+                assert!(restored.check_transaction_context("original","bond-a").is_ok());
+                assert!(restored.check_transaction_context("other","bond-a").is_err());
+                assert!(restored.check_transaction_context("original","bond-b").is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn wifi_control_dedup_preserves_principal_after_restart() {
+        for kind in ["trial", "activate"] {
+            let dir = tempfile::tempdir().unwrap();
+            let svc = service_with_device(dir.path());
+            let mac = "AABBCCDDEEFF";
+            let body = json!({"network_id":"home","version":7});
+            let job = svc.wifi_queue_control(mac, "original", kind, body.clone(), 100).unwrap();
+            drop(svc);
+            let svc = PlatformService::open(dir.path()).unwrap();
+            let before = serde_json::to_value(svc.wifi_state(mac)).unwrap();
+            for principal in ["other", "", &"x".repeat(65)] {
+                let error = svc.wifi_queue_control(mac, principal, kind, body.clone(), 101).unwrap_err();
+                assert_eq!(error.to_string(), if principal == "other" { "wifi_control_busy" } else { "invalid_wifi_intent" });
+                assert_eq!(serde_json::to_value(svc.wifi_state(mac)).unwrap(), before);
+            }
+            let replay = svc.wifi_queue_control(mac, "original", kind, body, 102).unwrap();
+            assert_eq!(replay.job_id, job.job_id);
+            assert_eq!(replay.request_id, job.request_id);
+            assert_eq!(replay.bridge_id, "original");
+            drop(svc);
+            let svc = PlatformService::open(dir.path()).unwrap();
+            assert_eq!(serde_json::to_value(svc.wifi_state(mac)).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn cancelled_and_expired_writes_reconcile_without_new_window_or_side_effect() {
+        use crate::platform::wifi::ExecutionIntent;
+        for kind in ["sync", "recovery_save", "trial", "activate"] {
+            for cancelled in [false, true] {
+                for rejected in [false, true] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let svc = service_with_device(dir.path());
+                    let mac = "AABBCCDDEEFF";
+                    svc.wifi_save(mac, 0, serde_json::from_value(json!([
+                        {"network_id":"home","host_ssid":"Host","ssid":"Device","credential":"open"}
+                    ])).unwrap(), 100).unwrap();
+                    let read = svc.wifi_queue(mac, "bridge", "read", vec![], 100).unwrap();
+                    svc.wifi_complete_read(mac, &read.job_id, serde_json::from_value(json!({
+                        "schema":2,"device_mac":mac,"revision":7,"snapshot_id":"before","complete":true,
+                        "observed_at":100,"networks":[],"capacity":{"total":12}
+                    })).unwrap(), 100).unwrap();
+                    let job = if matches!(kind, "trial" | "activate") {
+                        svc.wifi_queue_control(mac, "bridge", kind, json!({"network_id":"home","version":7}), 101).unwrap()
+                    } else { svc.wifi_queue(mac, "bridge", kind, vec!["home".into()], 101).unwrap() };
+                    svc.wifi_attempt(mac, &job.job_id, &job.bridge_id, "own", true, &Default::default(), 102, |op, _| {
+                        if op == "active" { return Ok(json!({"ok":true,"revision":7})); }
+                        assert_eq!(op, if matches!(kind, "sync" | "recovery_save") { "apply" } else { kind });
+                        Err(anyhow::anyhow!("transport_timeout"))
+                    }).unwrap();
+                    let now = if cancelled { 200 } else { job.expires_at + 1 };
+                    if cancelled { svc.wifi_finish(mac, &job.job_id, "cancelled", None, now - 10).unwrap(); }
+                    else { svc.wifi_expire(mac, now).unwrap(); }
+                    drop(svc);
+                    let svc = PlatformService::open(dir.path()).unwrap();
+                    let pending = svc.wifi_state(mac).jobs.into_iter().find(|j| j.job_id == job.job_id).unwrap();
+                    assert!(pending.confirmation_pending() && pending.runnable(now));
+                    assert!(!wifi_job_wants_window(&pending, now));
+                    assert!(svc.wifi_queue_control(mac, "bridge", "activate", json!({"network_id":"another"}), now).is_err());
+                    let unknown = svc.wifi_attempt(mac, &job.job_id, &job.bridge_id, "own", false, &Default::default(), now, |op, body| {
+                        assert_eq!(op, "result"); assert_eq!(body["query_id"], job.request_id);
+                        Ok(json!({"ok":false,"error":"storage"}))
+                    }).unwrap().unwrap();
+                    assert!(unknown.confirmation_pending());
+                    assert!(!unknown.runnable(now + 1));
+                    assert!(!wifi_job_wants_window(&unknown, now + 61));
+                    drop(svc);
+                    let svc = PlatformService::open(dir.path()).unwrap();
+                    let result = svc.wifi_attempt(mac, &job.job_id, &job.bridge_id, "own", false, &Default::default(), now + 61, |op, body| {
+                        assert_eq!(op, "result"); assert_eq!(body["query_id"], job.request_id);
+                        Ok(json!({"ok":true,"outcome":if rejected {"rejected"} else {"committed"},
+                            "revision":8,"bond":"own","error":"capacity"}))
+                    }).unwrap().unwrap();
+                    assert_eq!(result.execution_intent, if cancelled { ExecutionIntent::Cancelled } else { ExecutionIntent::Expired });
+                    assert_eq!(result.state, if rejected { "failed" } else { "completed" });
+                    assert!(!result.confirmation_pending()); assert!(result.receipt_ack_pending);
+                    drop(svc);
+                    let svc = PlatformService::open(dir.path()).unwrap();
+                    assert!(svc.wifi_state(mac).jobs.iter().find(|j| j.job_id == job.job_id).unwrap().receipt_ack_pending);
+                    svc.wifi_receipt_acked(mac, &job.job_id, &job.bridge_id, "own").unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn protocol_query_failure_preserves_control_transaction_across_restart() {
+        for kind in ["trial", "activate"] {
+            for code in ["storage", "session_expired", "claim_required", "occupied", "busy", "unauthorized", "storage_unknown"] {
+                let dir = tempfile::tempdir().unwrap();
+                let svc = service_with_device(dir.path());
+                let mac = "AABBCCDDEEFF";
+                let job = svc.wifi_queue_control(mac, "bridge", kind,
+                    json!({"network_id":"home","version":1}), 100).unwrap();
+                let unknown = svc.wifi_attempt(mac, &job.job_id, &job.bridge_id, "own", true, &Default::default(), 101, |op, _| {
+                    assert_eq!(op, kind);
+                    Err(anyhow::anyhow!("transport_timeout"))
+                }).unwrap().unwrap();
+                assert!(unknown.sent && unknown.may_have_committed);
+                drop(svc);
+                let svc = PlatformService::open(dir.path()).unwrap();
+                let failed_query = svc.wifi_attempt(mac, &job.job_id, &job.bridge_id, "own", false, &Default::default(), 200, |op, body| {
+                    assert_eq!(op, "result");
+                    assert_eq!(body["query_id"], job.request_id);
+                    Ok(json!({"ok":false,"error":code}))
+                }).unwrap().unwrap();
+                assert_eq!(failed_query.state, "awaiting_confirmation", "{kind}/{code}");
+                assert!(failed_query.sent && failed_query.may_have_committed, "{kind}/{code}");
+                assert_eq!(failed_query.error_code.as_deref(), Some(code));
+                assert!(!failed_query.receipt_ack_pending);
+                drop(svc);
+                let svc = PlatformService::open(dir.path()).unwrap();
+                let confirmed = svc.wifi_attempt(mac, &job.job_id, &job.bridge_id, "own", true, &Default::default(), 300, |op, body| {
+                    assert_eq!(op, "result", "query failure must never authorize another write");
+                    assert_eq!(body["query_id"], job.request_id);
+                    Ok(json!({"ok":true,"outcome":"completed","revision":2}))
+                }).unwrap().unwrap();
+                assert_eq!(confirmed.state, "completed");
+                assert!(confirmed.receipt_ack_pending);
+                drop(svc);
+                let svc = PlatformService::open(dir.path()).unwrap();
+                let persisted = svc.wifi_state(mac).jobs.into_iter().find(|j| j.job_id == job.job_id).unwrap();
+                assert_eq!(persisted.confirmation.as_deref(), Some("operation_result"));
+                assert!(persisted.receipt_ack_pending);
+            }
+        }
+    }
+
+    #[test]
+    fn protocol_control_rejections_distinguish_write_from_result_query() {
+        for kind in ["trial", "activate"] {
+            for previously_sent in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let svc = service_with_device(dir.path());
+                let mac = "AABBCCDDEEFF";
+                let job = svc.wifi_queue_control(mac, "bridge", kind,
+                    json!({"network_id":"home","version":1}), 100).unwrap();
+                if previously_sent {
+                    svc.wifi_attempt(mac, &job.job_id, &job.bridge_id, "own", true, &Default::default(), 101, |op, _| {
+                        assert_eq!(op, kind);
+                        Err(anyhow::anyhow!("transport_timeout"))
+                    }).unwrap();
+                }
+                let result = svc.wifi_attempt(mac, &job.job_id, &job.bridge_id, "own", true, &Default::default(), 200, |op, _| {
+                    assert_eq!(op, if previously_sent { "result" } else { kind });
+                    // An unsuccessful query's envelope is not a durable refusal.
+                    Ok(json!({"ok":false,"outcome":"rejected","error":"storage"}))
+                }).unwrap().unwrap();
+                assert_eq!(result.state, if previously_sent { "awaiting_confirmation" } else { "failed" });
+                if previously_sent {
+                    assert!(result.sent && result.may_have_committed);
+                    assert!(result.confirmation.is_none() && !result.receipt_ack_pending);
+                    let confirmed = svc.wifi_attempt(mac, &job.job_id, &job.bridge_id, "own", false, &Default::default(), 300, |op, body| {
+                        assert_eq!(op, "result");
+                        assert_eq!(body["query_id"], job.request_id);
+                        Ok(json!({"ok":true,"outcome":"rejected","error":"authentication_failed"}))
+                    }).unwrap().unwrap();
+                    assert_eq!(confirmed.confirmation.as_deref(), Some("durable_rejection"));
+                    assert!(confirmed.receipt_ack_pending);
+                }
+            }
         }
     }
 
@@ -4451,12 +4793,12 @@ mod tests {
                 let dir=tempfile::tempdir().unwrap();let svc=service_with_device(dir.path());let mac="AABBCCDDEEFF";
                 let job=svc.wifi_queue_control(mac,"bridge","activate",json!({"network_id":"home","version":1}),100).unwrap();
                 if previously_sent {
-                    let unknown=svc.wifi_attempt(mac,&job.job_id,Some("authenticated_http"),&Default::default(),101,|op,_| {
+                    let unknown=svc.wifi_attempt(mac,&job.job_id, &job.bridge_id, "own",true,&Default::default(),101,|op,_| {
                         assert_eq!(op,"activate");Err(anyhow::anyhow!("transport_timeout"))
                     }).unwrap().unwrap();
                     assert_eq!(unknown.state,"awaiting_confirmation");
                 }
-                let result=svc.wifi_attempt(mac,&job.job_id,Some("authenticated_http"),&Default::default(),200,|op,_| {
+                let result=svc.wifi_attempt(mac,&job.job_id, &job.bridge_id, "own",true,&Default::default(),200,|op,_| {
                     assert_eq!(op,if previously_sent {"result"} else {"activate"});
                     Err(crate::device_client::HttpStatus(code).into())
                 }).unwrap().unwrap();
@@ -4478,14 +4820,14 @@ mod tests {
             svc.wifi_complete_read(mac,&read.job_id,snapshot,100).unwrap();
             let targets=serde_json::from_value(json!([{"network_id":"home","host_ssid":"host","ssid":"device","credential":"open"}])).unwrap();
             svc.wifi_save(mac,0,targets,101).unwrap();let job=svc.wifi_queue(mac,"bridge","sync",vec!["home".into()],102).unwrap();
-            let result=svc.wifi_attempt(mac,&job.job_id,Some("authenticated_http"),&Default::default(),103,|op,_| {
+            let result=svc.wifi_attempt(mac,&job.job_id, &job.bridge_id, "own",true,&Default::default(),103,|op,_| {
                 assert_eq!(op,"apply");
                 Err(if local {crate::rendezvous::NotDispatched.into()} else {anyhow::anyhow!("wifi_window_budget")})
             }).unwrap().unwrap();
             assert_eq!(result.sent,!local);assert_eq!(result.may_have_committed,!local);
             assert_eq!(result.state,if local {"waiting_rendezvous"} else {"awaiting_confirmation"});
             if !local {
-                let query=svc.wifi_attempt(mac,&job.job_id,None,&Default::default(),200,|op,_| {
+                let query=svc.wifi_attempt(mac,&job.job_id, &job.bridge_id, "own",false,&Default::default(),200,|op,_| {
                     assert_eq!(op,"result");Err(crate::rendezvous::NotDispatched.into())
                 }).unwrap().unwrap();assert!(query.sent);
             }
@@ -4498,14 +4840,14 @@ mod tests {
         for outcome in [DispatchOutcome::NotSent,DispatchOutcome::WriteUnknown,DispatchOutcome::AckUnknown] {
             let dir=tempfile::tempdir().unwrap();let svc=service_with_device(dir.path());let mac="AABBCCDDEEFF";
             let job=svc.wifi_queue_control(mac,"bridge","activate",json!({"network_id":"home","version":1}),100).unwrap();
-            let result=svc.wifi_attempt(mac,&job.job_id,Some("authenticated_ble"),&Default::default(),101,|op,_| {
+            let result=svc.wifi_attempt(mac,&job.job_id, &job.bridge_id, "own",true,&Default::default(),101,|op,_| {
                 assert_eq!(op,"activate");Err(CommandFailure{outcome,stage:"write",reason:"window_budget_exhausted"}.into())
             }).unwrap().unwrap();
             let sent=outcome!=DispatchOutcome::NotSent;
             assert_eq!(result.sent,sent);assert_eq!(result.may_have_committed,sent);
             assert_eq!(result.state,if sent {"awaiting_confirmation"}else{"waiting_rendezvous"});
             assert_eq!(result.error_code.as_deref(),Some(if sent {"result_unknown"}else{"not_sent"}));
-            let next=svc.wifi_attempt(mac,&job.job_id,Some("authenticated_ble"),&Default::default(),200,|op,body| {
+            let next=svc.wifi_attempt(mac,&job.job_id, &job.bridge_id, "own",true,&Default::default(),200,|op,body| {
                 assert_eq!(op,if sent {"result"}else{"activate"});
                 assert_eq!(body[if sent {"query_id"}else{"request_id"}],job.request_id);
                 Err(CommandFailure{outcome:DispatchOutcome::NotSent,stage:"before_write",reason:"window_budget_exhausted"}.into())
@@ -4526,7 +4868,7 @@ mod tests {
             targets[0].label="Renamed".into();targets[0].deleted=deleted;
             svc.wifi_save(mac,state.local_revision,targets,103).unwrap();
             let job=svc.wifi_queue(mac,"bridge","sync",vec!["home".into()],104).unwrap();
-            let result=svc.wifi_attempt(mac,&job.job_id,Some("permit"),&BTreeMap::new(),105,|op,body| {
+            let result=svc.wifi_attempt(mac,&job.job_id, &job.bridge_id, "own",true,&BTreeMap::new(),105,|op,body| {
                 if op=="apply" {
                     assert_eq!(body["changes"].as_array().unwrap().len(),1);
                     assert_eq!(body["changes"][0]["network_id"],"home");assert_eq!(body["changes"][0]["deleted"],deleted);
@@ -4561,8 +4903,8 @@ mod tests {
         assert!(!saved.differences()[0]["writable"].as_bool().unwrap());
         // Local editing must not relax the device transport's binding checks.
         let job=svc.wifi_queue(mac,"bridge","sync",vec!["home".into()],104).unwrap();
-        let result=svc.wifi_attempt(mac,&job.job_id,None,&BTreeMap::new(),105,|op,_| {
-            assert_ne!(op,"apply","Missing device permit must never reach apply");
+        let result=svc.wifi_attempt(mac,&job.job_id, &job.bridge_id, "own",false,&BTreeMap::new(),105,|op,_| {
+            assert_ne!(op,"apply","Missing write permission must never reach apply");
             Ok(serde_json::to_value(&snapshot)?)
         }).unwrap().unwrap();assert_ne!(result.state,"completed");
         drop(svc);let state=PlatformService::open(dir.path()).unwrap().wifi_state(mac);
@@ -4583,7 +4925,7 @@ mod tests {
             let mut targets=svc.wifi_state(mac).targets;targets[0].ssid="Edited-2G".into();targets[0].label="Edited".into();targets[0].password=Some("fixture-pass".into());
             svc.wifi_save(mac,1,targets,103).unwrap();
             let job=svc.wifi_queue_manual_sync(mac,"bridge",vec!["home".into()],2,"roundtrip","Host",104).unwrap();
-            let result=svc.wifi_attempt(mac,&job.job_id,Some("permit"),&BTreeMap::new(),105,|op,body|{
+            let result=svc.wifi_attempt(mac,&job.job_id, &job.bridge_id, "own",true,&BTreeMap::new(),105,|op,body|{
                 assert_eq!(op,"apply");assert_eq!(body["changes"].as_array().unwrap().len(),1);
                 assert_eq!(body["changes"][0]["network_id"],"home");assert_eq!(body["changes"][0]["ssid"],"Edited-2G");
                 assert_eq!(body["changes"][0]["password"],"fixture-pass");
@@ -4613,7 +4955,7 @@ mod tests {
             let mut targets=svc.wifi_state(mac).targets;targets[0].ssid="Edited-2G".into();targets[0].label="Edited".into();targets[0].password=Some("fixture-pass".into());
             svc.wifi_save(mac,1,targets,103).unwrap();
             let job=svc.wifi_queue_manual_sync(mac,"bridge",vec!["home".into()],2,"roundtrip","Host",104).unwrap();
-            let result=svc.wifi_attempt(mac,&job.job_id,Some("permit"),&BTreeMap::new(),105,|op,body|{
+            let result=svc.wifi_attempt(mac,&job.job_id, &job.bridge_id, "own",true,&BTreeMap::new(),105,|op,body|{
                 assert_eq!(op,"apply");assert_eq!(body["changes"].as_array().unwrap().len(),1);
                 assert_eq!(body["changes"][0]["network_id"],"home");assert_eq!(body["changes"][0]["ssid"],"Edited-2G");
                 assert_eq!(body["changes"][0]["password"],"fixture-pass");
@@ -4647,7 +4989,7 @@ mod tests {
         assert_eq!(compared.differences()[0]["password"],"different");
         targets[0].credential="replace".into();svc.wifi_save(mac,1,targets,103).unwrap();
         let job=svc.wifi_queue(mac,"bridge","sync",vec!["home".into()],104).unwrap();
-        let result=svc.wifi_attempt(mac,&job.job_id,Some("permit"),&BTreeMap::new(),105,|op,body| {
+        let result=svc.wifi_attempt(mac,&job.job_id, &job.bridge_id, "own",true,&BTreeMap::new(),105,|op,body| {
             if op=="apply" {assert_eq!(body["changes"][0]["password"],"fixture-pass");Ok(json!({"ok":true,"outcome":"committed","revision":2}))}
             else {Ok(serde_json::to_value(&snapshot)?)}
         }).unwrap().unwrap();assert_eq!(result.state,"completed");
@@ -4661,10 +5003,14 @@ mod tests {
             let target:WifiNetwork=serde_json::from_value(json!({"network_id":"home","host_ssid":"Host","ssid":"Device","credential":"replace"})).unwrap();
             svc.wifi_save(mac,0,vec![target.clone()],100).unwrap();
             let job=svc.wifi_queue(mac,"bridge","recovery_save",vec!["home".into()],101).unwrap();
+            svc.wifi_bind_transaction(mac,&job.job_id,"bridge","own").unwrap();
             svc.wifi_mark_sent(mac,&job.job_id,102).unwrap();
+            svc.wifi_finish(mac,&job.job_id,"awaiting_confirmation",None,102).unwrap();
             if edit {let mut changed=target.clone();changed.ssid="New intent".into();svc.wifi_save(mac,1,vec![changed],103).unwrap();}
-            let mut observed=target;observed.credential="device".into();observed.version=7;
-            svc.wifi_confirm_recovery(mac,&job.job_id,observed,7,104).unwrap();
+            svc.wifi_attempt(mac,&job.job_id,"bridge","own",false,&BTreeMap::new(),200,|op,body| {
+                assert_eq!(op,"result");assert_eq!(body["query_id"],job.request_id);
+                Ok(json!({"ok":true,"outcome":"committed","revision":7,"bond":"own"}))
+            }).unwrap().unwrap();
             let state=svc.wifi_state(mac);
             assert_eq!(state.targets[0].credential,if edit{"replace"}else{"keep"});
             assert_eq!(state.targets[0].version,if edit{0}else{7});
@@ -5007,12 +5353,12 @@ mod tests {
         let job=svc.wifi_queue_manual_sync(mac,"bridge",vec!["old".into(),"current".into()],1,"manual","Host-5G",103).unwrap();
         assert_eq!(job.expected_revision,Some(7));assert_eq!(job.host_ssid.as_deref(),Some("Host-5G"));
         let mut newer=svc.wifi_state(mac).targets;newer[1].label="Later draft".into();svc.wifi_save(mac,1,newer,104).unwrap();
-        let outcome=svc.wifi_attempt(mac,&job.job_id,Some("permit"),&BTreeMap::new(),105,|op,body| {
+        let outcome=svc.wifi_attempt(mac,&job.job_id, &job.bridge_id, "own",true,&BTreeMap::new(),105,|op,body| {
             assert_eq!(op,"apply","must not reread device configuration");assert_eq!(body["expected_revision"],7);
             assert_eq!(body["changes"].as_array().unwrap().len(),2);anyhow::bail!("lost_ack")
         }).unwrap().unwrap();assert_eq!(outcome.state,"awaiting_confirmation");
         drop(svc);let svc=PlatformService::open(dir.path()).unwrap();
-        let result=svc.wifi_attempt(mac,&job.job_id,None,&BTreeMap::new(),166,|op,_| {
+        let result=svc.wifi_attempt(mac,&job.job_id, &job.bridge_id, "own",false,&BTreeMap::new(),166,|op,_| {
             assert_eq!(op,"result","lost ACK must only query the original transaction");Ok(json!({"ok":true,"outcome":"committed","revision":8,"bond":"own"}))
         }).unwrap().unwrap();assert_eq!(result.state,"completed");assert_eq!(result.confirmation.as_deref(),Some("durable_receipt"));
         let state=svc.wifi_state(mac);assert_eq!(state.targets[1].label,"Later draft");

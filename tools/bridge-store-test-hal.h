@@ -6,7 +6,8 @@ static bool endpointWriteFail=false,endpointCommitError=false,endpointReadFail=f
 class Preferences {
 public:
  bool begin(const char*,bool){return true;}void end(){}
- size_t getBytesLength(const char *key){return endpointNvs[key].size();}
+ bool isKey(const char *key){return endpointNvs.find(key)!=endpointNvs.end();}
+ size_t getBytesLength(const char *key){auto i=endpointNvs.find(key);return i==endpointNvs.end()?0:i->second.size();}
  size_t getBytes(const char *key,void *out,size_t cap){auto &b=endpointNvs[key];if(endpointReadFail||b.size()>cap)return 0;memcpy(out,b.data(),b.size());return b.size();}
  size_t putBytes(const char *key,const void *data,size_t size){if(endpointWriteFail)return 0;const auto *b=(const uint8_t *)data;endpointNvs[key]=std::vector<uint8_t>(b,b+size);return endpointCommitError?0:size;}
  String getString(const char *key,const char *fallback){auto &b=endpointNvs[key];return b.empty()?String(fallback):String(std::string(b.begin(),b.end()));}

@@ -1,22 +1,22 @@
 use std::time::Duration;
 
-use anyhow::Result;
-use bridge_ble::{lan_ip, BleConfig, Pusher};
+use anyhow::{Context, Result};
+use bridge_ble::{lan_ip, DeviceConnection};
 use clap::Parser;
 
 #[derive(Parser, Debug)]
 #[command(name = "bridge-ble", about = "Codex Status BLE endpoint handoff")]
 struct Args {
-    /// Device name prefix to scan for.
-    #[arg(long, default_value = "CodexStatus-")]
-    name_prefix: String,
+    /// Registered device Wi-Fi MAC; verified before endpoint writes.
+    #[arg(long)]
+    mac: String,
     /// Host advertised to the device (defaults to the detected LAN IP).
     #[arg(long)]
     host: Option<String>,
     /// HTTP port of the Wi-Fi channel (written as the device endpoint).
     #[arg(long, default_value = "8765")]
     port: u16,
-    #[arg(long, default_value = "test-token-123")]
+    #[arg(long)]
     token: String,
     #[arg(long, default_value = "30")]
     interval: u64,
@@ -38,23 +38,21 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let cfg = BleConfig {
-        name_prefix: args.name_prefix.clone(),
-        host: args.host.clone().unwrap_or_else(lan_ip),
-        port: args.port,
-        token: args.token.clone(),
-        bridge_id: args.bridge_id.clone(),
-        scan_timeout_ms: 30000,
-    };
-    tracing::info!("endpoint advertised: {}:{}", cfg.host, cfg.port);
-
-    let pusher = Pusher::new(cfg);
-
-    if args.once {
-        let adapter = Pusher::adapter().await?;
-        let info = pusher.cycle_once(&adapter).await?;
-        tracing::info!("device info: {info}");
-        return Ok(());
+    let host = args.host.clone().unwrap_or_else(lan_ip);
+    tracing::info!("endpoint advertised: {}:{}", host, args.port);
+    loop {
+        let mut link = DeviceConnection::connect(&args.mac, &args.token, &args.bridge_id).await?
+            .context("registered device is not advertising; open its BLE window")?;
+        let result = async {
+            link.write_endpoint(&host, args.port, &args.token).await?;
+            let status = link.command("status", serde_json::json!({})).await?;
+            anyhow::ensure!(status["result"] == "applied", "device did not confirm the current protocol session");
+            Ok::<(), anyhow::Error>(())
+        }.await;
+        link.close().await;
+        result?;
+        tracing::info!(device_mac = %args.mac, "endpoint handoff confirmed");
+        if args.once { return Ok(()); }
+        tokio::time::sleep(Duration::from_secs(args.interval.max(1))).await;
     }
-    pusher.run(Duration::from_secs(args.interval)).await
 }

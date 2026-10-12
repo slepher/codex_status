@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Host build of the firmware template engine for pixel-accurate previews"
+default-run = "bridge-render"
+
+[[bin]]
+name = "wifi-store-convert"
+path = "../../../tools/wifi-store-convert.rs"
 
 [dependencies]
 anyhow = "1"

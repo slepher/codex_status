@@ -316,7 +316,6 @@ void bleOff(const char *reason) {
     state.bleOn = false;
     diagnostics::traceSetStage(TRACE_STAGE_BLE_OFF);
     bleOpenPairingWindow(0);
-    wifiSetupRadioClosed("session_expired");
     diagnostics::bleRadioMark(false);
     bleAdvertiseStop();
     bleDeinit();

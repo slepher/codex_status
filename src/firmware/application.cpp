@@ -341,9 +341,7 @@ void tick() {
     if (transport::state.otaRebootPending && (int32_t)(millis() - transport::state.otaRebootAt) >= 0) ESP.restart();
     // OTA stall watchdog: no upload chunk for 20 s -> abort and restore the UI
     // (the WebServer also reports UPLOAD_FILE_ABORTED; this is the backstop).
-    if (transport::state.otaInProgress && transport::state.otaLastDataMs && (int32_t)(millis() - transport::state.otaLastDataMs) > 20000) {
-        transport::otaUploadCleanup("stalled");
-    }
+    transport::otaUploadTick();
     diagnostics::handleSerialCli();
     transport::state.server.handleClient();
     if (targetUnverified) {
@@ -409,8 +407,7 @@ void tick() {
         wifiSetupAbort("occupied");
     // Defer a new RF association until ordinary BLE releases, but always
     // finish an already started activation (including physical BLE recovery).
-    wifiSetupPoll(clock::v2NowMs(), blePeerIdentity(), bleConnectionGeneration(),
-                  bleIsConnected() && blePeerIsBonded() && blePeerIsEncrypted(),
+    wifiSetupPoll(clock::v2NowMs(),
                   !(radio::state.v2InRendezvous && radio::state.bleOn && radio::state.v2RvNetworkExpected));
     static bool wasSettingUp = false;
     if (wasSettingUp && !wifiSetupBusy() && WiFi.status() == WL_CONNECTED) {

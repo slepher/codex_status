@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use anyhow::{anyhow, bail, Context, Result};
 use crate::platform::model::DeviceIdentity;
 use serde_json::{json, Value};
+use crate::rendezvous::{CommandFailure, DispatchOutcome};
 
 pub const BUNDLE_CHUNK_BYTES: usize = 4048;
 const MAX_BUNDLE_BYTES: usize = crate::platform::model::MAX_BUNDLE_BYTES;
@@ -26,13 +27,36 @@ impl std::fmt::Display for HttpStatus {
 }
 impl std::error::Error for HttpStatus {}
 
-fn write_until(stream: &mut TcpStream, mut bytes: &[u8], deadline: Instant) -> Result<()> {
+#[derive(Debug, thiserror::Error)]
+#[error("device_http_session_expired; query original business transaction")]
+struct HttpSessionExpired;
+
+#[derive(Debug, thiserror::Error)]
+pub enum HttpRequestError {
+    #[error("device HTTP frame exceeds 4096 bytes")]
+    FrameLimit,
+    #[error("unregistered device HTTP operation")]
+    UnsupportedOperation,
+}
+
+struct HttpProgress { outcome: DispatchOutcome, stage: &'static str }
+
+fn write_until(stream: &mut TcpStream, bytes: &[u8], deadline: Instant, progress: &mut HttpProgress) -> Result<()> {
+    write_until_with(bytes, deadline, progress, |bytes, remaining| {
+        stream.set_write_timeout(Some(remaining))?;
+        stream.write(bytes)
+    })
+}
+
+fn write_until_with(mut bytes: &[u8], deadline: Instant, progress: &mut HttpProgress,
+    mut write: impl FnMut(&[u8], Duration) -> std::io::Result<usize>) -> Result<()>
+{
     while !bytes.is_empty() {
         let remaining = deadline.saturating_duration_since(Instant::now());
         anyhow::ensure!(!remaining.is_zero(), "wifi_window_budget");
-        stream.set_write_timeout(Some(remaining))?;
-        let written = stream.write(bytes)?;
+        let written = write(bytes, remaining)?;
         anyhow::ensure!(written != 0, "device HTTP write incomplete");
+        progress.outcome = DispatchOutcome::WriteUnknown;
         bytes = &bytes[written..];
     }
     Ok(())
@@ -48,6 +72,7 @@ fn transport_request(
     extra_headers: &[(&str, &str)],
     content_type: &str,
     timeout: Duration,
+    progress: &mut HttpProgress,
 ) -> Result<(u16, Vec<u8>)> {
     anyhow::ensure!(!timeout.is_zero(), "wifi_window_budget");
     let deadline = Instant::now() + timeout;
@@ -59,6 +84,7 @@ fn transport_request(
     let addr = target
         .parse()
         .map_err(|e| anyhow!("bad device address {ip}: {e}"))?;
+    progress.stage = "http_connect";
     let mut stream = TcpStream::connect_timeout(&addr, timeout)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
@@ -81,8 +107,11 @@ fn transport_request(
         head.push_str("\r\n");
     }
     head.push_str("\r\n");
-    write_until(&mut stream, head.as_bytes(), deadline)?;
-    if let Some(bytes) = body { write_until(&mut stream, bytes, deadline)?; }
+    progress.stage = "http_write";
+    write_until(&mut stream, head.as_bytes(), deadline, progress)?;
+    if let Some(bytes) = body { write_until(&mut stream, bytes, deadline, progress)?; }
+    progress.outcome = DispatchOutcome::AckUnknown;
+    progress.stage = "http_ack";
     let mut raw = Vec::new();
     let mut chunk = [0u8; 2048];
     let mut expected_len = None;
@@ -169,7 +198,7 @@ fn frame_operation(path: &str) -> Result<u16> {
         "/api/wifi/snapshot" => "wifi_snapshot", "/api/wifi/apply" => "wifi_apply",
         "/api/wifi/result" => "wifi_result", "/api/wifi/result_ack" => "wifi_result_ack",
         "/api/wifi/command" => "wifi_command",
-        _ => bail!("unregistered device HTTP operation {path}"),
+        _ => return Err(HttpRequestError::UnsupportedOperation.into()),
     };
     crate::compact_frame::operation(name).context("unregistered frame operation")
 }
@@ -179,8 +208,11 @@ fn request(
     extra_headers: &[(&str, &str)], timeout: Duration,
 ) -> Result<(u16, String)> {
     use crate::compact_frame::{Header, CONTENT_TYPE, HEADER_LEN, MAX_HTTP_FRAME};
+    let mut progress = HttpProgress { outcome: DispatchOutcome::NotSent, stage: "http_prepare" };
+    let result = (|| {
     let deadline = Instant::now() + timeout;
     let op = frame_operation(path)?;
+    progress.stage = "http_session";
     let session = frame_session(ip, token);
     if op != 1 && op != 19 && lock_session_until(&session, deadline)?.id == [0; 16] {
         status(ip, token, deadline.saturating_duration_since(Instant::now())).context("establish device HTTP session")?;
@@ -198,7 +230,7 @@ fn request(
         open_payload.as_slice()
     }
         else { body.unwrap_or(b"{}") };
-    anyhow::ensure!(payload.len() + HEADER_LEN <= MAX_HTTP_FRAME, "device HTTP frame exceeds 4096 bytes");
+    if payload.len() + HEADER_LEN > MAX_HTTP_FRAME { return Err(HttpRequestError::FrameLimit.into()); }
     let header = Header { kind: 0, op, result: 0,
         payload_len: payload.len().try_into().context("HTTP payload too large")?,
         session: if opening { new_open_nonce() } else { session.id },
@@ -206,15 +238,15 @@ fn request(
     let mut frame = header.encode().map_err(anyhow::Error::msg)?.to_vec();
     frame.extend_from_slice(payload);
     let (status, response) = transport_request(ip, "POST", path, token, Some(&frame),
-        extra_headers, CONTENT_TYPE, deadline.saturating_duration_since(Instant::now()))?;
+        extra_headers, CONTENT_TYPE, deadline.saturating_duration_since(Instant::now()), &mut progress)?;
+    progress.stage = "http_response";
     if matches!(status, 401 | 403) && op != 4 { return Err(HttpStatus(status).into()); }
     let (ack, bytes) = Header::decode(&response, MAX_HTTP_FRAME)
         .map_err(|e| anyhow!("device protocol mismatch: {e}; update Bridge and device software"))?;
     if status == 409 && serde_json::from_slice::<Value>(bytes).ok()
         .is_some_and(|reply|reply["error"]=="session") {
         session.id = [0;16];
-        return Err(anyhow!(if op == 19 {"device_http_session_expired"}
-            else {"device_http_session_expired; query original business transaction"}));
+        return Err(HttpSessionExpired.into());
     }
     anyhow::ensure!(ack.kind == 1 && ack.op == op && ack.request_no == number &&
         (opening || ack.session == session.id), "device HTTP response identity mismatch");
@@ -233,6 +265,12 @@ fn request(
         }
     }
     Ok((status, std::str::from_utf8(bytes).context("device frame payload UTF-8")?.to_owned()))
+    })();
+    result.map_err(|error: anyhow::Error| {
+        if error.chain().any(|cause| cause.downcast_ref::<HttpStatus>().is_some()) { return error; }
+        let reason = crate::rendezvous::wifi_error(&error).1;
+        error.context(CommandFailure { outcome: progress.outcome, stage: progress.stage, reason })
+    })
 }
 
 fn lock_session_until<T>(session: &Mutex<T>, deadline: Instant)
@@ -253,11 +291,12 @@ fn lock_session_until<T>(session: &Mutex<T>, deadline: Instant)
 /// It shares the production session and request numbering with business calls.
 pub fn raw_frame_request(ip: &str, path: &str, token: &str, body: &[u8],
                          timeout: Duration) -> Result<(u16, Vec<u8>)> {
+    let until = Instant::now() + timeout;
     let response = request(ip, "POST", path, token, Some(body), &[], timeout);
     let (status, payload) = match response {
         Err(error) if frame_operation(path).ok()==Some(19) &&
-            error.to_string()=="device_http_session_expired" =>
-            request(ip, "POST", path, token, Some(body), &[], timeout)?,
+            error.downcast_ref::<HttpSessionExpired>().is_some() =>
+            request(ip, "POST", path, token, Some(body), &[], until.saturating_duration_since(Instant::now()))?,
         result => result?,
     };
     Ok((status, payload.into_bytes()))
@@ -488,12 +527,13 @@ fn parse_status_body(body: &str) -> Result<Value> {
 
 /// Running OTA partition hash, authorized by the device operation token alone.
 pub fn ota_image(ip: &str, token: &str, mac: &str, image_bytes: usize, timeout: Duration) -> Result<Value> {
+    let until = Instant::now() + timeout;
     let expected_mac = DeviceIdentity::normalized_mac(mac).context("invalid OTA target MAC")?;
     let path = "/api/ota/image";
     let payload=serde_json::to_vec(&json!({"image_bytes":image_bytes}))?;
     let (status, body) = match request(ip, "POST", path, token, Some(&payload), &[], timeout) {
-        Err(error) if error.to_string() == "device_http_session_expired" =>
-            request(ip, "POST", path, token, Some(&payload), &[], timeout)?,
+        Err(error) if error.downcast_ref::<HttpSessionExpired>().is_some() =>
+            request(ip, "POST", path, token, Some(&payload), &[], until.saturating_duration_since(Instant::now()))?,
         result => result?,
     };
     if status != 200 { bail!("device /api/ota/image HTTP {status}"); }
@@ -753,6 +793,7 @@ mod tests {
                     if frame.op==14 {
                         let body:Value=serde_json::from_slice(body).unwrap();
                         assert_eq!(body["session_nonce"],"snapshot-test-nonce");
+                        assert!(body.get("permit").is_none(), "retired permit must not enter the frame");
                     }
                     let code = if opening { if status==401 {401}else{200} } else {status};
                     let text = if opening {r#"{"device_mac":"AABBCCDDEEFF","session_nonce":"snapshot-test-nonce"}"#} else {&payload};
@@ -766,6 +807,86 @@ mod tests {
                 }
             });
         (address, server)
+    }
+
+    #[test]
+    fn partial_http_write_keeps_unknown_and_never_restarts_the_frame() {
+        for written_before_failure in [0, 2, 7] {
+            let mut progress = HttpProgress { outcome: DispatchOutcome::NotSent, stage: "http_write" };
+            let mut accepted = Vec::new();
+            let mut calls = 0;
+            let mut previous_remaining = Duration::from_secs(1);
+            let error = write_until_with(b"request", Instant::now() + previous_remaining, &mut progress,
+                |bytes, remaining| {
+                    assert!(remaining <= previous_remaining);
+                    previous_remaining = remaining;
+                    calls += 1;
+                    if accepted.len() == written_before_failure {
+                        return Err(std::io::ErrorKind::TimedOut.into());
+                    }
+                    let count = 1.min(bytes.len());
+                    accepted.extend_from_slice(&bytes[..count]);
+                    Ok(count)
+                });
+            assert_eq!(accepted, b"request"[..written_before_failure]);
+            assert_eq!(progress.outcome, if written_before_failure == 0 {
+                DispatchOutcome::NotSent
+            } else { DispatchOutcome::WriteUnknown });
+            if written_before_failure == 7 { assert!(error.is_ok()); }
+            else { assert!(error.is_err()); }
+            assert_eq!(calls, written_before_failure + usize::from(written_before_failure < 7));
+        }
+        let mut progress = HttpProgress { outcome: DispatchOutcome::NotSent, stage: "http_write" };
+        assert!(write_until_with(b"request", Instant::now(), &mut progress,
+            |_, _| panic!("expired deadline must not reach the socket")).is_err());
+        assert_eq!(progress.outcome, DispatchOutcome::NotSent);
+        assert!(write_until_with(b"request", Instant::now() + Duration::from_secs(1), &mut progress,
+            |_, _| Ok(0)).is_err());
+        assert_eq!(progress.outcome, DispatchOutcome::NotSent);
+    }
+
+    #[test]
+    fn http_progress_distinguishes_connect_failure_session_open_and_sent_frame() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let error = request(&address, "POST", "/api/status", "connect-test", None, &[], Duration::from_millis(100)).unwrap_err();
+        let evidence = crate::rendezvous::command_failure(&error).unwrap();
+        assert_eq!(evidence.outcome, DispatchOutcome::NotSent);
+        assert_eq!(evidence.stage, "http_connect");
+
+        for established in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap().to_string();
+            let token = if established { "sent-test" } else { "opening-test" };
+            if established { frame_session(&address, token).lock().unwrap().id = [7; 16]; }
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut wire = Vec::new(); let mut chunk = [0u8; 1024];
+                loop {
+                    let n = stream.read(&mut chunk).unwrap(); assert_ne!(n, 0);
+                    wire.extend_from_slice(&chunk[..n]);
+                    if let Some(end) = wire.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let length: usize = String::from_utf8_lossy(&wire[..end]).lines().find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("Content-Length").then(||value.trim().parse().unwrap())
+                        }).unwrap();
+                        if wire.len() == end + 4 + length {
+                            let (frame, _) = crate::compact_frame::Header::decode(&wire[end+4..], 4096).unwrap();
+                            assert_eq!(frame.op, if established { 18 } else { 1 });
+                            break;
+                        }
+                    }
+                }
+                // Complete frame received, but no ACK is returned.
+            });
+            let error = request(&address, "POST", "/api/wifi/command", token, Some(b"{}"), &[], Duration::from_secs(2)).unwrap_err();
+            server.join().unwrap();
+            let evidence = crate::rendezvous::command_failure(&error).unwrap();
+            assert_eq!(evidence.outcome, if established { DispatchOutcome::AckUnknown } else { DispatchOutcome::NotSent });
+            assert_eq!(evidence.stage, if established { "http_ack" } else { "http_session" });
+        }
     }
 
     #[test]
@@ -792,7 +913,10 @@ mod tests {
         let started = Instant::now();
         let error = status(&address, "synthetic-lock-test", Duration::from_millis(30)).unwrap_err();
         assert!(started.elapsed() < Duration::from_millis(150));
-        assert_eq!(error.to_string(), "wifi_window_budget");
+        let evidence = crate::rendezvous::command_failure(&error).unwrap();
+        assert_eq!(evidence.outcome, DispatchOutcome::NotSent);
+        assert_eq!(evidence.stage, "http_session");
+        assert_eq!(evidence.reason, "window_budget_exhausted");
         assert!(matches!(listener.accept(), Err(error) if error.kind()==std::io::ErrorKind::WouldBlock));
         worker.join().unwrap();
         assert_eq!(session.lock().unwrap().next_no, 0);
@@ -871,7 +995,7 @@ mod tests {
             (200, json!({"device_mac":mac,"ok":true,"schema":2,"snapshot_id":"s","revision":1,"total":2,"offset":1,"next_offset":2,"chunk":"{}","done":true}).to_string(), ("failed", "snapshot_mismatch")),
         ] {
             let (ip, server) = respond_once(status, body);
-            let error = wifi_snapshot(&ip, "synthetic-token", mac, "bridge", None, "snapshot-test-nonce", Duration::from_secs(2)).unwrap_err();
+            let error = wifi_snapshot(&ip, "synthetic-token", mac, "bridge", "snapshot-test-nonce", Duration::from_secs(2)).unwrap_err();
             server.join().unwrap();
             assert_eq!(crate::rendezvous::wifi_error(&error), expected);
             assert!(!error.to_string().contains("must-not-expose"));
@@ -957,7 +1081,7 @@ pub fn wifi_command(ip:&str,token:&str,mac:&str,bridge:&str,op:&str,nonce:&str,m
 
 /// Freeze and consume every page before exposing a complete snapshot. One hard
 /// deadline covers the entire read; a failed page never becomes an empty list.
-pub fn wifi_snapshot(ip: &str, token: &str, mac: &str, bridge: &str, permit: Option<&str>, nonce: &str,
+pub fn wifi_snapshot(ip: &str, token: &str, mac: &str, bridge: &str, nonce: &str,
                      timeout: Duration) -> Result<crate::platform::wifi::Snapshot> {
     let until = Instant::now() + timeout;
     let mut offset = 0usize; let mut snapshot = String::new(); let mut revision = None;
@@ -966,7 +1090,7 @@ pub fn wifi_snapshot(ip: &str, token: &str, mac: &str, bridge: &str, permit: Opt
         let remaining = until.saturating_duration_since(Instant::now());
         if remaining.is_zero() { bail!("wifi_snapshot_timeout"); }
         let reply = wifi_request(ip, token, mac, bridge, "snapshot",
-            json!({"offset":offset,"snapshot_id":snapshot,"permit":permit,"session_nonce":nonce}), remaining)?;
+            json!({"offset":offset,"snapshot_id":snapshot,"session_nonce":nonce}), remaining)?;
         if reply["ok"] != true { bail!("{}", reply["error"].as_str().unwrap_or("wifi_snapshot_rejected")); }
         let current = reply["snapshot_id"].as_str().context("wifi_snapshot_id")?;
         let rev = reply["revision"].as_u64().context("wifi_revision")?;

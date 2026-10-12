@@ -69,7 +69,8 @@ impl std::fmt::Display for CommandFailure {
 impl std::error::Error for CommandFailure {}
 
 pub fn command_failure(error: &anyhow::Error) -> Option<&CommandFailure> {
-    error.chain().find_map(|cause| cause.downcast_ref::<CommandFailure>())
+    error.downcast_ref::<CommandFailure>()
+        .or_else(||error.chain().find_map(|cause| cause.downcast_ref::<CommandFailure>()))
 }
 pub fn not_dispatched(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.downcast_ref::<NotDispatched>().is_some()) ||
@@ -78,6 +79,7 @@ pub fn not_dispatched(error: &anyhow::Error) -> bool {
 
 /// Finite identifiers only. Never store arbitrary transport/device messages.
 pub fn wifi_error(error: &anyhow::Error) -> (&'static str, &'static str) {
+    if let Some(failure) = command_failure(error) { return ("waiting_rendezvous", failure.code()); }
     for cause in error.chain() {
         if cause.downcast_ref::<NotDispatched>().is_some() { return ("waiting_rendezvous", "not_sent"); }
         if let Some(failure) = cause.downcast_ref::<CommandFailure>() {

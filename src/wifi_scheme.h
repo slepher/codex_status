@@ -116,6 +116,10 @@ struct WifiReceipt {
     uint64_t targetVersion=0;
     uint8_t hash[32] = {};
     uint64_t revision = 0;
+    uint64_t executionGeneration = 0;
+    bool matches(const char *principal, const char *nameSpace, const char *id) const {
+        return !strcmp(bridge,principal) && !strcmp(bond,nameSpace) && !strcmp(request,id);
+    }
     bool valid() const { return bridge.valid() && request.valid() && bond.valid() && error.valid() && operation.valid() && target.valid(); }
     size_t heapBytes() const { return bridge.bytes()+request.bytes()+bond.bytes()+error.bytes()+operation.bytes()+target.bytes(); }
 };
@@ -141,6 +145,7 @@ struct WifiStore {
     // deleting that version, preserve just its old SSID/password for next wake.
     WifiNetwork active;
     uint64_t revision = 0, activeVersion = 0;
+    uint64_t executionGeneration = 0;
     WifiRows<WifiReceipt> receipts;
     WifiRows<WifiCursor> cursors;
     const WifiNetwork *activeCredentials() const {

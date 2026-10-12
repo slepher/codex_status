@@ -16,26 +16,21 @@ struct Endpoints {
 };
 static bool valid(const EndpointRec &r) {
     return r.mac.length()<=21 && r.host.length()>0 && r.host.length()<=64 && r.port &&
-        r.token.length()>0 && r.token.length()<=128 && r.principal.length()<=64 &&
-        r.identity.length()<=21 && r.nameSpace.length()<=21 && r.bssid.length()<=21 &&
-        (!r.principal.length() || (r.identity.length() && r.nameSpace.length()));
+        r.token.length()>0 && r.token.length()<=128 && r.principal.length()>0 && r.principal.length()<=64 &&
+        r.identity.length()>0 && r.identity.length()<=21 && r.nameSpace.length()>0 && r.nameSpace.length()<=21 && r.bssid.length()<=21;
 }
-// Atomic length-delimited BRS2. Old per-key records remain until readback of
-// the complete new blob succeeds. No LRU eviction of authorization identities.
+// Atomic length-delimited BRS2 with complete authorization identities only.
+// Retired records require offline conversion; never infer a namespace online.
 static bool load(Endpoints &out) {
     Preferences p; if (!p.begin("brg",true)) return false;
     size_t size=p.getBytesLength("records2");
     if (!size) {
-        out.count=p.getUChar("n",0);
-        if (out.count>STORE_MAX) { p.end(); return false; }
-        out.rows.reset(out.count ? new(std::nothrow) EndpointRec[out.count] : nullptr);
-        if (out.count && !out.rows) { p.end(); return false; }
-        for(size_t i=0;i<out.count;++i) {
-            auto &r=out.rows[i]; r.mac=p.getString(k("m",i).c_str(),""); r.host=p.getString(k("h",i).c_str(),"");
-            r.port=p.getUShort(k("p",i).c_str(),0);r.token=p.getString(k("t",i).c_str(),"");
-            r.bssid=p.getString(k("b",i).c_str(),"");r.mru=p.getULong(k("r",i).c_str(),0);
-            if (!valid(r)) { p.end(); return false; }
-        }
+        // An existing empty/wrong-type current record is corruption, not a
+        // legacy store. Never recreate authorization identities over it.
+        if (p.isKey("records2") || p.isKey("n") || p.isKey("ctr")) { p.end(); return false; }
+        // A missing legacy count cannot turn orphaned credentials into empty storage.
+        for(size_t i=0;i<STORE_MAX;++i)for(const char *prefix:{"m","h","p","t","b","r"})
+            if(p.isKey(k(prefix,i).c_str())) { p.end();return false; }
         p.end();return true;
     }
     if(size<16 || size>STORE_BYTES) { p.end();return false; }
@@ -55,8 +50,8 @@ static bool load(Endpoints &out) {
             char text[129];if(n>128)return false;memcpy(text,b+pos,n);text[n]=0;*field=text;memset(text,0,sizeof(text));pos+=n;
         }
         if(pos-start!=length||!valid(r))return false;
-        for(size_t j=0;j<i;++j) if((r.principal.length() && r.principal==out.rows[j].principal)||r.token==out.rows[j].token ||
-            (r.nameSpace.length() && r.nameSpace==out.rows[j].nameSpace))return false;
+        for(size_t j=0;j<i;++j) if(r.principal==out.rows[j].principal||r.token==out.rows[j].token ||
+            r.nameSpace==out.rows[j].nameSpace)return false;
     }
     memset(b,0,size);return pos==size;
 }
@@ -75,7 +70,7 @@ static bool save(const Endpoints &all) {
     integer(12,v2Crc32(b,size),4);Preferences p;bool okay=p.begin("brg",false);
     if(okay){okay=p.putBytes("records2",b,size)==size;
         if(okay){std::unique_ptr<uint8_t[]> check(new(std::nothrow) uint8_t[size]);okay=check&&p.getBytesLength("records2")==size&&p.getBytes("records2",check.get(),size)==size&&!memcmp(check.get(),b,size);if(check)memset(check.get(),0,size);}
-        if(okay){size_t old=p.getUChar("n",0);for(size_t i=0;i<old && i<STORE_MAX;++i)for(const char *prefix:{"m","h","p","t","b","r"})p.remove(k(prefix,i).c_str());p.remove("n");p.remove("ctr");}p.end();}
+        p.end();}
     memset(b,0,size);return okay;
 }
 int storeCount(){Endpoints all;return load(all)?all.count:0;}
@@ -86,15 +81,12 @@ bool storeAuthenticate(const String &token,EndpointRec &rec){Endpoints all;if(!t
 const char *storeUpsert(const String &mac,const String &host,uint16_t port,const String &token,
     const String &principal,const String &identity,const String &newNamespace,bool physical){
     if(!principal.length()||!identity.length()||!token.length())return "binding_required";
-    Endpoints old;if(!load(old))return "storage";int slot=-1,legacy=-1;
+    Endpoints old;if(!load(old))return "storage";int slot=-1;
     for(size_t i=0;i<old.count;++i){const auto &r=old.rows[i];
         if(r.principal==principal)slot=i;
-        if(r.token==token && r.principal.length() && r.principal!=principal)return "token_conflict";
-        if(!r.principal.length() && r.token==token){if(legacy>=0||r.mac!=mac)return "binding_ambiguous";legacy=i;}}
+        if(r.token==token && r.principal!=principal)return "token_conflict";}
     String ns;
     if(slot>=0){const auto &r=old.rows[slot];if(r.token!=token || (r.identity!=identity && !physical))return "binding_conflict";ns=r.nameSpace;}
-    else if(legacy>=0){slot=legacy;ns=identity;
-        for(size_t i=0;i<old.count;++i)if(old.rows[i].nameSpace==ns)return "binding_ambiguous";}
     else {if(!physical)return "physical_required";if(old.count>=STORE_MAX)return "capacity";ns=newNamespace;slot=old.count;}
     if(!ns.length())return "shape";
     Endpoints next;next.count=old.count+(size_t(slot)==old.count);next.rows.reset(new(std::nothrow) EndpointRec[next.count]);if(!next.rows)return "memory";

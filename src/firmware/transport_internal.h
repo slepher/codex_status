@@ -41,6 +41,7 @@ bool requestAuthorized();
 void handleBleAuth(const String &json);
 void handleBleV2Ctrl(const String &json);
 void otaUploadCleanup(const char *reason);
+void otaUploadTick();
 bool compactSessionFromHex(const String &text, uint8_t out[16]);
 void v2Response(int status, const String &body);
 void v2Ack(const char *op, const char *result, const char *display,

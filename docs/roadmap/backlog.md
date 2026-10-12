@@ -220,7 +220,11 @@
 
 ### B6. 离线 BLE 配 Wi-Fi 与 BOOT 蓝牙恢复入口（2026-10-03 新开）
 
-- **2026-10-12分层重设计细化，未实施**：[设计](../../project-workflow/bridge-macos/protocol-redesign-design.md)、[P0–P6计划与故障矩阵](../../project-workflow/bridge-macos/protocol-redesign-plan.md)明确业务/执行器/HTTP-BLE职责和状态机，保持既有电源及双向HTTP原则。用户明确最终不留旧协议/降级，删除旧permit/management2/旧恢复分支；独立OTA保留简单token鉴权原生上传，不加Bridge/owner/session/frame。先业务结果与建链生命周期，再统一入口/删除旧栈；OTA独立验收。旧持久未知回执不得因升级清空；所有实施/测试/部署尚未执行。
+- **2026-10-13协议重设计阶段提交，未部署**：按用户要求停止推进并保存P0–P6阶段成果，详见[执行状态](../../project-workflow/bridge-macos/protocol-redesign-status.md)收尾节。Wi-Fi运行时收束WFS5、BRS拒绝旧/缺身份库；离线转换与宿主回归通过，实际联合迁移未完成。继续入口包括BLE endpoint注册的持久ACK与结构化错误链（当前Bridge只等写入）、BRS离线身份恢复及原计划其余；不结B6/C8。
+
+- **2026-10-12重设计P1推进，未部署**：[执行状态](../../project-workflow/bridge-macos/protocol-redesign-status.md)记录类型化结果/取消与TTL后原ID确认、设备三元回执隔离、WFS5执行代际/原子中断终态、HTTP实际发送证据及worker保留设备许可。core168、app87/3忽略、Fake64、C++管理与ASAN存储通过；Note40.18.86候选及64栈项通过。P2扫描/现代建链截止、取消隔离、配对与控制写保护BLE26项已通过；P3旧Pusher驱动删除及CLI现行入口通过app87/3忽略、Fake64；全层身份围栏、P0发布转换、其余P2/P3及P4–P6仍开放；未启停默认Bridge、未访问设备。
+
+- **2026-10-12分层重设计细化，实施进度见上条**：[设计](../../project-workflow/bridge-macos/protocol-redesign-design.md)、[P0–P6计划与故障矩阵](../../project-workflow/bridge-macos/protocol-redesign-plan.md)明确业务/执行器/HTTP-BLE职责和状态机，保持既有电源及双向HTTP原则。用户明确最终不留旧协议/降级，删除旧permit/management2/旧恢复分支；独立OTA保留简单token鉴权原生上传，不加Bridge/owner/session/frame。先业务结果与建链生命周期，再统一入口/删除旧栈；OTA独立验收。旧持久未知回执不得因升级清空；设计提交时尚未实施；本轮增量实施/测试见上条，部署仍未执行。
 
 - **2026-10-12总体架构复核完成，未实施**：[源码审查与替代设计](../../project-workflow/bridge-macos/architecture-review-redesign-20261012.md)确认五类建链失败无界清理及Fake接缝缺口；新增trial/activate结果查询失败误清提交未知标记、事务namespace键不一致、取消/过期停止确认义务。先统一生命周期与事务结果，再收敛状态投影；验收必须证明失败后下一轮扫描/HTTP继续、未知原ID不重发及跨namespace隔离。用户确认保持深睡BLE会合及周期HTTP同步、浅睡HTTP直达、设备HTTP回报与Bridge反向请求；上层载体无关，下层选择合法可用通道。报告已按此修订，取消HTTP拉取替代方案评估，不改变电源策略。
 

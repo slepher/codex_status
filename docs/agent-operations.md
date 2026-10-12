@@ -32,10 +32,12 @@ Rust 桥（`bridge/` 目录；Windows 为已部署基线，macOS 正在实施/�
 cargo test
 cargo run -p bridge-core -- --once          # 拉一次真实数据并打印信封
 cargo run -p bridge-core                    # 独立数据源进程，HTTP :8765 只提供 /health
-cargo run -p bridge-ble -- --once           # 单次 BLE endpoint 交接；业务数据走当前设备协议
+cargo run -p bridge-ble -- --mac <WIFI_MAC> --token <ENDPOINT_TOKEN> --bridge-id <EXISTING_BRIDGE_ID> --once
 cargo run -p bridge-app                     # 托盘应用（生产形态，进程内含 HTTP+BLE+MCP）
 cargo run -p bridge-render -- --template <json> --out <png>   # 离线渲染对拍
 ```
+
+BLE CLI 使用已绑定设备的完整 Wi-Fi MAC、现有 endpoint token 和 Bridge principal，走现行 DeviceConnection；不再按名称前缀任意选设备或进入旧 Pusher 后备循环。首次配对使用显式设备配对入口。占位 token 不替换为文档内的真实凭据，不保存带凭据的运行日志。
 
 环境变量：`CODEX_STATUS_PORT/TOKEN/TEMPLATES/INTERVAL`、`CODEX_STATUS_CODEX`、`CODEX_STATUS_DATA`、`CODEX_STATUS_DEVICE_IP/MAC/NAME`、`CODEX_STATUS_BRIDGE_NAME`。
 
@@ -50,6 +52,14 @@ node tools/test-quad-preview.mjs
 pwsh tools/test-bridge/start.ps1   # 后台启动 Python 测试桥；stop.ps1 停止
 git diff --check                   # 提交前必查
 ```
+
+### 离线 Wi-Fi 显式格式转换（发布前工具）
+
+在 `bridge/` 中运行 `cargo run -p bridge-render --bin wifi-store-convert -- <私有输入blob> <新的私有输出blob>`。接受WFS3/WFS4/WFS5及已核对Note4布局的v1/raw-v2/WFZ2，输出WFS5；显式格式复用固件编解码，旧ABI按固定小端偏移读取并校验CRC，不转换为宿主原生结构体。不打开设备、不运行启动恢复、不推进执行代际、不把pending回执改成终态。输入是从NVS提取的完整单个blob，不是分区dump。
+
+输入/输出目录必须已存在并按私有数据管理。工具限制输入8192 B，校验输出后写入排他创建的 `<输出>.pending`，同步与读回核对，再以同目录硬链接原子发布，拒绝覆盖已有输出/暂存文件；只删除本次创建的暂存文件。中断残留或不支持硬链接会明确失败，不自动删除他人文件。CLI只打印长度，不打印密码、token或记录内容。
+
+旧ABI支持范围是Note4 ELF核对的v1 2296 B、v2 5248 B，WFZ2只允许解压为该v2；其他布局拒绝。未确认旧记录不得补猜执行代际或高水位，当前格式校验不成立时拒绝转换。工具不处理Bridge state.json、不替代原TransactionKey/未知作业/高水位的联合清单与可执行围栏验收，也不构成部署授权。源备份、匹配设备身份和转换结果哈希应在私有发布证据中核对；未确认事务缺字段时保持写入阻断，不能靠当前绑定猜测。当前候选Wi-Fi运行时仅接受WFS5；旧blob或已有零长度键保留且阻止业务写入，不自动转换或删除旧scheme键。部署前仍须完成BRS/Bridge联合迁移和真实数据验收。
 
 ## Bridge 启停与实例
 

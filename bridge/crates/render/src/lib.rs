@@ -417,9 +417,8 @@ extern "C" {
     fn codex_sim_sync_history(p: *mut std::ffi::c_void, since: u32, limit: u32, out: *mut c_char, cap: c_int) -> c_int;
 
     fn codex_sim_wifi_legacy(json: *const c_char);
+    fn codex_wifi_convert_storage(input:*mut u8,size:c_int,output:*mut u8,capacity:c_int)->c_int;
     fn codex_sim_wifi_open(dir: *const c_char) -> c_int;
-    fn codex_sim_wifi_command(input: *const c_char, peer: *const c_char, generation: u32, now: u64,
-        physical: u64, light: u64, allowed: c_int, out: *mut c_char, cap: c_int) -> c_int;
     fn codex_sim_wifi_control(input:*const c_char,principal:*const c_char,name_space:*const c_char,generation:u32,
         now:u64,until:u64,physical:u64,claimed:c_int,session_valid:c_int,out:*mut c_char,cap:c_int)->c_int;
     fn codex_sim_wifi_read_page(input:*const c_char,peer:*const c_char,generation:u32,text:*const c_char,out:*mut c_char,cap:c_int)->c_int;
@@ -1473,6 +1472,17 @@ pub fn png_to_bits_size(png_bytes: &[u8], width: u32, height: u32) -> anyhow::Re
 
 /// One Wi-Fi instance per Fake process, matching the production singleton.
 /// Serialize every call through SimState.wifi; no OS network is touched.
+/// Offline conversion of WFS3/4/5 or verified Note4 legacy ABI records. No simulator startup or
+/// transaction recovery runs; unknown receipts and generations stay unchanged.
+pub fn convert_wifi_storage(input:&[u8])->anyhow::Result<Vec<u8>> {
+    anyhow::ensure!((33..=8192).contains(&input.len()),"wifi_store_invalid");
+    let mut source=input.to_vec();let mut output=vec![0u8;8192];
+    let length=unsafe {codex_wifi_convert_storage(source.as_mut_ptr(),source.len() as c_int,output.as_mut_ptr(),output.len() as c_int)};
+    source.fill(0);
+    if length<0 {output.fill(0);anyhow::bail!("wifi_store_invalid_or_unsupported");}
+    output.truncate(length as usize);Ok(output)
+}
+
 pub struct SimulatorWifi { dir: std::path::PathBuf }
 impl SimulatorWifi {
     pub fn new(dir: &std::path::Path) -> anyhow::Result<Self> {
@@ -1493,14 +1503,6 @@ impl SimulatorWifi {
         let path=self.dir.join("wifi-legacy.json");let temp=self.dir.join("wifi-legacy.json.tmp");
         std::fs::write(&temp,&bytes)?;std::fs::rename(&temp,&path)?;
         let text=CString::new(bytes)?;unsafe {codex_sim_wifi_legacy(text.as_ptr())};Ok(())
-    }
-    pub fn command(&mut self, input: &serde_json::Value, peer: &str, generation: u32, now: u64,
-        physical: u64, light: u64, allowed: bool) -> anyhow::Result<serde_json::Value> {
-        let input = CString::new(serde_json::to_string(input)?)?; let peer = CString::new(peer)?;
-        let mut out = vec![0i8; 16384];
-        let rc = unsafe { codex_sim_wifi_command(input.as_ptr(), peer.as_ptr(), generation, now,
-            physical, light, allowed as c_int, out.as_mut_ptr(), out.len() as c_int) };
-        simulator_ffi_json(rc, &out, "wifi")
     }
     pub fn control(&mut self,input:&serde_json::Value,principal:&str,namespace:&str,generation:u32,now:u64,until:u64,physical:u64,claimed:bool,session_valid:bool)->anyhow::Result<serde_json::Value> {
         let input=CString::new(serde_json::to_string(input)?)?;let principal=CString::new(principal)?;let namespace=CString::new(namespace)?;let mut out=vec![0i8;16384];
@@ -1725,15 +1727,23 @@ fn shared_wifi_global_capacity_keeps_bounded_storage() {
 fn shared_wifi_old_duplicate_ids_are_preserved_and_explicitly_rejected() {
     let _guard=WIFI_PERMISSION_TEST_LOCK.lock().unwrap();
     let dir=std::env::temp_dir().join(format!("codex-wifi-duplicate-{}",std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();let mut sim=SimulatorWifi::new(&dir).unwrap();
-    for (revision,bond) in ["mac","windows"].iter().enumerate() {
-        let grant=sim.command(&serde_json::json!({"op":"wifi_authorize","bridge_id":"old","request_id":"grant","device_mac":"AABBCCDDEEFF"}),bond,1,1000,30000,0,true).unwrap();
-        let write=serde_json::json!({"op":"apply","bridge_id":"old","request_id":format!("seed{revision}"),"device_mac":"AABBCCDDEEFF","expected_revision":revision,"permit":grant["permit"],
-            "changes":[{"network_id":"same","host_ssid":"Host","ssid":"Device","credential":"open"}]});
-        assert_eq!(sim.command(&write,bond,1,1000,30000,0,true).unwrap()["outcome"],"committed");
-    }
+    // Frozen WFS5 bytes from the retired management2 writer: two open networks
+    // named "same" in namespaces "mac"/"windows", revision 2, two save receipts.
+    // Keep recovery coverage without compiling a retired command adapter.
+    use base64::Engine;
+    let fixture=base64::engine::general_purpose::STANDARD.decode(concat!(
+        "V0ZTNQUAAgIJAQAA9yLkWAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAfAAEAAAAAAAAAA21hYwRzYW1lBEhvc3QGRGV2aWNl",
+        "AAAjAAIAAAAAAAAAB3dpbmRvd3MEc2FtZQRIb3N0BkRldmljZQAASQABAAAAAAAAADj1DxblEqPrYFm9K5O1lPfVkeJNnGyz",
+        "EIvYRQPZIALCA29sZAVzZWVkMANtYWMAAAAAAAAAAAAAAAAAAAAAAAAATQACAAAAAAAAADj1DxblEqPrYFm9K5O1lPfVkeJN",
+        "nGyzEIvYRQPZIALCA29sZAVzZWVkMQd3aW5kb3dzAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+    )).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("wifi-schemes.bin"),&fixture).unwrap();
+    let mut sim=SimulatorWifi::new(&dir).unwrap();
+    assert_eq!(std::fs::read(dir.join("wifi-schemes.bin")).unwrap(),fixture);
     let request=serde_json::json!({"op":"apply","bridge_id":"new","request_id":"ambiguous","device_mac":"AABBCCDDEEFF","expected_revision":2,"changes":[{"network_id":"same","deleted":true}]});
     for _ in 0..2 {
+        sim=SimulatorWifi::new(&dir).unwrap();
         let r=sim.control(&request,"new","new",1,1000,30000,0,true,true).unwrap();assert_eq!(r["error"],"ambiguous_network_id");assert_eq!(sim.storage_status().unwrap()["revision"],2);
     }
     let activate=serde_json::json!({"op":"activate","bridge_id":"new","request_id":"ambiguous-activate","network_id":"same","version":1,"device_mac":"AABBCCDDEEFF"});

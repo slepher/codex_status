@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use bridge_ble::{lan_ip, BleConfig, Pusher};
+use bridge_ble::{lan_ip, Pusher};
 use bridge_core::activity::Activity;
 use bridge_core::codex::locate_codex;
 use bridge_core::http::serve_with_router;
@@ -269,7 +269,7 @@ struct AppCtx {
     ota_work: Arc<Notify>,
     device_delivery: tokio::sync::Mutex<()>,
     sim_control: tokio::sync::Mutex<()>,
-    per_mac_delivery: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    per_mac_delivery: Mutex<HashMap<String, Arc<platform::DeliveryLock>>>,
     report_sessions: Mutex<HashMap<String, ReportSession>>,
     status: Mutex<RuntimeStatus>,
     /// Per-MAC runtime records (address, name, caches, occupancy, queues).
@@ -289,8 +289,6 @@ struct AppCtx {
     /// v0.14 mode/activity state shared with the HTTP pull path
     /// (usage_rev / last_change_at / pending queues; docs §13.4).
     activity: Arc<Activity>,
-    /// The device asked for a BLE handshake in its UDP announce (`ble=1`).
-    udp_ble: AtomicBool,
     mcp_port: Mutex<u16>,
     mcp_error: Mutex<Option<String>>,
     mcp_tx: tokio::sync::watch::Sender<u16>,
@@ -1116,7 +1114,7 @@ async fn presence_hint(axum::extract::State(ctx):axum::extract::State<Arc<AppCtx
     let reply=json!({"result":"accepted","bridge_id":ctx.bridge_id,"device_http_verified":verified});
     // try_lock coalesces repeated hints and bounds work independently per MAC.
     let lock=platform::delivery_lock(&ctx,&mac);
-    let Ok(guard)=lock.try_lock_owned() else{return (axum::http::StatusCode::ACCEPTED, axum::Json(reply));};
+    let Ok(guard)=lock.try_lock() else{return (axum::http::StatusCode::ACCEPTED, axum::Json(reply));};
     tokio::spawn(async move {
         let sampled=std::time::Instant::now();let fetch=link.clone();
         if let Ok(Ok(status))=tokio::task::spawn_blocking(move||bridge_core::device_client::status(&fetch.ip,&fetch.token,Duration::from_secs(2))).await {
@@ -1229,7 +1227,7 @@ async fn ready_report(axum::extract::State(ctx):axum::extract::State<Arc<AppCtx>
     tracing::info!(event="ready_report",device_mac=%mac,plan_id,result="received","device network report received; business proof pending");
     tokio::spawn(async move {
         let lock=platform::delivery_lock(&ctx,&mac);
-        let Ok(_guard)=tokio::time::timeout(remaining,lock.lock_owned()).await else{return;};
+        let Ok(_guard)=tokio::time::timeout(remaining,lock.lock()).await else{return;};
         let target_ip=device_ip.clone();
         let result=tokio::task::spawn_blocking(move||
             bridge_core::device_client::status(&target_ip,&endpoint_token,remaining)).await;
@@ -3451,13 +3449,10 @@ async fn run_services(ctx: Arc<AppCtx>) {
         });
     }
 
-    // v0.12 demand-driven BLE (docs/power-state.md §5/§9): no periodic scanning
-    // and no template transfers. A cycle runs only when the device asks for a
-    // handshake in its UDP announce (`ble=1`), which refreshes the endpoint
-    // record (host/port/token) over the bonded link. Templates go over HTTP.
-    //
-    // Plan C: keep the 250 ms wake cadence and throttle actual GATT attempts
-    // independently for each registered device.
+    // Only registered MACs enter the current rendezvous protocol. UDP hints
+    // do not authorize writes; an unknown advertisement never triggers a fallback
+    // endpoint write or implicit registration.
+    // Preserve the 250 ms cadence and per-device attempt throttling.
     let mut last_device_attempt = HashMap::<String, i64>::new();
     loop {
         if ctx.status.lock().unwrap().paused {
@@ -3474,100 +3469,31 @@ async fn run_services(ctx: Arc<AppCtx>) {
             tokio::time::sleep(Duration::from_secs(2)).await;
             continue;
         }
-        let udp_request = ctx.udp_ble.swap(false, Ordering::SeqCst);
-        let current_is_registered_device = platform::is_registered_device(&ctx);
         let devices = automatic_devices(&ctx);
-        let registered_device = device_ble_candidates(&devices, &HashMap::new(), now_secs());
-        if !udp_request || current_is_registered_device || !registered_device.is_empty() {
-            let candidates = device_ble_candidates(&devices, &last_device_attempt, now_secs());
-            if !candidates.is_empty() {
-                match platform::ble_cycle(&ctx, &candidates).await {
-                    Ok(platform::BleOpportunity::NoDevice) => {}
-                    Ok(platform::BleOpportunity::Connected { mac, result }) => {
-                        last_device_attempt.insert(mac.clone(), device_now_secs(&mac));
-                        match result {
-                            Ok(()) => tracing::info!(event = "result", device_mac = %mac,
-                                transport = "ble", "device rendezvous complete"),
-                            Err(error) => tracing::warn!(event = "result", device_mac = %mac,
-                                transport = "ble", error_category = safe_device_error_category(&error),
-                                "device rendezvous failed"),
-                        }
-                    }
-                    Err(error) => {
-                        tracing::debug!(
-                            event = "result",
-                            error_category = safe_device_error_category(&error),
-                            "device BLE opportunity unavailable"
-                        );
+        let candidates = device_ble_candidates(&devices, &last_device_attempt, now_secs());
+        if !candidates.is_empty() {
+            match platform::ble_cycle(&ctx, &candidates).await {
+                Ok(platform::BleOpportunity::NoDevice) => {}
+                Ok(platform::BleOpportunity::Connected { mac, result }) => {
+                    last_device_attempt.insert(mac.clone(), device_now_secs(&mac));
+                    match result {
+                        Ok(()) => tracing::info!(event = "result", device_mac = %mac,
+                            transport = "ble", "device rendezvous complete"),
+                        Err(error) => tracing::warn!(event = "result", device_mac = %mac,
+                            transport = "ble", error_category = safe_device_error_category(&error),
+                            "device rendezvous failed"),
                     }
                 }
-            }
-            continue;
-        }
-        if host_wifi::require_bluetooth().is_err() { continue; }
-        let adapter = match Pusher::adapter().await {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::warn!("bluetooth adapter: {e}");
-                {
-                    let mut status = ctx.status.lock().unwrap();
-                    status.last_error = Some(format!("ble adapter: {e}"));
-                    status.last_error_at = Some(now_secs());
+                Err(error) => {
+                    tracing::debug!(
+                        event = "result",
+                        error_category = safe_device_error_category(&error),
+                        "device BLE opportunity unavailable"
+                    );
                 }
-                tokio::time::sleep(Duration::from_secs(30)).await;
-                continue;
-            }
-        };
-        let ble_cfg = BleConfig {
-            name_prefix: "CodexStatus-".to_string(),
-            host: lan_ip(),
-            port: ctx.config.port,
-            token: ctx.config.token.clone(),
-            bridge_id: ctx.bridge_id.clone(),
-            scan_timeout_ms: 30000,
-        };
-        let pusher = Pusher::new(ble_cfg);
-        match pusher.cycle_once(&adapter).await {
-            Ok(info) => {
-                tracing::info!("ble handshake done (udp announce)");
-                // The device announces `ble=1`; adopt its identity/address from
-                // the info JSON while we are connected (task-2 fallback path).
-                // The write lands in the record of the MAC the info names — and
-                // if that is not the device this handshake was for, it is not
-                // adopted at all rather than rewriting another device.
-                let reported = info
-                    .get("mac")
-                    .and_then(|v| v.as_str())
-                    .map(normalize_mac)
-                    .unwrap_or_default();
-                let selected = selected_mac(&ctx);
-                if let (Some(selected), false) = (selected.as_deref(), reported.is_empty()) {
-                    if selected != reported {
-                        tracing::warn!(
-                            "ble handshake returned {reported}, expected {selected}; not adopting"
-                        );
-                    } else if let Err(e) = adopt_ble_info(&ctx, &info) {
-                        tracing::debug!("ble info not adopted: {e}");
-                    }
-                } else if let Err(e) = adopt_ble_info(&ctx, &info) {
-                    tracing::debug!("ble info not adopted: {e}");
-                }
-                let mut status = ctx.status.lock().unwrap();
-                status.last_sync = Some(now_secs());
-                status.last_error = None;
-                status.last_error_at = None;
-            }
-            Err(e) => {
-                tracing::warn!("ble cycle: {e}");
-                {
-                    let mut status = ctx.status.lock().unwrap();
-                    status.last_error = Some(format!("ble: {e}"));
-                    status.last_error_at = Some(now_secs());
-                }
-                // Give an unreachable device time to re-open its BLE session.
-                tokio::time::sleep(Duration::from_secs(20)).await;
             }
         }
+
     }
 }
 
@@ -3755,7 +3681,6 @@ fn main() {
         bridge_id,
         device_status_cache: Mutex::new(HashMap::new()),
         arp_running: AtomicBool::new(false),
-        udp_ble: AtomicBool::new(false),
         activity: Arc::new(Activity::new()),
         mcp_port: Mutex::new(mcp_port),
         mcp_error: Mutex::new(None),

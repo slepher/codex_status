@@ -1,5 +1,4 @@
-// Explicit WFS4 wire storage; no compiler layout or compression in new writes.
-#include "wifi_legacy.h"
+// Explicit WFS5 wire storage; no compiler layout or compression in new writes.
 static constexpr size_t WIFI_STORAGE_MAX = 8192;
 struct WifiWriter {
     uint8_t *bytes; size_t pos = 0;
@@ -12,14 +11,16 @@ struct WifiWriter {
         for (const char *value : {n.bond.c_str(),n.id.c_str(),n.host.c_str(),n.ssid.c_str(),n.password.c_str(),n.label.c_str()}) text(value);
     }
     void receipt(const WifiReceipt &r) {
-        integer(8+32+4+10+strlen(r.bridge)+strlen(r.request)+strlen(r.bond)+strlen(r.error)+strlen(r.operation)+strlen(r.target),2);
+        integer(8+32+4+10+8+strlen(r.bridge)+strlen(r.request)+strlen(r.bond)+strlen(r.error)+strlen(r.operation)+strlen(r.target),2);
         integer(r.revision,8); raw(r.hash,32);
         for (const char *value : {r.bridge.c_str(),r.request.c_str(),r.bond.c_str(),r.error.c_str()}) text(value);
         integer(r.targetVersion,8);text(r.operation);text(r.target);
+        integer(r.executionGeneration,8);
     }
     void store(const WifiStore &s) {
-        raw("WFS4",4); integer(4,1); integer(s.cursors.size(),1); integer(s.schemes.networks.size(),1); integer(s.receipts.size(),1);
+        raw("WFS5",4); integer(5,1); integer(s.cursors.size(),1); integer(s.schemes.networks.size(),1); integer(s.receipts.size(),1);
         integer(0,4); integer(0,4); integer(s.revision,8); integer(s.activeVersion,8);
+        integer(s.executionGeneration,8);
         int slot = s.schemes.find(s.active.bond,s.active.id);
         bool reference = slot >= 0 && s.schemes.networks[slot].version == s.activeVersion;
         integer(!*s.active.id ? 0 : reference ? 1 : 2,1);
@@ -49,11 +50,12 @@ struct WifiReader {
         if (!okay || length > size-start) return false;
         return text(n.bond,21) && text(n.id,32) && text(n.host,32) && text(n.ssid,32) && text(n.password,64) && text(n.label,64) && pos-start == length;
     }
-    bool receipt(WifiReceipt &r, bool current) {
+    bool receipt(WifiReceipt &r) {
         size_t length = integer(2), start = pos; r.revision = integer(8);
         if (!okay || length > size-start) return false;
         if (!(raw(r.hash,32) && text(r.bridge,64) && text(r.request,64) && text(r.bond,21) && text(r.error,32))) return false;
-        if(current){r.targetVersion=integer(8);if(!text(r.operation,16)||!text(r.target,32))return false;}
+        r.targetVersion=integer(8);if(!text(r.operation,16)||!text(r.target,32))return false;
+        r.executionGeneration=integer(8);
         return pos-start==length;
     }
 };
@@ -76,7 +78,9 @@ static bool wifiStoreShape(const WifiStore &s) {
     for (size_t i=0; i<s.receipts.size(); ++i) {
         const auto &r = s.receipts[i];
         if (!identifier(r.bridge,64) || !identifier(r.request,64) || !*r.bond || strlen(r.bond)>21 || strlen(r.error)>32 || r.revision>s.revision || strlen(r.operation)>16 || strlen(r.target)>32) return false;
-        for (size_t j=0;j<i;++j) if (!strcmp(r.bridge,s.receipts[j].bridge) && !strcmp(r.request,s.receipts[j].request)) return false;
+        if (r.executionGeneration > s.executionGeneration || (r.executionGeneration &&
+            strcmp(r.operation,"trial") && strcmp(r.operation,"activate"))) return false;
+        for (size_t j=0;j<i;++j) if (r.matches(s.receipts[j].bridge,s.receipts[j].bond,s.receipts[j].request)) return false;
     }
     for (size_t i=0;i<s.cursors.size();++i) {
         const auto &c=s.cursors[i];
@@ -90,23 +94,25 @@ static bool wifiStoreShape(const WifiStore &s) {
     }
     return true;
 }
-static bool wifiDecode3(uint8_t *bytes, size_t size, WifiStore &out) {
-    if (size<33 || size>WIFI_STORAGE_MAX || (memcmp(bytes,"WFS3",4) && memcmp(bytes,"WFS4",4))) return false;
+static bool wifiDecode5(uint8_t *bytes, size_t size, WifiStore &out) {
+    if (size<41 || size>WIFI_STORAGE_MAX || memcmp(bytes,"WFS5",4)) return false;
     WifiReader r{bytes,size,4};
     size_t version=r.integer(1), cursors=r.integer(1);
-    if ((version!=3 && version!=4) || (version==3 && cursors) || cursors>8 || memcmp(bytes,version==3?"WFS3":"WFS4",4)) return false;
+    if (version!=5 || cursors>8) return false;
     size_t networks=r.integer(1), receipts=r.integer(1);
     if (networks>12 || receipts>8 || r.integer(4)!=size) return false;
     uint32_t crc=r.integer(4); memset(bytes+12,0,4);
     bool intact=crc==v2Crc32(bytes,size); for(size_t i=0;i<4;++i) bytes[12+i]=crc>>(8*i);
     if (!intact) return false;
-    out.revision=r.integer(8); out.activeVersion=r.integer(8); size_t mode=r.integer(1);
+    out.revision=r.integer(8); out.activeVersion=r.integer(8);
+    out.executionGeneration=r.integer(8);
+    size_t mode=r.integer(1);
     if (mode>2) return false;
     if (mode && !(r.text(out.active.bond,21) && r.text(out.active.id,32))) return false;
     if (mode==2 && !(r.text(out.active.ssid,32) && r.text(out.active.password,64))) return false;
     if (!out.schemes.networks.resize(networks) || !out.receipts.resize(receipts)) return false;
     for(auto &n:out.schemes.networks) if(!r.record(n)) return false;
-    for(auto &receipt:out.receipts) if(!r.receipt(receipt,version==4)) return false;
+    for(auto &receipt:out.receipts) if(!r.receipt(receipt)) return false;
     if (!out.cursors.resize(cursors)) return false;
     for (auto &c:out.cursors) {
         size_t length=r.integer(2), start=r.pos; c.high=r.integer(8);
@@ -118,46 +124,13 @@ static bool wifiDecode3(uint8_t *bytes, size_t size, WifiStore &out) {
     out.schemes.selectedBond=out.active.bond; out.schemes.selectedId=out.active.id;
     return r.okay && r.pos==size && wifiStoreShape(out);
 }
-static bool wifiConvertLegacy(const WifiLegacyStoreV2 &old, WifiStore &out) {
-    out.revision=old.revision; out.activeVersion=old.activeVersion;
-    for(size_t i=0;i<12;++i) if(*old.schemes.networks[i].id) {
-        const auto &o=old.schemes.networks[i]; WifiNetwork n;
-        n.bond.set(o.bond); n.id.set(o.id); n.host.set(o.host); n.ssid.set(o.ssid); n.password.set(o.password); n.label.set(old.labels[i]); n.version=old.versions[i];
-        if(!out.schemes.networks.append(n))return false;
-    }
-    out.active.bond.set(old.active.bond); out.active.id.set(old.active.id);
-    int active=out.schemes.find(out.active.bond,out.active.id);
-    if(active<0 || out.schemes.networks[active].version!=out.activeVersion) { out.active.ssid.set(old.active.ssid); out.active.password.set(old.active.password); }
-    out.schemes.selectedBond=out.active.bond; out.schemes.selectedId=out.active.id;
-    for(const auto &o:old.receipts) if(*o.request) {
-        WifiReceipt receipt; receipt.bridge.set(o.bridge); receipt.request.set(o.request); receipt.bond.set(o.bond); receipt.error.set(o.error);
-        memcpy(receipt.hash,o.hash,32); receipt.revision=o.revision; if(!out.receipts.append(receipt)) return false;
-    }
-    return wifiStoreShape(out);
-}
 static __attribute__((noinline)) bool readWifiStore(Preferences &prefs, WifiStore &out) {
-    bool current=prefs.getBytesLength("store3"); const char *key=current?"store3":"scheme";
-    size_t size=prefs.getBytesLength(key);
-    if (!size || size>(current?WIFI_STORAGE_MAX:sizeof(WifiLegacyStoreV2)+64)) return false;
-    std::unique_ptr<uint8_t[]> bytes(new(std::nothrow) uint8_t[size]); if(!bytes)return false;
-    bool okay=prefs.getBytes(key,bytes.get(),size)==size;
-    if(current) okay=okay && wifiDecode3(bytes.get(),size,out);
-    else if(okay) {
-        // Compatibility allocation exists only while loading a validated old blob.
-        std::unique_ptr<WifiLegacyStoreV2> old(new(std::nothrow) WifiLegacyStoreV2);
-        okay=bool(old);
-        if(okay && size>4 && !memcmp(bytes.get(),"WFZ2",4)) okay=wifiInflate(old.get(),sizeof(*old),bytes.get()+4,size-4)==sizeof(*old) && old->valid();
-        else if(okay && size==sizeof(*old)) { memcpy(old.get(),bytes.get(),size); okay=old->valid(); }
-        else if(okay && size==sizeof(WifiLegacySchemes)) {
-            memcpy(&old->schemes,bytes.get(),size); okay=old->schemes.valid();
-            int active=old->schemes.find(old->schemes.selectedBond,old->schemes.selectedId);
-            if(okay && active>=0) old->active=old->schemes.networks[active];
-        } else okay=false;
-        if(okay) okay=wifiConvertLegacy(*old,out);
-        if(old) wipe((char *)old.get(),sizeof(*old));
-    }
-    if(okay && current)wifiStorageFormat=bytes[4];
-    wipe((char *)bytes.get(),size); return okay;
+    size_t size=prefs.getBytesLength("store3");
+    if(size<41 || size>WIFI_STORAGE_MAX)return false;
+    std::unique_ptr<uint8_t[]> bytes(new(std::nothrow) uint8_t[size]);if(!bytes)return false;
+    bool okay=prefs.getBytes("store3",bytes.get(),size)==size && wifiDecode5(bytes.get(),size,out);
+    if(okay)wifiStorageFormat=5;
+    wipe((char *)bytes.get(),size);return okay;
 }
 static bool saveV2(WifiStore &next) {
     int active=next.schemes.find(next.active.bond,next.active.id);
@@ -183,11 +156,10 @@ static bool saveV2(WifiStore &next) {
             okay=check && prefs.getBytesLength("store3")==writer.pos && prefs.getBytes("store3",check.get(),writer.pos)==writer.pos && !memcmp(check.get(),bytes.get(),writer.pos);
             if(check) wipe((char *)check.get(),writer.pos);
         }
-        if(okay && prefs.getBytesLength("scheme")) prefs.remove("scheme");
-        wifiOldKeyPresent = prefs.getBytesLength("scheme") != 0;
+        wifiOldKeyPresent = prefs.isKey("scheme");
         prefs.end();
     }
-    if(okay) { wifiStorageUncertain=false; wifiVerifiedStorageBytes=writer.pos;wifiStorageFormat=4; }
+    if(okay) { wifiStorageUncertain=false; wifiVerifiedStorageBytes=writer.pos;wifiStorageFormat=5; }
     if(okay && &next!=&wifiStore) wifiStore=std::move(next);
     wipe((char *)bytes.get(),writer.pos); return okay;
 }

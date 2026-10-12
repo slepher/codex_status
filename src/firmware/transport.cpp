@@ -15,7 +15,6 @@ State state;
 
 static char        otaPasswordBuf[40] = {0};
 
-static bool        otaUploadDenied = false;
 
 static String         v2SessionNonce;
 
@@ -64,8 +63,6 @@ static void handleOtaImage();
 static void __attribute__((noinline)) handleBleClaim(JsonDocument &doc);
 static void __attribute__((noinline)) handleBleWifiCapabilities(
     JsonDocument &doc, const String &identity, uint32_t generation);
-static void __attribute__((noinline)) handleBleWifiMigration(
-    JsonDocument &doc, const String &identity, uint64_t now, bool allowed);
 
 // Business HTTP requests use the endpoint token provisioned over bonded BLE.
 bool endpointTokenAuthorized(String &mac) {
@@ -245,16 +242,7 @@ static void handleUpdatePage() {
 // aborted upload (client drop / stall) leaves UpdateClass "already running"
 // (every later begin() fails), the OTA PM lock held (no light sleep) and the
 // screen stuck on the OTA view -- the 0.14.10 battery OTA hang.
-void otaUploadCleanup(const char *reason) {
-    DevLog.printf("[ota] abort (%s) running=%d err=%u\n", reason, Update.isRunning() ? 1 : 0,
-                  (unsigned)Update.getError());
-    Update.abort();
-    state.otaInProgress = false;
-    power::setOtaLock(false);
-    power::setOtaWifiAwake(false);
-    otaUploadDenied = false;
-    if (display::state.frame) display::renderCurrent();
-}
+#include "ota_http.inc"
 
 static void compactDigest(const String &bytes, uint8_t digest[32]) {
     mbedtls_sha256(reinterpret_cast<const unsigned char *>(bytes.c_str()), bytes.length(), digest, 0);
@@ -620,69 +608,6 @@ static void __attribute__((noinline)) handleBleWifiCapabilities(
     v2BleNotify(reply);
 }
 
-static void __attribute__((noinline)) handleBleWifiMigration(
-    JsonDocument &doc, const String &identity, uint64_t now, bool allowed) {
-    EndpointRec mapping;
-    if (!storeAuthenticate(doc["token"] | "", mapping) || !allowed) {
-        JsonDocument out;
-        out["ack"] = "wifi"; out["request_id"] = doc["request_id"];
-        out["device_mac"] = radio::macText(); out["ok"] = false; out["error"] = "claim_required";
-        v2BleNotify(out); return;
-    }
-    String endpointNamespace = mapping.nameSpace;
-    // Resolve an earlier uncertain commit from durable storage before retry.
-    if (!wifiSetupBusy()) wifiSchemesBegin();
-    std::unique_ptr<WifiNetwork[]> slots(new(std::nothrow) WifiNetwork[MAX_SLOTS]{});
-    if (!slots) {
-        JsonDocument out; out["ack"] = "wifi"; out["request_id"] = doc["request_id"];
-        out["device_mac"] = radio::macText(); out["ok"] = false; out["error"] = "allocation";
-        v2BleNotify(out); return;
-    }
-    size_t count = 0;
-    String preferred = WiFi.status() == WL_CONNECTED ? WiFi.SSID() : String();
-    Preferences oldPrefs;
-    bool opened = oldPrefs.begin("wifi", true);
-    if (opened) {
-        uint8_t last = oldPrefs.getUChar("last", 0);
-        for (int i = 0; i < MAX_SLOTS; ++i) {
-            String ssid = oldPrefs.getString(("s" + String(i)).c_str(), "");
-            if (!ssid.length()) continue;
-            String password = oldPrefs.getString(("p" + String(i)).c_str(), "");
-            auto &n = slots[count++];
-            n.id.set((String("wifi-slot-") + String(i)).c_str());
-            // Length errors must reject rather than truncate credentials.
-            if (ssid.length() > 32 || password.length() > 64 ||
-                strlen(ssid.c_str()) != ssid.length() || strlen(password.c_str()) != password.length()) n.id.clear();
-            else { n.ssid.set(ssid.c_str()); n.password.set(password.c_str()); }
-            if (!preferred.length() && i == last) preferred = ssid;
-            if (password.length()) memset(const_cast<char *>(password.c_str()), 0, password.length());
-        }
-        oldPrefs.end();
-    }
-    if (!preferred.length() && count) preferred = slots[0].ssid.c_str();
-    JsonDocument out;
-    if (!opened) {
-        out["ack"] = "wifi"; out["request_id"] = doc["request_id"];
-        out["device_mac"] = radio::macText(); out["ok"] = false; out["error"] = "storage";
-    } else deserializeJson(out, wifiSchemesMigrate(doc, endpointNamespace, slots.get(), count,
-        preferred, now, power::state.bleRecovery.physicalUntil(), allowed));
-    if (out["persisted"] == true) {
-        bool retired = oldPrefs.begin("wifi", false);
-        if (retired) {
-            for (int i = 0; i < MAX_SLOTS; ++i) {
-                for (const char *prefix : {"s", "p"}) {
-                    String key = String(prefix) + String(i);
-                    if (oldPrefs.isKey(key.c_str()) && !oldPrefs.remove(key.c_str())) retired = false;
-                }
-            }
-            oldPrefs.end();
-        }
-        out["retired"] = retired;
-        if (!retired) { out["ok"] = false; out["error"] = "retirement_pending"; }
-    }
-    v2BleNotify(out);
-}
-
 void serviceV2Ble() {
     if (!state.v2BleQueue) return;
     V2BleMessage *message = nullptr;
@@ -764,8 +689,8 @@ void serviceV2Ble() {
     }
     String operation = doc["op"] | "";
     if (operation.startsWith("wifi_")) {
-        // Physical recovery is bond-authorized, independently of HTTP owner,
-        // endpoint token and data contact. Ordinary commands remain unchanged.
+        // Current Wi-Fi control uses the authenticated endpoint context.
+        // Discovery remains read-only; unknown/retired operations never fall back.
         if (body.length() > 4096 || String(doc["device_mac"] | "") != radio::macText() ||
             !doc["protocol"].isNull() || !doc["rv"].isNull()) {
             JsonDocument out;
@@ -774,14 +699,10 @@ void serviceV2Ble() {
             v2BleNotify(out);
             return;
         }
-        OwnerRec owner;
-        bool allowed = authenticated && ownerGet(owner) && owner.id == (doc["bridge_id"] | "");
         const uint64_t now = clock::v2NowMs();
-        const uint64_t admittedUntil = sync::httpUntil(now);
-        const uint64_t wifiWindowUntil = radio::state.v2Rv.active() ? std::min(admittedUntil, radio::state.v2Rv.deadline()) : admittedUntil;
         if (!authenticated) {
             JsonDocument out; out["ack"]="wifi"; out["request_id"]=doc["request_id"];
-            out["device_mac"]=radio::macText(); out["ok"]=false; out["error"]=authenticated ? "occupied" : "unauthorized";
+            out["device_mac"]=radio::macText(); out["ok"]=false; out["error"]="unauthorized";
             v2BleNotify(out); return;
         }
         if (operation=="wifi_command" || operation=="wifi_save" || operation=="wifi_result" || operation=="wifi_result_ack" ||
@@ -803,11 +724,6 @@ void serviceV2Ble() {
             if(wifiSetupBusy())radio::state.wifiUp=false;
             v2BleNotify(out);return;
         }
-        if (operation == "wifi_authorize") {
-            String result = wifiManagementAuthorize(doc, identity, now, power::state.bleRecovery.physicalUntil(),
-                authenticated && allowed ? wifiWindowUntil : 0);
-            JsonDocument out; deserializeJson(out, result); v2BleNotify(out); return;
-        }
         if (operation == "wifi_owner") {
             JsonDocument out;
             out["ack"] = "wifi"; out["request_id"] = doc["request_id"];
@@ -821,19 +737,10 @@ void serviceV2Ble() {
             handleBleWifiCapabilities(doc, identity, generation);
             return;
         }
-        if (operation == "wifi_migrate") {
-            handleBleWifiMigration(doc, identity, now, allowed);
-            return;
-        }
-        if(operation=="wifi_setup" || operation=="wifi_select" || operation=="wifi_scheme_delete") {
-            JsonDocument out;out["ack"]="wifi";out["request_id"]=doc["request_id"];out["device_mac"]=radio::macText();out["ok"]=false;out["error"]="retired_operation";v2BleNotify(out);return;
-        }
-        String result = wifiSetupCommand(doc, identity, generation, now, power::state.bleRecovery.physicalUntil(),
-            authenticated && allowed ? wifiWindowUntil : 0, allowed);
-        if (wifiSetupBusy()) radio::state.wifiUp = false;
-        if (operation == "wifi_scheme_delete") radio::loadPreferredWifiCredentials();
-        JsonDocument reply; deserializeJson(reply, result);
-        v2BleNotify(reply);
+        JsonDocument out;
+        out["ack"]="wifi";out["request_id"]=doc["request_id"];out["device_mac"]=radio::macText();
+        out["ok"]=false;out["error"]="unsupported";
+        v2BleNotify(out);
         return;
     }
     state.v2ReplyOverBle = true;
@@ -1055,72 +962,7 @@ void registerHttpRoutes() {
     state.server.on("/api/bundle/chunk", HTTP_POST, [] { v2HttpRoute(11, platform::handleV2BundleChunk); }, v2HttpRawHandler);
     state.server.on("/api/bundle/commit", HTTP_POST, [] { v2HttpRoute(12, platform::handleV2BundleCommit); }, v2HttpRawHandler);
     state.server.on("/update", HTTP_GET, handleUpdatePage);
-    state.server.on("/doUpdate", HTTP_POST,
-        []() {
-            state.server.sendHeader("Connection", "close");
-            if (otaUploadDenied) {
-                state.server.send(401, "text/plain", "unauthorized: negotiate a token over BLE first");
-                return;
-            }
-            power::setOtaLock(false);
-            power::setOtaWifiAwake(false);
-            state.server.send(200, "text/plain", Update.hasError() ? "UPDATE FAILED" : "UPDATE OK");
-        },
-        []() {
-            HTTPUpload &up = state.server.upload();
-            if (up.status == UPLOAD_FILE_WRITE && up.currentSize) dataLedActivity();
-            if (up.status == UPLOAD_FILE_START) {
-                if (!requestAuthorized()) {
-                    otaUploadDenied = true;
-                    DevLog.println("[ota] rejected: unauthorized");
-                    return;
-                }
-                // Normal Bridge uploads include a target guard. Emergency
-                // token-authenticated uploads may omit it to recover from a
-                // broken Bridge or a ROM without our project marker.
-                if (state.server.hasArg("target") && state.server.arg("target") != FW_TARGET_ID) {
-                    otaUploadDenied = true;
-                    DevLog.printf("[ota] rejected: target %s != %s\n",
-                                  state.server.arg("target").c_str(), FW_TARGET_ID);
-                    return;
-                }
-                otaUploadDenied = false;
-                state.otaInProgress = true;
-                power::setOtaLock(true);
-                power::setOtaWifiAwake(true);
-                state.otaLastDataMs = millis();
-                DevLog.printf("[ota] upload start: %s\n", up.filename.c_str());
-                std::vector<String> lines = {"OTA update", application::state.firmwareVersion, up.filename};
-                display::screen(lines);
-                if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
-                    DevLog.printf("[ota] begin failed: %u\n", (unsigned)Update.getError());
-                    otaUploadCleanup("begin-failed");
-                }
-            } else if (up.status == UPLOAD_FILE_WRITE) {
-                if (otaUploadDenied || !state.otaInProgress) return;
-                state.otaLastDataMs = millis();
-                if (Update.write(up.buf, up.currentSize) != up.currentSize) {
-                    DevLog.printf("[ota] write failed: %u\n", (unsigned)Update.getError());
-                    otaUploadCleanup("write-failed");
-                    otaUploadDenied = true;
-                }
-            } else if (up.status == UPLOAD_FILE_END) {
-                state.otaInProgress = false;
-                if (otaUploadDenied) { power::setOtaLock(false); return; }
-                if (Update.end(true)) {
-                    DevLog.printf("[ota] success %u bytes, rebooting shortly\n", (unsigned)up.totalSize);
-                    display::screen({"OTA success", "Rebooting..."});
-                    // The accepted plan survives OTA; do not mint a fresh Light window.
-                    state.otaRebootPending = true;
-                    state.otaRebootAt = millis() + 1500;
-                } else {
-                    DevLog.printf("[ota] end failed: %u\n", (unsigned)Update.getError());
-                    otaUploadCleanup("end-failed");
-                }
-            } else if (up.status == UPLOAD_FILE_ABORTED) {
-                otaUploadCleanup("aborted");
-            }
-        });
+    state.server.addHandler(new OtaHttpHandler());
 }
 
 } // namespace firmware::transport

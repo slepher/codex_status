@@ -1,6 +1,6 @@
 # 协议重设计分阶段实施与验收
 
-日期：2026-10-12。关联 B6/C8；设计合同见 [重设计](protocol-redesign-design.md)。本轮完成设计/静态复核，以下各阶段均未实施。仅按本计划安排工作，不扩展为另一个待办来源；正式状态仍在backlog和PROGRESS。
+日期：2026-10-12。关联 B6/C8；设计合同见 [重设计](protocol-redesign-design.md)。22:44更新：P0基线与P1类型化结果/确认义务/WFS5/HTTP证据和worker许可增量已实施并完成宿主回归，见[执行状态](protocol-redesign-status.md)；P0/P1总体及P2–P6仍待完成。仅按本计划安排工作，不扩展为另一个待办来源；正式状态仍在backlog和PROGRESS。
 
 ## 1 交付顺序与依赖
 
@@ -8,11 +8,11 @@
 
 | 阶段 | 工作和主要文件 | 必须交付的验收证据 | 状态 |
 |---|---|---|---|
-| P0 合同与基线 | 固定操作表、单一当前格式、删除清单；核对运行数据/未确认作业；记录已有失败 | 现行调用图、旧命令负向样本、OTA独立调用用例；明确active_protected旧断言差异 | 未实施 |
-| P1 业务结果纵向闭环 | core/platform/service.rs、wifi.rs、device_client.rs：类型化结果、HTTP发送证据、TransactionKey一致、取消/过期后query-only；固件Wi-Fi回执原子阶段与终态 | 已发trial→查询storage/401不清未知；跨namespace同号隔离；Bridge/设备重启原ID恢复；先落盘再ACK；可证明终态可退役，未知保留并明确capacity | 未实施 |
-| P2 完整BLE生命周期 | ble/lib.rs、app/rendezvous.rs、main.rs：统一open/close/代际/总截止；窄backend故障Adapter；自动与显式配对分开 | connect失败＋disconnect永久pending：本轮返回、许可回收/隔离、恢复后下一轮生产扫描、HTTP仍响应；各构造失败同样成立 | 未实施 |
-| P3 统一通信执行与删除旧栈 | app/platform.rs、rendezvous.rs、wifi.rs、core/rendezvous.rs、固件分派/上下文：所有UI/MCP/自动入口走同一执行器；删除旧permit/management2/Pusher后备/旧恢复驱动 | 深睡BLE/周期HTTP、浅睡HTTP双向链；同一业务两载体一致；旧报文全部拒绝；无超时降级；两设备一坏一好 | 未实施 |
-| P4 独立OTA完整回归 | transport.cpp、application.cpp、radio.cpp：保留普通上传，窄修请求级鉴权/真实结果/并发与清理；Bridge仅客户端编排 | Bridge关闭、无owner/业务session，正确token上传成功；空上传不报成功；错token401；中断后可重试；ArduinoOTA原生鉴权保留 | 未实施 |
+| P0 合同与基线 | 固定操作表、单一当前格式、删除清单；核对运行数据/未确认作业；记录已有失败 | 现行调用图、旧命令负向样本、OTA独立调用用例；明确active_protected旧断言差异 | 基线/夹具已验；发布转换准备未完成 |
+| P1 业务结果纵向闭环 | core/platform/service.rs、wifi.rs、device_client.rs：类型化结果、HTTP发送证据、TransactionKey一致、取消/过期后query-only；固件Wi-Fi回执原子阶段与终态 | 已发trial→查询storage/401不清未知；跨namespace同号隔离；Bridge/设备重启原ID恢复；先落盘再ACK；可证明终态可退役，未知保留并明确capacity | 结果/取消/设备回执/HTTP worker已验；全层身份补验仍开放 |
+| P2 完整BLE生命周期 | ble/lib.rs、app/rendezvous.rs、main.rs：统一open/close/代际/总截止；窄backend故障Adapter；自动与显式配对分开 | connect失败＋disconnect永久pending：本轮返回、许可回收/隔离、恢复后下一轮生产扫描、HTTP仍响应；各构造失败同样成立 | 扫描/现代构造和取消隔离BLE26项通过；旧入口/原生代际与恢复仍开放 |
+| P3 统一通信执行与删除旧栈 | app/platform.rs、rendezvous.rs、wifi.rs、core/rendezvous.rs、固件分派/上下文：所有UI/MCP/自动入口走同一执行器；删除旧permit/management2/Pusher后备/旧恢复驱动 | 深睡BLE/周期HTTP、浅睡HTTP双向链；同一业务两载体一致；旧报文全部拒绝；无超时降级；两设备一坏一好 | 旧Pusher/app旧驱动/客户端permit/固件在线迁移与后备入口已删除；模拟业务旧模式已删除且65项通过；permit管理及旧setup执行栈已删除；Wi-Fi核心异步收敛且BLE线程中转删除；Wi-Fi在线持久格式仅WFS5，旧格式离线转换；安全转换/全业务执行器及其余未完成 |
+| P4 独立OTA完整回归 | transport.cpp、application.cpp、radio.cpp：保留普通上传，窄修请求级鉴权/真实结果/并发与清理；Bridge仅客户端编排 | Bridge关闭、无owner/业务session，正确token上传成功；空上传不报成功；错token401；中断后可重试；ArduinoOTA原生鉴权保留 | 请求级结果/清理及生产handler故障矩阵通过，.87候选已构建；实机完整回归未验 |
 | P5 状态与离线诊断 | app投影/UI/MCP、sync_diagnostics、v2_sync*：观察/尝试/调度健康分开；本地离线持久化；显式持久编码 | UI/MCP一致；两小时离线目标按受控记录率验收；掉电/满容量/损坏/gap；实际资源表与写入成本 | 未实施 |
 | P6 集成发布验收 | 更新权威协议/电源实现对照/工具/Fake；候选构建、单协议部署和实机矩阵 | 当前合同唯一、ROM/Bridge身份与哈希、正常及失败后连续会合、旧电源期限保持、独立OTA恢复 | 未实施 |
 
@@ -116,6 +116,6 @@ P4可在P0后独立实现和测试，不依赖P1–P3新协议。P5可独立研�
 
 已完成：按当前工作区进行静态核查，明确三层职责/状态机/错误语义，列出旧协议删除表，独立OTA的入口及只读镜像证明边界已对照源码。设计保留原电源与双向HTTP原则，不包含设备拉取工作方案。
 
-未完成：P0–P6实现、测试执行、资源测量、构建、部署及实机矩阵。现有历史测试结果不记为本计划通过。
+本轮增量：P0基线、P1类型化结果/取消确认/设备回执/WFS5/HTTP进度与worker许可；core168、app87/3忽略、Fake64、C++管理/ASAN存储及Note4候选64栈项通过。详见[状态](protocol-redesign-status.md)与[审查](protocol-redesign-review.md)。未完成：发布转换准备、P1其余实现、P2–P6及实机矩阵；未部署。历史测试结果不记为本计划新增通过。
 
 审查重点：协议名字中的v2不等于旧协议；查询失败不能改原写结果；取消不取消确认义务；原生future取消不等于系统请求取消；OTA无文件请求的静态缺口需复现后窄修；旧持久未知记录不因升级而清空。设计中的trial/activate重启终态是拟议能力，需要原子提交证据实现后才可使用。

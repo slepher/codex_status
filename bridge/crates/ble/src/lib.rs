@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::future::Future;
 use std::net::UdpSocket;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -18,6 +18,8 @@ use serde_json::json;
 use uuid::Uuid;
 
 static NEXT_SCAN_ID: AtomicU64 = AtomicU64::new(1);
+// 0: idle, 1: native operation/link reserved, 2: unknown; restart is required.
+static NATIVE_RADIO_STATE: AtomicU8 = AtomicU8::new(0);
 static EMPTY_SCAN_SUMMARY: OnceLock<Mutex<EmptyScanSummary>> = OnceLock::new();
 
 #[derive(Default)]
@@ -108,53 +110,104 @@ async fn trace_stage<T>(
     }
 }
 
+#[derive(Debug)]
+struct NativeLease<'a> { state: &'a AtomicU8, stopped: bool }
+impl<'a> NativeLease<'a> {
+    fn acquire(state: &'a AtomicU8) -> Result<Self> {
+        state.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|value| anyhow!(if value == 2 { "ble_native_quarantined_restart_required" } else { "ble_native_busy" }))?;
+        Ok(Self { state, stopped: false })
+    }
+}
+impl Drop for NativeLease<'_> {
+    fn drop(&mut self) {
+        self.state.store(if self.stopped { 0 } else { 2 }, Ordering::Release);
+    }
+}
+
+/// The production scan and fault adapter share this entire start/work/stop path.
+/// Native cancellation is not proof that the platform watcher has stopped.
+async fn scan_with_cleanup<T, F>(state: &AtomicU8, limit: Duration, cleanup_budget: Duration,
+    start: impl Future<Output = Result<()>>,
+    scan: impl FnOnce(tokio::time::Instant) -> F,
+    stop: impl Future<Output = Result<()>>) -> Result<Option<T>>
+where F: Future<Output = Result<Option<T>>>
+{
+    anyhow::ensure!(limit > cleanup_budget, "ble_scan_budget_exhausted");
+    let mut lease = NativeLease::acquire(state)?;
+    let deadline = tokio::time::Instant::now() + limit;
+    let work_deadline = deadline - cleanup_budget.min(limit);
+    let started = tokio::time::timeout_at(work_deadline, start).await;
+    let start_unknown = started.is_err();
+    let result = match started {
+        Ok(Ok(())) => match tokio::time::timeout_at(work_deadline, scan(work_deadline)).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!("ble_scan_work_timeout")),
+        },
+        Ok(Err(error)) => Err(error.context("ble_scan_start_failed")),
+        Err(_) => Err(anyhow!("ble_scan_start_timeout")),
+    };
+    match tokio::time::timeout_at(deadline, stop).await {
+        Ok(Ok(())) => lease.stopped = !start_unknown,
+        Ok(Err(error)) => return Err(result.err().unwrap_or(error).context("ble_scan_stop_failed")),
+        Err(_) => return Err(result.err().unwrap_or_else(|| anyhow!("ble_scan_stop_timeout"))
+            .context("ble_scan_stop_timeout")),
+    }
+    result
+}
+
 async fn disconnect_bounded(
     scan_id: Option<u64>,
     limit: Duration,
     disconnect: impl Future<Output = btleplug::Result<()>>,
-) {
+) -> bool {
     let started = Instant::now();
     tracing::info!(scan_id, stage = "disconnect", limit_ms = limit.as_millis() as u64,
         "BLE cleanup started");
     match tokio::time::timeout(limit, disconnect).await {
-        Ok(Ok(())) => tracing::info!(scan_id, stage = "disconnect", result = "ok",
-            elapsed_ms = started.elapsed().as_millis() as u64, "BLE cleanup completed"),
-        Ok(Err(_)) => tracing::warn!(scan_id, stage = "disconnect", category = "disconnect_failed",
-            elapsed_ms = started.elapsed().as_millis() as u64, "BLE cleanup failed; link abandoned"),
-        Err(_) => tracing::warn!(scan_id, stage = "disconnect", category = "disconnect_timeout",
+        Ok(Ok(())) => { tracing::info!(scan_id, stage = "disconnect", result = "ok",
+            elapsed_ms = started.elapsed().as_millis() as u64, "BLE cleanup completed"); true },
+        Ok(Err(_)) => { tracing::warn!(scan_id, stage = "disconnect", category = "disconnect_failed",
+            elapsed_ms = started.elapsed().as_millis() as u64, "BLE cleanup failed; link abandoned"); false },
+        Err(_) => { tracing::warn!(scan_id, stage = "disconnect", category = "disconnect_timeout",
             elapsed_ms = started.elapsed().as_millis() as u64, limit_ms = limit.as_millis() as u64,
-            "BLE cleanup budget exhausted; link abandoned"),
+            "BLE cleanup budget exhausted; link abandoned"); false },
     }
 }
 
-async fn connect_with_retry<F>(
-    scan_id: u64,
+async fn open_link<'a, T, F>(state: &'a AtomicU8, scan_id: u64, limit: Duration,
     mut connect: impl FnMut() -> F,
-    disconnect: impl Future<Output = btleplug::Result<()>>,
-) -> Result<((), u128)>
-where
-    F: Future<Output = Result<()>>,
+    setup: impl Future<Output = Result<T>>,
+    disconnect: impl Future<Output = btleplug::Result<()>>) -> Result<(T, NativeLease<'a>)>
+where F: Future<Output = Result<()>>
 {
-    let mut connected = trace_stage(scan_id, "connect", async {
-        tokio::time::timeout(Duration::from_secs(4), connect())
-            .await
-            .map_err(anyhow::Error::from)?
-    }).await;
-    if connected.is_err() {
-        // Preserve the existing retry for a just-seen advertisement.
-        tracing::debug!(scan_id, stage = "connect", "BLE connect retry");
-        tokio::time::sleep(Duration::from_millis(120)).await;
-        connected = trace_stage(scan_id, "connect", async {
-            tokio::time::timeout(Duration::from_secs(4), connect())
-                .await
-                .map_err(anyhow::Error::from)?
-        }).await;
+    anyhow::ensure!(limit > CLOSE_BUDGET, "ble_open_budget_exhausted");
+    let mut lease = NativeLease::acquire(state)?;
+    let deadline = tokio::time::Instant::now() + limit;
+    let work_deadline = deadline - CLOSE_BUDGET;
+    let result = async {
+        for attempt in 0..2 {
+            anyhow::ensure!(tokio::time::Instant::now() < work_deadline, "ble_open_budget_exhausted");
+            // Retry only a completed native error. A timeout may still connect
+            // later, so a second native connect would overlap the first.
+            match tokio::time::timeout_at(work_deadline.min(tokio::time::Instant::now() + Duration::from_secs(4)), connect()).await {
+                Ok(Ok(())) => return tokio::time::timeout_at(work_deadline, setup).await.context("ble_setup_timeout")?,
+                Ok(Err(error)) if attempt == 1 => return Err(error.context("ble_connect_failed")),
+                Ok(Err(_)) => tokio::time::sleep_until(work_deadline.min(tokio::time::Instant::now() + Duration::from_millis(120))).await,
+                Err(error) => return Err(anyhow::Error::new(error).context("ble_connect_timeout")),
+            }
+        }
+        unreachable!()
+    }.await;
+    match result {
+        Ok(value) => Ok((value, lease)),
+        Err(error) => {
+            let unknown = error.downcast_ref::<tokio::time::error::Elapsed>().is_some();
+            let stopped = disconnect_bounded(Some(scan_id), deadline.saturating_duration_since(tokio::time::Instant::now()).min(CLOSE_BUDGET), disconnect).await;
+            lease.stopped = stopped && !unknown;
+            Err(error)
+        }
     }
-    if let Err(error) = connected {
-        disconnect_bounded(Some(scan_id), CLOSE_BUDGET, disconnect).await;
-        return Err(error.context("ble connect"));
-    }
-    connected
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -182,18 +235,6 @@ pub const CHR_AUTH: &str = "e7f1a007-4b2a-4c9e-9a11-3c0d5e9a0000";
 
 pub const JSON_WRITE_LIMIT: usize = 180;
 
-#[derive(Debug, Clone)]
-pub struct BleConfig {
-    pub name_prefix: String,
-    pub host: String,
-    pub port: u16,
-    pub token: String,
-    pub bridge_id: String,
-    /// Scan window per cycle. Long for one-shot tools, short (5 s) for the
-    /// low-duty tray loop.
-    pub scan_timeout_ms: u64,
-}
-
 /// Best-effort LAN IP used in the endpoint written over BLE.
 pub fn lan_ip() -> String {
     if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
@@ -206,15 +247,9 @@ pub fn lan_ip() -> String {
     "127.0.0.1".to_string()
 }
 
-pub struct Pusher {
-    cfg: BleConfig,
-}
+pub struct Pusher;
 
 impl Pusher {
-    pub fn new(cfg: BleConfig) -> Self {
-        Self { cfg }
-    }
-
     fn uuid(s: &str) -> Uuid {
         Uuid::parse_str(s).expect("static uuid")
     }
@@ -250,7 +285,8 @@ impl Pusher {
     /// Manager itself is a zero-sized wrapper, so recreating is the cheap,
     /// leak-free option here.
     pub async fn adapter() -> Result<Adapter> {
-        let result = async {
+        let mut lease = NativeLease::acquire(&NATIVE_RADIO_STATE)?;
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
             let manager = Manager::new().await.context("bluetooth manager")?;
             let adapter = manager
                 .adapters()
@@ -260,8 +296,9 @@ impl Pusher {
                 .next()
                 .ok_or_else(|| anyhow!("no bluetooth adapter"))?;
             Ok::<_, anyhow::Error>(adapter)
-        }
-        .await;
+        }).await;
+        lease.stopped = result.is_ok();
+        let result = result.context("ble_adapter_timeout")?;
         match &result {
             Ok(_) => tracing::debug!(result = "selected", "BLE adapter available"),
             Err(_) => tracing::warn!(
@@ -303,101 +340,93 @@ impl Pusher {
             timeout_ms = timeout.as_millis(),
             "BLE scan started"
         );
-        if let Err(error) = adapter.start_scan(ScanFilter::default()).await {
-            Self::log_scan_start(scan_id, started);
-            tracing::warn!(
-                scan_id,
-                stage = "start_scan",
-                category = error_category("start_scan"),
-                "BLE scan failed"
-            );
-            tracing::info!(
-                scan_id,
-                result = "error",
-                duration_ms = started.elapsed().as_millis(),
-                "BLE scan ended"
-            );
-            return Err(error).context("start scan");
-        }
-        let mut events = match adapter.events().await {
-            Ok(events) => events,
-            Err(error) => {
-                let _ = adapter.stop_scan().await;
-                Self::log_scan_start(scan_id, started);
-                tracing::warn!(
-                    scan_id,
-                    stage = "scan_events",
-                    category = "event_stream_failed",
-                    "BLE scan failed"
-                );
-                tracing::info!(
-                    scan_id,
-                    result = "error",
-                    duration_ms = started.elapsed().as_millis(),
-                    "BLE scan ended"
-                );
-                return Err(error).context("scan events");
-            }
-        };
-        let deadline = tokio::time::Instant::now() + timeout;
-        let mut counts = ScanCounts::default();
-        let mut seen_candidates = HashSet::new();
-        loop {
-            let event = match tokio::time::timeout_at(deadline, events.next()).await {
-                Ok(Some(event)) => event,
-                Ok(None) => {
-                    let _ = adapter.stop_scan().await;
-                    tracing::warn!(
+        // Keep the existing observation window; add only the bounded cleanup
+        // reserve. Start and all advertisement lookups consume that window.
+        let result = scan_with_cleanup(&NATIVE_RADIO_STATE, timeout + CLOSE_BUDGET, CLOSE_BUDGET,
+            async { adapter.start_scan(ScanFilter::default()).await.context("start scan") },
+            |deadline| async move {
+                let mut events = match adapter.events().await {
+                    Ok(events) => events,
+                    Err(error) => {
+                        Self::log_scan_start(scan_id, started);
+                        tracing::warn!(
+                            scan_id,
+                            stage = "scan_events",
+                            category = "event_stream_failed",
+                            "BLE scan failed"
+                        );
+                        tracing::info!(
+                            scan_id,
+                            result = "error",
+                            duration_ms = started.elapsed().as_millis(),
+                            "BLE scan ended"
+                        );
+                        return Err(error).context("scan events");
+                    }
+                };
+                let mut counts = ScanCounts::default();
+                let mut seen_candidates = HashSet::new();
+                loop {
+                    let event = match tokio::time::timeout_at(deadline, events.next()).await {
+                        Ok(Some(event)) => event,
+                        Ok(None) => {
+                            tracing::warn!(
+                                scan_id,
+                                stage = "scan_events",
+                                category = "event_stream_closed",
+                                "BLE scan event stream closed"
+                            );
+                            Self::log_scan_end(scan_id, started, "error", &counts);
+                            return Err(anyhow!("scan event stream closed"));
+                        }
+                        Err(_) => {
+                            Self::log_scan_end(scan_id, started, "timeout", &counts);
+                            return Ok(None);
+                        }
+                    };
+                    let (id, discovered) = match event {
+                        CentralEvent::DeviceDiscovered(id) => (id, true),
+                        CentralEvent::DeviceUpdated(id) => (id, false),
+                        _ => continue,
+                    };
+                    if discovered {
+                        counts.discovered += 1;
+                    } else {
+                        counts.updated += 1;
+                    }
+                    let Ok(peripheral) = adapter.peripheral(&id).await else {
+                        counts.ignored_properties += 1;
+                        tracing::warn!(
+                            scan_id,
+                            stage = "peripheral_lookup",
+                            category = "lookup_failed",
+                            "BLE advertisement lookup failed"
+                        );
+                        continue;
+                    };
+                    if let Some(found) = Self::consider_advertisement(
                         scan_id,
-                        stage = "scan_events",
-                        category = "event_stream_closed",
-                        "BLE scan event stream closed"
-                    );
-                    Self::log_scan_end(scan_id, started, "error", &counts);
-                    return Err(anyhow!("scan event stream closed"));
+                        started,
+                        &peripheral,
+                        discovered,
+                        &matches,
+                        &mut counts,
+                        &mut seen_candidates,
+                    )
+                    .await
+                    {
+                        Self::log_scan_end(scan_id, started, "matched", &counts);
+                        return Ok(Some((scan_id, found)));
+                    }
                 }
-                Err(_) => {
-                    let _ = adapter.stop_scan().await;
-                    Self::log_scan_end(scan_id, started, "timeout", &counts);
-                    return Ok(None);
-                }
-            };
-            let (id, discovered) = match event {
-                CentralEvent::DeviceDiscovered(id) => (id, true),
-                CentralEvent::DeviceUpdated(id) => (id, false),
-                _ => continue,
-            };
-            if discovered {
-                counts.discovered += 1;
-            } else {
-                counts.updated += 1;
-            }
-            let Ok(peripheral) = adapter.peripheral(&id).await else {
-                counts.ignored_properties += 1;
-                tracing::warn!(
-                    scan_id,
-                    stage = "peripheral_lookup",
-                    category = "lookup_failed",
-                    "BLE advertisement lookup failed"
-                );
-                continue;
-            };
-            if let Some(found) = Self::consider_advertisement(
-                scan_id,
-                started,
-                &peripheral,
-                discovered,
-                &matches,
-                &mut counts,
-                &mut seen_candidates,
-            )
-            .await
-            {
-                let _ = adapter.stop_scan().await;
-                Self::log_scan_end(scan_id, started, "matched", &counts);
-                return Ok(Some((scan_id, found)));
-            }
+            },
+            async { adapter.stop_scan().await.context("stop scan") }).await;
+        if result.is_err() {
+            tracing::warn!(scan_id, stage = "scan_lifecycle",
+                quarantined = NATIVE_RADIO_STATE.load(Ordering::Acquire) == 2,
+                duration_ms = started.elapsed().as_millis(), "BLE scan lifecycle failed");
         }
+        result
     }
 
     async fn consider_advertisement<F>(
@@ -606,16 +635,23 @@ impl Pusher {
             && (Self::peer_bonded(info) || info["pairingWindow"] == true)
     }
 
-    async fn token_link_info(peripheral: &Peripheral, scan_id: u64, expected_mac: &str) -> Result<serde_json::Value> {
+    fn link_auth_budget(info: &serde_json::Value, expected_mac: &str, explicit_pairing: bool) -> Result<Duration> {
+        anyhow::ensure!(Self::info_matches_mac(info, expected_mac), "BLE device Wi-Fi MAC does not match target");
+        anyhow::ensure!(explicit_pairing || Self::peer_bonded(info), "ble_pairing_required_use_explicit_pairing");
+        anyhow::ensure!(Self::pairing_probe_allowed(info, expected_mac), "open the device pairing window before first pairing");
+        Ok(Duration::from_secs(if explicit_pairing { 60 } else { 3 }))
+    }
+
+    async fn token_link_info(peripheral: &Peripheral, scan_id: u64, expected_mac: &str, explicit_pairing: bool) -> Result<serde_json::Value> {
         let info = Self::read_info_raw(peripheral, scan_id).await?;
         if !Self::info_matches_mac(&info, expected_mac) { bail!("BLE device Wi-Fi MAC does not match target"); }
         #[cfg(any(windows, target_os = "macos"))]
         if !Self::peer_encrypted_bonded(&info) {
-            if !Self::pairing_probe_allowed(&info, expected_mac) { bail!("open the device pairing window before first pairing"); }
+            let budget = Self::link_auth_budget(&info, expected_mac, explicit_pairing)?;
             // Accessing an encrypted characteristic triggers CoreBluetooth's
             // system pairing prompt after the complete MAC has been checked.
             // This probe does not issue tokens or alter the endpoint.
-            tokio::time::timeout(Duration::from_secs(60),
+            tokio::time::timeout(budget,
                 Self::write_json(peripheral, CHR_AUTH, br#"{"cmd":"pair_probe"}"#))
                 .await.context("system pairing timed out")??;
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -697,196 +733,66 @@ impl Pusher {
         Err(anyhow!("device token response timed out"))
     }
 
-    async fn log_notifications(peripheral: &Peripheral) -> Result<tokio::task::JoinHandle<()>> {
-        let status = peripheral
-            .characteristics()
-            .into_iter()
-            .find(|c| c.uuid == Self::uuid(CHR_STATUS))
-            .ok_or_else(|| anyhow!("status characteristic missing"))?;
-        peripheral
-            .subscribe(&status)
-            .await
-            .context("subscribe status")?;
-        let mut stream = peripheral.notifications().await?;
-        let handle = tokio::spawn(async move {
-            while let Some(ValueNotification { uuid, value, .. }) = stream.next().await {
-                if uuid == Uuid::parse_str(CHR_STATUS).unwrap() {
-                    tracing::debug!(bytes = value.len(), "BLE status notification received");
-                }
-            }
-        });
-        Ok(handle)
-    }
-
-    async fn push_endpoint(&self, peripheral: &Peripheral) -> Result<()> {
-        Self::write_json(
-            peripheral,
-            CHR_ENDPOINT,
-            &Self::endpoint_payload_for(&self.cfg.host, self.cfg.port, &self.cfg.token, &self.cfg.bridge_id),
-        )
-        .await
-    }
-
     fn endpoint_payload_for(host: &str,port:u16,token:&str,principal:&str)->Vec<u8> {
         json!({"schema":2,"host":host,"port":port,"token":token,"bridge_id":principal}).to_string().into_bytes()
     }
-    /// Connect to an advertising device and read its info JSON
-    /// (`{schema,model,fw,proto,mac,ip,http_port,templates,...}`). Used by the
-    /// explicit `device_discover via=ble` fallback; no usage/template writes.
-    pub async fn read_device_info(
-        adapter: &Adapter,
-        name_prefix: &str,
-        scan_timeout_ms: u64,
-    ) -> Result<serde_json::Value> {
-        let scan = Duration::from_millis(scan_timeout_ms.max(1000));
-        let (scan_id, peripheral) = Self::wait_for_device(adapter, name_prefix, scan).await?;
-        trace_stage(scan_id, "connect", async {
-            peripheral.connect().await.context("connect")
-        })
-        .await?;
-        if let Err(error) = trace_stage(scan_id, "discover_services", async {
-            peripheral.discover_services().await.context("discover")
-        })
-        .await
-        {
-            disconnect_bounded(Some(scan_id), CLOSE_BUDGET, peripheral.disconnect()).await;
-            return Err(error);
-        }
-        Self::log_service_lookup(&peripheral, scan_id);
-        let info = trace_stage(scan_id, "read_info", Self::read_info(&peripheral, scan_id))
-            .await
-            .map(|(info, _)| info);
-        disconnect_bounded(Some(scan_id), CLOSE_BUDGET, peripheral.disconnect()).await;
-        info
+    /// Explicit bootstrap operations use the same native ownership and failure
+    /// cleanup as rendezvous links; successful reads keep their result even if
+    /// close fails, while the native reservation remains quarantined.
+    async fn on_link<T>(peripheral: &Peripheral, scan_id: u64, limit: Duration,
+        work: impl Future<Output = Result<T>>) -> Result<T>
+    {
+        let deadline = tokio::time::Instant::now() + limit;
+        let (value, mut lease) = open_link(&NATIVE_RADIO_STATE, scan_id, limit,
+            || async { peripheral.connect().await.context("connect") },
+            async {
+                tokio::time::timeout(Duration::from_secs(3), peripheral.discover_services())
+                    .await.context("discover timeout")?.context("discover")?;
+                Self::log_service_lookup(peripheral, scan_id);
+                work.await
+            }, peripheral.disconnect()).await?;
+        lease.stopped = disconnect_bounded(Some(scan_id),
+            deadline.saturating_duration_since(tokio::time::Instant::now()).min(CLOSE_BUDGET),
+            peripheral.disconnect()).await;
+        Ok(value)
     }
 
-    /// Explicit device-page discovery. The unencrypted info is only a hint;
-    /// connect(mac) rechecks the full identity before pairing or writing.
+    /// Explicit discovery returns an identity hint and never writes credentials.
+    pub async fn read_device_info(adapter: &Adapter, name_prefix: &str,
+        scan_timeout_ms: u64) -> Result<serde_json::Value>
+    {
+        let scan = Duration::from_millis(scan_timeout_ms.max(1000));
+        let (scan_id, peripheral) = Self::wait_for_device(adapter, name_prefix, scan).await?;
+        Self::on_link(&peripheral, scan_id, Duration::from_secs(18),
+            Self::read_info(&peripheral, scan_id)).await
+    }
+
+    /// Candidate INFO is untrusted until the full MAC is verified during pairing.
     pub async fn read_candidate_info() -> Result<serde_json::Value> {
         let adapter = Self::adapter().await?;
         let Some((scan_id, peripheral)) = Self::find_device(&adapter, "CodexStatus-", Duration::from_secs(8)).await? else {
             bail!("no advertising device");
         };
-        let result = async {
-            tokio::time::timeout(Duration::from_secs(4), peripheral.connect()).await??;
-            tokio::time::timeout(Duration::from_secs(3), peripheral.discover_services()).await??;
-            tokio::time::timeout(Duration::from_secs(3), Self::read_info_raw(&peripheral, scan_id)).await?
-        }.await;
-        disconnect_bounded(Some(scan_id), CLOSE_BUDGET, peripheral.disconnect()).await;
-        result
+        Self::on_link(&peripheral, scan_id, Duration::from_secs(12),
+            Self::read_info_raw(&peripheral, scan_id)).await
     }
 
-    /// Connect to an advertising device (BLE session on, e.g. after a BOOT
-    /// click) and request the OTA/Wi-Fi operation token over the bonded auth
-    /// characteristic. The token is disclosed only over this encrypted link.
-    pub async fn request_device_token(
-        adapter: &Adapter,
-        name_prefix: &str,
-        expected_mac: &str,
-        scan_timeout_ms: u64,
-    ) -> Result<String> {
-        if bridge_core::platform::model::DeviceIdentity::normalized_mac(expected_mac).is_none() {
-            bail!("invalid target device MAC");
-        }
+    /// Explicit pairing/token request. Full identity is checked before the
+    /// encrypted probe; only this user-requested path can open first pairing.
+    pub async fn request_device_token(adapter: &Adapter, name_prefix: &str,
+        expected_mac: &str, scan_timeout_ms: u64) -> Result<String>
+    {
+        anyhow::ensure!(bridge_core::platform::model::DeviceIdentity::normalized_mac(expected_mac).is_some(),
+            "invalid target device MAC");
         let scan = Duration::from_millis(scan_timeout_ms.max(1000));
         let (scan_id, peripheral) = Self::wait_for_device(adapter, name_prefix, scan).await?;
-        trace_stage(scan_id, "connect", async {
-            peripheral.connect().await.context("connect")
-        })
-        .await?;
-        if let Err(error) = trace_stage(scan_id, "discover_services", async {
-            peripheral.discover_services().await.context("discover")
-        })
-        .await
-        {
-            disconnect_bounded(Some(scan_id), CLOSE_BUDGET, peripheral.disconnect()).await;
-            return Err(error);
-        }
-        Self::log_service_lookup(&peripheral, scan_id);
-        let info =
-            match trace_stage(scan_id, "read_info", Self::token_link_info(&peripheral, scan_id, expected_mac)).await {
-                Ok((info, _)) => info,
-                Err(e) => {
-                    disconnect_bounded(Some(scan_id), CLOSE_BUDGET, peripheral.disconnect()).await;
-                    return Err(e);
-                }
-            };
-        if !Self::info_matches_mac(&info, expected_mac) {
-            tracing::warn!(
-                scan_id,
-                stage = "verify_mac",
-                category = error_category("verify_mac"),
-                "BLE device identity mismatch"
-            );
-            disconnect_bounded(Some(scan_id), CLOSE_BUDGET, peripheral.disconnect()).await;
-            bail!("BLE device Wi-Fi MAC does not match target");
-        }
-        if !Self::peer_encrypted_bonded(&info) {
-            disconnect_bounded(Some(scan_id), CLOSE_BUDGET, peripheral.disconnect()).await;
-            bail!("BLE device link is not encrypted and bonded");
-        }
-        tracing::info!(
-            scan_id,
-            verified_mac = expected_mac,
-            "BLE device identity verified"
-        );
-        let token = Self::request_token_on_peripheral(&peripheral).await;
-        disconnect_bounded(Some(scan_id), CLOSE_BUDGET, peripheral.disconnect()).await;
-        token
+        Self::on_link(&peripheral, scan_id, Duration::from_secs(90), async {
+            Self::token_link_info(&peripheral, scan_id, expected_mac, true).await?;
+            tracing::info!(scan_id, verified_mac = expected_mac, "BLE device identity verified");
+            Self::request_token_on_peripheral(&peripheral).await
+        }).await
     }
 
-    /// One connect → endpoint handoff → disconnect cycle. Returns the device info JSON so
-    /// the caller can adopt its identity (mac/ip) when needed.
-    pub async fn cycle_once(&self, adapter: &Adapter) -> Result<serde_json::Value> {
-        let scan = Duration::from_millis(self.cfg.scan_timeout_ms.max(1000));
-        let (scan_id, peripheral) =
-            Self::wait_for_device(adapter, &self.cfg.name_prefix, scan).await?;
-        trace_stage(scan_id, "connect", async {
-            peripheral.connect().await.context("connect")
-        })
-        .await?;
-        if let Err(error) = trace_stage(scan_id, "discover_services", async {
-            peripheral.discover_services().await.context("discover")
-        })
-        .await
-        {
-            disconnect_bounded(Some(scan_id), CLOSE_BUDGET, peripheral.disconnect()).await;
-            return Err(error);
-        }
-        Self::log_service_lookup(&peripheral, scan_id);
-        let info =
-            match trace_stage(scan_id, "read_info", Self::read_info(&peripheral, scan_id)).await {
-                Ok((info, _)) => info,
-                Err(e) => {
-                    disconnect_bounded(Some(scan_id), CLOSE_BUDGET, peripheral.disconnect()).await;
-                    return Err(e);
-                }
-            };
-
-        let notify_handle = Self::log_notifications(&peripheral).await.ok();
-
-        let result = self.push_endpoint(&peripheral).await;
-
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        if let Some(handle) = notify_handle {
-            handle.abort();
-        }
-        disconnect_bounded(Some(scan_id), CLOSE_BUDGET, peripheral.disconnect()).await;
-        result?;
-        Ok(info)
-    }
-
-    /// Scan/connect/retry loop.
-    pub async fn run(&self, interval: Duration) -> Result<()> {
-        loop {
-            let adapter = Self::adapter().await?;
-            match self.cycle_once(&adapter).await {
-                Ok(_) => tracing::info!("BLE cycle done"),
-                Err(e) => tracing::warn!("BLE cycle failed: {e}"),
-            }
-            tokio::time::sleep(interval).await;
-        }
-    }
 }
 
 /// Plan C: stamp every rendezvous command with the bridge's wall clock and UTC
@@ -902,9 +808,10 @@ fn stamp_clock(body: &mut serde_json::Value, mac: &str) {
 pub struct DeviceConnection {
     pub info: serde_json::Value,
     peripheral: Option<Peripheral>,
+    native_lease: Option<NativeLease<'static>>,
     fake_url: Option<String>,
     rf_deadline: Option<tokio::time::Instant>,
-    write_uncertain: bool,
+    write_uncertain: AtomicBool,
     token: String,
     bridge_id: String,
     nonce: String,
@@ -1066,8 +973,8 @@ impl DeviceConnection {
                     .collect::<Vec<_>>().join(":");
                 return Ok(Some((authorized_mac, Self {
                     info: info.clone(),
-                    peripheral: None, fake_url: Some(url.trim_end_matches('/').to_owned()),
-                    write_uncertain: false,
+                    peripheral: None, native_lease: None, fake_url: Some(url.trim_end_matches('/').to_owned()),
+                    write_uncertain: std::sync::atomic::AtomicBool::new(false),
                     rf_deadline: info["rf_remaining_ms"].as_u64().map(|ms| info_started + Duration::from_millis(ms)),
                     token: token.to_owned(), bridge_id: bridge_id.to_owned(),
                     nonce: String::new(), session: [0; 16], next_request_no: 1, context_id: String::new(), device_mac,
@@ -1079,6 +986,7 @@ impl DeviceConnection {
             }
             return Ok(None);
         }
+        let open_deadline = tokio::time::Instant::now() + Duration::from_secs(25);
         let adapter = Pusher::adapter().await?;
         let find_start = Instant::now();
         let found = Pusher::find_device_matching(&adapter, Duration::from_secs(3), |name| {
@@ -1092,81 +1000,72 @@ impl DeviceConnection {
             vec![("find".to_string(), find_start.elapsed().as_millis())];
         let info_started = tokio::time::Instant::now();
         let connect_start = Instant::now();
-        connect_with_retry(
-            scan_id,
+        let ((info, authorized_mac), native_lease) = open_link(&NATIVE_RADIO_STATE, scan_id,
+            open_deadline.saturating_duration_since(tokio::time::Instant::now()).min(Duration::from_secs(18)),
             || async { peripheral.connect().await.map_err(anyhow::Error::from) },
-            peripheral.disconnect(),
-        ).await?;
-        timings.push(("connect".to_string(), connect_start.elapsed().as_millis()));
-        let setup = async {
-            let mut stages: Vec<(String, u128)> = Vec::new();
-            // Re-discovery is not optional here: `close` must call
-            // `disconnect` (see below), which clears btleplug's GATT object
-            // cache, and skipping both on a kept-open link made every second
-            // rendezvous lose its connect. Measured on the Windows backend:
-            // discover ~300 ms, INFO ~30 ms.
-            let (_, discover_ms) = trace_stage(scan_id, "discover_services", async {
-                tokio::time::timeout(Duration::from_secs(3), peripheral.discover_services())
-                    .await
-                    .context("discover timeout")
-                    .and_then(|result| result.context("discover"))
-            })
-            .await?;
-            stages.push(("discover".to_string(), discover_ms));
-            Pusher::log_service_lookup(&peripheral, scan_id);
-            let (info, info_ms) = trace_stage(scan_id, "read_info", async {
-                tokio::time::timeout(
-                    Duration::from_secs(3),
-                    Pusher::read_info_raw(&peripheral, scan_id),
-                )
-                .await
-                .map_err(|_| anyhow!("info timeout"))
-                .and_then(|result| result.map_err(|e| e.context("info")))
-            })
-            .await?;
-            stages.push(("info".to_string(), info_ms));
-            Ok::<_, anyhow::Error>((info, stages))
-        }
-        .await;
-        let (mut info, stages) = match setup {
-            Ok(value) => value,
-            Err(error) => {
-                disconnect_bounded(Some(scan_id), CLOSE_BUDGET, peripheral.disconnect()).await;
-                return Err(error);
-            }
-        };
-        timings.extend(stages);
-        let Some(authorized_mac) = info_authorized_target(&info, &targets) else {
-            disconnect_bounded(Some(scan_id), CLOSE_BUDGET, peripheral.disconnect()).await;
-            tracing::warn!(
-                scan_id,
-                stage = "verify_mac",
-                category = error_category("verify_mac"),
-                "BLE device identity mismatch"
-            );
-            bail!("BLE device identity mismatch");
-        };
-        if !Pusher::peer_encrypted_bonded(&info) {
-            match Pusher::token_link_info(&peripheral, scan_id, &authorized_mac).await {
-                Ok(verified) => info = verified,
-                Err(error) => { disconnect_bounded(Some(scan_id), CLOSE_BUDGET, peripheral.disconnect()).await; return Err(error); }
-            }
-        }
+            async {
+                timings.push(("connect".to_string(), connect_start.elapsed().as_millis()));
+                let setup = async {
+                    let mut stages: Vec<(String, u128)> = Vec::new();
+                    // Re-discovery is not optional here: `close` must call
+                    // `disconnect` (see below), which clears btleplug's GATT object
+                    // cache, and skipping both on a kept-open link made every second
+                    // rendezvous lose its connect. Measured on the Windows backend:
+                    // discover ~300 ms, INFO ~30 ms.
+                    let (_, discover_ms) = trace_stage(scan_id, "discover_services", async {
+                        tokio::time::timeout(Duration::from_secs(3), peripheral.discover_services())
+                            .await
+                            .context("discover timeout")
+                            .and_then(|result| result.context("discover"))
+                    })
+                    .await?;
+                    stages.push(("discover".to_string(), discover_ms));
+                    Pusher::log_service_lookup(&peripheral, scan_id);
+                    let (info, info_ms) = trace_stage(scan_id, "read_info", async {
+                        tokio::time::timeout(
+                            Duration::from_secs(3),
+                            Pusher::read_info_raw(&peripheral, scan_id),
+                        )
+                        .await
+                        .context("info timeout")
+                        .and_then(|result| result.map_err(|e| e.context("info")))
+                    })
+                    .await?;
+                    stages.push(("info".to_string(), info_ms));
+                    Ok::<_, anyhow::Error>((info, stages))
+                }
+                .await;
+                let (mut info, stages) = setup?;
+                timings.extend(stages);
+                let Some(authorized_mac) = info_authorized_target(&info, &targets) else {
+                    tracing::warn!(
+                        scan_id,
+                        stage = "verify_mac",
+                        category = error_category("verify_mac"),
+                        "BLE device identity mismatch"
+                    );
+                    bail!("BLE device identity mismatch");
+                };
+                if !Pusher::peer_encrypted_bonded(&info) {
+                    info = Pusher::token_link_info(&peripheral, scan_id, &authorized_mac, false).await?;
+                }
+                let initial_wake_identity = wake_identity(&info);
+                let (wake_generation, wake_seq) = identity_text(initial_wake_identity);
+                tracing::info!(
+                    scan_id,
+                    verified_mac = %authorized_mac,
+                    wake_generation = %wake_generation,
+                    wake_seq = %wake_seq,
+                    wake_association = if initial_wake_identity.is_some() { "confirmed" } else { "incomplete" },
+                    association_basis = "authenticated_info",
+                    "BLE device identity verified and wake contact associated"
+                );
+                if info["rendezvous"] != true {
+                    bail!("device BLE rendezvous is disabled");
+                }
+                Ok((info, authorized_mac))
+            }, peripheral.disconnect()).await?;
         let initial_wake_identity = wake_identity(&info);
-        let (wake_generation, wake_seq) = identity_text(initial_wake_identity);
-        tracing::info!(
-            scan_id,
-            verified_mac = %authorized_mac,
-            wake_generation = %wake_generation,
-            wake_seq = %wake_seq,
-            wake_association = if initial_wake_identity.is_some() { "confirmed" } else { "incomplete" },
-            association_basis = "authenticated_info",
-            "BLE device identity verified and wake contact associated"
-        );
-        if info["rendezvous"] != true {
-            disconnect_bounded(Some(scan_id), CLOSE_BUDGET, peripheral.disconnect()).await;
-            bail!("device BLE rendezvous is disabled");
-        }
         tracing::debug!(?timings, "device link ready");
         let device_mac = authorized_mac
             .as_bytes()
@@ -1179,8 +1078,9 @@ impl DeviceConnection {
             Self {
                 info: info.clone(),
                 peripheral: Some(peripheral),
+                native_lease: Some(native_lease),
                 fake_url: None,
-                write_uncertain: false,
+                write_uncertain: std::sync::atomic::AtomicBool::new(false),
                 rf_deadline: info["rf_remaining_ms"].as_u64().map(|ms| info_started + Duration::from_millis(ms)),
                 token: token.to_owned(),
                 bridge_id: bridge_id.to_owned(),
@@ -1236,12 +1136,25 @@ impl DeviceConnection {
         Ok(())
     }
 
+    async fn control_write_until(&self, deadline: tokio::time::Instant,
+        write: impl Future<Output = Result<()>>) -> Result<()>
+    {
+        anyhow::ensure!(tokio::time::Instant::now() < deadline, "device BLE RF window expired before write");
+        self.write_uncertain.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| anyhow!("previous_write_unknown"))?;
+        // Cancellation drops only the future; keep the flag until the complete
+        // native write returns success. Endpoint/auth obey the same rule as CMD.
+        tokio::time::timeout_at(deadline, write).await.context("device BLE control write timed out")??;
+        self.write_uncertain.store(false, Ordering::Release);
+        Ok(())
+    }
+
     /// Refresh the endpoint credentials on this already MAC-verified link.
     /// The caller must verify the registered target before invoking this.
     pub async fn write_endpoint(&self, host: &str, port: u16, token: &str) -> Result<()> {
         let deadline = self.command_deadline();
         if tokio::time::Instant::now() >= deadline { bail!("device BLE RF window expired before endpoint"); }
-        tokio::time::timeout_at(deadline, async {
+        self.control_write_until(deadline, async {
             if let Some(url) = &self.fake_url {
                 reqwest::Client::new().post(format!("{url}/sim/ble/endpoint"))
                     .header("x-sim-ble-generation", self.info["_sim_generation"].as_u64().unwrap().to_string())
@@ -1252,7 +1165,7 @@ impl DeviceConnection {
                 Pusher::write_json(self.peripheral.as_ref().unwrap(), CHR_ENDPOINT,
                     &Pusher::endpoint_payload_for(host, port, token, &self.bridge_id)).await
             }
-        }).await.context("device BLE endpoint write timed out")?
+        }).await.context("device BLE endpoint write failed")
     }
 
     /// Read token responses as attributes too: lost notification is not lost ACK.
@@ -1261,7 +1174,7 @@ impl DeviceConnection {
         let deadline = self.command_deadline();
         if tokio::time::Instant::now() >= deadline { bail!("device BLE RF window expired before auth"); }
         let status = self.peripheral.as_ref().and_then(|p| p.characteristics().into_iter().find(|c| c.uuid == Pusher::uuid(CHR_STATUS)));
-        tokio::time::timeout_at(deadline, async {
+        self.control_write_until(deadline, async {
             if let Some(url) = &self.fake_url {
                 reqwest::Client::new().post(format!("{url}/sim/ble/token"))
                     .header("x-sim-ble-generation", self.info["_sim_generation"].as_u64().unwrap().to_string())
@@ -1269,7 +1182,7 @@ impl DeviceConnection {
                     .send().await?.error_for_status()?;
             } else { Pusher::write_json(self.peripheral.as_ref().unwrap(), CHR_AUTH, br#"{"cmd":"token"}"#).await?; }
             Ok::<(), anyhow::Error>(())
-        }).await.context("device BLE auth write timed out")??;
+        }).await.context("device BLE auth write failed")?;
         loop {
             let raw = tokio::time::timeout_at(deadline, self.read_attribute(status.as_ref())).await??;
             if let Ok(reply) = decode_wire(&raw) {
@@ -1318,7 +1231,7 @@ impl DeviceConnection {
     }
 
     async fn command_inner(&mut self, op: &str, mut body: serde_json::Value, id: &str, deadline: tokio::time::Instant) -> Result<serde_json::Value> {
-        if self.write_uncertain {
+        if self.write_uncertain.load(Ordering::Acquire) {
             return Err(self.command_failure(id, op, bridge_core::rendezvous::DispatchOutcome::NotSent,
                 "before_write", "previous_write_unknown", deadline, Duration::ZERO).into());
         }
@@ -1393,11 +1306,11 @@ impl DeviceConnection {
         let write_budget_ms = deadline.saturating_duration_since(tokio::time::Instant::now()).as_millis();
         // Remains set if an outer future cancels the fragment write. Only a
         // complete write permits another command on this connection.
-        self.write_uncertain = true;
+        self.write_uncertain.store(true, Ordering::Release);
         tracing::info!(device_mac=%self.device_mac,op,request_id=%id,stage="write_dispatch",
             budget_ms=write_budget_ms,"BLE command dispatch started; result not yet known");
         match tokio::time::timeout_at(deadline, self.write_command(&bytes)).await {
-            Ok(Ok(())) => {self.write_uncertain = false;},
+            Ok(Ok(())) => {self.write_uncertain.store(false, Ordering::Release);},
             Ok(Err(error)) => return Err(error.context(self.command_failure(id, op,
                 bridge_core::rendezvous::DispatchOutcome::WriteUnknown, "write", "write_failed", deadline, write_start.elapsed()))),
             Err(_) => return Err(self.command_failure(id, op,
@@ -1624,15 +1537,15 @@ impl DeviceConnection {
     /// by link cleanup. btleplug 0.11.8 on macOS can leave
     /// `Peripheral::disconnect()` pending forever once the peripheral was
     /// removed by a natural link loss, and a pending future never returns
-    /// `Err`. On timeout the handle is abandoned (the caller drops the
-    /// connection) and a `close`/`disconnect_timeout` warning is recorded so
-    /// the failure becomes diagnosable instead of silent.
+    /// `Err`. A native timeout or uncertain write quarantines the shared
+    /// radio reservation; dropping the handle is not proof of shutdown.
+    /// The next native attempt returns a restart-required error.
     ///
     /// The future is cancelled in place rather than detached with
     /// `tokio::spawn`: a background disconnect would race the next rendezvous
     /// while btleplug's cached GATT objects are still alive (see `close`
     /// above).
-    pub async fn close_bounded(self, limit: Duration) {
+    pub async fn close_bounded(mut self, limit: Duration) {
         if let Some(url) = &self.fake_url {
             let request = reqwest::Client::new().post(format!("{url}/sim/ble/close"))
                 .header("x-sim-ble-generation", self.info["_sim_generation"].as_u64().unwrap().to_string())
@@ -1644,7 +1557,8 @@ impl DeviceConnection {
             }
         }
         if let Some(peripheral) = self.peripheral {
-            disconnect_bounded(None, limit, peripheral.disconnect()).await;
+            let stopped = disconnect_bounded(None, limit, peripheral.disconnect()).await;
+            if let Some(lease) = self.native_lease.as_mut() { lease.stopped = stopped && !self.write_uncertain.load(Ordering::Acquire); }
         }
         tracing::debug!(timings = ?self.timings, "device rendezvous link closed");
     }
@@ -1693,30 +1607,168 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[tokio::test]
+    async fn scan_failure_cleans_up_then_the_next_scan_can_run() {
+        use super::{scan_with_cleanup, AtomicU8, Ordering};
+        let state = AtomicU8::new(0);
+        let stops = std::cell::Cell::new(0);
+        let error = scan_with_cleanup::<(), _>(&state, Duration::from_millis(100), Duration::from_millis(20),
+            async { anyhow::bail!("injected_start_failure") },
+            |_| async { panic!("failed start must not scan") },
+            async { stops.set(stops.get()+1); Ok(()) }).await.unwrap_err();
+        assert!(format!("{error:#}").contains("injected_start_failure"));
+        assert_eq!(stops.get(), 1);
+        assert_eq!(state.load(Ordering::Acquire), 0);
+        assert_eq!(scan_with_cleanup(&state, Duration::from_millis(100), Duration::from_millis(20), async { Ok(()) },
+            |_| async { Ok(Some(7)) }, async { Ok(()) }).await.unwrap(), Some(7));
+        assert_eq!(state.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn hanging_scan_stages_return_and_uncertain_stop_prevents_native_reentry() {
+        use super::{scan_with_cleanup, AtomicU8, Ordering};
+        for stage in ["start", "events", "stop"] {
+            let state = AtomicU8::new(0);
+            let started = Instant::now();
+            let error = scan_with_cleanup::<(), _>(&state, Duration::from_millis(80), Duration::from_millis(20),
+                async { if stage == "start" { std::future::pending::<()>().await; } Ok(()) },
+                |_| async { if stage == "events" { std::future::pending::<()>().await; } Ok(Some(())) },
+                async { if stage == "stop" { std::future::pending::<()>().await; } Ok(()) }).await.unwrap_err();
+            assert!(started.elapsed() < Duration::from_millis(500));
+            assert!(error.to_string().contains(if stage == "events" { "work_timeout" } else if stage == "start" { "start_timeout" } else { "stop_timeout" }));
+            if stage == "events" {
+                assert_eq!(state.load(Ordering::Acquire), 0, "confirmed stop ends read-only scanning");
+            } else {
+                assert_eq!(state.load(Ordering::Acquire), 2);
+                let error = scan_with_cleanup::<(), _>(&state, Duration::from_millis(80), Duration::from_millis(20),
+                    async { panic!("quarantine must not issue native requests") },
+                    |_| async { panic!("quarantine must not scan") },
+                    async { panic!("quarantine must not spawn cleanup") }).await.unwrap_err();
+                assert_eq!(error.to_string(), "ble_native_quarantined_restart_required");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_scan_and_failed_stop_never_report_the_adapter_idle() {
+        use super::{scan_with_cleanup, AtomicU8, Ordering};
+        let state = AtomicU8::new(0);
+        assert!(tokio::time::timeout(Duration::from_millis(10),
+            scan_with_cleanup::<(), _>(&state, Duration::from_secs(1), Duration::from_millis(20), async { Ok(()) },
+                |_| std::future::pending(), async { Ok(()) })).await.is_err());
+        assert_eq!(state.load(Ordering::Acquire), 2);
+        let state = AtomicU8::new(0);
+        let result = scan_with_cleanup(&state, Duration::from_millis(100), Duration::from_millis(20), async { Ok(()) },
+            |_| async { Ok(Some(7)) }, async { anyhow::bail!("injected_stop_failure") }).await;
+        assert!(result.is_err(), "a match is unusable until scan shutdown is confirmed");
+        assert_eq!(state.load(Ordering::Acquire), 2);
+    }
+
+    #[tokio::test]
+    async fn scan_reservation_rejects_overlap_and_empty_budget_without_native_calls() {
+        use super::{scan_with_cleanup, AtomicU8, Ordering};
+        let state = AtomicU8::new(0);
+        let mut active = Box::pin(scan_with_cleanup::<(), _>(&state, Duration::from_secs(1),
+            Duration::from_millis(20), std::future::pending(),
+            |_| async { Ok(None) }, async { Ok(()) }));
+        assert!(futures::poll!(&mut active).is_pending());
+        let error = scan_with_cleanup::<(), _>(&state, Duration::from_millis(80), Duration::from_millis(20),
+            async { panic!("overlapping native start") }, |_| async { Ok(None) },
+            async { panic!("overlapping native stop") }).await.unwrap_err();
+        assert_eq!(error.to_string(), "ble_native_busy");
+        drop(active);
+        assert_eq!(state.load(Ordering::Acquire), 2);
+        let state = AtomicU8::new(0);
+        assert!(scan_with_cleanup::<(), _>(&state, Duration::ZERO, Duration::ZERO,
+            async { panic!("expired native start") }, |_| async { Ok(None) },
+            async { panic!("expired native stop") }).await.is_err());
+        assert_eq!(state.load(Ordering::Acquire), 0);
+        assert!(scan_with_cleanup::<(), _>(&state, Duration::from_millis(80), Duration::from_millis(20),
+            async { Ok(()) }, |deadline| async move {
+                tokio::time::sleep_until(deadline).await;
+                Ok(None)
+            }, async { Ok(()) }).await.unwrap().is_none());
+        assert_eq!(state.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
     async fn failed_connect_cleanup_releases_lock_and_allows_next_attempt() {
-        let lock = tokio::sync::Mutex::new(());
+        use super::{open_link, AtomicU8, Ordering, CLOSE_BUDGET};
+        let state = AtomicU8::new(0);
         let attempts = std::cell::Cell::new(0);
-        let first = tokio::time::timeout(
-            super::CLOSE_BUDGET + Duration::from_secs(1),
-            async {
-                let _guard = lock.lock().await;
-                super::connect_with_retry(1, || {
-                    attempts.set(attempts.get() + 1);
-                    std::future::ready(Err(anyhow::anyhow!("injected connect failure")))
-                }, std::future::pending()).await
-            },
-        ).await.expect("failed connect cleanup blocked the next scan");
-        let error = first.unwrap_err();
+        let error = open_link::<(), _>(&state, 1, CLOSE_BUDGET + Duration::from_millis(300),
+            || { attempts.set(attempts.get()+1); std::future::ready(Err(anyhow::anyhow!("injected connect failure"))) },
+            async { panic!("failed connect must not construct a link") }, async { Ok(()) }).await.unwrap_err();
         assert!(format!("{error:#}").contains("injected connect failure"));
         assert_eq!(attempts.get(), 2);
-        assert!(lock.try_lock().is_ok(), "failure retained the caller's lock");
+        assert_eq!(state.load(Ordering::Acquire), 0);
+        let (value, mut lease) = open_link(&state, 2, CLOSE_BUDGET + Duration::from_millis(300),
+            || async { Ok(()) }, async { Ok(7) }, std::future::pending()).await.unwrap();
+        assert_eq!(value, 7);
+        assert_eq!(state.load(Ordering::Acquire), 1, "the returned link owns the native radio");
+        lease.stopped = true; drop(lease);
+        assert_eq!(state.load(Ordering::Acquire), 0);
+    }
 
-        let _guard = lock.lock().await;
-        super::connect_with_retry(2, || {
-            attempts.set(attempts.get() + 1);
-            std::future::ready(Ok(()))
-        }, std::future::pending()).await.unwrap();
-        assert_eq!(attempts.get(), 3, "next connection was not attempted");
+    #[tokio::test]
+    async fn failed_native_open_and_unknown_cleanup_quarantine_without_retrying_native_work() {
+        use super::{open_link, AtomicU8, Ordering, CLOSE_BUDGET};
+        for stage in ["connect", "setup", "cleanup"] {
+            let state = AtomicU8::new(0);
+            let calls = std::cell::Cell::new(0);
+            let result = tokio::time::timeout(Duration::from_secs(3), open_link::<(), _>(&state, 1,
+                CLOSE_BUDGET + Duration::from_millis(150), || async {
+                    calls.set(calls.get()+1);
+                    if stage == "connect" { std::future::pending::<()>().await; }
+                    Ok(())
+                }, async {
+                    if stage == "setup" { std::future::pending::<()>().await; }
+                    anyhow::bail!("injected setup failure")
+                }, async {
+                    if stage == "cleanup" { std::future::pending::<()>().await; }
+                    Ok(())
+                })).await.expect("native open exceeded its total deadline");
+            assert!(result.is_err());
+            assert_eq!(calls.get(), 1, "unknown connect must not be retried");
+            assert_eq!(state.load(Ordering::Acquire), 2, "{stage}");
+            assert!(open_link::<(), _>(&state, 2, CLOSE_BUDGET + Duration::from_millis(150),
+                || async { panic!("quarantined native connect") }, async { Ok(()) },
+                async { panic!("quarantined native disconnect") }).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_setup_cleans_once_and_cancelled_or_dropped_links_remain_reserved() {
+        use super::{open_link, AtomicU8, Ordering, CLOSE_BUDGET};
+        for stage in ["discover", "info", "mac", "bond", "rendezvous"] {
+            let state = AtomicU8::new(0);
+            let closes = std::cell::Cell::new(0);
+            let error = open_link::<(), _>(&state, 1, CLOSE_BUDGET + Duration::from_millis(150),
+                || async { Ok(()) }, async { anyhow::bail!("injected {stage}") },
+                async { closes.set(closes.get()+1); Ok(()) }).await.unwrap_err();
+            assert!(error.to_string().contains(stage));
+            assert_eq!(closes.get(), 1);
+            assert_eq!(state.load(Ordering::Acquire), 0);
+        }
+        let state = AtomicU8::new(0);
+        let mut open = Box::pin(open_link::<(), _>(&state, 1, Duration::from_secs(3),
+            || async { Ok(()) }, std::future::pending(), async { Ok(()) }));
+        assert!(futures::poll!(&mut open).is_pending()); drop(open);
+        assert_eq!(state.load(Ordering::Acquire), 2);
+        let state = AtomicU8::new(0);
+        let (_, lease) = open_link(&state, 1, Duration::from_secs(3),
+            || async { Ok(()) }, async { Ok(()) }, async { Ok(()) }).await.unwrap();
+        drop(lease);
+        assert_eq!(state.load(Ordering::Acquire), 2, "dropping a live native handle is not confirmed disconnect");
+    }
+
+    #[test]
+    fn automatic_auth_never_opens_first_pairing_and_has_a_short_budget() {
+        let mut info = json!({"mac":"AA:BB:CC:DD:EE:01", "peerBonded":false, "pairingWindow":true});
+        assert!(Pusher::link_auth_budget(&info, "AABBCCDDEE01", false).is_err());
+        assert_eq!(Pusher::link_auth_budget(&info, "AABBCCDDEE01", true).unwrap(), Duration::from_secs(60));
+        info["peerBonded"] = json!(true);
+        assert_eq!(Pusher::link_auth_budget(&info, "AABBCCDDEE01", false).unwrap(), Duration::from_secs(3));
+        assert!(Pusher::link_auth_budget(&info, "AABBCCDDEE02", true).is_err());
     }
 
     #[test]
@@ -1962,18 +2014,40 @@ mod tests {
             assert!(super::decode_wire(bytes).is_err());
         }
     }
-    #[test]
-    fn rf_deadline_is_fixed_for_repeated_commands_and_expired_windows() {
-        let now = tokio::time::Instant::now();
-        let mut link = super::DeviceConnection {
-            info: json!({}), peripheral: None, fake_url: None,
-            write_uncertain: false,
-            rf_deadline: Some(now + Duration::from_secs(1)), token: String::new(),
+    fn test_link() -> super::DeviceConnection {
+        super::DeviceConnection {
+            info: json!({}), peripheral: None, native_lease: None, fake_url: None,
+            write_uncertain: std::sync::atomic::AtomicBool::new(false),
+            rf_deadline: None, token: String::new(),
             bridge_id: String::new(), nonce: String::new(), session: [0; 16], device_mac: String::new(),
             next_request_no: 1, context_id: String::new(),
             auth_ready: true, wake_identity: None, wake_cause: String::new(),
             device_last_stage: String::new(), timings: vec![],
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_control_write_poison_survives_until_the_link_is_closed() {
+        let mut link = test_link();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let mut write = Box::pin(link.control_write_until(deadline, std::future::pending()));
+        assert!(futures::poll!(&mut write).is_pending());
+        drop(write);
+        assert!(link.control_write_until(deadline, async { panic!("must not write on a poisoned link") }).await.is_err());
+        let error = link.command("status", json!({})).await.unwrap_err();
+        let proof = bridge_core::rendezvous::command_failure(&error).unwrap();
+        assert_eq!(proof.outcome, bridge_core::rendezvous::DispatchOutcome::NotSent);
+        assert_eq!(proof.reason, "previous_write_unknown");
+        let link = test_link();
+        link.control_write_until(deadline, async { Ok(()) }).await.unwrap();
+        link.control_write_until(deadline, async { Ok(()) }).await.unwrap();
+    }
+
+    #[test]
+    fn rf_deadline_is_fixed_for_repeated_commands_and_expired_windows() {
+        let now = tokio::time::Instant::now();
+        let mut link = test_link();
+        link.rf_deadline = Some(now + Duration::from_secs(1));
         assert_eq!(link.command_deadline(), link.rf_deadline.unwrap());
         assert_eq!(link.command_deadline(), link.rf_deadline.unwrap());
         link.rf_deadline = Some(now - Duration::from_secs(1));

@@ -6,6 +6,65 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::model::DeviceIdentity;
 
 pub const INTENT_TTL_S: u64 = 86400;
+
+/// Carrier I/O only; job identity and durable transitions belong to the service.
+pub trait Transport {
+    fn exchange(&mut self, op: &str, body: Value)
+        -> impl std::future::Future<Output = Result<Value>> + Send;
+}
+
+impl<F: FnMut(&str, Value) -> Result<Value>> Transport for F {
+    fn exchange(&mut self, op: &str, body: Value)
+        -> impl std::future::Future<Output = Result<Value>> + Send {
+        std::future::ready(self(op, body))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionIntent {
+    #[default]
+    Active,
+    Cancelled,
+    Expired,
+}
+
+#[derive(Clone, Copy)]
+pub enum ReplySource { OriginalWrite, ResultQuery }
+
+/// The origin of a response is part of its evidence: a failed result read
+/// cannot reject the operation it was trying to observe.
+pub enum OperationReply<'a> {
+    Committed { revision: u64, bond: Option<&'a str> },
+    Completed { revision: Option<u64> },
+    Rejected { code: &'a str, durable: bool },
+    Pending { code: Option<&'a str> },
+}
+impl<'a> OperationReply<'a> {
+    pub fn decode(source: ReplySource, reply: &'a Value) -> Result<Self> {
+        let error = reply["error"].as_str();
+        if matches!(source, ReplySource::ResultQuery) && reply["ok"] != true {
+            return Ok(Self::Pending { code: Some(error.unwrap_or("receipt_unknown")) });
+        }
+        if reply["ok"] == true {
+            match reply["outcome"].as_str() {
+                Some("committed") => return Ok(Self::Committed {
+                    revision: reply["revision"].as_u64().context("receipt_revision_required")?,
+                    bond: reply["bond"].as_str(),
+                }),
+                Some("completed") => return Ok(Self::Completed { revision: reply["revision"].as_u64() }),
+                _ => {}
+            }
+        }
+        if reply["outcome"] == "rejected" {
+            return Ok(Self::Rejected { code: error.unwrap_or("wifi_rejected"), durable: true });
+        }
+        if reply["ok"] == false && error != Some("storage_unknown") {
+            return Ok(Self::Rejected { code: error.unwrap_or("wifi_rejected"), durable: false });
+        }
+        Ok(Self::Pending { code: error })
+    }
+}
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Network {
@@ -168,6 +227,7 @@ impl Connection {
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WifiState {
     #[serde(default)]
     pub next_job_seq: u64,
@@ -181,13 +241,18 @@ pub struct WifiState {
     pub connection: Option<Connection>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Job {
     pub job_id: String,
     pub request_id: String,
     pub device_mac: String,
     pub bridge_id: String,
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    pub transaction_namespace: Option<String>,
     pub kind: String,
     pub state: String,
+    #[serde(default)]
+    pub execution_intent: ExecutionIntent,
     pub created_at: u64,
     pub expires_at: u64,
     pub updated_at: u64,
@@ -217,6 +282,23 @@ pub struct Job {
     pub command: Option<Value>,
 }
 impl Job {
+    pub fn check_transaction_context(&self, principal: &str, namespace: &str) -> Result<()> {
+        if principal != self.bridge_id { bail!("transaction_principal_changed"); }
+        if namespace.is_empty() || namespace.len() > 21 { bail!("transaction_namespace_invalid"); }
+        match self.transaction_namespace.as_deref() {
+            Some(saved) if saved == namespace => Ok(()),
+            Some(_) => bail!("transaction_namespace_changed"),
+            None => bail!("transaction_identity_unknown"),
+        }
+    }
+    pub fn confirmation_pending(&self) -> bool {
+        self.sent && self.may_have_committed && !matches!(self.confirmation.as_deref(),
+            Some("durable_receipt" | "operation_result" | "durable_rejection" | "receipt_and_readback" | "verified_post_state"))
+    }
+    pub fn execution_active(&self, now: u64) -> bool {
+        self.execution_intent == ExecutionIntent::Active && now < self.expires_at
+            && !matches!(self.state.as_str(), "cancelled" | "expired")
+    }
     fn safe_to_retire(&self) -> bool {
         self.terminal() && !self.receipt_ack_pending && (!self.may_have_committed ||
             matches!(self.confirmation.as_deref(),Some("durable_receipt"|"operation_result"|"durable_rejection"|"receipt_and_readback"|"verified_post_state")))
@@ -225,7 +307,8 @@ impl Job {
         matches!(self.state.as_str(), "completed" | "cancelled" | "expired" | "failed")
     }
     pub fn runnable(&self, now: u64) -> bool {
-        !self.terminal() && self.state != "conflict" && now < self.expires_at && now >= self.next_attempt_at
+        now >= self.next_attempt_at && (self.confirmation_pending() ||
+            (!self.terminal() && self.state != "conflict" && self.execution_active(now)))
     }
 }
 
@@ -241,10 +324,10 @@ mod retirement_tests {
         state.jobs=(0..32).map(|i|{let mut j=template.clone();j.job_id=format!("protected-{i}");j.request_id=j.job_id.clone();
             if i%2==0{j.state="expired".into();j.confirmation=None;j.receipt_ack_pending=false;}j}).collect();
         let before=serde_json::to_value(&state.jobs).unwrap();
-        assert!(state.queue("0200000000D4","bridge-test","activate",vec!["home".into()],1_000_000,"next".into(),BTreeMap::new()).unwrap_err().to_string().contains("wifi_job_capacity"));
+        assert!(state.queue("0200000000D4","bridge-test","read",vec![],1_000_000,"next".into(),BTreeMap::new()).unwrap_err().to_string().contains("wifi_job_capacity"));
         assert_eq!(serde_json::to_value(&state.jobs).unwrap(),before);
         state.jobs[1].receipt_ack_pending=false;
-        state.queue("0200000000D4","bridge-test","activate",vec!["home".into()],1_000_000,"next".into(),BTreeMap::new()).unwrap();
+        state.queue("0200000000D4","bridge-test","read",vec![],1_000_000,"next".into(),BTreeMap::new()).unwrap();
         assert_eq!(state.jobs.len(),32);
         assert!(!state.jobs.iter().any(|j|j.job_id=="protected-1"));
         assert!(state.jobs.iter().any(|j|j.job_id=="protected-0"));
@@ -262,6 +345,8 @@ impl WifiState {
     }
     pub fn recover(&mut self) {
         for j in &mut self.jobs {
+            if j.state == "cancelled" { j.execution_intent = ExecutionIntent::Cancelled; }
+            if j.state == "expired" { j.execution_intent = ExecutionIntent::Expired; }
             if matches!(j.state.as_str(), "connecting" | "reading" | "applying") {
                 j.state = if j.sent { "awaiting_confirmation" } else { "waiting_rendezvous" }.into();
             }
@@ -290,7 +375,8 @@ impl WifiState {
     }
     pub fn expire(&mut self, now: u64) {
         for j in &mut self.jobs {
-            if !j.terminal() && now >= j.expires_at {
+            if !j.terminal() && j.execution_intent == ExecutionIntent::Active && now >= j.expires_at {
+                j.execution_intent = ExecutionIntent::Expired;
                 j.state = "expired".into(); j.updated_at = now;
             }
         }
@@ -319,6 +405,8 @@ impl WifiState {
             && j.selected == selected && j.fields == fields && j.frozen == frozen && (kind == "read" || j.local_revision == self.local_revision)) {
             return Ok(j.clone());
         }
+        if matches!(kind,"sync"|"recovery_save"|"trial"|"activate") &&
+            self.jobs.iter().any(Job::confirmation_pending) { bail!("wifi_confirmation_pending"); }
         if matches!(kind,"sync"|"recovery_save") && self.jobs.iter().any(|j| matches!(j.kind.as_str(),"sync"|"recovery_save") && !j.terminal()) { bail!("wifi_sync_busy"); }
         self.jobs.retain(|j| !j.safe_to_retire() || now.saturating_sub(j.updated_at) < INTENT_TTL_S);
         // Keep recent history when possible; confirmed, acknowledged results
@@ -332,7 +420,7 @@ impl WifiState {
         let before = self.snapshot.as_ref().map(|s| s.networks.iter().filter(|n| n.writable && selected.contains(&n.network.network_id))
             .map(|n| (n.network.network_id.clone(), n.network.metadata())).collect()).unwrap_or_default();
         let j = Job { request_id: if self.next_job_seq>0 { format!("w3_{:016x}",self.next_job_seq) } else { job_id.clone() }, job_id, device_mac: mac.into(), bridge_id: bridge.into(), kind: kind.into(),
-            state: "queued".into(), created_at: now, expires_at: now.saturating_add(INTENT_TTL_S), updated_at: now,
+            transaction_namespace: None, state: "queued".into(), execution_intent: ExecutionIntent::Active, created_at: now, expires_at: now.saturating_add(INTENT_TTL_S), updated_at: now,
             local_revision: self.local_revision, attempt_count: 0, last_attempt_at: None, next_attempt_at: now,
             last_stage: "accepted".into(), error_code: None, sent: false, may_have_committed: false,
             selected, frozen, fields, expected_revision: self.snapshot.as_ref().map(|s| s.revision), host_ssid: None, before, confirmed_revision: None, confirmation: None, receipt_ack_pending: false, command: None };
@@ -355,7 +443,8 @@ impl WifiState {
         }
         if error.is_some_and(|s| !id(s, 64)) { bail!("invalid_error_code"); }
         let j = self.jobs.iter_mut().find(|j| j.job_id == job).ok_or_else(|| anyhow::anyhow!("wifi_job_not_found"))?;
-        if !j.terminal() {
+        if !j.terminal() || j.confirmation_pending() {
+            if state == "cancelled" { j.execution_intent = ExecutionIntent::Cancelled; }
             j.state = state.into(); j.error_code = error.map(str::to_owned); j.updated_at = now;
             let delay = match j.attempt_count { 0 | 1 => 5, 2 => 15, _ => 60 };
             j.next_attempt_at = now.saturating_add(delay);
@@ -386,7 +475,7 @@ impl WifiState {
     pub fn confirm_sync(&mut self, job: &str, snapshot: Snapshot, receipt: bool, now: u64) -> Result<Job> {
         let j = self.jobs.iter().find(|j| j.job_id == job).ok_or_else(|| anyhow::anyhow!("wifi_job_not_found"))?.clone();
         snapshot.validate(&j.device_mac)?;
-        if !j.sent || j.terminal() || now >= j.expires_at { bail!("wifi_job_no_longer_active"); }
+        if !j.confirmation_pending() { bail!("wifi_job_no_longer_active"); }
         for n in &j.frozen {
             let matches: Vec<_> = snapshot.networks.iter().filter(|r| r.writable && r.network.network_id == n.network_id).collect();
             let deleted = n.deleted && j.fields.get(&n.network_id).is_none_or(|fs| fs.iter().any(|f| f == "deleted"));
@@ -444,7 +533,7 @@ impl WifiState {
     /// frozen changes. Apply those changes to the cache, without another read.
     pub fn confirm_receipt(&mut self, job_id: &str, revision: u64, bond: Option<&str>, now: u64) -> Result<Job> {
         let job = self.jobs.iter().find(|j| j.job_id == job_id).context("wifi_job_not_found")?.clone();
-        if !job.sent || job.terminal() || now >= job.expires_at { bail!("wifi_job_no_longer_active"); }
+        if !job.confirmation_pending() { bail!("wifi_job_no_longer_active"); }
         if job.expected_revision.is_some_and(|r| revision != r.saturating_add(1)) { bail!("receipt_revision_mismatch"); }
         if job.kind == "sync" {
             let mut snapshot = self.snapshot.clone().context("snapshot_required")?;

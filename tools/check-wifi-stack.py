@@ -8,6 +8,8 @@ import subprocess
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("elf", type=Path)
 parser.add_argument("--objdump", type=Path, default=Path(__file__).resolve().parents[1] / ".pio-pkgs/note4/toolchain-xtensa-esp-elf/bin/xtensa-esp32s3-elf-objdump")
+parser.add_argument("--no-online-wifi-migration", action="store_true", help="Require the retired BLE migration handler to be absent")
+parser.add_argument("--no-legacy-management-entry", action="store_true", help="Require retired permit authorization and no-context management entry points to be absent")
 args = parser.parse_args()
 assembly = subprocess.check_output([str(args.objdump), "-d", "-C", str(args.elf)], text=True)
 functions = {}
@@ -28,10 +30,12 @@ for block in re.split(r"(?=^[0-9a-f]+ <[^\n]+>:\n)", assembly, flags=re.MULTILIN
 # codec/legacy conversion helpers; their frames are then included in read.
 reader = next((name for name in functions if name.startswith("readWifiStore(Preferences&, WifiStore")), None)
 required = ["wifiSchemesBegin()", reader]
-for prefix in ("serviceV2Ble(", "handleBleWifiMigration("):
+for prefix in ("serviceV2Ble(",) if args.no_online_wifi_migration else ("serviceV2Ble(", "handleBleWifiMigration("):
     required.append(next((name for name in functions if name.startswith(prefix)), None))
 if reader and "WifiStoreV2" not in reader:
     for prefix in ("saveV2(", "wifiSetupPoll(", "wifiSetupCommand(", "wifiManagementCommand(", "wifiControlCommand(", "wifiManagementWithContext(", "wifiDeviceStatus(", "handleWifiManagement(", "servicePresence(", "storeUpsert(", "storeAuthenticate("):
+        if prefix == "wifiManagementCommand(" and args.no_legacy_management_entry:
+            continue
         required.append(next((name for name in functions if name.startswith(prefix)), None))
 report = next((name for name in functions if name.startswith("serviceReadyReport(")), None)
 if report:
@@ -41,6 +45,14 @@ if report:
         name = next((name for name in functions if name.startswith(prefix)), None)
         if name is not None or prefix != "buildPlatformStatus(": required.append(name)
 failed = False
+if args.no_online_wifi_migration:
+    retired = [name for name in functions if name.startswith("handleBleWifiMigration(")]
+    print("FAIL: retired BLE migration still linked" if retired else "PASS: retired BLE migration absent")
+    failed |= bool(retired)
+if args.no_legacy_management_entry:
+    retired = [name for name in functions if name.startswith(("wifiManagementCommand(", "wifiManagementAuthorize("))]
+    print("FAIL: retired permit management entry still linked" if retired else "PASS: retired permit management entries absent")
+    failed |= bool(retired)
 for prefix in ("pageStatus(", "StatusPages::"):
     required.extend(name for name in functions if name.startswith(prefix))
 for prefix in ("PlanStore::", "applyV2Plan("):

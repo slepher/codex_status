@@ -135,7 +135,9 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             .as_u64().unwrap_or(0).min(300) as u32;
         let failure_report = state["network_error"].as_str().is_some();
         let needs_http = !failure_report && (remaining > 0 ||
-            (state["power"]["mode"] == "light" && state["power"]["remaining_s"].as_u64().unwrap_or(0) > 0) || !admitted_wifi.is_empty()
+            (state["power"]["mode"] == "light" && state["power"]["remaining_s"].as_u64().unwrap_or(0) > 0) ||
+            service(ctx).wifi_state(&mac).jobs.iter().any(|j| j.execution_active(device_now(&mac)) &&
+                bridge_core::rendezvous::admit_wifi(j, device_now(&mac)))
             || service(ctx).wifi_state(&mac).connection.is_some_and(|c| c.state == "requested")
             || matches!(decision["decision"].as_str(), Some("light_data" | "bundle" | "activate" | "waiting_for_device_contract"))
             || service(ctx).ota_job(&mac).is_some_and(|job|
@@ -363,7 +365,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             }
             let plan_id = state["_sent_plan"]["plan_id"].as_u64().unwrap_or(0);
             let unknown = state["_plan_ack_unknown"] == true || state["_sync_open_unknown"] == true;
-            let read_only = link.info["wifi_management"] == 3 && state["_plan_ack_unknown"] != true &&
+            let read_only = link.info["wifi_management"] == 3 && link.info["rf_remaining_ms"].as_u64().is_some() && state["_plan_ack_unknown"] != true &&
                 (state["_sync_open_unknown"] != true || state["_sync_open_read_safe"] == true) &&
                 service(ctx).wifi_state(&mac).jobs.iter().find(|j| j.runnable(device_now(&mac)))
                     .is_some_and(|j| j.kind == "read");
@@ -392,8 +394,10 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
                 .is_some_and(|j| j.sent);
             // A lost SyncOpen ACK cannot turn a legal configuration read into
             // a prerequisite for unavailable HTTP. Unified reads never apply.
-            if !unknown || confirmation_only || read_only {
-                let _ = crate::wifi::recover_on_link_budget(ctx, &mac, &mut link, shared_tail).await;
+            if read_only {
+                crate::wifi::read_on_link_budget(ctx, &mac, &mut link, shared_tail).await;
+            } else if !unknown || confirmation_only {
+                crate::wifi::recover_on_link_budget(ctx, &mac, &mut link, shared_tail).await;
             }
             if !unknown && state["_wifi_repair"] == true {
                 if let Err(error) = crate::wifi::automatic_on_link(
@@ -456,6 +460,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             )
             .await;
         }
+        crate::wifi::acknowledge_receipts_on_link_budget(ctx,&mac,&mut link,shared_tail.capped(Duration::from_millis(500))).await;
     }
     // Release both delivery locks before link cleanup. A hanging
     // `peripheral.disconnect()` (btleplug on macOS after a natural link loss)
