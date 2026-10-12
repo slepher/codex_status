@@ -141,7 +141,7 @@ size_t syncSanitizeText(const char *text, size_t length, char output[97], uint8_
 bool syncDiagnosticText(const char *text) {
     return text && (strstr(text, "fail") || strstr(text, "error") ||
         strstr(text, "rejected") || strstr(text, "unauthorized") ||
-        strstr(text, "[sync]") || strstr(text, "[ota]") ||
+        strstr(text, "[sync]") || strstr(text, "[net]") || strstr(text, "[ota]") ||
         strstr(text, "[boot]") || strstr(text, "[ble] session") ||
         strstr(text, "[ui] network glyph") || strstr(text, "[wifi] link") ||
         strstr(text, "[redacted]"));

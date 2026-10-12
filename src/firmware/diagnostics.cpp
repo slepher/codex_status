@@ -1348,6 +1348,7 @@ void handleV2Status() {
                     power::retained.rtcMode == MODE_LIGHT ? "WIFI_LIGHT" : "DEEP";
     const uint64_t syncUntil = sync::state.syncOpenAnsweredAt + 90000;
     sync["remaining_ms"] = sync::state.syncOpenThisWake && syncUntil > clock::v2NowMs() ? syncUntil-clock::v2NowMs() : 0;
+    sync["last_error"] = sync::state.lastFailure;
     sync["data_pending_seq"] = sync::state.syncDataPending ? sync::state.syncDataSeq : 0;
     sync["rounds"] = sync::retained.syncRtc.rounds;
     sync["due"] = (sync::retained.syncRtc.flags & 1) != 0;

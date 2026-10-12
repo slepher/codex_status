@@ -2943,6 +2943,13 @@ impl DeviceUdpTraceSampler {
 }
 
 fn safe_device_error_category(error: &str) -> &'static str {
+    match error {
+        "not_sent" => return "not_sent",
+        "result_unknown" | "ble_write_result_unknown" => return "result_unknown",
+        "network_not_found" => return "network_not_found",
+        "http_proof_budget_exhausted" | "wifi_window_timeout" => return "window_budget_exhausted",
+        _ => {},
+    }
     let text = error.to_ascii_lowercase();
     if text.contains("does not match") || text.contains("expected") || text.contains("identity") {
         "identity_mismatch"

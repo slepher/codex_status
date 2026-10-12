@@ -2510,6 +2510,9 @@ mod ble_close_lock_tests {
         lost_plan: AtomicBool,
         lost_network_start: AtomicBool,
         applied_plan: AtomicU64,
+        rf_initial_ms: AtomicU64,
+        rf_after_plan_ms: AtomicU64,
+        rf_epoch: Mutex<std::time::Instant>,
         apply_plan: AtomicBool,
         network_started: AtomicBool,
         sync_opened: AtomicBool,
@@ -2563,13 +2566,19 @@ mod ble_close_lock_tests {
     }
 
     async fn info(State(fake): State<Arc<FakeBle>>) -> impl IntoResponse {
+        let initial = fake.rf_initial_ms.load(Ordering::SeqCst);
+        let after = fake.rf_after_plan_ms.load(Ordering::SeqCst);
+        let limit = if fake.applied_plan.load(Ordering::SeqCst) > 0 && after > 0 { after } else { initial };
+        let remaining = limit.saturating_sub(fake.rf_epoch.lock().unwrap().elapsed().as_millis() as u64);
         (
             [("x-sim-ble-generation", "1")],
             Json(json!({"mac": fake.mac, "rendezvous": true, "fw": "lock-repro",
                 // 2 = Wi-Fi management supported. Without it `wifi::note_link`
                 // fails every queued job as `unsupported` before the cycle's
                 // drain/opportunity steps, which would hide the order under test.
-                "wifi_management": 2, "wc":u8::from(fake.protocol.load(Ordering::SeqCst)),
+                "wifi_management": if initial > 0 {3} else {2},
+                "rf_remaining_ms": if initial > 0 {json!(remaining)} else {Value::Null},
+                "wc":u8::from(fake.protocol.load(Ordering::SeqCst)),
                 "ble_claim":u8::from(fake.ble_claim.load(Ordering::SeqCst)),
                 "wake_generation":if fake.protocol.load(Ordering::SeqCst) {json!(2)} else {Value::Null},
                 "wake_seq":if fake.protocol.load(Ordering::SeqCst) {json!(9)} else {Value::Null}})),
@@ -2610,6 +2619,10 @@ mod ble_close_lock_tests {
         let command: Value = serde_json::from_slice(payload).unwrap_or(Value::Null);
         fake.commands.lock().unwrap().push(command.clone());
         let op = command["op"].as_str().unwrap_or("");
+        let blocked_write = *fake.blocked_op.lock().unwrap() == format!("write:{op}");
+        if blocked_write {
+            std::future::pending::<()>().await;
+        }
         let mut reply = command_ack(&fake.mac, &command, fake.sync_due);
         if op == "status" {
             reply["power"]["provisional_remaining_s"] = json!(fake.provisional_remaining_s.load(Ordering::SeqCst));
@@ -2626,10 +2639,14 @@ mod ble_close_lock_tests {
             }
             if op == "plan" {
                 if fake.apply_plan.load(Ordering::SeqCst) { fake.applied_plan.store(command["plan_id"].as_u64().unwrap(), Ordering::SeqCst); }
+                if fake.rf_after_plan_ms.load(Ordering::SeqCst) > 0 { *fake.rf_epoch.lock().unwrap() = std::time::Instant::now(); }
                 reply["accepted_remaining_s"] = command["light_duration_s"].clone();
             }
             if op == "network_start" { fake.network_started.store(true, Ordering::SeqCst); }
             if op == "sync_open" { fake.sync_opened.store(true, Ordering::SeqCst); }
+        }
+        if op == "sync_open" && fake.rf_initial_ms.load(Ordering::SeqCst) > 0 {
+            tokio::time::sleep(Duration::from_millis(900)).await;
         }
         if op.starts_with("wifi_") {
             reply["ack"] = json!("wifi"); reply["ok"] = json!(true);
@@ -2638,6 +2655,25 @@ mod ble_close_lock_tests {
                 "wifi_match" => {reply["network_id"]=json!("home");reply["version"]=json!(2);
                     reply["matches"]=json!(true);reply["connected"]=json!(true);},
                 "wifi_authorize" => { reply["write_remaining_ms"] = json!(60000); reply["permit"] = json!("test-permit"); },
+                "wifi_status" if fake.rf_initial_ms.load(Ordering::SeqCst) > 0 => {
+                    // A paged status read can outlive the original short exchange.
+                    tokio::time::sleep(Duration::from_millis(450)).await;
+                    let text=serde_json::to_vec(&json!({"device_mac":fake.mac,
+                        "boot_id":"00112233445566778899aabbccddeeff",
+                        "wifi_control":{"read_allowed":true,"write_allowed":true}})).unwrap();
+                    let offset=command["offset"].as_u64().unwrap_or(0) as usize;
+                    let end=(offset+100).min(text.len());
+                    reply["snapshot"]=json!(1);reply["total"]=json!(text.len());reply["next_offset"]=json!(end);
+                    reply["chunk"]=json!(text[offset..end].iter().map(|b|format!("{b:02x}")).collect::<String>());
+                },
+                "wifi_snapshot" if fake.rf_initial_ms.load(Ordering::SeqCst) > 0 => {
+                    let text=serde_json::to_string(&json!({"schema":2,"device_mac":fake.mac,
+                        "revision":8,"snapshot_id":"rf-read","complete":true,"observed_at":0,
+                        "capacity":{"total":12},"networks":[]})).unwrap();
+                    reply["schema"]=json!(2);reply["revision"]=json!(8);reply["snapshot_id"]=json!("rf-read");
+                    reply["offset"]=json!(0);reply["total"]=json!(text.len());reply["next_offset"]=json!(text.len());
+                    reply["chunk"]=json!(text);reply["complete"]=json!(true);
+                },
                 "wifi_save" | "wifi_result" => { reply["outcome"] = json!("committed"); reply["revision"] = json!(2); reply["bond"]=json!("own"); },
                 "wifi_scheme_get" => {
                     let text=serde_json::to_vec(&json!({"networks":[{"network_id":"home","host_ssid":"Host","ssid":"Device","version":2,"credential":"open"}]})).unwrap();
@@ -2727,6 +2763,7 @@ mod ble_close_lock_tests {
             claim_owner: Mutex::new(String::new()),
             claim_rejected: AtomicBool::new(false), lost_plan: AtomicBool::new(false), lost_network_start: AtomicBool::new(false),
             applied_plan: AtomicU64::new(0), apply_plan: AtomicBool::new(true), network_started: AtomicBool::new(false), sync_opened: AtomicBool::new(false), blocked_op: Mutex::new(String::new()),
+            rf_initial_ms: AtomicU64::new(0), rf_after_plan_ms: AtomicU64::new(0), rf_epoch: Mutex::new(std::time::Instant::now()),
             sync_due,
             provisional_remaining_s: AtomicU64::new(0),
             status_extra: Mutex::new(json!({})),
@@ -3407,7 +3444,7 @@ mod ble_close_lock_tests {
         );
         assert_eq!(
             (state.as_str(), error.as_deref()),
-            ("queued", None),
+            ("waiting_rendezvous", Some("http_session_mismatch")),
             "the queued read must not execute without authenticated confirmation of the original Plan: \
              status_calls={}",
             fake_http.status_calls.load(Ordering::SeqCst)
@@ -3541,7 +3578,7 @@ mod ble_close_lock_tests {
         );
         assert_eq!(
             (state.as_str(), error.as_deref()),
-            ("queued", None),
+            ("waiting_rendezvous", Some("http_session_mismatch")),
             "the queued read must remain pending when post-close Plan verification fails: \
              status_calls={}",
             fake_http.status_calls.load(Ordering::SeqCst)
@@ -3614,8 +3651,8 @@ mod ble_close_lock_tests {
         );
         assert_eq!(
             (state.as_str(), error.as_deref()),
-            ("queued", None),
-            "unconfirmed Plan must leave the admitted read queued"
+            ("waiting_rendezvous", Some("http_proof_budget_exhausted")),
+            "unconfirmed Plan must preserve the read and report its exhausted proof budget"
         );
         assert!(
             !paths.iter().any(|path| path == "/api/claim"),
@@ -3893,6 +3930,119 @@ mod ble_close_lock_tests {
             assert_eq!(after.snapshot.unwrap().snapshot_id, "cached-choice");
             assert_eq!(svc.coordinator_summary(HUNG_MAC, device_now(HUNG_MAC)).unwrap()["plan"], plan_before);
             assert!(crate::wifi::action(&ctx, HUNG_MAC, op, body).await.is_err()); // local revision changed
+        }
+    }
+
+    #[tokio::test(flavor="multi_thread",worker_threads=4)]
+    async fn network_start_requires_refresh_after_plan_extends_rf_phase() {
+        let _serial=SIM_ENV.lock().unwrap_or_else(|p|p.into_inner());
+        let (ble,url)=start_fake_ble(HUNG_MAC,false).await;
+        ble.protocol.store(true,Ordering::SeqCst);
+        ble.rf_initial_ms.store(700,Ordering::SeqCst);
+        ble.rf_after_plan_ms.store(30000,Ordering::SeqCst);
+        *ble.rf_epoch.lock().unwrap()=std::time::Instant::now();
+        std::env::set_var("CODEX_STATUS_SIM_BLE_ENDPOINTS",json!({HUNG_MAC:url}).to_string());
+        let mut link=bridge_ble::DeviceConnection::connect(HUNG_MAC,TOKEN,"bridge-lock-repro").await.unwrap().unwrap();
+        assert_eq!(link.command("status",json!({})).await.unwrap()["result"],"applied");
+        let plan=link.command("plan",json!({"plan_id":1})).await.unwrap();
+        assert_eq!(plan["result"],"applied");
+        // Reproduce the old caller: keep the initial INFO deadline after the
+        // device changes RF phase, then attempt startup on that expired lease.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let error=link.command("network_start",json!({"plan_id":1})).await.unwrap_err();
+        let failure=bridge_core::rendezvous::command_failure(&error).unwrap();
+        assert_eq!(failure.outcome,bridge_core::rendezvous::DispatchOutcome::NotSent);
+        assert_eq!(failure.stage,"before_write");
+        assert!(!ble.network_started.load(Ordering::SeqCst));
+        assert!(!command_ops(&ble).iter().any(|op|op=="network_start"));
+        // The same authenticated MAC/wake reports its actual extended window.
+        link.refresh_info(Duration::from_secs(1)).await.unwrap();
+        assert_eq!(link.command("network_start",json!({"plan_id":1})).await.unwrap()["result"],"accepted");
+        assert!(ble.network_started.load(Ordering::SeqCst));
+        assert_eq!(command_ops(&ble).iter().filter(|op|*op=="network_start").count(),1);
+        link.close_bounded(Duration::from_millis(100)).await;
+        std::env::remove_var("CODEX_STATUS_SIM_BLE_ENDPOINTS");
+    }
+
+    #[tokio::test]
+    async fn http_proof_exhaustion_and_network_error_remain_distinct() {
+        for unknown in [false,true] {
+            let dir=tempfile::tempdir().unwrap();let ctx=test_ctx(dir.path(),&[HUNG_MAC]);
+            let error=super::rendezvous::wait_for_device_http(&ctx,HUNG_MAC,
+                &json!({"_network_start_unknown":unknown}),1,true,
+                bridge_core::rendezvous::Budget::new(Duration::ZERO),
+                bridge_core::rendezvous::Budget::new(Duration::ZERO)).await.err().unwrap();
+            assert_eq!(error,if unknown {"result_unknown"}else{"http_proof_budget_exhausted"});
+            let targets=serde_json::from_value(json!([{"network_id":"home","host_ssid":"Host","ssid":"Device","credential":"open"}])).unwrap();
+            service(&ctx).wifi_save(HUNG_MAC,0,targets,100).unwrap();
+            let c=serde_json::from_value(json!({"host_ssid":"Host","network_id":"home","local_revision":1,
+                "version":1,"state":"connecting","error":null,"reason":0,"observed_at":100,"attempts":1,"next_attempt_at":0})).unwrap();
+            service(&ctx).wifi_note_connection(HUNG_MAC,c).unwrap();
+            crate::wifi::network_failed(&ctx,HUNG_MAC,"network_not_found");
+            let c=service(&ctx).wifi_state(HUNG_MAC).connection.unwrap();
+            assert_eq!(c.state,"connection_failed");assert_eq!(c.error.as_deref(),Some("network_not_found"));
+        }
+    }
+
+    #[tokio::test(flavor="multi_thread",worker_threads=4)]
+    async fn network_start_reports_dispatch_without_waiting_for_http() {
+        let _serial=SIM_ENV.lock().unwrap_or_else(|p|p.into_inner());
+        for case in ["not_sent","ack_unknown","write_unknown","accepted"] {
+            let (ble,url)=start_fake_ble(HUNG_MAC,false).await;
+            ble.protocol.store(true,Ordering::SeqCst);
+            std::env::set_var("CODEX_STATUS_SIM_BLE_ENDPOINTS",json!({HUNG_MAC:url}).to_string());
+            let mut link=bridge_ble::DeviceConnection::connect(HUNG_MAC,TOKEN,"bridge-lock-repro").await.unwrap().unwrap();
+            link.command("status",json!({})).await.unwrap();
+            if case=="ack_unknown" {ble.lost_network_start.store(true,Ordering::SeqCst);}
+            if case=="write_unknown" {*ble.blocked_op.lock().unwrap()="write:network_start".into();}
+            let started=std::time::Instant::now();
+            let result=super::rendezvous::network_start_on_link(&mut link,json!({"plan_id":1}),
+                bridge_core::rendezvous::Budget::new(if case=="not_sent" {Duration::ZERO}else{Duration::from_millis(200)})).await;
+            assert!(started.elapsed()<Duration::from_secs(1),"{case} waited for HTTP");
+            match case {
+                "not_sent" => assert_eq!(result,Err("not_sent".into())),
+                "ack_unknown" => assert_eq!(result,Ok(false)),
+                "write_unknown" => assert_eq!(result,Err("result_unknown".into())),
+                _ => assert_eq!(result,Ok(true)),
+            }
+            assert_eq!(command_ops(&ble).iter().filter(|op|*op=="network_start").count(),usize::from(case!="not_sent"));
+            if case=="write_unknown" {
+                let error=link.command("status",json!({})).await.unwrap_err();
+                let failure=bridge_core::rendezvous::command_failure(&error).unwrap();
+                assert_eq!(failure.reason,"previous_write_unknown");
+                assert_eq!(command_ops(&ble).iter().filter(|op|*op=="status").count(),1,"partial frame must prevent every later command");
+            }
+            link.close_bounded(Duration::from_millis(100)).await;
+            std::env::remove_var("CODEX_STATUS_SIM_BLE_ENDPOINTS");
+        }
+    }
+
+    #[tokio::test(flavor="multi_thread",worker_threads=4)]
+    async fn ble_cycle_reads_wifi_after_device_extends_rf_phase() {
+        let _serial=SIM_ENV.lock().unwrap_or_else(|p|p.into_inner());
+        for (extended,lost_sync) in [(true,""),(true,"ack"),(true,"write"),(false,"")] {
+            let dir=tempfile::tempdir().unwrap();let (ble,url)=start_fake_ble_with(HUNG_MAC,false,true,Arc::new(Mutex::new(Vec::new()))).await;
+            ble.protocol.store(true,Ordering::SeqCst);
+            ble.rf_initial_ms.store(700,Ordering::SeqCst);
+            ble.rf_after_plan_ms.store(if extended {30000}else{0},Ordering::SeqCst);
+            if !lost_sync.is_empty() { *ble.blocked_op.lock().unwrap()=if lost_sync=="write" {"write:sync_open"}else{"sync_open"}.into(); }
+            *ble.rf_epoch.lock().unwrap()=std::time::Instant::now();
+            let ctx=test_ctx(dir.path(),&[HUNG_MAC]);let svc=service(&ctx);
+            let job=svc.wifi_queue(HUNG_MAC,&ctx.bridge_id,"read",vec![],device_now(HUNG_MAC)).unwrap();
+            std::env::set_var("CODEX_STATUS_SIM_BLE_ENDPOINTS",json!({HUNG_MAC:url}).to_string());
+            let _=tokio::time::timeout(Duration::from_secs(8),ble_cycle(&ctx,&[HUNG_MAC.into()])).await;
+            std::env::remove_var("CODEX_STATUS_SIM_BLE_ENDPOINTS");
+            let read=svc.wifi_state(HUNG_MAC).jobs.into_iter().find(|j|j.job_id==job.job_id).unwrap();
+            let should_read=extended && lost_sync!="write";
+            assert_eq!(read.state=="completed",should_read,"extended={extended}, lost_sync={lost_sync}, state={}, error={:?}",read.state,read.error_code);
+            assert_eq!(command_ops(&ble).iter().any(|op|op=="wifi_snapshot"),should_read);
+            assert_eq!(command_ops(&ble).iter().filter(|op|*op=="sync_open").count(),1,"lost ACK must not resubmit SyncOpen");
+            if lost_sync=="write" {
+                let ops=command_ops(&ble);let start=ops.iter().position(|op|op=="sync_open").unwrap();
+                assert_eq!(start+1,ops.len(),"an unconfirmed fragment write must close before another BLE command");
+                assert_eq!(ble.closes.load(Ordering::SeqCst),1);
+            }
+            if should_read {assert_eq!(read.confirmed_revision,Some(8));}
         }
     }
 

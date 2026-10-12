@@ -13,6 +13,10 @@ void wifiSchemesStorageStatus(JsonObject out);
 void wifiSetupConnectionStarted(const String &ssid = String());
 // High 16 bits: wrapping event sequence; low 16 bits: latest driver reason.
 uint32_t wifiSetupDisconnectEvent();
+uint32_t wifiSetupAssociatedEvent();
+uint32_t wifiSetupIpEvent();
+uint16_t wifiSetupConnectionReason();
+const char *wifiSetupConnectionFailure();
 // Handles only wifi_*; callers still enforce encrypted bond and full MAC.
 String wifiSetupCommand(JsonDocument &doc, const String &peer, uint32_t generation,
                         uint64_t now, uint64_t physicalUntil, uint64_t lightUntil,

@@ -239,56 +239,69 @@ assert.equal(element('wifi-id').value,'unsaved-editor');
 assert.equal(run("wifiSelections.get('home')"),true);
 assert.equal(run('wifiPreview.scope'),'keep');
 assert.equal(calls.length,tabCalls);
-// Permission checks are passive; prompts/settings only follow explicit actions.
+// One combined request, sequential system decisions, and one startup attempt.
+assert(!html.includes('id="wifi-location-action"'));
+assert(!html.includes('id="wifi-bluetooth-action"'));
 run("wifiShowPermissions({platform:'macos',location:'not_determined',bluetooth:'denied'})");
-assert.equal(element('wifi-permissions').hidden,false);
-assert.equal(element('wifi-location-action').textContent,'授权定位');
-assert.equal(element('wifi-bluetooth-action').textContent,'打开蓝牙设置');
+assert.equal(element('wifi-permission-action').textContent,'授权定位与蓝牙');
 assert.match(element('wifi-bluetooth-note').textContent,/隐私与安全性 → 蓝牙/);
-let authorizationPoll=0;
+let permissionState={platform:'macos',location:'not_determined',bluetooth:'not_determined'};
+let authorizationPoll=0,requested=false;
 handlers.platform_wifi=({op})=>{
-  if(op==='permission_location')return {platform:'macos',location:'not_determined',bluetooth:'denied'};
-  if(op==='permissions') {authorizationPoll++;return {platform:'macos',location:'allowed',bluetooth:'denied'};}
-  if(op==='settings_bluetooth')return {opened:true};
+  if(op==='permission_all'){requested=true;return permissionState;}
+  if(op==='permissions') {
+    if(requested){authorizationPoll++;permissionState={platform:'macos',location:'allowed',bluetooth:authorizationPoll===1?'not_determined':'allowed'};}
+    return permissionState;
+  }
   if(op==='host')return {state:'connected',networks:[{ssid:'Host-5G'}]};
+  if(op==='settings_permissions')return {opened:true};
   throw new Error('Unexpected permission operation '+op);
 };
 const requestStart=calls.length;
-await run("wifiPermissionAction('location')");
-assert.equal(authorizationPoll,1);
-assert.equal(element('wifi-permission-location').hidden,true);
-assert.equal(element('wifi-permission-bluetooth').hidden,false);
-assert.equal(element('wifi-host').textContent,'Host-5G');
-assert.equal(calls.slice(requestStart).filter(c=>c.args.op==='permission_location').length,1);
-assert.equal(element('wifi-permission-result').textContent,'已授权。');
-const settingsStart=calls.length;
-await run("wifiPermissionAction('bluetooth')");
-assert(calls.slice(settingsStart).some(c=>c.args.op==='settings_bluetooth'));
-assert(!calls.slice(settingsStart).some(c=>c.args.op==='permission_bluetooth'));
-run("wifiShowPermissions({platform:'macos',location:'disabled',bluetooth:'restricted'})");
-assert.equal(element('wifi-location-action').textContent,'打开定位设置');
-assert.match(element('wifi-location-note').textContent,/开启定位服务/);
-assert.match(element('wifi-bluetooth-note').textContent,/管理员/);
-run("wifiShowPermissions({platform:'macos',location:'allowed',bluetooth:'allowed'})");
+run('wifiPermissionStartupChecked=false');
+await run('wifiInitPermissions()');
+assert.equal(authorizationPoll,2);
+assert.equal(calls.slice(requestStart).filter(c=>c.args.op==='permission_all').length,1);
 assert.equal(element('wifi-permissions').hidden,true);
-run("wifiShowPermissions({platform:'other'})");assert.equal(element('wifi-permissions').hidden,true);
-run("wifiShowPermissions({platform:'macos',location:'not_determined',bluetooth:'allowed'})");
-handlers.platform_wifi=({op})=>op==='host'?{state:'permission_required',networks:[]}:
-  {platform:'macos',location:'not_determined',bluetooth:'allowed'};
-const pendingStart=calls.length;
-await run("wifiPermissionAction('location')");
-assert.equal(calls.slice(pendingStart).filter(c=>c.args.op==='permissions').length,12);
-assert.equal(calls.slice(pendingStart).filter(c=>c.args.op==='permission_location').length,1);
+assert.equal(element('wifi-permission-result').textContent,'两项权限已授权。');
+assert.equal(element('wifi-host').textContent,'Host-5G');
+const secondStart=calls.length;await run('wifiInitPermissions()');
+assert.equal(calls.length,secondStart);
+for(const state of [{platform:'macos',location:'allowed',bluetooth:'allowed'},
+ {platform:'macos',location:'denied',bluetooth:'restricted'}, {platform:'other'}]) {
+ permissionState=state;requested=false;run('wifiPermissionStartupChecked=false');
+ const start=calls.length;await run('wifiInitPermissions()');
+ assert(!calls.slice(start).some(c=>/^(permission_|settings_)/.test(c.args.op)));
+}
+permissionState={platform:'macos',location:'disabled',bluetooth:'denied'};
+run('wifiShowPermissions('+JSON.stringify(permissionState)+')');
+assert.equal(element('wifi-permission-action').textContent,'打开权限设置');
+assert.match(element('wifi-location-note').textContent,/开启定位服务/);
+const settingsStart=calls.length;await run('wifiPermissionAction()');
+assert.equal(calls.slice(settingsStart).filter(c=>c.args.op==='settings_permissions').length,1);
+assert(!calls.slice(settingsStart).some(c=>/^permission_/.test(c.args.op)));
+// Slow decisions stay pending; native callbacks own the second system request.
+permissionState={platform:'macos',location:'not_determined',bluetooth:'allowed'};
+handlers.platform_wifi=({op})=>op==='host'?{state:'permission_required',networks:[]}:permissionState;
+const pendingStart=calls.length;await run('wifiPermissionAction()');
+assert.equal(calls.slice(pendingStart).filter(c=>c.args.op==='permissions').length,13);
+assert.equal(calls.slice(pendingStart).filter(c=>c.args.op==='permission_all').length,1);
 assert.match(element('wifi-permission-result').textContent,/等待系统授权/);
-assert.equal(element('wifi-permissions').hidden,false); // Never fake a grant after timeout.
-assert.equal(element('wifi-location-action').disabled,false);
+assert.equal(element('wifi-permissions').hidden,false);
+assert.equal(element('wifi-permission-action').disabled,false);
+// Duplicate clicks cannot issue another native request while the first is active.
+let finishPermissionCheck;
+handlers.platform_wifi=({op})=>op==='permissions'?new Promise(resolve=>{finishPermissionCheck=resolve}):permissionState;
+const busyStart=calls.length,activeRequest=run('wifiPermissionAction()');
+await run('wifiPermissionAction()');assert.equal(calls.length,busyStart+1);
+permissionState={platform:'macos',location:'allowed',bluetooth:'allowed'};
+finishPermissionCheck(permissionState);await activeRequest;
+assert.equal(element('wifi-permissions').hidden,true);
 const startup=script.slice(script.lastIndexOf('\n  renderFamilyMenu();'));
-assert(startup.includes('wifiCheckPermissions(true)'));
-assert(!/wifiPermissionAction|host_permission|permission_location|permission_bluetooth/.test(startup));
+assert(startup.includes('wifiInitPermissions()'));
 run("wifiPermissionGuideShown=false;wifiShowPermissions({platform:'macos',location:'not_determined',bluetooth:'allowed'});wifiGuidePermissionsOnce()");
 assert.equal(run('wifiPermissionGuideShown'),true);
-const guidedCalls=calls.length;
-run('wifiGuidePermissionsOnce()');assert.equal(calls.length,guidedCalls);
+const guidedCalls=calls.length;run('wifiGuidePermissionsOnce()');assert.equal(calls.length,guidedCalls);
 
 // Exercise the real edit/delete/save chain through production HTML and IPC.
 let persistedWifi;
@@ -340,7 +353,7 @@ console.log('Imported Bridge target: direct edit saved under original identity, 
 
 console.log('Wi-Fi edits: stable identity, rename, delete/save, undo, cancelled delete, duplicate protection and version/password retention OK');
 
-console.log('permission UI: passive startup, bounded request follow-up, denied/settings, global disable, real-grant visibility OK');
+console.log('permission UI: combined first-start request, bounded follow-up, denied/settings, duplicate guard, real-grant visibility OK');
 console.log('device page: passive cache, full bond/legacy groups, offline drafts, queued reads, whole-network preview, stale-MAC isolation and secret cleanup OK');
 
 // Manual sync guard applies to merged device rows, not local editing/import.
@@ -368,6 +381,8 @@ assert.match(element('wifi-online').textContent,/BOOT 在线.*剩余 (119|120) �
 run(`wifiRenderOnline({observed_at:Date.now()/1000-60,presence:{mode:'continuous',remaining_ms:null,reasons:['usb']}})`);
 assert.match(element('wifi-online').textContent,/在线状态待确认/);
 
+for(const [code,text] of [['not_sent','未发送'],['result_unknown','勿重复提交'],['network_not_found','未找到网络'],['window_budget_exhausted','预算已耗尽'],['http_proof_budget_exhausted','未能确认 HTTP']])
+  assert(run(`wifiError('${code}')`).includes(text));
 assert.match(run("wifiError('revision_conflict')"),/缓存已过期.*重新读取设备/);
 
 run("wifiState={local_revision:7,targets:[{network_id:'home',host_ssid:'Host 5G',ssid:'Device',deleted:false}],jobs:[]};wifiHostNetwork={state:'connected',networks:[{ssid:'Host 5G'}]}");

@@ -13,7 +13,7 @@ pub fn read(request_permission: bool) -> Value {
     unsafe { native_json(codex_host_wifi_read(i32::from(request_permission)), json!({"state":"unavailable", "networks":[]})) }
 }
 
-/// 0: passive check, 1: explicit location request, 2: explicit Bluetooth request.
+/// 0: passive check, 1: location, 2: Bluetooth, 3: sequential combined request.
 #[cfg(target_os = "macos")]
 pub fn permissions(request: i32) -> Value {
     unsafe extern "C" { fn codex_permissions_read(request: i32) -> *mut std::ffi::c_char; }

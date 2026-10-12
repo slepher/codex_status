@@ -7,6 +7,13 @@ inline uint64_t rendezvousWindowUntil(uint64_t now, uint64_t lightUntil, uint64_
     return until > now ? until : 0;
 }
 
+// Same existing limits, distinct terminal reasons. millis subtraction wraps safely.
+inline const char *syncBudgetFailure(uint64_t now, uint64_t openedAt, uint32_t uptime, uint32_t lastProgress) {
+    if (now >= openedAt + 90000) return "sync_total_budget_exhausted";
+    if (lastProgress && (uint32_t)(uptime-lastProgress) >= 90000) return "sync_no_progress";
+    return nullptr;
+}
+
 // Pure lifecycle. GPIO/radio/WebServer/PM operations belong to the adapter.
 constexpr uint32_t RV_NETWORK_MS = 30000;
 constexpr uint32_t RV_CONNECTED_MS = 6000;

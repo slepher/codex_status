@@ -31,12 +31,12 @@ pub async fn action(ctx: &AppCtx, mac: &str, op: &str, body: Value) -> Result<Va
         let request = op == "host_permission";
         return tokio::task::spawn_blocking(move || host_wifi::read(request)).await.map_err(|_| "host_network_unavailable".into());
     }
-    if matches!(op, "permissions" | "permission_location" | "permission_bluetooth") {
-        let request = match op { "permission_location" => 1, "permission_bluetooth" => 2, _ => 0 };
+    if matches!(op, "permissions" | "permission_location" | "permission_bluetooth" | "permission_all") {
+        let request = match op { "permission_location" => 1, "permission_bluetooth" => 2, "permission_all" => 3, _ => 0 };
         return tokio::task::spawn_blocking(move || host_wifi::permissions(request)).await.map_err(|_| "permissions_unavailable".into());
     }
-    if matches!(op, "settings_location" | "settings_bluetooth") {
-        let section = i32::from(op == "settings_bluetooth");
+    if matches!(op, "settings_location" | "settings_bluetooth" | "settings_permissions") {
+        let section = match op { "settings_bluetooth" => 1, "settings_permissions" => 2, _ => 0 };
         tokio::task::spawn_blocking(move || host_wifi::open_settings(section)).await.map_err(|_| "privacy_settings_unavailable")??;
         return Ok(json!({"opened":true}));
     }
@@ -434,6 +434,19 @@ pub fn http_ready(ctx:&AppCtx,mac:&str) {
         c.confirm_http();let _=platform::service(ctx).wifi_note_connection(mac,c);
     }
 }
+/// Preserve device failure and carrier outcome in the same MCP/UI projection.
+pub fn network_failed(ctx:&AppCtx,mac:&str,error:&str) {
+    let state=platform::service(ctx).wifi_state(mac);
+    if let Some(mut c)=state.connection.filter(|c|c.local_revision==state.local_revision) {
+        if matches!(error,"network_not_found"|"authentication_failed"|"security_mismatch"|
+            "signal_weak"|"association_failed"|"handshake_timeout"|"dhcp_timeout"|"connect_timeout") {
+            c.state="connection_failed".into();c.error=Some(error.into());c.http_ready=false;
+        } else if matches!(error,"not_sent"|"result_unknown"|"http_proof_budget_exhausted") {
+            c.fail_http(error);
+        } else { return; }
+        let _=platform::service(ctx).wifi_note_connection(mac,c);
+    }
+}
 pub fn http_failed(ctx:&AppCtx,mac:&str,error:&str) {
     let state=platform::service(ctx).wifi_state(mac);
     if let Some(mut c)=state.connection.filter(|c|c.local_revision==state.local_revision) {
@@ -532,8 +545,11 @@ pub async fn automatic_on_link(ctx: &AppCtx,mac:&str,link:&mut bridge_ble::Devic
             };
             let was_sent=job.sent;
             unified_on_link(ctx,mac,link,budget,Some(&job.job_id)).await;
+            let current=svc.wifi_state(mac).jobs.into_iter().find(|j|j.job_id==job.job_id).ok_or("wifi_job_not_found")?;
+            if current.sent && current.state=="awaiting_confirmation" && current.error_code.as_deref()==Some("result_unknown") {
+                return Err("result_unknown".into());
+            }
             if !was_sent {
-                let current=svc.wifi_state(mac).jobs.into_iter().find(|j|j.job_id==job.job_id).ok_or("wifi_job_not_found")?;
                 if !current.sent {
                     let code=current.error_code.unwrap_or("wifi_not_dispatched".into());connection.error=Some(code.clone());
                     svc.wifi_note_connection(mac,connection).map_err(|_|"persistence_failed".to_owned())?;return Err(code);
@@ -543,12 +559,22 @@ pub async fn automatic_on_link(ctx: &AppCtx,mac:&str,link:&mut bridge_ble::Devic
             }
             return Ok(());
         }
+        let previous_attempts=connection.attempts;let previous_next=connection.next_attempt_at;
         connection.attempts+=1;connection.next_attempt_at=now+60;connection.state="connecting".into();connection.http_ready=false;
         svc.wifi_note_connection(mac,connection.clone()).map_err(|_|"persistence_failed".to_owned())?;
-        match link.command("wifi_activate",json!({"network_id":target.network_id,"version":reply["version"]})).await {
+        let id=uuid::Uuid::new_v4().simple().to_string();
+        match link.command_with_id_budget("wifi_activate",json!({"network_id":target.network_id,"version":reply["version"]}),&id,budget.remaining()).await {
             Ok(result) if result["ok"]==true => {},
             Ok(result) => {connection.state="connection_failed".into();connection.error=Some(result["error"].as_str().filter(|e|e.len()<64&&e.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'_')).unwrap_or("wifi_rejected").into());let _=platform::service(ctx).wifi_note_connection(mac,connection);},
-            Err(_) => {connection.state="awaiting_confirmation".into();connection.error=Some("wifi_command_unknown".into());let _=platform::service(ctx).wifi_note_connection(mac,connection);},
+            Err(error) => {
+                let not_sent=bridge_core::rendezvous::not_dispatched(&error);
+                let code=if not_sent {"not_sent"}else{"result_unknown"};
+                if not_sent {connection.attempts=previous_attempts;connection.next_attempt_at=previous_next;}
+                connection.state=if not_sent {"waiting_for_window"}else{"awaiting_confirmation"}.into();
+                connection.fail_http(code);
+                let _=platform::service(ctx).wifi_note_connection(mac,connection);
+                return Err(code.into());
+            },
         }
         return Ok(());
         }
@@ -726,13 +752,16 @@ async fn unified_on_link(ctx:&AppCtx,mac:&str,link:&mut bridge_ble::DeviceConnec
         if budget.remaining().is_zero() {return Err(bridge_core::rendezvous::NotDispatched.into());}
         let (reply,result)=std::sync::mpsc::sync_channel(1);
         tx.blocking_send((op.to_owned(),body,reply)).map_err(|_|anyhow::anyhow!("ble_window_closed"))?;
-        result.recv_timeout(budget.remaining()).map_err(|_|anyhow::anyhow!("ble_window_closed"))?
+        // The async carrier enforces this exact budget and always sends its
+        // dispatch proof (or drops the sender on cancellation). A racing second
+        // deadline here would discard NotSent/ACK-unknown at the boundary.
+        result.recv().map_err(|_|anyhow::anyhow!("ble_window_closed"))?
     }));
     while let Some((op,body,reply))=rx.recv().await {
-        let result=tokio::time::timeout(budget.remaining(),async {
-            if op=="snapshot" {link.wifi_snapshot().await}
-            else {let id=body["request_id"].as_str().map(str::to_owned);let wire=if op=="apply" {"wifi_save".to_owned()} else {format!("wifi_{op}")};if let Some(id)=id {link.command_with_id(&wire,body,&id).await}else{link.command(&wire,body).await}}
-        }).await.unwrap_or_else(|_|Err(anyhow::anyhow!("ble_window_closed")));
+        let result=if op=="snapshot" {
+            tokio::time::timeout(budget.remaining(),link.wifi_snapshot()).await
+                .unwrap_or_else(|_|Err(anyhow::anyhow!("wifi_snapshot_timeout")))
+        } else {let id=body["request_id"].as_str().map(str::to_owned);let wire=if op=="apply" {"wifi_save".to_owned()} else {format!("wifi_{op}")};let id=id.unwrap_or_else(||uuid::Uuid::new_v4().simple().to_string());link.command_with_id_budget(&wire,body,&id,budget.remaining()).await};
         let _=reply.send(result);
     }
     let _=worker.await;

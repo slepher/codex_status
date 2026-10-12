@@ -315,12 +315,10 @@
         <p class="section-note">离线编辑 Bridge 目标，读取设备方案后比较与同步。同步只保存配置，试连和启用分别执行。</p>
         <div class="wifi-permissions" id="wifi-permissions" hidden>
           <h3>完成 macOS 权限设置</h3>
-          <p class="muted">定位权限用于读取当前 Wi-Fi 名称；蓝牙权限用于连接屏幕。这里只在你点击授权时请求，授权成功后此提示会收起。</p>
-          <div class="prow" id="wifi-permission-location"><div class="pmeta"><b>读取 Wi-Fi 名称</b><small id="wifi-location-note"></small></div>
-            <button id="wifi-location-action" onclick="wifiPermissionAction('location')">授权定位</button></div>
-          <div class="prow" id="wifi-permission-bluetooth"><div class="pmeta"><b>连接蓝牙设备</b><small id="wifi-bluetooth-note"></small></div>
-            <button id="wifi-bluetooth-action" onclick="wifiPermissionAction('bluetooth')">授权蓝牙</button></div>
-          <div class="action-strip"><button id="wifi-permission-recheck" onclick="wifiCheckPermissions()">重新检查</button></div>
+          <p class="muted">定位权限用于读取当前 Wi-Fi 名称；蓝牙权限用于连接屏幕。首次启动会依次弹出系统授权，两项允许后此提示会收起。</p>
+          <div class="prow" id="wifi-permission-location"><div class="pmeta"><b>读取 Wi-Fi 名称</b><small id="wifi-location-note"></small></div></div>
+          <div class="prow" id="wifi-permission-bluetooth"><div class="pmeta"><b>连接蓝牙设备</b><small id="wifi-bluetooth-note"></small></div></div>
+          <div class="action-strip"><button id="wifi-permission-action" onclick="wifiPermissionAction()">授权定位与蓝牙</button><button id="wifi-permission-recheck" onclick="wifiCheckPermissions()">重新检查</button></div>
           <p id="wifi-permission-result" role="status" aria-live="polite"></p>
         </div>
         <div class="wifi-summary">
@@ -1072,10 +1070,13 @@
   let wifiScheme=null, wifiHostNetwork=null, wifiBusyMac=null;
   let wifiState={local_revision:0,targets:[],jobs:[]}, wifiDifferences=[], wifiDraft=[], wifiDirty=false, wifiPreview=null, wifiEditingId=null;
   let wifiViewMac=null, wifiRequestSeq=0, wifiResultJobId=null;
-  let wifiPermissions=null, wifiPermissionBusy=false, wifiPermissionGuideShown=false;
+  let wifiPermissions=null, wifiPermissionBusy=false, wifiPermissionGuideShown=false, wifiPermissionStartupChecked=false;
   const wifiDrafts=new Map(), wifiSelections=new Map();
   const wifiError=e=>({ambiguous_network_id:'设备存在同名配置，无法确定目标。配置已保留，请核对冲突记录。',revision_conflict:'设备方案已变化，缓存已过期，请重新读取设备后再同步。Bridge 配置已保留。',physical_required:'请单击 BOOT 开启维护窗口',unsupported:'此固件尚不支持完整方案，请等待升级',
     local_revision_conflict:'Bridge 保存版本已改变，保留修改，请重新比较',target_revision_conflict:'方案已改变，请处理冲突',host_network_changed:'主机网络已改变，请重新选择当前网络',network_not_configured:'Bridge 尚无当前网络配置，请先保存方案',current_network_required:'请保留或加入当前网络后再同步。',host_network_unknown:'无法识别当前网络，请先授权读取主机 Wi-Fi。',snapshot_conflict:'设备快照已变化，请重新预览。',
+    http_session_mismatch:'HTTP 会话与本次设备会合不一致，已停止执行。',http_wake_mismatch:'HTTP 响应属于其他醒次，已停止执行。',rendezvous_failed:'本轮设备会合失败，任务与本地配置已保留。',
+    plan_unconfirmed:'设备计划尚未确认，本次未继续执行任务。',
+    not_sent:'本次命令未发送；等待下次可用通道。',result_unknown:'命令可能已生效，先确认原操作，勿重复提交。',network_not_found:'设备未找到网络，请检查 2.4GHz 网络和信号。',window_budget_exhausted:'本轮工作预算已耗尽，等待下次会合。',http_proof_budget_exhausted:'启动已接受，但本轮预算内未能确认 HTTP 就绪。',
     snapshot_required_or_read_only:'需要完整快照，或选中项属于只读归属',credentials_required:'等待本次密码输入',
     bluetooth_permission_required:'请在 Wi-Fi 页面完成 macOS 蓝牙授权',bluetooth_permission_denied:'请在系统设置 → 隐私与安全性 → 蓝牙中允许 Codex Status Bridge',
     bluetooth_permission_restricted:'蓝牙权限受系统管理限制，请联系管理员',
@@ -1139,16 +1140,17 @@
     const needed=p.platform==='macos'&&(p.location!=='allowed'||p.bluetooth!=='allowed');
     $('wifi-permissions').hidden=!needed;
     for(const kind of ['location','bluetooth']) {
-      const state=p[kind], name=kind==='location'?'定位':'蓝牙';
+      const state=p[kind];
       $('wifi-permission-'+kind).hidden=state==='allowed';
-      const note={not_determined:'尚未授权。点击按钮后在 macOS 系统弹窗中允许。',
+      const note={not_determined:'尚未授权。请在 macOS 系统弹窗中允许，也可点击下方按钮申请。',
         denied:`已拒绝。前往系统设置 → 隐私与安全性 → ${kind==='location'?'定位服务':'蓝牙'}，允许 Codex Status Bridge。`,
         disabled:'系统定位服务已关闭。前往系统设置 → 隐私与安全性 → 定位服务，开启定位服务并允许 Codex Status Bridge。',
         restricted:'权限受系统管理限制，请联系管理员。',unavailable:'暂时无法读取权限状态，请重新检查。'}[state]||'正在读取权限状态。';
       $('wifi-'+kind+'-note').textContent=note;
-      $('wifi-'+kind+'-action').textContent=state==='not_determined'?'授权'+name:'打开'+name+'设置';
-      $('wifi-'+kind+'-action').disabled=wifiPermissionBusy||state==='unavailable'||!state;
     }
+    const states=[p.location,p.bluetooth];
+    $('wifi-permission-action').textContent=states.includes('not_determined')?'授权定位与蓝牙':'打开权限设置';
+    $('wifi-permission-action').disabled=wifiPermissionBusy||!states.some(s=>['not_determined','denied','disabled'].includes(s));
     $('wifi-permission-recheck').disabled=wifiPermissionBusy;
   }
   function wifiGuidePermissionsOnce() {
@@ -1157,37 +1159,46 @@
     document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('on',b.dataset.tab==='device'));
     document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('on',p.id==='tab-device'));
     $('wifi-permissions').scrollIntoView({block:'center'});
-    const kind=wifiPermissions?.location!=='allowed'?'location':'bluetooth';
-    $('wifi-'+kind+'-action').focus();
+    $('wifi-permission-action').focus();
   }
   async function wifiCheckPermissions(guide=false) {
     try { const p=await invoke('platform_wifi',{mac:'',op:'permissions',body:{}});wifiShowPermissions(p);
       if(guide)wifiGuidePermissionsOnce();return p; }
     catch(e){$('wifi-permission-result').textContent=wifiError(e);return null;}
   }
-  async function wifiPermissionAction(kind) {
-    if(!['location','bluetooth'].includes(kind)||wifiPermissionBusy)return;
-    const state=wifiPermissions?.[kind];
-    const request=state==='not_determined';
+  async function wifiInitPermissions() {
+    if(wifiPermissionStartupChecked)return;
+    wifiPermissionStartupChecked=true;
+    const p=await wifiCheckPermissions(true);
+    if(p?.platform==='macos'&&[p.location,p.bluetooth].includes('not_determined'))
+      await wifiPermissionAction(true);
+  }
+  async function wifiPermissionAction(automatic=false) {
+    if(wifiPermissionBusy)return;
     wifiPermissionBusy=true;wifiShowPermissions(wifiPermissions);
-    $('wifi-permission-result').textContent=request?'请在 macOS 系统弹窗中选择允许。':'正在打开系统设置；完成后点击重新检查。';
     try {
-      const p=await invoke('platform_wifi',{mac:'',op:(request?'permission_':'settings_')+kind,body:{}});
-      if(request) {
-        wifiShowPermissions(p);
-        // Bounded follow-up; never initiate another request while polling.
-        for(let i=0;i<12&&wifiPermissions?.[kind]==='not_determined';i++) {
+      const current=await wifiCheckPermissions();
+      if(current?.platform!=='macos')return;
+      const pending=()=>[wifiPermissions?.location,wifiPermissions?.bluetooth].includes('not_determined');
+      if(pending()) {
+        $('wifi-permission-result').textContent='请依次在 macOS 系统弹窗中允许定位与蓝牙。';
+        wifiShowPermissions(await invoke('platform_wifi',{mac:'',op:'permission_all',body:{}}));
+        // Native callbacks continue the sequence after slow system decisions.
+        for(let i=0;i<12&&pending();i++) {
           await new Promise(resolve=>setTimeout(resolve,750));await wifiCheckPermissions();
         }
-        $('wifi-permission-result').textContent=wifiPermissions?.[kind]==='allowed'?'已授权。':
-          wifiPermissions?.[kind]==='not_determined'?'等待系统授权；完成后点击重新检查。':'请按上方说明在系统设置中处理。';
+        $('wifi-permission-result').textContent=[wifiPermissions?.location,wifiPermissions?.bluetooth].every(s=>s==='allowed')?'两项权限已授权。':
+          pending()?'等待系统授权；完成后点击重新检查。':'请按上方说明在系统设置中处理。';
+      } else if(!automatic&&[current.location,current.bluetooth].some(s=>['denied','disabled'].includes(s))) {
+        await invoke('platform_wifi',{mac:'',op:'settings_permissions',body:{}});
+        $('wifi-permission-result').textContent='请在隐私与安全性中检查定位服务和蓝牙，完成后点击重新检查。';
       }
       await wifiHost(false);
     } catch(e){$('wifi-permission-result').textContent=wifiError(e);}
     finally{wifiPermissionBusy=false;wifiShowPermissions(wifiPermissions);}
   }
   async function wifiHost(permission) {
-    if(permission)return wifiPermissionAction('location');
+    if(permission)return wifiPermissionAction();
     try {wifiShowHost(await invoke('platform_wifi',{mac:'',op:'host',body:{}}));}
     catch(e){$('wifi-host').textContent=wifiError(e);}
   }
@@ -1279,8 +1290,8 @@
     const state=job?.sent?'awaiting_confirmation':job?.state||v.automatic_state;
     const text={requested:'已请求使用当前网络，等待设备会合。',queued:'已排队，等待设备会合。',waiting_rendezvous:'等待设备的可用通道。',no_mapping:'Bridge 没有该网络的配置，请新增。',waiting_for_window:'已匹配 Bridge 方案，等待设备会合。',selected:'设备已选此方案，等待联网验证。',connecting:'设备正在连接此网络。',needs_sync:'设备需要更新此方案，通道可用时将写入。',waiting_input:'此方案缺少可用凭据，请提供本次密码。',waiting_authorization:'等待设备的可用通道写入此方案。',awaiting_confirmation:'正在确认上次操作结果，请勿重复提交。',occupied:'设备由其他 Bridge 占用。',firmware_upgrade_required:'设备固件需要升级以报告网络连接结果。'};
     const failure={authentication_failed:'设备认证失败，请核对密码和安全模式。',security_mismatch:'网络安全模式不兼容，请修正配置。',network_not_found:'设备未找到此网络，请检查 2.4GHz 网络是否可用。',signal_weak:'网络信号过弱，请检查距离。',association_failed:'设备关联失败，请检查网络。',handshake_timeout:'认证握手超时，请检查网络或凭据。',dhcp_timeout:'已关联但未取得 IP，请检查路由器 DHCP。',connect_timeout:'连接超时，请检查网络；尚不能判断密码错误。',storage:'配置保存失败，请重新检查设备。'};
-    const message=state==='retry_exhausted'?`自动连接已尝试 3 次，现已停止。${failure[c?.error]||'请检查网络。'}检查后可点击“重新尝试连接”。`:state==='bridge_unreachable'?(c?.error==='unauthorized'?'设备 HTTP 授权失败，请检查 Bridge 授权。':c?.error==='http_identity_mismatch'?'HTTP 设备身份不符，请检查地址。':'设备已连接当前网络，但 Bridge 无法访问设备 HTTP；请检查网络隔离或访问地址。'):state==='connection_failed'?(failure[c?.error]||'设备连接失败，请检查配置。'):
-      state==='connected'?(c?.bridge_error?'设备已连接 Wi-Fi；Bridge 验证未通过，请检查设备通信错误。':c?.http_ready?'设备已连接 Wi-Fi，Bridge HTTP 已确认。':'设备已连接 Wi-Fi，正在确认 Bridge HTTP。'):text[state]||'等待可用的主机 Wi-Fi 与设备会合。';
+    const message=['not_sent','result_unknown','http_proof_budget_exhausted'].includes(c?.bridge_error)?wifiError(c.bridge_error):state==='retry_exhausted'?`自动连接已尝试 3 次，现已停止。${failure[c?.error]||'请检查网络。'}检查后可点击“重新尝试连接”。`:state==='bridge_unreachable'?(c?.error==='unauthorized'?'设备 HTTP 授权失败，请检查 Bridge 授权。':c?.error==='http_identity_mismatch'?'HTTP 设备身份不符，请检查地址。':'设备已连接当前网络，但 Bridge 无法访问设备 HTTP；请检查网络隔离或访问地址。'):state==='connection_failed'?(failure[c?.error]||'设备连接失败，请检查配置。'):
+      state==='connected'?(c?.bridge_error?wifiError(c.bridge_error):c?.http_ready?'设备已连接 Wi-Fi，Bridge HTTP 已确认。':'设备已连接 Wi-Fi，正在确认 Bridge HTTP。'):text[state]||'等待可用的主机 Wi-Fi 与设备会合。';
     $('wifi-auto').textContent=ssid?`${target?.label||target?.network_id||ssid} · ${message}`:message;
     const action=$('wifi-current-action');action.hidden=!ssid;
     action.textContent=target?(state==='connection_failed'?'修正此网络配置':state==='waiting_input'?'补充此网络密码':'编辑此网络配置'):'配置当前网络';
@@ -2064,7 +2075,7 @@
   refreshProfiles();
   refreshPlatformTemplates();
   clearDeviceView();
-  wifiCheckPermissions(true); // Passive: opening the app never requests permission.
+  wifiInitPermissions(); // First launch requests only undecided system permissions.
   // Resolve the selected device before painting the device-dependent cards.
   refreshPlatformDevice().then(() => { refresh(); refreshDevice(); refreshPlatformPower(); });
   refreshPlatformData();

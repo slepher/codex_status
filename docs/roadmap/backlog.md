@@ -204,6 +204,8 @@
 
 ### B5. Bridge macOS 菜单栏支持（2026-10-03 新开）
 
+- **2026-10-12 统一授权入口已部署**：按用户新要求合并定位/蓝牙按钮，首次启动仅对未决定权限自动请求，原生delegate在定位选择后续请求蓝牙；拒绝不自动重弹，统一入口可开隐私设置。Node/App85（3条件忽略）/WK52与窄宽审阅通过；部署后MCP双allowed，未主动重置权限/钥匙串，首次未决真实弹窗次序仍未人为重现。详见[专项](../../project-workflow/bridge-macos/permissions-unified-20261012.md)，不以此结整个B5。
+
 - **2026-10-04 权限引导已部署**：缺权限时打开界面一次性转至引导，未决可请求/拒绝可开系统设置，定位请求等待实际前台激活、BLE后台不反复创建未授权central；App64通过/1既有需模拟器ignored，JS与WKWebView16场景通过。生产回读两权限尚未授权；待用户系统确认后真实SSID/撤权恢复及同镜像重启验证。用户明确暂不更改钥匙串，持久签名未实施，跨重建授权保持不能据此结项。证据/状态见[permissions-plan.md](../../project-workflow/bridge-macos/permissions-plan.md)。
 
 - A8与W7已修复/部署，成功数据证据不能替代USB常驻验收：实固件BLE data置pending仅由timer会合消费，普通USB loop的消费缺口/Fake立即绘制差异仍待独立复现与修复；完整USB/自然会合/重连矩阵保持开放。
@@ -217,6 +219,14 @@
 - 2026-10-03 用户确认本环境仅携带 Note4，1.54 不在现场：当前实机验收以 Note4 为范围，保留双设备软件身份回归；Windows 对照、Note4 每平台 ≥30 个自然会合及 macOS ≥24 h soak 按后续可用现场验证。1.54 实机与另一 CPU 架构另标未验，不为本轮要求用户取回设备，也不据 Note4 结果宣称全硬件已验。当前会话为 macOS 14.8.9 / x86_64，macOS 15+ 权限现场尚未验证。
 
 ### B6. 离线 BLE 配 Wi-Fi 与 BOOT 蓝牙恢复入口（2026-10-03 新开）
+
+
+
+- **2026-10-12 用户要求下一轮总体分析（关联C8）**：重点审查“防御代码多但关键逻辑漏处理”，按生产生命周期与资源所有权解释局部有界而失败清理无界的矛盾，评估重复防御的删除/合并并保持有效不变量，提出最小修复与失败后继续会合的验收。[当前问题报告/新窗口入口](../../project-workflow/bridge-macos/overall-analysis-handoff-20261012.md)已区分现场事实、推断、已部署与候选；本次仅记录，未做全仓审计或实施。
+
+- **2026-10-12 13:19后BLE扫描停滞，15:55清理修复已部署**：建链失败无界disconnect及其余裸清理统一原2s预算，记录开始/完成/明确失败/耗尽，不增大连接或业务超时。生产控制流注入两次connect失败+cleanup pending，red→green验证原错误返回/锁释放/下一连接；Rust269/3条件忽略、Node/WK60通过。实机15:56首轮Plan写入未知后持续扫描，15:58同MAC/wake908完整会合、15:59认证HTTP通过。总体P2迟到回调/worker失效等矩阵仍未完成，原进程具体卡点无栈实证。[修复与部署](../../project-workflow/bridge-macos/ble-connect-cleanup-fix-20261012.md)、[原取证](../../project-workflow/bridge-macos/disconnect-investigation-20261012.md)。
+
+- **2026-10-12 macOS读取RF截止修复已部署**：Plan ACK后及SyncOpen后读取同MAC/wake真实INFO窗口，完整发送丢ACK允许只读恢复，未知分片不复用。生产Fake四种边界及App85/BLE17通过、3条件忽略；用户恢复权限后最终Bridge实机BLE完整读取r237成功，后续认证HTTP正常且一次完整读回r238（active office/Xiaomi_1EBB）；本次读取故障验收通过，长期矩阵不结B6/C8。当前任务/部署边界见[专项](../../project-workflow/bridge-macos/wifi-read-rf-20261012-plan.md)。
 
 - **2026-10-11 BOOT/GATT、计划恢复与OTA统一实现已部署**：Note4 .81/配套Bridge/实际手动BLE模板已部署，基线f822531后的统一实现随.82电量平滑按用户授权收尾提交。用户六次按键符合预期；计划3490经USB工具复位恢复同ID/原剩余期限并直接HTTP。367项软件测试通过、3条件忽略，匹配ELF66项栈检查通过；同名模板合同失效/发布后认证回读已修正。USB工具复位后认证HTTP延迟/超时及旧.78停滞根因仍未知；电池Sleep重启、RF/掉电/功耗完整矩阵未验，不结B6/C8。电量抖动研究后已按用户授权实施.82：5秒采样、显示专用90/10 EMA、原始保护/诊断独立，12定向回归及实机/用户按键验收通过，见[电量记录](../../project-workflow/bridge-macos/note4-battery-smoothing-20261011.md)。详见[执行与证据](../../project-workflow/bridge-macos/note4-boot-gatt-followup-20261011.md)及PROGRESS。
 
@@ -336,6 +346,12 @@
 - 前置：C3 的记录格式（否则没有可信的对照口径）。
 
 ### C8. 设备同步与诊断协议（device-sync-diagnostics）
+- **10月12日分类/关键日志：Bridge15:55已部署，固件仍候选**：未发送立即结束；写入未知禁止复用链路；整帧丢ACK可只读核验，已发事务仅原ID查询；201/认证原因不被普通断开覆盖，补启动/关联/IP/监听/ready ACK及明确预算原因，清空INFO初始化伪错误。Rust268/3条件忽略、Node/WK60、生产回调专项及Note4.85构建/64栈门禁通过；[实现与候选](../../project-workflow/bridge-macos/timeout-reporting-fix-20261012.md)。Bridge部分随[清理修复](../../project-workflow/bridge-macos/ble-connect-cleanup-fix-20261012.md)部署；固件0.18.85未部署，固件关键日志与完整RF矩阵/离线保留仍不结项。旧Wi-Fi管理宿主active_protected断言在HEAD对照也失败，需独立核对合同与用例，不能记为本次全套通过。
+- **10月12日超时分类补证**：10:09/10:10分页ACK正常61–152ms、末页仅19/16ms被旧RF预算截断，属已证Bridge窗口错误；10:22 SyncOpen等3844ms未ACK仍为写后未知，不能同归短窗口。wake638两次先出现201/network_not_found后约15s失败，90s同步日志又混合总预算/无进展，需分别报告而非统一延长超时。[分类与证据](../../project-workflow/bridge-macos/wake-network-log-investigation-20261012.md)。
+- **11:43手动Wi-Fi现场取证**：认证.83/wake675成功，6.6s IP/7.7s HTTP、真实light-sleep累计通过；同诊断代际，当前环最早1962，history654–675，旧wake632只剩归档摘要。另定位BLE初始化先refreshInfo后设provider制造空MAC预检错误；现场11条占902B（4KiB约22%），应修初始化順序减少伪错误，不能当作旧network_start故障根因。pcf8563短读现场有两条，影响未知。[直接取证](../../project-workflow/bridge-macos/wake-network-log-investigation-20261012.md)。
+- **即时查询语义续项**：10:10查不到不能归为已覆盖；MCP诊断分栏读本机checkpoint/已归档JSON，HTTP失败阻断实时采集，直到10:28归档才见gap。需区分未采集/读取失败/旧缓存/确认gap并显示采集时间，禁止把无本机记录当设备无日志；19分钟uptime不是距10:09事件时间。[证据更正](../../project-workflow/bridge-macos/wake-network-log-investigation-20261012.md)。
+- **原两小时保留目标续验**：旧sleep-modes设计120×约12B/每分钟1条；当前统一流wake_summary已72B且混入文本，4KiB不能沿用旧估算。10月12日单醒次重试样本2393B/567.1s，相同速率仅约16分钟、两小时约30KiB原始记录。需按实际写入率重验两小时目标并定义有界Flash离线保存/写入成本；40KiB现有冻结保留不等于连续日志落盘。[计算与证据](../../project-workflow/bridge-macos/wake-network-log-investigation-20261012.md)。
+- **2026-10-12 离线日志/启动调查续项**：旧RF截止阻止network_start路径已由生产客户端差分回归复现，此前RF刷新已部署。首份恢复batch553明确报告404–1802共1399条overwritten；冻结前4KiB RTC环在HTTP失败时不能无损保留。发送前失败/写超时缺细分日志、network_start把确定未发也当unknown等待，以及会合取得IP缺阶段时间仍待修；需有界失败摘要保护和关键启动/IP/HTTP事件，见[调查](../../project-workflow/bridge-macos/wake-network-log-investigation-20261012.md)。10:09具体提前退出异常/约一分钟关联时延无足够历史证据，不以源码复现代替实机事实。
 - **2026-10-11续项**：BOOT/GATT与跨重启PowerPlan、USB/Light直接HTTP、OTA独立镜像确认已随.81部署；发布后旧data_contract索引失效并认证回读已部署。软件与部分实机通过，认证HTTP间歇延迟、完整电池/RF/掉电矩阵仍开放；见[统一执行记录](../../project-workflow/bridge-macos/note4-boot-gatt-followup-20261011.md)，不因USB单轮通过结项。
 - `sync-v1` 实施合同见 `project-workflow/device-sync-diagnostics/design.md`。当前默认 Bridge 与双设备现场见 `docs/history/progress-archive-2026-10-03.md` 相关历史节：Note4 `0.18.38-note4-b-bridge2` 的运行分区前缀 SHA256 已由认证接口与候选 ROM 精确匹配；1.54 `0.18.34-bw-ota1` 已做 USB 写入后逐字节回读，运行分区的独立认证哈希仍待验。双设备 BLE status/config/plan/open、OTA 上传与重启换槽等先前实机证据保留。2026-09-29 后台隔离双 Fake ROM + 候选 Bridge 虚拟 24h 达到各 97 个连续批次和第 15 轮；独立 light 入/离场、进程重启及同 seed 1h 回放烟测通过，详见 `docs/history/progress-archive-2026-10-03.md`。一次性 Wi-Fi 续传修正及设备页/MCP 对等版已部署默认实例。Fake ROM S01–S14、设备页 U01–U20 完整矩阵、F3 延迟页/同磁盘快照回放、页中途强退、真实窗口视觉及其他实机故障矩阵仍未完成；Flash 断电恢复和 1.54 运行分区哈希证据仍须过门槛。
 - 当前设备协议作为唯一业务协议的一次性统一见 `project-workflow/device-sync-diagnostics/protocol-unification.md`：业务 HTTP 已收敛到 `/api/*`，旧 `protocol=2`、BLE `rv=2`/`ack="v2"` 与 MCP `_v2` 入口已移除。两台设备现已升级，临时旧 Bridge 已停、新版默认实例已恢复。1.54 的增量缓存复核已完成，结论与四次构建日志见 `docs/history/progress-archive-2026-10-03.md` 相关历史节；不并行运行两个 Bridge，也不保留长期双协议兼容。Bridge 本地 `state.json` 无损保留，不凭 wire 更名删除运行数据。

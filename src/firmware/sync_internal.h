@@ -23,6 +23,7 @@ struct State {
     bool syncSkippedThisWake = false;
     uint8_t syncVisibleSkip = 0;
     uint16_t syncBlockedError = 0;
+    const char *lastFailure = nullptr; // RAM only; durable reason also enters unified diagnostic text.
 };
 extern State state;
 

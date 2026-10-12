@@ -466,14 +466,16 @@ void tick() {
             sync::state.syncDataPending = false;
             sync::state.syncExitAtMs = 0;
             if (!power::state.v2Plan.lightActive(clock::v2NowMs())) power::enterDeep("sync complete");
-        } else if (clock::v2NowMs() >= sync::state.syncOpenAnsweredAt + 90000 ||
-                   (sync::state.syncLastProgressMs && (uint32_t)(millis() - sync::state.syncLastProgressMs) >= 90000)) {
+        } else if (const char *failure = syncBudgetFailure(clock::v2NowMs(), sync::state.syncOpenAnsweredAt,
+                                                          millis(), sync::state.syncLastProgressMs)) {
+            sync::state.lastFailure = failure;
             sync::syncRecordOutcome(1, 3);
             syncFail(sync::retained.syncRtc);
             sync::state.syncOpenThisWake = false;
             sync::state.syncDataSeq = 0;
             sync::state.syncDataPending = false;
-            DevLog.println("[sync] 90s window exhausted");
+            DevLog.printf("[sync] stage=end reason=%s elapsed=%ums\n", failure,
+                (unsigned)(clock::v2NowMs()-sync::state.syncOpenAnsweredAt));
             if (!power::state.v2Plan.lightActive(clock::v2NowMs())) power::enterDeep("sync incomplete");
         }
     }
@@ -493,6 +495,7 @@ void tick() {
                 sync::state.syncOpenThisWake = true;
                 sync::state.syncLastProgressMs = millis();
                 sync::state.syncOpenAnsweredAt = clock::v2NowMs();
+                sync::state.lastFailure = nullptr;
                 radio::sendAnnounce(radio::state.bleOn);
             } else power::enterDeep("plan");
             break;
@@ -503,6 +506,7 @@ void tick() {
                 sync::state.syncOpenThisWake = true;
                 sync::state.syncLastProgressMs = millis();
                 sync::state.syncOpenAnsweredAt = clock::v2NowMs();
+                sync::state.lastFailure = nullptr;
                 radio::sendAnnounce(radio::state.bleOn);
             } else power::enterDeep("provisional");
             break;

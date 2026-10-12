@@ -30,3 +30,8 @@ assert "operationToken.size() == strlen(operationToken.c_str())" in claim
 assert 'doc["force"].isNull()' in claim and 'doc["release"].isNull()' in claim
 assert "ownerApplyClaim(args, allowed)" in claim
 print("PASS: BLE claim adapter retains token, session and no-force authorization")
+
+# Initial INFO must have the real provider before bleBegin publishes it.
+ble_start=radio[radio.index("void enterBleOn("):radio.index("void bleOff(")]
+assert ble_start.index("bleSetInfoProvider(infoExtraJson);") < ble_start.index("bleBegin("), "initial INFO has no MAC provider"
+print("PASS: initial INFO provider installed before GATT publication")

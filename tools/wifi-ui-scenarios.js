@@ -47,7 +47,34 @@ window.__wifiUiScenario = async function(scenario) {
     check(window.__uiCalls.length===guideCalls,'Permission guide unexpectedly requested permission');
     check($('wifi-location-note').textContent.length>10,'Missing location instructions');
     check($('wifi-bluetooth-note').textContent.length>10,'Missing Bluetooth instructions');
-    check($('wifi-location-action').textContent.includes(scenario==='permission-request'?'授权':'设置'),'Incorrect location action');
+    check($('wifi-permission-action').textContent.includes(scenario==='permission-request'?'授权':'设置'),'Incorrect location action');
+    check(!document.getElementById('wifi-location-action')&&!document.getElementById('wifi-bluetooth-action'),'Separate permission buttons returned');
+    let permission={platform:'macos',location:scenario==='permission-request'?'not_determined':'disabled',bluetooth:scenario==='permission-request'?'not_determined':'denied'};
+    const permissionCalls=[];
+    window.__wifiRoundtripInvoke=async(name,args)=>{
+      check(name==='platform_wifi','Unexpected permission IPC');
+      permissionCalls.push(args.op);
+      if(args.op==='permissions')return permission;
+      if(args.op==='permission_all'){permission={platform:'macos',location:'allowed',bluetooth:'allowed'};return permission;}
+      if(args.op==='settings_permissions')return {opened:true};
+      if(args.op==='host')return {state:'connected',networks:[{ssid:'Home-5G'}]};
+      throw Error('Unexpected permission operation '+args.op);
+    };
+    try {
+      wifiPermissionStartupChecked=false;
+      await wifiInitPermissions();await wifiInitPermissions();
+      if(scenario==='permission-request') {
+        check(permissionCalls.filter(op=>op==='permission_all').length===1,'Startup must request once');
+        check($('wifi-permissions').hidden,'Successful combined grant must hide setup');
+      } else {
+        check(!permissionCalls.some(op=>op.startsWith('permission_')||op.startsWith('settings_')),'Startup repeated a denied prompt');
+        $('wifi-permission-action').click();await wait();
+        check(permissionCalls.filter(op=>op==='settings_permissions').length===1,'Combined settings button failed');
+      }
+    } finally {window.__wifiRoundtripInvoke=null;}
+    wifiShowPermissions({platform:'macos',location:scenario==='permission-request'?'not_determined':'disabled',bluetooth:scenario==='permission-request'?'not_determined':'denied'});
+    if(scenario==='permission-request')$('wifi-permission-result').textContent='';
+
   } else check($('wifi-permissions').hidden,'Granted permissions should hide setup');
   if (scenario === 'compare') $('wifi-direction').value='import';
   wifiRenderLocal(); wifiRenderScheme(); wifiRenderComparison(); wifiRenderJobs();
@@ -110,7 +137,7 @@ window.__wifiUiScenario = async function(scenario) {
   if (scenario === 'device') {
     $('wifi-tab-device').click();
     const text=$('wifi-networks').textContent;
-    check(text.includes('本机绑定') && text.includes('其他绑定') && text.includes('USB / AP'),'Missing bond/legacy group');
+    check(text.includes('设备配置') && text.includes('设备配置（需占用）') && text.includes('USB / AP'),'Missing device/legacy group');
   } else if (scenario === 'compare') {
     $('wifi-tab-compare').click();
     check(!$('wifi-sync-submit').disabled,'Preview should enable scoped sync');
@@ -122,6 +149,13 @@ window.__wifiUiScenario = async function(scenario) {
     check($('wifi-current-jobs').textContent.includes('缓存已过期') && $('wifi-current-jobs').textContent.includes('重新读取设备'),'Missing actionable stale-cache feedback');
     check(!$('wifi-current-jobs').textContent.includes('待确认'),'Rejected new job must not remain pending');
     check($('wifi-result').textContent.includes('Bridge 配置已保留'),'Local edits must stay preserved');
+  } else if (scenario.startsWith('failure-')) {
+    const errors={sent:['not_sent','未发送'],unknown:['result_unknown','勿重复提交'],network:['network_not_found','未找到网络'],budget:['window_budget_exhausted','预算已耗尽']};
+    const [code,label]=errors[scenario.slice(8)];
+    wifiState.jobs=[{job_id:'failure-proof',device_mac:mac,kind:'sync',state:code==='result_unknown'?'awaiting_confirmation':'waiting_rendezvous',
+      sent:code==='result_unknown',may_have_committed:code==='result_unknown',error_code:code,created_at:now,attempt_count:1}];
+    wifiRenderJobs();wifiShowTab('device');
+    check($('wifi-current-jobs').textContent.includes(label),'Missing classified failure '+code);
   } else if (scenario === 'job-feedback' || scenario === 'job-feedback-error') {
     const state=structuredClone(wifiState);
     const job={job_id:'read-feedback',device_mac:mac,kind:'read',state:'queued',last_stage:'accepted',created_at:now,attempt_count:0};
@@ -262,7 +296,7 @@ window.__wifiUiScenario = async function(scenario) {
     const kind=scenario.slice(8),state={missing:'no_mapping',connecting:'connecting',error:'connection_failed',ready:'connected',unreachable:'bridge_unreachable'}[kind];
     wifiRenderCurrent({automatic_state:state,matched_target:kind==='missing'?null:network,
       connection:{state,error:kind==='error'?'authentication_failed':kind==='unreachable'?'http_unavailable':null,http_ready:kind==='ready'}});
-    check($('wifi-auto').textContent.includes({missing:'没有该网络',connecting:'正在连接',error:'认证失败',ready:'交接已确认',unreachable:'无法访问设备 HTTP'}[kind]),'Incorrect current-network guidance');
+    check($('wifi-auto').textContent.includes({missing:'没有该网络',connecting:'正在连接',error:'认证失败',ready:'Bridge HTTP 已确认',unreachable:'无法访问设备 HTTP'}[kind]),'Incorrect current-network guidance');
     if(kind==='missing') {
       wifiEditCurrent();
       check($('wifi-host-ssid').value==='Home-5G','Current host was not prefilled');
@@ -293,7 +327,7 @@ window.__wifiUiScenario = async function(scenario) {
   }
   check(window.__uiErrors.length === 0,'JavaScript errors: '+window.__uiErrors.join('; '));
   if(scenario==='imported-edit'||scenario==='save-error')$('wifi-save-result').scrollIntoView({block:'center'});
-  else if(scenario==='waiting'||scenario==='error'||scenario==='stale-cache'||scenario.startsWith('job-feedback'))$('wifi-current-jobs').closest('.wifi-tasks').scrollIntoView({block:'start'});
+  else if(scenario==='waiting'||scenario==='error'||scenario==='stale-cache'||scenario.startsWith('job-feedback')||scenario.startsWith('failure-'))$('wifi-current-jobs').closest('.wifi-tasks').scrollIntoView({block:'start'});
   else (scenario==='delivery-alignment'?$('pt-sync').closest('.card'):card).scrollIntoView({block:'start'});
   await wait();
   return {scenario,width:innerWidth,visiblePanel:document.querySelector('.wifi-panel:not([hidden])').id,

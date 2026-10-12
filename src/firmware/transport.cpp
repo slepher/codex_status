@@ -947,6 +947,7 @@ void serviceV2Ble() {
                     sync::state.syncExitAtMs = 0;
                     power::retained.rtcMode = MODE_LIGHT; // temporary only; never persist a Light plan
                     sync::state.syncBlockedError = 0;
+                    sync::state.lastFailure = nullptr;
                     sync::state.syncOpenId = openId;
                     sync::state.syncOpenReason = reason;
                     sync::state.syncDataSeq = data ? dataSeq : 0;
@@ -992,6 +993,8 @@ void serviceV2Ble() {
                 radio::state.v2RvNetworkRequested = true;
                 radio::state.v2RvBleReleaseAtMs = now + RV_ACK_GRACE_MS;
             }
+            DevLog.printf("[net] stage=network_start result=%s reason=%s plan=%llu\n",
+                error ? "rejected" : "accepted", error ? error : "none", (unsigned long long)power::state.v2Plan.acceptedId());
             v2Ack("network_start", error ? "rejected" : "accepted", "unchanged", "ram",
                   error, -1, power::state.v2Plan.acceptedId(), platform::state.v2Profile.contextId, UINT32_MAX);
         } else if (!strcmp(op, "history")) {

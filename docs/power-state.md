@@ -419,4 +419,6 @@ BLE sync_open支持reason=data和正整数data_seq，绑定当前MAC/principal/s
 
 状态报告以power.plan_id/remaining_s说明正式计划，以sync.phase=WIFI_SYNC_ONCE、sync.remaining_ms及sync.data_pending_seq说明临时传输。设备临时运行mode可为light且正式remaining_s=0；不得据mode推断存在正式Light授权。协议载体仍为48 B frame和现有同步路由；模板canonical哈希、CompiledTemplate格式及字段绑定未改变。
 
+2026-10-12诊断候选补充：90s限制不变，统一诊断流区分`sync_total_budget_exhausted`（总截止）与`sync_no_progress`（无进展）；认证HTTP的可选`sync.last_error`保存本次启动最近终止原因，新开窗清空。该观察字段不授予窗口、不替代成功确认，部署状态以PROGRESS为准。
+
 实施、测试和资源边界见[执行记录](../project-workflow/bridge-macos/sync-window-fix-20261011.md)。当前部署以PROGRESS为准，不能将.83候选写成已部署。

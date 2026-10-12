@@ -783,10 +783,21 @@ impl PlatformService {
                 let auth_rejected = error.chain().any(|cause|
                     cause.downcast_ref::<crate::device_client::HttpStatus>()
                         .is_some_and(|status| matches!(status.0, 401 | 403)));
-                if !job.sent && (auth_rejected || error.downcast_ref::<crate::rendezvous::NotDispatched>().is_some()) {
+                if !job.sent && (auth_rejected || crate::rendezvous::not_dispatched(&error)) {
                     self.wifi_definite_rejection(mac,job_id)?;
                 }
                 let (state, code) = crate::rendezvous::wifi_error(&error);
+                tracing::warn!(event="wifi_attempt_failed",device_mac=%mac,job_id,
+                    error_category=code,previously_sent=job.sent,
+                    stage=crate::rendezvous::command_failure(&error).map(|f|f.stage).unwrap_or("transport"),
+                    reason=crate::rendezvous::command_failure(&error).map(|f|f.reason).unwrap_or(code),
+                    "Wi-Fi task attempt failed; original transaction retained");
+                if let Some(failure) = crate::rendezvous::command_failure(&error) {
+                    self.wifi_mutate(mac, |s| {
+                        s.jobs.iter_mut().find(|j|j.job_id==job_id).context("wifi_job_not_found")?.last_stage=failure.stage.into();
+                        Ok(())
+                    })?;
+                }
                 let current = self.wifi_state(mac).jobs.into_iter().find(|j| j.job_id == job_id).context("wifi_job_not_found")?;
                 self.wifi_finish(mac, job_id, if current.sent { "awaiting_confirmation" } else { state },
                     Some(code), now).map(Some)
@@ -4478,6 +4489,28 @@ mod tests {
                     assert_eq!(op,"result");Err(crate::rendezvous::NotDispatched.into())
                 }).unwrap().unwrap();assert!(query.sent);
             }
+        }
+    }
+
+    #[test]
+    fn wifi_dispatch_failure_preserves_original_transaction_fence() {
+        use crate::rendezvous::{CommandFailure,DispatchOutcome};
+        for outcome in [DispatchOutcome::NotSent,DispatchOutcome::WriteUnknown,DispatchOutcome::AckUnknown] {
+            let dir=tempfile::tempdir().unwrap();let svc=service_with_device(dir.path());let mac="AABBCCDDEEFF";
+            let job=svc.wifi_queue_control(mac,"bridge","activate",json!({"network_id":"home","version":1}),100).unwrap();
+            let result=svc.wifi_attempt(mac,&job.job_id,Some("authenticated_ble"),&Default::default(),101,|op,_| {
+                assert_eq!(op,"activate");Err(CommandFailure{outcome,stage:"write",reason:"window_budget_exhausted"}.into())
+            }).unwrap().unwrap();
+            let sent=outcome!=DispatchOutcome::NotSent;
+            assert_eq!(result.sent,sent);assert_eq!(result.may_have_committed,sent);
+            assert_eq!(result.state,if sent {"awaiting_confirmation"}else{"waiting_rendezvous"});
+            assert_eq!(result.error_code.as_deref(),Some(if sent {"result_unknown"}else{"not_sent"}));
+            let next=svc.wifi_attempt(mac,&job.job_id,Some("authenticated_ble"),&Default::default(),200,|op,body| {
+                assert_eq!(op,if sent {"result"}else{"activate"});
+                assert_eq!(body[if sent {"query_id"}else{"request_id"}],job.request_id);
+                Err(CommandFailure{outcome:DispatchOutcome::NotSent,stage:"before_write",reason:"window_budget_exhausted"}.into())
+            }).unwrap().unwrap();
+            assert_eq!(next.request_id,job.request_id);assert_eq!(next.sent,sent);
         }
     }
 

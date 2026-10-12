@@ -1,6 +1,12 @@
 #include "rendezvous_protocol.h"
 #include <cassert>
+#include <cstring>
 int main() {
+    assert(syncBudgetFailure(90999,1000,90000,0)==nullptr);
+    assert(!strcmp(syncBudgetFailure(91000,1000,90000,0),"sync_total_budget_exhausted"));
+    assert(!strcmp(syncBudgetFailure(1001,1000,91000,1000),"sync_no_progress"));
+    assert(syncBudgetFailure(1001,1000,1000,0)==nullptr);
+    assert(!strcmp(syncBudgetFailure(1001,1000,89999,UINT32_MAX),"sync_no_progress"));
     // Temporary transfer windows are independent of formal Light expiry.
     assert(rendezvousWindowUntil(1000, 3000, 81000) == 81000);
     assert(rendezvousWindowUntil(3000, 3000, 81000) == 81000);

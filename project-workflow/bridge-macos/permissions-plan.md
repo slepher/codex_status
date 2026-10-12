@@ -26,3 +26,7 @@
 - 默认Bridge候选构建31.99s并沿用ad-hoc签名，保留旧app/私有data后部署，health204、MCP被动view正常、安装identity不变。当前exe75,817,232B，SHA25692B1BB244243D1C90D77D7BEE0E7ED131CD3A754004DEA0311F9689E8DC8CD76；supervisor39432。证据artifacts/bridge-macos/permissions-{app-tests,build}.log、permissions-{deployment,runtime}.json与wifi-ui。
 - 真实回读两项均not_determined，主机permission_required，已迁移设备完整缓存保留。未触发真实授权请求、未勾选系统权限，用户从菜单栏打开界面点击两项授权后才能验证系统弹窗/SSID回读/同镜像重启；不宣称已经授权或跨部署永久免授权。
 - 用户明确不更改钥匙串；相关持久签名代码已撤回，证书/私钥导入与信任命令未执行。不改变设备ROM、配网、Profile/Bundle或旧作业。
+
+## 2026-10-12 用户修订：统一按钮与首次启动请求
+
+用户明确要求两个权限请求按钮合并，并首次启动自动弹出系统请求，取代此前仅被动引导的产品要求。沿用原生激活等待和真实授权状态；自动只请求not_determined，已拒绝不重弹/不开设置，统一按钮进入隐私设置。定位delegate继续蓝牙请求，慢决策超过UI轮询仍可衔接。状态/软件与部署验收见[当日专项](permissions-unified-20261012.md)。不改钥匙串/签名政策/TCC数据库。

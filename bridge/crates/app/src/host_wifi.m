@@ -4,17 +4,21 @@
 #import <AppKit/AppKit.h>
 #include <string.h>
 
+static void requestAuthorization(int request);
 @interface WifiAuthorization : NSObject <CLLocationManagerDelegate, CBCentralManagerDelegate>
 @property(nonatomic, strong) CLLocationManager *location;
 @property(nonatomic, strong) CBCentralManager *bluetooth;
 @property(nonatomic) BOOL locationRequestPending;
 @property(nonatomic) BOOL bluetoothRequestPending;
+@property(nonatomic) BOOL combinedRequestPending;
 @property(nonatomic, strong) id activationObserver;
 @end
 @implementation WifiAuthorization
 - (void)locationManagerDidChangeAuthorization:(CLLocationManager *)manager {
-    if (manager.authorizationStatus != kCLAuthorizationStatusNotDetermined)
+    if (manager.authorizationStatus != kCLAuthorizationStatusNotDetermined) {
         self.locationRequestPending = NO;
+        if (self.combinedRequestPending) requestAuthorization(3);
+    }
 }
 - (void)centralManagerDidUpdateState:(CBCentralManager *)central { }
 @end
@@ -51,6 +55,17 @@ static NSString *bluetoothState(void) {
 }
 static void requestAuthorization(int request) {
     WifiAuthorization *value = authorization();
+    if (request == 3) {
+        value.combinedRequestPending = YES;
+        // Continue from the delegate even if the user takes longer than the UI poll.
+        if ([locationState() isEqual:@"not_determined"]) {
+            if (value.locationRequestPending) return;
+            request = 1;
+        } else {
+            value.combinedRequestPending = NO;
+            request = 2;
+        }
+    }
     BOOL location = request == 1 && [locationState() isEqual:@"not_determined"] && !value.locationRequestPending;
     BOOL bluetooth = request == 2 && [CBManager authorization] == CBManagerAuthorizationNotDetermined && !value.bluetooth && !value.bluetoothRequestPending;
     if (!location && !bluetooth) return;
@@ -100,7 +115,8 @@ int codex_privacy_open(int section) {
     __block BOOL opened = NO;
     void (^open)(void) = ^{
         NSString *url = section == 0 ? @"x-apple.systempreferences:com.apple.preference.security?Privacy_LocationServices" :
-            section == 1 ? @"x-apple.systempreferences:com.apple.preference.security?Privacy_Bluetooth" : nil;
+            section == 1 ? @"x-apple.systempreferences:com.apple.preference.security?Privacy_Bluetooth" :
+            section == 2 ? @"x-apple.systempreferences:com.apple.preference.security?Privacy" : nil;
         if (url) opened = [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:url]];
     };
     if ([NSThread isMainThread]) open(); else dispatch_sync(dispatch_get_main_queue(), open);

@@ -46,8 +46,12 @@ static volatile uint16_t wifiDisconnectReason = 0;
 // even if GOT_IP clears the transaction error before the main loop sees it.
 static std::atomic<uint32_t> wifiDisconnectEvent{0};
 uint32_t wifiSetupDisconnectEvent() { return wifiDisconnectEvent.load(std::memory_order_relaxed); }
+static std::atomic<uint16_t> wifiAttemptFailure{0};
+static std::atomic<uint32_t> wifiAssociatedEvent{0}, wifiIpEvent{0};
+uint32_t wifiSetupAssociatedEvent() { return wifiAssociatedEvent.load(std::memory_order_relaxed); }
+uint32_t wifiSetupIpEvent() { return wifiIpEvent.load(std::memory_order_relaxed); }
 static String attemptedSsid;
-void wifiSetupConnectionStarted(const String &ssid) { attemptedSsid = ssid; wifiDisconnectReason = 0; if (!running) error = ""; }
+void wifiSetupConnectionStarted(const String &ssid) { attemptedSsid = ssid; wifiDisconnectReason = 0; wifiAttemptFailure.store(0, std::memory_order_relaxed); if (!running) error = ""; }
 static const char *wifiConnectionFailure(uint16_t reason) {
     switch(reason) {
         case 202: return "authentication_failed";
@@ -58,6 +62,15 @@ static const char *wifiConnectionFailure(uint16_t reason) {
         case 203: return "association_failed";
         default: return nullptr;
     }
+}
+uint16_t wifiSetupConnectionReason() {
+    const uint16_t first = wifiAttemptFailure.load(std::memory_order_relaxed);
+    return first ? first : wifiDisconnectReason;
+}
+const char *wifiSetupConnectionFailure() {
+    // A later generic disconnect (e.g. local teardown reason 36) must not
+    // erase the specific AP/auth failure observed in this association attempt.
+    return wifiConnectionFailure(wifiSetupConnectionReason());
 }
 static uint64_t deadline = 0;
 static uint8_t fingerprint[32] = {};
@@ -126,17 +139,33 @@ static bool save(WifiSchemes &next) {
     return saveV2(*stored);
 }
 
+static void wifiSetupDisconnected(uint16_t reason) {
+    wifiDisconnectReason = reason;
+    if (wifiConnectionFailure(reason)) {
+        uint16_t expected = 0;
+        wifiAttemptFailure.compare_exchange_strong(expected, reason, std::memory_order_relaxed);
+    }
+    const uint32_t next = (wifiDisconnectEvent.load(std::memory_order_relaxed) >> 16) + 1;
+    wifiDisconnectEvent.store((next << 16) | reason, std::memory_order_relaxed);
+}
+static void wifiSetupGotIp() {
+    wifiDisconnectReason = 0;
+    wifiAttemptFailure.store(0, std::memory_order_relaxed);
+    wifiIpEvent.fetch_add(1, std::memory_order_relaxed);
+}
+
 bool wifiSchemesBegin() {
 #ifndef CODEX_WIFI_SETUP_HOST_TEST
     static bool eventsInstalled = false;
     if (!eventsInstalled) {
         WiFi.onEvent([](arduino_event_id_t, arduino_event_info_t info) {
-            wifiDisconnectReason = info.wifi_sta_disconnected.reason;
-            const uint32_t next = (wifiDisconnectEvent.load(std::memory_order_relaxed) >> 16) + 1;
-            wifiDisconnectEvent.store((next << 16) | info.wifi_sta_disconnected.reason, std::memory_order_relaxed);
+            wifiSetupDisconnected(info.wifi_sta_disconnected.reason);
         }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
         WiFi.onEvent([](arduino_event_id_t, arduino_event_info_t) {
-            wifiDisconnectReason = 0;
+            wifiAssociatedEvent.fetch_add(1, std::memory_order_relaxed);
+        }, ARDUINO_EVENT_WIFI_STA_CONNECTED);
+        WiFi.onEvent([](arduino_event_id_t, arduino_event_info_t) {
+            wifiSetupGotIp();
         }, ARDUINO_EVENT_WIFI_STA_GOT_IP);
         eventsInstalled = true;
     }
@@ -349,7 +378,7 @@ void wifiSetupPoll(uint64_t now, const String &peer, uint32_t generation, bool e
         wifiSetupAbort("disconnected"); return;
     }
     if (now >= deadline) {
-        const char *reported = wifiConnectionFailure(wifiDisconnectReason);
+        const char *reported = wifiSetupConnectionFailure();
         const char *failure = WiFi.status() == WL_CONNECTED && WiFi.SSID() == String(candidate.ssid) ? "dhcp_timeout" :
             reported ? reported : "connect_timeout";
         if (transactionUnified) deadline=0;
@@ -472,10 +501,10 @@ String wifiSetupCommand(JsonDocument &doc, const String &peer, uint32_t generati
         bool currentAttempt = slot >= 0 && transactionPeer == peer && String(networkId) == candidate.id &&
             selectionVersion == schemes.networks[slot].version && (running || error.length());
         const char *normalFailure = active && !connected && !currentAttempt && attemptedSsid == String(schemes.networks[slot].ssid) ?
-            wifiConnectionFailure(wifiDisconnectReason) : nullptr;
+            wifiSetupConnectionFailure() : nullptr;
         out["stage"] = connected ? "connected" : currentAttempt ? stage : normalFailure ? "failed" : slot < 0 ? "missing" : "saved";
-        if (currentAttempt && error.length()) { out["error"] = error; out["reason"] = wifiDisconnectReason; }
-        else if (normalFailure) { out["error"] = normalFailure; out["reason"] = wifiDisconnectReason; }
+        if (currentAttempt && error.length()) { out["error"] = error; out["reason"] = wifiSetupConnectionReason(); }
+        else if (normalFailure) { out["error"] = normalFailure; out["reason"] = wifiSetupConnectionReason(); }
         if (connected) out["ip"] = WiFi.localIP().toString();
         String text; serializeJson(out,text); return text;
     }

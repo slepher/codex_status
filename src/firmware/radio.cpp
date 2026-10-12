@@ -81,6 +81,17 @@ WifiPhase wifiPhase() {
 }
 
 void serviceWifiMetadata() {
+    static uint32_t seenAssociated = 0, seenIp = 0;
+    const uint32_t associated = wifiSetupAssociatedEvent(), ip = wifiSetupIpEvent();
+    if (associated != seenAssociated) {
+        DevLog.printf("[net] stage=associated count=%u\n", (unsigned)(associated-seenAssociated));
+        seenAssociated = associated;
+    }
+    if (ip != seenIp) {
+        diagnostics::traceSetTransport(2); diagnostics::traceSetStage(TRACE_STAGE_WIFI_IP);
+        DevLog.printf("[net] stage=wifi_ip count=%u\n", (unsigned)(ip-seenIp));
+        seenIp = ip;
+    }
     static uint32_t seenDisconnect = 0;
     const uint32_t event = wifiSetupDisconnectEvent();
     if (event != seenDisconnect) {
@@ -277,6 +288,7 @@ void enterBleOn(bool userInitiated) {
     // bridge can issue a formal light plan and install its first Bundle.
     if (!transport::state.v2BleQueue) transport::state.v2BleQueue = xQueueCreate(2, sizeof(transport::V2BleMessage *));
     if (!bleInitialized()) {
+        bleSetInfoProvider(infoExtraJson);
         bleBegin("CodexStatus-" + macSuffix(), application::state.firmwareVersion);
         bleSetEndpointHandler(transport::handleBleEndpoint);
         bleSetAuthHandler(transport::handleBleAuth);
@@ -351,6 +363,7 @@ static bool startFallback() {
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(false);
     wifiSetupConnectionStarted(state.wifiSsid);
+    DevLog.printf("[net] stage=association_start remaining=%ums\n", (unsigned)(state.fallbackUntilMs-now));
     WiFi.begin(state.wifiSsid.c_str(), state.wifiPass.c_str());
     return true;
 }
@@ -362,7 +375,7 @@ void pollWifi() {
         if (nowUp && WiFi.localIP() != IPAddress(0,0,0,0)) {
             state.fallbackUntilMs = 0; state.wifiConnActive = false;
         } else if (clock::v2NowMs() >= state.fallbackUntilMs) {
-            networkFailed("wifi_connect_failed");
+            networkFailed(wifiSetupConnectionFailure() ? wifiSetupConnectionFailure() : "connect_timeout");
             return;
         } else return;
     }
@@ -612,7 +625,11 @@ static __attribute__((noinline)) void serviceReadyReport() {
                     !memcmp(ack.session, request.session, 16)) {
                     JsonDocument reply;
                     if (!deserializeJson(reply, String(response.c_str() + COMPACT_FRAME_HEADER, ack.payloadLen)) &&
-                        reply["result"] == "report_received") state.readyReport.received = true;
+                        reply["result"] == "report_received") {
+                        state.readyReport.received = true;
+                        diagnostics::traceSetStage(TRACE_STAGE_HTTP);
+                        DevLog.printf("[net] stage=ready_report_acked plan=%llu\n", (unsigned long long)state.readyReport.planId);
+                    }
                 }
             } else if (code == 409 || code == 401) {
                 // A Bridge restart invalidates the hint session. The business
@@ -701,8 +718,7 @@ static void rendezvousWifiTick() {
     if (!state.fallbackUntilMs && WiFi.status()!=WL_CONNECTED) startFallback();
     if (state.fallbackUntilMs && clock::v2NowMs() >= state.fallbackUntilMs &&
         (WiFi.status()!=WL_CONNECTED || WiFi.localIP()==IPAddress(0,0,0,0))) {
-        WiFi.disconnect(false);
-        state.fallbackUntilMs = 0;
+        networkFailed(wifiSetupConnectionFailure() ? wifiSetupConnectionFailure() : "connect_timeout");
         state.v2Rv.finishExchange(clock::v2NowMs(), 0);
         return;
     }
@@ -710,7 +726,11 @@ static void rendezvousWifiTick() {
         state.wifiUp = true;
         state.wifiConnActive = false;
         state.wifiBlinkOn = false;
-        if (!state.v2Rv.ready()) { state.v2Rv.httpReady(); updateInfoExtra(); }
+        if (!state.v2Rv.ready()) {
+            diagnostics::traceSetTransport(2); diagnostics::traceSetStage(TRACE_STAGE_WIFI_IP);
+            state.v2Rv.httpReady(); updateInfoExtra();
+            DevLog.printf("[net] stage=http_listening plan=%llu\n", (unsigned long long)power::state.v2Plan.acceptedId());
+        }
         serviceReadyReport();
         return;
     }
@@ -770,7 +790,8 @@ void v2RendezvousTick() {
     if (!reporting && !state.v2RvNetworkRequested && !wifiSetupBusy() && WiFi.status()!=WL_CONNECTED &&
         power::state.bleRecovery.lightRemaining(now)) startFallback();
     if (networkFailedThisRound && !reporting) {
-        networkFailed(WiFi.status()==WL_CONNECTED ? "bridge_http_unreachable" : "wifi_connect_failed");
+        networkFailed(WiFi.status()==WL_CONNECTED ? "bridge_http_unreachable" :
+            wifiSetupConnectionFailure() ? wifiSetupConnectionFailure() : "connect_timeout");
     }
     const bool stayAwake = state.failureReportPending || power::state.bleRecovery.lightRemaining(now) || light || sync::state.syncOpenThisWake || power::v2ManualBleHoldActive() || (power::state.plugged && !power::retained.rtcDeepOnUsb);
     if (!stayAwake && power::retained.rtcMode != MODE_DEEP) {

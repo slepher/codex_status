@@ -47,9 +47,42 @@ impl std::fmt::Display for NotDispatched {
 }
 impl std::error::Error for NotDispatched {}
 
+/// Transport proof, independent of whether the device applied the operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchOutcome { NotSent, WriteUnknown, AckUnknown }
+#[derive(Debug)]
+pub struct CommandFailure {
+    pub outcome: DispatchOutcome,
+    pub stage: &'static str,
+    pub reason: &'static str,
+}
+impl CommandFailure {
+    pub fn code(&self) -> &'static str {
+        if self.outcome == DispatchOutcome::NotSent { "not_sent" } else { "result_unknown" }
+    }
+}
+impl std::fmt::Display for CommandFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {} ({})", self.code(), self.reason, self.stage)
+    }
+}
+impl std::error::Error for CommandFailure {}
+
+pub fn command_failure(error: &anyhow::Error) -> Option<&CommandFailure> {
+    error.chain().find_map(|cause| cause.downcast_ref::<CommandFailure>())
+}
+pub fn not_dispatched(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.downcast_ref::<NotDispatched>().is_some()) ||
+        command_failure(error).is_some_and(|e| e.outcome == DispatchOutcome::NotSent)
+}
+
 /// Finite identifiers only. Never store arbitrary transport/device messages.
 pub fn wifi_error(error: &anyhow::Error) -> (&'static str, &'static str) {
     for cause in error.chain() {
+        if cause.downcast_ref::<NotDispatched>().is_some() { return ("waiting_rendezvous", "not_sent"); }
+        if let Some(failure) = cause.downcast_ref::<CommandFailure>() {
+            return ("waiting_rendezvous", failure.code());
+        }
         if let Some(status) = cause.downcast_ref::<crate::device_client::HttpStatus>() {
             return match status.0 {
                 401 | 403 => ("failed", "unauthorized"),
@@ -72,6 +105,9 @@ pub fn wifi_error(error: &anyhow::Error) -> (&'static str, &'static str) {
         }
         let text = cause.to_string();
         match text.as_str() {
+            "network_not_found" => return ("failed", "network_not_found"),
+            "http_proof_budget_exhausted" | "sync_total_budget_exhausted" | "sync_no_progress" =>
+                return ("waiting_rendezvous", "window_budget_exhausted"),
             "wifi_snapshot_timeout" | "wifi_window_budget" => {
                 return ("waiting_rendezvous", "window_budget_exhausted")
             }
@@ -115,6 +151,8 @@ mod tests {
     fn snapshot_errors_are_distinct_and_do_not_expose_input() {
         for (message, state, code) in [
             ("snapshot_expired", "waiting_rendezvous", "snapshot_expired"),
+            ("network_not_found", "failed", "network_not_found"),
+            ("http_proof_budget_exhausted", "waiting_rendezvous", "window_budget_exhausted"),
             ("wifi_snapshot_mismatch", "failed", "snapshot_mismatch"),
             ("invalid_wifi_snapshot", "failed", "snapshot_shape"),
             (
