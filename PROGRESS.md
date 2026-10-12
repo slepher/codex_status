@@ -7,6 +7,7 @@
 - 最近现场证据：15:59认证 Note4 `7C4FADB93408`（IP192.168.31.90）运行 **0.18.83-note4 / ota_0**，wake908/reset_reason8，Plan3726/Light剩余531s；15:58自然BLE会合完成、HTTP可达。此前wake841实际light_sleep44s证据保留。codex-status-a **v5** 已发布，合同 CRC `eb628a93`。已部署 ROM `artifacts/note4-0.18.83-device-fields-candidate.bin`，SHA256 `32486C0763DB240777758F549BCE386F8884A09547AD3BC89F4423E499664517`。详见[部署记录](project-workflow/bridge-macos/device-fields-deploy-20261011.md)。
 - 本机macOS Bridge **15:55已部署并重启**清理/分类修复（包含此前权限/RF改动，源码随本轮提交）：x86_64 release20,850,560 B，App `artifacts/bridge-macos/Codex Status Bridge.app`，exe SHA256 `fc792b2b2016181550b7629b71846c66eba0aa8f69acd0378bbc1f85ef62acf7`。supervisor15210/child15214，health204/MCP43工具、签名/原data及身份保留；Rust269/3条件忽略、Node/WK60及窄宽审阅通过。双权限allowed；15:56首轮Plan写入未知后扫描继续，15:58下一同MAC/wake908会合完整成功、15:59认证HTTP通过。[修复/备份/验收](project-workflow/bridge-macos/ble-connect-cleanup-fix-20261012.md)。固件未刷、未发布模板。
 
+- Bridge 历史 build 已按用户要求清理，移除约 **28.51 GiB**；保留当前 App 与 release 缓存，旧 App 回滚副本已删除，运行数据/固件证据保留。本轮15:55已重建部署并核验默认实例；旧App在本次私有部署备份中重新保留。[清理记录](project-workflow/bridge-macos/build-cleanup-20261012.md)。
 
 ## 本轮里程碑与候选（C5/C6）
 
@@ -21,6 +22,7 @@
 
 ## 风险与下一步
 
+- **B6/C8重设计已细化，未实施**：[职责/状态机/错误/删除清单](project-workflow/bridge-macos/protocol-redesign-design.md)、[P0–P6实施与验收](project-workflow/bridge-macos/protocol-redesign-plan.md)。保持深睡BLE及周期HTTP、浅睡HTTP、设备回报/Bridge反向请求；上层载体无关。最终删除全部旧协议支持，独立OTA保持token+原生上传，不加owner/session/业务帧。原查询未知/namespace/清理/确认义务缺口见[审查](project-workflow/bridge-macos/architecture-review-redesign-20261012.md)；新增OTA空上传结果静态缺口待复现。未修代码、构建、测试或部署。
 - B6：13:19建链失败无界disconnect缺口 **15:55已修复部署**，所有裸断开共用原2s预算。生产控制流red→green证明原错误/锁释放/下一次连接；实机失败后继续扫描并于15:58完成后续会合。原进程具体await卡点未抓栈；迟到原生回调/worker失效及总体P2仍未完成。[修复](project-workflow/bridge-macos/ble-connect-cleanup-fix-20261012.md)、[原局域网取证](project-workflow/bridge-macos/disconnect-investigation-20261012.md)。
 - B6/C8：Bridge分类已部署；固件分类/关键日志候选待部署后实体故障矩阵，离线两小时留存仍缺。10:10即时查不到不能归为当时已覆盖；11:43手动wake675为6.6s IP/7.7s HTTP及真实light-sleep，旧632仅归档摘要、约一分钟路径未知。[证据与更正](project-workflow/bridge-macos/wake-network-log-investigation-20261012.md)。旧Wi-Fi管理宿主active_protected断言在HEAD对照亦失败，独立合同核对未结。
 - C5/C6：中文渲染尚无实机证据，安装/典型/上限动态资源峰值未知；1.54 字体准入仍为 0，最新候选的 USB/OTA/配网闭环未验收。GitHub 矩阵首次实跑、干净 Windows 安装、macOS 两架构安装及签名/公证保留缺口。

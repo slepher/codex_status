@@ -220,7 +220,9 @@
 
 ### B6. 离线 BLE 配 Wi-Fi 与 BOOT 蓝牙恢复入口（2026-10-03 新开）
 
+- **2026-10-12分层重设计细化，未实施**：[设计](../../project-workflow/bridge-macos/protocol-redesign-design.md)、[P0–P6计划与故障矩阵](../../project-workflow/bridge-macos/protocol-redesign-plan.md)明确业务/执行器/HTTP-BLE职责和状态机，保持既有电源及双向HTTP原则。用户明确最终不留旧协议/降级，删除旧permit/management2/旧恢复分支；独立OTA保留简单token鉴权原生上传，不加Bridge/owner/session/frame。先业务结果与建链生命周期，再统一入口/删除旧栈；OTA独立验收。旧持久未知回执不得因升级清空；所有实施/测试/部署尚未执行。
 
+- **2026-10-12总体架构复核完成，未实施**：[源码审查与替代设计](../../project-workflow/bridge-macos/architecture-review-redesign-20261012.md)确认五类建链失败无界清理及Fake接缝缺口；新增trial/activate结果查询失败误清提交未知标记、事务namespace键不一致、取消/过期停止确认义务。先统一生命周期与事务结果，再收敛状态投影；验收必须证明失败后下一轮扫描/HTTP继续、未知原ID不重发及跨namespace隔离。用户确认保持深睡BLE会合及周期HTTP同步、浅睡HTTP直达、设备HTTP回报与Bridge反向请求；上层载体无关，下层选择合法可用通道。报告已按此修订，取消HTTP拉取替代方案评估，不改变电源策略。
 
 - **2026-10-12 用户要求下一轮总体分析（关联C8）**：重点审查“防御代码多但关键逻辑漏处理”，按生产生命周期与资源所有权解释局部有界而失败清理无界的矛盾，评估重复防御的删除/合并并保持有效不变量，提出最小修复与失败后继续会合的验收。[当前问题报告/新窗口入口](../../project-workflow/bridge-macos/overall-analysis-handoff-20261012.md)已区分现场事实、推断、已部署与候选；本次仅记录，未做全仓审计或实施。
 
@@ -346,6 +348,7 @@
 - 前置：C3 的记录格式（否则没有可信的对照口径）。
 
 ### C8. 设备同步与诊断协议（device-sync-diagnostics）
+- **2026-10-12架构复核（关联B6）**：[报告](../../project-workflow/bridge-macos/architecture-review-redesign-20261012.md)确认4KiB环满淘汰、40KiB仅冻结批次，不提供两小时连续离线保证；提出本地持久化与上传解耦、限流摘要及资源/掉电验收。新增sync Meta按原生struct持久化的格式风险，需独立迁移验收。状态投影需区分观察、联系结果、调度健康和电源预期。仅静态审查，未修改生产代码或新增测试通过结论。
 - **10月12日分类/关键日志：Bridge15:55已部署，固件仍候选**：未发送立即结束；写入未知禁止复用链路；整帧丢ACK可只读核验，已发事务仅原ID查询；201/认证原因不被普通断开覆盖，补启动/关联/IP/监听/ready ACK及明确预算原因，清空INFO初始化伪错误。Rust268/3条件忽略、Node/WK60、生产回调专项及Note4.85构建/64栈门禁通过；[实现与候选](../../project-workflow/bridge-macos/timeout-reporting-fix-20261012.md)。Bridge部分随[清理修复](../../project-workflow/bridge-macos/ble-connect-cleanup-fix-20261012.md)部署；固件0.18.85未部署，固件关键日志与完整RF矩阵/离线保留仍不结项。旧Wi-Fi管理宿主active_protected断言在HEAD对照也失败，需独立核对合同与用例，不能记为本次全套通过。
 - **10月12日超时分类补证**：10:09/10:10分页ACK正常61–152ms、末页仅19/16ms被旧RF预算截断，属已证Bridge窗口错误；10:22 SyncOpen等3844ms未ACK仍为写后未知，不能同归短窗口。wake638两次先出现201/network_not_found后约15s失败，90s同步日志又混合总预算/无进展，需分别报告而非统一延长超时。[分类与证据](../../project-workflow/bridge-macos/wake-network-log-investigation-20261012.md)。
 - **11:43手动Wi-Fi现场取证**：认证.83/wake675成功，6.6s IP/7.7s HTTP、真实light-sleep累计通过；同诊断代际，当前环最早1962，history654–675，旧wake632只剩归档摘要。另定位BLE初始化先refreshInfo后设provider制造空MAC预检错误；现场11条占902B（4KiB约22%），应修初始化順序减少伪错误，不能当作旧network_start故障根因。pcf8563短读现场有两条，影响未知。[直接取证](../../project-workflow/bridge-macos/wake-network-log-investigation-20261012.md)。
