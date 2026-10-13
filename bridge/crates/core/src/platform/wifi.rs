@@ -307,14 +307,66 @@ impl Job {
         matches!(self.state.as_str(), "completed" | "cancelled" | "expired" | "failed")
     }
     pub fn runnable(&self, now: u64) -> bool {
-        now >= self.next_attempt_at && (self.confirmation_pending() ||
-            (!self.terminal() && self.state != "conflict" && self.execution_active(now)))
+        now >= self.next_attempt_at && self.execution_active(now) && !self.terminal()
+            && !matches!(self.state.as_str(), "conflict" | "needs_attention")
+            && self.blocking_reason().is_none()
+    }
+    fn blocking_reason(&self) -> Option<&str> {
+        if self.confirmation_pending() && self.transaction_namespace.as_deref().is_none_or(|s|s.is_empty()) {
+            return Some("transaction_identity_unknown");
+        }
+        self.error_code.as_deref().filter(|code|matches!(*code,
+            "transaction_identity_unknown" | "transaction_principal_changed" |
+            "transaction_namespace_changed" | "transaction_namespace_invalid"))
+    }
+    fn reconcile_execution(&mut self) {
+        // Execution intent is independent of the historical, possibly applied result.
+        if matches!(self.state.as_str(), "completed" | "failed") { return; }
+        if self.execution_intent == ExecutionIntent::Cancelled { self.state="cancelled".into(); }
+        else if self.execution_intent == ExecutionIntent::Expired { self.state="expired".into(); }
+        else if !self.terminal() {
+            if let Some(reason)=self.blocking_reason().map(str::to_owned) {
+                self.state="needs_attention".into();self.error_code=Some(reason);
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod retirement_tests {
     use super::*;
+    #[test]
+    fn unknown_wifi_results_do_not_revive_cancelled_expired_or_unidentifiable_jobs() {
+        for reason in ["cancelled", "expired", "missing", "changed"] {
+            let mut state=WifiState::default();
+            let job=state.queue("0200000000D4","bridge-test","activate",vec!["home".into()],100,"first".into(),BTreeMap::new()).unwrap();
+            state.jobs[0].transaction_namespace=Some("original".into());
+            state.mark_sent(&job.job_id,101).unwrap();
+            state.finish(&job.job_id,"awaiting_confirmation",Some("result_unknown"),102).unwrap();
+            assert!(state.jobs[0].runnable(200));
+            match reason {
+                "cancelled"=>{state.finish(&job.job_id,"cancelled",None,201).unwrap();},
+                "expired"=>{state.jobs[0].expires_at=201;state.expire(202);},
+                "missing"=>{state.jobs[0].transaction_namespace=None;},
+                _=>{state.finish(&job.job_id,"awaiting_confirmation",Some("transaction_namespace_changed"),201).unwrap();},
+            }
+            assert!(!state.jobs[0].runnable(300),"{reason} must not automatically retry");
+            state.recover();
+            let before=state.jobs[0].state.clone();let error=state.jobs[0].error_code.clone();
+            state.finish(&job.job_id,"awaiting_confirmation",Some("rendezvous_failed"),400).unwrap();
+            assert_eq!(state.jobs[0].state,before,"late transport failure must not revive {reason}");
+            assert_eq!(state.jobs[0].error_code,error,"late transport failure must preserve {reason}");
+            assert!(state.jobs[0].confirmation_pending());
+            assert!(!state.jobs[0].safe_to_retire());
+            assert_eq!(state.jobs[0].request_id,job.request_id);
+            // A real receipt arriving from an already in-flight call still wins;
+            // stopping future attempts must not erase a proven outcome on restart.
+            state.jobs[0].state="completed".into();
+            state.jobs[0].confirmation=Some("operation_result".into());
+            state.recover();
+            assert_eq!(state.jobs[0].state,"completed");
+        }
+    }
     #[test]
     fn wifi_retirement_preserves_unknown_submissions_and_pending_receipt_acks() {
         let mut state=WifiState::default();
@@ -347,10 +399,11 @@ impl WifiState {
         for j in &mut self.jobs {
             if j.state == "cancelled" { j.execution_intent = ExecutionIntent::Cancelled; }
             if j.state == "expired" { j.execution_intent = ExecutionIntent::Expired; }
+            j.reconcile_execution();
             if matches!(j.state.as_str(), "connecting" | "reading" | "applying") {
                 j.state = if j.sent { "awaiting_confirmation" } else { "waiting_rendezvous" }.into();
             }
-            if !j.terminal() && !j.sent && j.state != "conflict" && j.frozen.iter().any(|n|!n.deleted && n.credential=="replace" && n.password.is_none()) {
+            if !j.terminal() && !j.sent && !matches!(j.state.as_str(),"conflict"|"needs_attention") && j.frozen.iter().any(|n|!n.deleted && n.credential=="replace" && n.password.is_none()) {
                 j.state="waiting_input".into();j.error_code=Some("credentials_required".into());
             }
         }
@@ -443,9 +496,14 @@ impl WifiState {
         }
         if error.is_some_and(|s| !id(s, 64)) { bail!("invalid_error_code"); }
         let j = self.jobs.iter_mut().find(|j| j.job_id == job).ok_or_else(|| anyhow::anyhow!("wifi_job_not_found"))?;
-        if !j.terminal() || j.confirmation_pending() {
+        j.reconcile_execution();
+        if state != "cancelled" && (j.terminal() || j.state == "needs_attention") { return Ok(j.clone()); }
+        if !j.terminal() {
             if state == "cancelled" { j.execution_intent = ExecutionIntent::Cancelled; }
-            j.state = state.into(); j.error_code = error.map(str::to_owned); j.updated_at = now;
+            j.state = state.into();
+            if state != "cancelled" { j.error_code = error.map(str::to_owned); }
+            j.updated_at = now;
+            j.reconcile_execution();
             let delay = match j.attempt_count { 0 | 1 => 5, 2 => 15, _ => 60 };
             j.next_attempt_at = now.saturating_add(delay);
         }

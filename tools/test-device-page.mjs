@@ -409,3 +409,8 @@ await run('wifiRetryCurrent()');
 assert.equal(element('wifi-current-retry').disabled,false);
 assert.match(element('wifi-result').textContent,/修订|冲突|重新/);
 console.log('Wi-Fi exhausted budget: explicit message/retry, unknown/auth states protected, failure visible OK');
+
+run(`wifiShowResult({outcome:'rejected',stage:'persist',error:'storage',action:'offline_migration_or_storage_repair'})`);
+assert.match(element('wifi-result').textContent,/设备登记失败.*保存设备登记.*离线迁移/);
+run(`wifiShowResult({outcome:'unknown',stage:'ack',error:'window_budget_exhausted',action:'read_registration_before_retry'})`);
+assert.match(element('wifi-result').textContent,/设备登记结果未知.*确认登记结果.*请勿重复提交/);

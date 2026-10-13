@@ -88,6 +88,7 @@ struct SimHttpFrame {
 #[derive(Default)]
 struct SimBle {
     generation: u64,
+    endpoint_writes: u64,
     connected: bool,
     wake: (u64, u64),
     info: Vec<u8>,
@@ -102,12 +103,16 @@ struct SimBle {
 #[serde(deny_unknown_fields)]
 struct BleFault {
     kind: String,
+    #[serde(default)] op: Option<String>,
     #[serde(default)] size: usize,
     #[serde(default)] delay_ms: u64,
 }
 impl SimBle {
     fn store(&mut self, op: &str, mut bytes: Vec<u8>, now: u64) {
-        let fault = self.fault.take();
+        if op == "endpoint" {self.endpoint_writes += 1;}
+        let fault = if self.fault.as_ref().is_some_and(|f| f.op.as_deref().is_none_or(|target| target == op)) {
+            self.fault.take()
+        } else { None };
         let kind = fault.as_ref().map(|f| f.kind.as_str()).unwrap_or("none");
         let framed = Header::decode(&bytes, 8192).ok().map(|(header, payload)| (header, payload.to_vec()));
         if let Some(f) = &fault {
@@ -138,7 +143,7 @@ impl SimBle {
             if let Ok(mut value) = serde_json::from_slice::<Value>(json_bytes) {
                 match kind {
                     "wrong_op" => value["op"] = json!("other"),
-                    "wrong_request" => value["rid"] = json!("c3RhbGU="),
+                    "wrong_request" => { value["rid"] = json!("c3RhbGU="); value["request_id"] = json!("stale"); },
                     "wrong_wake" => value["w"][1] = json!(self.wake.1.saturating_add(1)),
                     "wrong_mac" => value["device_mac"] = json!("AA:BB:CC:DD:EE:FF"),
                     "wrong_session" => value["session_nonce"] = json!("f".repeat(32)),
@@ -2472,12 +2477,55 @@ async fn sim_ble_aux(State(state): State<SimState>, request: Request<Body>) -> R
     if !power.light && power.ble_window_until_ms.is_none() { return StatusCode::NOT_FOUND.into_response(); }
     let Ok(bytes) = to_bytes(request.into_body(), if token {256} else {1024}).await else { return StatusCode::PAYLOAD_TOO_LARGE.into_response(); };
     let Ok(body) = serde_json::from_slice::<Value>(&bytes) else { return StatusCode::BAD_REQUEST.into_response(); };
+    let text_valid = |key: &str, max: usize| body[key].as_str().is_some_and(|v| !v.is_empty() && v.len() <= max && !v.contains('\0'));
+    let check = body["check_only"] == true;
     let valid = if token { body["cmd"] == "token" && body.get("rotate").is_none() }
-        else { matches!(body["schema"].as_u64(),Some(1|2)) && body["host"].is_string() && body["port"].as_u64().is_some_and(|p| p > 0 && p <= 65535) && body["token"] == state.endpoint_token.as_ref() };
-    let op = if token {"auth"} else {"endpoint"};
-    let mut response = json!({"ack":op,"ok":valid});
+        else { body["schema"] == 2 && body["check_only"].is_boolean() && text_valid("host",64) &&
+            text_valid("bridge_id",64) && text_valid("request_id",64) &&
+            body["port"].as_u64().is_some_and(|p| p > 0 && p <= 65535) && body["token"] == state.endpoint_token.as_ref() };
+    let op = if token {"auth"} else if check {"endpoint_check"} else {"endpoint"};
+    let mut response = json!({"ack":if token {"auth"} else {"endpoint"},"ok":valid});
+    if !token {
+        response["request_id"] = body["request_id"].clone();
+        response["device_mac"] = json!(state.mac);
+        response["bridge_id"] = body["bridge_id"].clone();
+        response["stage"] = json!(if check {"verify"} else {"persist"});
+        let forced = {
+            let mut ble = state.ble.lock().unwrap();
+            if ble.fault.as_ref().is_some_and(|f| f.kind.starts_with("endpoint_") && f.op.as_deref().is_none_or(|target| target == op)) {
+                ble.fault.take().map(|f| f.kind[9..].to_owned())
+            } else {None}
+        };
+        // Synthetic file persistence models read-before-retry across reconnect
+        // and process restart. NVS atomicity is covered by the production store HAL.
+        let path = state.data_dir.join("endpoint-registration.json");
+        let intended = json!({"host":body["host"],"port":body["port"],"token":body["token"],"bridge_id":body["bridge_id"]});
+        let error = if !valid {Some("shape".to_owned())}
+        else if forced.as_deref().is_some_and(|e| e != "storage_unknown") {forced}
+        else if check {
+            match fs::read(&path) {
+                Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+                    Ok(stored) if stored == intended => None,
+                    Ok(_) => Some("registration_mismatch".into()),
+                    Err(_) => Some("storage".into()),
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some("registration_mismatch".into()),
+                Err(_) => Some("storage".into()),
+            }
+        } else {
+            let bytes = serde_json::to_vec(&intended).unwrap();
+            let pending = path.with_extension("pending");
+            if fs::write(&pending,&bytes).and_then(|_| fs::rename(&pending,&path)).is_err() ||
+                fs::read(&path).ok().as_ref() != Some(&bytes) {Some("storage_unknown".into())}
+            else {forced}
+        };
+        if let Some(error) = error {
+            response["error"] = json!(error);
+            if !valid {response["stage"] = json!("validate");}
+        } else {response["stage"] = json!(if check {"verified"} else {"persisted"});}
+    }
     if token && valid { response["token"] = json!(state.device_token.as_ref()); }
-    let Ok(raw) = bridge_render::simulator_ble_wire(op, &response) else { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); };
+    let Ok(raw) = bridge_render::simulator_ble_wire(if token {"auth"} else {"endpoint"}, &response) else { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); };
     state.ble.lock().unwrap().store(op, raw, clock.monotonic_ms);
     Json(json!({"result":"accepted"})).into_response()
 }
@@ -2562,7 +2610,8 @@ async fn sim_ble_fault(State(state): State<SimState>, request: Request<Body>) ->
     let Ok(bytes) = to_bytes(request.into_body(), 1024).await else { return StatusCode::PAYLOAD_TOO_LARGE.into_response(); };
     let Ok(fault) = serde_json::from_slice::<BleFault>(&bytes) else { return StatusCode::BAD_REQUEST.into_response(); };
     if !matches!(fault.kind.as_str(), "none" | "legacy_overflow" | "guard_overflow" | "write_failed" |
-        "disconnect" | "window_closed" | "empty" | "malformed" | "stale" | "overwrite" | "read_failed" | "delay" | "notify_lost" | "drop_ack" | "wrong_request" | "wrong_wake" | "wrong_mac" | "wrong_session" | "wrong_op") ||
+        "disconnect" | "window_closed" | "empty" | "malformed" | "stale" | "overwrite" | "read_failed" | "delay" | "notify_lost" | "drop_ack" | "wrong_request" | "wrong_wake" | "wrong_mac" | "wrong_session" | "wrong_op" | "endpoint_storage" | "endpoint_storage_unknown" | "endpoint_capacity" | "endpoint_binding_conflict" | "endpoint_physical_required") ||
+        fault.op.as_deref().is_some_and(|op| !matches!(op,"endpoint"|"endpoint_check")) ||
         fault.size > 8192 || fault.delay_ms > 86_400_000 { return StatusCode::BAD_REQUEST.into_response(); }
     state.ble.lock().unwrap().fault = Some(fault);
     Json(json!({"result":"armed"})).into_response()
@@ -2570,7 +2619,7 @@ async fn sim_ble_fault(State(state): State<SimState>, request: Request<Body>) ->
 async fn sim_ble_attributes(State(state): State<SimState>, request: Request<Body>) -> Response {
     if !bearer(&request, &state.control_token) { return unauthorized(); }
     let ble = state.ble.lock().unwrap();
-    Json(json!({"generation":ble.generation,"connected":ble.connected,"info_bytes":ble.info.len(),
+    Json(json!({"generation":ble.generation,"endpoint_writes":ble.endpoint_writes,"connected":ble.connected,"info_bytes":ble.info.len(),
         "status_bytes":ble.status.len(),"events":ble.events})).into_response()
 }
 

@@ -333,7 +333,7 @@ int main() {
         assert(saveV2(legacyPending));wifiExecutionGeneration=0;assert(wifiSchemesBegin());
         assert(unified(outcome)["outcome"]=="unknown"&&unified(retire)["outcome"]=="unknown");
     }
-    std::cout<<"WFS5 interruption: atomic recovery/readback failure, old pending retained, no replay after ACK passed\n";
+    std::cout<<"WTX1 interruption: atomic recovery/readback failure, old pending retained, no replay after ACK passed\n";
     // Identical namespace/request ID under a different principal is a new
     // transaction, never a hit in a transport-local replay shortcut.
     testNvsBlob.clear();running=false;requestId="";assert(wifiSchemesBegin());

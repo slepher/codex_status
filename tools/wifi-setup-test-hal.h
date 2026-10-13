@@ -1,5 +1,7 @@
 #pragma once
 #include <vector>
+#include <map>
+#include <string>
 #ifdef _WIN32
 extern "C" size_t codex_wifi_deflate(void *, size_t, const void *, size_t);
 extern "C" size_t codex_wifi_inflate(void *, size_t, const void *, size_t);
@@ -53,34 +55,77 @@ static bool testNvsReadbackFail = false;
 static bool testNvsNewReadbackFail = false;
 static bool testNvsRemoveFail = false;
 static size_t testNvsByteLimit = SIZE_MAX;
+// Synthetic NVS key map. The file container is only the Fake HAL, not a
+// firmware format; each put/remove atomically replaces this synthetic image.
+static std::string testNvsCommitThenFailKey, testNvsReadbackFailKey, testNvsFailReadAfterWriteKey;
+static long testNvsFailAfter=-1;
+static std::map<std::string,size_t> testNvsWrites;
+static size_t testNvsPeakStoredBytes=0;
+using TestNvsKeys=std::map<std::string,std::vector<uint8_t>>;
+static bool testNvsKeys(TestNvsKeys &keys){
+    keys.clear();
+    if(testNvsBlob.empty())return true;
+    if(testNvsBlob.size()<4 || memcmp(testNvsBlob.data(),"NVT1",4)){keys["store3"]=testNvsBlob;return true;}
+    size_t at=4;
+    while(at<testNvsBlob.size()){
+        size_t n=testNvsBlob[at++];if(!n || n>15 || n+4>testNvsBlob.size()-at)return false;
+        std::string key((const char *)testNvsBlob.data()+at,n);at+=n;size_t length=0;
+        for(size_t i=0;i<4;++i)length|=size_t(testNvsBlob[at++])<<(8*i);
+        if(length>16384 || length>testNvsBlob.size()-at || keys.count(key))return false;
+        keys[key]={testNvsBlob.begin()+at,testNvsBlob.begin()+at+length};at+=length;
+    }
+    return keys.size()<=6;
+}
+static bool testNvsPublish(const TestNvsKeys &keys){
+    std::vector<uint8_t> bytes={'N','V','T','1'};
+    for(const auto &entry:keys){bytes.push_back(entry.first.size());bytes.insert(bytes.end(),entry.first.begin(),entry.first.end());
+        for(size_t i=0;i<4;++i)bytes.push_back(entry.second.size()>>(8*i));bytes.insert(bytes.end(),entry.second.begin(),entry.second.end());}
+#ifdef CODEX_WIFI_SIM
+    auto temporary=wifiBlobPath+".tmp";
+    std::ofstream file(temporary,std::ios::binary|std::ios::trunc);file.write((const char *)bytes.data(),bytes.size());file.close();if(!file)return false;
+#ifdef _WIN32
+    if(codex_wifi_replace(temporary.c_str(),wifiBlobPath.c_str()))return false;
+#else
+    if(std::rename(temporary.c_str(),wifiBlobPath.c_str()))return false;
+#endif
+#endif
+    size_t raw=0;for(const auto &entry:keys)raw+=entry.second.size();
+    testNvsPeakStoredBytes=std::max(testNvsPeakStoredBytes,raw);
+    testNvsBlob=std::move(bytes);return true;
+}
 class Preferences {
 public:
-    bool begin(const char *, bool) { return true; }
-    void end() {}
-    size_t freeEntries() { return 300; }
-    bool isKey(const char *key) { return !strcmp(key,"scheme") ? testNvsEmptyLegacyKey || !testNvsLegacyBlob.empty() : testNvsEmptyCurrentKey || !testNvsBlob.empty(); }
-    size_t getBytesLength(const char *key) { return !strcmp(key,"scheme") ? testNvsLegacyBlob.size() : testNvsBlob.size(); }
-    bool remove(const char *key) { if (testNvsRemoveFail) return false; if (!strcmp(key,"scheme")) testNvsLegacyBlob.clear(); return true; }
-    size_t putBytes(const char *, const void *data, size_t size) {
-        if (testNvsFail || size > testNvsByteLimit) return 0;
-        auto bytes = (const uint8_t *)data;
-#ifdef CODEX_WIFI_SIM
-        auto temporary = wifiBlobPath + ".tmp";
-        std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
-        file.write((const char *)bytes, size); file.close();
-        if (!file) return 0;
-#ifdef _WIN32
-        if (codex_wifi_replace(temporary.c_str(), wifiBlobPath.c_str())) return 0;
-#else
-        if (std::rename(temporary.c_str(), wifiBlobPath.c_str())) return 0;
-#endif
-#endif
-        testNvsBlob.assign(bytes, bytes + size); return testNvsCommitThenFail ? 0 : size;
+    bool begin(const char *,bool){return true;}
+    void end(){}
+    size_t freeEntries(){return 300;}
+    bool isKey(const char *key){
+        if(!strcmp(key,"scheme"))return testNvsEmptyLegacyKey || !testNvsLegacyBlob.empty();
+        TestNvsKeys keys;if(!testNvsKeys(keys))return true;
+        return keys.count(key) || (!strcmp(key,"store3") && testNvsEmptyCurrentKey);
     }
-    size_t getBytes(const char *key, void *data, size_t size) {
-        const auto &blob = !strcmp(key,"scheme") ? testNvsLegacyBlob : testNvsBlob;
-        if (testNvsReadbackFail || (testNvsNewReadbackFail && !strcmp(key,"store3")) || size < blob.size()) return 0;
-        memcpy(data, blob.data(), blob.size()); return blob.size();
+    size_t getBytesLength(const char *key){
+        if(!strcmp(key,"scheme"))return testNvsLegacyBlob.size();
+        TestNvsKeys keys;if(!testNvsKeys(keys))return 0;auto it=keys.find(key);return it==keys.end()?0:it->second.size();
+    }
+    bool remove(const char *key){
+        if(testNvsRemoveFail)return false;
+        if(!strcmp(key,"scheme")){testNvsLegacyBlob.clear();return true;}
+        TestNvsKeys keys;if(!testNvsKeys(keys))return false;keys.erase(key);return testNvsPublish(keys);
+    }
+    size_t putBytes(const char *key,const void *data,size_t size){
+        if(testNvsFail || size>testNvsByteLimit || testNvsFailAfter==0)return 0;
+        if(testNvsFailAfter>0)--testNvsFailAfter;
+        TestNvsKeys keys;if(!testNvsKeys(keys))return 0;auto bytes=(const uint8_t *)data;keys[key]={bytes,bytes+size};
+        if(!testNvsPublish(keys))return 0;++testNvsWrites[key];
+        return testNvsCommitThenFail || testNvsCommitThenFailKey==key?0:size;
+    }
+    size_t getBytes(const char *key,void *data,size_t size){
+        TestNvsKeys keys;if(!testNvsKeys(keys))return 0;
+        auto it=keys.find(key);const auto *blob=!strcmp(key,"scheme")?&testNvsLegacyBlob:it==keys.end()?nullptr:&it->second;
+        if(!blob || testNvsReadbackFail || testNvsReadbackFailKey==key ||
+            (testNvsFailReadAfterWriteKey==key && testNvsWrites[key]) ||
+            (testNvsNewReadbackFail && !strcmp(key,"store3")) || size<blob->size())return 0;
+        memcpy(data,blob->data(),blob->size());return blob->size();
     }
 };
 class IPAddress {

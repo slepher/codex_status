@@ -1469,7 +1469,8 @@ int codex_ble_wire(const char *kind, const char *input, char *out, int cap) {
     } else if (!strcmp(kind, "auth")) {
         bytes = bleBuildAuth(doc["ok"] | false, text("token"));
     } else if (!strcmp(kind, "endpoint")) {
-        bytes = bleBuildEndpoint(doc["ok"] | false);
+        bytes = bleBuildEndpoint(text("request_id"),text("device_mac"),text("bridge_id"),
+            doc["error"] | "", doc["stage"] | "persisted");
     } else if (!strcmp(kind, "attribute")) {
         // AUTH/endpoint and already paged Wi-Fi frames still share final limits.
         serializeJson(doc, bytes);

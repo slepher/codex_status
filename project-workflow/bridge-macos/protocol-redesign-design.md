@@ -123,7 +123,7 @@ stateDiagram-v2
 
 该图描述业务结果，不是长期占用worker的运行循环。Reconciling的一次查询结束后立即释放本次资源，下次自然机会才继续。
 
-作业另有独立 `execution_intent=active/cancelled/expired`。取消/过期停止新的副作用，但不抹去 `outcome=unknown/accepted`；独立确认义务仍可query-only。界面可以显示“已取消继续执行，原操作结果待确认”。确定拒绝/冲突/缺输入不是无限自动等待；只有明确可恢复原因进入WaitingOpportunity。
+作业另有独立 `execution_intent=active/cancelled/expired`。取消/过期停止新的自动执行与自动确认查询，但不抹去 `outcome=unknown/accepted`；已经在途的真实回执仍可确认结果。缺失/变更事务身份转为需处理并停止自动尝试，普通通信失败不得覆盖该根因；不猜身份、不重发。界面显示“已取消，原操作结果未知”，历史确认义务不再作为后台调度许可。确定拒绝/冲突/缺输入不是无限自动等待；只有明确可恢复原因进入WaitingOpportunity。
 
 ### 4.4 回执生命周期与重启
 
@@ -214,6 +214,16 @@ close(link, deadline) -> Closed | Abandoned
 - 正常和构造失败只暴露一个有限close；取消Rust future不等于取消CoreBluetooth请求。隔离旧代际、有限恢复和停止堆积native工作必须可测。
 - 保留已有平台必要行为（MTU分片、停扫描再连接、GATT重发现）；平台特例限制在Adapter，不传播到业务状态机。
 
+### 6.4 BLE endpoint 登记确认（2026-10-13，宿主候选）
+
+INFO 的紧凑 `er=1` 表示支持关联回执与只读登记核对；Bridge 展开为 `endpoint_registration=1`。缺该能力时发送前返回 `update_required`，不能将旧固件对未知字段的忽略当成只读支持。请求保持 schema=2，必填 request_id、check_only、bridge_id、host、port、token。当前绑定加密 peer 与学习到的设备 MAC 前置保持；登记不 claim、不修改 PowerPlan。
+
+Bridge 在同一绝对截止内先发送 check_only=true，设备从现行完整 BRS2 核对 principal、绑定 identity、token、host、port。相同返回 verified，零写盘；仅明确 registration_mismatch 才允许一次 check_only=false。核对 storage/权限/传输失败不得转写。写入口只在 storeUpsert 写后读回成功后返回 persisted；storage_unknown 保持未知。核对与写有不同 request_id，防止核对回执被当成写回执。
+
+STATUS 使用 ack=endpoint、rid/pid（request_id/principal 的有界 Base64）、device_mac、ok、result、stage、error；不返回 token。Bridge 同时校验请求/设备/Bridge身份，旧布尔ACK和串线回执不能成功。缺通知时读取同一属性；丢ACK有界返回unknown并阻止同链路后续控制写，后续连接先只读核对相同登记值。该操作是登记状态赋值，不创建Wi-Fi业务作业，不改其TransactionKey或原ID确认义务。
+
+原生写未完成与业务ACK未知分开：前者保留原生隔离；后者已完成GATT写，允许在确认disconnect后释放原生许可。取消不清确认标记。UI/MCP保留outcome/stage/error/action，明确拒绝不表现为无限授权等待。
+
 ## 7 错误模型与对外反馈
 
 内部使用枚举/结构，最后一层才转换有限错误码及中文反馈，不再跨层解析字符串。结果分四个正交维度：
@@ -285,6 +295,10 @@ action: none / wait_opportunity / query_original / refresh_snapshot /
 **不删除**：当前48 B frame、现行sync/Data/Plan、owner与会话校验、MTU协商、设备token流程、固件分区与原生OTA、完整snapshot分页、独立HTTP回报、UDP发现、当前持久数据和原事务证据。`device_client::wifi_request`仍被现行snapshot调用，不按函数名删除；先收敛调用再决定是否移除多余包装。
 
 旧协议不支持与旧磁盘记录处理是两件事。升级前冻结写入、保存私有备份和未确认清单；只保留经过校验的现行持久格式，必要的一次性数据转换不成为在线协议双栈。未知格式明确拒绝并保留原文件，不静默初始化空库。
+
+### 2026-10-13 用户修订：配置与事务独立
+
+配置不随协议变化升级到WFS5；保持WFS4配置编码，事务回执/高水位/执行代际独立WTX1，以WCM1原子选择完整配对。现有完整WFS4直接读取并保留原事务证据，首次持久操作成功后才退役旧混合记录；不是恢复wifi_migrate或旧网络协议。实时连接观察仍在RAM。此修订覆盖先前“固件只读WFS5、部署前必须离线转换WFS4”的实施安排。详见[拆分方案与验收](wifi-config-state-separation.md)。
 
 ## 10 验收判据
 

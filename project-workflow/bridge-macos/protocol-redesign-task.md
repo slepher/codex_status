@@ -75,3 +75,13 @@ P3旧Pusher后备删除：自动UDP分支不再对任意前缀设备写endpoint�
 02:02 P0/P3 当前增量：BRS运行时只读完整BRS2身份；旧逐键仓库或缺principal/identity/namespace记录拒绝且阻断物理/非物理注册，不从当前peer补猜namespace，不自动删除旧键。验证完整旧库/孤立键/空键/缺身份/当前绑定续用与持久失败，构建Note4候选；不替代离线联合迁移。
 
 收尾：用户要求结束当前任务并提交阶段进度。BRS当前完整身份限制及旧库阻断红绿通过；BLE endpoint持久ACK/结构化错误链发现未修，作为继续入口。P0–P6不结项，不部署。
+
+## 2026-10-13 恢复推进（Bridge / Fake ROM）
+
+设备不在现场，用户限定本轮聚焦Bridge与Fake ROM。首先完成endpoint注册纵向路径：请求关联、读持久ACK、拒绝与未知分离、app错误传播、Fake故障矩阵。复用共享C++ wire编码并同步设备入口合同，不构建/烧录ROM、不启动生产Bridge、不接触真实数据。随后按原计划继续可在宿主验证的边界；实机项目保持未验。
+
+- [x] endpoint请求/ACK关联及错误语义，更新共享wire与当前入口。
+- [x] Bridge有界确认、未知/取消保护及app错误传播。
+- [x] Fake ROM和app生产会合回归；记录证据和剩余边界。
+
+2026-10-13用户确认配置/事务物理拆分：WFS4配置编码保留，WTX1独立回执/执行代际/高水位，WCM1根原子选择；旧WFS4直接读取并保留原事务，取消WFS5配置升级安排。生产存储/配网/管理、ASAN、App93/3忽略、render68、Fake66和`.98` ELF62项通过；资源/故障证据见wifi-config-state-separation.md。真实NVS容量/掉电及BRS身份仍未放行，无提交/部署。

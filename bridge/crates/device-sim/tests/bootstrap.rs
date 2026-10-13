@@ -3804,3 +3804,98 @@ fn periodic_data_completes_over_http_with_a_sleep_plan_and_releases_the_window()
     assert_eq!(after["power"]["sync_open"],false);
     assert_eq!(after["power"]["mode"],"deep");
 }
+
+
+#[test]
+fn endpoint_registration_requires_correlated_durable_ack() {
+    let _env_guard = BLE_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut sim = Simulator::start("02:00:00:00:00:B1", &[]);
+    assert_eq!(set_time(&sim, Some(CONTROL), &serde_json::json!({"op":"rate","rate_ppm":0})).0, 200);
+    assert_eq!(request(sim.address(), "POST", "/sim/power", Some(CONTROL), br#"{"plugged":true}"#).0, 200);
+    std::env::set_var("CODEX_STATUS_SIM_BLE_ENDPOINTS",
+        serde_json::json!({"0200000000B1":format!("http://{}",sim.address())}).to_string());
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let mut legacy=bridge_ble::DeviceConnection::connect("0200000000B1",ENDPOINT,"bridge-test").await.unwrap().unwrap();
+        legacy.info.as_object_mut().unwrap().remove("endpoint_registration");
+        let rejected=legacy.write_endpoint("127.0.0.1",8765,ENDPOINT).await.unwrap_err();
+        assert_eq!(rejected.downcast_ref::<bridge_ble::EndpointFailure>().unwrap().error,"update_required");
+        assert!(json_body(&request(sim.address(),"GET","/sim/ble/attributes",Some(CONTROL),b"").1)["events"].as_array().unwrap().is_empty());
+        legacy.close().await;
+        let verification=bridge_ble::DeviceConnection::connect("0200000000B1",ENDPOINT,"bridge-test").await.unwrap().unwrap();
+        assert_eq!(request(sim.address(),"POST","/sim/ble/fault",Some(CONTROL),
+            br#"{"kind":"endpoint_storage","op":"endpoint_check"}"#).0,200);
+        let error=verification.write_endpoint("127.0.0.1",8765,ENDPOINT).await.unwrap_err();
+        let failure=error.downcast_ref::<bridge_ble::EndpointFailure>().unwrap();
+        assert_eq!((failure.outcome,failure.stage,failure.error),("rejected","verify","storage"));
+        assert_eq!(json_body(&request(sim.address(),"GET","/sim/ble/attributes",Some(CONTROL),b"").1)["endpoint_writes"],0,
+            "failed verification must never fall through to registration");
+        verification.close().await;
+        for (fault, outcome, code) in [
+            ("none", "", ""), ("notify_lost", "", ""),
+            ("endpoint_storage", "rejected", "storage"),
+            ("endpoint_capacity", "rejected", "capacity"),
+            ("endpoint_binding_conflict", "rejected", "binding_conflict"),
+            ("endpoint_physical_required", "rejected", "physical_required"),
+            ("endpoint_storage_unknown", "unknown", "storage_unknown"),
+            ("read_failed", "unknown", "read_failed"),
+            ("drop_ack", "unknown", "window_budget_exhausted"),
+            ("stale", "unknown", "window_budget_exhausted"),
+            ("wrong_request", "unknown", "window_budget_exhausted"),
+            ("wrong_mac", "unknown", "window_budget_exhausted"),
+        ] {
+            let mut link = bridge_ble::DeviceConnection::connect("0200000000B1", ENDPOINT, "bridge-test").await.unwrap().unwrap();
+            // Seed a previous success on the SAME attribute to test stale success.
+            link.write_endpoint("127.0.0.1",8765,ENDPOINT).await.unwrap();
+            assert_eq!(request(sim.address(), "POST", "/sim/ble/fault", Some(CONTROL),
+                serde_json::json!({"kind":fault,"op":"endpoint"}).to_string().as_bytes()).0, 200);
+            let started = std::time::Instant::now();
+            let result = link.write_endpoint("127.0.0.1",8766,ENDPOINT).await;
+            assert!(started.elapsed() < Duration::from_secs(6), "{fault}");
+            if outcome.is_empty() { result.unwrap(); }
+            else {
+                let error = result.unwrap_err();
+                let failure = error.downcast_ref::<bridge_ble::EndpointFailure>().unwrap();
+                assert_eq!((failure.outcome,failure.error),(outcome,code),"{fault}: {error}");
+                assert!(!failure.feedback().to_string().contains(ENDPOINT));
+                if outcome == "unknown" {
+                    let blocked = link.command("status",serde_json::json!({})).await.unwrap_err();
+                    assert_eq!(bridge_core::rendezvous::command_failure(&blocked).unwrap().reason,"previous_write_unknown");
+                } else {
+                    // A definite rejection releases this link for a safe read.
+                    assert_eq!(link.command("status",serde_json::json!({})).await.unwrap()["result"],"applied");
+                }
+            }
+            link.close().await;
+            // Failure cannot break later scan/connect/read processing.
+            let mut recovered = bridge_ble::DeviceConnection::connect("0200000000B1",ENDPOINT,"bridge-test").await.unwrap().unwrap();
+            assert_eq!(recovered.command("status",serde_json::json!({})).await.unwrap()["result"],"applied");
+            if outcome == "unknown" {
+                let before=json_body(&request(sim.address(),"GET","/sim/ble/attributes",Some(CONTROL),b"").1);
+                let writes=before["endpoint_writes"].clone();
+                recovered.write_endpoint("127.0.0.1",8766,ENDPOINT).await.unwrap();
+                let after=json_body(&request(sim.address(),"GET","/sim/ble/attributes",Some(CONTROL),b"").1);
+                assert_eq!(after["endpoint_writes"],writes,"confirmation must not rewrite {fault}");
+                assert_eq!(after["events"].as_array().unwrap().last().unwrap()["op"],"endpoint_check");
+            }
+            recovered.close().await;
+        }
+        let link=bridge_ble::DeviceConnection::connect("0200000000B1",ENDPOINT,"bridge-test").await.unwrap().unwrap();
+        assert_eq!(request(sim.address(),"POST","/sim/ble/fault",Some(CONTROL),br#"{"kind":"drop_ack"}"#).0,200);
+        assert!(tokio::time::timeout(Duration::from_millis(100),link.write_endpoint("127.0.0.1",8765,ENDPOINT)).await.is_err());
+        let failure=link.write_endpoint("127.0.0.1",8765,ENDPOINT).await.unwrap_err();
+        assert_eq!(failure.downcast_ref::<bridge_ble::EndpointFailure>().unwrap().error,"previous_write_unknown");
+        link.close().await;
+    });
+    sim.stop_preserving_data();
+    let rebooted=Simulator::start_with_dir("02:00:00:00:00:B1",&[],sim.data_dir.clone(),true);
+    assert_eq!(request(rebooted.address(),"POST","/sim/power",Some(CONTROL),br#"{"plugged":true}"#).0,200);
+    std::env::set_var("CODEX_STATUS_SIM_BLE_ENDPOINTS",serde_json::json!({"0200000000B1":format!("http://{}",rebooted.address())}).to_string());
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let link=bridge_ble::DeviceConnection::connect("0200000000B1",ENDPOINT,"bridge-test").await.unwrap().unwrap();
+        link.write_endpoint("127.0.0.1",8766,ENDPOINT).await.unwrap();
+        let attrs=json_body(&request(rebooted.address(),"GET","/sim/ble/attributes",Some(CONTROL),b"").1);
+        assert_eq!(attrs["endpoint_writes"],0,"reboot confirms existing registration without a new mutation");
+        link.close().await;
+    });
+    std::env::remove_var("CODEX_STATUS_SIM_BLE_ENDPOINTS");
+}

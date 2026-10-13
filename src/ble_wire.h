@@ -27,7 +27,8 @@ struct BleStatusSnapshot {
 bool bleWireText(const String &value, size_t limit, bool allowEmpty = true);
 bool bleWireFits(const String &bytes);
 String bleBuildAuth(bool okay, const String &token = String());
-String bleBuildEndpoint(bool okay);
+String bleBuildEndpoint(const String &request, const String &mac, const String &principal,
+                        const char *error = "", const char *stage = "persisted");
 String bleBuildInfo(const BleInfoSnapshot &snapshot);
 String bleBuildStatus(const BleStatusSnapshot &snapshot);
 // Adds the final correlation envelope, encodes byte-bounded identifiers and

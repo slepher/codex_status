@@ -1727,16 +1727,13 @@ fn shared_wifi_global_capacity_keeps_bounded_storage() {
 fn shared_wifi_old_duplicate_ids_are_preserved_and_explicitly_rejected() {
     let _guard=WIFI_PERMISSION_TEST_LOCK.lock().unwrap();
     let dir=std::env::temp_dir().join(format!("codex-wifi-duplicate-{}",std::process::id()));
-    // Frozen WFS5 bytes from the retired management2 writer: two open networks
+    // Frozen WFS4 bytes from the retired management2 writer: two open networks
     // named "same" in namespaces "mac"/"windows", revision 2, two save receipts.
     // Keep recovery coverage without compiling a retired command adapter.
     use base64::Engine;
-    let fixture=base64::engine::general_purpose::STANDARD.decode(concat!(
-        "V0ZTNQUAAgIJAQAA9yLkWAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAfAAEAAAAAAAAAA21hYwRzYW1lBEhvc3QGRGV2aWNl",
-        "AAAjAAIAAAAAAAAAB3dpbmRvd3MEc2FtZQRIb3N0BkRldmljZQAASQABAAAAAAAAADj1DxblEqPrYFm9K5O1lPfVkeJNnGyz",
-        "EIvYRQPZIALCA29sZAVzZWVkMANtYWMAAAAAAAAAAAAAAAAAAAAAAAAATQACAAAAAAAAADj1DxblEqPrYFm9K5O1lPfVkeJN",
-        "nGyzEIvYRQPZIALCA29sZAVzZWVkMQd3aW5kb3dzAAAAAAAAAAAAAAAAAAAAAAAAAA==",
-    )).unwrap();
+    let fixture=base64::engine::general_purpose::STANDARD.decode(
+        "V0ZTNAQAAgLxAAAAf3iPKgIAAAAAAAAAAAAAAAAAAAAAHwABAAAAAAAAAANtYWMEc2FtZQRIb3N0BkRldmljZQAAIwACAAAAAAAAAAd3aW5kb3dzBHNhbWUESG9zdAZEZXZpY2UAAEEAAQAAAAAAAAA49Q8W5RKj62BZvSuTtZT31ZHiTZxssxCL2EUD2SACwgNvbGQFc2VlZDADbWFjAAAAAAAAAAAAAABFAAIAAAAAAAAAOPUPFuUSo+tgWb0rk7WU99WR4k2cbLMQi9hFA9kgAsIDb2xkBXNlZWQxB3dpbmRvd3MAAAAAAAAAAAAAAA==",
+    ).unwrap();
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("wifi-schemes.bin"),&fixture).unwrap();
     let mut sim=SimulatorWifi::new(&dir).unwrap();

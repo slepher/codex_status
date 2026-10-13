@@ -219,6 +219,13 @@
 - 2026-10-03 用户确认本环境仅携带 Note4，1.54 不在现场：当前实机验收以 Note4 为范围，保留双设备软件身份回归；Windows 对照、Note4 每平台 ≥30 个自然会合及 macOS ≥24 h soak 按后续可用现场验证。1.54 实机与另一 CPU 架构另标未验，不为本轮要求用户取回设备，也不据 Note4 结果宣称全硬件已验。当前会话为 macOS 14.8.9 / x86_64，macOS 15+ 权限现场尚未验证。
 
 ### B6. 离线 BLE 配 Wi-Fi 与 BOOT 蓝牙恢复入口（2026-10-03 新开）
+- **2026-10-13队列状态修复已部署**：取消/到期停止自动查询，身份缺失/变更转needs_attention，晚到普通失败不复活/覆盖，已在途真实回执仍可确认；显式新请求按自身job_id立即尝试。Core153+22集成/App94（3条件忽略）/UI66、窄宽截图通过。两条旧同步恢复已取消，activate停止自动重试；保留历史unknown。设备HTTP当前不可达，在线直达由模拟服务验证。部署hash与数据备份见PROGRESS和下方调查。
+- **2026-10-13在线读取排队调查**：新read立即执行入口使用通用FIFO机会，旧身份未知事务仍可入选；每轮只处理一个，后台机会又位于claim/Plan之后。实机16:53读取约11秒完成，快照两页约500ms；生产准入方法隔离探针确认旧事务可抢机会。当次缺任务选择/锁日志，无法完全归因；修复已部署，见[调查与边界](../../project-workflow/bridge-macos/wifi-read-queue-investigation-20261013.md)。
+- **2026-10-13最简OTA兼容修复**：`.99`候选保留逐键旧绑定和缺身份BRS2，不完整记录隔离授权/路由，完整绑定可继续使用；物理修复保留已有namespace，不猜旧身份。取消USB导出BRS刷机前置。生产存储ASAN/分配故障、BLE/Fake endpoint与原生OTA回归、匹配ELF64项门禁通过；用户就绪后`.99`已直接OTA并认证哈希核验；最终Bridge 237cd5a0…已部署，补修同context数据归零的旧ACK抑制，Core152+集成22/App93通过，实机569 applied/displayed、Codex good。证据见[部署记录](../../project-workflow/bridge-macos/deployment-20261013.md)，不结B6/C8。
+
+- **2026-10-13用户修订**：配置保持WFS4编码，与WTX1事务恢复信息独立存储，实时状态留RAM；现有WFS4读取不改字节，32 B原子提交记录保持配置/回执一致。替代WFS4→WFS5部署迁移安排；源码与宿主验收见[拆分专项](../../project-workflow/bridge-macos/wifi-config-state-separation.md)，实机与BRS身份门禁仍未关闭。
+
+- **2026-10-13继续Bridge/Fake ROM，未部署**：endpoint注册改为能力门禁、只读先核对、完整身份关联ACK；持久拒绝/未知、取消和丢ACK跨连接/重启核对、App/UI错误链已补宿主验证。旧固件缺能力发送前拒绝，匹配登记零NVS写。详细证据/限制见[执行状态](../../project-workflow/bridge-macos/protocol-redesign-status.md)末节；BRS/Bridge联合迁移、P2/P3/P5/P6与实机验收仍开放，不结B6/C8。
 
 - **2026-10-13协议重设计阶段提交，未部署**：按用户要求停止推进并保存P0–P6阶段成果，详见[执行状态](../../project-workflow/bridge-macos/protocol-redesign-status.md)收尾节。Wi-Fi运行时收束WFS5、BRS拒绝旧/缺身份库；离线转换与宿主回归通过，实际联合迁移未完成。继续入口包括BLE endpoint注册的持久ACK与结构化错误链（当前Bridge只等写入）、BRS离线身份恢复及原计划其余；不结B6/C8。
 

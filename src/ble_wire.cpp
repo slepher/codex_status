@@ -37,8 +37,15 @@ String bleBuildAuth(bool okay, const String &token) {
     if (doc["ok"] == true) doc["token"] = token;
     return finish(doc);
 }
-String bleBuildEndpoint(bool okay) {
-    JsonDocument doc; doc["ack"] = "endpoint"; doc["ok"] = okay;
+String bleBuildEndpoint(const String &request, const String &mac, const String &principal,
+                        const char *error, const char *stage) {
+    if (!bleWireText(request,64,false) || !bleWireText(mac,17,false) ||
+        !bleWireText(principal,64,false)) return String();
+    JsonDocument doc; doc["ack"] = "endpoint"; doc["ble_wire"] = 1; doc["rid"] = encoded(request);
+    doc["device_mac"] = mac; doc["pid"] = encoded(principal);
+    doc["ok"] = !*error; doc["stage"] = stage;
+    doc["result"] = !*error ? "applied" : !strcmp(error,"storage_unknown") ? "unknown" : "rejected";
+    if (*error) doc["error"] = error;
     return finish(doc);
 }
 static bool macValid(const String &mac) {
@@ -52,6 +59,7 @@ String bleBuildInfo(const BleInfoSnapshot &s) {
         !bleWireText(s.firmware, 64, false)) return String();
     JsonDocument doc;
     doc["schema"] = 1; doc["model"] = "CodexStatus"; doc["ble_wire"] = 1;
+    doc["er"] = 1; // correlated registration with read-only verification
     doc["f"] = encoded(s.firmware); doc["mac"] = s.mac; doc["ip"] = s.ip;
     doc["http_port"] = 80; doc["rendezvous"] = true;
     doc["wifi_setup_protocol"] = s.wifiProtocol;

@@ -1075,6 +1075,8 @@
   const wifiError=e=>({ambiguous_network_id:'设备存在同名配置，无法确定目标。配置已保留，请核对冲突记录。',revision_conflict:'设备方案已变化，缓存已过期，请重新读取设备后再同步。Bridge 配置已保留。',physical_required:'请单击 BOOT 开启维护窗口',unsupported:'此固件尚不支持完整方案，请等待升级',
     local_revision_conflict:'Bridge 保存版本已改变，保留修改，请重新比较',target_revision_conflict:'方案已改变，请处理冲突',host_network_changed:'主机网络已改变，请重新选择当前网络',network_not_configured:'Bridge 尚无当前网络配置，请先保存方案',current_network_required:'请保留或加入当前网络后再同步。',host_network_unknown:'无法识别当前网络，请先授权读取主机 Wi-Fi。',snapshot_conflict:'设备快照已变化，请重新预览。',
     http_session_mismatch:'HTTP 会话与本次设备会合不一致，已停止执行。',http_wake_mismatch:'HTTP 响应属于其他醒次，已停止执行。',rendezvous_failed:'本轮设备会合失败，任务与本地配置已保留。',
+    transaction_identity_unknown:'缺少原事务身份，无法自动确认，已停止自动重试。',transaction_principal_changed:'Bridge 身份已变化，已停止自动重试。',transaction_namespace_changed:'设备绑定身份已变化，已停止自动重试。',transaction_namespace_invalid:'设备事务身份无效，已停止自动重试。',
+    device_channel_busy:'设备通道正忙，等待本轮操作结束。',device_delivery_pending:'设备正在处理发布或升级，等待完成。',device_endpoint_unavailable:'暂无可用设备地址，等待设备上线。',
     plan_unconfirmed:'设备计划尚未确认，本次未继续执行任务。',
     not_sent:'本次命令未发送；等待下次可用通道。',result_unknown:'命令可能已生效，先确认原操作，勿重复提交。',network_not_found:'设备未找到网络，请检查 2.4GHz 网络和信号。',window_budget_exhausted:'本轮工作预算已耗尽，等待下次会合。',http_proof_budget_exhausted:'启动已接受，但本轮预算内未能确认 HTTP 就绪。',
     snapshot_required_or_read_only:'需要完整快照，或选中项属于只读归属',credentials_required:'等待本次密码输入',
@@ -1088,11 +1090,22 @@
   const wifiFieldLabels={host_ssid:'主机 Wi-Fi',ssid:'设备 Wi-Fi',label:'显示名称',deleted:'删除',credential:'凭据'};
   const wifiStage=s=>({queued:'已排队',waiting_rendezvous:'等待设备可用通道',waiting_authorization:'需要恢复设备认证',
     waiting_input:'等待凭据输入',reading:'正在读取',applying:'正在同步',awaiting_confirmation:'待确认，先查询原事务',
-    conflict:'需处理冲突',completed:'完成',cancelled:'已取消',expired:'已过期',failed:'已终止'}[s]||s);
+    needs_attention:'需处理，已停止自动重试',conflict:'需处理冲突',completed:'完成',cancelled:'已取消',expired:'已过期',failed:'已终止'}[s]||s);
   function wifiSetResult(message) {
     wifiResultJobId=null;$('wifi-result').textContent=message;
   }
   function wifiShowResult(r) {
+    if(r.outcome&&r.action) {
+      const actions={offline_migration_or_storage_repair:'保留设备数据，完成离线迁移或修复存储后再试',
+        press_boot_and_restore_binding:'单击 BOOT 后修复设备认证关联',review_registered_bridges:'检查设备已登记的 Bridge，处理容量后再试',update_matching_firmware:'升级到与 Bridge 配套的固件后再试',
+        read_registration_before_retry:'先读取设备登记状态确认结果，请勿重复提交',correct_registration_and_retry:'检查登记参数后再试'};
+      const stages={preflight:'发送前检查',write:'发送登记请求',ack:'确认登记结果',validate:'校验登记参数',binding:'校验认证关联',verify:'读取设备登记',persist:'保存设备登记'};
+      const errors={storage:'设备登记存储不可用',capacity:'设备登记容量已满',physical_required:'需要设备物理授权',
+        binding_conflict:'设备认证关联冲突',token_conflict:'设备凭据关联冲突',binding_ambiguous:'设备认证关联不唯一',
+        memory:'设备内存不足',shape:'登记参数无效',read_failed:'未读到设备回执',write_failed:'登记请求发送结果未知'};
+      wifiSetResult(`${r.outcome==='unknown'?'设备登记结果未知':'设备登记失败'} · ${stages[r.stage]||'设备登记'} · ${errors[r.error]||wifiError(r.error)}。${actions[r.action]||''}`);
+      return;
+    }
     wifiSetResult(r.job_id?`${wifiStage(r.state)} · ${r.job_id} · ${r.error_code?wifiError(r.error_code):wifiAttemptLabel(r.last_stage||'')}`:
       r.error?wifiError(r.error):r.state==='waiting_rendezvous'?'已接收，等待可用通道核对并启用当前网络':r.stage==='connecting'?'正在临时试连（未保存）':r.stage==='trial_complete'?'试连完成，已恢复原链路；保存与启用仍须分别操作':
       r.persisted?'指定版本已启用':r.ok===true?'维护授权已验证':'本次操作结束');
@@ -1382,7 +1395,7 @@
     const buttons=j=>`${!terminal(j)?`<button onclick="wifiCancelJob('${j.job_id}')">取消任务</button>`:''}${j.state==='waiting_input'?`<button onclick="wifiJobInput('${j.job_id}')">提供本次密码</button>`:''}`;
     $('wifi-current-jobs').innerHTML=jobs.filter(j=>!terminal(j)).map(j=>`<div class="prow"><div class="pmeta"><b>${escapeHtml(wifiKindLabel(j.kind))} · ${wifiStage(j.state)}</b><small>${j.error_code?escapeHtml(wifiError(j.error_code)):''}${j.may_have_committed?' · 远端可能已生效，取消不回滚':''}<br>创建时间 ${escapeHtml(wifiCreatedTime(j.created_at))}</small></div>${buttons(j)}</div>`).join('')||'暂无进行中的任务';
     const history=jobs.filter(terminal);$('wifi-history-label').textContent=`执行记录（${history.length}）`;
-    $('wifi-jobs').innerHTML=history.map(j=>`<div class="prow"><div class="pmeta"><b>${escapeHtml(wifiKindLabel(j.kind))} · ${wifiStage(j.state)}</b><small>${escapeHtml(j.device_mac)} · ${escapeHtml(j.job_id)} · 尝试 ${j.attempt_count} · ${j.error_code?escapeHtml(wifiError(j.error_code)):escapeHtml(wifiAttemptLabel(j.last_stage))}<br>创建时间 ${escapeHtml(wifiCreatedTime(j.created_at))} · 最近执行 ${eventTime(j.last_attempt_at)}${j.confirmation?' · '+escapeHtml(j.confirmation):''}</small></div></div>`).join('')||'暂无执行记录';
+    $('wifi-jobs').innerHTML=history.map(j=>`<div class="prow"><div class="pmeta"><b>${escapeHtml(wifiKindLabel(j.kind))} · ${wifiStage(j.state)}</b><small>${escapeHtml(j.device_mac)} · ${escapeHtml(j.job_id)} · 尝试 ${j.attempt_count} · ${j.error_code?escapeHtml(wifiError(j.error_code)):escapeHtml(wifiAttemptLabel(j.last_stage))}<br>创建时间 ${escapeHtml(wifiCreatedTime(j.created_at))} · 最近执行 ${eventTime(j.last_attempt_at)}${j.confirmation?' · '+escapeHtml(j.confirmation):''}${j.may_have_committed&&!j.confirmation?' · 原操作结果未知，停止重试不代表回滚':''}</small></div></div>`).join('')||'暂无执行记录';
   }
   async function wifiCancelJob(id){await wifiQueue('cancel_job',{job_id:id});}
   async function wifiJobInput(id){const network=$('wifi-id').value,password=$('wifi-password').value;$('wifi-password').value='';await wifiQueue('input',{job_id:id,credentials:{[network]:password}});}

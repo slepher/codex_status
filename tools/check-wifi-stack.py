@@ -33,7 +33,7 @@ required = ["wifiSchemesBegin()", reader]
 for prefix in ("serviceV2Ble(",) if args.no_online_wifi_migration else ("serviceV2Ble(", "handleBleWifiMigration("):
     required.append(next((name for name in functions if name.startswith(prefix)), None))
 if reader and "WifiStoreV2" not in reader:
-    for prefix in ("saveV2(", "wifiSetupPoll(", "wifiSetupCommand(", "wifiManagementCommand(", "wifiControlCommand(", "wifiManagementWithContext(", "wifiDeviceStatus(", "handleWifiManagement(", "servicePresence(", "storeUpsert(", "storeAuthenticate("):
+    for prefix in ("saveV2(", "wifiSetupPoll(", "wifiSetupCommand(", "wifiManagementCommand(", "wifiControlCommand(", "wifiManagementWithContext(", "wifiDeviceStatus(", "handleWifiManagement(", "servicePresence(", "storeUpsert(", "storeAuthenticate(", "legacyString("):
         if prefix == "wifiManagementCommand(" and args.no_legacy_management_entry:
             continue
         required.append(next((name for name in functions if name.startswith(prefix)), None))
@@ -72,7 +72,7 @@ for name in required:
 def local(name):
     if name.startswith(("PlanStore::", "applyV2Plan(")):
         return True
-    return name.startswith(("wifi", "Wifi", "readWifiStore(", "saveV2(", "save(Wifi", "Preferences::", "nvs_", "nvs::", "store", "load(Endpoints", "save(Endpoints", "wifiDeviceStatus(", "handleWifiManagement(", "servicePresence(", "serviceReadyReport(", "v2Http", "v2Response(", "handleV2Status(", "pageStatus(", "StatusPages::", "buildPlatformStatus(", "handleClaim(", "serviceV2Ble(", "_ZL22handleBleWifiMigration", "handleBleWifiMigration(", "handleBleWifiCapabilities(", "v2BleNotify("))
+    return name.startswith(("wifi", "Wifi", "readWifiStore(", "saveV2(", "save(Wifi", "Preferences::", "nvs_", "nvs::", "store", "load(Endpoints", "save(Endpoints", "legacyString(", "wifiDeviceStatus(", "handleWifiManagement(", "servicePresence(", "serviceReadyReport(", "v2Http", "v2Response(", "handleV2Status(", "pageStatus(", "StatusPages::", "buildPlatformStatus(", "handleClaim(", "serviceV2Ble(", "_ZL22handleBleWifiMigration", "handleBleWifiMigration(", "handleBleWifiCapabilities(", "v2BleNotify("))
 
 def chain(name, seen=frozenset()):
     if name in seen or name not in functions or not local(name):

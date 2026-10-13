@@ -167,6 +167,8 @@ light deadline 使用设备单调时钟，`accepted_at + granted_duration`；Bri
 
 owner lease与Light期限完全分开。只由显式claim建立/转移；HTTP claim使用endpoint会话加设备操作token，BLE claim使用当前绑定加密peer/principal/session/MAC/operation_token并要求ble_claim=1，两者共用处理器。普通Data/Plan不创建owner；他人占用明确拒绝。claim成功不等于发布，不续电源期限；恢复持久Plan也不恢复已过期owner。
 
+BLE endpoint登记同样要求真实结果：INFO声明`er=1`后，Bridge先只读核对完整登记；只有明确不匹配才写一次，BRS2写后读回成功才返回持久ACK。ACK必须关联请求、设备MAC与Bridge身份；丢失/存储结果未知不冒充成功，下一连接先核对已存值，不反复写Flash。登记不创建owner、不延长PowerPlan。当前实现仅宿主候选，未部署；字段与边界见[重设计§6.4](../project-workflow/bridge-macos/protocol-redesign-design.md)。
+
 双策略切换通过当前可用的认证通道提交完整配置并由设备持久化 ACK，在约定的未来窗口生效；Bridge 收到 ACK 或认证读取确认前不能显示“配置已接受”，生效前也不能显示已按新日程会合。默认始终为 device_first。`bridge_first` 的长期失配恢复属于该策略内部：连续两个窗口无有效指令或时基不可信后锁存 `BRIDGE_FIRST_RECOVERY`，每轮在固定无线预算内以认证广播挑战重新发现 Bridge、校准单调时间误差和新 epoch，并在明确未来窗口生效。Bridge 重启后开启不依赖旧相位的恢复入口；设备重启后废止无法证明连续的旧 anchor。未认证完成前只报告发现，不宣称已对齐；广播无法修复密钥、owner 或网络配置缺失。临时恢复不改用户持久策略、不创建 owner、不延长 PowerPlan/BOOT。正常策略及 BOOT 的 `device_first` 能力不等于在 `bridge_first` 恢复中切换协议。候选细节和证据边界见 `project-workflow/power-plan-c/task-5-advert-rendezvous.md` §9；当前仅 RF 原型，没有实现认证恢复。
 
 初始实验参数沿用专项候选：rendezvous 60 秒、广播约 1.5 秒、BLE 总窗口约 15 秒、Wi-Fi 建连约 15 秒、正式单次 light 最大 600 秒。它们必须按 target 和实测定值，只有 BOOT 300 秒兜底是本次已确认产品语义。PC USB/配网等模式若需要不同策略，必须成为明确配置和有界入口，不混入普通数据活动。
@@ -307,3 +309,21 @@ GATT 优先复用现有表并明确协议协商；修改特征表必须考虑 Wi
 ### 2026-10-11 临时同步窗口修正（源码候选）
 
 周期全量Data不授予正式Light。BLE小快照在会合内完成，大快照用既有sync_open新增reason=data/data_seq准入临时90秒WIFI_SYNC_ONCE；该窗口与正式Light绝对截止独立，跨正式截止可继续，不续计划、不续窗口。正式/临时剩余预算取合法较晚截止后再受本轮工作预算约束；Data及冻结完整读取先于诊断complete，成功收尾或硬截止退出。报文新增sync.data_pending_seq状态；48 B头/模板格式/哈希不变。详细合同见[协议总览](bridge-device-protocol.md)，实施/测试/候选部署边界见[执行记录](../project-workflow/bridge-macos/sync-window-fix-20261011.md)；现场以PROGRESS为准。
+
+### 2026-10-13 Wi-Fi 配置、观察与事务独立存储
+
+用户配置（网络列表、凭据、名称、映射）及已提交的active恢复选择保持WFS4编码；active不代表此刻联网。IP/RSSI/连接阶段/临时试连对象属于运行态，不写配置。请求身份、结果/未知、回执、高水位及executionGeneration独立存为WTX1，不因协议事务字段增长升级配置格式。
+
+配置与事务分NVS键保存，32 B显式WCM1提交记录选择一份配置和一份事务块。变化部分写未引用槽并读回，最后原子写/核验提交记录；确认后删除旧槽，清理失败报告cleanup_pending，不将已确认提交改判失败。恢复仅按有效提交记录读取完整配对，损坏时拒绝写入、不回退旧配置。回执单独变化不重写配置；保存不等于激活的语义保留。
+
+已部署完整WFS4可直接校验读取，原回执/未知/高水位仍有效；读取不改字节，首次实际持久操作验证完整独立提交后才退役原混合store3。WFS5是历史未部署候选/离线归档格式，不是配置升级目标；旧raw/WFZ2仍需单独有证据处理。协议兼容与存储读取分开，未恢复旧网络命令。实现与资源/验收见[拆分专项](../project-workflow/bridge-macos/wifi-config-state-separation.md)。
+
+### 2026-10-13 绑定持久兼容与原生升级
+
+固件可读取旧逐键绑定及边界/校验有效的BRS2不完整身份记录。持久可读与当前授权分开：缺principal/identity/namespace记录保留，不认证、不投递；同库完整记录正常使用。物理恢复的绑定加密链路可提交匹配凭据/来源的显式修复，已有namespace不变，缺失才新签发，不从当前peer补猜旧事务身份。只读不写盘，损坏/歧义仍明确拒绝。原生OTA使用设备token、目标/镜像校验和启动核验，不依赖Bridge任务队列、BRS导出或Wi-Fi格式迁移。
+
+OTA/软件重启可能保留Bundle的active_context_id但丢失RAM Data。Bridge收到同context的认证状态且data_seq（缺失时applied_seq）低于已确认序号时，应使该context的旧确认指纹失效并重推完整快照；不能仅依赖context变化。保留未知in-flight及其原序号，单调序号不回退，不因状态读取修改PowerPlan或延长full_sync_deadline；只有新完整ACK再次建立基线。
+
+### Wi-Fi任务取消与身份阻塞（2026-10-13）
+
+Wi-Fi任务的历史结果未知不授予无限后台执行许可。取消/期限耗尽后不再自动发命令或查询；已在途且匹配原事务的真实结果仍如实记录。缺失或变更事务身份标为needs_attention，保留根因及may_have_committed，不猜namespace、不换ID重发。重启恢复遵守execution_intent，普通会合失败不能复活取消任务或覆盖硬阻塞。已取消历史仍可能生效，不能冒充回滚或成功。用户新建请求持久接受后，先以自身job_id尝试现有HTTP通道，设备锁忙、地址缺失或窗口关闭才返回明确等待原因。

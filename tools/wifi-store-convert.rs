@@ -34,12 +34,12 @@ fn convert_file(input:&Path,output:&Path)->Result<(usize,usize)> {
 fn main()->Result<()> {
     let args:Vec<_>=std::env::args_os().skip(1).collect();
     if args.len()==1 && args[0]=="--help" {
-        println!("wifi-store-convert INPUT_BLOB NEW_OUTPUT_BLOB\nAccepts WFS3/WFS4/WFS5 and verified Note4 v1/v2/WFZ2 layouts; emits WFS5 without boot recovery.\nUse private existing directories. Does not overwrite or deploy. Other legacy ABIs are unsupported.");
+        println!("wifi-store-convert INPUT_BLOB NEW_OUTPUT_BLOB\nAccepts WFS3/WFS4/WFS5 and verified Note4 v1/v2/WFZ2 layouts; emits a historical WFS5 archive without boot recovery; NOT a deployable device store.\nUse private existing directories. Does not overwrite or deploy. Other legacy ABIs are unsupported.");
         return Ok(());
     }
     anyhow::ensure!(args.len()==2,"usage: wifi-store-convert INPUT_BLOB NEW_OUTPUT_BLOB");
     let (before,after)=convert_file(Path::new(&args[0]),Path::new(&args[1]))?;
-    println!("Validated WFS5 conversion: {before} -> {after} bytes; input unchanged.");
+    println!("Validated historical WFS5 archive (not deployable): {before} -> {after} bytes; input unchanged.");
     Ok(())
 }
 
@@ -142,21 +142,18 @@ mod tests {
         }
     }
     #[test]
-    fn runtime_rejects_old_and_empty_files_until_offline_conversion() {
+    fn runtime_reads_deployed_wfs4_without_rewriting_and_rejects_archive_formats() {
         let root=std::env::temp_dir().join(format!("wifi-current-runtime-{}",std::process::id()));
         fs::create_dir(&root).unwrap();let path=root.join("wifi-schemes.bin");
-        for original in [vec![],fixture(3,false),fixture(4,true)] {
+        for original in [vec![],fixture(3,false),fixture(4,true),fixture(5,true)] {
             fs::write(&path,&original).unwrap();
-            assert!(bridge_render::SimulatorWifi::new(&root).is_err());
+            if original.get(4)==Some(&4) {
+                let mut sim=bridge_render::SimulatorWifi::new(&root).unwrap();
+                let status=sim.storage_status().unwrap();
+                assert_eq!(status["format"],"WFS4");assert_eq!(status["receipts"],1);
+                assert_eq!(status["transaction_format"],"embedded");assert_eq!(status["cursors"],1);
+            } else { assert!(bridge_render::SimulatorWifi::new(&root).is_err()); }
             assert_eq!(fs::read(&path).unwrap(),original);
-            if original.is_empty() { continue; }
-            let converted=bridge_render::convert_wifi_storage(&original).unwrap();
-            fs::write(&path,&converted).unwrap();
-            let mut sim=bridge_render::SimulatorWifi::new(&root).unwrap();
-            let status=sim.storage_status().unwrap();
-            assert_eq!(status["format"],"WFS5");assert_eq!(status["receipts"],1);
-            assert_eq!(status["cursors"],if original[4]==4 {1}else{0});
-            assert_eq!(fs::read(&path).unwrap(),converted);
         }
         fs::remove_file(path).unwrap();fs::remove_dir(root).unwrap();
     }

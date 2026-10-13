@@ -70,6 +70,19 @@ fn production_info_and_all_ack_classes_are_bounded() {
     for category in ["auth","endpoint"] {
         for ok in [true,false] {
             let mut doc = json!({"ack":category,"ok":ok});
+            if category == "endpoint" {
+                doc["request_id"] = json!("\u{1}".repeat(64)); doc["device_mac"] = json!("AA:BB:CC:DD:EE:FF");
+                doc["bridge_id"] = json!("\u{1}".repeat(64));
+                if !ok { doc["error"] = json!("storage_unknown"); doc["stage"] = json!("persist"); }
+                let reply: Value = serde_json::from_slice(&wire(category, &doc).unwrap()).unwrap();
+                assert_eq!(reply["ble_wire"],1);
+                use base64::Engine;
+                for field in ["rid","pid"] {
+                    assert_eq!(base64::engine::general_purpose::STANDARD.decode(reply[field].as_str().unwrap()).unwrap(),vec![1;64]);
+                }
+                println!("max endpoint {ok} bytes={}",wire(category,&doc).unwrap().len());
+                assert_eq!(reply["result"], if ok {"applied"} else {"unknown"});
+            }
             if category == "auth" && ok { doc["token"] = json!("f".repeat(32)); }
             assert!(wire(category, &doc).unwrap().len() <= 512);
         }

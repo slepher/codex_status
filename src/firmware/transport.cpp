@@ -78,33 +78,35 @@ bool endpointTokenAuthorized(String &mac) {
 
 void handleBleEndpoint(const String &json) {
     JsonDocument doc;
-    if (deserializeJson(doc, json)) {
-        bleNotifyStatus(bleBuildEndpoint(false));
-        return;
+    if (deserializeJson(doc, json)) return;
+    String request=doc["request_id"]|"", principal=doc["bridge_id"]|"";
+    // Without an exact identity no response can safely acknowledge this write.
+    if (!bleWireText(request,64,false) || !bleWireText(principal,64,false)) return;
+    auto reply=[&](const char *error,const char *stage) {
+        bleNotifyStatus(bleBuildEndpoint(request,WiFi.macAddress(),principal,error,stage));
+    };
+    if(doc["schema"]!=2 || !doc["port"].is<uint16_t>() || !doc["check_only"].is<bool>()){reply("shape","validate");return;}
+    for(const char *key:{"host","token","bridge_id","request_id"}){JsonString value=doc[key].as<JsonString>();if(!value || value.size()!=strlen(value.c_str())){reply("shape","validate");return;}}
+    String host=doc["host"]|"", token=doc["token"]|"";
+    uint16_t port=doc["port"]|0;
+    if (!port || !bleWireText(host,64,false) || !bleWireText(token,128,false)) {
+        reply("shape","validate");return;
     }
-    if(doc["schema"]!=2 || !doc["port"].is<uint16_t>()){bleNotifyStatus(bleBuildEndpoint(false));return;}
-    for(const char *key:{"host","token","bridge_id"}){JsonString value=doc[key].as<JsonString>();if(!value || value.size()!=strlen(value.c_str())){bleNotifyStatus(bleBuildEndpoint(false));return;}}
-    const char *host = doc["host"] | "";
-    uint16_t port = doc["port"] | 0;
-    const char *token = doc["token"] | "";
-    if (!strlen(host) || !port) {
-        bleNotifyStatus(bleBuildEndpoint(false));
-        return;
+    String mac=blePeerAddress(), identity=blePeerIdentity();
+    if (!blePeerIsBonded() || !blePeerIsEncrypted() || !identity.length() || !mac.length()) {
+        reply("binding_required","binding");return;
     }
-    String mac = blePeerAddress();
-    if (!mac.length()) mac = "unknown";
-    String identity=blePeerIdentity(), principal=doc["bridge_id"]|"";
-    if (!blePeerIsBonded() || !blePeerIsEncrypted() || !identity.length() ||
-        !bleWireText(principal,64,false) || !bleWireText(String(host),64,false) || !bleWireText(String(token),128,false)) {
-        bleNotifyStatus(bleBuildEndpoint(false)); return;
+    if (doc["check_only"] == true) {
+        const char *failure=storeCheckEndpoint(host,port,token,principal,identity);
+        reply(failure?failure:"",failure?"verify":"verified");return;
     }
     char ns[17];snprintf(ns,sizeof(ns),"%08lx%08lx",(unsigned long)esp_random(),(unsigned long)esp_random());
     const char *failure=storeUpsert(mac,host,port,token,principal,identity,String(ns),power::state.bleRecovery.physicalUntil()>clock::v2NowMs());
-    if (failure) { bleNotifyStatus(bleBuildEndpoint(false));return; }
+    if (failure) { reply(failure,"persist");return; }
     diagnostics::traceSetTransport(1);
     diagnostics::traceSetStage(TRACE_STAGE_COMMAND);
     diagnostics::traceSetStage(TRACE_STAGE_REPLY);
-    bleNotifyStatus(bleBuildEndpoint(true));
+    reply("","persisted");
 }
 
 static void randomHex(char *out, size_t bytes) {

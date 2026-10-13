@@ -29,7 +29,7 @@ void operator delete[](void *p,const std::nothrow_t &) noexcept { ::operator del
 #include "../src/wifi_legacy.h"
 
 static const char *bond="02:00:00:00:00:02/1";
-static void reset() { testNvsBlob.clear();testNvsLegacyBlob.clear();testNvsCommitThenFail=testNvsFail=testNvsReadbackFail=testNvsNewReadbackFail=testNvsRemoveFail=false;testNvsByteLimit=SIZE_MAX;wifiManagementResetSession();running=false;assert(wifiSchemesBegin()); }
+static void reset() { testNvsBlob.clear();testNvsLegacyBlob.clear();testNvsCommitThenFail=testNvsFail=testNvsReadbackFail=testNvsNewReadbackFail=testNvsRemoveFail=false;testNvsByteLimit=SIZE_MAX;testNvsFailAfter=-1;testNvsCommitThenFailKey.clear();testNvsReadbackFailKey.clear();testNvsFailReadAfterWriteKey.clear();testNvsWrites.clear();wifiManagementResetSession();running=false;assert(wifiSchemesBegin()); }
 static WifiStore example(size_t networks,size_t receipts,bool maximum=false) {
     WifiStore s; s.revision=10;
     for(size_t i=0;i<networks;++i) {
@@ -46,6 +46,17 @@ static WifiStore example(size_t networks,size_t receipts,bool maximum=false) {
         if(maximum)r.error.set(std::string(32,'e').c_str());assert(s.receipts.append(r));
     }
     assert(wifiStoreShape(s));return s;
+}
+static std::vector<uint8_t> archive(const WifiStore &s) {
+    WifiWriter sizing{nullptr};sizing.store(s);std::vector<uint8_t>b(sizing.pos);WifiWriter writer{b.data()};writer.store(s);
+    wifiSetWord(b.data(),8,b.size());wifiSetWord(b.data(),12,v2Crc32(b.data(),b.size()));return b;
+}
+static void mutate(WifiStore &s) {
+    if(s.schemes.networks.size()) {
+        s.preserveActive();auto &n=s.schemes.networks[0];n.label.set(std::string(strlen(n.label),'x').c_str());n.version=++s.revision;
+    }
+    if(s.receipts.size())s.receipts[0].error.set(std::string(32,'m').c_str());
+    else ++s.executionGeneration;
 }
 static void reseal(std::vector<uint8_t> &bytes) {memset(bytes.data()+12,0,4);uint32_t crc=v2Crc32(bytes.data(),bytes.size());for(size_t i=0;i<4;++i)bytes[12+i]=crc>>(8*i);}
 static void refused(std::vector<uint8_t> bytes) {WifiStore decoded;assert(!wifiDecode5(bytes.data(),bytes.size(),decoded));}
@@ -66,7 +77,7 @@ static void legacyFixture(int version,bool compressed) {
 }
 int main() {
     // Format bytes and corruption, including valid CRC on invalid length/count.
-    reset();auto fixture=example(2,2);assert(saveV2(fixture));auto valid=testNvsBlob;
+    reset();auto fixture=example(2,2);assert(saveV2(fixture));auto valid=archive(wifiStore);
     for(size_t size=0;size<valid.size();++size) {auto cut=valid;cut.resize(size);refused(std::move(cut));}
     for(size_t i=0;i<valid.size();++i){auto broken=valid;broken[i]^=0x80;refused(std::move(broken));}
     auto broken=valid;broken.push_back(0);refused(broken);
@@ -82,11 +93,14 @@ int main() {
     duplicate=wifiStore;duplicate.activeVersion=9;assert(!saveV2(duplicate));
     // Build the actual prior WFS4 layout, which had neither generation field.
     auto prior=example(2,2);prior.receipts[0].error.set("pending");prior.receipts[0].operation.set("trial");
-    assert(saveV2(prior));auto wfs4=testNvsBlob;
+    prior.receipts[0].request.set("w3_0000000000000001");WifiCursor legacyCursor;
+    legacyCursor.bridge.set(prior.receipts[0].bridge);legacyCursor.bond.set(prior.receipts[0].bond);legacyCursor.high=1;assert(prior.cursors.append(legacyCursor));
+    assert(saveV2(prior));auto wfs4=archive(wifiStore);
     wfs4.erase(wfs4.begin()+32,wfs4.begin()+40);wfs4[3]='4';wfs4[4]=4;
     size_t pos=33;
     if(wfs4[32]) {for(int i=0;i<(wfs4[32]==2?4:2);++i)pos+=1+wfs4[pos];}
     for(size_t i=0;i<wfs4[6];++i)pos+=2+wfs4[pos]+256*wfs4[pos+1];
+    const size_t configurationEnd=pos;
     for(size_t i=0;i<wfs4[7];++i) {
         size_t length=wfs4[pos]+256*wfs4[pos+1];
         wfs4.erase(wfs4.begin()+pos+2+length-8,wfs4.begin()+pos+2+length);
@@ -94,7 +108,23 @@ int main() {
     }
     for(size_t i=0;i<4;++i)wfs4[8+i]=wfs4.size()>>(8*i);reseal(wfs4);
     testNvsBlob=wfs4;wifiExecutionGeneration=0;
-    assert(!wifiSchemesBegin()&&testNvsBlob==wfs4);refused(wfs4);
+    assert(wifiSchemesBegin()&&testNvsBlob==wfs4 && !wifiStorageSplit);refused(wfs4);
+    assert(wifiStore.receipts.size()==2 && !strcmp(wifiStore.receipts[0].error,"pending") && !wifiStore.receipts[0].executionGeneration);
+    auto imported=wifiStore;assert(saveV2(imported)&&wifiStorageSplit&&wifiSchemesBegin());
+    assert(!strcmp(wifiStore.receipts[0].error,"pending") && !wifiStore.receipts[0].executionGeneration);
+    TestNvsKeys importedKeys;assert(testNvsKeys(importedKeys)&&!importedKeys.count("store3"));
+    auto expectedConfig=std::vector<uint8_t>(wfs4.begin(),wfs4.begin()+configurationEnd);
+    expectedConfig[5]=expectedConfig[7]=0;wifiSetWord(expectedConfig.data(),8,expectedConfig.size());reseal(expectedConfig);
+    assert(importedKeys.at("config0")==expectedConfig); // exact original configuration encoding
+    assert(wifiStore.cursors.size()==1&&wifiStore.cursors[0].high==1&&!strcmp(wifiStore.receipts[0].request,"w3_0000000000000001"));
+    // Import is also a transaction: prepared separate blocks cannot hide or
+    // retire an existing WFS4 until the selector itself commits.
+    for(int fault=0;fault<4;++fault){
+        testNvsBlob=wfs4;assert(wifiSchemesBegin());auto split=wifiStore;
+        testNvsFailAfter=fault;assert(!saveV2(split));testNvsFailAfter=-1;
+        assert(wifiSchemesBegin()&&!wifiStorageSplit&&wifiStore.receipts.size()==2);
+        TestNvsKeys preserved;assert(testNvsKeys(preserved)&&preserved.at("store3")==wfs4);
+    }
     for(auto version:{1,2})legacyFixture(version,false);legacyFixture(2,true);
     // Existing empty/wrong-type keys cannot be mistaken for a pristine store.
     for(bool current:{false,true}) {
@@ -122,8 +152,8 @@ int main() {
         JsonDocument apply;apply["op"]="apply";apply["bridge_id"]="installation";apply["request_id"]="new";apply["expected_revision"]=wifiStore.revision;
         auto n=apply["changes"].to<JsonArray>().add<JsonObject>();n["network_id"]="network-0";n["host_ssid"]="Host-0";n["ssid"]="Edited";n["credential"]="replace";n["password"]="new-password";
         allocationFaultInjected=false;
-        testNvsCommitThenFail = fault==140;
-        failAllocation=fault;String result=wifiControlCommand(apply,context,1000);failAllocation=-1;testNvsCommitThenFail=false;
+        testNvsCommitThenFailKey=fault==140?"commit":"";
+        failAllocation=fault;String result=wifiControlCommand(apply,context,1000);failAllocation=-1;testNvsCommitThenFailKey.clear();
         if(allocationFaultInjected)++exercisedAllocationFailures;
         if(fault==140) {
             JsonDocument response;assert(!deserializeJson(response,result)&&response["error"]=="storage_unknown");
@@ -131,36 +161,93 @@ int main() {
             assert(!deserializeJson(response,wifiControlCommand(query,context,1000))&&response["outcome"]=="committed"&&response["revision"]==11);
         }
         assert(wifiSchemesBegin());
-        if(testNvsBlob!=previous) {assert(wifiStore.revision==11&&wifiStore.receipts.size()==1&&!strcmp(wifiStore.receipts[0].request,"new"));}
+        if(wifiStore.revision==11) {assert(wifiStore.receipts.size()==1&&!strcmp(wifiStore.receipts[0].request,"new"));}
         else assert(wifiStore.revision==10&&wifiStore.receipts.size()==0);
     }
     std::cout<<"Allocation fault sites reached="<<exercisedAllocationFailures<<" of 140 probes; committed-then-error original result confirmed\n";
     // Old or complete new bytes after a simulated NVS atomic commit boundary;
     // readback failure never allows a stale-revision follow-up overwrite.
     reset();auto initial=example(1,0);assert(saveV2(initial));auto oldBytes=testNvsBlob;
-    auto changed=example(2,1);changed.revision=11;testNvsReadbackFail=true;assert(!saveV2(changed));auto newBytes=testNvsBlob;testNvsReadbackFail=false;
+    auto changed=example(2,1);changed.revision=11;testNvsWrites.clear();testNvsFailReadAfterWriteKey="commit";
+    assert(!saveV2(changed));auto newBytes=testNvsBlob;testNvsFailReadAfterWriteKey.clear();
     assert(wifiSchemesBegin()&&schemes.networks.size()==2);
-    testNvsCommitThenFail=true;WifiStore committedDespiteError=example(3,1);assert(!saveV2(committedDespiteError)&&wifiStorageUncertain);testNvsCommitThenFail=false;
+    testNvsCommitThenFailKey="commit";WifiStore committedDespiteError=example(3,1);
+    assert(!saveV2(committedDespiteError)&&wifiStorageUncertain);testNvsCommitThenFailKey.clear();
     assert(wifiSchemesBegin()&&schemes.networks.size()==3&&!wifiStorageUncertain);
     testNvsBlob=oldBytes;assert(wifiSchemesBegin()&&schemes.networks.size()==1);testNvsBlob=newBytes;assert(wifiSchemesBegin()&&schemes.networks.size()==2);
-    testNvsByteLimit=newBytes.size()-1;auto tooLarge=example(3,1);assert(!saveV2(tooLarge)&&testNvsBlob==newBytes);testNvsByteLimit=SIZE_MAX;
-    std::cout<<"WFS5: old-v1/raw-v2/WFZ2/WFS4 rejection and preservation, corruption/truncation/count/length, allocation faults, active snapshots, atomic boundaries and capacity passed\n";
+    testNvsByteLimit=32;auto tooLarge=example(3,1);assert(!saveV2(tooLarge));testNvsByteLimit=SIZE_MAX;
+    assert(wifiSchemesBegin()&&schemes.networks.size()==2);
+    // Every preparation/selector write boundary keeps either the complete old
+    // state or the complete new state. No split config/receipt visibility.
+    for(int fault=0;fault<3;++fault){
+        reset();auto base=example(1,1);assert(saveV2(base));auto next=example(2,2);next.revision=11;
+        testNvsFailAfter=fault;assert(!saveV2(next));testNvsFailAfter=-1;assert(wifiSchemesBegin());
+        assert(wifiStore.revision==10&&schemes.networks.size()==1&&wifiStore.receipts.size()==1);
+    }
+    for(const char *key:{"config1","txn1","commit"}){
+        for(bool afterCommit:{false,true}){
+            reset();auto base=example(1,1);assert(saveV2(base));auto next=example(2,2);next.revision=11;testNvsWrites.clear();
+            if(afterCommit)testNvsCommitThenFailKey=key;else testNvsFailReadAfterWriteKey=key;
+            assert(!saveV2(next));testNvsCommitThenFailKey.clear();testNvsFailReadAfterWriteKey.clear();assert(wifiSchemesBegin());
+            bool committed=!strcmp(key,"commit");assert(wifiStore.revision==(committed?11:10));
+            assert(schemes.networks.size()==(committed?2:1)&&wifiStore.receipts.size()==(committed?2:1));
+        }
+    }
+    reset();auto separated=example(2,2);assert(saveV2(separated));TestNvsKeys before;assert(testNvsKeys(before));
+    testNvsWrites.clear();auto txnOnly=wifiStore;txnOnly.receipts[0].error.set("timeout");assert(saveV2(txnOnly));
+    TestNvsKeys after;assert(testNvsKeys(after));assert(after.at("config0")==before.at("config0")&&!after.count("config1"));
+    assert(!testNvsWrites["config0"]&&!testNvsWrites["config1"]);
+    const auto &cfg=after.at("config0");assert(!memcmp(cfg.data(),"WFS4",4)&&!cfg[5]&&!cfg[7]);
+    const auto &tx=after.at("txn1");assert(!memcmp(tx.data(),"WTX1",4));
+    assert(std::search(tx.begin(),tx.end(),std::begin("test-password"),std::end("test-password")-1)==tx.end());
+    testNvsWrites.clear();auto unchanged=wifiStore;assert(saveV2(unchanged)&&testNvsWrites.empty());
+    // A failed retirement leaves a verified new commit and bounded old slots;
+    // retry removes them without writing credentials or replaying a command.
+    auto update=example(3,2);testNvsRemoveFail=true;assert(saveV2(update)&&wifiStorageCleanupPending);testNvsRemoveFail=false;
+    assert(wifiSchemesBegin());testNvsWrites.clear();auto cleanup=wifiStore;assert(saveV2(cleanup)&&!wifiStorageCleanupPending&&testNvsWrites.empty());
+    TestNvsKeys keys;assert(testNvsKeys(keys)&&keys.size()==3);
+    // Corrupt/truncated selector must never fall back to the legacy record.
+    auto complete=testNvsBlob;auto marker=keys.at("commit");
+    for(size_t n=0;n<marker.size();++n){keys["commit"]={marker.begin(),marker.begin()+n};assert(testNvsPublish(keys));assert(!wifiSchemesBegin());}
+    for(size_t n=0;n<marker.size();++n){keys["commit"]=marker;keys["commit"][n]^=0x80;assert(testNvsPublish(keys));assert(!wifiSchemesBegin());}
+    testNvsBlob=complete;assert(wifiSchemesBegin());assert(testNvsKeys(keys));
+    const auto validKeys=keys;
+    for(const char *key:{wifiConfigKey(marker[4]),wifiTransactionKey(marker[5])}){
+        const auto original=validKeys.at(key);
+        for(size_t n=0;n<original.size();++n){keys=validKeys;keys[key].resize(n);assert(testNvsPublish(keys));assert(!wifiSchemesBegin());}
+        for(size_t n=0;n<original.size();++n){keys=validKeys;keys[key][n]^=0x80;assert(testNvsPublish(keys));assert(!wifiSchemesBegin());}
+        // Valid CRCs do not authorize an unknown schema or unbounded count.
+        for(auto [offset,value]:std::initializer_list<std::pair<size_t,uint8_t>>{{4,99},{5,9},{6,13},{7,9}}){
+            keys=validKeys;auto &part=keys[key];part[offset]=value;reseal(part);
+            auto &selector=keys["commit"];wifiSetWord(selector.data(),!strncmp(key,"config",6)?12:20,v2Crc32(part.data(),part.size()));
+            wifiSetWord(selector.data(),24,0);wifiSetWord(selector.data(),24,v2Crc32(selector.data(),selector.size()));
+            assert(testNvsPublish(keys));assert(!wifiSchemesBegin());
+        }
+    }
+    // A missing selector cannot be guessed to mean fresh or legacy state.
+    keys=validKeys;keys.erase("commit");assert(testNvsPublish(keys));assert(!wifiSchemesBegin());
+    keys["store3"]=wfs4;assert(testNvsPublish(keys));assert(!wifiSchemesBegin());
+    // First ever save has an explicit empty root before any prepared blobs.
+    for(int fault=0;fault<4;++fault){reset();auto first=example(1,1);testNvsFailAfter=fault;
+        assert(!saveV2(first));testNvsFailAfter=-1;assert(wifiSchemesBegin()&&schemes.networks.size()==0&&wifiStore.receipts.size()==0);}
+    testNvsBlob=complete;assert(wifiSchemesBegin());
+    std::cout<<"WFS4 + WTX1: compatible import, zero config writes for receipts, atomic split commit faults, unknown original result, cleanup and corruption passed\n";
     // Isolate production clone+encode+readback; exclude host NVS vectors from
     // logical target budgets. Measured host delta includes its vector resize.
     for(auto [networks,receipts]:std::initializer_list<std::pair<size_t,size_t>>{{0,0},{1,1},{2,2},{12,8}}) {
         reset();auto source=example(networks,receipts,networks==12);assert(saveV2(source));
-        size_t storeHeap=wifiStore.heapBytes(), base=liveBytes;peakBytes=base;
-        {std::unique_ptr<WifiStore> next(new(std::nothrow) WifiStore(wifiStore));assert(next&&saveV2(*next));}
+        size_t storeHeap=wifiStore.heapBytes(), base=liveBytes;peakBytes=base;testNvsPeakStoredBytes=0;
+        {std::unique_ptr<WifiStore> next(new(std::nothrow) WifiStore(wifiStore));assert(next);mutate(*next);assert(saveV2(*next));}
         size_t peak=peakBytes-base;
         size_t strings=storeHeap-networks*sizeof(WifiNetwork)-receipts*sizeof(WifiReceipt);
-        std::cout<<"budget networks="<<networks<<" receipts="<<receipts<<" blob="<<testNvsBlob.size()<<" string_allocations_bytes="<<strings<<" host_store_heap="<<storeHeap<<" host_clone_save_peak_delta="<<peak<<"\n";
+        std::cout<<"budget networks="<<networks<<" receipts="<<receipts<<" fixture_bytes="<<testNvsBlob.size()<<" config="<<wifiConfigurationBytes<<" txn="<<wifiTransactionBytes<<" selector=32 logical_total="<<wifiVerifiedStorageBytes<<" string_allocations_bytes="<<strings<<" host_store_heap="<<storeHeap<<" nvs_preparation_peak_bytes="<<testNvsPeakStoredBytes<<" host_clone_save_peak_delta="<<peak<<"\n";
     }
     reset();auto combined=example(12,8,true);
     for(size_t i=0;i<8;++i){WifiCursor c;c.bridge.set((std::string(63,'p')+char('a'+i)).c_str());c.bond.set(std::string(21,'b').c_str());c.high=8;assert(combined.cursors.append(c));combined.receipts[i].operation.set("activate");combined.receipts[i].target.set(std::string(32,'n').c_str());}
     combined.preserveActive();combined.schemes.networks[0].version=++combined.revision;
-    assert(saveV2(combined));size_t base=liveBytes;peakBytes=base;
-    {std::unique_ptr<WifiStore> next(new(std::nothrow) WifiStore(wifiStore));assert(next&&saveV2(*next));}
-    std::cout<<"combined upper bound blob="<<testNvsBlob.size()<<" heap="<<wifiStore.heapBytes()<<" clone-save peak delta="<<peakBytes-base<<" cursor="<<sizeof(WifiCursor)<<" bytes\n";
+    assert(saveV2(combined));size_t base=liveBytes;peakBytes=base;testNvsPeakStoredBytes=0;
+    {std::unique_ptr<WifiStore> next(new(std::nothrow) WifiStore(wifiStore));assert(next);mutate(*next);assert(saveV2(*next));}
+    std::cout<<"combined upper bound fixture_bytes="<<testNvsBlob.size()<<" config="<<wifiConfigurationBytes<<" txn="<<wifiTransactionBytes<<" selector=32 logical_total="<<wifiVerifiedStorageBytes<<" heap="<<wifiStore.heapBytes()<<" nvs_preparation_peak_bytes="<<testNvsPeakStoredBytes<<" clone-save peak delta="<<peakBytes-base<<" cursor="<<sizeof(WifiCursor)<<" bytes\n";
     std::cout<<"host layout network="<<sizeof(WifiNetwork)<<" receipt="<<sizeof(WifiReceipt)<<" store="<<sizeof(WifiStore)<<" legacy="<<sizeof(WifiLegacyStoreV2)<<"\n";
     return 0;
 }

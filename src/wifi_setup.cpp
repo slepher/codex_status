@@ -143,8 +143,9 @@ bool wifiSchemesBegin() {
 #endif
     Preferences prefs;
     if (!prefs.begin("wifi-bonds", false)) { storeReady = false; return false; }
-    wifiStorageFormat=0;
-    if (!prefs.isKey("store3") && !prefs.isKey("scheme")) {
+    wifiStorageFormat=0;wifiStorageSplit=false;wifiStorageCleanupPending=false;
+    wifiConfigurationBytes=wifiTransactionBytes=wifiStorageBytes=0;
+    if (!prefs.isKey("commit") && !prefs.isKey("store3") && !prefs.isKey("scheme") && !wifiPreparedKeys(prefs)) {
         wifiStore = WifiStore{}; storeReady = true;wifiStorageFormat=0;
     } else {
         std::unique_ptr<WifiStore> check(new(std::nothrow) WifiStore);
@@ -152,7 +153,6 @@ bool wifiSchemesBegin() {
         if (storeReady) wifiStore = std::move(*check);
     }
     wifiOldKeyPresent = prefs.isKey("scheme");
-    wifiStorageBytes = prefs.getBytesLength("store3");
     if (storeReady) wifiVerifiedStorageBytes = wifiStorageBytes;
     prefs.end();
     if (storeReady && !wifiExecutionGeneration && wifiStore.executionGeneration != UINT64_MAX)
@@ -187,7 +187,10 @@ bool wifiSchemesCredentials(String &ssid, String &password) {
     return true;
 }
 void wifiSchemesStorageStatus(JsonObject out) {
-    out["format"] = !storeReady?"unreadable":wifiStorageFormat==5?"WFS5":"empty"; out["ready"] = storeReady; out["uncertain"] = wifiStorageUncertain;
+    out["transaction_format"]=!storeReady?"unreadable":wifiStorageSplit?"WTX1":wifiStorageFormat?"embedded":"empty";
+    out["configuration_bytes"]=wifiConfigurationBytes;out["transaction_bytes"]=wifiTransactionBytes;
+    out["cleanup_pending"]=wifiStorageCleanupPending;
+    out["format"] = !storeReady?"unreadable":wifiStorageFormat==4?"WFS4":"empty"; out["ready"] = storeReady; out["uncertain"] = wifiStorageUncertain;
     out["bytes"] = wifiVerifiedStorageBytes; out["old_key_present"] = wifiOldKeyPresent;
     out["networks"] = schemes.networks.size(); out["receipts"] = wifiStore.receipts.size();
     out["revision"]=wifiStore.revision;out["cursors"]=wifiStore.cursors.size();out["cursor_bytes"]=sizeof(WifiCursor);

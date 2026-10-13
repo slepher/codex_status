@@ -13,10 +13,14 @@ struct EndpointRec {
     uint32_t mru  = 0;
 };
 
+// Count includes preserved unbound records; storeGet exposes only complete bindings.
 int  storeCount();
 bool storeGet(int i, EndpointRec &rec);
 const char *storeUpsert(const String &mac, const String &host, uint16_t port, const String &token,
                         const String &principal, const String &identity, const String &newNamespace, bool physical);
+// Read-only comparison for registration confirmation; never rewrites NVS.
+const char *storeCheckEndpoint(const String &host, uint16_t port, const String &token,
+                              const String &principal, const String &identity);
 bool storeAuthenticate(const String &token, EndpointRec &rec);
 void storeTouch(const String &mac);
 void storeSetBssid(const String &mac, const String &bssid);

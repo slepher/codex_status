@@ -25,8 +25,9 @@ extern "C" int codex_sim_wifi_open(const char *dir) {
     wifiBlobPath = std::string(dir) + "/wifi-schemes.bin";
     testNvsBlob.clear();
     std::ifstream file(wifiBlobPath, std::ios::binary);
-    testNvsEmptyCurrentKey=bool(file);
+    bool existed=bool(file);
     if (file) testNvsBlob.assign(std::istreambuf_iterator<char>(file), {});
+    testNvsEmptyCurrentKey=existed && testNvsBlob.empty();
     testNvsLegacyBlob.clear();
 
     wifiManagementResetSession(); running = false; storeReady = false; requestId="";transactionPeer="";wifiExecutionGeneration=0;

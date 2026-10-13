@@ -149,6 +149,13 @@ window.__wifiUiScenario = async function(scenario) {
     check($('wifi-current-jobs').textContent.includes('缓存已过期') && $('wifi-current-jobs').textContent.includes('重新读取设备'),'Missing actionable stale-cache feedback');
     check(!$('wifi-current-jobs').textContent.includes('待确认'),'Rejected new job must not remain pending');
     check($('wifi-result').textContent.includes('Bridge 配置已保留'),'Local edits must stay preserved');
+  } else if (scenario.startsWith('endpoint-')) {
+    const unknown=scenario==='endpoint-unknown';
+    wifiShowResult({outcome:unknown?'unknown':'rejected',stage:unknown?'ack':'persist',
+      error:unknown?'window_budget_exhausted':'storage',
+      action:unknown?'read_registration_before_retry':'offline_migration_or_storage_repair'});
+    check($('wifi-result').textContent.includes(unknown?'设备登记结果未知':'设备登记失败'),'Missing endpoint outcome');
+    check($('wifi-result').textContent.includes(unknown?'请勿重复提交':'离线迁移'),'Missing endpoint action');
   } else if (scenario.startsWith('failure-')) {
     const errors={sent:['not_sent','未发送'],unknown:['result_unknown','勿重复提交'],network:['network_not_found','未找到网络'],budget:['window_budget_exhausted','预算已耗尽']};
     const [code,label]=errors[scenario.slice(8)];
@@ -156,6 +163,14 @@ window.__wifiUiScenario = async function(scenario) {
       sent:code==='result_unknown',may_have_committed:code==='result_unknown',error_code:code,created_at:now,attempt_count:1}];
     wifiRenderJobs();wifiShowTab('device');
     check($('wifi-current-jobs').textContent.includes(label),'Missing classified failure '+code);
+  } else if (scenario === 'job-blocked') {
+    wifiState.jobs=[{job_id:'blocked',device_mac:mac,attempt_count:3,last_stage:'query_result',kind:'activate',state:'needs_attention',error_code:'transaction_identity_unknown',created_at:now,sent:true,may_have_committed:true},
+      {job_id:'cancelled',device_mac:mac,attempt_count:2,last_stage:'query_result',kind:'sync',state:'cancelled',created_at:now,sent:true,may_have_committed:true}];
+    wifiRenderJobs();wifiShowTab('device');$('wifi-job-history').open=true;
+    check($('wifi-current-jobs').textContent.includes('已停止自动重试'),'Blocked task still looks runnable');
+    check($('wifi-current-jobs').textContent.includes('缺少原事务身份'),'Missing actionable root cause');
+    check(!$('wifi-current-jobs').textContent.includes('同步到设备'),'Cancelled task revived');
+    check($('wifi-jobs').textContent.includes('原操作结果未知'),'Cancellation must preserve unknown result');
   } else if (scenario === 'job-feedback' || scenario === 'job-feedback-error') {
     const state=structuredClone(wifiState);
     const job={job_id:'read-feedback',device_mac:mac,kind:'read',state:'queued',last_stage:'accepted',created_at:now,attempt_count:0};
@@ -264,7 +279,8 @@ window.__wifiUiScenario = async function(scenario) {
     check(a.height<=20,'Text-field minimum height inflated native checkbox');
     label.closest('.card').scrollIntoView({block:'start'});await wait();
   }
-  if(scenario==='imported-edit'||scenario==='save-error') {
+  if(scenario.startsWith('endpoint-'))$('wifi-result').scrollIntoView({block:'center'});
+  else if(scenario==='imported-edit'||scenario==='save-error') {
     const original={...structuredClone(network),origin:'other-bond',credential:'device',password:undefined};
     wifiState.targets=[original];wifiDraft=structuredClone(wifiState.targets);wifiDirty=false;
     window.__wifiTestState=structuredClone(wifiState);wifiRenderLocal();
@@ -326,8 +342,9 @@ window.__wifiUiScenario = async function(scenario) {
     check(r.left >= bounds.left-1 && r.right <= bounds.right+1,'Control exceeds Wi-Fi card: '+(node.id||node.textContent));
   }
   check(window.__uiErrors.length === 0,'JavaScript errors: '+window.__uiErrors.join('; '));
-  if(scenario==='imported-edit'||scenario==='save-error')$('wifi-save-result').scrollIntoView({block:'center'});
-  else if(scenario==='waiting'||scenario==='error'||scenario==='stale-cache'||scenario.startsWith('job-feedback')||scenario.startsWith('failure-'))$('wifi-current-jobs').closest('.wifi-tasks').scrollIntoView({block:'start'});
+  if(scenario.startsWith('endpoint-'))$('wifi-result').scrollIntoView({block:'center'});
+  else if(scenario==='imported-edit'||scenario==='save-error')$('wifi-save-result').scrollIntoView({block:'center'});
+  else if(scenario==='waiting'||scenario==='error'||scenario==='stale-cache'||scenario.startsWith('job-feedback')||scenario==='job-blocked'||scenario.startsWith('failure-'))$('wifi-current-jobs').closest('.wifi-tasks').scrollIntoView({block:'start'});
   else (scenario==='delivery-alignment'?$('pt-sync').closest('.card'):card).scrollIntoView({block:'start'});
   await wait();
   return {scenario,width:innerWidth,visiblePanel:document.querySelector('.wifi-panel:not([hidden])').id,

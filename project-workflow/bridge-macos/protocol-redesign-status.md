@@ -329,3 +329,25 @@ core默认功能150、app90/3条件忽略、Fake65通过；日志 `artifacts/pro
 - 证据：`artifacts/protocol-redesign-p3-binding-current-{red,green,build,candidate,stack}.log`；候选最终身份见PROGRESS。
 
 最终候选0.18.95-note4构建28.42s，RAM118788 B/Flash1771331 B，62项栈门禁通过；ROM1822768 B SHA256 `844d02066561f9d874b17e23683771a627478e8f87ee82dfaf7e660056f550a1`，ELF30265616 B SHA256 `7c48c64482cee05d18d6d7109d25eecfcfe8a194ba29aafe482d9543510a0c5a`，map20204959 B SHA256 `a893ffc06b3c3e530d168d16eedfefb1471a60da4c6c16dc76d4a1683b5ede97`。均为artifacts/protocol-redesign-note4-0.18.95同名前缀，未部署。
+
+## 2026-10-13 Bridge / Fake ROM 恢复推进：endpoint 登记闭环
+
+用户明确设备不在现场，本轮只做Bridge/Fake ROM与同源C++宿主验证；没有启停/替换运行Bridge，没有访问真实设备、改真实数据、构建或烧录ROM。源码同步设备入口和共享wire合同，历史.95候选不包含本次改动。
+
+- Bridge不再把GATT写入当登记成功。INFO `er=1`能力门禁在发送前拒绝旧固件；请求/ACK关联request_id、device_mac、principal，明确拒绝/结果未知分别返回有限错误码和stage。rid/pid复用Base64保证最坏转义输入有界，不回传token。
+- 每次先只读核对现行BRS2的principal/identity/token/host/port；匹配即完成，不写NVS。仅明确registration_mismatch允许一次写入，核对/写共用原5秒或更短RF截止。查询错误不能触发写入；写后读回失败为storage_unknown。丢ACK跨连接/模拟器进程重启后能核对原状态，零新增写入。
+- 原生write_uncertain与endpoint_unconfirmed分离；ACK未知或取消阻止本链后续命令，但已完成原生写且disconnect确认后不错误隔离整个adapter。原生写未完成/未知关闭继续沿用隔离，不宣称系统回调已取消。
+- authorize及临时add/trial/activate入口保留结构化outcome/stage/error/action，自动会合保留具体错误并关闭链路，不继续Plan/业务写。UI中文区分明确失败与结果未知，显示处理动作。
+- Fake ROM使用生产C++ INFO/endpoint编码；登记持久性采用**合成文件模型**，可指定endpoint或endpoint_check注入故障，不能代替真实NVS。生产BRS HAL另验只读核对、不匹配各字段、旧/坏库拒绝及原字节保留。现行BRS2持久字节不变：空0、单条108、典型2条187、8条697、满字段8条2856 B；匹配核对写次数0，变化登记仍1次写后读回。新增核对复用原load按实际条目分配；Bridge每连接多1个AtomicBool。嵌入式动态堆/栈、RF成本未测，本次不据宿主结果放行ROM。
+
+验证日志位于 `artifacts/bridge-macos/protocol-resume-*`：binding.log生产BRS HAL通过；endpoint-confirm.log覆盖持久拒绝/未知、通知丢失、旧ACK/错ID/错MAC、取消后禁止写、恢复后读取及双进程恢复。final-current.log中App93/3条件忽略、BLE26及render通过，最终Fake因新增紧凑回执遗漏ble_wire标记而暴露超时；补标记与合同断言后以wire-final.log重跑render/Fake，结果见交接卡；ui-node.log和ui-wk.log覆盖最终UI，WK64场景，560/1000宽endpoint拒绝/未知截图已审阅。
+
+回归曾发现App Fake未实现token回执及JSON请求头不匹配，已修夹具和载体。旧恢复测试120ms在本机负载下耗尽于注入阶段之前，输出window_required（并非原写未知）；只将**测试预算**改为1秒并新增“确实到达指定故障命令”断言，生产预算不变。保留失败日志regression.log/final.log及后续通过证据，不以扩大生产超时掩盖失败。
+
+B6/C8与P0–P6仍开放：BRS/Bridge离线联合迁移、设备派发身份完整矩阵、P2原生生命周期/排队截止、P3全业务执行器、P5离线诊断和P6发布矩阵继续；独立OTA/Flash/RF/功耗实机等待现场。用户短暂看到Codex no snapshot后自行确认恢复，本轮未改采集链，未把该瞬态归因于协议改动。
+
+最终分批通过：App93/3条件忽略、BLE26（final-current.log）；共享render库/集成68与Fake66（wire-final.log）。新增查询存储失败不转写的定向测试见query-guard.log。最后生产变动仅为C++ endpoint回执补ble_wire=1；App生产执行器的最终测试结果未因先前Fake失败而冒称整条命令通过。无Git提交。
+
+## 2026-10-13 用户修订：配置与事务物理分离
+
+用户要求区分配置和现状，随后明确选择独立存储配置与事务信息。WFS4中原来确有active选择、回执和高水位，实时IP/连接阶段不在其中；不能将整包称为纯配置。现行实现保持WFS4配置编码，WTX1独立事务记录、WCM1原子根，直接读已部署WFS4并保留未知/防重放；不再以WFS4→WFS5离线转换作为Wi-Fi升级前提。历史WFS5工具仅保留归档，不得用于部署。完整实现、失败修复、资源与证据见[拆分专项](wifi-config-state-separation.md)。这不恢复旧在线命令，不豁免BRS身份与P0–P6剩余项。

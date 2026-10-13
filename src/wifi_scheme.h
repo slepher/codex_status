@@ -139,12 +139,17 @@ static uint64_t wifiRequestSequence(const char *id) {
     }
     return sequence;
 }
+// Aggregate used only to validate/commit a consistent pair. The configuration
+// writer and transaction writer persist disjoint fields; live RF state is in
+// wifi_setup.cpp and is never reconstructed from a receipt or active choice.
 struct WifiStore {
+    // WFS4: user configuration and the committed selection for the next wake.
     WifiSchemes schemes;
     // Only bond/id are retained for an unedited active row. Before editing or
     // deleting that version, preserve just its old SSID/password for next wake.
     WifiNetwork active;
     uint64_t revision = 0, activeVersion = 0;
+    // WTX1: durable evidence for original-ID recovery and replay fencing.
     uint64_t executionGeneration = 0;
     WifiRows<WifiReceipt> receipts;
     WifiRows<WifiCursor> cursors;

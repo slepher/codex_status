@@ -18,6 +18,37 @@ use serde_json::json;
 use uuid::Uuid;
 
 static NEXT_SCAN_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_ENDPOINT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Finite, credential-free registration feedback shared by UI/MCP and rendezvous.
+#[derive(Debug)]
+pub struct EndpointFailure {
+    pub outcome: &'static str,
+    pub stage: &'static str,
+    pub error: &'static str,
+}
+impl EndpointFailure {
+    pub fn feedback(&self) -> serde_json::Value {
+        json!({"state":if self.outcome == "unknown" {"awaiting_confirmation"} else {"failed"},
+            "outcome":self.outcome,"stage":self.stage,"error":self.error,
+            "message":self.to_string(),
+            "action":match self.error {
+                "storage" => "offline_migration_or_storage_repair",
+                "physical_required" | "binding_required" | "binding_conflict" => "press_boot_and_restore_binding",
+                "capacity" => "review_registered_bridges",
+                "update_required" => "update_matching_firmware",
+                _ if self.outcome == "unknown" => "read_registration_before_retry",
+                _ => "correct_registration_and_retry",
+            }})
+    }
+}
+impl std::fmt::Display for EndpointFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "endpoint {}: {} ({})", self.outcome, self.error, self.stage)
+    }
+}
+impl std::error::Error for EndpointFailure {}
+
 // 0: idle, 1: native operation/link reserved, 2: unknown; restart is required.
 static NATIVE_RADIO_STATE: AtomicU8 = AtomicU8::new(0);
 static EMPTY_SCAN_SUMMARY: OnceLock<Mutex<EmptyScanSummary>> = OnceLock::new();
@@ -733,8 +764,8 @@ impl Pusher {
         Err(anyhow!("device token response timed out"))
     }
 
-    fn endpoint_payload_for(host: &str,port:u16,token:&str,principal:&str)->Vec<u8> {
-        json!({"schema":2,"host":host,"port":port,"token":token,"bridge_id":principal}).to_string().into_bytes()
+    fn endpoint_payload_for(host: &str,port:u16,token:&str,principal:&str,request_id:&str,check_only:bool)->Vec<u8> {
+        json!({"schema":2,"host":host,"port":port,"token":token,"bridge_id":principal,"request_id":request_id,"check_only":check_only}).to_string().into_bytes()
     }
     /// Explicit bootstrap operations use the same native ownership and failure
     /// cleanup as rendezvous links; successful reads keep their result even if
@@ -812,6 +843,7 @@ pub struct DeviceConnection {
     fake_url: Option<String>,
     rf_deadline: Option<tokio::time::Instant>,
     write_uncertain: AtomicBool,
+    endpoint_unconfirmed: AtomicBool,
     token: String,
     bridge_id: String,
     nonce: String,
@@ -880,18 +912,24 @@ pub fn decode_wire(raw: &[u8]) -> Result<serde_json::Value> {
         if bytes.len() > max || bytes.contains(&0) { bail!("invalid BLE identifier"); }
         Ok(String::from_utf8(bytes)?)
     }
+    if value.get("er").is_some() { value["endpoint_registration"] = value["er"].clone(); }
     if value.get("f").is_some() { value["fw"] = json!(text(&value["f"], 64)?); }
     if value.get("rid").is_some() {
         let request = text(&value["rid"], 64)?;
         if request.is_empty() { bail!("empty BLE request identity"); }
         value["request_id"] = json!(request);
-        let wake = value["w"].as_array().context("BLE wake missing")?;
-        if wake.len() != 2 || wake.iter().any(|n| n.as_u64().is_none_or(|n| n > u32::MAX as u64)) {
-            bail!("invalid BLE wake identity");
+        if value["ack"] == "endpoint" {
+            value["bridge_id"] = json!(text(&value["pid"], 64)?);
+        } else {
+            let wake = value["w"].as_array().context("BLE wake missing")?;
+            if wake.len() != 2 || wake.iter().any(|n| n.as_u64().is_none_or(|n| n > u32::MAX as u64)) {
+                bail!("invalid BLE wake identity");
+            }
+            let wake = wake.clone();
+            value["wake_generation"] = wake[0].clone(); value["wake_seq"] = wake[1].clone();
         }
-        let wake = wake.clone();
-        value["wake_generation"] = wake[0].clone(); value["wake_seq"] = wake[1].clone();
     }
+
     if value.get("ctx").is_some() { value["active_context_id"] = json!(text(&value["ctx"], 32)?); }
     if let Some(summary) = value.get("s") {
         let a = summary.as_array().context("invalid BLE summary")?.clone();
@@ -975,6 +1013,7 @@ impl DeviceConnection {
                     info: info.clone(),
                     peripheral: None, native_lease: None, fake_url: Some(url.trim_end_matches('/').to_owned()),
                     write_uncertain: std::sync::atomic::AtomicBool::new(false),
+                    endpoint_unconfirmed: std::sync::atomic::AtomicBool::new(false),
                     rf_deadline: info["rf_remaining_ms"].as_u64().map(|ms| info_started + Duration::from_millis(ms)),
                     token: token.to_owned(), bridge_id: bridge_id.to_owned(),
                     nonce: String::new(), session: [0; 16], next_request_no: 1, context_id: String::new(), device_mac,
@@ -1081,6 +1120,7 @@ impl DeviceConnection {
                 native_lease: Some(native_lease),
                 fake_url: None,
                 write_uncertain: std::sync::atomic::AtomicBool::new(false),
+                endpoint_unconfirmed: std::sync::atomic::AtomicBool::new(false),
                 rf_deadline: info["rf_remaining_ms"].as_u64().map(|ms| info_started + Duration::from_millis(ms)),
                 token: token.to_owned(),
                 bridge_id: bridge_id.to_owned(),
@@ -1140,6 +1180,7 @@ impl DeviceConnection {
         write: impl Future<Output = Result<()>>) -> Result<()>
     {
         anyhow::ensure!(tokio::time::Instant::now() < deadline, "device BLE RF window expired before write");
+        anyhow::ensure!(!self.endpoint_unconfirmed.load(Ordering::Acquire), "previous_write_unknown");
         self.write_uncertain.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| anyhow!("previous_write_unknown"))?;
         // Cancellation drops only the future; keep the flag until the complete
@@ -1152,20 +1193,109 @@ impl DeviceConnection {
     /// Refresh the endpoint credentials on this already MAC-verified link.
     /// The caller must verify the registered target before invoking this.
     pub async fn write_endpoint(&self, host: &str, port: u16, token: &str) -> Result<()> {
+        if self.info["endpoint_registration"] != 1 {
+            return Err(EndpointFailure {outcome:"not_sent",stage:"preflight",error:"update_required"}.into());
+        }
         let deadline = self.command_deadline();
-        if tokio::time::Instant::now() >= deadline { bail!("device BLE RF window expired before endpoint"); }
-        self.control_write_until(deadline, async {
+        match self.write_endpoint_until(host, port, token, true, deadline).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.downcast_ref::<EndpointFailure>().is_some_and(|e|
+                e.outcome == "rejected" && e.stage == "verify" && e.error == "registration_mismatch") =>
+                self.write_endpoint_until(host, port, token, false, deadline).await,
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn write_endpoint_until(&self, host: &str, port: u16, token: &str, check_only: bool,
+        deadline: tokio::time::Instant) -> Result<()>
+    {
+        let failure = |outcome, stage, error| EndpointFailure {outcome, stage, error};
+        if !self.auth_ready {
+            return Err(failure("not_sent", "preflight", "binding_required").into());
+        }
+        if host.is_empty() || host.len() > 64 || host.contains('\0') || port == 0 ||
+            token.is_empty() || token.len() > 128 || token.contains('\0') ||
+            self.bridge_id.is_empty() || self.bridge_id.len() > 64 || self.bridge_id.contains('\0') {
+            return Err(failure("not_sent", "preflight", "shape").into());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(failure("not_sent", "preflight", "window_budget_exhausted").into());
+        }
+        let status = self.peripheral.as_ref().and_then(|p| p.characteristics().into_iter()
+            .find(|c| c.uuid == Pusher::uuid(CHR_STATUS)));
+        if status.is_none() && self.fake_url.is_none() {
+            return Err(failure("not_sent", "preflight", "characteristic_missing").into());
+        }
+        // Correlate this registration across stale attributes and earlier links.
+        let id = format!("ep{:x}-{:x}", std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos(),
+            NEXT_ENDPOINT_ID.fetch_add(1, Ordering::Relaxed));
+        let payload = Pusher::endpoint_payload_for(host, port, token, &self.bridge_id, &id, check_only);
+        if self.endpoint_unconfirmed.load(Ordering::Acquire) {
+            return Err(failure("not_sent", "preflight", "previous_write_unknown").into());
+        }
+        self.write_uncertain.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| failure("not_sent", "preflight", "previous_write_unknown"))?;
+        self.endpoint_unconfirmed.store(true, Ordering::Release);
+        // Keep the link blocked through ACK confirmation, including cancellation.
+        // A GATT write response only proves receipt, never durable registration.
+        let written = tokio::time::timeout_at(deadline, async {
             if let Some(url) = &self.fake_url {
                 reqwest::Client::new().post(format!("{url}/sim/ble/endpoint"))
                     .header("x-sim-ble-generation", self.info["_sim_generation"].as_u64().unwrap().to_string())
-                    .bearer_auth(&self.token).body(Pusher::endpoint_payload_for(host, port, token, &self.bridge_id))
-                    .send().await?.error_for_status()?;
-                Ok(())
+                    .bearer_auth(&self.token).header("content-type", "application/json").body(payload).send().await?.error_for_status()?;
             } else {
-                Pusher::write_json(self.peripheral.as_ref().unwrap(), CHR_ENDPOINT,
-                    &Pusher::endpoint_payload_for(host, port, token, &self.bridge_id)).await
+                Pusher::write_json(self.peripheral.as_ref().unwrap(), CHR_ENDPOINT, &payload).await?;
             }
-        }).await.context("device BLE endpoint write failed")
+            Ok::<_, anyhow::Error>(())
+        }).await;
+        if !matches!(written, Ok(Ok(()))) {
+            return Err(failure("unknown", "write", "write_failed").into());
+        }
+        // Completed native writes can be safely disconnected even if their
+        // business ACK is lost; do not quarantine the adapter for missing ACKs.
+        self.write_uncertain.store(false, Ordering::Release);
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(failure("unknown", "ack", "window_budget_exhausted").into());
+            }
+            let raw = match tokio::time::timeout_at(deadline, self.read_attribute(status.as_ref())).await {
+                Ok(Ok(raw)) => raw,
+                Ok(Err(_)) => return Err(failure("unknown", "ack", "read_failed").into()),
+                Err(_) => return Err(failure("unknown", "ack", "window_budget_exhausted").into()),
+            };
+            if let Ok(reply) = decode_wire(&raw) {
+                if reply["ack"] == "endpoint" && reply["request_id"] == id &&
+                    reply["bridge_id"] == self.bridge_id &&
+                    bridge_core::platform::model::DeviceIdentity::normalized_mac(reply["device_mac"].as_str().unwrap_or("")) ==
+                    bridge_core::platform::model::DeviceIdentity::normalized_mac(&self.device_mac) {
+                    if reply["ok"] == true && reply["result"] == "applied" && reply["stage"] == if check_only {"verified"} else {"persisted"} {
+                        self.endpoint_unconfirmed.store(false, Ordering::Release);
+                        return Ok(());
+                    }
+                    let error = match reply["error"].as_str().unwrap_or("") {
+                        "registration_mismatch" => "registration_mismatch",
+                        "shape" => "shape", "binding_required" => "binding_required",
+                        "storage" => "storage", "storage_unknown" => "storage_unknown",
+                        "token_conflict" => "token_conflict", "binding_conflict" => "binding_conflict",
+                        "physical_required" => "physical_required", "capacity" => "capacity",
+                        "memory" => "memory", "binding_ambiguous" => "binding_ambiguous",
+                        _ => "invalid_ack",
+                    };
+                    let stage = match reply["stage"].as_str().unwrap_or("") {
+                        "validate" => "validate", "binding" => "binding", "persist" => "persist", "verify" => "verify",
+                        _ => "ack",
+                    };
+                    if reply["ok"] == false && reply["result"] == "rejected" &&
+                        error != "storage_unknown" && error != "invalid_ack" && stage != "ack" {
+                        self.endpoint_unconfirmed.store(false, Ordering::Release);
+                        return Err(failure("rejected", stage, error).into());
+                    }
+                    return Err(failure("unknown", stage, error).into());
+                }
+            }
+            tokio::time::sleep_until((tokio::time::Instant::now() + Duration::from_millis(20)).min(deadline)).await;
+        }
     }
 
     /// Read token responses as attributes too: lost notification is not lost ACK.
@@ -1231,7 +1361,7 @@ impl DeviceConnection {
     }
 
     async fn command_inner(&mut self, op: &str, mut body: serde_json::Value, id: &str, deadline: tokio::time::Instant) -> Result<serde_json::Value> {
-        if self.write_uncertain.load(Ordering::Acquire) {
+        if self.write_uncertain.load(Ordering::Acquire) || self.endpoint_unconfirmed.load(Ordering::Acquire) {
             return Err(self.command_failure(id, op, bridge_core::rendezvous::DispatchOutcome::NotSent,
                 "before_write", "previous_write_unknown", deadline, Duration::ZERO).into());
         }
@@ -1878,8 +2008,11 @@ mod tests {
             8765,
             "bridge-token",
             "bridge-test",
+            "endpoint-test", true,
         ))
         .unwrap();
+        assert_eq!(payload["check_only"], true);
+        assert_eq!(payload["request_id"], "endpoint-test");
         assert_eq!(payload["schema"], 2);
         assert_eq!(payload["host"], "192.168.1.2");
         assert_eq!(payload["port"], 8765);
@@ -2018,6 +2151,7 @@ mod tests {
         super::DeviceConnection {
             info: json!({}), peripheral: None, native_lease: None, fake_url: None,
             write_uncertain: std::sync::atomic::AtomicBool::new(false),
+            endpoint_unconfirmed: std::sync::atomic::AtomicBool::new(false),
             rf_deadline: None, token: String::new(),
             bridge_id: String::new(), nonce: String::new(), session: [0; 16], device_mac: String::new(),
             next_request_no: 1, context_id: String::new(),
