@@ -1,5 +1,13 @@
 # 交接
 
+2026-10-13 23:44：最终0031最小同步XIP App候选2已生成，6,804,520 B，SHA256`61af60e00475f24f4460e60734d7b93a67fb05bb5b756077ccf9d81d4ba7f849`。宿主ASAN/UBSAN、RV32模拟12/12及独立终审通过；heap31 B，自定义栈304 B排除原厂logger（该链至少864 B+嵌套），日志读取/任务余栈仍须首刷前验证。[实现验收](app-implementation-20261013.md)含最终`candidate2`路径。未刷入，完整Bridge/认证/文件App OTA/持久安全启动未实现；历史“无可刷ROM”只指此前或完整Bridge。[恢复评估](failure-recovery-20261013.md)：可返回错误走原厂，底座启动失败不开壳恢复未知。本轮不读账号/设备、部署或提交。
+
+2026-10-13现场（用户报告）：AP01已到手、绑定米家，当前`1.02_0031`，可升级`1.02_0041`。0041官方BIN已下载，6,769,704 B，MD5`3c2d962be82c73860daff903178d9b9e`、SHA256`972db4c136c7ed9e24a83c07c1a7fd62040ca018b08ca285216d26b1fee3c6b9`；保存凭据及新进程复用查询通过，受Git忽略且未跟踪，见[下载专项](firmware-download-20261013.md)。没有升级设备。
+
+0041主线静态逆向已推进到实际Ghidra反编译及0031/GNU对照：新增signed_file=false拒绝返回-10、后续米家根证书链/公钥验签、CRC与切槽边界；新版仍登记4 MiB外部堆并有1.25 MiB资源区。REA接入层不支持裸RV32目标，实际证据来自直接Ghidra；custom0/坏指令、完整Flash下载路径、Boot2/eFuse、USB线路和实机空闲量仍未解决。首次进入优先研究当前0031原厂OTA，未证实0041绕过。完整结果/接口边界见[0041分析](knowledge/0041签名与Bridge接口分析.md)。无可刷Bridge接入ROM；本轮未读凭据/设备、未提交。
+
+2026-10-13目标纠正：**0031自定义App变体**。沿用[0031准备](preparation-index-20261013.md)，最小XIP候选已构建，未来接完整Bridge/App-only更新，见[方案](first-flash-plan-20261013.md)。0041仅对照；P0/P2–P5实机、USB救砖/自动回退未验。上游规范仅参考，不构成本项目新增审批规则。
+
 归属：2026-10-12研究文档、分析脚本及原始证据已迁入codex_status，第三方克隆恢复干净并仅供只读参考。入口见 [README](README.md)，完整性及自检见 [迁移记录](migration.md)。
 
 2026-10-12。AP01当前完成静态逆向与接入设计，尚无本项目Bridge接入的可刷ROM或实机验收。全平台待办归主项目C9，规则见 [单份更新设计](../single-copy-updates/design.md)，Note4已实现并部署的范围见 [C9状态](../single-copy-updates/status.md)。

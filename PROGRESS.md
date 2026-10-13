@@ -1,6 +1,6 @@
 # Codex Status 当前交接
 
-更新时间：2026-10-13 17:35（中国标准时间；ROM/Bridge已部署；源码随本次提交归档）
+更新时间：2026-10-14 00:11（中国标准时间；Note4/Bridge部署不变；AP01最小App候选离线验收，源码/研究归档提交，未刷机）
 
 ## 当前部署与存档
 
@@ -19,5 +19,7 @@ Wi-Fi任务异常重试已修复并部署：取消/到期停止自动查询，�
 验收补修Bridge：同context的认证设备序号回退使旧ACK基线失效并重推完整快照；保留未知in-flight、序号和PowerPlan。最小回归先红后绿；Core152+集成22、App93通过/3条件忽略。此前存储ASAN/9处分配故障、BLE/Fake endpoint、原生OTA回归及`.99`匹配ELF64项栈门禁通过。
 
 ## 边界与下一步
+
+AP01 **0031自定义App**最小XIP候选2已构建，未刷机：`artifacts/ap01-research/app0031-20261013/candidate2/ap01-1.0.2_0031-app-xip.bin`，6,804,520 B，SHA256 `61af60e00475f24f4460e60734d7b93a67fb05bb5b756077ccf9d81d4ba7f849`。ABI1/data+BSS/同步生命周期/原厂返回路径完成，宿主ASAN/UBSAN、RV32模拟12/12及独立审阅通过；[验收](project-workflow/ap01/app-implementation-20261013.md)含map/ELF/指纹。heap31 B，304 B模拟栈不含原厂logger（该链至少864 B+嵌套），日志同机读取/任务余栈仍须首刷前核实。完整Bridge/认证/文件App OTA/持久安全启动未实现，P0/P2–P5实机未执行；[恢复评估](project-workflow/ap01/failure-recovery-20261013.md)确认底座失败不开壳恢复未知，Type-C/双槽不能作保障。用户报告仍0031，0041仅对照；研究/源码随本次提交归档，ROM/凭据/私有证据仍在Git忽略目录。待办C9。
 
 本次存档/原生OTA/新Bridge部署、数据恢复及Wi-Fi任务修复闭环完成，源码随本次提交归档。NVS16 KiB，Wi-Fi组合上限临时12,828 B未含绑定/索引/GC；真实最大容量/堆/Flash掉电及其余P0–P6仍待验收。BRS上限2856 B。唯一待办：[backlog](docs/roadmap/backlog.md)；[操作细则](docs/agent-operations.md)。
