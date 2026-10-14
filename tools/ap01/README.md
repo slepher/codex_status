@@ -62,3 +62,24 @@ python -B tools/ap01/compare_roms.py --output <同一目录> --inventory-only
 ## 历史资源探针
 
 `resource_budget.py` 保留用于解释 2026-10-11 的尺寸报告，仅调整迁移后的路径。它依赖旧版 Bundle 存储结构和第三方工具链，不适配当前单份格式，不能用作当前源码的容量验证；本次不运行其编译流程。更新资源测量前须先调整探针并记录新源哈希。旧报告和对象在 `artifacts/ap01-research/raw/bridge-budget-20261011/`。
+
+## 0031 蓝牙绑定接口定位
+
+`inspect_ble.py`复用本目录0031校验器/解码器，依赖固定上游只读克隆的`core/firmware_image`与Capstone 5.0.7。支持显式原件路径，不要求Windows产物已复制到Mac。只输出候选引用及指定窗口，不生成ROM、不连接/配对设备；先按AGENTS提权预建输出目录，输出文件必须不存在。
+
+```sh
+PYTHONPATH=artifacts/ap01-research/ble0031-20261014/deps python3 -B tools/ap01/inspect_ble.py \
+  --image artifacts/ap01-research/ble0031-20261014/ap01-1.0.2_0031.bin \
+  --output <既有目录中的新报告.json> --self-test \
+  --window 0xa0127bd0:0xa01282d0 --window 0xa0191a50:0xa0191ae6
+```
+
+未知指令和分支会清除基本块常量推导，避免跨调用臆测寄存器值；仍是有限线性扫描，不证明函数边界、ABI、SMP或密钥持久化。2026-10-14定位/LLVM交叉核对和实机边界见[绑定专项](../../project-workflow/ap01/ble-binding-20261014.md)。
+
+`test_ble_security.py`额外依赖隔离目录内Unicorn 2.1.4，执行精确0031原件中72字节的ATT权限检查函数，不生成替代实现。10个明确场景和6144个组合验证普通读写、缺回调、加密/认证拒绝及返回时的栈/属性约束；仅证明这个真实函数的行为，不替代无线实测或证明整个ROM没有SMP。
+
+```sh
+PYTHONPATH=artifacts/ap01-research/ble0031-20261014/deps python3 -B tools/ap01/test_ble_security.py \
+  --image artifacts/ap01-research/ble0031-20261014/ap01-1.0.2_0031.bin \
+  --output <既有目录中的新报告.json>
+```
