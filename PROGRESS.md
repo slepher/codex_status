@@ -20,4 +20,4 @@
 
 10月14日已按用户授权直接OTA并恢复Bridge；原BLE隔离根因和再次触发证据见上方部署记录，B6/C8保持开放。
 
-待办唯一来源：[backlog](docs/roadmap/backlog.md)；操作：[细则](docs/agent-operations.md)。
+历史详细记录见[合并快照](docs/history/progress-archive-2026-10-14-conflict.md)。待办唯一来源：[backlog](docs/roadmap/backlog.md)；操作：[细则](docs/agent-operations.md)。
