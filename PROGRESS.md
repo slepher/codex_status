@@ -1,6 +1,6 @@
 # Codex Status 当前交接
 
-更新时间：2026-10-14 15:54（中国标准时间；Bridge连接修复/.102离线日志已部署并完成自然睡醒核验）
+更新时间：2026-10-14 16:40（中国标准时间；Note4/Bridge部署不变，AP01调查与绑定方案分批归档）
 
 ## 部署与工作区
 
@@ -12,7 +12,9 @@
 
 **B6/C8 新断连**：12:20服务发现断开漏回pending connect导致永久隔离，14:28 BOOT为同一隔离延续。Bridge根因修复/.102日志均部署，HTTP正常；.102自然睡醒回填与恢复Light/认证HTTP通过，实施部署完成；本次修复随当前提交归档。首次物理链路超时详情因旧记录覆盖仍未知；真实24h保留及长期RF未验，不据此结项。[调查](project-workflow/bridge-macos/ble-connect-disconnect-20261014.md)。
 
-**C9 / AP01**：AP01 **0031自定义App**最小XIP候选2已构建，未刷机：`artifacts/ap01-research/app0031-20261013/candidate2/ap01-1.0.2_0031-app-xip.bin`，6,804,520 B，SHA256 `61af60e00475f24f4460e60734d7b93a67fb05bb5b756077ccf9d81d4ba7f849`。ABI1/data+BSS/同步生命周期/原厂返回路径完成，宿主ASAN/UBSAN、RV32模拟12/12及独立审阅通过；[验收](project-workflow/ap01/app-implementation-20261013.md)含map/ELF/指纹。heap31 B，304 B模拟栈不含原厂logger（该链至少864 B+嵌套），日志同机读取/任务余栈仍须首刷前核实。完整Bridge/认证/文件App OTA/持久安全启动未实现，P0/P2–P5实机未执行；[恢复评估](project-workflow/ap01/failure-recovery-20261013.md)确认底座失败不开壳恢复未知，Type-C/双槽不能作保障。用户报告仍0031，0041仅对照；研究/源码随本次提交归档，ROM/凭据/私有证据仍在Git忽略目录。待办C9。
+**C9 / AP01**：最新用户决策为Wi-Fi双屏4位固定码＋旋钮确认，首版仅防误绑定，不要求严格加密/SMP；多对多持久绑定与单owner分离，复用300秒租约/60秒续约，有效owner时不弹新码。0031、无fallback、OTA与常规通信/绘图双进程不变。[具体设计](project-workflow/ap01/screen-binding-design-20261014.md)完成；旋钮/UI/常驻HTTP、绑定存储和Bridge适配/实机待实施。原厂ATT固定拒绝的10场景+6144组合与扫描证据保留为[历史调查](project-workflow/ap01/ble-binding-20261014.md)，不再是当前SMP实施闸门；未构建或刷入AP01新ROM。
+
+历史0031最小XIP候选2未刷：6,804,520 B，SHA256 `61af60e00475f24f4460e60734d7b93a67fb05bb5b756077ccf9d81d4ba7f849`；Windows产物路径 `artifacts/ap01-research/app0031-20261013/candidate2/ap01-1.0.2_0031-app-xip.bin`，本Mac未恢复该候选。它是同步ABI诊断，不能承载长期BLE回调。完整Bridge/App OTA及P0/P2–P5实机未验；[验收](project-workflow/ap01/app-implementation-20261013.md)。
 
 **B6/C8**：Fake后续范围已收缩为[七项生产逻辑覆盖](project-workflow/bridge-macos/fake-rom-logic-coverage.md)，清单已文档化、待实施。Wi-Fi任务取消/到期及身份异常修复已部署，旧ACK回退重推已验；WFS4直接读取、真实变更才拆分，旧缺身份BRS记录不授权。真实最大容量、掉电及其余实机矩阵仍未完成。[Wi-Fi验收](project-workflow/bridge-macos/wifi-read-queue-investigation-20261013.md)。
 

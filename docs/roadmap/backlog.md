@@ -342,6 +342,8 @@
 
 ### C9. 取消项目自管A/B、动态容量与内置更新界面
 
+- **2026-10-14 AP01最新决策**：0031、无fallback、OTA与常规通信/绘图双进程；改用Wi-Fi双屏4位固定码＋旋钮确认，仅防误绑定，首版不要求严格加密/SMP。持久多对多、单owner、300秒租约/60秒续约，有效owner不弹新码。具体[方案](../../project-workflow/ap01/screen-binding-design-20261014.md)已完成；旋钮/UI/常驻HTTP、绑定存储及Bridge适配/实机待实施。原厂ATT固定拒绝的[历史调查](../../project-workflow/ap01/ble-binding-20261014.md)保留，不能标已绑定/可刷。
+
 - **2026-10-11 源码实现与候选验证**：共享固件 Bundle 改为单份内容与短小回执，Bridge 使用动态容量；原生固件 OTA 双槽保留，覆盖全部共享固件目标。用户进一步明确允许临时下载文件，下载期间继续运行，完成后才停用内容并覆盖。
 - 更新覆盖失败进入内置恢复，身份/配对/owner/认证重传保留。动态容量含下载、缓存与预留，旧设备仍使用其能力上限。资产发布模型移除 rollback manifest；AP01 独立应用尚无可运行实现，保持同一设计；逆向成果归本仓库 [AP01 专项](../../project-workflow/ap01/README.md)。
 - **2026-10-13 AP01实现**：0031最小同步XIP App加载器/ABI1候选2已构建，宿主ASAN/UBSAN、RV32模拟12/12和独立终审通过，未刷机；[实现/指纹](../../project-workflow/ap01/app-implementation-20261013.md)。首刷前核实同机日志读取/UI任务余栈；接续完整Bridge/长期宿主、认证、文件App-only OTA与安装/恢复。0041仅对照；P0/P2–P5实机未执行，完整Bridge ROM未有。App/Bundle单份、原生双槽保留。[恢复评估](../../project-workflow/ap01/failure-recovery-20261013.md)：底座启动失败不开壳恢复未知，双槽/Type-C不构成保障。
