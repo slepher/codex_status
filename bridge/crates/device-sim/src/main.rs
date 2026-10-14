@@ -1,3 +1,5 @@
+mod ble_device;
+use ble_device::{BleProxy, BleFault};
 use anyhow::{bail, ensure, Context, Result};
 use axum::{
     body::{to_bytes, Body},
@@ -57,7 +59,7 @@ struct SimState {
     stall_ack_after: Arc<Mutex<Option<StallFault>>>,
     status_padding_bytes: Arc<Mutex<usize>>,
     ble_rx: Arc<Mutex<Vec<u8>>>,
-    ble: Arc<Mutex<SimBle>>,
+    ble: BleProxy,
     wifi: Arc<Mutex<SimWifi>>,
     report_ip: Ipv4Addr,
     ready_report: Arc<Mutex<Option<Value>>>,
@@ -82,102 +84,6 @@ struct SimHttpFrame {
     token_digest: [u8; 32],
     opens: u64,
     fence: RequestFence,
-}
-
-// Connection-local GATT attributes, distinct from business HTTP responses.
-#[derive(Default)]
-struct SimBle {
-    generation: u64,
-    endpoint_writes: u64,
-    connected: bool,
-    wake: (u64, u64),
-    info: Vec<u8>,
-    status: Vec<u8>,
-    pending: Option<(u64, Vec<u8>)>,
-    fault: Option<BleFault>,
-    read_failed: bool,
-    events: std::collections::VecDeque<Value>,
-    fence: RequestFence,
-}
-#[derive(Clone, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BleFault {
-    kind: String,
-    #[serde(default)] op: Option<String>,
-    #[serde(default)] size: usize,
-    #[serde(default)] delay_ms: u64,
-}
-impl SimBle {
-    fn store(&mut self, op: &str, mut bytes: Vec<u8>, now: u64) {
-        if op == "endpoint" {self.endpoint_writes += 1;}
-        let fault = if self.fault.as_ref().is_some_and(|f| f.op.as_deref().is_none_or(|target| target == op)) {
-            self.fault.take()
-        } else { None };
-        let kind = fault.as_ref().map(|f| f.kind.as_str()).unwrap_or("none");
-        let framed = Header::decode(&bytes, 8192).ok().map(|(header, payload)| (header, payload.to_vec()));
-        if let Some(f) = &fault {
-            if f.size > 0 {
-                // Explicit SYNTHETIC same-length frame; not a captured ROM frame.
-                if let Some((header, payload)) = &framed {
-                    let mut header = *header;
-                    if let Ok(mut value) = serde_json::from_slice::<Value>(payload) {
-                        value["padding"] = json!("");
-                        let base = serde_json::to_vec(&value).unwrap();
-                        if f.size >= HEADER_LEN + base.len() {
-                            value["padding"] = json!("x".repeat(f.size - HEADER_LEN - base.len()));
-                            let payload = serde_json::to_vec(&value).unwrap();
-                            header.payload_len = payload.len() as u16;
-                            bytes = header.encode().unwrap().to_vec();
-                            bytes.extend_from_slice(&payload);
-                        } else { bytes.resize(f.size, b'x'); }
-                    } else { bytes.resize(f.size, b'x'); }
-                } else if bytes.last() == Some(&b'}') && f.size >= bytes.len() + 13 {
-                    bytes.pop(); bytes.extend_from_slice(b",\"padding\":\"");
-                    bytes.resize(f.size - 2, b'x'); bytes.extend_from_slice(b"\"}");
-                } else { bytes.resize(f.size, b'x'); }
-            }
-        }
-        if matches!(kind, "wrong_request" | "wrong_wake" | "wrong_mac" | "wrong_session" | "wrong_op") {
-            let frame_header = Header::decode(&bytes, 8192).ok().map(|(h,p)| (h,p.to_vec()));
-            let json_bytes = frame_header.as_ref().map_or(bytes.as_slice(), |(_,p)| p.as_slice());
-            if let Ok(mut value) = serde_json::from_slice::<Value>(json_bytes) {
-                match kind {
-                    "wrong_op" => value["op"] = json!("other"),
-                    "wrong_request" => { value["rid"] = json!("c3RhbGU="); value["request_id"] = json!("stale"); },
-                    "wrong_wake" => value["w"][1] = json!(self.wake.1.saturating_add(1)),
-                    "wrong_mac" => value["device_mac"] = json!("AA:BB:CC:DD:EE:FF"),
-                    "wrong_session" => value["session_nonce"] = json!("f".repeat(32)),
-                    _ => unreachable!(),
-                }
-                let payload = serde_json::to_vec(&value).unwrap();
-                if let Some((mut header,_)) = frame_header {
-                    header.payload_len = payload.len() as u16;
-                    bytes = header.encode().unwrap().to_vec();
-                    bytes.extend_from_slice(&payload);
-                } else { bytes = payload; }
-            }
-        }
-        let attempted = bytes.len();
-        let result = match kind {
-            "legacy_overflow" if attempted > 512 => { self.status.clear(); "library_cleared" }
-            "guard_overflow" if attempted > 512 => "precheck_failed",
-            "write_failed" | "drop_ack" => "write_failed",
-            "disconnect" | "window_closed" => { self.connected = false; self.pending = None; "disconnected" }
-            "empty" => { self.status.clear(); "empty" }
-            "malformed" => { self.status = b"invalid-json".to_vec(); "malformed" }
-            "stale" | "overwrite" => "old_value",
-            "read_failed" => { self.read_failed = true; "read_failed" }
-            "delay" => {
-                self.pending = Some((now.saturating_add(fault.as_ref().unwrap().delay_ms), bytes));
-                "delayed"
-            }
-            _ if attempted > 512 => "precheck_failed",
-            _ => { self.status = bytes; "written" } // notify_lost is still readable
-        };
-        self.events.push_back(json!({"op":op,"characteristic":"status","bytes":attempted,
-            "max":512,"result":result,"generation":self.generation,"wake_generation":self.wake.0,"wake_seq":self.wake.1}));
-        while self.events.len() > 64 { self.events.pop_front(); }
-    }
 }
 
 #[derive(Clone)]
@@ -942,8 +848,7 @@ fn reboot_device(state: &SimState, cause: &str) -> Result<SimSession> {
 fn reset_power_after_reboot(state: &SimState, now_ms: u64, cause: &str) -> Result<()> {
     reboot_device(state, cause)?;
     state.ble_rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
-    { let mut ble = state.ble.lock().unwrap();
-      let next = ble.generation.saturating_add(1); *ble = SimBle::default(); ble.generation = next; }
+    state.ble.reset();
     let configured = state.bundle.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
         .status()?["configured"] == true;
     let mut power = state.power.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1602,6 +1507,8 @@ async fn sim_diagnostics(State(state): State<SimState>, request: Request<Body>) 
                 .map(|seq| (1, String::new(), seq)),
         Some("corrupt_header") if object.len() == 1 =>
             Some((2, String::new(), 0)),
+        Some("bridge_contact") if object.len() == 2 =>
+            value["connected"].as_bool().map(|connected| (3,String::new(),connected as u64)),
         _ => None,
     };
     let Some((kind, text, seq)) = operation else {
@@ -1611,6 +1518,14 @@ async fn sim_diagnostics(State(state): State<SimState>, request: Request<Body>) 
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     let mut sync = state.sync.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Drive the production record sink using logical contact/time inputs.
+    if kind==3 {
+        return match sync.log_context(clock.wall_ms/1000,seq!=0) {
+            Ok(())=>Json(json!({"result":"ok"})).into_response(),
+            Err(_)=>StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+    }
+    if sync.archive(clock.wall_ms/1000,0,0,0).is_err(){return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
     let result = match kind {
         0 => sync.append_text(&text, device_uptime_ms(&state, clock) as u32),
         1 => sync.corrupt(false, seq),
@@ -2432,18 +2347,14 @@ async fn sim_ble_info(State(state): State<SimState>, request: Request<Body>) -> 
         Ok(bytes) => bytes, Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     let connect = request.uri().query().is_some_and(|q| q == "connect=1");
-    let mut ble = state.ble.lock().unwrap();
-    if connect || !ble.connected || ble.wake != (generation, power.wake_count) {
-        ble.generation = ble.generation.saturating_add(1); ble.connected = true;
-        ble.wake = (generation, power.wake_count); ble.status.clear(); ble.pending = None; ble.read_failed = false;
-        ble.fence = RequestFence::default();
+    let (link_generation, changed) = state.ble.connect((generation, power.wake_count), bytes.clone(), connect);
+    if changed {
         state.ble_rx.lock().unwrap().clear();
         let mut rv=state.rendezvous.lock().unwrap();
         rv.begin(clock.monotonic_ms,4000);
         rv.connected(clock.monotonic_ms);
     }
-    ble.info = bytes.clone();
-    ([("x-sim-ble-generation", ble.generation.to_string())], bytes).into_response()
+    ([("x-sim-ble-generation", link_generation.to_string())], bytes).into_response()
 }
 
 fn ble_generation_ok(state: &SimState, request: &Request<Body>) -> bool {
@@ -2459,7 +2370,7 @@ async fn sim_ble_status(State(state): State<SimState>, request: Request<Body>) -
     let mut ble = state.ble.lock().unwrap();
     if !ble.connected || (!power.light && power.ble_window_until_ms.is_none()) ||
         ble.wake != (session_snapshot(&state).boot_id, power.wake_count) {
-        ble.connected = false; ble.pending = None; state.ble_rx.lock().unwrap().clear();
+        ble.disconnect("window_closed"); state.ble_rx.lock().unwrap().clear();
         return StatusCode::NOT_FOUND.into_response();
     }
     if ble.read_failed { return StatusCode::SERVICE_UNAVAILABLE.into_response(); }
@@ -2526,7 +2437,7 @@ async fn sim_ble_aux(State(state): State<SimState>, request: Request<Body>) -> R
     }
     if token && valid { response["token"] = json!(state.device_token.as_ref()); }
     let Ok(raw) = bridge_render::simulator_ble_wire(if token {"auth"} else {"endpoint"}, &response) else { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); };
-    state.ble.lock().unwrap().store(op, raw, clock.monotonic_ms);
+    state.ble.store(op, raw, clock.monotonic_ms);
     Json(json!({"result":"accepted"})).into_response()
 }
 // Network adapter around the shared ROM rendezvous/Wi-Fi engines. Real RF and
@@ -2600,11 +2511,61 @@ async fn sim_ready_reports(state: SimState) {
 async fn sim_ble_close(State(state): State<SimState>, request: Request<Body>) -> Response {
     if !bearer(&request, &state.endpoint_token) { return unauthorized(); }
     if !ble_generation_ok(&state, &request) { return StatusCode::CONFLICT.into_response(); }
-    let mut ble = state.ble.lock().unwrap();
-    ble.connected = false; ble.pending = None; ble.status.clear();
+    state.ble.disconnect("central_close");
     state.ble_rx.lock().unwrap().clear();
     Json(json!({"result":"closed"})).into_response()
 }
+async fn sim_ble_discover(State(state): State<SimState>, request: Request<Body>) -> Response {
+    if !bearer(&request,&state.endpoint_token){return unauthorized();}
+    if !ble_generation_ok(&state,&request){return StatusCode::CONFLICT.into_response();}
+    let mut device=state.ble.lock().unwrap();
+    if device.disconnect_on_discovery {
+        device.disconnect_on_discovery=false;device.disconnect("during_discovery");
+    }
+    Json(device.snapshot()).into_response()
+}
+// Independent device controls; reading does not connect or mutate ROM state.
+async fn offline_log(State(state): State<SimState>, request: Request<Body>) -> Response {
+    if !bearer(&request,&state.endpoint_token){return unauthorized();}
+    let Some(clock)=clock_snapshot(&state) else {return StatusCode::INTERNAL_SERVER_ERROR.into_response();};
+    let mut hour=0u64;let mut offset=0u32;let mut serial=0u64;
+    for (key,value) in form_urlencoded::parse(request.uri().query().unwrap_or("").as_bytes()) {
+        match key.as_ref() {
+            "hour"=>match value.parse(){Ok(v)=>hour=v,Err(_)=>return StatusCode::BAD_REQUEST.into_response()},
+            "offset"=>match value.parse(){Ok(v)=>offset=v,Err(_)=>return StatusCode::BAD_REQUEST.into_response()},
+            "serial"=>match value.parse(){Ok(v)=>serial=v,Err(_)=>return StatusCode::BAD_REQUEST.into_response()},
+            _=>return StatusCode::BAD_REQUEST.into_response(),
+        }
+    }
+    let result=state.sync.lock().unwrap_or_else(std::sync::PoisonError::into_inner).archive(clock.wall_ms/1000,hour,offset,serial);
+    match result {
+        Ok(mut value)=>{let status=StatusCode::from_u16(value["http_status"].as_u64().unwrap_or(500) as u16).unwrap();value.as_object_mut().unwrap().remove("http_status");(status,Json(value)).into_response()},
+        Err(_)=>StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn sim_ble_device(State(state): State<SimState>, request: Request<Body>) -> Response {
+    if request.method() == axum::http::Method::GET {
+        if !bearer(&request, &state.endpoint_token) && !bearer(&request, &state.control_token) { return unauthorized(); }
+        return Json(state.ble.lock().unwrap().snapshot()).into_response();
+    }
+    if !bearer(&request, &state.control_token) { return unauthorized(); }
+    let Ok(bytes) = to_bytes(request.into_body(), 256).await else { return StatusCode::BAD_REQUEST.into_response(); };
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Control { op: String }
+    let Ok(control) = serde_json::from_slice::<Control>(&bytes) else { return StatusCode::BAD_REQUEST.into_response(); };
+    let mut device = state.ble.lock().unwrap();
+    match control.op.as_str() {
+        "disconnect" => device.disconnect("remote_control"),
+        "drop_close_callback" => device.drop_close_callback = true,
+        "restore_close_callback" => device.drop_close_callback = false,
+        "disconnect_on_discovery" => device.disconnect_on_discovery = true,
+        _ => return StatusCode::BAD_REQUEST.into_response(),
+    }
+    Json(device.snapshot()).into_response()
+}
+
 async fn sim_ble_fault(State(state): State<SimState>, request: Request<Body>) -> Response {
     if !bearer(&request, &state.control_token) { return unauthorized(); }
     let Ok(bytes) = to_bytes(request.into_body(), 1024).await else { return StatusCode::PAYLOAD_TOO_LARGE.into_response(); };
@@ -2838,7 +2799,7 @@ async fn sim_wifi_control(State(state): State<SimState>, request: Request<Body>)
     if let Some(peer) = value["bond"].as_str() {
         if peer.len() != 19 || !peer.ends_with("/1") { return StatusCode::BAD_REQUEST.into_response(); }
         wifi.peer = peer.into();
-        let mut ble = state.ble.lock().unwrap(); ble.connected = false; ble.status.clear(); ble.pending = None;
+        state.ble.disconnect("bond_changed");
     }
     if let Some(legacy)=value.get("legacy") { if wifi.engine.legacy(legacy).is_err() { return StatusCode::BAD_REQUEST.into_response(); } }
     if let Some(outcome) = value["outcome"].as_i64() {
@@ -2953,7 +2914,7 @@ async fn sim_ble_command(State(state): State<SimState>, request: Request<Body>) 
         }
     };
     if let Some((error, replay)) = admission {
-        if let Some(replay) = replay { state.ble.lock().unwrap().store(op, replay, clock.monotonic_ms); }
+        if let Some(replay) = replay { state.ble.store(op, replay, clock.monotonic_ms); }
         else {
             let reject = json!({"ack":"command","op":op,"request_id":message["request_id"],
                 "result":"rejected","error":error.unwrap()});
@@ -2961,7 +2922,7 @@ async fn sim_ble_command(State(state): State<SimState>, request: Request<Body>) 
             let header = Header {kind:1,op:frame.op,result:2,payload_len:payload.len() as u16,
                 session:ble_frame_session(&state),request_no:frame.request_no,context:frame.context};
             let mut raw = header.encode().unwrap().to_vec(); raw.append(&mut payload);
-            state.ble.lock().unwrap().store(op,raw,clock.monotonic_ms);
+            state.ble.store(op,raw,clock.monotonic_ms);
         }
         return Json(json!({"result":"accepted"})).into_response();
     }
@@ -3447,6 +3408,9 @@ fn app(state: SimState) -> Router {
         .route("/sim/ble/endpoint", post(sim_ble_aux))
         .route("/sim/ble/status", get(sim_ble_status))
         .route("/sim/ble/close", post(sim_ble_close))
+        .route("/sim/ble/device", get(sim_ble_device).post(sim_ble_device))
+        .route("/sim/ble/discover",post(sim_ble_discover))
+        .route("/offline-log",get(offline_log))
         .route("/sim/ble/fault", post(sim_ble_fault))
         .route("/sim/ble/attributes", get(sim_ble_attributes))
         .route("/sim/ble/command", post(sim_ble_command))
@@ -3523,7 +3487,7 @@ async fn main() -> Result<()> {
         stall_ack_after: Arc::new(Mutex::new(None)),
         status_padding_bytes: Arc::new(Mutex::new(0)),
         ble_rx: Arc::new(Mutex::new(Vec::new())),
-        ble: Arc::new(Mutex::new(SimBle::default())),
+        ble: BleProxy::default(),
         wifi: Arc::new(Mutex::new(SimWifi {
             engine: bridge_render::SimulatorWifi::new(&options.data_dir)?, peer: "02:00:00:00:00:02/1".into(),
             physical_until: 0, outcome: 1, drop_http_ack: false,

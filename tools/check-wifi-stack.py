@@ -44,6 +44,16 @@ if report:
                    "handleBleWifiCapabilities(", "v2BleNotify(", "buildPlatformStatus("):
         name = next((name for name in functions if name.startswith(prefix)), None)
         if name is not None or prefix != "buildPlatformStatus(": required.append(name)
+# The registered diagnostic sink adds an indirect edge from syncAppend. Gate
+# its actual Xtensa frames too when inspecting a ROM that contains the journal.
+if any(name.startswith("offlineLogAppend(") for name in functions):
+    for prefix in ("offlineLogBegin(", "offlineLogAppend(", "offlineLogStatus(", "offlineLogPage(", "offlineLogCapture(",
+                   "beginOfflineLog(", "persistOfflineRecord(", "handleOfflineLog(", "syncAppend("):
+        required.append(next((name for name in functions if name.startswith(prefix)), None))
+    append = next((name for name in functions if name.startswith("syncAppend(")), None)
+    sink = next((name for name in functions if name.startswith("persistOfflineRecord(")), None)
+    if append and sink:
+        functions[append][1].add(sink)
 failed = False
 if args.no_online_wifi_migration:
     retired = [name for name in functions if name.startswith("handleBleWifiMigration(")]
@@ -70,6 +80,13 @@ for name in required:
 # Scope is explicit: Wi-Fi module + Preferences/NVS frames present in this ELF.
 # Indirect platform/library calls and ISR stacks remain outside this subtotal.
 def local(name):
+    if name.startswith(("offlineLog", "beginOfflineLog(", "persistOfflineRecord(", "handleOfflineLog(", "syncAppend(",
+                        "fs::File::", "fs::FS::", "(anonymous namespace)::header(fs::File&",
+                        "(anonymous namespace)::readRecord(", "(anonymous namespace)::prefix(fs::File&",
+                        "(anonymous namespace)::repair(", "(anonymous namespace)::room(",
+                        "(anonymous namespace)::recoverTail(", "(anonymous namespace)::prune(",
+                        "(anonymous namespace)::readFloor(", "(anonymous namespace)::saveFloor(")):
+        return True
     if name.startswith(("PlanStore::", "applyV2Plan(")):
         return True
     return name.startswith(("wifi", "Wifi", "readWifiStore(", "saveV2(", "save(Wifi", "Preferences::", "nvs_", "nvs::", "store", "load(Endpoints", "save(Endpoints", "legacyString(", "wifiDeviceStatus(", "handleWifiManagement(", "servicePresence(", "serviceReadyReport(", "v2Http", "v2Response(", "handleV2Status(", "pageStatus(", "StatusPages::", "buildPlatformStatus(", "handleClaim(", "serviceV2Ble(", "_ZL22handleBleWifiMigration", "handleBleWifiMigration(", "handleBleWifiCapabilities(", "v2BleNotify("))

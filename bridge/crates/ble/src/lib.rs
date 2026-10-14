@@ -1,5 +1,7 @@
 //! BLE central for device discovery, endpoint handoff, and authenticated commands.
 
+mod sim_peripheral;
+
 use std::collections::HashSet;
 use std::future::Future;
 use std::net::UdpSocket;
@@ -51,6 +53,8 @@ impl std::error::Error for EndpointFailure {}
 
 // 0: idle, 1: native operation/link reserved, 2: unknown; restart is required.
 static NATIVE_RADIO_STATE: AtomicU8 = AtomicU8::new(0);
+// Simulation uses the production reservation logic, isolated from the physical radio.
+static SIM_RADIO_STATE: AtomicU8 = AtomicU8::new(0);
 static EMPTY_SCAN_SUMMARY: OnceLock<Mutex<EmptyScanSummary>> = OnceLock::new();
 
 #[derive(Default)]
@@ -153,6 +157,10 @@ impl<'a> NativeLease<'a> {
 impl Drop for NativeLease<'_> {
     fn drop(&mut self) {
         self.state.store(if self.stopped { 0 } else { 2 }, Ordering::Release);
+        if !self.stopped {
+            tracing::warn!(error = "ble_native_quarantined_restart_required",
+                action = "restart_bridge", "BLE native shutdown is unconfirmed; further BLE work blocked");
+        }
     }
 }
 
@@ -987,20 +995,45 @@ impl DeviceConnection {
                     Some("127.0.0.1" | "localhost")) || parsed.port().is_none() {
                     bail!("fake BLE endpoint must be an explicit loopback HTTP address");
                 }
+                let mut native_lease = if std::env::var("CODEX_STATUS_SIM_BLE_LIFECYCLE").as_deref() == Ok("1") {
+                    Some(NativeLease::acquire(&SIM_RADIO_STATE)?)
+                } else { None };
                 let info_started = tokio::time::Instant::now();
                 let response = match client.get(format!("{}/sim/ble/info?connect=1", url.trim_end_matches('/')))
                     .bearer_auth(token).send().await {
                     Ok(response) => response,
                     Err(error) => {
+                        // A refused carrier connection sent no connect request;
+                        // a timeout after dispatch may have connected the device.
+                        if error.is_connect() {
+                            if let Some(lease) = native_lease.as_mut() { lease.stopped = true; }
+                        }
                         tracing::warn!(device_mac = mac, %error, "fake BLE candidate unavailable");
                         continue;
                     }
                 };
+                if matches!(response.status().as_u16(), 400 | 401 | 403 | 404) {
+                    if let Some(lease) = native_lease.as_mut() { lease.stopped = true; }
+                }
                 if response.status() == reqwest::StatusCode::NOT_FOUND { continue; }
                 let response = response.error_for_status()?;
                 let generation = response.headers().get("x-sim-ble-generation").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok()).context("fake BLE connection generation missing")?;
                 let mut info = decode_wire(&response.bytes().await?)?;
                 info["_sim_generation"] = json!(generation);
+                if native_lease.is_some() {
+                    let result=tokio::time::timeout(Duration::from_secs(4),
+                        sim_peripheral::discover(url.trim_end_matches('/'),token,generation)).await;
+                    if !matches!(&result,Ok(Ok(()))) {
+                        let stopped=disconnect_bounded(None,CLOSE_BUDGET,
+                            sim_peripheral::disconnect(url.trim_end_matches('/'),token,generation)).await;
+                        if let Some(lease)=native_lease.as_mut(){lease.stopped=stopped && result.is_ok();}
+                        return match result {
+                            Ok(Err(error))=>Err(error.context("ble_connect_failed")),
+                            Err(error)=>Err(anyhow::Error::new(error).context("ble_connect_timeout")),
+                            Ok(Ok(()))=>unreachable!(),
+                        };
+                    }
+                }
                 let authorized_mac = info_authorized_target(&info, &targets)
                     .context("fake BLE device identity mismatch")?;
                 if authorized_mac != *mac || info["rendezvous"] != true {
@@ -1011,7 +1044,7 @@ impl DeviceConnection {
                     .collect::<Vec<_>>().join(":");
                 return Ok(Some((authorized_mac, Self {
                     info: info.clone(),
-                    peripheral: None, native_lease: None, fake_url: Some(url.trim_end_matches('/').to_owned()),
+                    peripheral: None, native_lease, fake_url: Some(url.trim_end_matches('/').to_owned()),
                     write_uncertain: std::sync::atomic::AtomicBool::new(false),
                     endpoint_unconfirmed: std::sync::atomic::AtomicBool::new(false),
                     rf_deadline: info["rf_remaining_ms"].as_u64().map(|ms| info_started + Duration::from_millis(ms)),
@@ -1664,10 +1697,9 @@ impl DeviceConnection {
     }
 
     /// Bounded variant of [`Self::close`] for callers that must not be blocked
-    /// by link cleanup. btleplug 0.11.8 on macOS can leave
-    /// `Peripheral::disconnect()` pending forever once the peripheral was
-    /// removed by a natural link loss, and a pending future never returns
-    /// `Err`. A native timeout or uncertain write quarantines the shared
+    /// by link cleanup. Our btleplug patch acknowledges a peripheral already
+    /// removed by a native disconnect callback. An actual native timeout or
+    /// uncertain write still quarantines the shared
     /// radio reservation; dropping the handle is not proof of shutdown.
     /// The next native attempt returns a restart-required error.
     ///
@@ -1677,6 +1709,12 @@ impl DeviceConnection {
     /// above).
     pub async fn close_bounded(mut self, limit: Duration) {
         if let Some(url) = &self.fake_url {
+            if let Some(lease) = self.native_lease.as_mut() {
+                lease.stopped = disconnect_bounded(None, limit,
+                    sim_peripheral::disconnect(url, &self.token, self.info["_sim_generation"].as_u64().unwrap())).await
+                    && !self.write_uncertain.load(Ordering::Acquire);
+                return;
+            }
             let request = reqwest::Client::new().post(format!("{url}/sim/ble/close"))
                 .header("x-sim-ble-generation", self.info["_sim_generation"].as_u64().unwrap().to_string())
                 .bearer_auth(&self.token).send();

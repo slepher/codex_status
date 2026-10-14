@@ -83,7 +83,8 @@ void handleBleEndpoint(const String &json) {
     // Without an exact identity no response can safely acknowledge this write.
     if (!bleWireText(request,64,false) || !bleWireText(principal,64,false)) return;
     auto reply=[&](const char *error,const char *stage) {
-        bleNotifyStatus(bleBuildEndpoint(request,WiFi.macAddress(),principal,error,stage));
+        // BLE-first wake has no STA netif yet; identity must not depend on Wi-Fi.
+        bleNotifyStatus(bleBuildEndpoint(request,radio::macText(),principal,error,stage));
     };
     if(doc["schema"]!=2 || !doc["port"].is<uint16_t>() || !doc["check_only"].is<bool>()){reply("shape","validate");return;}
     for(const char *key:{"host","token","bridge_id","request_id"}){JsonString value=doc[key].as<JsonString>();if(!value || value.size()!=strlen(value.c_str())){reply("shape","validate");return;}}
@@ -408,6 +409,7 @@ bool v2Command(const String &body, JsonDocument &doc) {
     diagnostics::traceSetRequest(request);
     diagnostics::traceSetStage(TRACE_STAGE_COMMAND);
     if (!state.v2ReplyOverBle) diagnostics::traceMarkHttp(true, 200);
+    sync::noteLogContact();
     return true;
 }
 
@@ -938,6 +940,7 @@ void registerHttpRoutes() {
     state.server.on("/", HTTP_GET, diagnostics::handleStatus);
     state.server.on("/status.json", HTTP_GET, diagnostics::handleStatusJson);
     state.server.on("/log", HTTP_GET, diagnostics::handleLog);
+    state.server.on("/offline-log", HTTP_GET, sync::handleOfflineLog);
     state.server.on("/history", HTTP_GET, diagnostics::handleHistory);
     state.server.on("/pmstats", HTTP_GET, diagnostics::handlePmStats);
     state.server.on("/frame", HTTP_GET, diagnostics::handleFrame);

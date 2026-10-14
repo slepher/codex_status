@@ -7,6 +7,10 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
+[patch.crates-io]
+# macOS: complete close/state replies after a native remote disconnect.
+btleplug = { path = "vendor/btleplug" }
+
 [profile.release]
 lto = "thin"
 strip = true

@@ -231,6 +231,7 @@ void initialize(const char *firmwareVersion, const char *imageIdentity) {
     platform::state.v2BundleReady = bsBegin();
     platform::state.bundleMaintenance = !platform::state.v2BundleReady;
     if (!syncStoreBegin()) DevLog.println("[sync] frozen store unavailable");
+    sync::beginOfflineLog();
     // Old ROMs persisted an OTA arm that could block recovery after A/B rollback.
     Preferences oldOta;
     if (oldOta.begin("sync-ota", false)) {
@@ -358,6 +359,7 @@ void tick() {
     power::serviceBatteryDisplay();
     blePoll();
     diagnostics::tracePollConnection();
+    sync::expireOfflineLog();
     transport::serviceV2Ble();
 
     static uint32_t pwrDownAt = 0;

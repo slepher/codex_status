@@ -1,4 +1,5 @@
 #include "diagnostics_internal.h"
+#include "offline_log.h"
 #include "application_internal.h"
 #include "clock_internal.h"
 #include "display_internal.h"
@@ -1281,6 +1282,7 @@ void handleV2Status() {
         return;
     }
     traceMarkHttp(true, 200);
+    sync::noteLogContact();
     JsonDocument options;
     if (deserializeJson(options, transport::state.v2HttpBody)) {
         transport::v2Response(400, "{\"result\":\"rejected\",\"error\":\"payload\"}"); return;
@@ -1342,6 +1344,7 @@ void handleV2Status() {
         doc["diag_capacity"] = 4096;
     }
     JsonObject sync = doc["sync"].to<JsonObject>();
+    offlineLogStatus(clock::timeKnown() ? (uint64_t)time(nullptr) : 0,doc["offline_log"].to<JsonObject>());
     OwnerRec owner;
     sync["enabled"] = sync::state.syncEnabled && ownerGet(owner) && owner.id == sync::state.syncOwner;
     sync["phase"] = sync::state.syncOpenThisWake ? "WIFI_SYNC_ONCE" :

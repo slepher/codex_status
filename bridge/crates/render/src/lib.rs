@@ -415,6 +415,8 @@ extern "C" {
     fn codex_rv_tick(p:*mut std::ffi::c_void,now:u64)->i32;
     fn codex_sim_sync_append_wake(p: *mut std::ffi::c_void, json: *const c_char) -> c_int;
     fn codex_sim_sync_history(p: *mut std::ffi::c_void, since: u32, limit: u32, out: *mut c_char, cap: c_int) -> c_int;
+    fn codex_sim_sync_log_context(p: *mut std::ffi::c_void, utc: u64, connected: c_int) -> c_int;
+    fn codex_sim_sync_archive(p: *mut std::ffi::c_void, utc: u64, hour: u64, offset: u32, serial: u64, out: *mut c_char, cap: c_int) -> c_int;
 
     fn codex_sim_wifi_legacy(json: *const c_char);
     fn codex_wifi_convert_storage(input:*mut u8,size:c_int,output:*mut u8,capacity:c_int)->c_int;
@@ -647,6 +649,14 @@ impl SimulatorSync {
         anyhow::ensure!(unsafe { codex_sim_sync_append_text(self.state,
             text.as_ptr(), uptime_ms) } == 1, "sync diagnostic append failed");
         Ok(())
+    }
+
+    pub fn log_context(&mut self, utc: u64, connected: bool) -> anyhow::Result<()> {
+        anyhow::ensure!(unsafe { codex_sim_sync_log_context(self.state,utc,connected as c_int) }==1,"log context failed");Ok(())
+    }
+    pub fn archive(&mut self, utc:u64, hour:u64, offset:u32, serial:u64) -> anyhow::Result<serde_json::Value> {
+        let mut out=vec![0i8;8192];let rc=unsafe {codex_sim_sync_archive(self.state,utc,hour,offset,serial,out.as_mut_ptr(),out.len() as c_int)};
+        simulator_ffi_json(rc,&out,"offline archive")
     }
 
     pub fn corrupt(&mut self, header: bool, seq: u64) -> anyhow::Result<()> {

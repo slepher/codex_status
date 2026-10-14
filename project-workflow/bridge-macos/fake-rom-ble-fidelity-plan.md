@@ -210,3 +210,7 @@ Fake现在保存原始C++编码字节；fragment/command只返回上传accepted�
 五crate239 passed/1 ignored，Fake48 passed，总287 passed/1 ignored；最后调度app51/1 ignored及受最后变更影响的Fake Wi-Fi3项复测通过，host最终Wi-Fi418 B/授权196 B。完整命令/A01–A17具体证据范围在 [wifi-rendezvous-execution.md第11节](wifi-rendezvous-execution.md#11-w0w6-软件交付与验收对账2026-10-03未部署)，不把有限软件矩阵等同于全部时序压力或实体P4/P5放行。
 
 W7本轮未执行，实际仍.44/原运行.app；没有整板编译/新包/部署或设备动作。账本8项保守永久保留且满时拒绝，是明确产品限制。真实NimBLE/RF、连续重连/INFO超时、自然会合/TCC/电流、试连实体屏幕跳变、NVS断电、Windows/其他架构/缺席1.54仍未验。一般诊断读任务扩展和完整app进程接Fake的抢锁/系统网络事件压力不在已通过声明内；B5/B6继续未结项。
+
+## 14. 独立BLE设备与原生生命周期逻辑（2026-10-14）
+
+按用户要求新增BleDevice/ROM BleProxy和独立控制入口。CoreBluetooth与Fake peripheral proxy共用close/state/future，生命周期模式复用生产有界关闭/NativeLease（模拟radio独立）。假StaticJson源三组Data渲染穿插BLE会话、远端先断开/重连；临时恢复漏回复分支可确定性触发第二次连接隔离。参见[实施、测试和操作](fake-ble-lifecycle-20261014.md)。旧Fake不覆盖这个逻辑是模型缺口，不是物理传输必需；RF/TCC仍独立验收。

@@ -1,5 +1,6 @@
 #include "v2_sync_protocol.h"
 #include "wake_trace_projection.h"
+#include "offline_log.h"
 #include <LittleFS.h>
 #include <filesystem>
 #include <fstream>
@@ -16,7 +17,14 @@ struct SimSync {
     uint64_t seed = 0;
     uint32_t wakeSeq = 0;
     bool enabled = false;
+    bool logReady = false, bridgeContact = false;
+    uint64_t logUtc = 0;
 };
+SimSync *logOwner=nullptr;
+void persistLog(const uint8_t generation[16],const uint8_t *bytes,size_t length) {
+    if(logOwner && !logOwner->bridgeContact)
+        offlineLogAppend(logOwner->logUtc,generation,bytes,length);
+}
 
 bool saveRtc(const SimSync &sim) {
     std::ofstream out(sim.rtcPath, std::ios::binary | std::ios::trunc);
@@ -79,7 +87,25 @@ void *codex_sim_sync_new(const char *dataDir, const char *mac, const char *targe
     return sim;
 }
 
-void codex_sim_sync_free(void *p) { delete (SimSync *)p; }
+void codex_sim_sync_free(void *p) {
+    if(logOwner==p){syncSetRecordSink(nullptr);logOwner=nullptr;}delete (SimSync *)p;
+}
+
+int codex_sim_sync_log_context(void *p,unsigned long long utc,int connected) {
+    if(!p)return 0;auto &sim=*(SimSync *)p;sim.logUtc=utc;sim.bridgeContact=connected!=0;
+    if(!sim.logReady){offlineLogBegin(utc);sim.logReady=true;}
+    offlineLogExpire(utc);
+    if(!sim.bridgeContact)offlineLogCapture(sim.rtc,utc);
+    logOwner=&sim;syncSetRecordSink(persistLog);return 1;
+}
+int codex_sim_sync_archive(void *p,unsigned long long utc,unsigned long long hour,unsigned offset,unsigned long long serial,char *out,int cap) {
+    if(!p)return -1;auto &sim=*(SimSync *)p;
+    codex_sim_sync_log_context(p,utc,sim.bridgeContact);
+    JsonDocument doc;int status=200;
+    if(!hour){offlineLogStatus(utc,doc.to<JsonObject>());doc["result"]=doc["available"]==true?"ok":"rejected";status=doc["available"]==true?200:503;}
+    else status=offlineLogPage(utc,hour,offset,doc.to<JsonObject>(),serial);
+    doc["device_mac"]=sim.mac;doc["http_status"]=status;return copyJson(doc,out,cap);
+}
 
 int codex_sim_sync_set_owner(void *p, const char *owner, int enabled) {
     if (!p || !owner || strlen(owner) > 64) return 0;

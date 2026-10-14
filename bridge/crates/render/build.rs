@@ -65,6 +65,7 @@ fn main() {
         .file(firmware.join("v2_status_snapshot.cpp"))
         .file(firmware.join("v2_sync.cpp"))
         .file(firmware.join("v2_sync_store.cpp"))
+        .file(firmware.join("offline_log.cpp"))
         .file(firmware.join("v2_sync_protocol.cpp"))
         .file(firmware.join("bundle_store.cpp"))
         .file(firmware.join("bundle_payload.cpp"))
@@ -103,6 +104,7 @@ fn main() {
                     "v2_status_snapshot.h", "v2_status_snapshot.cpp",
                     "v2_sync.h", "v2_sync.cpp",
                     "v2_sync_store.h", "v2_sync_store.cpp",
+                    "offline_log.h", "offline_log.cpp",
                     "v2_sync_protocol.h", "v2_sync_protocol.cpp",
                     "bundle_store.h", "bundle_store.cpp", "bundle_payload.h", "bundle_payload.cpp", "fonts.h",
                     "font_noto.h", "font_noto_nt16.h", "font_noto_nt30.h",

@@ -6,11 +6,55 @@
 #include "power_internal.h"
 #include "radio_internal.h"
 #include "transport_internal.h"
+#include "offline_log.h"
 
 namespace firmware::sync {
 
 State state;
 RTC_DATA_ATTR Retained retained;
+
+static bool syncParseNumber(const char *text, uint64_t &value);
+static uint64_t logUtc() { return clock::timeKnown() ? (uint64_t)time(nullptr) : 0; }
+static void persistOfflineRecord(const uint8_t generation[16],const uint8_t *record,size_t length) {
+    // A successful BLE contact is fresh for one rendezvous period plus grace;
+    // an old plan must not suppress journaling after a later loss this wake.
+    if(radio::automaticContactNeeded() &&
+       (!state.lastBridgeContactMs || millis()-state.lastBridgeContactMs>=90000))
+        offlineLogAppend(logUtc(),generation,record,length);
+}
+void noteLogContact() { state.lastBridgeContactMs=millis()?millis():1; }
+void beginOfflineLog() {
+    offlineLogBegin(logUtc());
+    // Recover every retained record, including a prior thin wake or interrupted
+    // startup. UTC means save time; original wake/uptime and CRC stay intact.
+    offlineLogCapture(retained.syncRtc,logUtc());
+    syncSetRecordSink(persistOfflineRecord);
+}
+void expireOfflineLog() {
+    static uint32_t checked=0;
+    if(checked && millis()-checked<1000)return;
+    checked=millis();offlineLogExpire(logUtc());
+}
+void handleOfflineLog() {
+    String mac;
+    if(!transport::endpointTokenAuthorized(mac)) {
+        transport::state.server.send(401,"application/json","{\"result\":\"rejected\",\"error\":\"unauthorized\",\"stage\":\"offline_log_read\"}");return;
+    }
+    JsonDocument doc;int status=200;
+    if(!transport::state.server.hasArg("hour")) {
+        offlineLogStatus(logUtc(),doc.to<JsonObject>());
+        doc["result"]=doc["available"]==true?"ok":"rejected";status=doc["available"]==true?200:503;
+    } else {
+        uint64_t hour=0,offset=0,serial=0;
+        if(!syncParseNumber(transport::state.server.arg("hour").c_str(),hour) ||
+           (transport::state.server.hasArg("offset") && !syncParseNumber(transport::state.server.arg("offset").c_str(),offset)) || offset>UINT32_MAX ||
+           (transport::state.server.hasArg("serial") && !syncParseNumber(transport::state.server.arg("serial").c_str(),serial))) {
+            doc["result"]="rejected";doc["error"]="cursor_invalid";doc["stage"]="offline_log_read";status=400;
+        } else status=offlineLogPage(logUtc(),hour,(uint32_t)offset,doc.to<JsonObject>(),serial);
+    }
+    doc["device_mac"]=radio::macText();String out;serializeJson(doc,out);
+    transport::state.server.send(status,"application/json",out);
+}
 
 uint64_t httpUntil(uint64_t now) {
     return rendezvousWindowUntil(now,

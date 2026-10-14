@@ -6,6 +6,7 @@ namespace {
 constexpr uint32_t MAGIC = 0x31594353u; // SCY1
 constexpr uint16_t CAP = 4096;
 constexpr uint8_t DUE = 1, KNOWN = 2, RETRY = 4;
+SyncRecordSink recordSink = nullptr;
 
 uint8_t at(const SyncRtc &rtc, uint16_t pos) { return rtc.bytes[pos % CAP]; }
 void put(SyncRtc &rtc, uint16_t pos, uint8_t value) { rtc.bytes[pos % CAP] = value; }
@@ -26,6 +27,8 @@ uint64_t readLe(const uint8_t *in, size_t count) {
     return value;
 }
 }
+
+void syncSetRecordSink(SyncRecordSink sink) { recordSink = sink; }
 
 uint32_t syncCrc32(const uint8_t *bytes, size_t length) {
     uint32_t crc = 0xffffffffu;
@@ -218,6 +221,7 @@ bool syncAppend(SyncRtc &rtc, uint8_t kind, uint8_t flags, uint32_t wakeSeq,
     rtc.head = (rtc.head + size) % CAP;
     rtc.used += size;
     seal(rtc);
+    if(recordSink)recordSink(rtc.generation,raw,size);
     return true;
 }
 

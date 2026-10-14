@@ -219,6 +219,18 @@
 - 2026-10-03 用户确认本环境仅携带 Note4，1.54 不在现场：当前实机验收以 Note4 为范围，保留双设备软件身份回归；Windows 对照、Note4 每平台 ≥30 个自然会合及 macOS ≥24 h soak 按后续可用现场验证。1.54 实机与另一 CPU 架构另标未验，不为本轮要求用户取回设备，也不据 Note4 结果宣称全硬件已验。当前会话为 macOS 14.8.9 / x86_64，macOS 15+ 权限现场尚未验证。
 
 ### B6. 离线 BLE 配 Wi-Fi 与 BOOT 蓝牙恢复入口（2026-10-03 新开）
+
+- **2026-10-14 连接结束修复与离线日志已部署**：服务发现期间断开漏回pending connect导致12:20永久隔离；14:28 BOOT为同一隔离延续。Bridge根因修复14:44部署，真实handler7项/共享Fake红→绿及App94/BLE26/Fake68通过（3条件忽略）。.101完成跨深睡读回；最终Note4 .102于15:48单次原生OTA、认证运行hash匹配，LittleFS保留24小时内/384KiB日志，补薄唤醒RTC回填和过期去重，不改分区/NVS。正式Sleep→自然醒次3 BLE ACK/关闭0ms→Light3948/认证HTTP恢复，Flash40条3504B CRC正常、薄唤醒2摘要回填、原27条保持，无认证401。生产存储到期/轮换/截断/资源及最终Fake68/匹配ELF栈通过。初始物理链路超时因旧记录覆盖仍未知，长期RF/真实24h矩阵未验，不结项。[实施与部署](../../project-workflow/bridge-macos/offline-log-connect-fix-20261014.md)、[调查](../../project-workflow/bridge-macos/ble-connect-disconnect-20261014.md)。
+
+- **2026-10-14 Fake ROM逻辑覆盖范围收缩，待实施**：以[七项生产逻辑覆盖清单](../../project-workflow/bridge-macos/fake-rom-logic-coverage.md)为后续入口，依次核对会合重试、期限、连接代际、权限、OTA完成判定、显示确认及按键解释。只补Fake绕过的生产分支和最小组合用例，不预建外设/现实故障模型；配置事务、Bundle和渲染先复用已有测试。清单文档化不代表实施或验收通过。
+
+- **2026-10-14 CoreBluetooth断开竞态修复已部署，连续会合验证通过**：系统日志确认设备已主动断开，Bridge随后重复disconnect；锁定btleplug缺失外设时漏回future造成2s超时/永久隔离。补齐原生线程上的幂等close/state回复，保留真实未知隔离并补WARN。实际handler/future回放2红→4绿，BLE26/App94通过（3条件忽略），10:54部署新版hash f3576f02…；正式Sleep3897后定时唤醒，连续两次BLE会合关闭0/1ms、Data590及HTTP恢复通过；非长期RF验收。后续已补独立Fake BLE/ROM proxy，共享实际close/state/future和隔离路径；假StaticJson连续3帧对拍通过，恢复旧分支可复现第二次连接隔离。App94/BLE26/Fake67通过（3条件忽略），新测试结构未部署，见[Fake生命周期](../../project-workflow/bridge-macos/fake-ble-lifecycle-20261014.md)。[证据/实施](../../project-workflow/bridge-macos/ble-close-fix-20261014.md)。
+
+- **2026-10-14 .100已部署**：用户BOOT就绪后直接原生OTA一次，认证ota_0/运行hash匹配，稳定MAC回执使BLE status/claim/plan通过；HTTP Data578 applied/displayed。转Wi-Fi再次触发Bridge disconnect_timeout，10:40托管重启清隔离，原App二进制未改。当前恢复不等于Bridge恢复逻辑修好；本次button醒，timer长期验收仍待完成。[部署](../../project-workflow/bridge-macos/deployment-20261014.md)。
+
+- **2026-10-14 再次断连调查（未恢复现场）**：10月13日18:26后无认证HTTP成功，19:36 BLE disconnect超时2001ms使NativeLease永久隔离；此后同进程无扫描，次日权限allowed/health204仍正常。App仅debug记录restart_required，反馈与恢复不闭环；既有故障测试通过。单独重启只解进程阻断，仍须配套部署.99稳定MAC修复并验自然timer醒次；不能无证据清隔离。详见[本轮证据与边界](../../project-workflow/bridge-macos/disconnect-20261014.md)。
+
+- **2026-10-13 长断连根因与源码修复（未部署）**：17:02:51–18:10:36 共 29 次 BLE INFO 成功后会合失败。endpoint ACK 错用依赖 STA netif 的 `WiFi.macAddress()`，冷醒输出全零 MAC，被 Bridge 身份匹配过滤，5秒超时阻止后续网络命令；改用稳定 `radio::macText()`。生产处理函数/codec 8项红→绿、BLE-first检查通过；实机第69次timer无命令，第70次button恢复Wi-Fi。当前仍.99，未抓历史ACK字节，新ROM自然定时醒次闭环待验。[调查与边界](../../project-workflow/bridge-macos/disconnect-20261013.md)。
 - **2026-10-13队列状态修复已部署**：取消/到期停止自动查询，身份缺失/变更转needs_attention，晚到普通失败不复活/覆盖，已在途真实回执仍可确认；显式新请求按自身job_id立即尝试。Core153+22集成/App94（3条件忽略）/UI66、窄宽截图通过。两条旧同步恢复已取消，activate停止自动重试；保留历史unknown。设备HTTP当前不可达，在线直达由模拟服务验证。部署hash与数据备份见PROGRESS和下方调查。
 - **2026-10-13在线读取排队调查**：新read立即执行入口使用通用FIFO机会，旧身份未知事务仍可入选；每轮只处理一个，后台机会又位于claim/Plan之后。实机16:53读取约11秒完成，快照两页约500ms；生产准入方法隔离探针确认旧事务可抢机会。当次缺任务选择/锁日志，无法完全归因；修复已部署，见[调查与边界](../../project-workflow/bridge-macos/wifi-read-queue-investigation-20261013.md)。
 - **2026-10-13最简OTA兼容修复**：`.99`候选保留逐键旧绑定和缺身份BRS2，不完整记录隔离授权/路由，完整绑定可继续使用；物理修复保留已有namespace，不猜旧身份。取消USB导出BRS刷机前置。生产存储ASAN/分配故障、BLE/Fake endpoint与原生OTA回归、匹配ELF64项门禁通过；用户就绪后`.99`已直接OTA并认证哈希核验；最终Bridge 237cd5a0…已部署，补修同context数据归零的旧ACK抑制，Core152+集成22/App93通过，实机569 applied/displayed、Codex good。证据见[部署记录](../../project-workflow/bridge-macos/deployment-20261013.md)，不结B6/C8。

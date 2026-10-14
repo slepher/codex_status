@@ -49,6 +49,9 @@ bool syncDiagnosticText(const char *text);
 bool syncRecover(SyncRtc &rtc, const uint8_t generation[16]);
 bool syncAppend(SyncRtc &rtc, uint8_t kind, uint8_t flags, uint32_t wakeSeq,
                 uint32_t uptimeMs, const uint8_t *payload, size_t length);
+// A terminal diagnostic record can also be persisted without copying the ring.
+using SyncRecordSink = void (*)(const uint8_t generation[16], const uint8_t *record, size_t length);
+void syncSetRecordSink(SyncRecordSink sink);
 bool syncAppendEvent(SyncRtc &rtc, uint32_t wakeSeq, uint32_t uptimeMs,
                      uint16_t code, const int32_t *args, uint8_t argc);
 bool syncAppendResult(SyncRtc &rtc, uint32_t wakeSeq, uint32_t uptimeMs,

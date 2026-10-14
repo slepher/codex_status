@@ -24,6 +24,8 @@
 | 改电源/唤醒/占用 | `docs/power-state.md` + `docs/generic-display-platform-design.md` §7 |
 | 改休眠设备的状态页、模板/OTA 延后投递 | `docs/generic-display-platform-design.md` + `project-workflow/sleep-aware-bridge/design.md` / `task.md` |
 | 实施 PowerPlan 与 Data 同轮联合下发 | `project-workflow/bridge-macos/powerplan-data-execution-plan.md`（P1–P6；仅计划，待办 A9） |
+| 查失联日志与连接结束修复 | [离线日志与连接修复](../project-workflow/bridge-macos/offline-log-connect-fix-20261014.md) |
+| 扩展 Fake ROM 的生产逻辑覆盖 | [逻辑覆盖清单](../project-workflow/bridge-macos/fake-rom-logic-coverage.md)：七项优先级、最小场景与红绿验收规则；待办归 B6，不扩展为外设故障模拟 |
 | 改 BLE 会合功耗 | `docs/ble-rendezvous-power-design.md` |
 | 改双 ROM 首次蓝牙配网页与新配对屏幕码 | `project-workflow/ble-wifi-provisioning/design.md` + `plan.md`（2026-09-30 原始设计；协议/存储/窗口以后续统一协议为准，剩余归 backlog B6） |
 | 接续 Bridge macOS 菜单栏与 BLE 支持 | `project-workflow/bridge-macos/remaining-plan.md`（新窗口剩余实施入口）→ 按需读原 `plan.md` / `task.md`；已授权实施，`bridge_first` 已废弃，待办见 backlog B5 |

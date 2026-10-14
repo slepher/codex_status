@@ -3899,3 +3899,148 @@ fn endpoint_registration_requires_correlated_durable_ack() {
     });
     std::env::remove_var("CODEX_STATUS_SIM_BLE_ENDPOINTS");
 }
+
+// No real accounts or native radio: StaticJson -> production DataSource ->
+// HTTP Data -> Fake ROM render, interleaved with actual DeviceConnection/GATT
+// status/close/reconnect; device lifecycle is independent.
+#[test]
+fn offline_flash_logs_survive_rtc_wrap_reboot_and_expire_within_one_day() {
+    use base64::Engine;
+    let mut sim=Simulator::start("02:00:00:00:00:C5",&[]);
+    assert_eq!(set_time(&sim,Some(CONTROL),&serde_json::json!({"op":"rate","rate_ppm":0})).0,200);
+    let append=|sim:&Simulator,text:String| {
+        assert_eq!(request(sim.address(),"POST","/sim/diagnostics",Some(CONTROL),
+            serde_json::json!({"op":"append_text","text":text}).to_string().as_bytes()).0,200);
+    };
+    for i in 0..100 {append(&sim,format!("[net] offline witness {i:03} {}","x".repeat(40)));}
+    append(&sim,"[net] token=SECRET-WITNESS fail".into());
+    assert!(sim_state(&sim)["sync"]["diag_earliest_seq"].as_str().unwrap().parse::<u64>().unwrap()>1);
+    assert_eq!(request(sim.address(),"GET","/offline-log",None,b"").0,401);
+    let listing=json_body(&request(sim.address(),"GET","/offline-log",Some(ENDPOINT),b"").1);
+    assert_eq!(listing["retention_s"],86400);assert_eq!(listing["files"].as_array().unwrap().len(),1);
+    let hour=listing["files"][0]["hour"].as_u64().unwrap();
+    let read=|sim:&Simulator| {
+        let mut offset=0;let mut serial=0;let mut text=String::new();let mut count=0;
+        loop {
+            let reply=request(sim.address(),"GET",&format!("/offline-log?hour={hour}&offset={offset}&serial={serial}"),Some(ENDPOINT),b"");
+            assert_eq!(reply.0,200);let page=json_body(&reply.1);
+            for record in page["records"].as_array().unwrap() {
+                let raw=base64::engine::general_purpose::STANDARD.decode(record["record_b64"].as_str().unwrap()).unwrap();
+                if raw[2]==3 {text.push_str(&String::from_utf8_lossy(&raw[20..raw.len()-4]));text.push('\n');}
+                count+=1;
+            }
+            serial=page["serial"].as_u64().unwrap();let next=page["next_offset"].as_u64().unwrap();assert!(next>=offset);
+            if page["more"]!=true {break;}assert!(next>offset);offset=next;
+        }
+        (count,text)
+    };
+    let (count,text)=read(&sim);assert!(count>=101);assert!(text.contains("offline witness 000"));
+    assert!(text.contains("offline witness 099"));assert!(!text.contains("SECRET-WITNESS"));assert!(text.contains("[redacted]"));
+    assert_eq!(request(sim.address(),"GET",&format!("/offline-log?hour={hour}&offset=25"),Some(ENDPOINT),b"").0,400);
+    let bytes=listing["bytes"].clone();
+    assert_eq!(request(sim.address(),"POST","/sim/diagnostics",Some(CONTROL),br#"{"op":"bridge_contact","connected":true}"#).0,200);
+    append(&sim,"[net] online record only in RTC".into());
+    assert_eq!(json_body(&request(sim.address(),"GET","/offline-log",Some(ENDPOINT),b"").1)["bytes"],bytes);
+    // A later offline/full wake must recover retained records from before the
+    // current wake; it must not silently lose a prior clock-only interval.
+    assert_eq!(request(sim.address(),"POST","/sim/diagnostics",Some(CONTROL),br#"{"op":"bridge_contact","connected":false}"#).0,200);
+    let (count,text)=read(&sim);assert!(text.contains("online record only in RTC"));
+    let dir=sim.data_dir.clone();sim.stop_preserving_data();drop(sim);
+    let reboot=Simulator::start_with_dir("02:00:00:00:00:C5",&[],dir,true);
+    let (recovered,text)=read(&reboot);assert_eq!(recovered,count);assert!(text.contains("offline witness 000"));
+    assert_eq!(set_time(&reboot,Some(CONTROL),&serde_json::json!({"op":"step","delta_ms":86_400_000})).0,200);
+    let expired=json_body(&request(reboot.address(),"GET","/offline-log",Some(ENDPOINT),b"").1);
+    // Stepping a day creates fresh clock-wake events. They may be archived;
+    // every old hour must be gone and no old witness may be resurrected.
+    assert!(expired["files"].as_array().unwrap().iter().all(|f|f["hour"].as_u64().unwrap()>hour));
+    for file in expired["files"].as_array().unwrap() {
+        let page=json_body(&request(reboot.address(),"GET",&format!("/offline-log?hour={}&serial={}",file["hour"],file["serial"]),Some(ENDPOINT),b"").1);
+        for r in page["records"].as_array().unwrap() {
+            let raw=base64::engine::general_purpose::STANDARD.decode(r["record_b64"].as_str().unwrap()).unwrap();
+            assert!(!String::from_utf8_lossy(&raw).contains("offline witness"));
+        }
+    }
+    assert_eq!(request(reboot.address(),"GET",&format!("/offline-log?hour={hour}"),Some(ENDPOINT),b"").0,410);
+    eprintln!("Offline Flash logs: RTC wrap preserves earliest witness; cold restart retains it; online append stays in RTC; 24h expiry removes it; secrets redacted.");
+}
+
+#[test]
+fn fake_ble_device_remote_close_reconnect_and_unknown_quarantine() {
+    let _env_guard = BLE_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    struct EnvGuard;
+    impl Drop for EnvGuard { fn drop(&mut self) {
+        std::env::remove_var("CODEX_STATUS_SIM_BLE_ENDPOINTS");
+        std::env::remove_var("CODEX_STATUS_SIM_BLE_LIFECYCLE");
+    } }
+    let _env = EnvGuard;
+    let mac = "02:00:00:00:00:C4";
+    let sim = Simulator::start(mac, &[]);
+    set_time(&sim, Some(CONTROL), &serde_json::json!({"op":"rate","rate_ppm":0}));
+    let mut template: Value = serde_json::from_str(include_str!("../../../../tools/test-bridge/templates/quad.json")).unwrap();
+    template["id"] = "lifecycle".into();
+    template["elements"] = serde_json::json!([{"type":"text","bind":"account.plan","font":"f16","color":"black","x":8,"y":8}]);
+    let compiled = bridge_core::compile::compile(&template,"epd-ssd1681-200x200-1bpp").unwrap();
+    let index = compiled.requirements.iter().find(|f| f.field=="account.plan").unwrap().index;
+    let bundle = serde_json::json!({"bridge_id":"bridge-test","job_id":"lifecycle",
+        "firmware_target":"codex-status-154g","render_target":"epd-ssd1681-200x200-1bpp","compiler_abi":2,
+        "profile":{"template_ids":["lifecycle"],"initial_active_id":"lifecycle"},
+        "templates":[{"key":{"template_id":"lifecycle","render_target":"epd-ssd1681-200x200-1bpp"},"source":template,"compiled":compiled}],
+        "resources":[],"bindings":[]});
+    let installed = bridge_core::device_client::install_bundle(&sim.address().to_string(),ENDPOINT,mac,"bridge-test",
+        &bridge_core::template::canonical_bytes(&bundle),4096,Duration::from_secs(3)).unwrap();
+    assert_eq!(installed["result"],"applied");
+    assert_eq!(claim(&sim,"id=bridge-test&lease=3600",Some(DEVICE)).0,200);
+    std::env::set_var("CODEX_STATUS_SIM_BLE_ENDPOINTS",serde_json::json!({"0200000000C4":format!("http://{}",sim.address())}).to_string());
+    std::env::set_var("CODEX_STATUS_SIM_BLE_LIFECYCLE","1");
+    let control = |op: &str| {
+        let reply=request(sim.address(),"POST","/sim/ble/device",Some(CONTROL),serde_json::json!({"op":op}).to_string().as_bytes());
+        assert_eq!(reply.0,200); json_body(&reply.1)
+    };
+    assert_eq!(request(sim.address(),"POST","/sim/ble/device",Some(ENDPOINT),br#"{"op":"disconnect"}"#).0,401);
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        control("disconnect_on_discovery");
+        let failed=bridge_ble::DeviceConnection::connect("0200000000C4",ENDPOINT,"bridge-test").await.err().expect("discovery disconnect must fail");
+        assert!(format!("{failed:#}").contains("Device disconnected"),"{failed:#}");
+        assert_eq!(json_body(&request(sim.address(),"GET","/sim/ble/device",Some(CONTROL),b"").1)["connected"],false);
+        for (seq, plan) in [(1,"Plus"),(2,"Pro"),(3,"Team")] {
+            let mut link=bridge_ble::DeviceConnection::connect("0200000000C4",ENDPOINT,"bridge-test").await.unwrap().unwrap();
+            link.command("status",serde_json::json!({})).await.unwrap();
+            let source=bridge_core::datasource::DataSource {
+                source_id:"fake".into(),kind:bridge_core::datasource::DataSourceKind::StaticJson,
+                config:serde_json::json!({"values":{"account.plan":plan}}),credential_ref:None,enabled:true };
+            source.validate().unwrap();
+            let snapshot=source.snapshot(None);
+            let fields=vec![serde_json::json!({"i":index,"k":"account.plan","v":snapshot.fields["account.plan"].value,"q":"good"})];
+            let data=serde_json::json!({"bridge_id":"bridge-test","active_context_id":installed["active_context_id"],"seq":seq,
+                "crc":format!("{:08x}",bridge_core::coordinator::data_fields_crc(&fields)),"fields":fields});
+            let ack=bridge_core::device_client::data(&sim.address().to_string(),ENDPOINT,mac,&data,Duration::from_secs(3)).unwrap();
+            assert_eq!(ack["result"],"applied");
+            let frame=request(sim.address(),"GET","/sim/frame",Some(CONTROL),b"").1;
+            let expected=bridge_render::render_bits(&template.to_string(),&serde_json::json!({"account":{"plan":plan}}).to_string(),
+                &bridge_render::Env{channel:"PULL",battery:75,..Default::default()}).unwrap();
+            assert_eq!(frame,expected,"fake source rendered before remote close {seq}");
+            assert_eq!(control("disconnect")["connected"],false);
+            assert_eq!(control("disconnect")["connected"],false,"remote disconnect is idempotent");
+            link.close_bounded(Duration::from_millis(300)).await;
+            // Next iteration uses the production lease: the old missing-reply
+            // bug times out above and rejects the next connection as quarantined.
+        }
+        let old=bridge_ble::DeviceConnection::connect("0200000000C4",ENDPOINT,"bridge-test").await.unwrap().unwrap();
+        let replacement=request(sim.address(),"GET","/sim/ble/info?connect=1",Some(ENDPOINT),b"");
+        assert_eq!(replacement.0,200);
+        old.close_bounded(Duration::from_millis(300)).await;
+        let current=json_body(&request(sim.address(),"GET","/sim/ble/device",Some(CONTROL),b"").1);
+        assert_eq!(current["connected"],true,"stale handle cannot close new generation");
+        let link=bridge_ble::DeviceConnection::connect("0200000000C4",ENDPOINT,"bridge-test").await.unwrap().unwrap();
+        link.close_bounded(Duration::from_millis(300)).await; // ordinary callback path
+        let link=bridge_ble::DeviceConnection::connect("0200000000C4",ENDPOINT,"bridge-test").await.unwrap().unwrap();
+        control("drop_close_callback");
+        link.close_bounded(Duration::from_millis(100)).await;
+        let before=json_body(&request(sim.address(),"GET","/sim/ble/device",Some(CONTROL),b"").1);
+        let error=bridge_ble::DeviceConnection::connect("0200000000C4",ENDPOINT,"bridge-test").await.err().expect("unknown close must block reconnect");
+        assert!(error.to_string().contains("ble_native_quarantined_restart_required"),"{error:#}");
+        let after=json_body(&request(sim.address(),"GET","/sim/ble/device",Some(CONTROL),b"").1);
+        assert_eq!(before,after,"quarantined reconnect must not touch peripheral");
+        eprintln!("Fake BLE lifecycle: 3 StaticJson frames verified; remote-first and stale-generation close recovered; missing callback blocks reconnect.");
+    });
+}

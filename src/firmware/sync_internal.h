@@ -9,6 +9,7 @@ namespace firmware::sync {
 struct State {
     uint32_t syncLogWakeSeq = 0;
     bool syncLogReady = false;
+    uint32_t lastBridgeContactMs = 0;
     uint32_t       v2HistorySyncMs = 0;
     uint64_t       v2HistorySyncUntilMs = 0;
     bool syncEnabled = false;
@@ -47,5 +48,9 @@ void handleSyncBegin();
 void handleSyncPage();
 void handleSyncAck();
 void handleSyncComplete();
+void beginOfflineLog();
+void noteLogContact();
+void expireOfflineLog();
+void handleOfflineLog();
 
 } // namespace firmware::sync
