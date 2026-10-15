@@ -850,6 +850,7 @@ pub struct DeviceConnection {
     native_lease: Option<NativeLease<'static>>,
     fake_url: Option<String>,
     rf_deadline: Option<tokio::time::Instant>,
+    command_budget_deadline: Option<tokio::time::Instant>,
     write_uncertain: AtomicBool,
     endpoint_unconfirmed: AtomicBool,
     token: String,
@@ -1047,6 +1048,7 @@ impl DeviceConnection {
                     peripheral: None, native_lease, fake_url: Some(url.trim_end_matches('/').to_owned()),
                     write_uncertain: std::sync::atomic::AtomicBool::new(false),
                     endpoint_unconfirmed: std::sync::atomic::AtomicBool::new(false),
+                    command_budget_deadline: None,
                     rf_deadline: info["rf_remaining_ms"].as_u64().map(|ms| info_started + Duration::from_millis(ms)),
                     token: token.to_owned(), bridge_id: bridge_id.to_owned(),
                     nonce: String::new(), session: [0; 16], next_request_no: 1, context_id: String::new(), device_mac,
@@ -1154,6 +1156,7 @@ impl DeviceConnection {
                 fake_url: None,
                 write_uncertain: std::sync::atomic::AtomicBool::new(false),
                 endpoint_unconfirmed: std::sync::atomic::AtomicBool::new(false),
+                command_budget_deadline: None,
                 rf_deadline: info["rf_remaining_ms"].as_u64().map(|ms| info_started + Duration::from_millis(ms)),
                 token: token.to_owned(),
                 bridge_id: bridge_id.to_owned(),
@@ -1175,7 +1178,15 @@ impl DeviceConnection {
 
     fn command_deadline(&self) -> tokio::time::Instant {
         let normal = tokio::time::Instant::now() + Duration::from_secs(5);
-        self.rf_deadline.map_or(normal, |rf| rf.min(normal))
+        let deadline = self.rf_deadline.map_or(normal, |rf| rf.min(normal));
+        self.command_budget_deadline.map_or(deadline, |phase| phase.min(deadline))
+    }
+
+    /// A shared phase deadline belongs inside the carrier: an application
+    /// timeout must not drop a fragmented write before its outcome is recorded.
+    /// Call once on phase entry; individual commands cannot renew this budget.
+    pub fn set_command_budget(&mut self, budget: Option<bridge_core::rendezvous::Budget>) {
+        self.command_budget_deadline = budget.map(|b| tokio::time::Instant::now() + b.remaining());
     }
 
     /// Refresh only from the same authenticated peripheral/wake. A new phase
@@ -2190,7 +2201,7 @@ mod tests {
             info: json!({}), peripheral: None, native_lease: None, fake_url: None,
             write_uncertain: std::sync::atomic::AtomicBool::new(false),
             endpoint_unconfirmed: std::sync::atomic::AtomicBool::new(false),
-            rf_deadline: None, token: String::new(),
+            command_budget_deadline: None, rf_deadline: None, token: String::new(),
             bridge_id: String::new(), nonce: String::new(), session: [0; 16], device_mac: String::new(),
             next_request_no: 1, context_id: String::new(),
             auth_ready: true, wake_identity: None, wake_cause: String::new(),
@@ -2213,6 +2224,23 @@ mod tests {
         let link = test_link();
         link.control_write_until(deadline, async { Ok(()) }).await.unwrap();
         link.control_write_until(deadline, async { Ok(()) }).await.unwrap();
+    }
+
+    #[test]
+    fn phase_budget_is_shared_with_rf_and_cannot_be_renewed_by_commands() {
+        let mut link = test_link();
+        link.rf_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(4));
+        link.set_command_budget(Some(bridge_core::rendezvous::Budget::new(Duration::from_secs(1))));
+        let phase = link.command_deadline();
+        assert!(phase < link.rf_deadline.unwrap());
+        assert_eq!(link.command_deadline(), phase);
+        // A refreshed, longer RF phase cannot extend the admitted work budget.
+        link.rf_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(30));
+        assert_eq!(link.command_deadline(), phase);
+        link.command_budget_deadline = Some(tokio::time::Instant::now() - Duration::from_secs(1));
+        assert!(link.command_deadline() < tokio::time::Instant::now());
+        link.set_command_budget(None);
+        assert!(link.command_deadline() > phase);
     }
 
     #[test]

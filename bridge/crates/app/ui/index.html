@@ -378,7 +378,7 @@
         </section>
         <div class="wifi-tasks"><h3>当前任务</h3><div id="wifi-current-jobs" class="muted"></div>
           <details id="wifi-job-history"><summary id="wifi-history-label">执行记录</summary><div id="wifi-jobs" class="muted"></div></details>
-          <div id="wifi-result" class="status" role="status" aria-live="polite">等待操作</div>
+          <div id="wifi-result" class="status" role="status" aria-live="polite">操作结果将在此显示</div>
         </div>
       </div>
       <div class="card">
@@ -1215,7 +1215,9 @@
     try {wifiShowHost(await invoke('platform_wifi',{mac:'',op:'host',body:{}}));}
     catch(e){$('wifi-host').textContent=wifiError(e);}
   }
-  function wifiRenderOnline(status) {
+  let wifiOnlineStatus=null;
+  function wifiRenderOnline(status=wifiOnlineStatus) {
+    wifiOnlineStatus=status;
     const node=$('wifi-online');if(!node)return;
     if(!status?.presence){node.textContent='等待认证在线状态';return;}
     const age=Math.max(0,Date.now()/1000-Number(status.observed_at||0));
@@ -1226,6 +1228,9 @@
     node.textContent=(left===0?'窗口已结束 / 预计休眠':why+(left==null?'':' · 剩余 '+left+' 秒'))+
       ' · HTTP '+(t.http?.ready?'就绪':'暂不可达')+' · BLE '+(t.ble?.ready?'就绪':'关闭')+
       (control.reason?' · '+wifiError(control.reason):'');
+  }
+  function wifiTickOnline() {
+    if(!document.hidden&&document.querySelector('.tabs button[data-tab="device"]').classList.contains('on')) wifiRenderOnline();
   }
   async function wifiRefreshView() {
     if(!selectedDeviceMac) return;
@@ -1393,7 +1398,7 @@
     const jobs=(wifiState.jobs||[]).slice().reverse(),terminal=j=>['completed','cancelled','expired','failed'].includes(j.state);
     const resultJob=jobs.find(j=>j.job_id===wifiResultJobId);if(resultJob)wifiShowResult(resultJob);
     const buttons=j=>`${!terminal(j)?`<button onclick="wifiCancelJob('${j.job_id}')">取消任务</button>`:''}${j.state==='waiting_input'?`<button onclick="wifiJobInput('${j.job_id}')">提供本次密码</button>`:''}`;
-    $('wifi-current-jobs').innerHTML=jobs.filter(j=>!terminal(j)).map(j=>`<div class="prow"><div class="pmeta"><b>${escapeHtml(wifiKindLabel(j.kind))} · ${wifiStage(j.state)}</b><small>${j.error_code?escapeHtml(wifiError(j.error_code)):''}${j.may_have_committed?' · 远端可能已生效，取消不回滚':''}<br>创建时间 ${escapeHtml(wifiCreatedTime(j.created_at))}</small></div>${buttons(j)}</div>`).join('')||'暂无进行中的任务';
+    $('wifi-current-jobs').innerHTML=jobs.filter(j=>!terminal(j)).map(j=>`<div class="prow"><div class="pmeta"><b>${escapeHtml(wifiKindLabel(j.kind))} · ${wifiStage(j.state)}</b><small>${escapeHtml(j.device_mac||selectedDeviceMac||'')} · ${escapeHtml(j.job_id||'任务ID缺失')} · ${j.error_code?escapeHtml(wifiError(j.error_code)):''}${j.may_have_committed?' · 远端可能已生效，取消不回滚':''}<br>创建时间 ${escapeHtml(wifiCreatedTime(j.created_at))}</small></div>${buttons(j)}</div>`).join('')||'暂无进行中的任务';
     const history=jobs.filter(terminal);$('wifi-history-label').textContent=`执行记录（${history.length}）`;
     $('wifi-jobs').innerHTML=history.map(j=>`<div class="prow"><div class="pmeta"><b>${escapeHtml(wifiKindLabel(j.kind))} · ${wifiStage(j.state)}</b><small>${escapeHtml(j.device_mac)} · ${escapeHtml(j.job_id)} · 尝试 ${j.attempt_count} · ${j.error_code?escapeHtml(wifiError(j.error_code)):escapeHtml(wifiAttemptLabel(j.last_stage))}<br>创建时间 ${escapeHtml(wifiCreatedTime(j.created_at))} · 最近执行 ${eventTime(j.last_attempt_at)}${j.confirmation?' · '+escapeHtml(j.confirmation):''}${j.may_have_committed&&!j.confirmation?' · 原操作结果未知，停止重试不代表回滚':''}</small></div></div>`).join('')||'暂无执行记录';
   }
@@ -1437,6 +1442,7 @@
   }
 
   function clearDeviceView() {
+    wifiRenderOnline(null);
     wifiEditingId=null;$('wifi-id').readOnly=false;
     wifiShowTab('bridge');$('wifi-editor').open=false;
     if(wifiViewMac&&wifiDirty)wifiDrafts.set(wifiViewMac,structuredClone(wifiDraft));
@@ -1444,7 +1450,7 @@
     wifiState={local_revision:0,targets:[],jobs:[]};wifiScheme=null;wifiDifferences=[];wifiPreview=null;wifiSelections.clear();wifiRequestSeq++;
     wifiPasswordVisibility();$('wifi-password').value='';for(const id of ['wifi-id','wifi-host-ssid','wifi-ssid','wifi-label'])$(id).value='';
     $('wifi-credential').value='keep';$('wifi-networks').textContent='尚未读取完整设备方案';$('wifi-compare').innerHTML='';
-    $('wifi-jobs').innerHTML='';$('wifi-current-jobs').textContent='暂无进行中的任务';$('wifi-history-label').textContent='执行记录';$('wifi-job-history').open=false;$('wifi-sync-submit').disabled=true;wifiRenderLocal();wifiLocalResult('等待操作');
+    $('wifi-jobs').innerHTML='';$('wifi-current-jobs').textContent='暂无进行中的任务';$('wifi-history-label').textContent='执行记录';$('wifi-job-history').open=false;$('wifi-sync-submit').disabled=true;wifiRenderLocal();wifiLocalResult('操作结果将在此显示');
     for (const id of ['dev-contact','dev-fw','dev-latest','dev-verdict','dev-installed',
       'dev-active','dev-applied','dev-display','dev-batt','dev-owner','dev-name']) $(id).textContent = '尚未读取';
     $('dev-upgrade-failure-row').hidden = true;
@@ -1886,7 +1892,7 @@
           const on = d.device_mac === selected;
           return `<div class="prow pick${on ? ' current' : ''}" onclick="pickDevice('${escapeAttr(d.device_mac)}')">` +
             `<span class="name"><b>${escapeHtml(d.name || fallbackDeviceName(d))}</b>` +
-            `<small>${escapeHtml(d.model || '型号未知')} · ${escapeHtml(d.device_mac.slice(-6))} · ${escapeHtml(d.status || '尚无认证联系')}${d.attention?.length ? ' · 待处理 ' + d.attention.length + ' 项' : ''}</small></span>` +
+            `<small>${escapeHtml(d.model || '型号未知')} · ${escapeHtml(d.device_mac.slice(-6))} · ${escapeHtml(d.status || '尚无认证联系')}${d.attention?.length ? ' · ' + escapeHtml(d.attention.map(kind=>({firmware_upgrade:'有可用固件升级',firmware_version:'固件版本需核对',upgrade_failed:'升级失败需处理',display_failed:'屏幕显示失败',contact_blocked:'设备认证或占用受阻'}[kind]||'设备状态需核对')).join(' · ')) : ''}</small></span>` +
             `<span class="ctl">${on ? '<span class="badge">当前</span>' : ''}</span></div>`;
         }).join('')
       : '<div class="todo" style="padding:10px">尚无已登记设备；先按键唤醒设备并重新发现。</div>';
@@ -2093,6 +2099,7 @@
   refreshPlatformDevice().then(() => { refresh(); refreshDevice(); refreshPlatformPower(); });
   refreshPlatformData();
   setInterval(() => { refresh(); refreshVisibleDevice(); }, 3000);
+  setInterval(wifiTickOnline, 1000);
 </script>
 </body>
 </html>

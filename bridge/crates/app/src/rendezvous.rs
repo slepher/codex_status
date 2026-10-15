@@ -92,7 +92,8 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
         .map(|job| job.job_id.clone())
         .collect();
     let mut admitted_at = std::time::Instant::now();
-    let mut recovery_state = None;
+    let command_budget = Budget::new(Duration::from_secs(10));
+    link.set_command_budget(Some(command_budget));
     let work = async {
         if !still_registered {
             return Err(format!(
@@ -175,7 +176,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
         state["_wifi_repair"] = json!(needs_http && (!reachable || requested));
         if reachable && !requested { crate::wifi::http_ready(ctx, &mac); }
         else if needs_http && remaining == 0 {
-            let _=tokio::time::timeout(Duration::from_millis(700),crate::wifi::prepare_connection(ctx,&mac,&mut link,remaining>0)).await;
+            crate::wifi::prepare_connection(ctx,&mac,&mut link,remaining>0,command_budget).await?;
             if !reachable { crate::wifi::http_failed(ctx,&mac,"http_unavailable"); }
         }
         admitted_wifi = service(ctx).wifi_state(&mac).jobs.iter()
@@ -206,7 +207,6 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
         state["_sent_plan"] = serde_json::to_value(&plan).map_err(err_text)?;
         state["_plan_ack_unknown"] = json!(true);
         state["_sync_enabled"] = json!(sync_enabled);
-        recovery_state = Some(state.clone());
         admitted_at = std::time::Instant::now();
         let reply = link.command("plan", plan_body).await;
         if reply.as_ref().is_err_and(bridge_core::rendezvous::not_dispatched) {
@@ -294,7 +294,6 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             let open_id = uuid::Uuid::new_v4().simple().to_string();
             state["_sync_open_id"] = json!(open_id);
             state["_sync_open_unknown"] = json!(true);
-            recovery_state = Some(state.clone());
             match link
                 .command(
                     "sync_open",
@@ -338,21 +337,8 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
         };
         Ok((state, sync_enabled, sync_opened, light_plan))
     };
-    let mut normal_result = match tokio::time::timeout(Duration::from_secs(10), work).await {
-        Ok(result) => result,
-        Err(_) => match recovery_state {
-            Some(state)
-                if state["_sent_plan"]["mode"] == "light"
-                    || state["_sync_open_unknown"] == true =>
-            {
-                let enabled = state["_sync_enabled"] == true;
-                let light = state["_sent_plan"]["mode"] == "light";
-                let opened = state["_sync_open_unknown"] == true;
-                Ok((state, enabled, opened, light))
-            }
-            _ => Err("BLE rendezvous timed out".to_owned()),
-        },
-    };
+    let mut normal_result = work.await;
+    link.set_command_budget(None);
     let shared_tail = Budget::at(admitted_at, HTTP_PROOF_BUDGET).capped(http_window.remaining());
     let mut http_budget = http_window;
     let mut wifi_repair_error = None;

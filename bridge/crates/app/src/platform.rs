@@ -599,6 +599,18 @@ fn upgrade_failure_label(error: &str) -> &'static str {
     else { "升级任务失败，详情见历史归档" }
 }
 
+fn firmware_version_order(current: &str, registered: &str) -> Option<std::cmp::Ordering> {
+    let parts = |text: &str| {
+        let (number, family) = text.split_once('-').unwrap_or((text, ""));
+        let numbers = number.split('.').map(str::parse::<u32>).collect::<Result<Vec<_>, _>>().ok()?;
+        ((2..=3).contains(&numbers.len())).then(|| (numbers, family.to_owned()))
+    };
+    let (current, current_family) = parts(current)?;
+    let (registered, registered_family) = parts(registered)?;
+    (current.len() == registered.len() && current_family == registered_family)
+        .then(|| current.cmp(&registered))
+}
+
 fn project_device(raw: &Value, identity: &Value, now: u64) -> Value {
     let mac = &raw["device_mac"];
     let observed = &raw["record_observed"];
@@ -634,12 +646,19 @@ fn project_device(raw: &Value, identity: &Value, now: u64) -> Value {
         && image["image_bytes"] == release["size"]
         && image["boot_id"] == *current_boot && !image["sha256"].is_null();
     let verdict = if current["value"].is_null() || release.is_null() { "unknown" }
-        else if current["value"] != latest["value"] { "upgrade_available" }
+        else if current["value"] != latest["value"] {
+            match firmware_version_order(current["value"].as_str().unwrap_or(""), latest["value"].as_str().unwrap_or("")) {
+                Some(std::cmp::Ordering::Less) => "upgrade_available",
+                Some(std::cmp::Ordering::Greater) => "newer_than_release",
+                _ => "version_mismatch",
+            }
+        }
         else if comparable && image["sha256"] != release["sha256"] { "different_image" }
         else { "current" };
     let verdict_label = match verdict {
         "current" => "已是最新版", "upgrade_available" => "可升级",
-        "different_image" => "同版本但运行镜像不同", _ => "无法判断",
+        "different_image" => "同版本但运行镜像不同", "newer_than_release" => "运行版本高于登记版本",
+        "version_mismatch" => "版本不同，需核对", _ => "无法判断",
     };
     let mut related = Vec::new();
     if !release.is_null() {
@@ -686,6 +705,7 @@ fn project_device(raw: &Value, identity: &Value, now: u64) -> Value {
     };
     let mut attention = Vec::new();
     if matches!(verdict, "upgrade_available" | "different_image") { attention.push("firmware_upgrade"); }
+    if verdict == "version_mismatch" { attention.push("firmware_version"); }
     if upgrade_failure.is_some() { attention.push("upgrade_failed"); }
     if display_state["value"] == "failed" { attention.push("display_failed"); }
     if blocked { attention.push("contact_blocked"); }
@@ -766,6 +786,22 @@ mod device_view_tests {
         assert_eq!(fresh_ble["firmware"]["verdict"], "unknown");
         assert_eq!(fresh_ble["battery"]["reason"], "stale_boot");
         assert_eq!(fresh_ble["display"]["installed"]["reason"], "stale_boot");
+    }
+
+    #[test]
+    fn newer_running_firmware_does_not_create_a_pending_upgrade_notice() {
+        let mut raw=json!({"device_mac":"7C4FADB93408","capabilities":{"firmware_target":"zectrix-note4-400x300"},
+            "last_authenticated":{"observed_at":100,"body":{"fw":"0.18.102-note4","boot_id":"boot","display_state":"displayed"}},
+            "latest_firmware":{"version":"0.18.61-note4"}});
+        let view=project_device(&raw,&Value::Null,100);
+        assert_eq!(view["firmware"]["verdict"],"newer_than_release");
+        assert_eq!(view["attention"],json!([]));
+        raw["latest_firmware"]["version"]=json!("0.18.103-note4");
+        assert_eq!(project_device(&raw,&Value::Null,100)["attention"],json!(["firmware_upgrade"]));
+        raw["latest_firmware"]["version"]=json!("0.18.103-other");
+        assert_eq!(project_device(&raw,&Value::Null,100)["firmware"]["verdict"],"version_mismatch");
+        assert_eq!(firmware_version_order("0.18.9-note4","0.18.10-note4"),Some(std::cmp::Ordering::Less));
+        assert_eq!(firmware_version_order("dev-note4","0.18.10-note4"),None);
     }
 
     #[test]
@@ -2597,6 +2633,8 @@ mod ble_close_lock_tests {
         network_started: AtomicBool,
         sync_opened: AtomicBool,
         blocked_op: Mutex<String>,
+        wifi_match_write_delay_ms: AtomicU64,
+        wifi_match_reply: Mutex<Value>,
         /// Device status reports `sync.due=true` / `enabled=true`, so a real
         /// `ble_cycle` takes its `sync_open` path (`sync_opened == true`).
         sync_due: bool,
@@ -2707,6 +2745,9 @@ mod ble_close_lock_tests {
         let command: Value = serde_json::from_slice(payload).unwrap_or(Value::Null);
         fake.commands.lock().unwrap().push(command.clone());
         let op = command["op"].as_str().unwrap_or("");
+        if op == "wifi_match" {
+            tokio::time::sleep(Duration::from_millis(fake.wifi_match_write_delay_ms.load(Ordering::SeqCst))).await;
+        }
         let blocked_write = *fake.blocked_op.lock().unwrap() == format!("write:{op}");
         if blocked_write {
             std::future::pending::<()>().await;
@@ -2741,7 +2782,8 @@ mod ble_close_lock_tests {
             match op {
                 "wifi_active" => { reply["revision"] = json!(1); },
                 "wifi_match" => {reply["network_id"]=json!("home");reply["version"]=json!(2);
-                    reply["matches"]=json!(true);reply["connected"]=json!(true);},
+                    reply["matches"]=json!(true);reply["connected"]=json!(true);
+                    for (key,value) in fake.wifi_match_reply.lock().unwrap().as_object().unwrap() {reply[key]=value.clone();}},
                 "wifi_status" => {
                     // A paged status read can outlive the original short exchange.
                     if fake.rf_initial_ms.load(Ordering::SeqCst) > 0 {tokio::time::sleep(Duration::from_millis(450)).await;}
@@ -2850,7 +2892,7 @@ mod ble_close_lock_tests {
             omit_free_owner: AtomicBool::new(false),
             claim_owner: Mutex::new(String::new()),
             claim_rejected: AtomicBool::new(false), lost_plan: AtomicBool::new(false), lost_network_start: AtomicBool::new(false),
-            applied_plan: AtomicU64::new(0), apply_plan: AtomicBool::new(true), network_started: AtomicBool::new(false), sync_opened: AtomicBool::new(false), blocked_op: Mutex::new(String::new()),
+            applied_plan: AtomicU64::new(0), apply_plan: AtomicBool::new(true), network_started: AtomicBool::new(false), sync_opened: AtomicBool::new(false), blocked_op: Mutex::new(String::new()), wifi_match_write_delay_ms: AtomicU64::new(0), wifi_match_reply: Mutex::new(json!({})),
             rf_initial_ms: AtomicU64::new(0), rf_after_plan_ms: AtomicU64::new(0), rf_epoch: Mutex::new(std::time::Instant::now()),
             sync_due,
             provisional_remaining_s: AtomicU64::new(0),
@@ -2864,6 +2906,8 @@ mod ble_close_lock_tests {
         });
         let app = Router::new()
             .route("/sim/ble/info", get(info))
+            .route("/sim/ble/discover", post(|| async {Json(json!({"connected":true,"generation":1}))}))
+            .route("/sim/ble/device", get(|| async {Json(json!({"connected":true,"generation":1,"close_callback":true}))}))
             .route("/sim/ble/endpoint", post(endpoint))
             .route("/sim/ble/token", post(token))
             .route("/sim/ble/fragment", post(fragment))
@@ -4123,6 +4167,154 @@ mod ble_close_lock_tests {
             assert_eq!(after.snapshot.unwrap().snapshot_id, "cached-choice");
             assert_eq!(svc.coordinator_summary(HUNG_MAC, device_now(HUNG_MAC)).unwrap()["plan"], plan_before);
             assert!(crate::wifi::action(&ctx, HUNG_MAC, op, body).await.is_err()); // local revision changed
+        }
+    }
+
+    #[tokio::test(flavor="multi_thread",worker_threads=4)]
+    async fn wifi_prepare_slow_write_uses_carrier_budget_and_next_native_cycle_recovers() {
+        let _serial=SIM_ENV.lock().unwrap_or_else(|p|p.into_inner());
+        let dir=tempfile::tempdir().unwrap();
+        let (ble,url)=start_fake_ble_with(HUNG_MAC,false,true,Arc::new(Mutex::new(Vec::new()))).await;
+        ble.protocol.store(true,Ordering::SeqCst);
+        ble.wifi_match_write_delay_ms.store(900,Ordering::SeqCst);
+        let (_http,ip,server)=start_full_http(ble.clone(),"bridge-lock-repro").await;
+        let ctx=test_ctx_with_ip(dir.path(),HUNG_MAC,&ip);
+        let svc=service(&ctx);
+        svc.wifi_save(HUNG_MAC,0,serde_json::from_value(json!([
+            {"network_id":"home","host_ssid":"Host","ssid":"Device","credential":"open"}
+        ])).unwrap(),device_now(HUNG_MAC)).unwrap();
+        bridge_mcp::save_device_token_at(dir.path(),HUNG_MAC,&"a".repeat(32)).unwrap();
+        queue_read_job(&ctx,HUNG_MAC);
+        // Also exercise the native radio lease: a cancelled write quarantines
+        // this lease even when the device confirms disconnect immediately.
+        std::env::set_var("CODEX_STATUS_SIM_BLE_ENDPOINTS",json!({HUNG_MAC:url}).to_string());
+        std::env::set_var("CODEX_STATUS_SIM_BLE_LIFECYCLE","1");
+        std::env::set_var("CODEX_STATUS_TEST_HOST_WIFI",json!({"state":"connected","networks":[{"ssid":"Host"}]}).to_string());
+        let first=ble_cycle(&ctx,&[HUNG_MAC.into()]).await;
+        let second=ble_cycle(&ctx,&[HUNG_MAC.into()]).await;
+        std::env::remove_var("CODEX_STATUS_SIM_BLE_ENDPOINTS");
+        std::env::remove_var("CODEX_STATUS_SIM_BLE_LIFECYCLE");
+        std::env::remove_var("CODEX_STATUS_TEST_HOST_WIFI");server.abort();
+        for result in [first,second] {
+            assert!(matches!(result,Ok(BleOpportunity::Connected { result:Ok(()),.. })),"{result:?} ops={:?}",command_ops(&ble));
+        }
+        let ops=command_ops(&ble);
+        assert!(ops.iter().position(|op|op=="wifi_match").unwrap()<ops.iter().position(|op|op=="plan").unwrap());
+        assert_eq!(ops.iter().filter(|op|*op=="plan").count(),2);
+        assert_eq!(ble.closes.load(Ordering::SeqCst),2);
+        assert!(ble.network_started.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor="multi_thread",worker_threads=4)]
+    async fn wifi_prepare_unknown_result_stops_before_plan_and_keeps_original_failure() {
+        let _serial=SIM_ENV.lock().unwrap_or_else(|p|p.into_inner());
+        for blocked in ["wifi_match","write:wifi_match"] {
+            let dir=tempfile::tempdir().unwrap();
+            let (ble,url)=start_fake_ble_with(HUNG_MAC,false,true,Arc::new(Mutex::new(Vec::new()))).await;
+            ble.protocol.store(true,Ordering::SeqCst);
+            ble.rf_initial_ms.store(1400,Ordering::SeqCst);
+            *ble.blocked_op.lock().unwrap()=blocked.into();
+            let ctx=test_ctx(dir.path(),&[HUNG_MAC]);
+            service(&ctx).wifi_save(HUNG_MAC,0,serde_json::from_value(json!([
+                {"network_id":"home","host_ssid":"Host","ssid":"Device","credential":"open"}
+            ])).unwrap(),device_now(HUNG_MAC)).unwrap();
+            std::env::set_var("CODEX_STATUS_SIM_BLE_ENDPOINTS",json!({HUNG_MAC:url}).to_string());
+            std::env::set_var("CODEX_STATUS_TEST_HOST_WIFI",json!({"state":"connected","networks":[{"ssid":"Host"}]}).to_string());
+            let started=std::time::Instant::now();
+            let result=ble_cycle(&ctx,&[HUNG_MAC.into()]).await;
+            std::env::remove_var("CODEX_STATUS_SIM_BLE_ENDPOINTS");
+            std::env::remove_var("CODEX_STATUS_TEST_HOST_WIFI");
+            assert!(matches!(result,Ok(BleOpportunity::Connected { result:Err(ref e),.. }) if e=="result_unknown"),"{blocked}: {result:?}");
+            assert!(started.elapsed()<Duration::from_secs(4));
+            let ops=command_ops(&ble);
+            assert_eq!(ops.last().map(String::as_str),Some("wifi_match"),"{blocked}: {ops:?}");
+            assert_eq!(ble.closes.load(Ordering::SeqCst),1);
+            assert!(ctx.device_delivery.try_lock().is_ok());
+            assert!(delivery_lock(&ctx,HUNG_MAC).try_lock().is_ok());
+        }
+    }
+
+    #[tokio::test(flavor="multi_thread",worker_threads=4)]
+    async fn existing_active_network_reconnects_without_replaying_unknown_history() {
+        let _serial=SIM_ENV.lock().unwrap_or_else(|p|p.into_inner());
+        let dir=tempfile::tempdir().unwrap();
+        let (ble,url)=start_fake_ble_with(HUNG_MAC,false,true,Arc::new(Mutex::new(Vec::new()))).await;
+        ble.protocol.store(true,Ordering::SeqCst);
+        *ble.wifi_match_reply.lock().unwrap()=json!({"active":true,"connected":false,"stage":"saved"});
+        let (http,ip,server)=start_full_http(ble.clone(),"bridge-lock-repro").await;
+        let ctx=test_ctx_with_ip(dir.path(),HUNG_MAC,&ip);let svc=service(&ctx);let now=device_now(HUNG_MAC);
+        svc.wifi_save(HUNG_MAC,0,serde_json::from_value(json!([
+            {"network_id":"home","host_ssid":"Host","ssid":"Device","credential":"open","version":2}
+        ])).unwrap(),now).unwrap();
+        bridge_mcp::save_device_token_at(dir.path(),HUNG_MAC,&"a".repeat(32)).unwrap();
+        let job=svc.wifi_queue_control(HUNG_MAC,&ctx.bridge_id,"activate",json!({"network_id":"home","version":2}),now).unwrap();
+        svc.wifi_mark_sent(HUNG_MAC,&job.job_id,now).unwrap();
+        svc.wifi_finish(HUNG_MAC,&job.job_id,"cancelled",Some("transaction_identity_unknown"),now).unwrap();
+        // Keep the same fence that rejects true conflicting writes.
+        assert!(svc.wifi_queue_control(HUNG_MAC,&ctx.bridge_id,"activate",json!({"network_id":"home","version":3}),now).unwrap_err().to_string().contains("wifi_confirmation_pending"));
+        let history=serde_json::to_value(&svc.wifi_state(HUNG_MAC).jobs).unwrap();
+        // Reproduce the stale local error inherited by later wifi_match replies.
+        let mut connection:bridge_core::platform::wifi::Connection=serde_json::from_value(json!({
+            "host_ssid":"Host","network_id":"home","local_revision":1,"version":2,
+            "state":"waiting_for_window","error":"wifi_confirmation_pending","reason":0,"observed_at":now,
+            "attempts":0,"next_attempt_at":0})).unwrap();
+        svc.wifi_note_connection(HUNG_MAC,connection.clone()).unwrap();
+        std::env::set_var("CODEX_STATUS_SIM_BLE_ENDPOINTS",json!({HUNG_MAC:url}).to_string());
+        std::env::set_var("CODEX_STATUS_TEST_HOST_WIFI",json!({"state":"connected","networks":[{"ssid":"Host"}]}).to_string());
+        let mut results=Vec::new();
+        for _ in 0..2 {
+            // Lose the carrier again while preserving the same configuration
+            // and unresolved historical result, then take another real cycle.
+            ble.network_started.store(false,Ordering::SeqCst);
+            http.complete.store(false,Ordering::SeqCst);
+            queue_read_job(&ctx,HUNG_MAC);
+            results.push(ble_cycle(&ctx,&[HUNG_MAC.into()]).await);
+        }
+        std::env::remove_var("CODEX_STATUS_SIM_BLE_ENDPOINTS");std::env::remove_var("CODEX_STATUS_TEST_HOST_WIFI");server.abort();
+        for result in results {
+            assert!(matches!(result,Ok(BleOpportunity::Connected {result:Ok(()),..})),"{result:?} ops={:?}",command_ops(&ble));
+        }
+        assert_eq!(command_ops(&ble).iter().filter(|op|*op=="network_start").count(),2);
+        assert!(ble.network_started.load(Ordering::SeqCst));assert!(http.pages.load(Ordering::SeqCst)>1);
+        let after=svc.wifi_state(HUNG_MAC);assert_eq!(after.jobs.len(),history.as_array().unwrap().len()+2);
+        assert_eq!(serde_json::to_value(&after.jobs[..1]).unwrap(),history,"unknown historical submission must remain unchanged");
+        assert!(!command_ops(&ble).iter().any(|op|matches!(op.as_str(),"wifi_activate"|"wifi_save"|"wifi_apply"|"wifi_trial")));
+        connection=after.connection.unwrap();assert!(connection.http_ready);assert_eq!(connection.error,None);
+    }
+
+    #[tokio::test(flavor="multi_thread",worker_threads=4)]
+    async fn historical_unknown_submission_still_blocks_network_switch_or_configuration_change() {
+        let _serial=SIM_ENV.lock().unwrap_or_else(|p|p.into_inner());
+        for (label,reply,credential) in [
+            ("inactive",json!({"active":false,"connected":false,"stage":"saved"}),"keep"),
+            ("active_unknown",json!({"connected":false,"stage":"saved"}),"keep"),
+            ("metadata",json!({"active":true,"connected":false,"matches":false,"stage":"saved"}),"keep"),
+            ("version_unknown",json!({"active":true,"version":0,"connected":false,"stage":"saved"}),"keep"),
+            ("authentication",json!({"active":true,"connected":false,"stage":"failed","error":"authentication_failed"}),"keep"),
+            ("password",json!({"active":true,"connected":false,"stage":"saved"}),"replace")
+        ] {
+            let dir=tempfile::tempdir().unwrap();let (ble,url)=start_fake_ble(HUNG_MAC,false).await;
+            ble.protocol.store(true,Ordering::SeqCst);*ble.wifi_match_reply.lock().unwrap()=reply;
+            let ctx=test_ctx(dir.path(),&[HUNG_MAC]);let svc=service(&ctx);let now=device_now(HUNG_MAC);
+            svc.wifi_save(HUNG_MAC,0,serde_json::from_value(json!([
+                {"network_id":"home","host_ssid":"Host","ssid":"Device","credential":credential,"password":"synthetic-password","version":2}
+            ])).unwrap(),now).unwrap();
+            let old=now.saturating_sub(172800);
+            let job=svc.wifi_queue_control(HUNG_MAC,&ctx.bridge_id,"activate",json!({"network_id":"home","version":2}),old).unwrap();
+            svc.wifi_mark_sent(HUNG_MAC,&job.job_id,old).unwrap();svc.wifi_expire(HUNG_MAC,now).unwrap();
+            let before=serde_json::to_value(svc.wifi_state(HUNG_MAC)).unwrap();
+            std::env::set_var("CODEX_STATUS_SIM_BLE_ENDPOINTS",json!({HUNG_MAC:url}).to_string());
+            std::env::set_var("CODEX_STATUS_TEST_HOST_WIFI",json!({"state":"connected","networks":[{"ssid":"Host"}]}).to_string());
+            let mut link=bridge_ble::DeviceConnection::connect(HUNG_MAC,TOKEN,&ctx.bridge_id).await.unwrap().unwrap();
+            link.command("status",json!({})).await.unwrap();
+            let result=crate::wifi::automatic_on_link(&ctx,HUNG_MAC,&mut link,bridge_core::rendezvous::Budget::new(Duration::from_secs(3)),false).await;
+            link.close_bounded(Duration::from_millis(100)).await;
+            std::env::remove_var("CODEX_STATUS_SIM_BLE_ENDPOINTS");std::env::remove_var("CODEX_STATUS_TEST_HOST_WIFI");
+            let expected=if label=="authentication" {"authentication_failed"} else {"wifi_confirmation_pending"};
+            assert_eq!(result,Err(expected.into()),"{label}");
+            let after=serde_json::to_value(svc.wifi_state(HUNG_MAC)).unwrap();
+            assert_eq!(after["jobs"],before["jobs"],"{label}");assert_eq!(after["targets"],before["targets"],"{label}");
+            assert!(!command_ops(&ble).iter().any(|op|matches!(op.as_str(),"wifi_activate"|"wifi_save"|"network_start")),"{label}");
         }
     }
 

@@ -13,7 +13,7 @@ esac
 app_root="${CODEX_STATUS_APP_OUTPUT:-$build_root/Codex Status Bridge.app}"
 : "${CODEX_STATUS_ARDUINOJSON:?Set CODEX_STATUS_ARDUINOJSON to a pinned ArduinoJson src directory}"
 cd "$repo_root/bridge"
-cargo build --locked -p bridge-app --target-dir "$target_root" "${build_args[@]}"
+cargo build --locked -p bridge-app --target-dir "$target_root" ${build_args[@]+"${build_args[@]}"}
 python3 - "$repo_root" "$target_root/$profile" "$app_root" <<'PY'
 import pathlib, plistlib, shutil, sys
 repo, target, app = map(pathlib.Path, sys.argv[1:])

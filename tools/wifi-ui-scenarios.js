@@ -207,6 +207,7 @@ window.__wifiUiScenario = async function(scenario) {
     check($(scenario==='waiting'?'wifi-current-jobs':'wifi-jobs').textContent.includes(scenario === 'waiting' ? '等待设备可用通道' : '不支持'),'Missing task/error state');
     const taskText=$(scenario==='waiting'?'wifi-current-jobs':'wifi-jobs').textContent;
     check(taskText.includes('创建时间 '+wifiCreatedTime(1791121712)),'Task creation timestamp missing');
+    check(taskText.includes('fixture-job'),'Task ID missing from current/history row');
     check(!$('wifi-job-history').open,'Execution history must default to collapsed');
     if(scenario==='error')$('wifi-job-history').open=true;
   }

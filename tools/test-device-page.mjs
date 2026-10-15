@@ -224,7 +224,7 @@ run("wifiState.jobs.push({job_id:'done',kind:'read',state:'completed',device_mac
 assert.match(element('wifi-jobs').innerHTML,/创建时间 时间未记录/);assert.match(element('wifi-jobs').innerHTML,/完成/);assert(!element('wifi-current-jobs').innerHTML.includes('done'));assert.equal(element('wifi-job-history').open,false);
 let finishWifi;handlers.platform_wifi=({op})=>op==='get'?new Promise(resolve=>{finishWifi=resolve}):{wifi,differences:[difference]};
 const oldRead=run('wifiReadScheme()');select(macB);finishWifi({job_id:'old',device_mac:macA,state:'completed'});await oldRead;
-assert.equal(element('wifi-result').textContent,'等待操作');assert.equal(element('wifi-password').value,'');
+assert.equal(element('wifi-result').textContent,'操作结果将在此显示');assert.equal(element('wifi-password').value,'');
 assert(!calls.some(c=>c.name==='platform_publish'));
 const tabCalls=calls.length;
 element('wifi-id').value='unsaved-editor';
@@ -414,3 +414,34 @@ run(`wifiShowResult({outcome:'rejected',stage:'persist',error:'storage',action:'
 assert.match(element('wifi-result').textContent,/设备登记失败.*保存设备登记.*离线迁移/);
 run(`wifiShowResult({outcome:'unknown',stage:'ack',error:'window_budget_exhausted',action:'read_registration_before_retry'})`);
 assert.match(element('wifi-result').textContent,/设备登记结果未知.*确认登记结果.*请勿重复提交/);
+
+run(`platformDevices=[{device_mac:'0200000000A1',name:'screen',model:'Note4',status:'最近已认证',attention:['firmware_upgrade']}];renderRegisteredDevices('0200000000A1')`);
+assert.match(element('registered-devices').innerHTML,/有可用固件升级/);
+assert.doesNotMatch(element('registered-devices').innerHTML,/待处理 1 项/);
+run(`wifiState.jobs=[{job_id:'visible-job-id',device_mac:'0200000000A1',kind:'read',state:'waiting_rendezvous',created_at:1}];wifiRenderJobs()`);
+assert.match(element('wifi-current-jobs').innerHTML,/visible-job-id/);
+assert(html.includes('操作结果将在此显示'));
+
+// Local second ticks reuse one sample, never invoke IPC, and cannot leak another device's state.
+assert(script.includes('setInterval(wifiTickOnline, 1000)'));
+deviceTabOn=true;
+run(`globalThis.countdownNow=2000000;Date.now=()=>countdownNow;wifiRenderOnline({observed_at:2000,presence:{mode:'window',remaining_ms:112000,reasons:['bridge']}})`);
+assert.match(element('wifi-online').textContent,/剩余 112 秒/);
+const countdownCalls=calls.length;
+run('countdownNow+=1000;wifiTickOnline()');
+assert.match(element('wifi-online').textContent,/剩余 111 秒/);
+run('countdownNow+=5000;wifiTickOnline()');
+assert.match(element('wifi-online').textContent,/剩余 106 秒/);
+assert.equal(calls.length,countdownCalls);
+run('countdownNow+=25000;wifiTickOnline()');
+assert.match(element('wifi-online').textContent,/在线状态待确认/);
+run('clearDeviceView();wifiTickOnline()');
+assert.equal(element('wifi-online').textContent,'等待认证在线状态');
+run(`wifiRenderOnline({observed_at:countdownNow/1000-5,presence:{mode:'window',remaining_ms:1000,reasons:['bridge']}});wifiTickOnline()`);
+assert.match(element('wifi-online').textContent,/窗口已结束 \/ 预计休眠/);
+assert.doesNotMatch(element('wifi-online').textContent,/剩余 -/);
+run('document.hidden=true;wifiRenderOnline(null);wifiOnlineStatus={observed_at:countdownNow/1000,presence:{mode:"continuous",reasons:["usb"]}};wifiTickOnline()');
+assert.equal(element('wifi-online').textContent,'等待认证在线状态');
+run('document.hidden=false;wifiTickOnline()');
+assert.match(element('wifi-online').textContent,/USB 常驻在线/);
+console.log('Local countdown: second ticks, elapsed-time correction, stale/zero/reset/hidden guards, zero IPC OK');

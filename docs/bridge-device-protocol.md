@@ -75,6 +75,8 @@ Codex app-server → Bridge 的 JSON-RPC、UI IPC、Bridge MCP 不属于本协�
 | Diagnostic Sync | 冻结 batch、分页、ACK/complete | begin/page/ack/complete 全程绑定批次；不能将本地归档冒充设备确认 |
 | Firmware OTA | 冻结镜像与作业、身份/target/版本/长度/hash 预检 | 上传 ACK 不代表部署成功；重启后的认证运行镜像 SHA256 匹配才是 `image_verified` |
 
+Wi-Fi运行恢复与配置提交分开：认证`wifi_match`确认内容匹配、`active=true`及有效版本，且无密码替换意图时，Bridge可使用已确认PowerPlan的`network_start`重连当前配置，不新建activate作业。历史未确认提交仍阻挡配置变更及网络切换；不因恢复连接清除原事务或伪造确认。
+
 Profile 包含 1–8 个有序模板，全部参与设备按键循环。Bridge 保存模板/Profile 只落盘；发布冻结完整 Bundle，是用户显式动作。现行发布不是 manifest 增量协议，也不能裁剪成旧 3 槽。
 
 ### 4.1 Data 与电源的幂等
