@@ -1344,31 +1344,46 @@ impl DeviceConnection {
 
     /// Read token responses as attributes too: lost notification is not lost ACK.
     pub async fn request_device_token(&self) -> Result<String> {
-        if !self.auth_ready { bail!("BLE device link is not encrypted and bonded"); }
         let deadline = self.command_deadline();
-        if tokio::time::Instant::now() >= deadline { bail!("device BLE RF window expired before auth"); }
-        let status = self.peripheral.as_ref().and_then(|p| p.characteristics().into_iter().find(|c| c.uuid == Pusher::uuid(CHR_STATUS)));
-        self.control_write_until(deadline, async {
-            if let Some(url) = &self.fake_url {
-                reqwest::Client::new().post(format!("{url}/sim/ble/token"))
-                    .header("x-sim-ble-generation", self.info["_sim_generation"].as_u64().unwrap().to_string())
-                    .bearer_auth(&self.token).body(br#"{"cmd":"token"}"#.to_vec())
-                    .send().await?.error_for_status()?;
-            } else { Pusher::write_json(self.peripheral.as_ref().unwrap(), CHR_AUTH, br#"{"cmd":"token"}"#).await?; }
-            Ok::<(), anyhow::Error>(())
-        }).await.context("device BLE auth write failed")?;
-        loop {
-            let raw = tokio::time::timeout_at(deadline, self.read_attribute(status.as_ref())).await??;
-            if let Ok(reply) = decode_wire(&raw) {
-                if reply["ack"] == "auth" && reply["ok"] == true {
-                    let token = reply["token"].as_str().context("invalid BLE token response")?;
-                    // Fake seeds are explicit test credentials; real tokens remain hex.
-                    if self.fake_url.is_none() && !Pusher::valid_device_token(token) { bail!("invalid BLE token response"); }
-                    return Ok(token.to_owned());
-                }
-            }
-            tokio::time::sleep_until((tokio::time::Instant::now() + Duration::from_millis(20)).min(deadline)).await;
+        let started=Instant::now();
+        if self.write_uncertain.load(Ordering::Acquire) || self.endpoint_unconfirmed.load(Ordering::Acquire) {
+            return Err(self.command_failure("token","token",bridge_core::rendezvous::DispatchOutcome::NotSent,
+                "before_write","previous_write_unknown",deadline,Duration::ZERO).into());
         }
+        let mut sent = false;
+        let result = async {
+            if !self.auth_ready { bail!("BLE device link is not encrypted and bonded"); }
+            if tokio::time::Instant::now() >= deadline { bail!("device BLE RF window expired before auth"); }
+            let status = self.peripheral.as_ref().and_then(|p| p.characteristics().into_iter().find(|c| c.uuid == Pusher::uuid(CHR_STATUS)));
+            self.control_write_until(deadline, async {
+                if let Some(url) = &self.fake_url {
+                    reqwest::Client::new().post(format!("{url}/sim/ble/token"))
+                        .header("x-sim-ble-generation", self.info["_sim_generation"].as_u64().unwrap().to_string())
+                        .bearer_auth(&self.token).body(br#"{"cmd":"token"}"#.to_vec())
+                        .send().await?.error_for_status()?;
+                } else { Pusher::write_json(self.peripheral.as_ref().unwrap(), CHR_AUTH, br#"{"cmd":"token"}"#).await?; }
+                Ok::<(), anyhow::Error>(())
+            }).await.context("device BLE auth write failed")?;
+            sent = true;
+            loop {
+                let raw = tokio::time::timeout_at(deadline, self.read_attribute(status.as_ref())).await??;
+                if let Ok(reply) = decode_wire(&raw) {
+                    if reply["ack"] == "auth" && reply["ok"] == true {
+                        let token = reply["token"].as_str().context("invalid BLE token response")?;
+                        // Fake seeds are explicit test credentials; real tokens remain hex.
+                        if self.fake_url.is_none() && !Pusher::valid_device_token(token) { bail!("invalid BLE token response"); }
+                        return Ok(token.to_owned());
+                    }
+                }
+                tokio::time::sleep_until((tokio::time::Instant::now() + Duration::from_millis(20)).min(deadline)).await;
+            }
+        }.await;
+        result.map_err(|error: anyhow::Error| {
+            use bridge_core::rendezvous::DispatchOutcome;
+            let outcome = if self.write_uncertain.load(Ordering::Acquire) { DispatchOutcome::WriteUnknown }
+                else if sent { DispatchOutcome::AckUnknown } else { DispatchOutcome::NotSent };
+            error.context(self.command_failure("token", "token", outcome, "auth", "token_exchange_failed", deadline, started.elapsed()))
+        })
     }
 
     pub async fn command(
@@ -1376,13 +1391,17 @@ impl DeviceConnection {
         op: &str,
         body: serde_json::Value,
     ) -> Result<serde_json::Value> {
+        self.command_budget(op, body, Duration::from_secs(5)).await
+    }
+
+    pub async fn command_budget(&mut self, op: &str, body: serde_json::Value, limit: Duration) -> Result<serde_json::Value> {
         let id = format!(
             "r{:x}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_nanos()
         );
-        self.command_with_id(op, body, &id).await
+        self.command_with_id_budget(op, body, &id, limit).await
     }
 
     pub async fn command_with_id(&mut self, op: &str, body: serde_json::Value, id: &str) -> Result<serde_json::Value> {
@@ -1413,8 +1432,8 @@ impl DeviceConnection {
         if op.starts_with("wifi_") && self.nonce.is_empty() {
             // Obtain the ordinary session before a configuration command.
             // Physical rescue still works if endpoint auth has not been set up.
-            let _ = Box::pin(self.command_with_id_budget("status", json!({}), "session",
-                deadline.saturating_duration_since(tokio::time::Instant::now()))).await;
+            Box::pin(self.command_with_id_budget("status", json!({}), "session",
+                deadline.saturating_duration_since(tokio::time::Instant::now()))).await?;
         }
         body["op"] = json!(op);
         body["request_id"] = json!(id);
@@ -1619,12 +1638,16 @@ impl DeviceConnection {
     /// ATT values are limited to 512 bytes. Read frozen Wi-Fi summaries through
     /// bounded hex pages on the existing Status attribute, without a new GATT table.
     pub async fn wifi_read(&mut self, op: &str) -> Result<serde_json::Value> {
+        self.wifi_read_budget(op, bridge_core::rendezvous::Budget::new(Duration::from_secs(30))).await
+    }
+
+    pub async fn wifi_read_budget(&mut self, op: &str, budget: bridge_core::rendezvous::Budget) -> Result<serde_json::Value> {
         if !matches!(op, "wifi_scheme_get" | "wifi_capabilities" | "wifi_status") { bail!("invalid Wi-Fi read"); }
         let mut body = json!({"offset":0});
         let mut bytes = Vec::new();
         let mut snapshot = None;
         loop {
-            let reply = self.command(op, body).await?;
+            let reply = self.command_budget(op, body, budget.remaining()).await?;
             if reply["ok"] != true { bail!("Wi-Fi summary read rejected"); }
             let total = reply["total"].as_u64().context("Wi-Fi summary total")? as usize;
             let next = reply["next_offset"].as_u64().context("Wi-Fi summary offset")? as usize;
@@ -1644,9 +1667,13 @@ impl DeviceConnection {
 
     /// Same frozen snapshot used by HTTP, carried in bounded GATT replies.
     pub async fn wifi_snapshot(&mut self) -> Result<serde_json::Value> {
+        self.wifi_snapshot_budget(bridge_core::rendezvous::Budget::new(Duration::from_secs(30))).await
+    }
+
+    pub async fn wifi_snapshot_budget(&mut self, budget: bridge_core::rendezvous::Budget) -> Result<serde_json::Value> {
         let mut offset=0usize;let mut snapshot=String::new();let mut revision=None;let mut total=None;let mut text=String::new();
         loop {
-            let reply=self.command("wifi_snapshot",json!({"offset":offset,"snapshot_id":snapshot})).await?;
+            let reply=self.command_budget("wifi_snapshot",json!({"offset":offset,"snapshot_id":snapshot}),budget.remaining()).await?;
             if reply["ok"]!=true {bail!("{}",reply["error"].as_str().unwrap_or("wifi_snapshot_rejected"));}
             let id=reply["snapshot_id"].as_str().context("wifi_snapshot_id")?;
             let rev=reply["revision"].as_u64().context("wifi_revision")?;

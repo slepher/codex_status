@@ -677,6 +677,7 @@ static bool clkBlitString(uint8_t *buf, const char *s) {
 bool clockTickWake() {
     if (!retained.clkR.valid || !panelThinReady) return false;
     if (!clock::timeKnown()) return false;
+    if (!minuteClockDue(time(nullptr), retained.displayedMinute)) return true;
     const uint64_t t0 = esp_timer_get_time();
     const size_t n = (size_t)retained.clkR.bw * retained.clkR.rows;
     static uint8_t buf[CLK_MAX_BYTES];
@@ -723,8 +724,14 @@ bool clockTickWake() {
         DevLog.println("[clk] window write failed; full refresh required");
         return false;
     }
+    retained.displayedMinute = nowSec / 60;
     memcpy(clkPixels, buf, n);
     retained.clkPixelsValid = true;
+    if (state.epdBaselineTrusted && state.lastDisplayedFrame) {
+        for (int row = 0; row < retained.clkR.rows; ++row)
+            memcpy(state.lastDisplayedFrame + (retained.clkR.y0 + row) * (EPD_W / 8) + retained.clkR.x0b,
+                   buf + row * retained.clkR.bw, retained.clkR.bw);
+    }
     state.epdAsleep = false;
     epdPanelSleep();
     diagnostics::state.bootRenderCount++;
@@ -738,6 +745,25 @@ bool clockTickWake() {
                   (unsigned)(t1 - t0), (unsigned)(t2 - t1), (unsigned)(t3 - t2),
                   (unsigned)(t4 - t3), (unsigned)(t4 - t0));
     return true;
+}
+
+// Called before network work on the single display-owning loop. No RF/Plan
+// deadline is moved to make room for this write.
+void serviceMinuteClock() {
+    if (!platform::state.activeTplHasNow || platform::state.bundleMaintenance) return;
+    static uint64_t checkAt = 0;
+    const uint64_t now = clock::v2NowMs();
+    if (now < checkAt) return;
+    checkAt = now + 1000; // 1 Hz wall reads and bounded retry on panel failure
+    if (!minuteClockDue(time(nullptr), retained.displayedMinute)) return;
+#ifdef CODEX_CLK_WINDOW_TEST
+    clkTestTick();
+#else
+    if (state.epdPartialCount >= 30) {
+        state.forceCleanRefresh = true;
+        renderCurrent();
+    } else if (!clockTickWake()) renderCurrent();
+#endif
 }
 
 #ifdef CODEX_CLK_WINDOW_TEST
@@ -879,7 +905,10 @@ void renderActiveUsage(const String &json, const char *channel) {
         else screenStatus();
         return;
     }
+    const time_t renderedEpoch = time(nullptr);
     TplEnv env;
+    env.hasNowEpoch = true;
+    env.nowEpochSecs = renderedEpoch;
     env.channel  = channel ? channel : "";
     env.ip       = radio::ipText();
     env.syncHHMM = clock::nowHHMM();
@@ -897,6 +926,9 @@ void renderActiveUsage(const String &json, const char *channel) {
         epdFlush(false);
         if (state.epdBaselineTrusted && state.lastDisplayedFrame &&
             memcmp(state.lastDisplayedFrame, state.frame, EPD_FB_BYTES) == 0) {
+            if (platform::state.activeTplHasNow && renderedEpoch > 1600000000)
+                retained.displayedMinute = renderedEpoch / 60;
+            else if (!platform::state.activeTplHasNow) retained.displayedMinute = -1;
             if (env.offlineMins >= 0) diagnostics::retained.rtcDeepGlyph |= 8;
             else diagnostics::retained.rtcDeepGlyph &= ~8;
         }

@@ -459,6 +459,7 @@ extern "C" {
         boot_id: u64, wake_cause: *const c_char) -> *mut std::ffi::c_void;
     fn codex_sim_bundle_free(p: *mut std::ffi::c_void);
     fn codex_sim_bundle_set_wall(p: *mut std::ffi::c_void, epoch_secs: i64) -> c_int;
+    fn codex_sim_clock_tick(p: *mut std::ffi::c_void, deep: c_int) -> c_int;
     fn codex_sim_bundle_display(p: *mut std::ffi::c_void, deep: c_int, wifi_up: c_int, contact: c_int) -> c_int;
     fn codex_sim_bundle_status(p: *mut std::ffi::c_void, out: *mut c_char, cap: c_int) -> c_int;
     fn codex_sim_bundle_frame(p: *mut std::ffi::c_void, out: *mut u8, cap: c_int) -> c_int;
@@ -719,6 +720,11 @@ impl SimulatorBundle {
     pub fn note_bridge_contact(&mut self) -> anyhow::Result<()> {
         anyhow::ensure!(unsafe { codex_sim_bundle_display(self.state, -1, -1, 1) } == 1,
             "simulator contact unavailable");
+        Ok(())
+    }
+    pub fn service_clock(&mut self, deep: bool) -> anyhow::Result<()> {
+        anyhow::ensure!(unsafe { codex_sim_clock_tick(self.state, deep as c_int) } == 1,
+            "simulator clock unavailable");
         Ok(())
     }
     pub fn display_state(&mut self, deep: bool, wifi_up: bool, contact: bool) -> anyhow::Result<()> {

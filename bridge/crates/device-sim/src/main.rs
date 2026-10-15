@@ -882,6 +882,18 @@ fn controlled_reboot(state: &SimState, now_ms: u64, cause: &str) -> Result<()> {
 }
 
 fn reconcile_power(state: &SimState, now_ms: u64) -> Result<SimPower> {
+    let power = reconcile_power_inner(state, now_ms)?;
+    // The local minute service runs even while HTTP is off or BLE is open.
+    // Rendering stays serialized by the existing Bundle mutex.
+    if let Some(clock) = clock_snapshot(state) {
+        let mut bundle = state.bundle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        bundle.set_wall_secs((clock.wall_ms / 1000) as i64)?;
+        bundle.service_clock(!power.light)?;
+    }
+    Ok(power)
+}
+
+fn reconcile_power_inner(state: &SimState, now_ms: u64) -> Result<SimPower> {
     let _serial = state.power_reconcile.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let configured = state.bundle.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1440,6 +1452,10 @@ async fn sim_state(State(state): State<SimState>, request: Request<Body>) -> Res
     drop(plan);
     let bundle = state.bundle.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
         .status().unwrap_or(serde_json::Value::Null);
+    let has_clock = bundle["data_contract"]["requirements"].as_array()
+        .is_some_and(|fields| fields.iter().any(|f| f["field"] == "device.now"));
+    let next_clock_ms = (has_clock && clock.wall_ms / 1000 > 1_600_000_000)
+        .then(|| clock.monotonic_ms.saturating_add(60_000 - clock.wall_ms % 60_000));
     let ota = state.ota.lock().unwrap_or_else(std::sync::PoisonError::into_inner).state_json();
     let sync = state.sync.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
         .status().unwrap_or(serde_json::Value::Null);
@@ -1452,6 +1468,7 @@ async fn sim_state(State(state): State<SimState>, request: Request<Body>) -> Res
         "uptime_ms": device_uptime_ms(&state, clock),
         "clock": clock.json(device_uptime_ms(&state, clock)),
         "clock_persistence": "instance_file",
+        "next_clock_ms": next_clock_ms,
         "owner": owner_json(owner.as_ref(), now_s),
         "bundle": bundle,
         "ota": ota,

@@ -38,6 +38,5 @@ uint64_t v2NowMs();
 String nowHHMM();
 String fmtEpoch(long long ts, const char *fmt);
 void restoreTimeFromRtc();
-uint32_t secsToNextMinute();
 
 } // namespace firmware::clock

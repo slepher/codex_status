@@ -304,3 +304,9 @@ BLE sync_open支持reason=data和正整数data_seq，绑定当前MAC/principal/s
 状态报告以power.plan_id/remaining_s说明正式计划，以sync.phase=WIFI_SYNC_ONCE、sync.remaining_ms及sync.data_pending_seq说明临时传输。设备临时运行mode可为light且正式remaining_s=0；不得据mode推断存在正式Light授权。协议载体仍为48 B frame和现有同步路由；模板canonical哈希、CompiledTemplate格式及字段绑定未改变。
 
 实施、测试和资源边界见[执行记录](../project-workflow/bridge-macos/sync-window-fix-20261011.md)。当前部署以PROGRESS为准，不能将.83候选写成已部署。
+
+### Bridge 预算与取消边界（2026-10-15）
+
+同一BLE阶段的token、自动恢复及Wi-Fi分页请求共用绝对截止；每条命令在carrier内取阶段剩余、单命令上限及认证RF截止最小值，业务外层不得用短timeout取消在途分片。首次token失败停止本轮；旧history只用一份有界诊断预算，不再嵌套500ms/2s/5s。NotSent、WriteUnknown、AckUnknown保留真实分类，真正未知写继续隔离，完整写后丢ACK不冒充部分写。
+
+HTTP快速就绪判断可读认证compact；需要sync窗口/data_contract的最终proof使用原总期限内的完整分页，不能周期性以3s重启全读或将单页200视为完成。claim身份预检、认证回退及socket发送共享原截止，后台worker排队不续期。宿主RPC与恢复GET的总预算覆盖锁/连接/发送/接收；取消半条RPC JSON后退役该stdin。实现与验收见 `project-workflow/bridge-macos/timeout-budget-followup-20261015.md`。

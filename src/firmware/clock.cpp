@@ -203,12 +203,5 @@ void restoreTimeFromRtc() {
     settimeofday(&tv, nullptr);
 }
 
-uint32_t secsToNextMinute() {
-    if (!timeKnown()) return 60;
-    time_t n = time(nullptr);
-    uint32_t s = (uint32_t)(60 - (n % 60));
-    if (s < 5) s += 60;   // keep a margin so ticks never double-fire
-    return s;
-}
 
 } // namespace firmware::clock

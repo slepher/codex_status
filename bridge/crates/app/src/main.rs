@@ -1520,12 +1520,13 @@ async fn post_claim_once(
     token: &str,
     force: bool,
     release: bool,
+    budget: bridge_core::rendezvous::Budget,
 ) -> Result<(reqwest::StatusCode, String), ClaimError> {
     let bridge_id = ctx.bridge_id.clone();
     let name = ctx.bridge_name.lock().unwrap().clone();
     let host = lan_ip();
     let port = ctx.config.port;
-    post_claim_to_endpoint(
+    post_claim_to_endpoint_budget(
         endpoint,
         target_mac,
         token,
@@ -1536,10 +1537,12 @@ async fn post_claim_once(
         port,
         force,
         release,
+        budget,
     )
     .await
 }
 
+#[cfg(test)]
 async fn post_claim_to_endpoint(
     endpoint: &str,
     target_mac: &str,
@@ -1552,6 +1555,23 @@ async fn post_claim_to_endpoint(
     force: bool,
     release: bool,
 ) -> Result<(reqwest::StatusCode, String), ClaimError> {
+    post_claim_to_endpoint_budget(endpoint,target_mac,claim_token,device_token,bridge_id,name,host,port,force,release,
+        bridge_core::rendezvous::Budget::new(Duration::from_secs(9))).await
+}
+
+async fn post_claim_to_endpoint_budget(
+    endpoint: &str,
+    target_mac: &str,
+    claim_token: &str,
+    device_token: &str,
+    bridge_id: &str,
+    name: &str,
+    host: &str,
+    port: u16,
+    force: bool,
+    release: bool,
+    budget: bridge_core::rendezvous::Budget,
+) -> Result<(reqwest::StatusCode, String), ClaimError> {
     let started = std::time::Instant::now();
     let expected_mac = bridge_core::platform::model::DeviceIdentity::normalized_mac(target_mac)
         .ok_or_else(|| ClaimError::Other("invalid target MAC; refusing claim".into()))?;
@@ -1559,8 +1579,9 @@ async fn post_claim_to_endpoint(
         "claim identity preflight");
     let endpoint = endpoint.to_string();
     let status_endpoint = endpoint.clone();
+    let preflight=budget.capped(Duration::from_secs(2));
     let status = tokio::task::spawn_blocking(move || {
-        bridge_core::device::fetch(&status_endpoint, Duration::from_secs(2))
+        bridge_core::device::fetch(&status_endpoint, preflight.remaining())
     })
     .await
     .map_err(|e| ClaimError::Other(format!("device identity check failed: {e}")))?;
@@ -1576,11 +1597,12 @@ async fn post_claim_to_endpoint(
                 operation = "/api/status", "using authenticated device status for claim identity");
             let device_endpoint = endpoint.clone();
             let device_token = device_token.to_owned();
+            let fallback=budget.capped(Duration::from_secs(2));
             let device_status = tokio::task::spawn_blocking(move || {
-                bridge_core::device_client::status(
+                bridge_core::device_client::status_compact(
                     &device_endpoint,
                     &device_token,
-                    Duration::from_secs(2),
+                    fallback.remaining(),
                 )
             })
             .await
@@ -1620,9 +1642,10 @@ async fn post_claim_to_endpoint(
     let endpoint_for_claim=endpoint.clone();
     let endpoint_token=device_token.to_owned();
     let operation_token=claim_token.to_owned();
+    let claim_budget=budget.capped(Duration::from_secs(5));
     let resp = match tokio::task::spawn_blocking(move ||
         bridge_core::device_client::claim(&endpoint_for_claim,&endpoint_token,
-            &operation_token,&claim,Duration::from_secs(5))).await {
+            &operation_token,&claim,claim_budget.remaining())).await {
         Ok(Ok(resp)) => resp,
         Err(error) => {
             tracing::warn!(event = "result", device_mac = %expected_mac, operation = "/claim",
@@ -1700,12 +1723,22 @@ async fn post_claim_for_mac(
     release: bool,
     mac: &str,
 ) -> Result<Option<Value>, ClaimError> {
+    post_claim_for_mac_budget(ctx,force,release,mac,bridge_core::rendezvous::Budget::new(Duration::from_secs(9))).await
+}
+
+async fn post_claim_for_mac_budget(
+    ctx: &AppCtx,
+    force: bool,
+    release: bool,
+    mac: &str,
+    budget: bridge_core::rendezvous::Budget,
+) -> Result<Option<Value>, ClaimError> {
     let endpoint = claim_endpoint_for_mac(ctx, mac)?;
     let cached = bridge_mcp::load_device_token(&mcp_config(ctx), mac);
     let Some(token) = cached else {
         return Err(ClaimError::Unauthorized);
     };
-    let (code, body) = post_claim_once(ctx, &endpoint, mac, &token, force, release).await?;
+    let (code, body) = post_claim_once(ctx, &endpoint, mac, &token, force, release, budget).await?;
     parse_claim_response(code, body)
 }
 
@@ -1736,7 +1769,7 @@ async fn post_claim_explicit_for_mac(
                 })?;
             let endpoint = claim_endpoint_for_mac(ctx, &mac)?;
             let (code, body) =
-                post_claim_once(ctx, &endpoint, &mac, &fresh, force, release).await?;
+                post_claim_once(ctx, &endpoint, &mac, &fresh, force, release, bridge_core::rendezvous::Budget::new(Duration::from_secs(9))).await?;
             parse_claim_response(code, body)
         }
         other => other,
@@ -3964,6 +3997,24 @@ mod claim_target_tests {
             }
         });
         (endpoint, worker)
+    }
+
+    #[tokio::test]
+    async fn claim_preflight_consumes_original_budget_and_cannot_send_late_claim() {
+        let listener=TcpListener::bind("127.0.0.1:0").unwrap();let endpoint=listener.local_addr().unwrap().to_string();
+        let worker=thread::spawn(move|| {
+            let (mut stream,_)=listener.accept().unwrap();let _=read_request(&mut stream);
+            thread::sleep(Duration::from_millis(180));
+            let body=r#"{"fw":"test","mac":"7C4FADB93408"}"#;
+            let _=write!(stream,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
+            drop(stream);listener.set_nonblocking(true).unwrap();
+            thread::sleep(Duration::from_millis(100));
+            assert!(matches!(listener.accept(),Err(e) if e.kind()==std::io::ErrorKind::WouldBlock));
+        });
+        let started=std::time::Instant::now();
+        let result=super::post_claim_to_endpoint_budget(&endpoint,"7C4FADB93408","claim-test","endpoint-test","bridge-test","test","127.0.0.1",8765,false,false,
+            bridge_core::rendezvous::Budget::new(Duration::from_millis(100))).await;
+        assert!(result.is_err());assert!(started.elapsed()<Duration::from_millis(300));worker.join().unwrap();
     }
 
     fn device_fallback_server(

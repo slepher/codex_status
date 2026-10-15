@@ -38,7 +38,7 @@ const bridgeStep = (mac, delta) => call(bridge, 'POST', '/sim/clock',
   { mac, op: 'step', delta_ms: delta });
 const bridgeRun = (mac, kind) => call(bridge, 'POST', '/sim/run', { mac, kind }, 120_000);
 
-function deadline(state) {
+function powerDeadline(state) {
   const power = state.power;
   if (power.mode === 'deep') return power.ble_window_until_ms ?? power.next_contact_ms;
   if (state.plan.accepted && state.plan.mode === 'light') {
@@ -46,6 +46,11 @@ function deadline(state) {
   }
   if (power.provisional) return power.boot_ms + 300_000;
   return power.safety_deadline_ms || null;
+}
+
+function deadline(state) {
+  const due = [powerDeadline(state), state.next_clock_ms].filter(x => x != null);
+  return due.length ? Math.min(...due) : null;
 }
 
 function eventTime(states, devices) {

@@ -1973,67 +1973,51 @@ pub enum BleOpportunity {
 }
 
 /// Pull completed wake records only after the normal rendezvous work has been
-/// acknowledged. The short budget keeps diagnostics from extending the wake
-/// window or changing the result of a healthy plan/data exchange.
+/// acknowledged. One diagnostic budget is capped by the admitted tail/RF
+/// window. Failures stop optional BLE work; confirmed Plan/Data receipts remain.
 async fn sync_wake_history(
     link: &mut bridge_ble::DeviceConnection,
     mac: &str,
     status: &Value,
-) {
+    budget: bridge_core::rendezvous::Budget,
+) -> Result<(), String> {
     let Some(generation) = status.get("wake_generation").and_then(Value::as_u64) else {
         // Older ROMs have no generation and therefore cannot be safely joined
         // to a durable Bridge stream.
-        return;
+        return Ok(());
     };
     let mut store = match wake_history::Store::open(mac, generation) {
         Ok(store) => store,
         Err(error) => {
             tracing::debug!(device_mac = %mac, wake_generation = generation, error = %error,
                 "wake history store unavailable");
-            return;
+            return Ok(());
         }
     };
     let now = device_now(&mac) as i64;
     if !store.due(now) {
-        return;
+        return Ok(());
     }
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     let mut pages = 0;
     loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let remaining = budget.remaining();
         if remaining.is_zero() || pages >= 16 {
             tracing::debug!(device_mac = %mac, wake_generation = generation,
                 cursor = store.cursor(), pages, "wake history sync budget exhausted");
-            return;
+            return Ok(());
         }
         pages += 1;
         let before = store.cursor();
-        let reply = match tokio::time::timeout(
-            remaining,
-            link.command(
-                "history",
-                json!({
-                    "since": before.min(u32::MAX as u64),
-                    "limit": wake_history::PAGE_LIMIT,
-                }),
-            ),
-        )
-        .await
-        {
-            Ok(Ok(reply)) => reply,
-            Ok(Err(error)) => {
-                if is_history_unsupported(&error.to_string()) {
-                    let _ = store.mark_unsupported();
-                }
-                tracing::debug!(device_mac = %mac, wake_generation = generation, error = %error,
-                    "wake history sync skipped");
-                return;
-            }
-            Err(_) => {
-                tracing::debug!(device_mac = %mac, wake_generation = generation,
-                    cursor = before, "wake history sync timed out");
-                return;
+        let reply = match link.command_budget("history", json!({
+            "since":before.min(u32::MAX as u64),"limit":wake_history::PAGE_LIMIT,
+        }), remaining).await {
+            Ok(reply) => reply,
+            Err(error) => {
+                if is_history_unsupported(&error.to_string()) { let _=store.mark_unsupported();return Ok(()); }
+                let code=bridge_core::rendezvous::wifi_error(&error).1;
+                tracing::debug!(device_mac=mac,error_category=code,"wake history sync ended");
+                return Err(code.to_owned());
             }
         };
         if is_history_unsupported(
@@ -2048,31 +2032,31 @@ async fn sync_wake_history(
                 .unwrap_or_default(),
         ) {
             let _ = store.mark_unsupported();
-            return;
+            return Ok(());
         }
         if reply.get("wake_generation").and_then(Value::as_u64) != Some(generation) {
             tracing::debug!(device_mac = %mac, wake_generation = generation,
                 "wake history generation mismatch");
-            return;
+            return Ok(());
         }
         let progress = match store.append_page(&reply, device_now(&mac) as i64) {
             Ok(progress) => progress,
             Err(error) => {
                 tracing::debug!(device_mac = %mac, wake_generation = generation, error = %error,
                     "wake history page rejected");
-                return;
+                return Ok(());
             }
         };
         if progress.more && progress.received == 0 && progress.cursor <= before {
             tracing::debug!(device_mac = %mac, wake_generation = generation,
                 cursor = before, "wake history page made no progress");
-            return;
+            return Ok(());
         }
         if !progress.more {
             tracing::info!(event = "wake_history_sync", device_mac = %mac,
                 wake_generation = generation, records = progress.received,
                 cursor = progress.cursor, pages, "wake history synchronized");
-            return;
+            return Ok(());
         }
     }
 }
@@ -2094,21 +2078,16 @@ fn is_history_unsupported(text: &str) -> bool {
         || text.contains("not found")
 }
 
-async fn cache_device_token_if_missing(ctx: &AppCtx, link: &bridge_ble::DeviceConnection, mac: &str) {
-    if bridge_mcp::load_device_token(&crate::mcp_config(ctx), mac).is_some() {
-        return;
-    }
-    match tokio::time::timeout(Duration::from_secs(1), link.request_device_token()).await {
-        Ok(Ok(token)) => match bridge_mcp::save_device_token(&crate::mcp_config(ctx), mac, &token) {
-            Ok(()) => tracing::info!(device_mac = %mac, "device token cached after BLE rendezvous"),
-            Err(error) => tracing::warn!(device_mac = %mac, error = %error,
-                "device token cache write failed; continuing rendezvous"),
-        },
-        Ok(Err(error)) => tracing::warn!(device_mac = %mac, error = %error,
-            "device token request failed; continuing rendezvous"),
-        Err(_) => tracing::warn!(device_mac = %mac, reason = "timeout",
-            "device token request timed out; continuing rendezvous"),
-    }
+async fn cache_device_token_if_missing(ctx: &AppCtx, link: &bridge_ble::DeviceConnection, mac: &str) -> Result<(), String> {
+    if bridge_mcp::load_device_token(&crate::mcp_config(ctx), mac).is_some() { return Ok(()); }
+    let token = link.request_device_token().await.map_err(|error| {
+        let code=bridge_core::rendezvous::wifi_error(&error).1;
+        tracing::warn!(device_mac=mac,error_category=code,"device token exchange failed; ending rendezvous");
+        code.to_owned()
+    })?;
+    bridge_mcp::save_device_token(&crate::mcp_config(ctx), mac, &token).map_err(|_| "token_persistence_failed".to_owned())?;
+    tracing::info!(device_mac=mac,"device token cached after BLE rendezvous");
+    Ok(())
 }
 
 /// Upper bound for the link cleanup at the end of `ble_cycle`. The cleanup
@@ -2702,6 +2681,8 @@ mod ble_close_lock_tests {
     }
 
     async fn token(State(fake): State<Arc<FakeBle>>) -> impl IntoResponse {
+        let delay=fake.status_extra.lock().unwrap()["_token_write_delay_ms"].as_u64().unwrap_or(0);
+        tokio::time::sleep(Duration::from_millis(delay)).await;
         *fake.ack.lock().unwrap() = Some(serde_json::to_vec(&json!({"ack":"auth","ok":true,"token":"a".repeat(32)})).unwrap());
         Json(json!({"result":"accepted"}))
     }
@@ -2747,6 +2728,10 @@ mod ble_close_lock_tests {
         let op = command["op"].as_str().unwrap_or("");
         if op == "wifi_match" {
             tokio::time::sleep(Duration::from_millis(fake.wifi_match_write_delay_ms.load(Ordering::SeqCst))).await;
+        }
+        if op=="history" {
+            let delay=fake.status_extra.lock().unwrap()["_history_write_delay_ms"].as_u64().unwrap_or(0);
+            tokio::time::sleep(Duration::from_millis(delay)).await;
         }
         let blocked_write = *fake.blocked_op.lock().unwrap() == format!("write:{op}");
         if blocked_write {
@@ -3788,11 +3773,11 @@ mod ble_close_lock_tests {
         );
     }
 
-    /// A delayed authenticated status cannot confirm the accepted Plan within
-    /// the direct-HTTP proof budget. The read stays queued and the original
-    /// Plan is not resent or renewed. The fake records the late response.
+    /// A delayed response now fits the shared proof budget. Its missing session
+    /// must be rejected for the actual mismatch, while the read stays queued
+    /// and the original Plan is neither resent nor renewed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn combo_slow_onboarding_reply_after_budget_keeps_read_job_waiting() {
+    async fn combo_slow_onboarding_invalid_session_keeps_read_job_waiting() {
         let _serial = SIM_ENV.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -3832,7 +3817,7 @@ mod ble_close_lock_tests {
         let paths = fake_http.paths.lock().unwrap().clone();
         let plan_commands = command_ops(&fake_ble).iter().filter(|op| *op == "plan").count();
         eprintln!(
-            "[C01 baseline] slow onboarding (3s reply vs 2s opportunity budget): \
+            "[C01 baseline] slow onboarding (3s reply, invalid session): \
              ble_cycle={elapsed_ms}ms; job={state}/{error:?}; \
              status_calls={}; slow_reply_sent={slow_reply_sent}; \
              plan_commands={plan_commands}; paths={paths:?}",
@@ -3849,8 +3834,8 @@ mod ble_close_lock_tests {
         );
         assert_eq!(
             (state.as_str(), error.as_deref()),
-            ("waiting_rendezvous", Some("http_proof_budget_exhausted")),
-            "unconfirmed Plan must preserve the read and report its exhausted proof budget"
+            ("waiting_rendezvous", Some("http_session_mismatch")),
+            "invalid session must preserve the read and report the real rejection"
         );
         assert!(
             !paths.iter().any(|path| path == "/api/claim"),
@@ -3938,6 +3923,8 @@ mod ble_close_lock_tests {
         headers: axum::http::HeaderMap, body: Bytes) -> Response {
         let (frame,payload)=bridge_core::compact_frame::Header::decode(&body,4096).unwrap();
         let input=serde_json::from_slice::<Value>(payload).unwrap_or(Value::Null);
+        let paged=f.ble.status_extra.lock().unwrap()["_paged_http_status"]==true && uri.path()=="/api/status" && input["compact"]!=true;
+        let page_offset=input["offset"].as_u64().unwrap_or(0) as usize;
         let response=match uri.path() {
             "/api/status"=>full_status(State(f)).await,
             "/claim"=>full_claim(State(f),headers).await,
@@ -3945,7 +3932,16 @@ mod ble_close_lock_tests {
             _=>full_sync(State(f),uri,Json(input)).await.into_response(),
         };
         let status=response.status();
-        let payload=axum::body::to_bytes(response.into_body(),4096).await.unwrap();
+        let mut payload=axum::body::to_bytes(response.into_body(),4096).await.unwrap().to_vec();
+        if paged && status.is_success() {
+            let mut status:Value=serde_json::from_slice(&payload).unwrap();status["padding"]=json!("x".repeat(3200));
+            let full=serde_json::to_vec(&status).unwrap();let offset=page_offset;
+            let end=(offset+1400).min(full.len());
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            payload=serde_json::to_vec(&json!({"result":"applied","status_read":"a".repeat(32),"offset":offset,
+                "total_bytes":full.len(),"next_offset":if end==full.len(){0}else{end},
+                "chunk_hex":full[offset..end].iter().map(|b|format!("{b:02x}")).collect::<String>()})).unwrap();
+        }
         let result=if status.is_success(){0}else{2};
         let header=bridge_core::compact_frame::Header{kind:1,op:frame.op,result,
             payload_len:payload.len() as u16,session:[9;16],request_no:frame.request_no,context:frame.context};
@@ -3969,6 +3965,30 @@ mod ble_close_lock_tests {
         let ip=listener.local_addr().unwrap().to_string();
         let server=tokio::spawn(async move {let _=axum::serve(listener,app).await;});
         (f,ip,server)
+    }
+
+    #[tokio::test(flavor="multi_thread",worker_threads=4)]
+    async fn http_proof_completes_slow_pagination_within_original_phase() {
+        let _serial=SIM_ENV.lock().unwrap_or_else(|p|p.into_inner());
+        let dir=tempfile::tempdir().unwrap();let (ble,_url)=start_fake_ble(HUNG_MAC,false).await;
+        ble.network_started.store(true,Ordering::SeqCst);ble.applied_plan.store(42,Ordering::SeqCst);
+        ble.status_extra.lock().unwrap()["_paged_http_status"]=json!(true);
+        let (_http,ip,server)=start_full_http(ble.clone(),"bridge-lock-repro").await;
+        let ctx=test_ctx_with_ip(dir.path(),HUNG_MAC,&ip);
+        let compact_ip=ip.clone();
+        let compact=tokio::task::spawn_blocking(move||device_client::status_compact(&compact_ip,TOKEN,Duration::from_secs(1))).await.unwrap().unwrap();
+        assert_eq!(compact["device_mac"],HUNG_MAC);
+        let proof=json!({"session_nonce":"00112233445566778899aabbccddeeff","wake_generation":2,"wake_seq":9});
+        let started=std::time::Instant::now();
+        let result=super::rendezvous::wait_for_device_http(&ctx,HUNG_MAC,&proof,42,true,
+            bridge_core::rendezvous::Budget::new(Duration::from_secs(6)),bridge_core::rendezvous::Budget::new(Duration::from_secs(30))).await;
+        let (status,_,_)=result.unwrap();
+        assert!(started.elapsed()>Duration::from_secs(3));assert_eq!(status["padding"].as_str().unwrap().len(),3200);
+        let started=std::time::Instant::now();
+        let result=super::rendezvous::wait_for_device_http(&ctx,HUNG_MAC,&proof,42,true,
+            bridge_core::rendezvous::Budget::new(Duration::from_millis(200)),bridge_core::rendezvous::Budget::new(Duration::from_secs(30))).await;
+        server.abort();assert!(matches!(result,Err(ref e) if e=="http_proof_budget_exhausted"));
+        assert!(started.elapsed()<Duration::from_millis(700));
     }
 
     #[tokio::test(flavor="multi_thread",worker_threads=4)]
@@ -4167,6 +4187,101 @@ mod ble_close_lock_tests {
             assert_eq!(after.snapshot.unwrap().snapshot_id, "cached-choice");
             assert_eq!(svc.coordinator_summary(HUNG_MAC, device_now(HUNG_MAC)).unwrap()["plan"], plan_before);
             assert!(crate::wifi::action(&ctx, HUNG_MAC, op, body).await.is_err()); // local revision changed
+        }
+    }
+
+    #[tokio::test(flavor="multi_thread",worker_threads=4)]
+    async fn caller_deadlines_preserve_carrier_outcomes_and_slow_token_succeeds() {
+        let _serial=SIM_ENV.lock().unwrap_or_else(|p|p.into_inner());
+        let mut failures=Vec::new();
+        for case in ["token","slow_history","automatic_wifi","wifi_snapshot","history"] {
+            let dir=tempfile::tempdir().unwrap();let (ble,url)=start_fake_ble(HUNG_MAC,false).await;
+            ble.protocol.store(true,Ordering::SeqCst);let ctx=test_ctx(dir.path(),&[HUNG_MAC]);
+            std::env::set_var("CODEX_STATUS_DATA",dir.path());
+            std::env::set_var("CODEX_STATUS_SIM_BLE_ENDPOINTS",json!({HUNG_MAC:url}).to_string());
+            std::env::set_var("CODEX_STATUS_TEST_HOST_WIFI",json!({"state":"connected","networks":[{"ssid":"Host"}]}).to_string());
+            let mut link=bridge_ble::DeviceConnection::connect(HUNG_MAC,TOKEN,&ctx.bridge_id).await.unwrap().unwrap();
+            link.command("status",json!({})).await.unwrap();
+            if case=="token" {
+                ble.status_extra.lock().unwrap()["_token_write_delay_ms"]=json!(1400);
+                super::cache_device_token_if_missing(&ctx,&link,HUNG_MAC).await.unwrap();
+                if bridge_mcp::load_device_token(&crate::mcp_config(&ctx),HUNG_MAC).is_none() {failures.push("slow token was cancelled".to_owned());}
+                if link.command("status",json!({})).await.is_err() {failures.push("slow token poisoned next command".to_owned());}
+            } else if case=="slow_history" {
+                ble.status_extra.lock().unwrap()["_history_write_delay_ms"]=json!(700);
+                super::sync_wake_history(&mut link,HUNG_MAC,&json!({"wake_generation":2}),
+                    bridge_core::rendezvous::Budget::new(Duration::from_secs(2))).await.unwrap();
+                link.command("status",json!({})).await.unwrap();
+            } else {
+                let budget=bridge_core::rendezvous::Budget::new(Duration::from_millis(300));
+                if case=="automatic_wifi" {
+                    service(&ctx).wifi_save(HUNG_MAC,0,serde_json::from_value(json!([
+                        {"network_id":"home","host_ssid":"Host","ssid":"Device","credential":"open"}
+                    ])).unwrap(),device_now(HUNG_MAC)).unwrap();
+                    *ble.blocked_op.lock().unwrap()="write:wifi_match".into();
+                    let result=crate::wifi::automatic_on_link(&ctx,HUNG_MAC,&mut link,budget,false).await;
+                    if result!=Err("result_unknown".into()) {failures.push(format!("automatic lost carrier outcome: {result:?}"));}
+                } else if case=="history" {
+                    *ble.blocked_op.lock().unwrap()="write:history".into();
+                    let result=super::sync_wake_history(&mut link,HUNG_MAC,&json!({"wake_generation":2}),budget).await;
+                    if result!=Err("result_unknown".into()) {failures.push(format!("history lost carrier outcome: {result:?}"));}
+                } else {
+                    let job=service(&ctx).wifi_queue(HUNG_MAC,&ctx.bridge_id,"read",vec![],device_now(HUNG_MAC)).unwrap();
+                    *ble.blocked_op.lock().unwrap()="write:wifi_snapshot".into();
+                    let lock=delivery_lock(&ctx,HUNG_MAC);let _guard=lock.lock().await;
+                    crate::wifi::read_on_link_budget(&ctx,HUNG_MAC,&mut link,budget).await;
+                    let job=service(&ctx).wifi_state(HUNG_MAC).jobs.into_iter().find(|j|j.job_id==job.job_id).unwrap();
+                    if job.error_code.as_deref()!=Some("result_unknown") {failures.push(format!("snapshot lost carrier outcome: {:?}",job.error_code));}
+                }
+                let error=link.command("status",json!({})).await.unwrap_err();
+                assert_eq!(bridge_core::rendezvous::command_failure(&error).unwrap().reason,"previous_write_unknown");
+            }
+            link.close_bounded(Duration::from_millis(100)).await;
+            std::env::remove_var("CODEX_STATUS_DATA");std::env::remove_var("CODEX_STATUS_SIM_BLE_ENDPOINTS");std::env::remove_var("CODEX_STATUS_TEST_HOST_WIFI");
+        }
+        assert!(failures.is_empty(),"{}",failures.join("; "));
+    }
+
+    #[tokio::test(flavor="multi_thread",worker_threads=4)]
+    async fn token_failure_stops_real_cycle_before_endpoint_or_plan() {
+        let _serial=SIM_ENV.lock().unwrap_or_else(|p|p.into_inner());
+        let dir=tempfile::tempdir().unwrap();let (ble,url)=start_fake_ble(HUNG_MAC,false).await;
+        ble.protocol.store(true,Ordering::SeqCst);ble.rf_initial_ms.store(400,Ordering::SeqCst);
+        ble.status_extra.lock().unwrap()["_token_write_delay_ms"]=json!(1500);
+        let ctx=test_ctx(dir.path(),&[HUNG_MAC]);
+        std::env::set_var("CODEX_STATUS_SIM_BLE_ENDPOINTS",json!({HUNG_MAC:url}).to_string());
+        let result=ble_cycle(&ctx,&[HUNG_MAC.into()]).await;
+        std::env::remove_var("CODEX_STATUS_SIM_BLE_ENDPOINTS");
+        assert!(matches!(result,Ok(BleOpportunity::Connected { result:Err(ref e),.. }) if e=="result_unknown"),"{result:?}");
+        assert!(command_ops(&ble).is_empty());assert_eq!(ble.closes.load(Ordering::SeqCst),1);
+    }
+
+    #[tokio::test(flavor="multi_thread",worker_threads=4)]
+    async fn shared_deadline_ack_unknown_does_not_poison_completed_write() {
+        let _serial=SIM_ENV.lock().unwrap_or_else(|p|p.into_inner());
+        for op in ["wifi_match","wifi_owner","history","wifi_snapshot","wifi_status"] {
+            let dir=tempfile::tempdir().unwrap();let (ble,url)=start_fake_ble(HUNG_MAC,false).await;
+            ble.protocol.store(true,Ordering::SeqCst);let ctx=test_ctx(dir.path(),&[HUNG_MAC]);
+            std::env::set_var("CODEX_STATUS_DATA",dir.path());
+            std::env::set_var("CODEX_STATUS_SIM_BLE_ENDPOINTS",json!({HUNG_MAC:url}).to_string());
+            std::env::set_var("CODEX_STATUS_TEST_HOST_WIFI",json!({"state":"connected","networks":[{"ssid":"Host"}]}).to_string());
+            let mut link=bridge_ble::DeviceConnection::connect(HUNG_MAC,TOKEN,&ctx.bridge_id).await.unwrap().unwrap();
+            link.command("status",json!({})).await.unwrap();*ble.blocked_op.lock().unwrap()=op.into();
+            let budget=bridge_core::rendezvous::Budget::new(Duration::from_millis(250));
+            if op=="wifi_match" || op=="wifi_owner" {
+                if op=="wifi_owner" {*ble.wifi_match_reply.lock().unwrap()=json!({"connected":false,"active":false,"stage":"idle"});}
+                service(&ctx).wifi_save(HUNG_MAC,0,serde_json::from_value(json!([
+                    {"network_id":"home","host_ssid":"Host","ssid":"Device","credential":"open"}
+                ])).unwrap(),device_now(HUNG_MAC)).unwrap();
+                assert_eq!(crate::wifi::automatic_on_link(&ctx,HUNG_MAC,&mut link,budget,false).await,Err("result_unknown".into()));
+            } else if op=="history" {
+                assert_eq!(super::sync_wake_history(&mut link,HUNG_MAC,&json!({"wake_generation":2}),budget).await,Err("result_unknown".into()));
+            } else {
+                let result=if op=="wifi_snapshot" {link.wifi_snapshot_budget(budget).await} else {link.wifi_read_budget(op,budget).await};
+                assert_eq!(bridge_core::rendezvous::command_failure(&result.unwrap_err()).unwrap().outcome,bridge_core::rendezvous::DispatchOutcome::AckUnknown);
+            }
+            link.command("status",json!({})).await.unwrap();link.close_bounded(Duration::from_millis(100)).await;
+            std::env::remove_var("CODEX_STATUS_DATA");std::env::remove_var("CODEX_STATUS_SIM_BLE_ENDPOINTS");std::env::remove_var("CODEX_STATUS_TEST_HOST_WIFI");
         }
     }
 

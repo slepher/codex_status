@@ -166,3 +166,8 @@ Bridge 只看生产设备能提供的认证状态（包括 fw），不看控制�
 每份证据含 revision/工作树摘要、共享源清单、target/能力、seed/输入、时域、MAC/boot/job/request/seq/plan 关联、状态变化/结果。日志有界，不含 token、Wi-Fi 密码、完整用户数据。产物进 artifacts 或隔离测试目录，新目录依 AGENTS.md 提权预建。构建不清理 target/debug/data；两族模拟测试不自动授权真实刷写。
 
 本版撤销旧版预设通用 DeviceKernel、重复 S0–S6 与 A–G 两套里程碑、legacy ≤3 验收等建议。保留现有切片，按可观察证据完成全部剩余需求。
+
+
+## 2026-10-15 独立分钟调度回归
+
+Fake ROM使用与固件相同的minute_clock.h到期判断，控制时钟推进时在RF窗口关闭前服务编译模板显示。/sim/state公开next_clock_ms，step/max runner取其与电源/会合截止的较早者，不能只推进到会合。bootstrap用例明确设置UTC :58的非整分会合：深睡先跨整分刷新、联系时间不变；会合开始后跨:00，在RF窗口仍开放时检查display_writes和真实frame_crc变化，结束同一分钟不再写屏。该测试不通过GET /sim/frame触发被测刷新。另以固件serviceMinuteClock原函数和同源RendezvousProtocol测试:17联系、:59睡眠、校时回拨、失败重试及串行调用顺序。仍不模拟面板波形/实际启动耗时。

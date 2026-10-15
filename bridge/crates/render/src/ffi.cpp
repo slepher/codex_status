@@ -6,6 +6,7 @@
 #include "v2_data_command.h"
 #include "v2_plan_command.h"
 #include "rendezvous_protocol.h"
+#include "minute_clock.h"
 #include "v2_bundle_command.h"
 #include "v2_activate_command.h"
 #include "v2_claim_command.h"
@@ -101,6 +102,7 @@ struct SimBundleDevice {
     bool failNextDisplay = false;
     uint32_t displayWrites = 0;
     const char *refreshKind = "none";
+    int64_t displayedMinute = -1;
     long long wallEpochSecs = 0;
     bool hasWallEpoch = false;
     bool deep = false, wifiUp = true;
@@ -136,6 +138,7 @@ const char *simRender(SimBundleDevice &device) {
     if (decision.action == RFN_NONE) {
         device.bridgeOffline = env.offlineMins;
         device.displayState = 1;
+        if (device.hasWallEpoch) device.displayedMinute = device.wallEpochSecs / 60;
         device.refreshKind = "none";
         return "unchanged";
     }
@@ -152,6 +155,7 @@ const char *simRender(SimBundleDevice &device) {
     device.frameTrusted = true;
     device.bridgeOffline = env.offlineMins;
     device.refreshKind = rfnActionName(decision.action);
+    if (device.hasWallEpoch) device.displayedMinute = device.wallEpochSecs / 60;
     device.displayWrites++;
     device.displayState = 1;
     return "displayed";
@@ -336,6 +340,7 @@ int codex_sim_bundle_status(void *p, char *out, int cap) {
     doc["data_crc"] = device.dataSeq.appliedCrc();
     doc["bridge_contact_epoch"] = device.lastBridgeContact;
     doc["display_wall_epoch"] = device.wallEpochSecs;
+    doc["displayed_minute"] = device.displayedMinute;
     doc["bridge_offline_mins"] = device.bridgeOffline;
     doc["display_state_code"] = device.displayState;
     doc["frame_crc"] = device.frame.empty() ? 0 : v2Crc32(device.frame.data(), device.frame.size());
@@ -578,8 +583,16 @@ int codex_sim_bundle_display(void *p, int deep, int wifi_up, int contact) {
     const bool changed = device.deep != bool(deep) || device.wifiUp != bool(wifi_up)
         || (deep ? sleepFrameNeedsRefresh(sleepGlyph, offline) : device.bridgeOffline != offline);
     device.deep = deep; device.wifiUp = wifi_up;
-    if (changed && device.compiledValid) simRender(device);
+    if ((changed || (device.hasWallEpoch && minuteClockDue(device.wallEpochSecs, device.displayedMinute)))
+        && device.compiledValid) simRender(device);
     return 1;
+}
+
+int codex_sim_clock_tick(void *p, int deep) {
+    if (!p) return 0;
+    auto &device = *(SimBundleDevice *)p;
+    if (!device.hasWallEpoch || !minuteClockDue(device.wallEpochSecs, device.displayedMinute)) return 1;
+    return codex_sim_bundle_display(p, deep, -1, 0);
 }
 
 int codex_sim_activate(void *p, const char *message, uint64_t now_ms,

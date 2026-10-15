@@ -107,7 +107,7 @@ int  batteryPercent();
 int  displayBatteryPercent();
 void serviceBatteryDisplay();
 void releaseWakeHolds();
-void deepSleepFor(uint32_t sec);
+void deepSleepFor(uint32_t sec, uint64_t wakeEpochUs = 0);
 void pollPlug();
 void checkBattery();
 void handleBootClick(uint32_t physicalMs = 0);

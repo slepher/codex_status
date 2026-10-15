@@ -4044,3 +4044,42 @@ fn fake_ble_device_remote_close_reconnect_and_unknown_quarantine() {
         eprintln!("Fake BLE lifecycle: 3 StaticJson frames verified; remote-first and stale-generation close recovered; missing callback blocks reconnect.");
     });
 }
+
+#[test]
+fn clock_updates_during_off_minute_rendezvous_without_waiting_for_close() {
+    // UTC :58, deliberately NOT a minute boundary. The five-second fake RF
+    // window must span :00; its start/end must not define the clock cadence.
+    let sim = configured_note4_sync_sim_with_options("02:00:00:00:00:9A", &["--epoch-ms", "1800000058000"]);
+    let wall=time(&sim,Some(CONTROL)).1["wall_ms"].as_u64().unwrap();
+    assert_eq!(set_time(&sim,Some(CONTROL),&serde_json::json!({"op":"wall","offset_ms":1800000058000i64-wall as i64})).0,200);
+    let status = bridge_core::device_client::status(&sim.address().to_string(), ENDPOINT, Duration::from_secs(3)).unwrap();
+    let config=serde_json::json!({"op":"sync_config","request_id":"clock-disable-sync","token":ENDPOINT,
+        "device_mac":"02:00:00:00:00:9A","session_nonce":status["session_nonce"],"bridge_id":"bridge-test","enabled":false});
+    assert_eq!(json_body(&request(sim.address(),"POST","/sim/ble/command",Some(ENDPOINT),config.to_string().as_bytes()).1)["result"],"applied");
+    let sleep=plan_message(&status,"bridge-test","clock-sleep",9000,"sleep",None);
+    assert_eq!(post_plan(&sim,Some(ENDPOINT),&sleep).1["result"],"applied");
+    let sleeping=sim_state(&sim);
+    let contact=sleeping["power"]["next_contact_ms"].clone();
+    assert!(sleeping["next_clock_ms"].as_u64().unwrap()<contact.as_u64().unwrap());
+    assert_eq!(set_time(&sim,Some(CONTROL),&serde_json::json!({"op":"step","delta_ms":2000})).0,200);
+    let clock_only=sim_state(&sim);
+    assert!(clock_only["power"]["ble_window_until_ms"].is_null());
+    assert_eq!(clock_only["power"]["next_contact_ms"],contact);
+    assert_ne!(clock_only["bundle"]["frame_crc"],sleeping["bundle"]["frame_crc"],"sleeping clock must update before the off-minute RF appointment");
+    assert_eq!(set_time(&sim,Some(CONTROL),&serde_json::json!({"op":"step","delta_ms":58_000})).0,200);
+    let before=sim_state(&sim);
+    assert_eq!(before["clock"]["wall_ms"].as_u64().unwrap()%60_000,58_000);
+    let until=before["power"]["ble_window_until_ms"].as_u64().unwrap();
+    let writes=before["bundle"]["display_writes"].as_u64().unwrap();
+    let crc=before["bundle"]["frame_crc"].clone();
+    assert_eq!(set_time(&sim,Some(CONTROL),&serde_json::json!({"op":"step","delta_ms":2000})).0,200);
+    let at_minute=sim_state(&sim);
+    assert!(at_minute["clock"]["monotonic_ms"].as_u64().unwrap()<until);
+    assert_eq!(at_minute["power"]["ble_window_until_ms"],until);
+    assert!(at_minute["bundle"]["display_writes"].as_u64().unwrap()>writes,"clock must draw before rendezvous closes");
+    assert_ne!(at_minute["bundle"]["frame_crc"],crc);
+    assert_eq!(set_time(&sim,Some(CONTROL),&serde_json::json!({"op":"step","delta_ms":3000})).0,200);
+    let after=sim_state(&sim);
+    assert_eq!(after["bundle"]["display_writes"],at_minute["bundle"]["display_writes"],"closing RF must not redraw this minute");
+    assert_eq!(after["power"]["next_contact_ms"],before["power"]["next_contact_ms"]);
+}

@@ -25,6 +25,7 @@ fn main() {
     println!("cargo:rerun-if-changed=../../../src/wifi_storage_commit.inc");
     println!("cargo:rerun-if-changed=../../../tools/wifi-legacy-convert.inc");
     println!("cargo:rerun-if-changed=../../../src/battery_display.h");
+    println!("cargo:rerun-if-changed=../../../src/minute_clock.h");
     println!("cargo:rerun-if-changed=src/battery_display_test.cpp");
     println!("cargo:rerun-if-changed=../../../src/status_pages.h");
     println!("cargo:rerun-if-changed=../../../src/network_display_state.h");

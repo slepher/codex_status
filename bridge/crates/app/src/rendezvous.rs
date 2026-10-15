@@ -78,11 +78,6 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             .and_then(DeviceIdentity::normalized_mac)
             == Some(mac.clone())
     });
-    // Fetch the token before the exchange budget so a short BLE window can
-    // close immediately after the accepted network-start command.
-    if still_registered {
-        cache_device_token_if_missing(ctx, &link, &mac).await;
-    }
     let http_window = Budget::new(Duration::from_secs(90));
     let mut admitted_wifi: Vec<String> = service(ctx)
         .wifi_state(&mac)
@@ -100,6 +95,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
                 "connected BLE device {mac} is no longer registered for device protocol"
             ));
         }
+        cache_device_token_if_missing(ctx, &link, &mac).await?;
         link.write_endpoint(&bridge_ble::lan_ip(), ctx.config.port, &ctx.config.token)
             .await
             .map_err(err_text)?;
@@ -161,7 +157,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
         let reachable = if !needs_http { false } else if let Some(target) = device_link_for_mac(ctx, &mac) {
             let expected = mac.clone();
             let probe = blocking(move || {
-                match device_client::status(&target.ip, &target.token, Duration::from_millis(400)) {
+                match device_client::status_compact(&target.ip, &target.token, command_budget.remaining().min(Duration::from_millis(400))) {
                     Ok(s) if DeviceIdentity::normalized_mac(s["device_mac"].as_str().unwrap_or("")) == Some(expected) => Ok(true),
                     Ok(_) => Err("http_identity_mismatch".into()),
                     Err(error) if bridge_core::rendezvous::wifi_error(&error).1 == "unauthorized" => Err("unauthorized".into()),
@@ -367,10 +363,11 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             if !admitted_wifi.is_empty() && !read_only {
                 // Cancelling a fragmented write leaves a partial JSON frame.
                 // Use the shared deadline; on timeout never reuse this link.
-                if tokio::time::timeout(shared_tail.remaining(),crate::wifi::note_link(ctx,&mac,&mut link)).await.is_err() {
+                let noted=crate::wifi::note_link_budget(ctx,&mac,&mut link,shared_tail).await;
+                if noted["ok"]!=true {
                     drop(_device_delivery);drop(_delivery);
                     link.close_bounded(CLOSE_BUDGET).await;
-                    return Err("wifi_window_timeout".into());
+                    return Err(noted["error"].as_str().unwrap_or("status_unavailable").to_owned());
                 }
             }
             // An unknown plan may query an already sent transaction, but
@@ -429,25 +426,23 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
         }
     }
     if let Some(error) = wifi_repair_error { normal_result = Err(error); }
+    let mut tail_error=None;
     if let Ok((state, enabled, _, light)) = &normal_result {
         if !enabled {
-            let _ = tokio::time::timeout(
-                Duration::from_millis(500),
-                sync_wake_history(&mut link, &mac, state),
-            )
-            .await;
+            tail_error=sync_wake_history(&mut link,&mac,state,shared_tail.capped(Duration::from_secs(2))).await.err();
         }
-        if !light {
+        if tail_error.is_none() && !light {
             let _ = crate::wifi::recover_on_link_budget(
                 ctx,
                 &mac,
                 &mut link,
-                Budget::new(Duration::from_millis(500)),
+                shared_tail.capped(Duration::from_millis(500)),
             )
             .await;
         }
-        crate::wifi::acknowledge_receipts_on_link_budget(ctx,&mac,&mut link,shared_tail.capped(Duration::from_millis(500))).await;
+        if tail_error.is_none() {crate::wifi::acknowledge_receipts_on_link_budget(ctx,&mac,&mut link,shared_tail.capped(Duration::from_millis(500))).await;}
     }
+    if let Some(error)=tail_error {normal_result=Err(error);}
     // Release both delivery locks before link cleanup. A hanging
     // `peripheral.disconnect()` (btleplug on macOS after a natural link loss)
     // must not block HTTP delivery for this MAC or the next rendezvous for any
@@ -462,9 +457,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
              state["_network_start_accepted"] == true || state["_network_start_unknown"] == true) {
             let plan_id=state["_sent_plan"]["plan_id"].as_u64().unwrap_or(0);
             let explicit=state["rendezvous_v"]==1;
-            let proof_budget=if state["_http_reachable"]==true {
-                Budget::new(Duration::from_secs(3)).capped(http_window.remaining())
-            } else {shared_tail};
+            let proof_budget=shared_tail;
             match wait_for_device_http(ctx,&mac,state,plan_id,explicit,proof_budget,http_window).await {
                 Ok((status,budget,sampled_at)) => {
                     http_budget=budget;
@@ -666,11 +659,11 @@ pub(super) async fn wait_for_device_http(
         };
         let ip = target.ip.clone();
         let token = target.token.clone();
-        let timeout = budget.remaining().min(Duration::from_secs(3));
+        let read_budget = budget;
         let sample_start = std::time::Instant::now();
         let sampled_at = device_now(mac);
         let observed = blocking(move || {
-            device_client::status(&ip, &token, timeout).map_err(|e| if bridge_core::rendezvous::wifi_error(&e).1=="unauthorized" {"unauthorized".into()} else {"http_unavailable".into()})
+            device_client::status(&ip, &token, read_budget.remaining()).map_err(|e| if bridge_core::rendezvous::wifi_error(&e).1=="unauthorized" {"unauthorized".into()} else {"http_unavailable".into()})
         })
         .await;
         if observed.as_ref().is_err_and(|e| e=="unauthorized") { return Err("unauthorized".into()); }
@@ -681,12 +674,10 @@ pub(super) async fn wait_for_device_http(
                     if status["owner_id"] != ctx.bridge_id {
                         // Occupancy is renewed only by an explicit claim after
                         // the authenticated device response.
-                        let limit=budget.remaining().min(observed_budget.remaining())
-                            .min(Duration::from_secs(2));
+                        let claim_budget=budget.capped(observed_budget.remaining()).capped(Duration::from_secs(2));
                         service(ctx).note_device_endpoint(mac,&target.ip).map_err(err_text)?;
-                        let claim=tokio::time::timeout(limit,
-                            crate::post_claim_for_mac(ctx,false,false,mac)).await;
-                        if !matches!(claim,Ok(Ok(Some(ref owner))) if owner["id"]==ctx.bridge_id) {
+                        let claim=crate::post_claim_for_mac_budget(ctx,false,false,mac,claim_budget).await;
+                        if !matches!(claim,Ok(Some(ref owner)) if owner["id"]==ctx.bridge_id) {
                             return Err("claim_unconfirmed".into());
                         }
                     }

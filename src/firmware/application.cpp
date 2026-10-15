@@ -121,6 +121,15 @@ void initialize(const char *firmwareVersion, const char *imageIdentity) {
     diagnostics::nvsStageMark(5);      // wake classified (deepTimerBoot known)
     diagnostics::histAdd(HIST_BOOT, (uint16_t)cause);
     diagnostics::state.wakeResult = deepTimerBoot ? WAKE_NET : WAKE_LIGHT;
+    // Even a network-due wake owes the minute display before starting RF.
+    if (deepTimerBoot && !deepClockOnlyBoot && display::retained.clkR.valid &&
+        minuteClockDue(time(nullptr), display::retained.displayedMinute)) {
+        display::epdThinBegin();
+#if defined(CODEX_TARGET_NOTE4)
+        display::note4RestoreFrameBaseline(true);
+#endif
+        display::clockTickWake(); // failure falls back after the Bundle loads
+    }
     if (deepClockOnlyBoot) {
         diagnostics::state.wakeResult = WAKE_THIN;
         diagnostics::traceMarkThin();
@@ -319,6 +328,7 @@ void initialize(const char *firmwareVersion, const char *imageIdentity) {
         // GPIO0 itself woke the device: do not require a second click.
         power::state.bleRecovery.startup(power::state.v2BootMs);
     }
+    display::serviceMinuteClock();
     wifiSchemesBegin();
     captureStartupBoot();
     capturingBoot = false;
@@ -344,6 +354,7 @@ void tick() {
     // (the WebServer also reports UPLOAD_FILE_ABORTED; this is the backstop).
     transport::otaUploadTick();
     diagnostics::handleSerialCli();
+    if (!targetUnverified) display::serviceMinuteClock();
     transport::state.server.handleClient();
     if (targetUnverified) {
         // Unverified panel combination: stay recoverable over USB serial and
@@ -517,17 +528,8 @@ void tick() {
         }
     }
 
-    // 1 Hz housekeeping tick: read the clock once per second and share it
-    // between the offline-minutes row and the `device.now` clock bind. Both
-    // used to call timeKnown()/time() every loop; 0.13.7 only gated the clock
-    // block, and the remaining per-loop clock read still cut into light sleep.
-    //
-    // Offline-minutes row: once contact is lost (>= BRIDGE_LOST_MIN minutes
-    // since the last sync) the template shows `OFF <n>M`, so redraw when the
-    // integer minute changes. No periodic refresh while the bridge is
-    // heartbeating.
+    // Offline label housekeeping is separate from the early minute service.
     static int lastOfflineMinute = -1;
-    static long lastClockMinute = -1;
     static uint32_t lastClockCheckMs = 0;
     uint32_t clockMs = millis();
     if ((platform::state.activeTplHasNow || radio::retained.rtcLastSyncEpoch > 1600000000) &&
@@ -542,32 +544,6 @@ void tick() {
                     bool wasShown = lastOfflineMinute > 0;
                     lastOfflineMinute = offlineMinute;
                     if (offlineMinute > 0 || wasShown) display::renderCurrent();
-                }
-            }
-            // Clock bind: while the active template shows `device.now`, redraw
-            // when the local minute changes (partial refresh, ~1/min; the
-            // bridge only pushes every 5 min, so server_time looks frozen).
-            if (platform::state.activeTplHasNow) {
-                long minute = (long)nowSec / 60;
-                if (lastClockMinute < 0) {
-                    lastClockMinute = minute;
-                    if (display::retained.clkR.valid) display::clkCaptureFromFramebuffer();
-                } else if (minute != lastClockMinute) {
-                    lastClockMinute = minute;
-#ifdef CODEX_CLK_WINDOW_TEST
-                    display::clkTestTick();
-#else
-                    // Direct window write (v0.14): ~796 ms vs ~864 ms for a full
-                    // re-render; a full re-render every 30 partials clears
-                    // ghosting, and the clean request bypasses the identical-
-                    // frame early return (design §8.4).
-                    if (display::state.epdPartialCount >= 30) {
-                        display::state.forceCleanRefresh = true;
-                        display::renderCurrent();
-                    } else if (!display::clockTickWake()) {
-                        display::renderCurrent();
-                    }
-#endif
                 }
             }
         }

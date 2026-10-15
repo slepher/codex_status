@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -111,7 +111,32 @@ pub fn locate_codex(explicit: Option<&Path>) -> Result<PathBuf> {
     bail!("codex CLI not found (need `--version` to contain `{CLI_MARKER}`)")
 }
 
-type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
+type Pending = Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
+
+struct PendingCall<'a> { pending: &'a Pending, id: u64 }
+impl Drop for PendingCall<'_> {
+    fn drop(&mut self) { self.pending.lock().unwrap().remove(&self.id); }
+}
+
+// A cancelled/failed write may leave half a JSON line. Never reuse that stream.
+struct RpcWriteGuard<'a> { retired: &'a AtomicBool, complete: bool }
+impl Drop for RpcWriteGuard<'_> {
+    fn drop(&mut self) { if !self.complete { self.retired.store(true, Ordering::Release); } }
+}
+async fn write_rpc_line<W: tokio::io::AsyncWrite + Unpin>(stdin: &Mutex<W>, retired: &AtomicBool,
+    msg: &Value, deadline: tokio::time::Instant) -> Result<()> {
+    let line=format!("{msg}\n");
+    let mut writer=tokio::time::timeout_at(deadline,stdin.lock()).await.context("rpc stdin lock timed out")?;
+    anyhow::ensure!(!retired.load(Ordering::Acquire),"rpc stdin retired after uncertain write");
+    anyhow::ensure!(tokio::time::Instant::now()<deadline,"rpc write budget exhausted before dispatch");
+    let mut guard=RpcWriteGuard {retired,complete:false};
+    tokio::time::timeout_at(deadline,async {
+        writer.write_all(line.as_bytes()).await.context("write rpc")?;
+        writer.flush().await.context("flush rpc")
+    }).await.context("rpc write timed out")??;
+    guard.complete=true;
+    Ok(())
+}
 
 /// Whether a server notification looks like a rolling rate-limit update. The
 /// app-server protocol ships `AccountRateLimitsUpdatedNotification`
@@ -134,6 +159,7 @@ pub struct CodexClient {
     stdin: Arc<Mutex<tokio::process::ChildStdin>>,
     next_id: AtomicU64,
     pending: Pending,
+    retired: Arc<AtomicBool>,
     timeout: Duration,
     rate_limit_notify: Arc<Notify>,
 }
@@ -157,7 +183,8 @@ impl CodexClient {
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
         let stderr = child.stderr.take().ok_or_else(|| anyhow!("no stderr"))?;
         let stdin = Arc::new(Mutex::new(stdin));
-        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let pending: Pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let retired=Arc::new(AtomicBool::new(false));
         let rate_limit_notify = Arc::new(Notify::new());
 
         tokio::spawn(async move {
@@ -168,6 +195,7 @@ impl CodexClient {
         });
 
         let pending_reader = pending.clone();
+        let retired_reader=retired.clone();
         let stdin_reader = stdin.clone();
         let notify_reader = rate_limit_notify.clone();
         tokio::spawn(async move {
@@ -200,12 +228,13 @@ impl CodexClient {
                         if msg.get("method").is_some() {
                             // Server -> client request; answer with null to keep it unstuck.
                             let reply = json!({"id": id, "result": null});
-                            let mut w = stdin_reader.lock().await;
-                            let _ = w.write_all(format!("{reply}\n").as_bytes()).await;
-                            let _ = w.flush().await;
+                            if let Err(error)=write_rpc_line(&stdin_reader,&retired_reader,&reply,tokio::time::Instant::now()+RPC_TIMEOUT).await {
+                                for (_,tx) in pending_reader.lock().unwrap().drain() {let _=tx.send(Err(format!("rpc reply write failed: {error}")));}
+                                break;
+                            }
                             continue;
                         }
-                        if let Some(tx) = pending_reader.lock().await.remove(&id) {
+                        if let Some(tx) = pending_reader.lock().unwrap().remove(&id) {
                             let payload = match msg.get("error") {
                                 Some(err) => Err(err.to_string()),
                                 None => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
@@ -215,7 +244,7 @@ impl CodexClient {
                     }
                     Ok(None) => {
                         tracing::warn!("codex app-server stdout closed");
-                        let mut p = pending_reader.lock().await;
+                        let mut p = pending_reader.lock().unwrap();
                         for (_, tx) in p.drain() {
                             let _ = tx.send(Err("app-server closed".into()));
                         }
@@ -234,30 +263,28 @@ impl CodexClient {
             stdin,
             next_id: AtomicU64::new(1),
             pending,
+            retired,
             timeout: RPC_TIMEOUT,
             rate_limit_notify,
         })
     }
 
     async fn write_line(&self, msg: &Value) -> Result<()> {
-        let mut w = self.stdin.lock().await;
-        w.write_all(format!("{msg}\n").as_bytes())
-            .await
-            .context("write rpc")?;
-        w.flush().await.context("flush rpc")?;
-        Ok(())
+        write_rpc_line(&self.stdin,&self.retired,msg,tokio::time::Instant::now()+self.timeout).await
     }
 
     pub async fn call(&self, method: &str, params: Option<Value>) -> Result<Value> {
+        let deadline=tokio::time::Instant::now()+self.timeout;
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(id, tx);
+        self.pending.lock().unwrap().insert(id, tx);
+        let _pending=PendingCall {pending:&self.pending,id};
         let mut msg = json!({"method": method, "id": id});
         if let Some(p) = params {
             msg["params"] = p;
         }
-        self.write_line(&msg).await?;
-        match tokio::time::timeout(self.timeout, rx).await {
+        write_rpc_line(&self.stdin,&self.retired,&msg,deadline).await?;
+        match tokio::time::timeout_at(deadline, rx).await {
             Ok(Ok(Ok(v))) => Ok(v),
             Ok(Ok(Err(e))) => bail!("rpc {method} error: {e}"),
             Ok(Err(_)) => bail!("rpc {method} channel closed"),
@@ -313,6 +340,50 @@ impl CodexClient {
 mod tests {
     use super::is_rate_limit_notification;
     use serde_json::json;
+
+    #[cfg(unix)]
+    fn stalled_rpc_client() -> super::CodexClient {
+        use super::*;
+        let mut child=Command::new("sh").args(["-c","exec sleep 5"]).stdin(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+        let stdin=child.stdin.take().unwrap();
+        CodexClient {child,stdin:Arc::new(Mutex::new(stdin)),next_id:AtomicU64::new(1),
+            pending:Arc::new(std::sync::Mutex::new(HashMap::new())),retired:Arc::new(AtomicBool::new(false)),
+            timeout:Duration::from_millis(500),rate_limit_notify:Arc::new(Notify::new())}
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rpc_deadline_includes_lock_write_and_response_and_cleans_pending() {
+        use super::*;
+        let client=stalled_rpc_client();
+        let lock=client.stdin.lock().await;
+        let result=client.call("locked",None).await;
+        assert!(result.unwrap_err().to_string().contains("lock timed out"));
+        assert!(client.pending.lock().unwrap().is_empty());assert!(!client.retired.load(Ordering::Acquire));
+        drop(lock);
+        assert!(client.call("missing-response",None).await.unwrap_err().to_string().contains("timed out"));
+        assert!(client.pending.lock().unwrap().is_empty());assert!(!client.retired.load(Ordering::Acquire));
+        assert!(client.call("blocked-write",Some(json!({"text":"x".repeat(128*1024)}))).await.is_err());
+        assert!(client.retired.load(Ordering::Acquire));assert!(client.pending.lock().unwrap().is_empty());
+        assert!(client.notify("after-partial",None).await.unwrap_err().to_string().contains("retired"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_rpc_retires_partial_stream_and_removes_pending() {
+        use super::*;
+        let mut client=stalled_rpc_client();client.timeout=Duration::from_secs(2);
+        let mut call=Box::pin(client.call("cancelled-write",Some(json!({"text":"x".repeat(128*1024)}))));
+        tokio::time::timeout(Duration::from_secs(2),async {
+            tokio::select! {
+                result=&mut call=>panic!("write must still be in flight: {result:?}"),
+                _=async {loop {tokio::task::yield_now().await;if client.stdin.try_lock().is_err(){break;}}}=>{}
+            }
+        }).await.unwrap();
+        drop(call);
+        assert!(client.retired.load(Ordering::Acquire));assert!(client.pending.lock().unwrap().is_empty());
+        assert!(client.notify("after-cancel",None).await.is_err());
+    }
 
     #[test]
     fn matches_rolling_rate_limit_notifications() {

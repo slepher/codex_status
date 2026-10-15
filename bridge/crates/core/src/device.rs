@@ -2,7 +2,7 @@
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 
@@ -24,18 +24,33 @@ impl DeviceStatus {
 
 /// GET `http://<ip><path>` and return the body.
 fn http_get(ip: &str, path: &str, timeout: Duration) -> Result<String> {
+    const MAX_RESPONSE: usize = 64 * 1024;
+    let deadline=Instant::now()+timeout;
+    let remaining=|| -> Result<Duration> {
+        let left=deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {return Err(anyhow!("device GET deadline exhausted"));} Ok(left)
+    };
     let addr = parse_device_addr(ip)?;
-    let mut stream = TcpStream::connect_timeout(&addr, timeout)?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-    let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: device\r\nConnection: close\r\nAccept: */*\r\n\r\n"
-    );
-    stream.write_all(request.as_bytes())?;
-    let mut raw = String::new();
-    stream.read_to_string(&mut raw)?;
-    let body = raw.split("\r\n\r\n").nth(1).unwrap_or(&raw);
-    Ok(body.to_string())
+    let mut stream = TcpStream::connect_timeout(&addr, remaining()?)?;
+    let request=format!("GET {path} HTTP/1.1\r\nHost: device\r\nConnection: close\r\nAccept: */*\r\n\r\n");
+    let mut pending=request.as_bytes();
+    while !pending.is_empty() {
+        stream.set_write_timeout(Some(remaining()?))?;
+        let n=stream.write(pending)?;if n==0 {return Err(anyhow!("device GET write closed"));}pending=&pending[n..];
+    }
+    let mut raw=Vec::new();let mut chunk=[0;4096];
+    loop {
+        stream.set_read_timeout(Some(remaining()?))?;
+        let n=stream.read(&mut chunk)?;if n==0 {break;}
+        if raw.len()+n>MAX_RESPONSE {return Err(anyhow!("device GET response exceeds limit"));}
+        raw.extend_from_slice(&chunk[..n]);
+    }
+    let raw=String::from_utf8(raw)?;
+    let (headers,body)=raw.split_once("\r\n\r\n").ok_or_else(||anyhow!("invalid device GET response"))?;
+    if headers.lines().next().and_then(|line|line.split_whitespace().nth(1))!=Some("200") {
+        return Err(anyhow!("device GET HTTP rejected"));
+    }
+    Ok(body.to_owned())
 }
 
 fn parse_device_addr(address: &str) -> Result<SocketAddr> {
@@ -174,6 +189,29 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
     use std::thread;
+
+    #[test]
+    fn recovery_get_has_one_deadline_even_with_continuous_progress() {
+        let listener=TcpListener::bind("127.0.0.1:0").unwrap();let address=listener.local_addr().unwrap();
+        let server=thread::spawn(move|| {
+            let (mut stream,_)=listener.accept().unwrap();let mut request=[0;1024];stream.read(&mut request).unwrap();
+            if stream.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n").is_err(){return;}
+            for _ in 0..15 {if stream.write_all(b"x").is_err(){break;}thread::sleep(Duration::from_millis(40));}
+        });
+        let started=std::time::Instant::now();
+        assert!(http_get(&address.to_string(),"/pmstats",Duration::from_millis(150)).is_err());
+        assert!(started.elapsed()<Duration::from_millis(400));server.join().unwrap();
+    }
+
+    #[test]
+    fn recovery_get_rejects_unbounded_response() {
+        let listener=TcpListener::bind("127.0.0.1:0").unwrap();let address=listener.local_addr().unwrap();
+        let server=thread::spawn(move|| {
+            let (mut stream,_)=listener.accept().unwrap();let mut request=[0;1024];stream.read(&mut request).unwrap();
+            let _=stream.write_all(&vec![b'x';70000]);
+        });
+        assert!(http_get(&address.to_string(),"/status.json",Duration::from_secs(2)).is_err());server.join().unwrap();
+    }
 
     #[test]
     fn bare_ipv4_defaults_to_port_80() {

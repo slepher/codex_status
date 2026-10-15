@@ -121,6 +121,7 @@ HTTP就绪、PowerPlan接受与CPU light-sleep分别记账。HTTP交接阶段20s
   ~8KB 模板——会冲掉唤醒路径缓存、light sleep 碎片化）、分钟检查用
   `millis()` 门控 1Hz（勿每轮 `timeKnown()/time()`）；改回原写法实测
   SLEEP 26%/CPU_MAX 62%（正常 ~92%/7%）。
+- **独立分钟调度（0.18.103-note4源码候选，部署见PROGRESS）**：会合可在任意秒发生，不能作为时钟刷新周期。深睡取整分钟与下次联系的较早截止，关闭射频后按该绝对时刻重算剩余微秒；不再把不足5秒的分钟跳过。网络到期的timer醒先尝试到期时钟，主循环1Hz分钟服务在网络处理/会合分支之前执行，所有面板操作仍串行。成功显示才登记该分钟，收尾同分钟无须再次刷新；显示失败有界重试、校时回拨重新显示。局刷后同步完整帧比较基线，避免随后网络图标刷新因旧时钟像素误判。会合/PowerPlan截止均不延长。慢面板、阻塞I/O和RTC硬件偏差仍需实机测量，不将宿主结果描述为硬实时保证。
 - 当前quad v14及Note4 codex-status-a v5只使用独立字段：BT看ble_manual_active，Wi-Fi看wifi_state/wifi_blink，Bridge看offline_mins，睡眠看mode。候选保存不自动发布；部署以PROGRESS为准。
 - **移除待机模板功能**：删除 `mode: idle/live` 元素语义（模板引擎/Rust
   canonical/Python 测试桥三端同步），模板改为单布局；`device.idle_reason`

@@ -39,7 +39,7 @@ static esp_err_t sleepExitCb(int64_t slept_us, void *);
 #endif
 static void armWakeSources(uint64_t timerUs);
 static void holdPinsForDeepSleep();
-static void deepSleepRaw(uint32_t sec);
+static void deepSleepRaw(uint32_t sec, uint64_t wakeEpochUs);
 static bool idleDeepDue();
 static void rememberActiveTemplate();
 
@@ -242,10 +242,10 @@ void releaseWakeHolds() {
 // Bare sleep: no Wi-Fi/BLE/panel calls at all, so it is safe on the thin wake
 // path where those drivers were never initialized (an uninitialized
 // WiFi.disconnect(true) is a known hang risk).
-static void deepSleepRaw(uint32_t sec) {
+static void deepSleepRaw(uint32_t sec, uint64_t wakeEpochUs) {
     dataLedStop();
     clock::flushNtpRtcSync();  // do not lose a successful SNTP correction at sleep/reset
-    if (sec < 2) sec = 2;
+    if (sec < 1) sec = 1;
     if (sec > 3600) sec = 3600;
     // Plan C telemetry: snapshot this wake's totals into RTC (RAM accounting
     // dies with the boot) for /status.json `deep.last_*` and /history.
@@ -267,16 +267,19 @@ static void deepSleepRaw(uint32_t sec) {
     clock::retained.rtcEpochUsAtSleep = clock::timeKnown() && gettimeofday(&wallAtSleep, nullptr) == 0
         ? (uint64_t)wallAtSleep.tv_sec * 1000000ULL + (uint64_t)wallAtSleep.tv_usec : 0;
     clock::retained.rtcClkUsAtSleep = esp_rtc_get_time_us();
-    armWakeSources((uint64_t)sec * 1000000ULL);
+    const uint64_t sleepUs = wakeEpochUs && clock::retained.rtcEpochUsAtSleep
+        ? displaySleepMicros(wakeEpochUs, clock::retained.rtcEpochUsAtSleep)
+        : (uint64_t)sec * 1000000ULL;
+    armWakeSources(sleepUs);
     diagnostics::setStage(90);
-    DevLog.printf("[pm] deep sleep %us (raw)\n", (unsigned)sec);
+    DevLog.printf("[pm] deep sleep %lluus (raw)\n", (unsigned long long)sleepUs);
     holdPinsForDeepSleep();
     esp_deep_sleep_start();
 }
 
 // Full transition cleanup (light -> deep and the network-window paths): put
 // the panel to sleep, stop BLE and disconnect Wi-Fi if it was ever up.
-void deepSleepFor(uint32_t sec) {
+void deepSleepFor(uint32_t sec, uint64_t wakeEpochUs) {
     application::captureStartupBoot();
     if (state.bleRecovery.lightRemaining(clock::v2NowMs()) || v2ManualBleHoldActive()) return;
 #if defined(CODEX_TARGET_NOTE4)
@@ -292,7 +295,7 @@ void deepSleepFor(uint32_t sec) {
     diagnostics::nvsStageMark(49);
     if (WiFi.getMode() != WIFI_MODE_NULL) WiFi.disconnect(true);
     diagnostics::nvsStageMark(50);
-    deepSleepRaw(sec);
+    deepSleepRaw(sec, wakeEpochUs);
 }
 
 void pollPlug() {
@@ -437,16 +440,12 @@ void enterDeep(const char *reason) {
 // Sleep to the next minute tick (clock reserved) or the next network contact;
 // records the wall-clock/RTC anchors used to reconstruct time on wake.
 void sleepToNextEvent() {
-    uint32_t secs = 60;
-    if (display::retained.clkR.valid) {
-        secs = clock::secsToNextMinute();
-    } else if (retained.rtcNextNetAt && clock::timeKnown() &&
-               (time_t)retained.rtcNextNetAt > time(nullptr)) {
-        long d = (long)((time_t)retained.rtcNextNetAt - time(nullptr));
-        secs = (uint32_t)(d > 3600 ? 3600 : (d < 2 ? 2 : d));
-    }
-    if (secs < 2) secs = 2;
-    deepSleepFor(secs);   // deepSleepRaw records the sleep-time anchors
+    const time_t now = time(nullptr);
+    const uint32_t secs = nextDisplayWakeSeconds(now,
+        display::retained.clkR.valid || display::retained.displayedMinute >= 0,
+                                                retained.rtcNextNetAt);
+    const uint64_t wakeEpochUs = now > 1600000000 ? ((uint64_t)now + secs) * 1000000ULL : 0;
+    deepSleepFor(secs, wakeEpochUs); // preserve the event deadline across radio cleanup
 }
 
 // Thin deep wake: panel + clock window only, no Wi-Fi/NVS/template work.

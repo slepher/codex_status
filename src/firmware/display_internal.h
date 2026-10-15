@@ -4,6 +4,7 @@
 #include "config.h"
 #include "dependencies.h"
 #include "network_display_state.h"
+#include "minute_clock.h"
 
 namespace firmware::display {
 
@@ -52,6 +53,7 @@ struct State {
 extern State state;
 
 struct Retained {
+    int64_t displayedMinute = -1; // last successfully displayed wall minute (RTC only)
     uint32_t rtcClockTicks = 0;    // clock window writes
     uint16_t rtcClkPartials = 0;   // clock window partials
 
@@ -82,6 +84,7 @@ void note4SaveFrameBaseline();
 bool note4RestoreFrameBaseline(bool thin);
 #endif
 bool clockTickWake();
+void serviceMinuteClock();
 #ifdef CODEX_CLK_WINDOW_TEST
 void clkTestTick();
 #endif
