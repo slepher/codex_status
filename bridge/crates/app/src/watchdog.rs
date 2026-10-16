@@ -13,6 +13,70 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const GIVE_UP_WINDOW_SECS: u64 = 300;
 const MAX_ABNORMAL: usize = 3;
+const BLE_RECOVERY_EXIT: i32 = 75;
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct BleRecovery {
+    pub state: String,
+    pub error: String,
+    pub stage: String,
+    pub action: String,
+    pub attempt: u32,
+    pub failed_at: u64,
+    pub retry_at: u64,
+    pub recovered_at: Option<u64>,
+}
+
+impl BleRecovery {
+    fn next(previous: Option<&Self>, now: u64, automatic: bool) -> Self {
+        // Only a sustained healthy interval resets the backoff.
+        let attempt = previous.filter(|p| p.recovered_at.is_none_or(|at| now.saturating_sub(at) < 300))
+            .map_or(1, |p| p.attempt.saturating_add(1));
+        let delay = match attempt { 1 => 5, 2 => 30, 3 => 120, _ => 300 };
+        Self { state: if automatic { "recovering" } else { "restart_required" }.into(),
+            error: "ble_native_quarantined_restart_required".into(), stage: "native_shutdown".into(),
+            action: if automatic { "wait_for_automatic_recovery" } else { "restart_managed_bridge" }.into(),
+            attempt, failed_at: now, retry_at: now.saturating_add(delay), recovered_at: None }
+    }
+}
+
+fn recovery_path() -> PathBuf { bridge_core::paths::data_root().join("ble-recovery.json") }
+pub(crate) fn ble_recovery() -> Option<BleRecovery> {
+    serde_json::from_slice(&fs::read(recovery_path()).ok()?).ok()
+}
+fn save_recovery(recovery: &BleRecovery) -> anyhow::Result<()> {
+    bridge_core::platform::store::write_json(&recovery_path(), recovery)
+}
+
+/// Called even when paused or permissions are unavailable. The old native
+/// process exits before the supervisor is allowed to construct its replacement.
+pub(crate) fn recover_ble(pending: &mut Option<BleRecovery>, quarantined: bool) {
+    if !quarantined { return; }
+    let automatic = cfg!(windows) || std::env::args().any(|arg| arg == "--managed-child");
+    if pending.is_none() {
+        let recovery = BleRecovery::next(ble_recovery().as_ref(), now_secs(), automatic);
+        if let Err(error) = save_recovery(&recovery) {
+            tracing::error!(%error, "Cannot persist BLE recovery status");
+        }
+        tracing::warn!(attempt=recovery.attempt, retry_at=recovery.retry_at, automatic,
+            error="ble_native_quarantined_restart_required", "BLE service isolated; recovery scheduled");
+        *pending = Some(recovery);
+    }
+    if automatic && pending.as_ref().is_some_and(|p| now_secs() >= p.retry_at) {
+        append_log("BLE recovery: ending isolated child before replacement");
+        std::process::exit(BLE_RECOVERY_EXIT);
+    }
+}
+
+pub(crate) fn ble_recovered() {
+    if let Some(mut recovery) = ble_recovery().filter(|r| r.recovered_at.is_none()) {
+        recovery.state = "recovered".into();
+        recovery.recovered_at = Some(now_secs());
+        if let Err(error) = save_recovery(&recovery) {
+            tracing::error!(%error, "Cannot persist successful BLE recovery");
+        }
+    }
+}
 
 fn log_path() -> PathBuf {
     let dir = bridge_core::paths::data_root().join("logs");
@@ -29,7 +93,11 @@ fn now_secs() -> u64 {
 
 fn read_recent_stamps() -> Vec<u64> {
     let now = now_secs();
-    fs::read_to_string(log_path())
+    recent_stamps_at(&log_path(), now)
+}
+
+fn recent_stamps_at(path: &std::path::Path, now: u64) -> Vec<u64> {
+    fs::read_to_string(path)
         .map(|text| {
             text.lines()
                 .filter_map(|line| line.strip_prefix("abnormal "))
@@ -41,11 +109,12 @@ fn read_recent_stamps() -> Vec<u64> {
         .unwrap_or_default()
 }
 
-fn append_log(line: &str) {
+fn append_log(line: &str) { append_log_at(&log_path(), line); }
+fn append_log_at(path: &std::path::Path, line: &str) {
     if let Ok(mut f) = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(log_path())
+        .open(path)
     {
         let _ = writeln!(f, "{line}");
     }
@@ -129,6 +198,10 @@ pub fn run(parent_pid: u32) -> ! {
         if code == 0 {
             std::process::exit(0);
         }
+        if code == BLE_RECOVERY_EXIT as u32 {
+            append_log("BLE recovery: isolated parent exited; relaunching");
+            std::process::exit(if relaunch() { 0 } else { 1 });
+        }
         let recent = read_recent_stamps();
         let now = now_secs();
         let count = recent.len() + 1;
@@ -158,22 +231,79 @@ pub fn run(_parent_pid: u32) -> ! {
 pub fn supervise() -> ! {
     use std::process::{Command, Stdio};
     let exe = std::env::current_exe().expect("supervised app path");
+    let mut command = Command::new(&exe);
+    command.arg("--managed-child").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    supervise_command(&mut command, &log_path());
+    std::process::exit(0);
+}
+
+#[cfg(target_os = "macos")]
+fn supervise_command(command: &mut std::process::Command, path: &std::path::Path) {
     loop {
-        let status = Command::new(&exe).arg("--managed-child")
-            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
-            .spawn().and_then(|mut child| child.wait());
+        let status = command.spawn().and_then(|mut child| child.wait());
         if status.as_ref().is_ok_and(|status| status.success()) {
-            append_log("managed child exited normally");
-            std::process::exit(0);
+            append_log_at(path, "managed child exited normally");
+            return;
+        }
+        if status.as_ref().is_ok_and(|status| status.code() == Some(BLE_RECOVERY_EXIT)) {
+            append_log_at(path, "BLE recovery: isolated child exited; relaunching");
+            continue;
         }
         let now = now_secs();
-        let count = read_recent_stamps().len() + 1;
-        append_log(&format!("abnormal {now} managed_exit recent={count}"));
+        let count = recent_stamps_at(path, now).len() + 1;
+        append_log_at(path, &format!("abnormal {now} managed_exit recent={count}"));
         if count >= MAX_ABNORMAL {
-            append_log("managed restart circuit open");
+            append_log_at(path, "managed restart circuit open");
             // Successful supervisor exit leaves launchd idle until explicit start.
-            std::process::exit(0);
+            return;
         }
         std::thread::sleep(std::time::Duration::from_secs(10));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ble_recovery_backoff_survives_restarts_and_does_not_clear_on_startup() {
+        let mut recovery = BleRecovery::next(None, 100, true);
+        assert_eq!(recovery.retry_at, 105);
+        for (at, delay) in [(110,30), (150,120), (280,300), (600,300)] {
+            let persisted = serde_json::from_slice::<BleRecovery>(&serde_json::to_vec(&recovery).unwrap()).unwrap();
+            assert_eq!(persisted.state, "recovering");
+            recovery = BleRecovery::next(Some(&persisted), at, true);
+            assert_eq!(recovery.retry_at - at, delay);
+        }
+        recovery.recovered_at = Some(601);
+        assert_eq!(BleRecovery::next(Some(&recovery), 650, true).attempt, 6);
+        assert_eq!(BleRecovery::next(Some(&recovery), 901, true).attempt, 1);
+        assert_eq!(BleRecovery::next(None,100,false).state,"restart_required");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn managed_ble_recovery_waits_for_old_child_and_bypasses_crash_circuit() {
+        use std::process::Command;
+        let stem = std::env::temp_dir().join(format!("bridge-recovery-{}-{}",std::process::id(),now_secs()));
+        let marker = stem.with_extension("children");
+        let log = stem.with_extension("log");
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(r#"
+            if test -f "$1"; then
+                old=$(tail -1 "$1")
+                if kill -0 "$old" 2>/dev/null; then exit 9; fi
+            fi
+            echo $$ >> "$1"
+            if test "$(wc -l < "$1")" -lt 5; then exit 75; fi
+            exit 0
+        "#).arg("recovery-test").arg(&marker);
+        supervise_command(&mut command, &log);
+        assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(),5);
+        let text=fs::read_to_string(&log).unwrap();
+        assert_eq!(text.matches("isolated child exited").count(),4);
+        assert!(!text.contains("abnormal"));
+        assert!(text.contains("exited normally"));
+        fs::remove_file(marker).unwrap(); fs::remove_file(log).unwrap();
     }
 }

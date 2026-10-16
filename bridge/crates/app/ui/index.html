@@ -386,7 +386,7 @@
           <div class="menus"><button onclick="refreshDeviceCache()">刷新缓存</button>
             <button onclick="refreshPlatformStatus()">从设备读取</button></div></div>
         <div class="row" id="dev-contact-row"><span>最近认证联系</span><span id="dev-contact">尚无</span></div>
-        <div class="sub" id="dev-sample-note">普通缓存读取不会联系设备。</div>
+        <div class="sub" id="dev-sample-note" style="white-space:pre-line">普通缓存读取不会联系设备。</div>
       </div>
       <div class="card">
         <h2>固件与升级</h2>
@@ -1597,6 +1597,12 @@
       $('dev-sample-note').textContent = d.contact.wifi_sampled_at
         ? `上次完整状态回报：${eventTime(d.contact.wifi_sampled_at)} · Wi-Fi`
         : '尚无完整 Wi-Fi 状态回报；普通缓存读取不会联系设备。';
+      const recovery = d.contact.ble_recovery;
+      if (recovery && recovery.state !== 'recovered') {
+        $('dev-sample-note').textContent += recovery.state === 'restart_required'
+          ? '\n蓝牙操作未确认结束；请从托管入口重新启动 Bridge。'
+          : `\n蓝牙操作未确认结束，正在自动恢复（第 ${recovery.attempt} 次）；恢复后等待设备下次联系，无需按 BOOT。`;
+      }
       $('dev-fw').textContent = showReading(d.firmware.current);
       $('dev-latest').textContent = d.firmware.latest?.value
         ? `${d.firmware.latest.value} · 登记于 ${eventTime(d.firmware.latest.published_at)}`
@@ -1892,7 +1898,7 @@
           const on = d.device_mac === selected;
           return `<div class="prow pick${on ? ' current' : ''}" onclick="pickDevice('${escapeAttr(d.device_mac)}')">` +
             `<span class="name"><b>${escapeHtml(d.name || fallbackDeviceName(d))}</b>` +
-            `<small>${escapeHtml(d.model || '型号未知')} · ${escapeHtml(d.device_mac.slice(-6))} · ${escapeHtml(d.status || '尚无认证联系')}${d.attention?.length ? ' · ' + escapeHtml(d.attention.map(kind=>({firmware_upgrade:'有可用固件升级',firmware_version:'固件版本需核对',upgrade_failed:'升级失败需处理',display_failed:'屏幕显示失败',contact_blocked:'设备认证或占用受阻'}[kind]||'设备状态需核对')).join(' · ')) : ''}</small></span>` +
+            `<small>${escapeHtml(d.model || '型号未知')} · ${escapeHtml(d.device_mac.slice(-6))} · ${escapeHtml(d.status || '尚无认证联系')}${d.attention?.length ? ' · ' + escapeHtml(d.attention.map(kind=>({firmware_upgrade:'有可用固件升级',firmware_version:'固件版本需核对',upgrade_failed:'升级失败需处理',display_failed:'屏幕显示失败',contact_blocked:'设备认证或占用受阻',ble_recovery:'蓝牙异常，正在恢复'}[kind]||'设备状态需核对')).join(' · ')) : ''}</small></span>` +
             `<span class="ctl">${on ? '<span class="badge">当前</span>' : ''}</span></div>`;
         }).join('')
       : '<div class="todo" style="padding:10px">尚无已登记设备；先按键唤醒设备并重新发现。</div>';

@@ -624,14 +624,18 @@ fn project_device(raw: &Value, identity: &Value, now: u64) -> Value {
     let wifi_at = raw["last_authenticated"]["observed_at"].as_u64().unwrap_or(0);
     let contact_at = raw["last_authenticated_contact_at"].as_u64();
     let attempt = &raw["last_status_attempt"];
+    let recovery = &raw["ble_recovery"];
+    let ble_recovering = matches!(recovery["state"].as_str(), Some("recovering" | "restart_required"));
     let blocked = matches!(attempt["outcome"].as_str(), Some("blocked" | "mac_mismatch"))
         && attempt["at"].as_u64().unwrap_or(0) >= contact_at.unwrap_or(0);
     let recent = contact_at.is_some_and(|at| at <= now && now - at <= 30);
     let expected_sleep = body["power"]["mode"] == "sleep"
         || raw["record_observed"]["power"]["mode"] == "sleep";
-    let contact_state = if blocked { "blocked" } else if recent { "recently_authenticated" }
+    let contact_state = if ble_recovering { "ble_recovering" } else if blocked { "blocked" } else if recent { "recently_authenticated" }
         else if expected_sleep { "expected_sleep" } else { "waiting" };
     let contact_label = match contact_state {
+        "ble_recovering" if recovery["state"] == "restart_required" => "蓝牙异常，需要重新启动 Bridge",
+        "ble_recovering" => "蓝牙异常，正在自动恢复",
         "blocked" => "认证或占用受阻", "recently_authenticated" => "最近已认证",
         "expected_sleep" => "预计休眠", _ => "等待下次联系",
     };
@@ -709,6 +713,7 @@ fn project_device(raw: &Value, identity: &Value, now: u64) -> Value {
     if upgrade_failure.is_some() { attention.push("upgrade_failed"); }
     if display_state["value"] == "failed" { attention.push("display_failed"); }
     if blocked { attention.push("contact_blocked"); }
+    if ble_recovering { attention.push("ble_recovery"); }
     json!({
         "device_mac":mac,
         "identity":{"name":identity["name"].as_str().filter(|name| !name.is_empty())
@@ -716,7 +721,7 @@ fn project_device(raw: &Value, identity: &Value, now: u64) -> Value {
             "zectrix-note4-400x300" => "Note4 400×300",
             "codex-status-154g" => "书桌屏 200×200", _ => target},
             "source":"bridge_registration"},
-        "contact":{"state":contact_state,"label":contact_label,"last_authenticated_at":contact_at,
+        "contact":{"state":contact_state,"label":contact_label,"ble_recovery":recovery,"last_authenticated_at":contact_at,
             "transport":raw["last_authenticated_transport"],
             "wifi_sampled_at":raw["last_authenticated"]["observed_at"],
             "last_attempt_at":attempt["at"]},
@@ -733,6 +738,21 @@ fn project_device(raw: &Value, identity: &Value, now: u64) -> Value {
             "owner_name":identity["owner"]["name"],"source":identity["owner_source"]},
         "attention":attention,
     })
+}
+
+#[cfg(test)]
+#[test]
+fn isolated_ble_is_visible_even_with_recent_http_and_survives_new_process() {
+    let mut raw = json!({"device_mac":"AABBCCDDEEFF", "last_authenticated_contact_at":99,
+        "last_authenticated":{"observed_at":99,"body":{"fw":"1.0","power":{"mode":"sleep"}}},
+        "ble_recovery":{"state":"recovering","attempt":2,"retry_at":130}});
+    let view = project_device(&raw, &Value::Null, 100);
+    assert_eq!(view["contact"]["state"], "ble_recovering");
+    assert_eq!(view["contact"]["label"], "蓝牙异常，正在自动恢复");
+    assert!(view["attention"].as_array().unwrap().contains(&json!("ble_recovery")));
+    assert_eq!(view["contact"]["last_authenticated_at"],99);
+    raw["ble_recovery"]["state"]=json!("recovered");
+    assert_eq!(project_device(&raw,&Value::Null,100)["contact"]["state"],"recently_authenticated");
 }
 
 #[cfg(test)]
@@ -851,7 +871,9 @@ pub fn device_view(ctx: &AppCtx, requested_mac: Option<&str>) -> Result<Value, S
         let device_mac = row["device_mac"].as_str().unwrap_or("");
         let identity = crate::device_facts_for(ctx, device_mac)
             .map(|facts| crate::device_facts_json(&facts)).unwrap_or(Value::Null);
-        project_device(row, &identity, device_now(device_mac))
+        let mut row = row.clone();
+        row["ble_recovery"] = serde_json::to_value(crate::watchdog::ble_recovery()).unwrap_or(Value::Null);
+        project_device(&row, &identity, device_now(device_mac))
     }).collect();
     let devices: Vec<Value> = views.iter().map(|view| json!({
         "device_mac":view["device_mac"],"name":view["identity"]["name"],

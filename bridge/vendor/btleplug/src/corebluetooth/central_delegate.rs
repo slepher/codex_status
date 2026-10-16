@@ -20,7 +20,7 @@ use super::utils::nsstring_to_string;
 use super::utils::{core_bluetooth::cbuuid_to_uuid, nsuuid_to_uuid};
 use futures::channel::mpsc::Sender;
 use futures::sink::SinkExt;
-use log::{error, trace};
+use log::{error, trace, warn};
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{declare_class, msg_send_id, mutability, rc::Retained, ClassType, DeclaredClass};
 use objc2_core_bluetooth::{
@@ -83,6 +83,10 @@ pub enum CentralDelegateEvent {
     },
     ConnectedDevice {
         peripheral_uuid: Uuid,
+    },
+    DiscoveryFailed {
+        peripheral_uuid: Uuid,
+        stage: &'static str,
     },
     ConnectionFailed {
         peripheral_uuid: Uuid,
@@ -179,6 +183,8 @@ impl Debug for CentralDelegateEvent {
                 .debug_struct("ConnectedDevice")
                 .field("peripheral_uuid", peripheral_uuid)
                 .finish(),
+            CentralDelegateEvent::DiscoveryFailed { peripheral_uuid, stage } => f
+                .debug_struct("DiscoveryFailed").field("peripheral_uuid", peripheral_uuid).field("stage", stage).finish(),
             CentralDelegateEvent::ConnectionFailed {
                 peripheral_uuid,
                 error_description,
@@ -471,6 +477,14 @@ declare_class!(
                 peripheral_debug(peripheral),
                 localized_description(error)
             );
+            if error.is_some() {
+                warn!("BLE native discovery error stage=services code={}", error.unwrap().code());
+                self.send_event(CentralDelegateEvent::DiscoveryFailed {
+                    peripheral_uuid: nsuuid_to_uuid(unsafe { &peripheral.identifier() }),
+                    stage: "services",
+                });
+                return;
+            }
             if error.is_none() {
                 let services = unsafe { peripheral.services() }.unwrap_or_default();
                 let mut service_map = HashMap::new();
@@ -527,6 +541,14 @@ declare_class!(
                 service_debug(service),
                 localized_description(error)
             );
+            if error.is_some() {
+                warn!("BLE native discovery error stage=characteristics code={}", error.unwrap().code());
+                self.send_event(CentralDelegateEvent::DiscoveryFailed {
+                    peripheral_uuid: nsuuid_to_uuid(unsafe { &peripheral.identifier() }),
+                    stage: "characteristics",
+                });
+                return;
+            }
             if error.is_none() {
                 let mut characteristics = HashMap::new();
                 let chars = unsafe { service.characteristics() }.unwrap_or_default();
@@ -559,6 +581,14 @@ declare_class!(
                 characteristic_debug(characteristic),
                 localized_description(error)
             );
+            if error.is_some() {
+                warn!("BLE native discovery error stage=descriptors code={}", error.unwrap().code());
+                self.send_event(CentralDelegateEvent::DiscoveryFailed {
+                    peripheral_uuid: nsuuid_to_uuid(unsafe { &peripheral.identifier() }),
+                    stage: "descriptors",
+                });
+                return;
+            }
             if error.is_none() {
                 let mut descriptors = HashMap::new();
                 let descs = unsafe { characteristic.descriptors() }.unwrap_or_default();

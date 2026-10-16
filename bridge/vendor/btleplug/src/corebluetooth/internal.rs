@@ -23,7 +23,7 @@ use futures::channel::mpsc::{self, Receiver, Sender};
 use futures::select;
 use futures::sink::SinkExt;
 use futures::stream::{Fuse, StreamExt};
-use log::{error, trace, warn};
+use log::{error, info, trace, warn};
 use objc2::{msg_send_id, ClassType};
 use objc2::{rc::Retained, runtime::AnyObject};
 use objc2_core_bluetooth::{
@@ -285,9 +285,7 @@ impl PeripheralInternal {
         // back a Connected reply to the waiting future with all of the
         // characteristic info in it.
         if !self.services.values().any(|service| !service.discovered) {
-            if self.connected_future_state.is_none() {
-                panic!("We should still have a future at this point!");
-            }
+            if self.connected_future_state.is_none() { return; }
             let services = self
                 .services
                 .iter()
@@ -317,6 +315,7 @@ impl PeripheralInternal {
                         .collect(),
                 })
                 .collect();
+            info!("BLE native stage=discovery_complete");
             self.connected_future_state
                 .take()
                 .unwrap()
@@ -632,6 +631,8 @@ impl CoreBluetoothInternal {
                 })
                 .collect();
             p.services = services;
+            info!("BLE native stage=services count={}", p.services.len());
+            p.check_discovered();
         }
     }
 
@@ -650,6 +651,7 @@ impl CoreBluetoothInternal {
             trace!("{}", id);
         }
         if let Some(p) = self.peripherals.get_mut(&peripheral_uuid) {
+            info!("BLE native stage=characteristics count={}", characteristics.len());
             p.set_characteristics(service_uuid, characteristics);
         }
     }
@@ -671,11 +673,13 @@ impl CoreBluetoothInternal {
             trace!("{}", id);
         }
         if let Some(p) = self.peripherals.get_mut(&peripheral_uuid) {
+            info!("BLE native stage=descriptors count={}", descriptors.len());
             p.set_characteristic_descriptors(service_uuid, characteristic_uuid, descriptors);
         }
     }
 
     fn on_peripheral_connect(&mut self, _peripheral_uuid: Uuid) {
+        info!("BLE native stage=link_connected");
         // Don't actually do anything here. The peripheral will fire the future
         // itself when it receives all of its service/characteristic info.
     }
@@ -1100,6 +1104,10 @@ impl CoreBluetoothInternal {
                     }
                     CentralDelegateEvent::ConnectedDevice{peripheral_uuid} => {
                             self.on_peripheral_connect(peripheral_uuid)
+                    },
+                    CentralDelegateEvent::DiscoveryFailed { peripheral_uuid, stage } => {
+                        warn!("BLE native discovery failed stage={stage}");
+                        self.on_peripheral_connection_failed(peripheral_uuid, Some(format!("ble_discovery_failed:{stage}")));
                     },
                     CentralDelegateEvent::ConnectionFailed{peripheral_uuid, error_description} => {
                         self.on_peripheral_connection_failed(peripheral_uuid, error_description)

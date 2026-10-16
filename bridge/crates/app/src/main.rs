@@ -3487,7 +3487,9 @@ async fn run_services(ctx: Arc<AppCtx>) {
     // endpoint write or implicit registration.
     // Preserve the 250 ms cadence and per-device attempt throttling.
     let mut last_device_attempt = HashMap::<String, i64>::new();
+    let mut ble_recovery = None;
     loop {
+        watchdog::recover_ble(&mut ble_recovery, bridge_ble::native_quarantined());
         if ctx.status.lock().unwrap().paused {
             tokio::time::sleep(Duration::from_secs(2)).await;
             continue;
@@ -3509,9 +3511,12 @@ async fn run_services(ctx: Arc<AppCtx>) {
                 Ok(platform::BleOpportunity::NoDevice) => {}
                 Ok(platform::BleOpportunity::Connected { mac, result }) => {
                     last_device_attempt.insert(mac.clone(), device_now_secs(&mac));
+                    if !bridge_ble::native_quarantined() { watchdog::ble_recovered(); }
                     match result {
-                        Ok(()) => tracing::info!(event = "result", device_mac = %mac,
-                            transport = "ble", "device rendezvous complete"),
+                        Ok(()) => {
+                            tracing::info!(event = "result", device_mac = %mac,
+                                transport = "ble", "device rendezvous complete");
+                        },
                         Err(error) => tracing::warn!(event = "result", device_mac = %mac,
                             transport = "ble", error_category = safe_device_error_category(&error),
                             "device rendezvous failed"),
@@ -3607,7 +3612,7 @@ fn main() {
 
     let instance = instance::Instance::from_env().unwrap_or_else(|error| panic!("{error}"));
     #[cfg(target_os = "macos")]
-    if argv.iter().any(|arg| arg == "--managed-supervisor") { watchdog::supervise(); }
+    if !argv.iter().any(|arg| arg == "--managed-child") { watchdog::supervise(); }
     #[cfg(any(windows, unix))]
     let _instance_lock = instance::acquire(&instance).unwrap_or_else(|error| panic!("{error}"));
 

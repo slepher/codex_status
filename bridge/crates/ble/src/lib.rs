@@ -53,6 +53,8 @@ impl std::error::Error for EndpointFailure {}
 
 // 0: idle, 1: native operation/link reserved, 2: unknown; restart is required.
 static NATIVE_RADIO_STATE: AtomicU8 = AtomicU8::new(0);
+/// Unknown native operations can only be retired by ending their process.
+pub fn native_quarantined() -> bool { NATIVE_RADIO_STATE.load(Ordering::Acquire) == 2 }
 // Simulation uses the production reservation logic, isolated from the physical radio.
 static SIM_RADIO_STATE: AtomicU8 = AtomicU8::new(0);
 static EMPTY_SCAN_SUMMARY: OnceLock<Mutex<EmptyScanSummary>> = OnceLock::new();
@@ -229,11 +231,17 @@ where F: Future<Output = Result<()>>
             anyhow::ensure!(tokio::time::Instant::now() < work_deadline, "ble_open_budget_exhausted");
             // Retry only a completed native error. A timeout may still connect
             // later, so a second native connect would overlap the first.
+            let started = Instant::now();
+            tracing::info!(scan_id, stage="connect_and_discovery", attempt, "BLE native open started");
             match tokio::time::timeout_at(work_deadline.min(tokio::time::Instant::now() + Duration::from_secs(4)), connect()).await {
                 Ok(Ok(())) => return tokio::time::timeout_at(work_deadline, setup).await.context("ble_setup_timeout")?,
                 Ok(Err(error)) if attempt == 1 => return Err(error.context("ble_connect_failed")),
                 Ok(Err(_)) => tokio::time::sleep_until(work_deadline.min(tokio::time::Instant::now() + Duration::from_millis(120))).await,
-                Err(error) => return Err(anyhow::Error::new(error).context("ble_connect_timeout")),
+                Err(error) => {
+                    tracing::warn!(scan_id, stage="connect_and_discovery", elapsed_ms=started.elapsed().as_millis() as u64,
+                        error="ble_connect_timeout", "BLE native open deadline exhausted");
+                    return Err(anyhow::Error::new(error).context("ble_connect_timeout"));
+                },
             }
         }
         unreachable!()
@@ -1894,6 +1902,26 @@ mod tests {
                 Ok(None)
             }, async { Ok(()) }).await.unwrap().is_none());
         assert_eq!(state.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn discovery_error_completes_native_future_without_timeout_quarantine() {
+        use super::{open_link, AtomicU8, Ordering, CLOSE_BUDGET};
+        use btleplug::connection_lifecycle::{self, future::BtlePlugFuture};
+        for stage in ["services", "characteristics", "descriptors"] {
+            let state = AtomicU8::new(0);
+            let result = open_link::<(), _>(&state, 1, CLOSE_BUDGET + Duration::from_millis(300),
+                || async {
+                    let future = BtlePlugFuture::default();
+                    let mut pending = Some(future.get_state_clone());
+                    // The native DiscoveryFailed handler uses this same completion
+                    // sink for the connect awaiting service/characteristic discovery.
+                    connection_lifecycle::complete(&mut pending, Err::<(),_>(format!("ble_discovery_failed:{stage}")));
+                    future.await.map_err(anyhow::Error::msg)
+                }, async { panic!("failed discovery must not enter setup") }, async { Ok(()) }).await;
+            assert!(format!("{:#}",result.unwrap_err()).contains(stage));
+            assert_eq!(state.load(Ordering::Acquire),0);
+        }
     }
 
     #[tokio::test]
