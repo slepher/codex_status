@@ -344,6 +344,12 @@
 
 - **2026-10-16 REA RISC-V裸BIN工具计划**：在同父目录`rea`复用ARM裸BIN路径，补RV32/RV64准入、语言/profile与验证，并独立处理AP01加载基址/入口分离；关联上游[#4246](https://github.com/morluto/rea/issues/4246)。[实施计划、验收与源码依据](../../project-workflow/ap01/rea-riscv-bin-plan.md)。当前仅完成克隆/源码核对和计划，未实现、未安装；不恢复AP01额外逆向，不改现场。
 
+- **2026-10-15 AP01维护核心已构建**：认证/流式事务/单份安装仲裁/未知结果查询/恢复记录核心通过宿主与RV32同组故障回归，代码3330 B、核心栈链256 B；[产物和限制](../../project-workflow/ap01/maintenance-build-20261015.md)。现有破解材料无原厂完整源码，缺独立任务/HTTP、持久认证、原厂共用排他、安全停机/安装/UI适配；无额外逆向、无新ROM/刷机，整项维护服务保持未完成，不以核心ELF代替完整ROM。
+
+- **2026-10-15 AP01后续约束**：以同父目录已存在的0031破解包/源码/清单/SOP推进，不额外逆向。已核对看板opt包指纹及米家OTA安装器，未找到现成直接切槽入口；公开包须个人化后才能用于部署。[包核对](../../project-workflow/ap01/independent-maintenance-20261015.md#最新约束已有破解包核对)优先于此前逆向接续安排。
+
+- **2026-10-15 AP01独立维护**：用户确认新增独立维护界面及更新服务、业务停机可修复、原厂米家OTA窗口逻辑保留。[设计/定位](../../project-workflow/ap01/independent-maintenance-20261015.md)及精确0031工具自检完成；1秒原厂回调是点号动画，不是OTA接收窗口。常驻任务/网络、认证、原厂排他及文件App安装仍待实施，无新ROM/刷机；不承诺解决底座启动失败或内存越界。
+
 - **2026-10-14 AP01最新决策**：0031、无fallback、OTA与常规通信/绘图双进程；改用Wi-Fi双屏4位固定码＋旋钮确认，仅防误绑定，首版不要求严格加密/SMP。持久多对多、单owner、300秒租约/60秒续约，有效owner不弹新码。具体[方案](../../project-workflow/ap01/screen-binding-design-20261014.md)已完成；旋钮/UI/常驻HTTP、绑定存储及Bridge适配/实机待实施。原厂ATT固定拒绝的[历史调查](../../project-workflow/ap01/ble-binding-20261014.md)保留，不能标已绑定/可刷。
 
 - **2026-10-11 源码实现与候选验证**：共享固件 Bundle 改为单份内容与短小回执，Bridge 使用动态容量；原生固件 OTA 双槽保留，覆盖全部共享固件目标。用户进一步明确允许临时下载文件，下载期间继续运行，完成后才停用内容并覆盖。
@@ -376,6 +382,11 @@
 - 前置：C3 的记录格式（否则没有可信的对照口径）。
 
 ### C8. 设备同步与诊断协议（device-sync-diagnostics）
+
+- **2026-10-16隔夜断连/自动恢复修复已部署，授权后自然恢复通过**：昨晚服务发现未完成与11:40系统加密失败719都经4s超时进入隔离，休眠不是必要触发。11:58部署supervisor退避重建、持久化UI/MCP错误提示及发现失败回执，保留未知隔离；App107/BLE28/回放3/Node/WK68和supervisor红→绿通过。两项权限allowed后14:03自然wake2104完成Plan4050/认证HTTP/sync，独立认证MAC/.104/Bridge可达；正式Sleep4051后14:05自然wake2106再次会合。9旧Wi-Fi作业哈希不变，无BOOT/刷机/手动重启。真实隔离后自动child重建尚未现场触发，最初原生失败深层原因与长期矩阵仍开放。[证据/部署/边界](../../project-workflow/bridge-macos/sleep-resume-disconnect-20261016.md)。
+- **2026-10-15 .104已正式部署**：用户授权后OTA d1199896一次succeeded/image_verified，独立完整hash/MAC/版本/ota_0一致，.103保留ota_1。SPI初始化自锁宿主red→green与实际ELF门禁通过；电池deep网络醒的实机复测仍开放，不以部署代替。[部署证据](../../project-workflow/bridge-macos/clock-stall-20261015.md)。
+- **2026-10-15停钟自锁已复现/修复，.104候选未部署**：DEV_Module_Init先GPIO_Config再查spiReady，二次初始化拆SCK→spiStopBus重取本任务已持有mutex；.103/.104匹配ELF与生产/HAL red→green、100重入ASan/UBSan、分钟/模块/栈门禁通过。与15:36现场高度吻合，缺原CPU栈，实机候选验收仍开放。[根因/候选/边界](../../project-workflow/bridge-macos/clock-stall-20261015.md)。
+- **2026-10-15新增停钟/失联现场**：用户报告停15:36且在Mac附近/电池供电；最后BLE会合15:34:59成功，随后目标不可见，17:27直连Host is down。USB无控制线监听/只读status、log无新回应，BOOT短按无变化。用户授权读取dump：23620B/CRC有效但ELF指纹不属.103，不能归因本次；工具复位已单记，未擦写Flash，根因仍待查。[调查](../../project-workflow/bridge-macos/clock-stall-20261015.md)。
 - **2026-10-15独立分钟时钟.103已部署**：分钟/会合解耦及绝对唤醒截止，Fake ROM :58跨:00先red后green、69全套及固件门禁通过。14:48正式OTA后完整运行hash/版本/ota_1认证一致；用户14:49确认“时钟已及时更新，不做进一步复测”，停止追加验收。本轮未取得实机跨界秒级配对，不扩大为全部场景定量保证。[实施/部署](../../project-workflow/bridge-macos/independent-clock-20261015.md)。
 - **2026-10-15分钟显示延迟实测**：在线light两次时钟渲染774/761ms，整分后≤3.13/2.73s完成，认证钟差[-2.14,-0.14]s；未复现用户此前10s，用户14:22:17目视更新与wake1188的16.581会合结束吻合；确认deep网络醒会合后才刷钟，启动/RTC分段仍待测。另见RTC短读后恢复、局刷回退全刷1362ms，原因未归并，未改ROM。[测量与边界](../../project-workflow/bridge-macos/clock-display-delay-20261015.md)。
 - **2026-10-15统一预算修复已部署，14:00自然恢复通过**：四条BLE路径取消/分页错误、HTTP proof/claim、RPC及恢复GET已收口；310通过/3既有忽略。Bridge/data备份及health204通过，9作业不变。用户完成新版macOS权限授权后，timer wake1186完成Plan4011→认证HTTP proof/同步；独立认证HTTP ready/Bridge reachable，manual/provisional0、9旧作业哈希不变。两条ACK未知如实保留，由HTTP确认恢复；长期RF/原生连接矩阵仍开放。[实施与下一步](../../project-workflow/bridge-macos/timeout-budget-followup-20261015.md)。
