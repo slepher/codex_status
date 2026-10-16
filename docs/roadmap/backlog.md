@@ -342,6 +342,8 @@
 
 ### C9. 取消项目自管A/B、动态容量与内置更新界面
 
+- **2026-10-16 REA RISC-V裸BIN工具计划**：在同父目录`rea`复用ARM裸BIN路径，补RV32/RV64准入、语言/profile与验证，并独立处理AP01加载基址/入口分离；关联上游[#4246](https://github.com/morluto/rea/issues/4246)。[实施计划、验收与源码依据](../../project-workflow/ap01/rea-riscv-bin-plan.md)。当前仅完成克隆/源码核对和计划，未实现、未安装；不恢复AP01额外逆向，不改现场。
+
 - **2026-10-14 AP01最新决策**：0031、无fallback、OTA与常规通信/绘图双进程；改用Wi-Fi双屏4位固定码＋旋钮确认，仅防误绑定，首版不要求严格加密/SMP。持久多对多、单owner、300秒租约/60秒续约，有效owner不弹新码。具体[方案](../../project-workflow/ap01/screen-binding-design-20261014.md)已完成；旋钮/UI/常驻HTTP、绑定存储及Bridge适配/实机待实施。原厂ATT固定拒绝的[历史调查](../../project-workflow/ap01/ble-binding-20261014.md)保留，不能标已绑定/可刷。
 
 - **2026-10-11 源码实现与候选验证**：共享固件 Bundle 改为单份内容与短小回执，Bridge 使用动态容量；原生固件 OTA 双槽保留，覆盖全部共享固件目标。用户进一步明确允许临时下载文件，下载期间继续运行，完成后才停用内容并覆盖。

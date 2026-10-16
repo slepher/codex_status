@@ -19,4 +19,6 @@
 
 **C9/AP01**：Wi-Fi双屏4位码＋旋钮确认方案已定；[设计](project-workflow/ap01/screen-binding-design-20261014.md)完成，实施/实机待做，未刷候选。
 
+**C9/REA工具计划（10月16日）**：同父目录`rea`已克隆并核对6.5.0与当前源码；[RISC-V裸BIN计划](project-workflow/ap01/rea-riscv-bin-plan.md)已登记，覆盖准入/profile及AP01基址与入口分离。仅计划，未实现/安装/真实Ghidra验收，不恢复额外逆向。
+
 待办唯一来源：[backlog](docs/roadmap/backlog.md)；[操作细则](docs/agent-operations.md)；[此前快照](docs/history/progress-archive-2026-10-15.md)。
