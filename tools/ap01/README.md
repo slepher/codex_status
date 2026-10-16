@@ -1,5 +1,27 @@
 # AP01 研究与离线构建工具
 
+## 维护核心离线构建
+
+`build_maintenance.py`只读核对现有0031-opt/opt-setting及清单，复用原校验器检查允许修改范围和尾部CRC，编译本仓库维护核心，执行宿主检查与同一套RV32模拟测试，输出栈/尺寸/源码与产物哈希。只生成静态库和核心ELF，**没有设备任务/HTTP/存储/安装/UI适配，不生成完整ROM**；不联网、不访问设备、不修改旁仓库、不创建目录。使用本机已有LLVM23和Rust所带链接器，以及既有Unicorn2.1.4；不用原Linux构建工具在macOS上冒充成功。
+
+```sh
+python3 -B tools/ap01/build_maintenance.py --output <已提权预建的AP01产物目录> --require-rom
+```
+
+`--require-rom`在核心验证通过后仍返回2并记录`rom_ready=false`，表示设备接口缺失；去掉该参数仅检查核心构建。已有同名最终报告拒绝覆盖。现有固件没有完整原厂源码，本轮遵循“不额外逆向”，缺失接口见[实施记录](../../project-workflow/ap01/maintenance-build-20261015.md)。
+
+## 0031 原厂OTA与独立维护定位
+
+`inspect_ota.py`复用0031精确校验/基本块分析，只读提取原厂OTA弹窗、点号定时回调、原生更新I/O等7个窗口及候选引用；不创建目录、不联网、不构建或刷机。输出含原字节与哈希，不定义可调用ABI或完整函数边界。
+
+```sh
+PYTHONPATH=artifacts/ap01-research/ble0031-20261014/deps python3 -B tools/ap01/inspect_ota.py \
+  --image artifacts/ap01-research/ble0031-20261014/ap01-1.0.2_0031.bin \
+  --output <既有目录中的新报告.json> --self-test
+```
+
+输出已存在则拒绝，自检覆盖真实timer call目标、UI引用及变异/截断拒绝。[维护设计/证据边界](../../project-workflow/ap01/independent-maintenance-20261015.md)不代表已实现常驻服务。
+
 ## 0031 最小XIP App候选
 
 `build_app_rom.py`读取精确原厂0031和已验证的优化GIF，使用只读克隆中现有WSL RV32 GCC工具链编译本仓库`firmware/ap01`，输出完整更新容器、App包、ELF/map/dis/su及源码/成品哈希清单。不联网、读凭据或访问设备，不创建目录，不覆盖既有产物；先按AGENTS提权预建输出目录。WSL需提权工具调用，普通沙箱会E_ACCESSDENIED。GIF逐帧无损验证用WSL现有Pillow。
