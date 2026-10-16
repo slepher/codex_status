@@ -64,6 +64,11 @@ Info:
 ******************************************************************************/
 UBYTE DEV_Module_Init(void)
 {
+    // A thin clock wake can be followed by full panel init in the same boot.
+    // Reconfiguring SCK/MOSI would detach the active SPI bus and try to take
+    // the mutex already held by our transaction. Guard GPIO and USB too.
+    static bool spiReady = false;
+    if (spiReady) return 0;
 	//gpio
 	GPIO_Config();
 
@@ -76,8 +81,6 @@ UBYTE DEV_Module_Init(void)
 	// non-locking path while `_inTransaction`), so a second beginTransaction()
 	// would block forever on our own lock. Do it once per boot: a deep network
 	// wake used to call epdBegin() after setup's epdBegin() and hung there.
-	static bool spiReady = false;
-	if (spiReady) return 0;
 	spiReady = true;
 	SPI.begin(EPD_SCK_PIN, -1, EPD_MOSI_PIN, -1);
 	SPI.beginTransaction(SPISettings(20000000, MSBFIRST, SPI_MODE0));
