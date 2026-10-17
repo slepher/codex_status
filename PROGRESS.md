@@ -1,20 +1,21 @@
 # Codex Status 当前交接
 
-更新时间：2026-10-17（AP01 QEMU/OTA已验证；主界面显示待续，不刷实机）
+更新时间：2026-10-18（AP01 逆向与模拟材料已迁出到同父目录 `cuktech-ap01-firmware`；本仓库只保留 AP01 对接职责）
 
 ## 当前现场
 
-- Note4 **7C4FADB93408**：**0.18.104-note4 / ota_0**，已OTA部署并认证image_verified；Bridge 10月16日部署版不变。ROM/Bridge指纹、数据备份及其它专项原交接完整保存在[10月17日快照](docs/history/progress-archive-2026-10-17-ap01-qemu.md)。
-- AP01现场为**0031**，没有备份/USB恢复途径；本轮未访问/刷写设备、未启停Bridge。QEMU测试进程已退出，无正在运行的演示窗口或OTA监听。
+- Note4 **7C4FADB93408**：**0.18.104-note4 / ota_0**，已OTA部署并认证image_verified；Bridge 10月16日部署版不变。历史交接按日期存于 `docs/history/`。
+- AP01 现场版本仍取用户报告（未访问/刷写设备、未读凭据、未启停Bridge、未开公网/局域网服务）。
+- **2026-10-18 结构变更**：AP01 原厂 ROM、逆向报告与知识、QEMU/REA 证据、Ghidra 项目及构建工具已迁至同父目录 `cuktech-ap01-firmware` 仓库；本仓库的 `artifacts/ap01-research`、`project-workflow/ap01`、`tools/ap01`、`firmware/ap01` 已删除，不再保留副本。
 
-## C9 / 下一位agent从这里继续
+## AP01 对接（本仓库职责）
 
-**用户当前要求看到0041真实界面。** 先读[QEMU显示续作交接](project-workflow/ap01/qemu-display-handoff-20261017.md)，其中有现有环境、可复制启动命令、调试入口及禁区；待办唯一来源仍为[backlog C9](docs/roadmap/backlog.md)。
-
-- 原件125已运行50宿主秒/8628虚拟ms，无guest异常，NuttX/MiIO/LVGL原生初始化和定时回调执行；**实际LCD仍为CUKTECH Logo，完整主界面未打通**，不能以OTA通过或宿主SIM截图替代。
-- 改版A004→B005安装/原厂CRC与分区提交→同NOR虚拟复启B→回刷A→复启A后OTA均通过（127–132证据链）。[验收、ROM哈希与复现](project-workflow/ap01/qemu-ota-final-20261017.md)。A004/B005各6769704 B，均为模拟候选、未部署。
-- 下一步先区分LVGL framebuffer未更新与LCD刷新未送达，再沿fbdev→LCD任务→SPI/DMA/TE定位；当前尚无已证根因。[模型证据](project-workflow/ap01/qemu-rtc-display-20261017.md)。保留已验证OTA通道与错误围栏。
+- 对接实现与设计在本仓库完成：Bridge 侧数据源/显示适配、设备端服务与认证、C9 单份更新与压缩。待办仍归 [backlog C9](docs/roadmap/backlog.md)。
+- 逆向依据、ROM 候选与模拟验收查 `cuktech-ap01-firmware` 仓库：报告在 `reverse/reports/ap01/`，ROM 清单在 `roms/CATALOG.md`，QEMU/REA 证据在 `evidence/`。
+- 该仓库只把文本纳入 Git（约 33 MiB）；二进制、Evidence 与 Ghidra 环境留在本地归档，按 `checksums/SHA256SUMS.txt` 对账。
 
 ## 风险与工作区
 
-网络为payload限定loopback，Boot2为显式虚拟选择；不证明物理Wi-Fi、031首刷或防砖。原件/密钥/Flash/日志留在ignored本地artifacts，不入库。既有SIM/逆向改动仍有未提交内容，接手不要回退。其它B6/C8实体回归边界见上述快照；不因本轮AP01进展变更它们。操作遵循[细则](docs/agent-operations.md)。
+- QEMU 模型是显式合成（PEC/API 表/MACHW/NOR/Boot2 均为模型假设），不证明物理设备；AP01 首刷与恢复路径未验证，结论以 ap01 仓库报告为准。
+- 本仓库不再持有 AP01 原件、密钥或 Flash 证据；需要核对时回到 ap01 仓库本地归档。
+- 既有未提交改动保留，不回退。操作遵循[细则](docs/agent-operations.md)。

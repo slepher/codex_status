@@ -8,7 +8,7 @@
 | 你要做什么 | 依次读 |
 |---|---|
 | 接手项目、想知道现状 | `AGENTS.md`（操作约定）→ `PROGRESS.md`（当前交接卡）→ 按需查 `docs/roadmap/backlog.md` 相关条目（唯一待办来源） |
-| 继续AP01原厂QEMU界面显示（OTA模拟闭环已过，当前LCD仍Logo） | [显示续作交接](../project-workflow/ap01/qemu-display-handoff-20261017.md) → [OTA闭环验收](../project-workflow/ap01/qemu-ota-final-20261017.md)；不要用宿主SIM替代原ROM画面，不刷实机 |
+| 继续 AP01 对接（本仓库实现与设计） | [backlog C9](roadmap/backlog.md)；原厂界面/OTA 模拟依据在同父目录 `cuktech-ap01-firmware` 仓库 `reverse/reports/ap01/qemu-display-handoff-20261017.md`，不要用宿主 SIM 替代原 ROM 画面，不刷实机 |
 | 构建、Bridge 启停/数据路径、模板缺省或串口/dump 操作 | [Agent 操作细则](agent-operations.md) 中对应节；从精简前 AGENTS 原文提取，历史现场不代替当前交接卡 |
 | clone 后编译/安装当前系统 Bridge，或让 Agent 完成 USB 分区刷机配网 | [构建与安装指南](build-install.md)：可复制提示词、Windows/macOS 原生构建、双 ROM CI 与逐阶段验收 |
 | 决定下一步做什么 | `docs/roadmap/backlog.md` §2 紧急 / §3 暂缓 |
@@ -20,8 +20,8 @@
 | 查HTTP直达、BLE提前结束与独立HTTP报告的应有行为 | [bridge-device-communication-scenarios.md](bridge-device-communication-scenarios.md)（场景合同）→ [bridge-device-communication-implementation.md](bridge-device-communication-implementation.md)（源码证据与验收边界） |
 | 判断历史协议哪些已过期、哪些遗漏或仍是草案 | [bridge-device-protocol-history-audit.md](bridge-device-protocol-history-audit.md)（定向历史对账，当前源码/现场交叉核对） |
 | 查同父目录 Slate 的协议参考及适用边界 | [bridge-device-slate-protocol-comparison.md](bridge-device-slate-protocol-comparison.md)（schema、错误、摘要、生命周期；只读比较） |
-| 查 CUKTECH 控制器与 AP01 ROM 对当前平台的价值 | [cuktech-ap01-repository-value-analysis.md](cuktech-ap01-repository-value-analysis.md)（三仓库对照、可复用接口、显示交接、完整接入成本） |
-| 查 AP01 逆向、首次安装、资源预算与应用 OTA | [AP01 研究入口](../project-workflow/ap01/README.md)（本仓库维护；第三方克隆只读参考） |
+| 查 AP01 逆向、ROM、首次安装、资源预算与应用 OTA | 同父目录 `cuktech-ap01-firmware` 仓库（`reverse/reports/ap01/`、`roms/CATALOG.md`）；本仓库只做对接，第三方克隆只读参考 |
+
 | 改电源/唤醒/占用 | `docs/power-state.md` + `docs/generic-display-platform-design.md` §7 |
 | 改休眠设备的状态页、模板/OTA 延后投递 | `docs/generic-display-platform-design.md` + `project-workflow/sleep-aware-bridge/design.md` / `task.md` |
 | 实施 PowerPlan 与 Data 同轮联合下发 | `project-workflow/bridge-macos/powerplan-data-execution-plan.md`（P1–P6；仅计划，待办 A9） |
@@ -73,6 +73,8 @@
 | `docs/history/bugs-2026-09-22.md` | 原 `bugs.md`：BUG-1 / BUG-2 结案记录 |
 | `docs/history/workflow/<name>/` | 已结项的 `project-workflow/*` 专项原件。2026-09-25 分两批迁入 **17 个**：`bridge-multi-instance`、`bundle-v3`、`codex-quota-display`、`deep-pull-test`、`device-discovery`、`fake-rom-simulator`、`note4-bridge-publish`、`note4-buttons`、`note4-icon-correction`、`note4-live-sync`、`note4-ota-bringup`、`note4-template-96`、`pmstats`、`sleep-modes`、`wake-contact-trace`（第一批 15 个）；`generic-display-platform-design`、`live-template-delivery`（第二批，等 ACL 修好后补上） |
 | `docs/history/workflow/fake-rom-simulator-def/` | 2026-09-26 D/E/F 完成原件：计划、任务、时钟审计、M01–M18 证据、硬件边界 case、状态和评审 |
+
+> 2026-10-18：AP01 逆向材料已迁至同父目录 `cuktech-ap01-firmware` 仓库。按日期归档的进度原文（`docs/history/`）里出现的 `project-workflow/ap01/...`、`artifacts/ap01-research/...` 链接指向该仓库的 `reverse/`、`evidence/`，原路径已删除，归档正文保持原样不改写。
 
 ### 仍在 `project-workflow/` 的专项（未结项，别归档）
 

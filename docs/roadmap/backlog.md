@@ -342,23 +342,51 @@
 
 ### C9. 取消项目自管A/B、动态容量与内置更新界面
 
-- **AP01下一步（2026-10-17用户要求看到真实界面）**：从[QEMU显示交接](../../project-workflow/ap01/qemu-display-handoff-20261017.md)接续，先确认framebuffer是否更新，再查fbdev/LCD任务/SPI/DMA/TE链；实际LCD仍Logo，根因尚未定位。保留127–132已验证OTA模拟往返，不刷实机、不用宿主SIM替代。不重复扩展米家协议作为前置。
+> 2026-10-18：AP01 逆向、ROM 与模拟证据已迁至同父目录 `cuktech-ap01-firmware` 仓库（报告在 `reverse/reports/ap01/`）。本仓库 C9 只保留 AP01 **对接**实现与验收；下列历史条目中的原 ap01 链接已改为对该仓库的引用。
 
-- **2026-10-17 AP01 QEMU独立OTA模拟闭环完成**：原件125持续观察50宿主秒/8628虚拟ms，无guest异常，原生MiIO/LVGL回调执行（LCD仍Logo）。基于授权unsigned候选注入6132 B模块，127 A→B实际HTTP整包/原厂CRC/ff13提交/payload复位、128独立槽/镜像/保护区核对、129 B从同NOR虚拟复启后OTA、130 B→A回刷、131核对、132 A复启后OTA均通过。最终引擎7246b77a…18b9d；HTTP42、DMA6/PWM3/NOR三profile、扫描13/验证器20通过。只证明显式模型：网络为payload专属loopback，Boot2为虚拟选择；不证明031首刷/物理Wi-Fi/救砖或任意后续Patch稳定。全部候选flashable=false，未刷实机/改Bridge，C9整体仍开放。[验收/指纹/复现](../../project-workflow/ap01/qemu-ota-final-20261017.md)。
+- **2026-10-17 AP01 0031 fallback 基座离线闭环完成（用户目标：ota_0 为永久固定 0031 fallback，ota_1 只跑 0041 开发）**：0031 原件 6,804,520 B/8a721fc8…；按 0031 反编译完成 20 个原厂绑定与独立认证 HTTP OTA 端口，候选 A `cca6a243…`、B `c909ae30…`（均 flashable=false）。147 健康 200/401/500→149 A→B 整包 6,804,520 B+原厂 ff13=0+payload 复位→150 独立核对 active1/age2/NOR `4b36b82a…`→151 同 NOR 复启 B 健康→152 B→A→153 核对 active0/age3/NOR `6b257d0d…`→154 复启 A 健康。边界：仅宿主 loopback；0031 scan 请求显式抑制（scan API 未派生）；cloud OTA 未改；不证明首刷/Boot2/掉电/物理 Wi-Fi。专项（ap01 仓库 reverse/reports/ap01/qemu-ota-0031-20261017.md）
 
-- **2026-10-16 REA RISC-V裸BIN工具计划**：在同父目录`rea`复用ARM裸BIN路径，补RV32/RV64准入、语言/profile与验证，并独立处理AP01加载基址/入口分离；关联上游[#4246](https://github.com/morluto/rea/issues/4246)。[实施计划、验收与源码依据](../../project-workflow/ap01/rea-riscv-bin-plan.md)。当前仅完成克隆/源码核对和计划，未实现、未安装；不恢复AP01额外逆向，不改现场。
+- **2026-10-17 AP01 0031 fallback 安全回退最小闭环完成（QEMU）**：安全角色镜像（无 HTTP，ota-safety-dev3-0031.bin，sha b9cc6ed9…）经 fallback HTTP 装入 ota_1；开机 ff13 预切 E000→active0，崩溃窗 169 同 NOR 复启 fallback 200/401/500 通过（170）；9 s 后直接重写 E000 表为 active1/age+1 锁回 ota_1，锁定窗 168 同 NOR 复启 dev3 正常（171）；开发镜像运行期 socket 调用为 0。实现复用 0031 RAM 原生表写/CRC 叶（0x62fc8cd8、0x62fc168e、0x62fc1c5e/0x62fc159e）。旋钮强制回退无 Boot2 证据未验证；仅 QEMU/loopback，不刷实机；RAM 叶依赖固件版本。专项（ap01 仓库 reverse/reports/ap01/safety-return-20261017.md）
 
-- **2026-10-15 AP01维护核心已构建**：认证/流式事务/单份安装仲裁/未知结果查询/恢复记录核心通过宿主与RV32同组故障回归，代码3330 B、核心栈链256 B；[产物和限制](../../project-workflow/ap01/maintenance-build-20261015.md)。现有破解材料无原厂完整源码，缺独立任务/HTTP、持久认证、原厂共用排他、安全停机/安装/UI适配；无额外逆向、无新ROM/刷机，整项维护服务保持未完成，不以核心ELF代替完整ROM。
+- **AP01下一步（2026-10-17用户要求看到真实界面）**：从QEMU显示交接（ap01 仓库 reverse/reports/ap01/qemu-display-handoff-20261017.md）接续，先确认framebuffer是否更新，再查fbdev/LCD任务/SPI/DMA/TE链；实际LCD仍Logo，根因尚未定位。保留127–132已验证OTA模拟往返，不刷实机、不用宿主SIM替代。不重复扩展米家协议作为前置。
 
-- **2026-10-15 AP01后续约束**：以同父目录已存在的0031破解包/源码/清单/SOP推进，不额外逆向。已核对看板opt包指纹及米家OTA安装器，未找到现成直接切槽入口；公开包须个人化后才能用于部署。[包核对](../../project-workflow/ap01/independent-maintenance-20261015.md#最新约束已有破解包核对)优先于此前逆向接续安排。
+- **2026-10-17 AP01 QEMU独立OTA模拟闭环完成**：原件125持续观察50宿主秒/8628虚拟ms，无guest异常，原生MiIO/LVGL回调执行（LCD仍Logo）。基于授权unsigned候选注入6132 B模块，127 A→B实际HTTP整包/原厂CRC/ff13提交/payload复位、128独立槽/镜像/保护区核对、129 B从同NOR虚拟复启后OTA、130 B→A回刷、131核对、132 A复启后OTA均通过。最终引擎7246b77a…18b9d；HTTP42、DMA6/PWM3/NOR三profile、扫描13/验证器20通过。只证明显式模型：网络为payload专属loopback，Boot2为虚拟选择；不证明031首刷/物理Wi-Fi/救砖或任意后续Patch稳定。全部候选flashable=false，未刷实机/改Bridge，C9整体仍开放。验收/指纹/复现（ap01 仓库 reverse/reports/ap01/qemu-ota-final-20261017.md）。
 
-- **2026-10-15 AP01独立维护**：用户确认新增独立维护界面及更新服务、业务停机可修复、原厂米家OTA窗口逻辑保留。[设计/定位](../../project-workflow/ap01/independent-maintenance-20261015.md)及精确0031工具自检完成；1秒原厂回调是点号动画，不是OTA接收窗口。常驻任务/网络、认证、原厂排他及文件App安装仍待实施，无新ROM/刷机；不承诺解决底座启动失败或内存越界。
+- **2026-10-17 AP01 RTC/显示Mock续作**：0041已在QEMU显示原厂CUKTECH开机Logo（`lcd-icount-paced-24.json`/`.json.png`、76800 pixels），主UI入口未到。RTC/CLIC/WFI/P/UART/SPI/DMA/TE、WDG/双TIMER、显式PEC与合成NOR native检查通过；保留icount shift2/sleepON作为明确计时假设，sleepOFF复位对照单列。现停板级RF访问20001220（`aon-cap-25.json`），继续必要Mock，C9开放。031现有ROM无备份途径，不刷设备/改Bridge。证据/复现/边界（ap01 仓库 reverse/reports/ap01/qemu-rtc-display-20261017.md）。旧实例仅历史快照（ap01 仓库 reverse/reports/ap01/qemu-mock-runtime-20261017.md）。
 
-- **2026-10-14 AP01最新决策**：0031、无fallback、OTA与常规通信/绘图双进程；改用Wi-Fi双屏4位固定码＋旋钮确认，仅防误绑定，首版不要求严格加密/SMP。持久多对多、单owner、300秒租约/60秒续约，有效owner不弹新码。具体[方案](../../project-workflow/ap01/screen-binding-design-20261014.md)已完成；旋钮/UI/常驻HTTP、绑定存储及Bridge适配/实机待实施。原厂ATT固定拒绝的[历史调查](../../project-workflow/ap01/ble-binding-20261014.md)保留，不能标已绑定/可刷。
+- **2026-10-17 AP01 Patch/QEMU路线**：用户选择保留原厂后台＋注入App，完整MiIO/MiBLE恢复不再是接入前置。真实QEMU10.1.0最小machine/INSB/有限启动模型已运行0041至RAM中的OTP触发写，18项回归通过；入口12 B范围Patch＋44 B追加代码的非零寄存器/返回对照通过。整ROM/NuttX/UI未启动，候选仅QEMU用不可安装。下一步OTP只读事务及显式fixture，再按轨迹补计时/中断/Flash等。设备无已知救砖入口，继续不刷写；C9开放。复现/证据/边界（ap01 仓库 reverse/reports/ap01/qemu-0041-runtime-20261017.md）。
+
+- **2026-10-17 AP01 0041完整代码逆向进行中**：REA＋GPT-6.1 Sol使用已修复私有模型，387检查/286执行通过；MiIO全部162已知根完成局部实现审阅，90命令描述符关联合同，新增6份路由及9份MiBLE传输/认证合同。当前同profile315函数、2529直接边，537个未采集直接callee/161处未定向调用、原0041浮点ABI及运行闭包仍开放，不宣称完整源码。官方SDK固定41bf338a，确认E907/MHINT；未刷实机/改Bridge。接手读0041交接（ap01 仓库 reverse/reports/ap01/0041-handoff.md）、本轮上层恢复/验收（ap01 仓库 reverse/reports/ap01/upper-layer-0041-20261017.md）；模型复现见私有模型（ap01 仓库 reverse/reports/ap01/private-profile-0041-20261017.md）。
+
+- **2026-10-17 0041应用SIM子任务完成**：GPT-6.1 Sol逐项逆向并补齐33构造器、7组额外业务、25服务契约；原厂布局/55字体/指南/连接态/旋钮/屏保/绑定/双目标OTA与恢复、持久事务和错误恢复均用本地模拟数据闭环。最终502步/99截图、WSLg30步/15截图、服务147项ASan/UBSan及81772天农历校验通过，同一ELF/源码/配置/报告哈希归档。数值空洞仍标未观察；不声称真实云端、整ROM或硬件验收。未刷实机/改Bridge；C9维护集成仍开放。验收、矩阵与产物（ap01 仓库 reverse/reports/ap01/application-rehost-complete-0041-20261017.md）。
+
+- **2026-10-16 0041第四批端口与详情**：GPT-6.1 Sol恢复C1/C2离线四卡、Power六项/模式/端口子菜单、日期周行跨月年、天气五档长页、米家QR/引导入口，32套ROM字体、219步真实X11及字体校验通过，WSLg已起。农历/连接态专属UI/实操/真实服务/在线跳页仍缺，接口动作明确不可用；无刷机/OTA候选变更。实现/指纹/验收边界（ap01 仓库 reverse/reports/ap01/application-rehost-0041-round4-20261016.md），C9开放。
+
+- **2026-10-16 0041第三批照片校准**：时间仪表/空图、天气离线状态、日历原厂小字体和时间设置勾选已接入，118步真实X11/数字逐像素误差0/字体校验通过，WSLg已验证运行；F可切换照片对照场景。改用GPT-6.1 Sol完成复杂逆向/实现/审阅，不再使用Luna。仍缺C1/C2及多页详情/实操/真实服务，未刷实机。第三批实现、指纹及边界（ap01 仓库 reverse/reports/ap01/application-rehost-0041-round3-20261016.md），C9开放。
+
+- **2026-10-16 0041应用重建第二批**：原厂10套字体、设置顺序/详情、日历天气布局、时间制式、5萌宠GIF、指南前两页已接入SIM，最终108步真实X11及字体独立校验通过，WSLg已起。首批设置错误映射已更正；C1/C2及功率/日期天气详情、实操指南和在线服务仍缺，未刷实机。指纹/证据/缺口见第二批验收（ap01 仓库 reverse/reports/ap01/application-rehost-0041-round2-20261016.md），C9开放。
+
+- **2026-10-16 0041应用重建首批已运行/OTA新增门槛离线修改**：按用户切换0041基线，原厂数字/天气图标/萌宠GIF、八页导航/七项设置/详情返回/SIM亮度，82步真实X11与截图通过，WSLg已启动。设置端点部分为跨版本映射，全部原厂布局与服务仍未移植。新增unsigned拒绝仅改2字节分支+4字节恢复CRC，离线候选与8项回归（含实际RV32分支执行）通过；未验证首次安装或完整原厂ROM启动，未刷写。实现/产物/复现/剩余缺口（ap01 仓库 reverse/reports/ap01/application-rehost-0041-20261016.md）。C9整体开放。
+
+- **2026-10-16 路线调整及硬件模型阶段结果**：按用户“系统用开源NuttX、只逆向应用”调整后续主线为应用重建（ap01 仓库 reverse/reports/ap01/application-rehost-plan-20261016.md）。已实现部分CSR/扩展指令/寄存器及RAM别名模型，11测试通过；原厂回放180961条尝试、两块RAM搬运逐字节匹配，当前停eFuse影子访问0x20056000，未完整启动。模型/证据/限制（ap01 仓库 reverse/reports/ap01/full-rom-runtime-20261016.md）。当时原厂应用重建未实现；后续0041首批结果见上条，仍不能标为完整ROM运行。
+
+- **2026-10-16 原厂整ROM启动仍未完成**：用户要求完整运行原厂0031；复用Unicorn2.1.4原样执行入口，观察7条指令尝试，最后0xa0000018读CSR0x7c5后异常2，SP0x62fdb890，未进入NuttX/UI，无补丁/stub/设备访问。需AP01 CPU扩展及SoC/外设模型，SIM不能直接承载原厂BIN。实际证据、复现及缺口（ap01 仓库 reverse/reports/ap01/full-rom-runtime-20261016.md）。
+
+- **2026-10-16 SIM与限定应用逆向**：用户新增授权非等价开源系统模拟及subagent应用逆向。NuttX12.10.0/LVGL9.2.1在WSL2编译运行，320×240与方向键/Enter/Space/Esc真实X11验证通过，WSLg窗口已启动；只演示导航/确认，不含原厂业务或实机移植。环境/使用/证据（ap01 仓库 reverse/reports/ap01/nuttx-sim-20261016.md）、5条REA应用证据（ap01 仓库 reverse/reports/ap01/ui-reverse-20261016.md）。此授权覆盖本次结构/入口/编码器/页面的限定分析，不修改原厂ROM或现场，C9整体仍开放。
+
+- **2026-10-16 REA RISC-V adapter已实现**：同父目录`rea`的`codex/riscv-raw-adapter-6.5.0`分支工作区，RV32/RV64裸BIN、base/entry分离与真实CLI/MCP验收通过；旧ARM/x86真实回归通过。AP01完整镜像映射verified，但已知间接调用目标未自动恢复；Windows原生RV32/RV64真实CLI/MCP及110项回归亦通过（无WSL），见Windows验收（ap01 仓库 reverse/reports/ap01/rea-windows-riscv-20261016.md）；原始ABI/厂商指令质量仍不承诺。未提交/推送/全局安装，不改现场。实施与验收边界（ap01 仓库 reverse/reports/ap01/rea-riscv-implementation-20261016.md）。
+
+- **2026-10-15 AP01维护核心已构建**：认证/流式事务/单份安装仲裁/未知结果查询/恢复记录核心通过宿主与RV32同组故障回归，代码3330 B、核心栈链256 B；产物和限制（ap01 仓库 reverse/reports/ap01/maintenance-build-20261015.md）。现有破解材料无原厂完整源码，缺独立任务/HTTP、持久认证、原厂共用排他、安全停机/安装/UI适配；无额外逆向、无新ROM/刷机，整项维护服务保持未完成，不以核心ELF代替完整ROM。
+
+- **2026-10-15 AP01后续约束**：以同父目录已存在的0031破解包/源码/清单/SOP推进，不额外逆向。已核对看板opt包指纹及米家OTA安装器，未找到现成直接切槽入口；公开包须个人化后才能用于部署。包核对（ap01 仓库 reverse/reports/ap01/independent-maintenance-20261015.md#最新约束已有破解包核对）优先于此前逆向接续安排。
+
+- **2026-10-15 AP01独立维护**：用户确认新增独立维护界面及更新服务、业务停机可修复、原厂米家OTA窗口逻辑保留。设计/定位（ap01 仓库 reverse/reports/ap01/independent-maintenance-20261015.md）及精确0031工具自检完成；1秒原厂回调是点号动画，不是OTA接收窗口。常驻任务/网络、认证、原厂排他及文件App安装仍待实施，无新ROM/刷机；不承诺解决底座启动失败或内存越界。
+
+- **2026-10-14 AP01最新决策**：0031、无fallback、OTA与常规通信/绘图双进程；改用Wi-Fi双屏4位固定码＋旋钮确认，仅防误绑定，首版不要求严格加密/SMP。持久多对多、单owner、300秒租约/60秒续约，有效owner不弹新码。具体方案（ap01 仓库 reverse/reports/ap01/screen-binding-design-20261014.md）已完成；旋钮/UI/常驻HTTP、绑定存储及Bridge适配/实机待实施。原厂ATT固定拒绝的历史调查（ap01 仓库 reverse/reports/ap01/ble-binding-20261014.md）保留，不能标已绑定/可刷。
 
 - **2026-10-11 源码实现与候选验证**：共享固件 Bundle 改为单份内容与短小回执，Bridge 使用动态容量；原生固件 OTA 双槽保留，覆盖全部共享固件目标。用户进一步明确允许临时下载文件，下载期间继续运行，完成后才停用内容并覆盖。
-- 更新覆盖失败进入内置恢复，身份/配对/owner/认证重传保留。动态容量含下载、缓存与预留，旧设备仍使用其能力上限。资产发布模型移除 rollback manifest；AP01 独立应用尚无可运行实现，保持同一设计；逆向成果归本仓库 [AP01 专项](../../project-workflow/ap01/README.md)。
-- **2026-10-13 AP01实现**：0031最小同步XIP App加载器/ABI1候选2已构建，宿主ASAN/UBSAN、RV32模拟12/12和独立终审通过，未刷机；[实现/指纹](../../project-workflow/ap01/app-implementation-20261013.md)。首刷前核实同机日志读取/UI任务余栈；接续完整Bridge/长期宿主、认证、文件App-only OTA与安装/恢复。0041仅对照；P0/P2–P5实机未执行，完整Bridge ROM未有。App/Bundle单份、原生双槽保留。[恢复评估](../../project-workflow/ap01/failure-recovery-20261013.md)：底座启动失败不开壳恢复未知，双槽/Type-C不构成保障。
+- 更新覆盖失败进入内置恢复，身份/配对/owner/认证重传保留。动态容量含下载、缓存与预留，旧设备仍使用其能力上限。资产发布模型移除 rollback manifest；AP01 独立应用尚无可运行实现，保持同一设计；逆向成果归本仓库 AP01 专项（ap01 仓库 reverse/reports/ap01/README.md）。
+- **2026-10-13 AP01实现**：0031最小同步XIP App加载器/ABI1候选2已构建，宿主ASAN/UBSAN、RV32模拟12/12和独立终审通过，未刷机；实现/指纹（ap01 仓库 reverse/reports/ap01/app-implementation-20261013.md）。首刷前核实同机日志读取/UI任务余栈；接续完整Bridge/长期宿主、认证、文件App-only OTA与安装/恢复。0041仅对照；P0/P2–P5实机未执行，完整Bridge ROM未有。App/Bundle单份、原生双槽保留。恢复评估（ap01 仓库 reverse/reports/ap01/failure-recovery-20261013.md）：底座启动失败不开壳恢复未知，双槽/Type-C不构成保障。
 - Note4 **0.18.80** 已完成统一CSZ1分块zlib并于16:27配套部署Bridge：复用ROM miniz、压缩正文按块读取、Bridge冻结传输字节，动态物理容量与原文处理上限分开。359项回归通过/3条件忽略，匹配ELF栈检查通过；OTA单次上传、运行镜像SHA256认证一致，旧模板迁移和Data显示正常，压缩安装实机峰值/掉电矩阵未验。证据、ROM哈希和实机待验见[实施交接](../../project-workflow/single-copy-updates/status.md)。AP01仅确定兼容格式，解压入口/实机仍待调查；C1 dense编码未实现，不以压缩代替其验收。
 
 ### C1. Bundle v3（manifest + 原始 dense 对象）
