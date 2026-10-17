@@ -1,5 +1,19 @@
 # AP01 研究与离线构建工具
 
+## 0041 QEMU执行与Patch注入
+
+当前目标与验收见[独立OTA闭环验收](../../project-workflow/ap01/qemu-ota-final-20261017.md)，硬件细节见[模型证据](../../project-workflow/ap01/qemu-rtc-display-20261017.md)。原件已进NuttX、MiIO及LVGL原生初始化/定时回调；`ui-empty-scan-continuous-125.json`在50秒宿主观察期推进到虚拟8628ms，无guest异常。LCD捕获仍是原厂开机Logo，不能称完整主界面显示已验。显式`--icount-shift 2 --icount-sleep on`是合成时间，不表示E907精确计时；`start-qemu-ap01.py`历史RTC实例不代表最新模型。
+
+`run-qemu-mock.sh <新报告.json>`先编译当前模型，再有限时执行精确0041。必要功能显式启用：`--rom-shim <bin> --clic-mock --pec-uart-mock --flash-fixture <bin>`；CPU还须开启`x-ap01-clic=on,x-ap01-p=on`及原有T-Head扩展。`--breakpoint 0x62fc2500 --pass-interrupts 1000 --pass-ecalls 1000`允许原厂trap/handler/mret实际执行，其他异常仍停止。报告记录原件/引擎/shim/fixture哈希、UART、异常和QMP显示/Flash状态；截图与`pixel_writes`须结合执行入口判读，不将合成测试画面算作原厂UI。
+
+连续观察可用`--observe-seconds 50 --timeout 60`并省略trap-handler breakpoint/pass参数。正常输入配置`--gpio3-input-high --gpio24-input-high`显式选择非工厂模式、松开旋钮按键；BLE/ADC采用真实不可用路径`--ble-unavailable --adc-unavailable`。扫描必须用`--scan-empty-mock`：20ms pending→done→空列表ENOENT；`--scan-unavailable`会使原件安排4秒延迟重启，保留它仅用于失败取证。无线连接没有被模拟。
+
+`build-ota-channel-0041.sh <新名称>`构建RV32独立HTTP模块，`build-ota-channel-0041.py`重建固定unsigned候选上的限定Patch及清单；`run-qemu-ota-channel.py`用payload范围限定的loopback socket提供器执行实际HTTP模块。`verify-qemu-ota-boot.py`检查真实提交后的NOR表CRC/age/活动槽、候选逐字节匹配及旧槽保护，再供显式虚拟复启；它不是恢复出的Boot2。候选均为simulation-only，不能据此宣称031首次安装或实机恢复能力。
+
+`build-qemu-bootrom-shim.sh <新前缀>`编译只供模拟器的RV32 API绑定；`build-qemu-flash-fixture.py`构造16MiB合成NOR及SDK格式分区表。默认只有`/data [710000,720000)`和`/resource [EB0000,FF0000)`可修改进程内NOR；显式`ota-flash-mock=on`额外允许非活动FW槽及非活动分区表，活动槽/Boot2/保留区仍拒绝。`ota-fw1-active=on`仅供已核验提交后的FW1复启。磁盘输入fixture始终只读；不是实机备份或可安装Flash镜像。各`test-qemu-*.py`为独立合成用例，不代替整ROM验收。
+
+入口：[显示续作交接](../../project-workflow/ap01/qemu-display-handoff-20261017.md)。`build-qemu-ap01.sh`构建固定QEMU10.1.0及`qemu-ap01.c`；`run-qemu-ap01.py`执行精确0041，`test-qemu-ap01.py`检查模型，`probe-qemu-injection.py`保留早期注入对照。已进入原生任务并完成OTA模拟往返，实际LCD主界面仍未显示。须在WSL运行，构建新目录按AGENTS提权创建；不刷实机。
+
 ## 维护核心离线构建
 
 `build_maintenance.py`只读核对现有0031-opt/opt-setting及清单，复用原校验器检查允许修改范围和尾部CRC，编译本仓库维护核心，执行宿主检查与同一套RV32模拟测试，输出栈/尺寸/源码与产物哈希。只生成静态库和核心ELF，**没有设备任务/HTTP/存储/安装/UI适配，不生成完整ROM**；不联网、不访问设备、不修改旁仓库、不创建目录。使用本机已有LLVM23和Rust所带链接器，以及既有Unicorn2.1.4；不用原Linux构建工具在macOS上冒充成功。

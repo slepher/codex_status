@@ -342,6 +342,10 @@
 
 ### C9. 取消项目自管A/B、动态容量与内置更新界面
 
+- **AP01下一步（2026-10-17用户要求看到真实界面）**：从[QEMU显示交接](../../project-workflow/ap01/qemu-display-handoff-20261017.md)接续，先确认framebuffer是否更新，再查fbdev/LCD任务/SPI/DMA/TE链；实际LCD仍Logo，根因尚未定位。保留127–132已验证OTA模拟往返，不刷实机、不用宿主SIM替代。不重复扩展米家协议作为前置。
+
+- **2026-10-17 AP01 QEMU独立OTA模拟闭环完成**：原件125持续观察50宿主秒/8628虚拟ms，无guest异常，原生MiIO/LVGL回调执行（LCD仍Logo）。基于授权unsigned候选注入6132 B模块，127 A→B实际HTTP整包/原厂CRC/ff13提交/payload复位、128独立槽/镜像/保护区核对、129 B从同NOR虚拟复启后OTA、130 B→A回刷、131核对、132 A复启后OTA均通过。最终引擎7246b77a…18b9d；HTTP42、DMA6/PWM3/NOR三profile、扫描13/验证器20通过。只证明显式模型：网络为payload专属loopback，Boot2为虚拟选择；不证明031首刷/物理Wi-Fi/救砖或任意后续Patch稳定。全部候选flashable=false，未刷实机/改Bridge，C9整体仍开放。[验收/指纹/复现](../../project-workflow/ap01/qemu-ota-final-20261017.md)。
+
 - **2026-10-16 REA RISC-V裸BIN工具计划**：在同父目录`rea`复用ARM裸BIN路径，补RV32/RV64准入、语言/profile与验证，并独立处理AP01加载基址/入口分离；关联上游[#4246](https://github.com/morluto/rea/issues/4246)。[实施计划、验收与源码依据](../../project-workflow/ap01/rea-riscv-bin-plan.md)。当前仅完成克隆/源码核对和计划，未实现、未安装；不恢复AP01额外逆向，不改现场。
 
 - **2026-10-15 AP01维护核心已构建**：认证/流式事务/单份安装仲裁/未知结果查询/恢复记录核心通过宿主与RV32同组故障回归，代码3330 B、核心栈链256 B；[产物和限制](../../project-workflow/ap01/maintenance-build-20261015.md)。现有破解材料无原厂完整源码，缺独立任务/HTTP、持久认证、原厂共用排他、安全停机/安装/UI适配；无额外逆向、无新ROM/刷机，整项维护服务保持未完成，不以核心ELF代替完整ROM。

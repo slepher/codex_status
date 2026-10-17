@@ -1,3 +1,5 @@
 * text=auto eol=lf
 *.ico binary
 *.png binary
+# Unified-diff context lines contain a required leading space, including blanks.
+tools/ap01/qemu-ap01-cpu.patch whitespace=-blank-at-eol
