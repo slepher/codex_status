@@ -268,6 +268,11 @@ bool rgnBuild(const String &tmplJson, RgnSet &out) {
             int w = e["w"] | 0, h = e["h"] | 0;
             if (!strlen(e["bits"] | "")) { out.wholeFrame = true; return false; }
             addRegion(out, x, y, w, h, RGN_ICON, false);
+        } else if (!strcmp(type, "ring")) {
+            int x = e["x"] | 0, y = e["y"] | 0, r = e["radius"] | 0;
+            if (r < 1 || r >= PANEL_W || x < r || y < r || x > PANEL_W-r-1 || y > PANEL_H-r-1) { out.wholeFrame = true; return false; }
+            addRegion(out, x-r, y-r, r*2+1, r*2+1, RGN_BAR, false);
+            out.wholeFrame = true;
         } else if (!strcmp(type, "bar")) {
             int x, y, w, h;
             if (!rectFromElement(e, x, y, w, h)) { out.wholeFrame = true; return false; }
@@ -358,6 +363,10 @@ bool rgnBuildCt(const CtTemplate &ct, RgnSet &out) {
         }
         case CT_ICON:
             addRegion(out, op.x, op.y, op.w, op.h, RGN_ICON, false);
+            break;
+        case CT_RING:
+            addRegion(out, op.x-op.w, op.y-op.w, op.w*2+1, op.w*2+1, RGN_BAR, false);
+            out.wholeFrame = true;
             break;
         case CT_BAR:
             addRegion(out, op.x, op.y, op.w, op.h, RGN_BAR, false);

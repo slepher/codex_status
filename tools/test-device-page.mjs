@@ -453,3 +453,15 @@ assert.equal(element('wifi-online').textContent,'等待认证在线状态');
 run('document.hidden=false;wifiTickOnline()');
 assert.match(element('wifi-online').textContent,/USB 常驻在线/);
 console.log('Local countdown: second ticks, elapsed-time correction, stale/zero/reset/hidden guards, zero IPC OK');
+
+assert(html.includes('添加 AP01 · 局域网'));
+assert(script.includes("invoke('platform_ap01'"));
+assert.equal(run("ap01Message({result:'pending',display_code:'0042',reply:{state:'awaiting_confirmation'}})"),'awaiting_confirmation');
+assert.match(element('ap01-result').textContent,/0042.*旋钮/);
+assert.equal(run("ap01Message({result:'rejected',reply:{state:'binding_storage',error:'binding_storage'}})"),'rejected');
+assert.equal(run("ap01Message({result:'unknown',action:'查询原配对事务'})"),'unknown');
+assert.match(element('ap01-result').textContent,/结果未知.*查询原配对事务/);
+assert.equal(run("ap01Message({result:'paired'})"),'paired');
+assert.match(element('ap01-result').textContent,/配置模板并发布/);
+assert(script.includes("$('device-power').hidden=d.power_mode==='always_on'"));
+console.log('AP01 onboarding: fixed four-digit code, unknown-query guidance, terminal storage rejection, separate publication and always-on UI OK');

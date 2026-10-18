@@ -26,6 +26,7 @@ public:
     // not enough for the font store (it enumerates and removes directories).
     std::set<std::string> dirs;
     size_t capacity = 1024 * 1024;
+    size_t externalUsed = 0; // Explicit filesystem metadata/other-app budget in capacity tests.
     long long writeBudget = -1; // inject a torn write after exactly N bytes
     std::string crashAfterSyncKind;
     int crashAfterSyncCount = 0;
@@ -53,7 +54,7 @@ public:
         return path;
     }
     void useDirectory(const std::string &directory) {
-        files.clear(); dirs.clear(); root = directory;
+        files.clear(); dirs.clear(); root = directory; externalUsed = 0;
         crashAfterSyncKind.clear(); crashAfterSyncCount = 0;
         for (const auto &entry : std::filesystem::directory_iterator(root)) {
             if (!entry.is_regular_file()) continue;
@@ -117,7 +118,7 @@ public:
     }
     bool rename(const char *from, const char *to);
     size_t totalBytes() const { return capacity; }
-    size_t usedBytes() const { size_t n = 0; for (const auto &f : files) n += f.second.size(); return n; }
+    size_t usedBytes() const { size_t n = externalUsed; for (const auto &f : files) n += f.second.size(); return n; }
     File open(const char *path, const char *mode);
 };
 inline LittleFSClass LittleFS;

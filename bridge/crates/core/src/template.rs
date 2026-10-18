@@ -25,6 +25,8 @@ pub const FONTS: [&str; 10] = [
 pub const CANVAS: i64 = 200;
 pub const NOTE4_WIDTH: i64 = 400;
 pub const NOTE4_HEIGHT: i64 = 300;
+pub const AP01_WIDTH: i64 = 320;
+pub const AP01_HEIGHT: i64 = 240;
 pub const MAX_TEMPLATE_BYTES: usize = 32768;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,6 +234,19 @@ fn validate_element(
     render_target: Option<&str>,
 ) -> Result<(), String> {
     validate_condition(e)?;
+    let ap01 = render_target == Some(crate::platform::model::RENDER_TARGET_AP01);
+    if ap01 {
+        for key in ["color", "fg", "bg"] {
+            if let Some(value) = e.get(key) {
+                let valid = match value {
+                    Value::Number(n) => n.as_u64().is_some_and(|n| n <= 6 || (key == "bg" && n == 255)),
+                    Value::String(s) => ["black", "white", "cyan", "orange", "muted", "track", "alert", "yellow", "red"].contains(&s.as_str()) || (key == "bg" && s == "none"),
+                    _ => false,
+                };
+                if !valid { return Err(format!("invalid AP01 {key}")); }
+            }
+        }
+    }
     let ty = e.get("type").and_then(|v| v.as_str()).ok_or("type")?;
     match ty {
         "text" => {
@@ -303,6 +318,20 @@ fn validate_element(
                 }
             }
         }
+        "ring" => {
+            if !ap01 { return Err("ring requires AP01 color target".into()); }
+            let x = e["x"].as_i64().ok_or("ring x")?;
+            let y = e["y"].as_i64().ok_or("ring y")?;
+            let radius = e["radius"].as_i64().ok_or("ring radius")?;
+            let thickness = e["thickness"].as_i64().ok_or("ring thickness")?;
+            if radius < 1 || radius >= canvas_w.min(canvas_h) || thickness < 1 || thickness > radius ||
+                x < radius || y < radius || x >= canvas_w - radius || y >= canvas_h - radius {
+                return Err("ring bounds".into());
+            }
+            if !matches!(e["bind"].as_str().and_then(parse_bind), Some(BindSpec::Bucket { field: BindField::Remaining | BindField::UsedPercent, .. })) {
+                return Err("ring requires a percentage bind".into());
+            }
+        }
         "bar" => {
             let bind = e.get("bind").and_then(|v| v.as_str()).ok_or("bind")?;
             if parse_bind(bind).is_none() {
@@ -350,11 +379,14 @@ pub fn validate_template(v: &Value) -> Result<(), String> {
     }
     let canvas = v.get("canvas").ok_or("canvas")?;
     let (w, h) = (canvas.get("w").and_then(|x| x.as_i64()), canvas.get("h").and_then(|x| x.as_i64()));
-    if !matches!((w, h), (Some(CANVAS), Some(CANVAS)) | (Some(NOTE4_WIDTH), Some(NOTE4_HEIGHT))) {
+    if !matches!((w, h), (Some(CANVAS), Some(CANVAS)) | (Some(NOTE4_WIDTH), Some(NOTE4_HEIGHT)) | (Some(AP01_WIDTH), Some(AP01_HEIGHT))) {
         return Err("canvas size".into());
     }
     let (w, h) = (w.unwrap(), h.unwrap());
     let render_target = v.get("render_target").and_then(Value::as_str);
+    if ((w, h) == (AP01_WIDTH, AP01_HEIGHT)) != (render_target == Some(crate::platform::model::RENDER_TARGET_AP01)) {
+        return Err("AP01 canvas/render target mismatch".into());
+    }
     let els = v
         .get("elements")
         .and_then(|x| x.as_array())

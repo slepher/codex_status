@@ -44,7 +44,7 @@ bool fontAssetValidate(const uint8_t *bytes, size_t len, FontAssetInfo &info, St
     if (len > FONT_ASSET_MAX_BYTES) { err = "font_too_large"; return false; }
     if (rd32(bytes) != FONT_ASSET_MAGIC) { err = "font_magic"; return false; }
     info.version = rd16(bytes + 4);
-    if (info.version != FONT_ASSET_VERSION && info.version != FONT_ASSET_UNICODE_VERSION) {
+    if (info.version != FONT_ASSET_VERSION && info.version != FONT_ASSET_UNICODE_VERSION && info.version != 3) {
         err = "font_version"; return false;
     }
     if (rd16(bytes + 6) != FONT_ASSET_HEADER_BYTES) { err = "font_header_bytes"; return false; }
@@ -70,10 +70,12 @@ bool fontAssetValidate(const uint8_t *bytes, size_t len, FontAssetInfo &info, St
     info.payloadCrc   = payloadCrc;
     info.bytes        = (uint32_t)len;
 
-    if (info.bpp != 1 && info.bpp != 2) { err = "font_bpp"; return false; }
-    if (info.pixelFormat > FONT_PIXEL_GRAY4) { err = "font_pixel_format"; return false; }
+    if (info.bpp != 1 && info.bpp != 2 && info.bpp != 4) { err = "font_bpp"; return false; }
+    if (info.pixelFormat > FONT_PIXEL_ALPHA4) { err = "font_pixel_format"; return false; }
     if (info.pixelFormat == FONT_PIXEL_BW1 && info.bpp != 1) { err = "font_bpp_format"; return false; }
     if (info.pixelFormat == FONT_PIXEL_GRAY4 && info.bpp != 2) { err = "font_bpp_format"; return false; }
+    if ((info.version == 3) != (info.pixelFormat == FONT_PIXEL_ALPHA4) ||
+        (info.version == 3 && info.bpp != 4)) { err = "font_alpha_format"; return false; }
     if ((info.version == 1 && info.glyphCount != FONT_ASSET_GLYPH_COUNT) ||
         info.glyphCount < FONT_ASSET_GLYPH_COUNT || info.glyphCount > FONT_ASSET_MAX_GLYPHS) {
         err = "font_glyph_count"; return false;
@@ -96,7 +98,7 @@ bool fontAssetValidate(const uint8_t *bytes, size_t len, FontAssetInfo &info, St
                          (uint32_t)(coverageLen & 1);
     const uint32_t headerAndStrings = FONT_ASSET_HEADER_BYTES + nameLen + familyLen +
                                       coverageLen + pad;
-    const uint32_t glyphOff = headerAndStrings + (info.version == 2 ? info.glyphCount * 4 : 0);
+    const uint32_t glyphOff = headerAndStrings + (info.version >= 2 ? info.glyphCount * 4 : 0);
     if (glyphOff & 1u) { err = "font_align"; return false; }
     const uint32_t glyphBytes = info.glyphCount * FONT_ASSET_GLYPH_BYTES;
     const uint32_t blobOff = glyphOff + glyphBytes;
@@ -113,7 +115,7 @@ bool fontAssetValidate(const uint8_t *bytes, size_t len, FontAssetInfo &info, St
     if (!copySection(p, coverageLen, info.coverage, sizeof(info.coverage))) { err = "font_coverage"; return false; }
     if (info.name[0] == 0) { err = "font_name_empty"; return false; }
     if (info.coverage[0] == 0) { err = "font_coverage_empty"; return false; }
-    if (info.version == 2) {
+    if (info.version >= 2) {
         if (strcmp(info.coverage, "unicode")) { err = "font_coverage"; return false; }
         uint32_t previous = 0;
         for (uint32_t i = 0; i < info.glyphCount; ++i) {
@@ -134,7 +136,7 @@ bool fontAssetValidate(const uint8_t *bytes, size_t len, FontAssetInfo &info, St
         const uint32_t off = rd16(g);
         const uint32_t w = g[4], h = g[5];
         if (w == 0 || h == 0) continue;
-        const uint32_t need = (uint32_t)((w + 7) / 8) * h;
+        const uint32_t need = (uint32_t)((w * (info.version == 3 ? 4 : 1) + 7) / 8) * h;
         if (w > 127 || h > 127) { err = "font_glyph_box"; return false; }
         if (off > info.blobBytes || need > info.blobBytes - off) {
             err = "font_glyph_range";
@@ -155,7 +157,7 @@ bool fontAssetView(const uint8_t *bytes, size_t len, const FontAssetInfo &info,
     const uint32_t pad = (uint32_t)(nameLen & 1) + (uint32_t)(familyLen & 1) +
                          (uint32_t)(coverageLen & 1);
     const uint32_t codepointOff = FONT_ASSET_HEADER_BYTES + nameLen + familyLen + coverageLen + pad;
-    const uint32_t glyphOff = codepointOff + (info.version == 2 ? info.glyphCount * 4 : 0);
+    const uint32_t glyphOff = codepointOff + (info.version >= 2 ? info.glyphCount * 4 : 0);
     const uint32_t blobOff = glyphOff + info.glyphCount * FONT_ASSET_GLYPH_BYTES;
     if (glyphOff & 1u) return false;
     if (blobOff + info.blobBytes > len) return false;
@@ -164,12 +166,22 @@ bool fontAssetView(const uint8_t *bytes, size_t len, const FontAssetInfo &info,
     font.lineHeight = info.lineHeight;
     font.baseLine   = info.baseLine;
     font.maxAdv     = info.maxAdv;
-    font.codepoints = info.version == 2 ? bytes + codepointOff : nullptr;
+    font.codepoints = info.version >= 2 ? bytes + codepointOff : nullptr;
     font.glyphCount = info.glyphCount;
+    font.alphaBpp = info.version == 3 ? 4 : 0;
     return true;
 }
 
 bool fontAssetMatchesTarget(const FontAssetInfo &info, String &err) {
+#if defined(CODEX_BUNDLE_HOST)
+    // Host supports LCD alpha assets; each template draw still checks its canvas.
+    if (info.pixelFormat == FONT_PIXEL_ALPHA4) return true;
+#endif
+    if (strcmp(TARGET_PIXEL_FORMAT, "4bpp") == 0 &&
+        info.pixelFormat != FONT_PIXEL_BW1 && info.pixelFormat != FONT_PIXEL_ALPHA4) {
+        err = "font_pixel_format_mismatch";
+        return false;
+    }
     if (strcmp(TARGET_PIXEL_FORMAT, "1bpp") == 0 && info.pixelFormat != FONT_PIXEL_BW1) {
         err = "font_pixel_format_mismatch";
         return false;
@@ -185,6 +197,7 @@ const char *fontAssetPixelFormatName(uint8_t pf) {
     switch (pf) {
         case FONT_PIXEL_BW1:   return "bw";
         case FONT_PIXEL_GRAY4: return "gray4";
+        case FONT_PIXEL_ALPHA4: return "alpha4";
         default:               return "?";
     }
 }
@@ -193,6 +206,7 @@ const char *fontAssetBppName(uint8_t bpp) {
     switch (bpp) {
         case 1: return "1bpp";
         case 2: return "2bpp";
+        case 4: return "4bpp";
         default: return "?";
     }
 }

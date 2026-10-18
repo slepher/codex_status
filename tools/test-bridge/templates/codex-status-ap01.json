@@ -1,0 +1,404 @@
+{
+  "schema": 1,
+  "id": "codex-status-a",
+  "version": 1,
+  "render_target": "lcd-jd9853-320x240-palette4",
+  "canvas": {
+    "w": 320,
+    "h": 240
+  },
+  "elements": [
+    {
+      "type": "rect",
+      "rect": [
+        0,
+        0,
+        320,
+        240
+      ],
+      "fill": true,
+      "color": "black"
+    },
+    {
+      "type": "text",
+      "text": "CODEX STATUS",
+      "x": 16,
+      "y": 11,
+      "font": "ntthin18",
+      "color": "white",
+      "bg": "black"
+    },
+    {
+      "type": "text",
+      "text": "AP01",
+      "x": 274,
+      "y": 13,
+      "font": "ntthin18",
+      "color": "muted",
+      "bg": "black"
+    },
+    {
+      "type": "line",
+      "x1": 16,
+      "y1": 35,
+      "x2": 303,
+      "y2": 35,
+      "color": "track"
+    },
+    {
+      "type": "ring",
+      "x": 160,
+      "y": 104,
+      "radius": 61,
+      "thickness": 4,
+      "bind": "buckets[codex].weekly.remaining",
+      "fg": "cyan",
+      "bg": "track",
+      "when": {
+        "bind": "buckets[codex].5h.remaining",
+        "exists": false
+      }
+    },
+    {
+      "type": "text",
+      "text": "周额度剩余",
+      "x": 130,
+      "y": 62,
+      "font": "ntthin18",
+      "color": "cyan",
+      "bg": "black",
+      "when": {
+        "bind": "buckets[codex].5h.remaining",
+        "exists": false
+      }
+    },
+    {
+      "type": "text",
+      "bind": "buckets[codex].weekly.remaining",
+      "x": 111,
+      "y": 78,
+      "font": "ntreg64",
+      "color": "white",
+      "bg": "black",
+      "region": [
+        111,
+        78,
+        98,
+        64
+      ],
+      "align": "center",
+      "when": {
+        "bind": "buckets[codex].5h.remaining",
+        "exists": false
+      }
+    },
+    {
+      "type": "text",
+      "text": "%",
+      "x": 195,
+      "y": 109,
+      "font": "ntthin18",
+      "color": "white",
+      "bg": "black",
+      "when": {
+        "bind": "buckets[codex].5h.remaining",
+        "exists": false
+      },
+      "digit_bind": "buckets[codex].weekly.remaining",
+      "digit_x": [
+        181,
+        195,
+        208
+      ]
+    },
+    {
+      "type": "text",
+      "bind": "buckets[codex].weekly.resetsAt",
+      "x": 106,
+      "y": 128,
+      "font": "ntthin18",
+      "color": "muted",
+      "bg": "black",
+      "when": {
+        "bind": "buckets[codex].5h.remaining",
+        "exists": false
+      },
+      "region": [
+        106,
+        126,
+        108,
+        18
+      ],
+      "align": "center"
+    },
+    {
+      "type": "ring",
+      "x": 73,
+      "y": 104,
+      "radius": 54,
+      "thickness": 4,
+      "bind": "buckets[codex].weekly.remaining",
+      "fg": "cyan",
+      "bg": "track",
+      "when": {
+        "bind": "buckets[codex].5h.remaining",
+        "exists": true
+      }
+    },
+    {
+      "type": "text",
+      "text": "周额度剩余",
+      "x": 43,
+      "y": 65,
+      "font": "ntthin18",
+      "color": "cyan",
+      "bg": "black",
+      "when": {
+        "bind": "buckets[codex].5h.remaining",
+        "exists": true
+      }
+    },
+    {
+      "type": "text",
+      "bind": "buckets[codex].weekly.remaining",
+      "x": 24,
+      "y": 78,
+      "font": "ntreg64",
+      "color": "white",
+      "bg": "black",
+      "region": [
+        24,
+        78,
+        98,
+        64
+      ],
+      "align": "center",
+      "when": {
+        "bind": "buckets[codex].5h.remaining",
+        "exists": true
+      }
+    },
+    {
+      "type": "text",
+      "text": "%",
+      "x": 108,
+      "y": 109,
+      "font": "ntthin18",
+      "color": "white",
+      "bg": "black",
+      "when": {
+        "bind": "buckets[codex].5h.remaining",
+        "exists": true
+      },
+      "digit_bind": "buckets[codex].weekly.remaining",
+      "digit_x": [
+        94,
+        108,
+        121
+      ]
+    },
+    {
+      "type": "text",
+      "text": "7 天窗口",
+      "x": 47,
+      "y": 128,
+      "font": "ntthin18",
+      "color": "muted",
+      "bg": "black",
+      "when": {
+        "bind": "buckets[codex].5h.remaining",
+        "exists": true
+      }
+    },
+    {
+      "type": "line",
+      "x1": 145,
+      "y1": 53,
+      "x2": 145,
+      "y2": 164,
+      "color": "track",
+      "when": {
+        "bind": "buckets[codex].5h.remaining",
+        "exists": true
+      }
+    },
+    {
+      "type": "text",
+      "text": "5 小时剩余",
+      "x": 160,
+      "y": 52,
+      "font": "ntthin18",
+      "color": "orange",
+      "bg": "black",
+      "when": {
+        "bind": "buckets[codex].5h.remaining",
+        "exists": true
+      }
+    },
+    {
+      "type": "text",
+      "bind": "buckets[codex].5h.remaining",
+      "x": 157,
+      "y": 74,
+      "font": "nt30",
+      "color": "white",
+      "bg": "black",
+      "suffix": "%",
+      "when": {
+        "bind": "buckets[codex].5h.remaining",
+        "exists": true
+      }
+    },
+    {
+      "type": "text",
+      "bind": "buckets[codex].5h.resetsAt",
+      "x": 160,
+      "y": 108,
+      "font": "ntthin18",
+      "color": "muted",
+      "bg": "black",
+      "time_format": "hhmm",
+      "suffix": " 重置",
+      "when": {
+        "bind": "buckets[codex].5h.remaining",
+        "exists": true
+      }
+    },
+    {
+      "type": "text",
+      "text": "周额度重置",
+      "x": 160,
+      "y": 130,
+      "font": "ntthin18",
+      "color": "cyan",
+      "bg": "black",
+      "when": {
+        "bind": "buckets[codex].5h.remaining",
+        "exists": true
+      }
+    },
+    {
+      "type": "text",
+      "bind": "buckets[codex].weekly.resetsAt",
+      "x": 153,
+      "y": 150,
+      "font": "ntthin18",
+      "color": "white",
+      "bg": "black",
+      "when": {
+        "bind": "buckets[codex].5h.remaining",
+        "exists": true
+      },
+      "region": [
+        153,
+        149,
+        151,
+        18
+      ],
+      "align": "center"
+    },
+    {
+      "type": "line",
+      "x1": 16,
+      "y1": 176,
+      "x2": 303,
+      "y2": 176,
+      "color": "track"
+    },
+    {
+      "type": "text",
+      "bind": "account.plan",
+      "x": 16,
+      "y": 184,
+      "font": "ntthin18",
+      "color": "white",
+      "bg": "black"
+    },
+    {
+      "type": "text",
+      "bind": "bridge.label",
+      "x": 65,
+      "y": 186,
+      "font": "ntthin18",
+      "color": "muted",
+      "bg": "black",
+      "region": [
+        65,
+        184,
+        174,
+        20
+      ],
+      "when": {
+        "bind": "bridge.label",
+        "exists": true
+      }
+    },
+    {
+      "type": "text",
+      "bind": "resetCredits.availableCount",
+      "x": 257,
+      "y": 186,
+      "font": "ntthin18",
+      "color": "orange",
+      "bg": "black",
+      "prefix": "RC ",
+      "when": {
+        "bind": "resetCredits.availableCount",
+        "exists": true
+      },
+      "region": [
+        249,
+        184,
+        54,
+        20
+      ],
+      "align": "right"
+    },
+    {
+      "type": "line",
+      "x1": 16,
+      "y1": 211,
+      "x2": 303,
+      "y2": 211,
+      "color": "track"
+    },
+    {
+      "type": "text",
+      "bind": "device.sync_hhmm",
+      "x": 16,
+      "y": 220,
+      "font": "ntthin18",
+      "color": "muted",
+      "bg": "black",
+      "prefix": "SYNC ",
+      "when": {
+        "bind": "device.offline_mins",
+        "exists": false
+      }
+    },
+    {
+      "type": "text",
+      "bind": "device.offline_mins",
+      "x": 16,
+      "y": 220,
+      "font": "ntthin18",
+      "color": "orange",
+      "bg": "black",
+      "prefix": "OFF ",
+      "suffix": "m",
+      "when": {
+        "bind": "device.offline_mins",
+        "exists": true
+      }
+    },
+    {
+      "type": "text",
+      "text": "额度看板",
+      "x": 260,
+      "y": 219,
+      "font": "ntthin18",
+      "color": "muted",
+      "bg": "black"
+    }
+  ]
+}

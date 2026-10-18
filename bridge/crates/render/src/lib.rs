@@ -76,7 +76,7 @@ fn engine_loop(rx: Receiver<Job>) {
         if job.fonts.is_some() { unsafe { codex_font_clear_assets() } }
         unsafe { codex_set_canvas(WIDTH as c_int, HEIGHT as c_int) };
         if matches!(job.op, Op::RenderJson | Op::RenderCompiled) {
-            out.truncate(((job.width + 7) / 8 * job.height) as usize);
+            out.truncate(frame_bytes(job.width, job.height));
         } else if rc > 0 && (rc as usize) <= out.len() {
             out.truncate(rc as usize);
         }
@@ -208,7 +208,7 @@ fn run_job(job: &Job, out: &mut [u8], message: &mut String) -> i32 {
                 job.offline_mins,
                 mode.as_ptr(),
                 out.as_mut_ptr(),
-                (((job.width + 7) / 8) * job.height) as c_int,
+                frame_bytes(job.width, job.height) as c_int,
             )
         };
     }
@@ -230,7 +230,7 @@ fn run_job(job: &Job, out: &mut [u8], message: &mut String) -> i32 {
             job.offline_mins,
             mode.as_ptr(),
             out.as_mut_ptr(),
-            (((job.width + 7) / 8) * job.height) as c_int,
+            frame_bytes(job.width, job.height) as c_int,
         )
     }
 }
@@ -288,7 +288,7 @@ pub fn canvas_size(template: &str) -> Option<(u32, u32)> {
         source.get("canvas")?.get("h")?.as_u64()?,
     );
     match size {
-        (200, 200) | (400, 300) => Some((size.0 as u32, size.1 as u32)),
+        (200, 200) | (400, 300) | (320, 240) => Some((size.0 as u32, size.1 as u32)),
         _ => None,
     }
 }
@@ -381,7 +381,13 @@ pub fn compiled_serialize() -> anyhow::Result<Vec<u8>> {
 
 /// Load a compiled template from its fixed layout (validates ABI/CRC/bounds).
 pub fn compiled_deserialize(blob: &[u8]) -> Result<(), String> {
+    compiled_deserialize_with_canvas(blob, WIDTH, HEIGHT)
+}
+
+pub fn compiled_deserialize_with_canvas(blob: &[u8], width: u32, height: u32) -> Result<(), String> {
     let mut job = base_job("", &Env::default());
+    job.width = width;
+    job.height = height;
     job.blob = blob.to_vec();
     let (rc, _, message) = run_engine(Op::Deserialize, "", job).map_err(|e| e.to_string())?;
     if rc == 1 {
@@ -392,6 +398,10 @@ pub fn compiled_deserialize(blob: &[u8]) -> Result<(), String> {
 }
 
 pub const WIDTH: u32 = 200;
+pub fn frame_bytes(width: u32, height: u32) -> usize {
+    if (width, height) == (320, 240) { (width / 2 * height) as usize }
+    else { ((width + 7) / 8 * height) as usize }
+}
 pub const HEIGHT: u32 = 200;
 /// Preview fallback for values the template cannot obtain (the device reports
 /// the real battery itself); keeps previews looking like a live screen.
@@ -400,6 +410,11 @@ pub const ROW_BYTES: usize = (WIDTH as usize + 7) / 8;
 pub const BUF_LEN: usize = ROW_BYTES * HEIGHT as usize;
 
 extern "C" {
+    #[cfg(test)]
+    fn codex_ap01_binding_check() -> c_int;
+    #[cfg(test)]
+    fn codex_ap01_page_check() -> c_int;
+    fn codex_ap01_palette565(index: u32) -> u16;
     #[cfg(test)]
     fn codex_rv_window_until(now:u64, light:u64, sync:u64)->u64;
     fn codex_rv_new() -> *mut std::ffi::c_void;
@@ -464,6 +479,7 @@ extern "C" {
     fn codex_sim_bundle_status(p: *mut std::ffi::c_void, out: *mut c_char, cap: c_int) -> c_int;
     fn codex_sim_bundle_frame(p: *mut std::ffi::c_void, out: *mut u8, cap: c_int) -> c_int;
     fn codex_sim_store_budget(p: *mut std::ffi::c_void, budget: i64) -> c_int;
+    fn codex_sim_store_capacity(p: *mut std::ffi::c_void, capacity:u32, external_used:u32) -> c_int;
     fn codex_sim_store_crash_after_sync(p: *mut std::ffi::c_void,
         kind: *const c_char, count: c_int) -> c_int;
     fn codex_sim_display_fail_next(p: *mut std::ffi::c_void) -> c_int;
@@ -764,7 +780,7 @@ impl SimulatorBundle {
     }
 
     pub fn frame_bits(&self) -> anyhow::Result<Vec<u8>> {
-        let mut bits = vec![0u8; 15_000];
+        let mut bits = vec![0u8; 38_400];
         let len = unsafe { codex_sim_bundle_frame(self.state, bits.as_mut_ptr(), bits.len() as c_int) };
         anyhow::ensure!(len >= 0 && (len as usize) <= bits.len(), "simulator frame read failed");
         bits.truncate(len as usize);
@@ -775,6 +791,12 @@ impl SimulatorBundle {
         anyhow::ensure!(unsafe { codex_sim_store_budget(self.state, budget) } == 1,
             "invalid simulator write budget");
         Ok(())
+    }
+
+    /// Explicit host model geometry and occupancy; never a physical statfs read.
+    pub fn set_storage_capacity(&mut self,capacity:u32,external_used:u32)->anyhow::Result<()> {
+        anyhow::ensure!(unsafe{codex_sim_store_capacity(self.state,capacity,external_used)}==1,
+            "invalid simulator storage capacity/occupancy");Ok(())
     }
 
     pub fn crash_after_sync(&mut self, kind: &str, count: i32) -> anyhow::Result<()> {
@@ -1421,7 +1443,34 @@ pub fn bits_to_png(bits: &[u8]) -> anyhow::Result<Vec<u8>> {
     bits_to_png_size(bits, WIDTH, HEIGHT)
 }
 
+#[test]
+fn ap01_page_navigation_and_row_conversion() {
+    assert_eq!(unsafe { codex_ap01_page_check() }, 0);
+}
+
 pub fn bits_to_png_size(bits: &[u8], width: u32, height: u32) -> anyhow::Result<Vec<u8>> {
+    if (width, height) == (320, 240) {
+        anyhow::ensure!(bits.len() == frame_bytes(width, height), "palette framebuffer size");
+        let mut rgb = Vec::with_capacity((width * height * 3) as usize);
+        for &byte in bits {
+            for index in [byte >> 4, byte & 15] {
+                anyhow::ensure!(index <= 15, "unknown AP01 palette index");
+                let value = unsafe { codex_ap01_palette565(index as u32) };
+                let r = ((value >> 11) & 31) as u8;
+                let g = ((value >> 5) & 63) as u8;
+                let b = (value & 31) as u8;
+                rgb.extend_from_slice(&[(r << 3) | (r >> 2), (g << 2) | (g >> 4), (b << 3) | (b >> 2)]);
+            }
+        }
+        let mut out = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut out, width, height);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.write_header()?.write_image_data(&rgb)?;
+        }
+        return Ok(out);
+    }
     let row_bytes = ((width + 7) / 8) as usize;
     anyhow::ensure!(
         bits.len() == row_bytes * height as usize,
@@ -1793,3 +1842,9 @@ fn physical_ble_hold_finishes_wifi_activation_without_starting_deferred_rf() {
     assert!(!sim.poll_with_start_allowed(1700,"bond",1,false,1,true).unwrap());
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn ap01_binding_physical_confirmation_persistence_and_unknown_commit() {
+    assert_eq!(unsafe{codex_ap01_binding_check()},0);
+}
+pub mod ap01;

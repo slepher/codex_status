@@ -2133,7 +2133,7 @@ const uint8_t Font20_Table[] =
 };
 
 
-sFONT Font20 = {
+CODEX_FONT_STORAGE sFONT Font20 = {
   Font20_Table,
   14, /* Width */
   20, /* Height */

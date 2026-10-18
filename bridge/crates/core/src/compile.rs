@@ -3,7 +3,7 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use crate::template::{parse_bind, BindSpec, CANVAS, NOTE4_WIDTH, NOTE4_HEIGHT};
+use crate::template::{parse_bind, BindSpec, CANVAS, NOTE4_WIDTH, NOTE4_HEIGHT, AP01_WIDTH, AP01_HEIGHT};
 use crate::platform::model::{FieldRequirement, MissingPolicy};
 
 pub const COMPILER_ABI: u32 = 2;
@@ -69,6 +69,8 @@ fn resources(meta: &ArtifactMeta) -> Vec<CompiledResource> {
 pub fn validate(t: &CompiledTemplate) -> Result<()> {
     let expected = if t.render_target == crate::platform::model::RENDER_TARGET_NOTE4 {
         (NOTE4_WIDTH as u32, NOTE4_HEIGHT as u32)
+    } else if t.render_target == crate::platform::model::RENDER_TARGET_AP01 {
+        (AP01_WIDTH as u32, AP01_HEIGHT as u32)
     } else { (CANVAS as u32, CANVAS as u32) };
     if t.compiler_abi != COMPILER_ABI || t.render_target.is_empty() ||
         (t.canvas_w, t.canvas_h) != expected {
@@ -114,6 +116,8 @@ pub fn compile(source: &Value, render_target: &str) -> Result<CompiledTemplate> 
     crate::template::validate_template(source).map_err(|e| anyhow::anyhow!("template: {e}"))?;
     let (width, height) = if render_target == crate::platform::model::RENDER_TARGET_NOTE4 {
         (NOTE4_WIDTH as u32, NOTE4_HEIGHT as u32)
+    } else if render_target == crate::platform::model::RENDER_TARGET_AP01 {
+        (AP01_WIDTH as u32, AP01_HEIGHT as u32)
     } else { (CANVAS as u32, CANVAS as u32) };
     if source["canvas"]["w"].as_u64() != Some(width as u64)
         || source["canvas"]["h"].as_u64() != Some(height as u64) {

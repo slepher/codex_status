@@ -344,7 +344,21 @@
 
 ### C9. 取消项目自管A/B、动态容量与内置更新界面
 
+- **2026-10-19 01:36 独立OTA稳定槽完成模拟**：维护18080加入slots/stable/switch/持久查询及响应后重启，与业务18081及owner/context/Bundle隔离。候选22/原生49、50、51验证有焦点模板时完整OTA、直接稳定槽回切、原槽重启回执；ff13重放只提交一次，两槽及保护区字节不变、三轮四场景零像素差异。修复实际LVGL绘制事件误入OTA输入分支的断言。新ROM6993160 B，SHA256 `63eb98e51c9cb1e0b2783d63b51c50da0dadb3db95b1ad107fcbb0fbb970df94`，未刷机/部署Bridge；物理与传统OTA旁路边界保留，C9不关闭。见[交付](../../project-workflow/ap01-template-integration/release-0041-ota-slots.md)。
+
+- **2026-10-19 AP01完整0041 ROM模拟收尾**：原生维护/业务HTTP、VFS/Bundle/持久激活、发现/配对和原厂UI接线完成；候选16原生31/32/33验证八模板/四场景、完整ROM写非活动槽与保护区、同NOR新槽回执恢复。正式待刷ROM 6981976 B，SHA256 `6adb31dcaa0a35c77a38c729d298764f0c72ae7e729b6c77a21dd0b7beeb56bc`，配套Bridge隔离构建未部署。保留五GIF、AP01无PowerPlan；ASan/UBSan、core162/render15/v2_state21、存储8组合及Note4兼容/栈检查通过。**不关闭C9**：未刷机，物理首启/LCD-SPI/真实free和高水位、0031旧接收器跨升及macOS WK仍未验；QEMU显式模型限制见[完整交付](../../project-workflow/ap01-template-integration/release-0041.md)。下方早期“无ROM/接线待完成”保留历史语义。
+
+- **2026-10-18 0041原生渲染续作**：画布/字体绑定/尺寸与裁剪状态迁为调用方持有对象；绑定及完整渲染核心11个RV32对象无可写静态段/隐式初始化段，原生String端口宿主4组画面像素差异0，33项共享回归通过。取得0041窗口/图片/事件小函数依据，不能代替原ROM UI运行。原生HTTP/VFS/Bundle/UI与完整ROM仍未完成、不刷机；旧Bridge候选未重建。[原生里程碑](../../project-workflow/ap01-template-integration/native-0041-progress.md)。
+
+- **2026-10-18 独立HTTP与Bundle存储调查**：用户确认维护/应用管理18080与Codex业务18081分离，模拟业务停止后维护健康/配对仍可读，11检查/8截图；Bridge双端点发现/配对与隔离候选已配套，未部署。0041本身确认/resource总1.25MiB，8模板含三字体未压缩安装384575 B、同规格更新保守准入827039 B（8KiB额外占用模型），1/2/4/8×raw/CSZ1共8组合及满盘旧内容保护通过。实机free和LittleFS块开销仍未读；五份萌宠GIF为ROM内2153808 B，删除不直接释放/resource，当前不触发条件性整页删除。原生HTTP/VFS/statfs/隔离及ROM接线继续开放，先模拟不刷机。[调查/证据](../../project-workflow/ap01-template-integration/storage-http.md)。
+
+- **用户最新纠正：新业务ROM基于0041制作。** `cuktech-ap01-0041`为当前接入目标；0031现场与既有审计仅保留历史含义，不得复用其地址或将其当新ROM基线。共享Bridge/模板/发现/配对逻辑继续，先模拟验证、暂不刷机。
+
+- **2026-10-18 AP01 Bridge/实时SIM首轮已实现，原生ROM未完成**：常在线目标拒绝PowerPlan，UI/MCP共用主动多接口UDP/通告接收/邻居补查与认证端点更新；复用双屏四位码/旋钮绑定，先持久保存候选事务，未知结果查原ID。实际CompactFrame客户端→共享C++绑定/Bundle/激活/渲染→隔离NuttX UI，10检查/8截图、6组像素差异0，双模板切页/新context和重启恢复通过。Bridge候选已构建但未部署；原0031 HTTP/OTA/VFS/引擎RAM context/UI接线、真实存储和镜像资源审计仍未完成，**无新待刷ROM**。便携绑定核心RV32无可写静态段、绑定提交核心峰6816 B，不代表整机预算；多网卡/DHCP/权限及实机矩阵仍开放。见[实施与证据](../../project-workflow/ap01-template-integration/status.md)、[原生审计](../../project-workflow/ap01-template-integration/native-integration-review.md)，不刷机。
+
 > 2026-10-18：AP01 逆向、ROM 与模拟证据已迁至同父目录 `cuktech-ap01-firmware` 仓库（报告在 `reverse/reports/ap01/`）。本仓库 C9 只保留 AP01 **对接**实现与验收；下列历史条目中的原 ap01 链接已改为对该仓库的引用。
+
+- **2026-10-18 AP01彩色通用模板/页面功能接入已验（未部署，视觉精修已SIM复验）**：用户选择保留彩色圆环；新增显式320×240 palette4目标、共享C++ ring、`codex-status-a`变体。缺5h整组隐藏并居中，RC/账号按when，RC独立于5h（单窗口示例夹具漏项已修正）；原有条件切页插入Profile全部1–8项，后台不抢屏，弹窗/屏保/长按保留。共享core/render253通过、app串行105通过/3忽略（首次并行网络夹具断言失败，单独/串行重跑通过），隔离0041 NuttX真实X11 21检查/9截图，4次与同源引擎像素差异0。CTP1仍11333 B，单帧38400 B＋LVGL调色板64 B，缓存4096 B按需分配。现已补齐CSFN v3 alpha4、16色覆盖率圆环及排版，原尺寸前后截图已目视复核；帧缓冲不增，用户视觉确认与实机观感仍未验。真实AP01binding/HTTP/Bundle接收/持久激活、原ROM UI hook/实机资源与安装仍未验，C9不结项；无刷机/Bridge重启。接续[专项状态](../../project-workflow/ap01-template-integration/status.md)和[验收边界](../../project-workflow/ap01-template-integration/review.md)。
 
 - **2026-10-17 AP01 0031 fallback 基座离线闭环完成（用户目标：ota_0 为永久固定 0031 fallback，ota_1 只跑 0041 开发）**：0031 原件 6,804,520 B/8a721fc8…；按 0031 反编译完成 20 个原厂绑定与独立认证 HTTP OTA 端口，候选 A `cca6a243…`、B `c909ae30…`（均 flashable=false）。147 健康 200/401/500→149 A→B 整包 6,804,520 B+原厂 ff13=0+payload 复位→150 独立核对 active1/age2/NOR `4b36b82a…`→151 同 NOR 复启 B 健康→152 B→A→153 核对 active0/age3/NOR `6b257d0d…`→154 复启 A 健康。边界：仅宿主 loopback；0031 scan 请求显式抑制（scan API 未派生）；cloud OTA 未改；不证明首刷/Boot2/掉电/物理 Wi-Fi。专项（ap01 仓库 reverse/reports/ap01/qemu-ota-0031-20261017.md）
 

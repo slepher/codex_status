@@ -22,9 +22,21 @@ fn find_arduinojson(root: &Path) -> PathBuf {
 }
 
 fn main() {
+    println!("cargo:rerun-if-changed=../../../src/local_json_allocator.h");
+    println!("cargo:rerun-if-changed=../../../src/bundle_store_context.h");
+    println!("cargo:rerun-if-changed=../../../src/template_renderer.h");
     println!("cargo:rerun-if-changed=../../../src/wifi_storage_commit.inc");
     println!("cargo:rerun-if-changed=../../../tools/wifi-legacy-convert.inc");
     println!("cargo:rerun-if-changed=../../../src/battery_display.h");
+    println!("cargo:rerun-if-changed=../../../src/ap01_template_display.h");
+    println!("cargo:rerun-if-changed=../../../src/ap01_template_page.h");
+    println!("cargo:rerun-if-changed=../../../src/ap01_binding.h");
+    println!("cargo:rerun-if-changed=../../../src/ap01_binding.cpp");
+    println!("cargo:rerun-if-changed=../../../src/ap01_pairing.h");
+    println!("cargo:rerun-if-changed=../../../src/ap01_pairing.cpp");
+    println!("cargo:rerun-if-changed=src/ap01_binding_ffi.cpp");
+    println!("cargo:rerun-if-changed=src/ap01_binding_test.cpp");
+    println!("cargo:rerun-if-changed=src/ap01_template_test.cpp");
     println!("cargo:rerun-if-changed=../../../src/minute_clock.h");
     println!("cargo:rerun-if-changed=src/battery_display_test.cpp");
     println!("cargo:rerun-if-changed=../../../src/status_pages.h");
@@ -58,6 +70,7 @@ fn main() {
         .file(firmware.join("plan_store.cpp"))
         .file(manifest.join("src/plan_store_test.cpp"))
         .file(manifest.join("src/battery_display_test.cpp"))
+        .file(manifest.join("src/ap01_template_test.cpp"))
         .file(firmware.join("v2_bundle_command.cpp"))
         .file(firmware.join("v2_activate_command.cpp"))
         .file(firmware.join("v2_claim_command.cpp"))
@@ -65,11 +78,16 @@ fn main() {
         .file(firmware.join("ble_wire.cpp"))
         .file(firmware.join("v2_status_snapshot.cpp"))
         .file(firmware.join("v2_sync.cpp"))
+        .file(firmware.join("sha256.cpp"))
         .file(firmware.join("v2_sync_store.cpp"))
         .file(firmware.join("offline_log.cpp"))
         .file(firmware.join("v2_sync_protocol.cpp"))
         .file(firmware.join("bundle_store.cpp"))
         .file(firmware.join("bundle_payload.cpp"))
+        .file(firmware.join("ap01_binding.cpp"))
+        .file(firmware.join("ap01_pairing.cpp"))
+        .file(manifest.join("src/ap01_binding_ffi.cpp"))
+        .file(manifest.join("src/ap01_binding_test.cpp"))
         .file(firmware.join("refresh_policy.cpp"))
         .file(firmware.join("font_asset.cpp"))
         .file(firmware.join("font_store.cpp"))
@@ -103,7 +121,7 @@ fn main() {
                     "v2_command_envelope.h", "v2_command_envelope.cpp",
                     "ble_wire.h", "ble_wire.cpp", "wifi_scheme.h", "wifi_legacy.h", "wifi_storage.inc", "wifi_setup.h", "wifi_setup.cpp", "wifi_management.inc", "wake_trace_projection.h",
                     "v2_status_snapshot.h", "v2_status_snapshot.cpp",
-                    "v2_sync.h", "v2_sync.cpp",
+                    "v2_sync.h", "v2_sync.cpp", "sha256.cpp",
                     "v2_sync_store.h", "v2_sync_store.cpp",
                     "offline_log.h", "offline_log.cpp",
                     "v2_sync_protocol.h", "v2_sync_protocol.cpp",

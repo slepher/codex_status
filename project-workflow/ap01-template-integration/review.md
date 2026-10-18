@@ -1,0 +1,69 @@
+# 验收审阅
+
+## 2026-10-19 自动窗口：用户要求收尾保存
+
+候选23完成编译/链接/镜像重建，新增策略及模拟验证脚本尚未验收。首轮宿主显式救援用例ID冲突已修正；重跑与原生53按用户要求中断，不能宣称通过。原生52的直接替换夹具与旧Applied回执不匹配，不作功能结论。后续必须验证双表交替/9秒健康/窗口断电稳定恢复，再扩展放行脚本。详见[交接](boot-safety-handoff.md)。
+
+## 2026-10-19 01:36 独立OTA稳定槽收尾
+
+候选22是最终同镜像依据：原生49/50/51全部通过；49在模板有焦点时完整OTA，50从新槽重新校验稳定槽并实际ff13提交、精确重放无第二次提交、两槽及保护区字节完全不变，51从同NOR稳定槽启动并确认原切换回执。四场景三轮原厂活动LVGL均零像素差异。ASan/UBSan覆盖业务从未启动时维护可用、稳定槽写保护、损坏/变化/重放/unknown和持久恢复。
+
+独立OTA执行器无业务owner/context/Bundle依赖，绑定仅用于认证；原子APS1记录有界，APF1兼容旧upload并明确operation/target_slot。类型/NUL/长度、编码缓冲含终止字节、不确定写入结果和镜像完整性已复核。RV32 31对象只读段审计和匹配完整ELF通过，新增资源详见ota-stable-slots.md。
+
+实际回切测试发现根UI绘制事件被维护分支当作输入并隐藏控件，触发lv_inv_area断言，后续panic ROM API不是首因。候选22增加仅按下/释放/旋钮键的输入筛选；重跑同条件的升级和回切均无断言。没有绕过槽校验或修改冻结QEMU来掩盖错误。旧18–21不用于放行。
+
+最终ROM6993160 B，SHA256 `63eb98e51c9cb1e0b2783d63b51c50da0dadb3db95b1ad107fcbb0fbb970df94`。放行脚本独立重比源/头文件、ELF、三轮同镜像、双槽原始字节、保护区与回执，正式stable_slot_switch_verified=true；hardware_verified=false。物理及传统OTA旁路限制在交付说明中保留，未刷机/部署Bridge/提交Git。
+
+## 2026-10-19 完整0041收尾
+
+候选16及正式ROM为同一 SHA256 `6adb31dcaa0a35c77a38c729d298764f0c72ae7e729b6c77a21dd0b7beeb56bc`。原生31/32/33验证首次绑定和八模板Bundle、维护全镜像升级及保护区、新槽恢复绑定/Bundle/激活/升级回执；四场景活动LVGL缓冲零差异。宿主ASan/UBSan另覆盖损坏Bundle恢复、五分钟接收超时、提交unknown围栏及持久失败。最后发现的损坏元数据误作空配置问题已修正并重编全部最终证据，未复用候选15验收。
+
+原厂0041字节保护、30对象无可写静态/隐式初始化、完整XIP链接、匹配ELF及资源成本已审阅。core162/render15/v2_state21与存储8组合、Note4兼容构建/匹配ELF Wi-Fi栈闸门通过；Bridge预帧HTTP错误不再误报协议版本，并保持拒绝与AckUnknown区别。正式放行脚本复核当前源/头文件和全部镜像/证据指纹，不依靠手填通过标记。
+
+完整说明见[release-0041.md](release-0041.md)。实际原厂VFS/LVGL在模型环境运行；MAC、socket、输入、fbdev与Boot2等明确合成。物理LCD/SPI、首启、free/高水位和0031旧独立接收器跨升未验；不得将flashable=true解读为已刷或物理验收完成。全程未访问实机、未部署Bridge、未提交Git。下方保留历史审阅。
+
+最新原生应用/完整候选与真实RV32运行见[native-0041-application.md](native-0041-application.md)。候选01已生成，原生服务/UI验收仍开放，flashable=false。下列“未生成ROM”是此前阶段记录。
+
+2026-10-18原生续作：[0041里程碑](native-0041-progress.md)。调用方持有状态避免XIP可写全局量；原生目标不实例化ESP/宿主默认对象。CT ABI/字体索引不变，33项共享回归及4组宿主像素一致通过；RV32检查同时拒绝隐式构造/TLS/GOT。合并产物明确ET_REL/flashable=false。原生VFS/HTTP/Bundle/UI、完整镜像和资源总量仍开放，不把私有Ghidra离线ABI候选当运行证明。
+
+2026-10-18：共享模板、Bridge候选及隔离实时NuttX模拟验收通过；完整0041原生ROM接线及实机未完成。
+
+本轮新增实际CompactFrame/UDP客户端、共享绑定/存储/激活/渲染核心的实时闭环，10检查/8截图；含两个模板的原子本地激活与重启恢复。宿主设备服务和NuttX UI通过私有HOSTFS端口相接，不是0031原件在模拟器执行。Bridge UI截图使用合成IPC，不能证明Tauri真实Rust通信；pair POST失回执/恢复由application service本地socket回归覆盖。详见status.md及native-integration-review.md。
+
+用户复核指出RC预览缺漏和明显粗糙：RC问题在示例数据（只给双窗口填RC），不是模板条件绑定；夹具已修正并覆盖两种布局的RC显示/隐藏。首轮视觉被指出粗糙；本轮已用v3 alpha4字体、覆盖率圆环及排版调整完成精修。原尺寸对照已目视复核，不能用像素一致性代替用户确认或实机观感。
+
+## 核对结果
+
+- AP01显式画布/调色板/身份与Wi-Fi-only能力；旧EPD不接受ring，不能把320×240回退成200×200。新target始终hardware_verified=false、partial=false。
+- Ring百分比绑定、几何、0/100、未知颜色/字段/图元、CTP1 CRC/读回与序列化后的绑定类型均严格校验。CTP1固定记录仍11333 B；ABI2结构未扩张，目标能力负责隔离新语义。
+- 两种布局由when完成，没有在设备硬编码Codex缺桶规则。源码CRC **fb18016d**由Python/Rust/C++交叉核对；Pythoncanonical补充ensure_ascii=False，已有ASCII模板字节不变。
+- core/render完整252项通过；app并行首次103通过/1失败/3忽略，失败为`page_network_guard_does_not_block_programmatic_cached_sync`的host_network_changed/host_network_unknown断言，涉及全局测试网络环境。单独运行通过，随后app串行104通过/3忽略；新增AP01能力所属5项通过。未以修复无关产品逻辑掩盖此失败。
+- CLI支持重复--font，实际CSFN v2两份字体下JSON/CTP1/序列化读回像素差异0。彩色参考PNG的CLI --diff暂不支持，明确报错；不能走旧1bpp比较而误报一致。SIM的PIL像素核验支持本版彩色。
+- 最终SIM **21检查/9截图**：天气↔模板↔萌宠，缺桶重排、后台不抢屏、4次共享帧与LVGL像素差异0、充电弹窗、屏保首次唤醒消费、8项双向导航、失败不推进位置、原厂长按依据底座状态回Power/Time。
+
+## 诊断记录与复现注意
+
+- 首轮复制了构建缓存，归档内旧绝对路径对象与新对象同时留在libapps.a，链接仍选旧UI。发现于按键发送前，那个旧ELF启动短暂使用原SIM的HOSTFS状态/响应目录；不能声称整个调查从未访问该运行目录。没有停止原SIM、没有设备/Bridge请求或用户配置操作。准备器已重定位隔离副本链接、清退723个有新替代项的旧库成员，最终ELF字符串只含新HOSTFS路径及模板入口，再开展所有有效验收。
+- LVGL/NuttX默认cache=0时索引图行解码无法分配，首轮实际黑屏；本轮提供按需4096 B预算，含1280 B解码行及分配器开销。没有盲增整屏RGB缓冲。通用sink在cache禁用时返回失败。
+- 原厂长按在底座连接时回Power，非固定Time；测试按原有规则修正，不改产品路由迎合断言。
+- 证据：[SIM报告](../../artifacts/ap01-template-integration/sim-integration-report.json)、[像素一致性](../../artifacts/ap01-template-integration/compiled-parity.log)、[编译合同](../../artifacts/ap01-template-integration/template-manifest.json)、[core/render](../../artifacts/ap01-template-integration/core-render-tests.log)、[app串行](../../artifacts/ap01-template-integration/app-serial-tests.log)。字体/截图/日志留在artifacts，不入库。
+
+AP01 原厂 UI 接入点以已重建 0041 SIM 为可运行验证入口；不能把 SIM 或已存在的 0031 OTA 健康检查当作生产显示接入完成。
+
+## 边界
+
+先前离线SIM只验证导航与拒绝语义；本轮实时端口已调用共享单context/原子本地激活并验证宿主重启恢复。实际AP01原ROM binding/HTTP/VFS/Bundle/UI线程、精确LVGL ABI、掉电及匹配ROM堆栈仍归backlog C9。没有提交Git、修改实际Profile、部署Bridge或刷设备。
+
+## 本轮视觉精修复核
+
+- v3严格限定alpha4，行步长/字形越界、错误版本/格式/位深、旧EPD目标拒绝均由Rust和C++验证；新增完整AP01 Bundle携带v3字体的验证。协议3只准入AP01，发布前按字体实际版本拒绝旧能力。
+- 原有字体拒绝测试使用的“未知格式2/版本3”现已成为正式值，改为未知格式3/版本4；首次回归因此两项预期过时，更新后完整core/render253通过。不是放宽拒绝条件；新增v1+alpha4错误组合仍拒绝。
+- 本轮app串行105通过/3条件忽略；JSON/编译/序列化读回像素差异0，CRC fb18016d。SIM21项/9截图、4次像素差异0；新ELF14965080 B、SHA256 f38e2a3362dc4f09706224e64fbacab2d6e1e5850333100e312d8d2515434f5e。
+- 字体三份共49028 B，帧与解码缓存预算未增长。目视检查原尺寸双布局、原有天气页及前后对照：笔画和圆周已消除原硬边，重置文案不再穿过环线。有限调色板仍有量化，不声称原版逐像素一致。
+- 日志：`aa-core-render-tests.log`、`aa-app-tests.log`、`aa-compiled-parity.log`；原尺寸`aa-before-after.png`及`aa-native-navigation.png`，均在artifacts/ap01-template-integration。测试脚本所建SIM/Xvfb已正常退出；生产Bridge、Note4、AP01 ROM未改。
+
+## 独立HTTP与存储复核
+
+稳定维护与Codex显示业务分监听及服务任务，非只分URL；配对走维护，维护健康不依赖业务context。实际停止业务监听后维护健康及pairing/info保持可读，401及错误端点链正确；不声称原机进程内存隔离。新UDP须同时含不同的业务/维护端口；Bridge认证仍按完整MAC，不降级到旧同端口。
+
+0041精确原件的分区函数重新检查，/resource总1.25MiB；GIF五项表原生descriptor解析/结束符核对共2153808 B，均在ROM而非/resource。宿主容量不再固定1MiB，显式容量/外部占用模型验证1/2/4/8模板raw/CSZ1及更新，满盘前置拒绝且旧文件字节不变。报告明列原机free未知、LittleFS块放大未测、原生解压未接，不以压缩才判够用。当前无不足证据，未删除GIF页面。详情storage-http.md；无新ROM、未刷机。

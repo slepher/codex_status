@@ -3,9 +3,9 @@
 #include <algorithm>
 #include <new>
 #include <string.h>
-#ifndef CODEX_BUNDLE_HOST
+#if !defined(CODEX_BUNDLE_HOST) && !defined(CODEX_AP01_NATIVE)
 #include <miniz.h>
-#else
+#elif defined(CODEX_BUNDLE_HOST)
 extern "C" bool codex_bundle_inflate(uint8_t *, size_t, const uint8_t *, size_t);
 #endif
 namespace {
@@ -22,6 +22,9 @@ bool BundlePayload::begin(uint32_t at, uint32_t bytes, uint32_t decodedLimit) {
     uint8_t h[24] = {};
     size_t got = file.read(h, std::min<uint32_t>(bytes, sizeof(h)));
     if (got < 4 || memcmp(h, "CSZ1", 4)) { valid = bytes <= decodedLimit; return valid; }
+#if defined(CODEX_AP01_NATIVE)
+    return false; // Advertised compression_protocol=0 until a native decoder is linked.
+#endif
     packed = true;
     length = u32(h + 4); crc = u32(h + 8); blocks = u32(h + 16);
     if (got != sizeof(h) || !length || length > decodedLimit || u32(h + 12) != BLOCK ||
@@ -40,7 +43,7 @@ bool BundlePayload::begin(uint32_t at, uint32_t bytes, uint32_t decodedLimit) {
     offsets[blocks] = bytes;
     input.reset(new (std::nothrow) uint8_t[MAX_PACKED]);
     output.reset(new (std::nothrow) uint8_t[BLOCK]);
-#ifndef CODEX_BUNDLE_HOST
+#if !defined(CODEX_BUNDLE_HOST) && !defined(CODEX_AP01_NATIVE)
     decoder = malloc(sizeof(tinfl_decompressor));
     if (!decoder) return false;
 #endif
@@ -51,7 +54,9 @@ bool BundlePayload::load(uint32_t index) {
     size_t in = offsets[index + 1] - offsets[index];
     size_t out = std::min<uint32_t>(BLOCK, length - index * BLOCK);
     if (!file.seek(base + offsets[index]) || file.read(input.get(), in) != in) return false;
-#ifdef CODEX_BUNDLE_HOST
+#if defined(CODEX_AP01_NATIVE)
+    bool ok = false; // Packed input was rejected in begin().
+#elif defined(CODEX_BUNDLE_HOST)
     bool ok = codex_bundle_inflate(output.get(), out, input.get(), in);
 #else
     auto *work = static_cast<tinfl_decompressor *>(decoder); tinfl_init(work);

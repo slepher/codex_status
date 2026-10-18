@@ -6,6 +6,8 @@ mod autostart;
 #[path = "autostart_unix.rs"]
 mod autostart;
 mod config;
+mod ap01;
+mod ap01_lan;
 mod device_runtime;
 mod discovery;
 mod icon;
@@ -259,6 +261,7 @@ fn device_occupancy_decision(
 }
 
 struct AppCtx {
+    ap01: ap01::Control,
     instance: instance::Instance,
     config: Config,
     root: PathBuf,
@@ -988,6 +991,7 @@ async fn mcp_handler(
             name,
             "device_rename"
                 | "device_discover"
+                | "ap01_devices"
                 | "device_owner"
                 | "device_claim"
                 | "device_release"
@@ -1526,6 +1530,18 @@ async fn post_claim_once(
     let name = ctx.bridge_name.lock().unwrap().clone();
     let host = lan_ip();
     let port = ctx.config.port;
+    if ap01::is_ap01(ctx,target_mac) {
+        if force || release {return Err(ClaimError::Other("AP01 不支持 force/release；请等待占用租约到期".into()));}
+        ap01::verify_endpoint(ctx,target_mac,endpoint).await.map_err(ClaimError::Other)?;
+        let (endpoint,token,mac)=(endpoint.to_owned(),token.to_owned(),target_mac.to_owned());
+        let body=json!({"device_mac":mac,"bridge_id":bridge_id,"name":name,"host":host,"port":port,
+            "lease_s":300,"request_id":uuid::Uuid::new_v4().simple().to_string()});
+        let (code,reply)=tokio::task::spawn_blocking(move ||bridge_core::device_client::claim(
+            &endpoint,&token,&token,&body,budget.remaining())).await
+            .map_err(|_|ClaimError::Other("AP01 claim worker failed".into()))?
+            .map_err(|_|ClaimError::Other("AP01 claim result unknown; read authenticated status".into()))?;
+        return Ok((reqwest::StatusCode::from_u16(code).map_err(|e|ClaimError::Other(e.to_string()))?,reply.to_string()));
+    }
     post_claim_to_endpoint_budget(
         endpoint,
         target_mac,
@@ -1757,7 +1773,7 @@ async fn post_claim_explicit_for_mac(
         ));
     };
     match post_claim_for_mac(ctx, force, release, &mac).await {
-        Err(ClaimError::Unauthorized) => {
+        Err(ClaimError::Unauthorized) if !ap01::is_ap01(ctx,&mac) => {
             tracing::info!("claim token missing/rejected; requesting a fresh one over BLE");
             let cfg = mcp_config(ctx);
             let fresh = bridge_mcp::fetch_device_token(&cfg, &mac)
@@ -2018,8 +2034,15 @@ async fn device_tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, S
         "device_owner" => Ok(device_identity_json(ctx)
             .unwrap_or(Value::Null)
             .to_string()),
+        "ap01_devices" => Ok(ap01::action(ctx,args["op"].as_str().unwrap_or("search"),args).await.to_string()),
         "device_discover" => {
             let via = args.get("via").and_then(|v| v.as_str()).unwrap_or("auto");
+            if let Some(mac)=args["mac"].as_str().and_then(bridge_core::platform::model::DeviceIdentity::normalized_mac) {
+                if ap01::is_ap01(ctx,&mac) {
+                    if via=="ble" {return Err("AP01 使用局域网发现与屏幕确认配对".into());}
+                    return Ok(platform::refresh_status(ctx,&mac).await.to_string());
+                }
+            }
             let result =
                 discover_device(ctx, via, args.get("mac").and_then(Value::as_str)).await?;
             Ok(result.to_string())
@@ -2149,6 +2172,11 @@ async fn platform_device_detail(state: State<'_, Arc<AppCtx>>, mac: String, sect
 async fn platform_wifi(state: State<'_, Arc<AppCtx>>, mac: String, op: String, body: Value) -> Result<Value, String> {
     if op == "view" { wifi::view(&state, &mac, false).await }
     else { wifi::action(&state, &mac, &op, body).await }
+}
+
+#[tauri::command]
+async fn platform_ap01(state: State<'_, Arc<AppCtx>>, op: String, body: Value) -> Result<Value,String> {
+    Ok(ap01::action(&state,&op,&body).await)
 }
 
 #[tauri::command]
@@ -2730,6 +2758,19 @@ async fn udp_listen(ctx: Arc<AppCtx>) {
             continue;
         }
         let raw_mac = doc.get("mac").and_then(Value::as_str).unwrap_or("");
+        if doc["discovery_v"]==1 && doc["kind"]=="announce" {
+            if let Ok(candidate)=bridge_core::ap01::decode_announce(&buf[..n],from) {
+                if ap01::is_ap01(&ctx,&candidate.device_mac) {
+                    let now=now_secs();
+                    if last_revalidation.get(&candidate.device_mac).is_none_or(|at|now.saturating_sub(*at)>=10) {
+                        last_revalidation.insert(candidate.device_mac.clone(),now);
+                        let ctx=ctx.clone();
+                        tokio::spawn(async move {let _=ap01::revalidate(&ctx,&candidate.device_mac,&candidate.endpoint).await;});
+                    }
+                }
+            }
+            continue;
+        }
         let devices = ctx.platform.devices();
         if bridge_core::platform::model::DeviceIdentity::normalized_mac(raw_mac).is_none() {
             if let Some(suppressed) = device_udp_sampler.record(None, "format_invalid", now_secs()) {
@@ -3696,6 +3737,7 @@ fn main() {
 
     let (mcp_tx, _mcp_rx) = tokio::sync::watch::channel(mcp_port);
     let ctx = Arc::new(AppCtx {
+        ap01: ap01::Control::default(),
         instance,
         config,
         root: root.clone(),
@@ -3776,6 +3818,7 @@ fn main() {
             platform_device_view,
             platform_device_detail,
             platform_wifi,
+            platform_ap01,
             platform_template_get,
             platform_template_validate,
             platform_template_preview,

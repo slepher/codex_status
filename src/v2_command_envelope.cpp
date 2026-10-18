@@ -1,3 +1,4 @@
+#include "local_json_allocator.h"
 #include "v2_command_envelope.h"
 
 #include <string.h>
@@ -51,7 +52,7 @@ bool compactFrameDecode(const uint8_t *frame, size_t length, CompactFrameHeader 
 
 uint16_t compactOperation(const char *name) {
     if (!name) return 0;
-    static const char *names[] = {"", "status", "data", "plan", "claim", "renew",
+    static const char *const names[] = {"", "status", "data", "plan", "claim", "renew",
         "sync_begin", "sync_page", "sync_ack", "sync_complete", "bundle_begin",
         "bundle_chunk", "bundle_commit", "activate", "wifi_snapshot", "wifi_apply",
         "wifi_result", "wifi_result_ack", "wifi_command", "ota_image",
@@ -89,7 +90,7 @@ String v2BuildAck(const char *op, const char *result, const char *display,
                   const char *retention, const char *error, int64_t seq,
                   uint64_t planId, const char *context,
                   uint32_t acceptedRemainingS, const char *fwTarget, bool fullSeq) {
-    JsonDocument doc;
+    LocalJsonAllocator allocator_doc; JsonDocument doc(&allocator_doc);
     doc["op"] = op;
     doc["result"] = result;
     doc["display_state"] = display;

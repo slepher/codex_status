@@ -96,7 +96,7 @@ void tplSetCanvas(int w, int h);
 #define CT_B64_MAX      64
 #define CT_NONE_IDX     0xFF
 
-enum CtOpType { CT_TEXT = 0, CT_BAR = 1, CT_RECT = 2, CT_LINE = 3, CT_ICON = 4 };
+enum CtOpType { CT_TEXT = 0, CT_BAR = 1, CT_RECT = 2, CT_LINE = 3, CT_ICON = 4, CT_RING = 5 };
 
 // Condition modes (bit-stable for persistence).
 enum CtWhenMode { CTW_NONE = 0, CTW_EXISTS_TRUE = 1, CTW_EXISTS_FALSE = 2, CTW_EQ_NUM = 3, CTW_EQ_STR = 4 };

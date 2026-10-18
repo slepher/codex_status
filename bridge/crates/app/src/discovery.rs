@@ -94,7 +94,7 @@ fn parse_macos_neighbors(text: &str) -> Vec<(String, String)> {
 /// Read the Windows IPv4 neighbor table and map a normalized MAC back to its
 /// current IP. `dwAddr` is stored in network byte order.
 #[cfg(windows)]
-fn neighbor_ip_for_mac(target: &str) -> Option<String> {
+pub(crate) fn neighbor_ip_for_mac(target: &str) -> Option<String> {
     use windows_sys::Win32::NetworkManagement::IpHelper::{GetIpNetTable, MIB_IPNETTABLE};
     let mut size: u32 = 0;
     unsafe { GetIpNetTable(std::ptr::null_mut(), &mut size, 0) };
@@ -133,12 +133,12 @@ fn neighbor_ip_for_mac(target: &str) -> Option<String> {
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
-fn neighbor_ip_for_mac(_target: &str) -> Option<String> {
+pub(crate) fn neighbor_ip_for_mac(_target: &str) -> Option<String> {
     None
 }
 
 #[cfg(target_os = "macos")]
-fn neighbor_ip_for_mac(target: &str) -> Option<String> {
+pub(crate) fn neighbor_ip_for_mac(target: &str) -> Option<String> {
     let output = std::process::Command::new("/usr/sbin/arp").arg("-an").output().ok()?;
     parse_macos_neighbors(&String::from_utf8(output.stdout).ok()?).into_iter()
         .find(|(_, mac)| mac == target).map(|(ip, _)| ip)

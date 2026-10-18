@@ -228,11 +228,10 @@ pub fn save_device_token_at(data_root: &Path, expected_mac: &str, token: &str) -
     if !valid_device_token(token) {
         return Err(anyhow::anyhow!("invalid device token"));
     }
-    let _ = std::fs::create_dir_all(data_root);
     let path = device_token_path_at(data_root, &mac).context("invalid target device MAC")?;
     let doc = json!({"device_mac": mac, "token": token, "updated_at": now_secs()});
-    std::fs::write(&path, serde_json::to_string_pretty(&doc)?)
-        .with_context(|| format!("write {}", path.display()))?;
+    bridge_core::platform::store::write_json(&path,&doc)?;
+    anyhow::ensure!(load_device_token_at(data_root,&mac).as_deref()==Some(token),"credential_readback_failed");
     tracing::info!("device token cached ({})", path.display());
     Ok(())
 }
@@ -700,6 +699,13 @@ fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "ap01_devices",
+            "title": "发现与配对 AP01",
+            "description": "局域网主动发现，无需输入IP；pair显示双屏四位码，必须设备旋钮确认；pair_status查询原事务，cancel_pair取消。绑定不发布模板或启用同步。",
+            "annotations": {"readOnlyHint": false,"destructiveHint": false},
+            "inputSchema": {"type":"object","properties":{"op":{"enum":["search","cancel_search","pair","pair_status","cancel_pair"]},"mac":{"type":"string"}},"required":["op"],"additionalProperties":false}
+        },
+        {
             "name": "device_discover",
             "title": "重新发现设备",
             "description": "用户显式动作：按 via=auto（先 HTTP 再 ARP）|arp|ble（需设备 BLE 会话：单击 BOOT）重新发现设备地址并持久化",
@@ -1151,7 +1157,7 @@ async fn call_tool(cfg: &McpConfig, name: &str, args: &Value) -> Result<Vec<Valu
             .map_err(|e| e.to_string())?;
             Ok(vec![text_block(text)])
         }
-        "device_rename" | "device_discover" | "device_owner" | "device_claim"
+        "ap01_devices" | "device_rename" | "device_discover" | "device_owner" | "device_claim"
         | "device_release" => {
             // Implemented in bridge-app (live identity/occupancy state); this
             // library copy has no running app to mutate.

@@ -1,3 +1,4 @@
+#include "local_json_allocator.h"
 #include "v2_status_snapshot.h"
 
 void v2WriteDataContract(JsonObject out, const CtTemplate &compiled) {
@@ -22,7 +23,7 @@ void v2WriteDataContract(JsonObject out, const CtTemplate &compiled) {
 }
 
 String v2BuildStatusSnapshot(const V2StatusSnapshot &snapshot) {
-    JsonDocument doc;
+    LocalJsonAllocator allocator_doc; JsonDocument doc(&allocator_doc);
     const BsProfile &profile = *snapshot.profile;
     const V2DataSeq &dataSeq = *snapshot.dataSeq;
     const V2PlanState &plan = *snapshot.plan;

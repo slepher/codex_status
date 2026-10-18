@@ -15,7 +15,16 @@
 //                             paths are used; partial hardware validation remains.
 #pragma once
 
-#if defined(CODEX_TARGET_NOTE4)
+#if defined(CODEX_AP01_NATIVE)
+#define FW_TARGET_ID       "cuktech-ap01-0041"
+#define RENDER_TARGET_ID   "lcd-jd9853-320x240-palette4"
+#define TARGET_PIXEL_FORMAT "4bpp"
+#define TARGET_COLORS      "palette4"
+#define TARGET_PARTIAL     0
+#define TARGET_VERIFIED    0
+#define TARGET_WIDTH  320
+#define TARGET_HEIGHT 240
+#elif defined(CODEX_TARGET_NOTE4)
 #define FW_TARGET_ID       "zectrix-note4-400x300"
 #define RENDER_TARGET_ID   "epd-ssd2683-400x300-1bpp"
 #define TARGET_PIXEL_FORMAT "1bpp"
@@ -44,7 +53,11 @@
 #define TARGET_HEIGHT 200
 #endif
 
+#if defined(CODEX_AP01_NATIVE)
+#define TARGET_ROW_BYTES ((TARGET_WIDTH + 1) / 2)
+#else
 #define TARGET_ROW_BYTES ((TARGET_WIDTH + 7) / 8)
+#endif
 #define TARGET_FB_BYTES  (TARGET_ROW_BYTES * TARGET_HEIGHT)
 
 // ---------------------------------------------------------------------------

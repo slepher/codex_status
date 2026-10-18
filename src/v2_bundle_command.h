@@ -3,6 +3,14 @@
 #include <ArduinoJson.h>
 #include "v2_state.h"
 
+class BundleStore;
+struct BsReceipt;
+struct V2BundleServices {
+    BundleStore &store;
+    // The durable replay scratch is owned by the serialized command executor.
+    BsReceipt &receipt;
+};
+
 struct V2BundleFingerprint {
     const char *owner;
     const char *request;
@@ -46,7 +54,7 @@ struct V2BundleCommitDecision {
 V2BundleBeginDecision v2DecideBundleBegin(
     JsonDocument &doc, const V2BundleRx &current,
     const V2BundleFingerprint &committed, const char *sessionNonce,
-    uint64_t nowMs);
+    uint64_t nowMs, V2BundleServices *services = nullptr);
 
 // Validate a Bundle commit against the received payload on flash. The payload is
 // streamed for CRC/owner/job checks, so a commit never holds the whole bundle in
@@ -54,7 +62,8 @@ V2BundleBeginDecision v2DecideBundleBegin(
 V2BundleCommitDecision v2DecideBundleCommit(
     JsonDocument &doc, const V2BundleRx &current,
     const V2BundleFingerprint &committed, const char *sessionNonce,
-    uint64_t nowMs, const char *receivePath, const char *bridgeIdFallback);
+    uint64_t nowMs, const char *receivePath, const char *bridgeIdFallback,
+    V2BundleServices *services = nullptr);
 
 struct V2BundleChunkStartDecision {
     bool allowed = false;

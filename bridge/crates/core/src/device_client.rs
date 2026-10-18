@@ -241,6 +241,20 @@ fn request(
         extra_headers, CONTENT_TYPE, deadline.saturating_duration_since(Instant::now()), &mut progress)?;
     progress.stage = "http_response";
     if matches!(status, 401 | 403) && op != 4 { return Err(HttpStatus(status).into()); }
+    // Admission/lifecycle errors can precede frame dispatch. Preserve their
+    // bounded explanation instead of misreporting a software-version mismatch.
+    if status >= 400 && response.first() != Some(&0xc1) {
+        if let Ok(value) = serde_json::from_slice::<Value>(&response) {
+            let field = |key: &str| value[key].as_str().filter(|text|
+                !text.is_empty() && text.len() <= 64 &&
+                text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'));
+            if let (Some(code),Some(stage),Some(action)) = (field("error"),field("stage"),field("action")) {
+                let detail=format!("device {code}; stage={stage}; action={action}");
+                if value["result"]=="rejected" { return Err(anyhow::Error::new(HttpStatus(status)).context(detail)); }
+                if value["result"]=="unknown" { bail!("device result unknown; {detail}"); }
+            }
+        }
+    }
     let (ack, bytes) = Header::decode(&response, MAX_HTTP_FRAME)
         .map_err(|e| anyhow!("device protocol mismatch: {e}; update Bridge and device software"))?;
     if status == 409 && serde_json::from_slice::<Value>(bytes).ok()
@@ -309,6 +323,26 @@ pub fn claim(ip: &str, endpoint_token: &str, device_token: &str,
     let payload = serde_json::to_vec(body)?;
     request(ip, "POST", "/claim", endpoint_token, Some(&payload),
         &[("X-Device-Token",device_token)], timeout)
+}
+
+/// AP01's explicitly advertised screen-confirm bootstrap is ordinary bounded
+/// JSON HTTP on the maintenance listener, including authenticated health reads.
+/// It is independent from the business listener's compact-frame session.
+pub fn pairing_request(endpoint: &str, method: &str, path: &str, token: &str,
+                       body: Option<&Value>, timeout: Duration) -> Result<(u16, Value)> {
+    let valid_path = path == "/api/pairing/info" || path == "/api/pairing" ||
+        (method=="GET" && matches!(path,"/health"|"/api/maintenance/status")) ||
+        path.strip_prefix("/api/pairing/").is_some_and(|id|
+            !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
+    anyhow::ensure!(valid_path && matches!(method,"GET"|"POST"|"DELETE"),"pairing_request_invalid");
+    let payload=body.map(serde_json::to_vec).transpose()?;
+    anyhow::ensure!(payload.as_ref().is_none_or(|p| p.len() <= 4096),"pairing_request_too_large");
+    let mut progress=HttpProgress{outcome:DispatchOutcome::NotSent,stage:"pairing_prepare"};
+    let (status,bytes)=transport_request(endpoint,method,path,token,payload.as_deref(),&[],
+        "application/json",timeout.min(Duration::from_secs(5)),&mut progress)?;
+    anyhow::ensure!(bytes.len() <= 8192,"pairing_response_too_large");
+    let reply=serde_json::from_slice(&bytes).context("pairing_response_json")?;
+    Ok((status,reply))
 }
 
 fn post_json(ip: &str, path: &str, token: &str, body: &Value, timeout: Duration) -> Result<Value> {
@@ -765,6 +799,32 @@ mod tests {
     use std::io::Read;
     use std::net::TcpListener;
     use std::thread;
+
+    #[test]
+    fn pre_dispatch_json_errors_keep_stage_without_exposing_other_fields() {
+        for result in ["rejected","unknown"] {
+            let listener=TcpListener::bind("127.0.0.1:0").unwrap();
+            let address=listener.local_addr().unwrap().to_string();
+            let server=thread::spawn(move || {
+                let (mut stream,_)=listener.accept().unwrap();stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut head=Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {let mut byte=[0];stream.read_exact(&mut byte).unwrap();head.push(byte[0]);assert!(head.len()<4096);}
+                let text=String::from_utf8(head).unwrap();
+                let length=text.lines().find_map(|line|line.split_once(':').filter(|(name,_)|name.eq_ignore_ascii_case("content-length"))
+                    .and_then(|(_,value)|value.trim().parse::<usize>().ok())).unwrap();
+                let mut body=vec![0;length];stream.read_exact(&mut body).unwrap();
+                let body=json!({"result":result,"error":"business_offline","stage":"lifecycle","action":"read_device_status","secret":"response-secret"}).to_string();
+                write!(stream,"HTTP/1.1 503 Busy\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+            });
+            let error=request(&address,"POST","/api/status","request-secret",None,&[],Duration::from_secs(2)).unwrap_err();
+            server.join().unwrap();let text=format!("{error:#}");
+            assert!(text.contains("business_offline")&&text.contains("lifecycle")&&text.contains("read_device_status"));
+            assert!(!text.contains("protocol mismatch")&&!text.contains("response-secret")&&!text.contains("request-secret"));
+            let refused=error.chain().any(|cause|cause.downcast_ref::<HttpStatus>().is_some());
+            assert_eq!(refused,result=="rejected");
+            if result=="unknown" {assert_eq!(error.downcast_ref::<CommandFailure>().unwrap().outcome,DispatchOutcome::AckUnknown);}
+        }
+    }
 
     fn respond_once(status: u16, payload: String) -> (String, thread::JoinHandle<()>) {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();

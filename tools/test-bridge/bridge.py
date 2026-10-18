@@ -123,7 +123,7 @@ TEMPLATES = [
 
 
 def tpl_canon(t: dict) -> bytes:
-    return json.dumps(t, separators=(",", ":"), sort_keys=True).encode()
+    return json.dumps(t, separators=(",", ":"), sort_keys=True, ensure_ascii=False).encode()
 
 
 TPL_BYTES = {t["id"]: tpl_canon(t) for t in TEMPLATES}

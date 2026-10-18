@@ -62,7 +62,7 @@ UI 和 MCP 调用同一套保存、预览、发布、同步开关、激活、cla
 
 `job_id` 用于事务去重，整体 digest/CRC 用于包完整性，`compiler_abi` 用于格式兼容；它们都不是模板版本。`data_seq` 仅在一个 active_context 内递增，用于拒绝乱序数据。Bridge 重启保留每设备已分配计数；丢失本地记录时先认证读取设备状态，再从实际计数之后发送，不能盲目从 0 开始。
 
-本地时钟、电池和连接状态由设备注入，远程字段不得覆盖。内建/v1字体文本保持ASCII净化；CSFN v2资产按有界UTF-8查字、缺字回退问号，中文字库只随完整Bundle发布、不内置ROM。格式/能力与未验边界见[字体合同](font-asset-format.md)。任何未知 type/font/bind 或越界引用整份拒绝。Codex 缺 5h 桶显示静态 100/隐藏 reset、RC<=0 隐藏、无用户名整行隐藏由 Codex 映射及模板合同保留，通用运行时不硬编码这些桶名。
+本地时钟、电池和连接状态由设备注入，远程字段不得覆盖。内建/v1字体文本保持ASCII净化；CSFN v2/v3资产按有界UTF-8查字、缺字回退问号，中文字库只随完整Bundle发布、不内置ROM。格式/能力与未验边界见[字体合同](font-asset-format.md)。任何未知 type/font/bind 或越界引用整份拒绝。现有EPD变体缺 5h 桶显示静态 100/隐藏 reset、RC<=0 隐藏、无用户名整行隐藏由各模板合同保留；AP01变体缺5h则整组隐藏并居中重排，RC独立按存在性显示，通用运行时不硬编码这些桶名。
 
 ## 4. 模板与 Profile 生命周期
 
@@ -97,6 +97,8 @@ UI 和 MCP 调用同一套保存、预览、发布、同步开关、激活、cla
 | firmware_target | 上述可构建组合及分区；每种组合独立 ROM |
 
 模板 ID 可有不同 render_target 的最新版，但 Profile 仍只引用 ID，由目标设备选择匹配变体。没有匹配变体就阻止发布；不自动缩放、不抹掉颜色假装兼容。彩色/灰阶先验证全刷和像素合同，不支持局刷的组合明确报告 partial=false。
+
+2026-10-18 AP01 彩色软件候选：用户选择扩展共享引擎并保留圆环，替代旧 AP01 专项的首版黑白限制。新增 `lcd-jd9853-320x240-palette4`（320×240，4bpp十六色调色板（ap01-palette-v2，7语义色＋9覆盖率色），RGB565颜色表），`ring` 只允许百分比绑定；旧EPD目标拒绝该图元。复用当前CTP1布局/ABI2、字段与when、CSFN v1/v2掩码与v3 alpha4覆盖率、完整Bundle。`hardware_verified=false, partial=false`；只有共享引擎和隔离NuttX重建UI验证，未成为已部署固件。原有旋钮页与模板焦点、显示线程及内存合同见[AP01接入设计](../project-workflow/ap01-template-integration/design.md)。
 
 新目标按最大 8 项总存储、单份安装内容及临时下载峰值、编译峰值、无线栈和双帧计算容量。200×200 1bpp 单帧为 5000B，仅为已知目标示例；PSRAM 不等于 deep 保留内存。编译可逐项执行并写入唯一内容文件，运行只加载 active，不能同时展开 8 个 JSON DOM。能力不足的旧设备继续 legacy 限制并明确提示，不能静默裁剪 8 项到 3 项。
 

@@ -1,11 +1,24 @@
+#include "local_json_allocator.h"
 #include "v2_runtime.h"
 #include "v2_state.h"
 
 #include <ArduinoJson.h>
 #include <string.h>
+#include <utility>
 
 // Bounded usage document: only the active template's required fields exist here.
 static const size_t V2_USAGE_CAP = 6144;
+
+static bool serializeUsage(JsonDocument &doc, String &out, String &error) {
+    size_t expected = measureJson(doc);
+    if (doc.overflowed()) { error = "usage_oom"; return false; }
+    if (expected > V2_USAGE_CAP) { error = "usage_size"; return false; }
+    String candidate; candidate.reserve(expected);
+    if (serializeJson(doc, candidate) != expected || candidate.length() != expected) {
+        error = "usage_oom"; return false;
+    }
+    out = std::move(candidate); return true;
+}
 
 uint32_t v2CrcOf(const String &text) {
     return v2Crc32((const uint8_t *)text.c_str(), text.length());
@@ -138,7 +151,7 @@ static V2DataAck applyEntries(const CtTemplate &ct, JsonArrayConst fields,
 
 V2DataAck v2ApplyData(const CtTemplate &ct, const String &messageJson,
                       const char *currentContext, String &usageOut, String &errorOut) {
-    JsonDocument in;
+    LocalJsonAllocator allocator_in; JsonDocument in(&allocator_in);
     if (deserializeJson(in, messageJson)) { errorOut = "json"; return V2_DATA_REJECTED; }
     const char *context = in["active_context_id"] | "";
     if (!*context) context = in["context_id"] | "";
@@ -148,7 +161,7 @@ V2DataAck v2ApplyData(const CtTemplate &ct, const String &messageJson,
     }
     JsonArrayConst fields = in["fields"].as<JsonArrayConst>();
     if (fields.isNull()) { errorOut = "fields"; return V2_DATA_REJECTED; }
-    JsonDocument doc;
+    LocalJsonAllocator allocator_doc; JsonDocument doc(&allocator_doc);
     doc["schema"] = 1;
     uint32_t crc = 0;
     const char *crcText = in["crc"] | "";
@@ -159,12 +172,7 @@ V2DataAck v2ApplyData(const CtTemplate &ct, const String &messageJson,
     }
     V2DataAck rc = applyEntries(ct, fields, doc, errorOut, crc);
     if (rc != V2_DATA_APPLIED) return rc;
-    usageOut = "";
-    serializeJson(doc, usageOut);
-    if (usageOut.length() > V2_USAGE_CAP) {
-        errorOut = "usage_size";
-        return V2_DATA_REJECTED;
-    }
+    if (!serializeUsage(doc, usageOut, errorOut)) return V2_DATA_REJECTED;
     return rc;
 }
 
@@ -173,7 +181,7 @@ V2DataAck v2AcceptData(const CtTemplate &ct, const String &messageJson,
                      String &usageOut, String &errorOut) {
     V2DataAck rc = v2ApplyData(ct, messageJson, currentContext, usageOut, errorOut);
     if (rc != V2_DATA_APPLIED) return rc;
-    JsonDocument in;
+    LocalJsonAllocator allocator_in; JsonDocument in(&allocator_in);
     if (deserializeJson(in, messageJson)) { errorOut = "json"; return V2_DATA_REJECTED; }
     uint64_t seq = in["seq"].as<uint64_t>();
     uint32_t crc = v2DataFieldsCrc(in["fields"].as<JsonArrayConst>());
@@ -184,15 +192,13 @@ V2DataAck v2AcceptData(const CtTemplate &ct, const String &messageJson,
 
 bool v2UsageFromFields(const CtTemplate &ct, const String &storedFieldsJson,
                        String &usageOut, String &errorOut) {
-    JsonDocument in;
+    LocalJsonAllocator allocator_in; JsonDocument in(&allocator_in);
     if (deserializeJson(in, storedFieldsJson)) { errorOut = "json"; return false; }
     JsonArrayConst fields = in.as<JsonArrayConst>();
     if (fields.isNull()) { errorOut = "fields"; return false; }
-    JsonDocument doc;
+    LocalJsonAllocator allocator_doc; JsonDocument doc(&allocator_doc);
     doc["schema"] = 1;
     V2DataAck rc = applyEntries(ct, fields, doc, errorOut, v2DataFieldsCrc(fields));
     if (rc != V2_DATA_APPLIED) return false;
-    usageOut = "";
-    serializeJson(doc, usageOut);
-    return usageOut.length() <= V2_USAGE_CAP;
+    return serializeUsage(doc, usageOut, errorOut);
 }

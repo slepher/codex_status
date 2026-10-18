@@ -1,3 +1,4 @@
+mod ap01_device;
 mod ble_device;
 use ble_device::{BleProxy, BleFault};
 use anyhow::{bail, ensure, Context, Result};
@@ -424,8 +425,8 @@ fn parse_options() -> Result<Options> {
         "--listen must use loopback or a private IPv4 address (synthetic MAC only)"
     );
     let mac = normalize_mac(mac.as_deref().context("--mac is required")?)?;
-    ensure!(target == "codex-status-154g" || target == "zectrix-note4-400x300",
-        "--target must be codex-status-154g or zectrix-note4-400x300");
+    ensure!(target == "codex-status-154g" || target == "zectrix-note4-400x300" || target == "cuktech-ap01-0041",
+        "--target must be codex-status-154g, zectrix-note4-400x300, or cuktech-ap01-0041");
     ensure!(["cold", "deep", "soft", "button"].contains(&wake_cause.as_str()),
         "--wake-cause must be cold, deep, soft or button");
     if let Some(path) = &catalog_path {
@@ -3450,6 +3451,7 @@ fn app(state: SimState) -> Router {
 #[tokio::main]
 async fn main() -> Result<()> {
     let options = parse_options()?;
+    if options.target == "cuktech-ap01-0041" { return ap01_device::run(options).await; }
     let endpoint_token = required_token("CODEX_STATUS_SIM_ENDPOINT_TOKEN")?;
     let device_token = required_token("CODEX_STATUS_SIM_DEVICE_TOKEN")?;
     let control_token = required_token("CODEX_STATUS_SIM_CONTROL_TOKEN")?;

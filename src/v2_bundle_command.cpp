@@ -1,5 +1,6 @@
 #include "v2_bundle_command.h"
-#include "bundle_store.h"
+#include "bundle_store_context.h"
+#include "local_json_allocator.h"
 #include "bundle_payload.h"
 #include "v2_runtime.h"
 
@@ -17,10 +18,16 @@ struct CommittedReplay {
 };
 // Storage owns the durable strings; decisions use this scratch until the next
 // serialized command, just as they use the caller's in-memory fingerprint.
-BsReceipt durableReceipt;
+#if !defined(CODEX_AP01_NATIVE)
+V2BundleServices &legacyServices() {
+    static BsReceipt receipt;
+    static V2BundleServices services{bsDefaultStore(), receipt};
+    return services;
+}
+#endif
 
 CommittedReplay checkCommittedReplay(JsonDocument &doc,
-                                     const V2BundleFingerprint &committed) {
+                                     const V2BundleFingerprint &committed, V2BundleServices &services) {
     CommittedReplay result;
     const char *owner = doc["bridge_id"] | "";
     const char *request = doc["request_id"] | "";
@@ -29,10 +36,10 @@ CommittedReplay checkCommittedReplay(JsonDocument &doc,
     uint32_t committedCrc = committed.crc, committedLength = committed.length;
     const char *committedContext = committed.context;
     if (strcmp(owner, committedOwner) || strcmp(request, committedRequest)) {
-        if (!bsReceipt(durableReceipt) || strcmp(owner, durableReceipt.owner) ||
-            strcmp(request, durableReceipt.request)) return result;
-        committedCrc = durableReceipt.crc; committedLength = durableReceipt.length;
-        committedContext = durableReceipt.context;
+        if (!services.store.bsReceipt(services.receipt) || strcmp(owner, services.receipt.owner) ||
+            strcmp(request, services.receipt.request)) return result;
+        committedCrc = services.receipt.crc; committedLength = services.receipt.length;
+        committedContext = services.receipt.context;
     }
 
     result.matched = true;
@@ -51,12 +58,16 @@ CommittedReplay checkCommittedReplay(JsonDocument &doc,
 V2BundleBeginDecision v2DecideBundleBegin(
     JsonDocument &doc, const V2BundleRx &current,
     const V2BundleFingerprint &committed, const char *sessionNonce,
-    uint64_t nowMs) {
+    uint64_t nowMs, V2BundleServices *services) {
     V2BundleBeginDecision decision;
+#if !defined(CODEX_AP01_NATIVE)
+    if (!services) services = &legacyServices();
+#endif
+    if (!services) { decision.error = "port_unbound"; return decision; }
     const char *owner = doc["bridge_id"] | "";
     const char *request = doc["request_id"] | "";
     const uint32_t length = doc["length"] | 0u;
-    CommittedReplay replay = checkCommittedReplay(doc, committed);
+    CommittedReplay replay = checkCommittedReplay(doc, committed, *services);
     if (replay.matched) {
         if (replay.replay) {
             decision.action = V2_BUNDLE_BEGIN_REPLAY;
@@ -93,15 +104,19 @@ V2BundleBeginDecision v2DecideBundleBegin(
 V2BundleCommitDecision v2DecideBundleCommit(
     JsonDocument &doc, const V2BundleRx &current,
     const V2BundleFingerprint &committed, const char *sessionNonce,
-    uint64_t nowMs, const char *receivePath, const char *bridgeIdFallback) {
+    uint64_t nowMs, const char *receivePath, const char *bridgeIdFallback, V2BundleServices *services) {
+#if !defined(CODEX_AP01_NATIVE)
+    if (!services) services = &legacyServices();
+#endif
     V2BundleCommitDecision decision;
+    if (!services) { decision.error = "port_unbound"; return decision; }
     const char *owner = doc["bridge_id"] | "";
     const char *request = doc["request_id"] | "";
     decision.owner = owner;
     decision.request = request;
     decision.length = doc["length"] | 0u;
 
-    CommittedReplay replay = checkCommittedReplay(doc, committed);
+    CommittedReplay replay = checkCommittedReplay(doc, committed, *services);
     if (replay.matched) {
         if (replay.replay) {
             decision.action = V2_BUNDLE_COMMIT_REPLAY;
@@ -124,7 +139,7 @@ V2BundleCommitDecision v2DecideBundleCommit(
         return decision;
     }
 
-    File file = LittleFS.open(receivePath, "r");
+    File file = services->store.openRead(receivePath);
     if (!file || file.size() != current.length) {
         if (file) file.close();
         decision.error = "length";
@@ -153,13 +168,13 @@ V2BundleCommitDecision v2DecideBundleCommit(
     }
 
     BundlePayload payload(file);
-    if (!payload.begin(0, current.length, LittleFS.totalBytes()) || !payload.verify()) {
+    if (!payload.begin(0, current.length, services->store.bsDecodedLimit()) || !payload.verify()) {
         decision.error = "compression"; return decision;
     }
     // The bundle's own `bridge_id` must match the command; fall back to the
     // query/form value when the payload is not readable as JSON. Filtered parses
     // keep only the two keys we need, so the cost stays bounded.
-    JsonDocument ownerFilter, ownerDoc;
+    LocalJsonAllocator ownerAllocator; JsonDocument ownerFilter(&ownerAllocator), ownerDoc(&ownerAllocator);
     ownerFilter["bridge_id"] = true;
     const char *bodyOwner = bridgeIdFallback ? bridgeIdFallback : "";
     if (payload.seek(0) && !deserializeJson(ownerDoc, payload, DeserializationOption::Filter(ownerFilter))) {
@@ -172,7 +187,7 @@ V2BundleCommitDecision v2DecideBundleCommit(
         return decision;
     }
 
-    JsonDocument idFilter, idDoc;
+    LocalJsonAllocator idAllocator; JsonDocument idFilter(&idAllocator), idDoc(&idAllocator);
     idFilter["job_id"] = true;
     if (!payload.seek(0) || deserializeJson(idDoc, payload, DeserializationOption::Filter(idFilter))) {
         file.close();
@@ -181,7 +196,7 @@ V2BundleCommitDecision v2DecideBundleCommit(
     }
     const char *jobId = idDoc["job_id"] | "";
     uint32_t activeCrc = 0;
-    if (bsActiveJobPayload(jobId, activeCrc)) {
+    if (services->store.bsActiveJobPayload(jobId, activeCrc)) {
         file.close();
         if (activeCrc != decision.crc) {
             decision.error = "request_conflict";

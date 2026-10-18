@@ -81,7 +81,10 @@
 #include <string.h> //memset()
 #include <math.h>
 
+#if !defined(CODEX_AP01_NATIVE)
 PAINT Paint;
+static PaintCanvas defaultPaintCanvas(Paint);
+#endif
 
 /******************************************************************************
 function: Create Image
@@ -91,7 +94,7 @@ parameter:
     Height  :   The height of the picture
     Color   :   Whether the picture is inverted
 ******************************************************************************/
-void Paint_NewImage(UBYTE *image, UWORD Width, UWORD Height, UWORD Rotate, UWORD Color)
+void PaintCanvas::Paint_NewImage(UBYTE *image, UWORD Width, UWORD Height, UWORD Rotate, UWORD Color)
 {
     Paint.Image = NULL;
     Paint.Image = image;
@@ -122,7 +125,7 @@ function: Select Image
 parameter:
     image : Pointer to the image cache
 ******************************************************************************/
-void Paint_SelectImage(UBYTE *image)
+void PaintCanvas::Paint_SelectImage(UBYTE *image)
 {
     Paint.Image = image;
 }
@@ -132,7 +135,7 @@ function: Select Image Rotate
 parameter:
     Rotate : 0,90,180,270
 ******************************************************************************/
-void Paint_SetRotate(UWORD Rotate)
+void PaintCanvas::Paint_SetRotate(UWORD Rotate)
 {
     if(Rotate == ROTATE_0 || Rotate == ROTATE_90 || Rotate == ROTATE_180 || Rotate == ROTATE_270) {
         // Debug("Set image Rotate %d\r\n", Rotate);
@@ -147,7 +150,7 @@ function:	Select Image mirror
 parameter:
     mirror   :Not mirror,Horizontal mirror,Vertical mirror,Origin mirror
 ******************************************************************************/
-void Paint_SetMirroring(UBYTE mirror)
+void PaintCanvas::Paint_SetMirroring(UBYTE mirror)
 {
     if(mirror == MIRROR_NONE || mirror == MIRROR_HORIZONTAL || 
         mirror == MIRROR_VERTICAL || mirror == MIRROR_ORIGIN) {
@@ -159,7 +162,7 @@ void Paint_SetMirroring(UBYTE mirror)
     }    
 }
 
-void Paint_SetScale(UBYTE scale)
+void PaintCanvas::Paint_SetScale(UBYTE scale)
 {
     if(scale == 2){
         Paint.Scale = scale;
@@ -169,8 +172,8 @@ void Paint_SetScale(UBYTE scale)
         Paint.Scale = scale;
         Paint.WidthByte = (Paint.WidthMemory % 4 == 0)? (Paint.WidthMemory / 4 ): (Paint.WidthMemory / 4 + 1);
     }
-	else if(scale == 6 || scale == 7) {//Only applicable with 5in65 e-Paper
-		Paint.Scale = 7;
+	else if(scale == 6 || scale == 7 || scale == 16) {
+		Paint.Scale = scale == 16 ? 16 : 7;
 		Paint.WidthByte = (Paint.WidthMemory % 2 == 0)? (Paint.WidthMemory / 2 ): (Paint.WidthMemory / 2 + 1);
 	}
 	else {
@@ -185,7 +188,7 @@ parameter:
     Ypoint : At point Y
     Color  : Painted colors
 ******************************************************************************/
-void Paint_SetPixel(UWORD Xpoint, UWORD Ypoint, UWORD Color)
+void PaintCanvas::Paint_SetPixel(UWORD Xpoint, UWORD Ypoint, UWORD Color)
 {
     if(Xpoint > Paint.Width || Ypoint > Paint.Height){
         Debug("Exceeding display boundaries\r\n");
@@ -263,7 +266,7 @@ function: Clear the color of the picture
 parameter:
     Color : Painted colors
 ******************************************************************************/
-void Paint_Clear(UWORD Color)
+void PaintCanvas::Paint_Clear(UWORD Color)
 {
     if(Paint.Scale == 2) {
 		for (UWORD Y = 0; Y < Paint.HeightByte; Y++) {
@@ -298,7 +301,7 @@ parameter:
     Yend   : y end point
     Color  : Painted colors
 ******************************************************************************/
-void Paint_ClearWindows(UWORD Xstart, UWORD Ystart, UWORD Xend, UWORD Yend, UWORD Color)
+void PaintCanvas::Paint_ClearWindows(UWORD Xstart, UWORD Ystart, UWORD Xend, UWORD Yend, UWORD Color)
 {
     UWORD X, Y;
     for (Y = Ystart; Y < Yend; Y++) {
@@ -317,7 +320,7 @@ parameter:
     Dot_Pixel	: point size
     Dot_Style	: point Style
 ******************************************************************************/
-void Paint_DrawPoint(UWORD Xpoint, UWORD Ypoint, UWORD Color,
+void PaintCanvas::Paint_DrawPoint(UWORD Xpoint, UWORD Ypoint, UWORD Color,
                      DOT_PIXEL Dot_Pixel, DOT_STYLE Dot_Style)
 {
     if (Xpoint > Paint.Width || Ypoint > Paint.Height) {
@@ -355,7 +358,7 @@ parameter:
     Line_width : Line width
     Line_Style: Solid and dotted lines
 ******************************************************************************/
-void Paint_DrawLine(UWORD Xstart, UWORD Ystart, UWORD Xend, UWORD Yend,
+void PaintCanvas::Paint_DrawLine(UWORD Xstart, UWORD Ystart, UWORD Xend, UWORD Yend,
                     UWORD Color, DOT_PIXEL Line_width, LINE_STYLE Line_Style)
 {
     if (Xstart > Paint.Width || Ystart > Paint.Height ||
@@ -413,7 +416,7 @@ parameter:
     Line_width: Line width
     Draw_Fill : Whether to fill the inside of the rectangle
 ******************************************************************************/
-void Paint_DrawRectangle(UWORD Xstart, UWORD Ystart, UWORD Xend, UWORD Yend,
+void PaintCanvas::Paint_DrawRectangle(UWORD Xstart, UWORD Ystart, UWORD Xend, UWORD Yend,
                          UWORD Color, DOT_PIXEL Line_width, DRAW_FILL Draw_Fill)
 {
     if (Xstart > Paint.Width || Ystart > Paint.Height ||
@@ -446,7 +449,7 @@ parameter:
     Line_width: Line width
     Draw_Fill : Whether to fill the inside of the Circle
 ******************************************************************************/
-void Paint_DrawCircle(UWORD X_Center, UWORD Y_Center, UWORD Radius,
+void PaintCanvas::Paint_DrawCircle(UWORD X_Center, UWORD Y_Center, UWORD Radius,
                       UWORD Color, DOT_PIXEL Line_width, DRAW_FILL Draw_Fill)
 {
     if (X_Center > Paint.Width || Y_Center >= Paint.Height) {
@@ -515,7 +518,7 @@ parameter:
     Color_Foreground : Select the foreground color
     Color_Background : Select the background color
 ******************************************************************************/
-void Paint_DrawChar(UWORD Xpoint, UWORD Ypoint, const char Acsii_Char,
+void PaintCanvas::Paint_DrawChar(UWORD Xpoint, UWORD Ypoint, const char Acsii_Char,
                     sFONT* Font, UWORD Color_Foreground, UWORD Color_Background)
 {
     UWORD Page, Column;
@@ -564,7 +567,7 @@ parameter:
     Color_Foreground : Select the foreground color
     Color_Background : Select the background color
 ******************************************************************************/
-void Paint_DrawString_EN(UWORD Xstart, UWORD Ystart, const char * pString,
+void PaintCanvas::Paint_DrawString_EN(UWORD Xstart, UWORD Ystart, const char * pString,
                          sFONT* Font, UWORD Color_Foreground, UWORD Color_Background)
 {
     UWORD Xpoint = Xstart;
@@ -609,7 +612,7 @@ parameter:
     Color_Foreground : Select the foreground color
     Color_Background : Select the background color
 ******************************************************************************/
-void Paint_DrawString_CN(UWORD Xstart, UWORD Ystart, const char * pString, cFONT* font,
+void PaintCanvas::Paint_DrawString_CN(UWORD Xstart, UWORD Ystart, const char * pString, cFONT* font,
                         UWORD Color_Foreground, UWORD Color_Background)
 {
     const char* p_text = pString;
@@ -720,7 +723,7 @@ parameter:
     Color_Background : Select the background color
 ******************************************************************************/
 #define  ARRAY_LEN 255
-void Paint_DrawNum(UWORD Xpoint, UWORD Ypoint, int32_t Nummber,
+void PaintCanvas::Paint_DrawNum(UWORD Xpoint, UWORD Ypoint, int32_t Nummber,
                    sFONT* Font, UWORD Color_Foreground, UWORD Color_Background)
 {
 
@@ -761,7 +764,7 @@ parameter:
     Color_Foreground : Select the foreground color
     Color_Background : Select the background color
 ******************************************************************************/
-void Paint_DrawTime(UWORD Xstart, UWORD Ystart, PAINT_TIME *pTime, sFONT* Font,
+void PaintCanvas::Paint_DrawTime(UWORD Xstart, UWORD Ystart, PAINT_TIME *pTime, sFONT* Font,
                     UWORD Color_Foreground, UWORD Color_Background)
 {
     uint8_t value[10] = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9'};
@@ -787,7 +790,7 @@ info:
     Use a computer to convert the image into a corresponding array,
     and then embed the array directly into Imagedata.cpp as a .c file.
 ******************************************************************************/
-void Paint_DrawBitMap(const unsigned char* image_buffer)
+void PaintCanvas::Paint_DrawBitMap(const unsigned char* image_buffer)
 {
     UWORD x, y;
     UDOUBLE Addr = 0;
@@ -812,7 +815,7 @@ parameter:
 info:
     Use this function to paste image data into a buffer
 ******************************************************************************/
-void Paint_DrawBitMap_Paste(const unsigned char* image_buffer, UWORD xStart, UWORD yStart, UWORD imageWidth, UWORD imageHeight, UBYTE flipColor)
+void PaintCanvas::Paint_DrawBitMap_Paste(const unsigned char* image_buffer, UWORD xStart, UWORD yStart, UWORD imageWidth, UWORD imageHeight, UBYTE flipColor)
 {
     UBYTE color, srcImage;
     UWORD x, y;
@@ -839,7 +842,7 @@ parameter:
     xEnd             ：Image width
     yEnd             : Image height
 ******************************************************************************/
-void Paint_DrawImage(const unsigned char *image_buffer, UWORD xStart, UWORD yStart, UWORD W_Image, UWORD H_Image) 
+void PaintCanvas::Paint_DrawImage(const unsigned char *image_buffer, UWORD xStart, UWORD yStart, UWORD W_Image, UWORD H_Image)
 {
     UWORD x, y;
 	UWORD w_byte=(W_Image%8)?(W_Image/8)+1:W_Image/8;
@@ -853,3 +856,35 @@ void Paint_DrawImage(const unsigned char *image_buffer, UWORD xStart, UWORD ySta
         }
     }
 }
+
+#if !defined(CODEX_AP01_NATIVE)
+void Paint_NewImage(UBYTE *image, UWORD Width, UWORD Height, UWORD Rotate, UWORD Color) { defaultPaintCanvas.Paint_NewImage(image, Width, Height, Rotate, Color); }
+void Paint_SelectImage(UBYTE *image) { defaultPaintCanvas.Paint_SelectImage(image); }
+void Paint_SetRotate(UWORD Rotate) { defaultPaintCanvas.Paint_SetRotate(Rotate); }
+void Paint_SetMirroring(UBYTE mirror) { defaultPaintCanvas.Paint_SetMirroring(mirror); }
+void Paint_SetScale(UBYTE scale) { defaultPaintCanvas.Paint_SetScale(scale); }
+void Paint_SetPixel(UWORD Xpoint, UWORD Ypoint, UWORD Color) { defaultPaintCanvas.Paint_SetPixel(Xpoint, Ypoint, Color); }
+void Paint_Clear(UWORD Color) { defaultPaintCanvas.Paint_Clear(Color); }
+void Paint_ClearWindows(UWORD Xstart, UWORD Ystart, UWORD Xend, UWORD Yend, UWORD Color) { defaultPaintCanvas.Paint_ClearWindows(Xstart, Ystart, Xend, Yend, Color); }
+void Paint_DrawPoint(UWORD Xpoint, UWORD Ypoint, UWORD Color,
+                     DOT_PIXEL Dot_Pixel, DOT_STYLE Dot_Style) { defaultPaintCanvas.Paint_DrawPoint(Xpoint, Ypoint, Color, Dot_Pixel, Dot_Style); }
+void Paint_DrawLine(UWORD Xstart, UWORD Ystart, UWORD Xend, UWORD Yend,
+                    UWORD Color, DOT_PIXEL Line_width, LINE_STYLE Line_Style) { defaultPaintCanvas.Paint_DrawLine(Xstart, Ystart, Xend, Yend, Color, Line_width, Line_Style); }
+void Paint_DrawRectangle(UWORD Xstart, UWORD Ystart, UWORD Xend, UWORD Yend,
+                         UWORD Color, DOT_PIXEL Line_width, DRAW_FILL Draw_Fill) { defaultPaintCanvas.Paint_DrawRectangle(Xstart, Ystart, Xend, Yend, Color, Line_width, Draw_Fill); }
+void Paint_DrawCircle(UWORD X_Center, UWORD Y_Center, UWORD Radius,
+                      UWORD Color, DOT_PIXEL Line_width, DRAW_FILL Draw_Fill) { defaultPaintCanvas.Paint_DrawCircle(X_Center, Y_Center, Radius, Color, Line_width, Draw_Fill); }
+void Paint_DrawChar(UWORD Xpoint, UWORD Ypoint, const char Acsii_Char,
+                    sFONT* Font, UWORD Color_Foreground, UWORD Color_Background) { defaultPaintCanvas.Paint_DrawChar(Xpoint, Ypoint, Acsii_Char, Font, Color_Foreground, Color_Background); }
+void Paint_DrawString_EN(UWORD Xstart, UWORD Ystart, const char * pString,
+                         sFONT* Font, UWORD Color_Foreground, UWORD Color_Background) { defaultPaintCanvas.Paint_DrawString_EN(Xstart, Ystart, pString, Font, Color_Foreground, Color_Background); }
+void Paint_DrawString_CN(UWORD Xstart, UWORD Ystart, const char * pString, cFONT* font,
+                        UWORD Color_Foreground, UWORD Color_Background) { defaultPaintCanvas.Paint_DrawString_CN(Xstart, Ystart, pString, font, Color_Foreground, Color_Background); }
+void Paint_DrawNum(UWORD Xpoint, UWORD Ypoint, int32_t Nummber,
+                   sFONT* Font, UWORD Color_Foreground, UWORD Color_Background) { defaultPaintCanvas.Paint_DrawNum(Xpoint, Ypoint, Nummber, Font, Color_Foreground, Color_Background); }
+void Paint_DrawTime(UWORD Xstart, UWORD Ystart, PAINT_TIME *pTime, sFONT* Font,
+                    UWORD Color_Foreground, UWORD Color_Background) { defaultPaintCanvas.Paint_DrawTime(Xstart, Ystart, pTime, Font, Color_Foreground, Color_Background); }
+void Paint_DrawBitMap(const unsigned char* image_buffer) { defaultPaintCanvas.Paint_DrawBitMap(image_buffer); }
+void Paint_DrawBitMap_Paste(const unsigned char* image_buffer, UWORD xStart, UWORD yStart, UWORD imageWidth, UWORD imageHeight, UBYTE flipColor) { defaultPaintCanvas.Paint_DrawBitMap_Paste(image_buffer, xStart, yStart, imageWidth, imageHeight, flipColor); }
+void Paint_DrawImage(const unsigned char *image_buffer, UWORD xStart, UWORD yStart, UWORD W_Image, UWORD H_Image) { defaultPaintCanvas.Paint_DrawImage(image_buffer, xStart, yStart, W_Image, H_Image); }
+#endif

@@ -98,7 +98,9 @@ typedef struct {
     UWORD HeightByte;
     UWORD Scale;
 } PAINT;
+#if !defined(CODEX_AP01_NATIVE)
 extern PAINT Paint;
+#endif
 
 /**
  * Display rotate
@@ -192,6 +194,43 @@ typedef struct {
 extern PAINT_TIME sPaint_time;
 
 //init and Clear
+class PaintCanvas {
+protected:
+    PAINT &Paint;
+public:
+    explicit PaintCanvas(PAINT &paint) : Paint(paint) {}
+    void Paint_NewImage(UBYTE *image, UWORD Width, UWORD Height, UWORD Rotate, UWORD Color);
+    void Paint_SelectImage(UBYTE *image);
+    void Paint_SetRotate(UWORD Rotate);
+    void Paint_SetMirroring(UBYTE mirror);
+    void Paint_SetScale(UBYTE scale);
+    void Paint_SetPixel(UWORD Xpoint, UWORD Ypoint, UWORD Color);
+    void Paint_Clear(UWORD Color);
+    void Paint_ClearWindows(UWORD Xstart, UWORD Ystart, UWORD Xend, UWORD Yend, UWORD Color);
+    void Paint_DrawPoint(UWORD Xpoint, UWORD Ypoint, UWORD Color,
+                     DOT_PIXEL Dot_Pixel, DOT_STYLE Dot_Style);
+    void Paint_DrawLine(UWORD Xstart, UWORD Ystart, UWORD Xend, UWORD Yend,
+                    UWORD Color, DOT_PIXEL Line_width, LINE_STYLE Line_Style);
+    void Paint_DrawRectangle(UWORD Xstart, UWORD Ystart, UWORD Xend, UWORD Yend,
+                         UWORD Color, DOT_PIXEL Line_width, DRAW_FILL Draw_Fill);
+    void Paint_DrawCircle(UWORD X_Center, UWORD Y_Center, UWORD Radius,
+                      UWORD Color, DOT_PIXEL Line_width, DRAW_FILL Draw_Fill);
+    void Paint_DrawChar(UWORD Xpoint, UWORD Ypoint, const char Acsii_Char,
+                    sFONT* Font, UWORD Color_Foreground, UWORD Color_Background);
+    void Paint_DrawString_EN(UWORD Xstart, UWORD Ystart, const char * pString,
+                         sFONT* Font, UWORD Color_Foreground, UWORD Color_Background);
+    void Paint_DrawString_CN(UWORD Xstart, UWORD Ystart, const char * pString, cFONT* font,
+                        UWORD Color_Foreground, UWORD Color_Background);
+    void Paint_DrawNum(UWORD Xpoint, UWORD Ypoint, int32_t Nummber,
+                   sFONT* Font, UWORD Color_Foreground, UWORD Color_Background);
+    void Paint_DrawTime(UWORD Xstart, UWORD Ystart, PAINT_TIME *pTime, sFONT* Font,
+                    UWORD Color_Foreground, UWORD Color_Background);
+    void Paint_DrawBitMap(const unsigned char* image_buffer);
+    void Paint_DrawBitMap_Paste(const unsigned char* image_buffer, UWORD xStart, UWORD yStart, UWORD imageWidth, UWORD imageHeight, UBYTE flipColor);
+    void Paint_DrawImage(const unsigned char *image_buffer, UWORD xStart, UWORD yStart, UWORD W_Image, UWORD H_Image);
+};
+
+#if !defined(CODEX_AP01_NATIVE)
 void Paint_NewImage(UBYTE *image, UWORD Width, UWORD Height, UWORD Rotate, UWORD Color);
 void Paint_SelectImage(UBYTE *image);
 void Paint_SetRotate(UWORD Rotate);
@@ -219,6 +258,8 @@ void Paint_DrawTime(UWORD Xstart, UWORD Ystart, PAINT_TIME *pTime, sFONT* Font, 
 void Paint_DrawBitMap(const unsigned char* image_buffer);
 void Paint_DrawBitMap_Paste(const unsigned char* image_buffer, UWORD xStart, UWORD yStart, UWORD imageWidth, UWORD imageHeight, UBYTE flipColor);
 void Paint_DrawImage(const unsigned char *image_buffer, UWORD xStart, UWORD yStart, UWORD W_Image, UWORD H_Image); 
+
+#endif // legacy default canvas
 
 #endif
 

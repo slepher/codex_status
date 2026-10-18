@@ -78,11 +78,17 @@ typedef struct
   
 }cFONT;
 
-extern sFONT Font24;
-extern sFONT Font20;
-extern sFONT Font16;
-extern sFONT Font12;
-extern sFONT Font8;
+#if defined(CODEX_AP01_NATIVE)
+#define CODEX_FONT_STORAGE const
+#else
+#define CODEX_FONT_STORAGE
+#endif
+
+extern CODEX_FONT_STORAGE sFONT Font24;
+extern CODEX_FONT_STORAGE sFONT Font20;
+extern CODEX_FONT_STORAGE sFONT Font16;
+extern CODEX_FONT_STORAGE sFONT Font12;
+extern CODEX_FONT_STORAGE sFONT Font8;
 
 extern cFONT Font12CN;
 extern cFONT Font24CN;

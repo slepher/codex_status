@@ -102,6 +102,9 @@ impl FontDescriptor {
     /// a 1bpp target (or the reverse) renders wrong pixels, so it is refused
     /// here instead.
     pub fn check_target(&self, target_pixel_format: &str) -> Result<()> {
+        if target_pixel_format == "4bpp" && (self.pixel_format == "alpha4" || self.pixel_format == "bw") {
+            return Ok(());
+        }
         let wanted = match target_pixel_format {
             "1bpp" => "bw",
             "2bpp" => "gray4",
@@ -126,6 +129,7 @@ pub fn pixel_format_name(pixel_format: u8) -> &'static str {
     match pixel_format {
         PIXEL_BW => "bw",
         PIXEL_GRAY4 => "gray4",
+        2 => "alpha4",
         _ => "?",
     }
 }
@@ -192,8 +196,8 @@ impl FontLibrary {
             bail!("bad font magic 0x{magic:08x}: expected \"CSFN\" (0x{MAGIC:08x})");
         }
         let version = rd16(bytes, 4);
-        if version != VERSION && version != 2 {
-            bail!("unsupported font container version {version}: expected 1 or 2");
+        if version != VERSION && version != 2 && version != 3 {
+            bail!("unsupported font container version {version}: expected 1, 2 or 3");
         }
         let header_bytes = rd16(bytes, 6) as usize;
         if header_bytes != HEADER_BYTES {
@@ -226,12 +230,12 @@ impl FontLibrary {
         let filled_glyphs = rd16(bytes, 40);
         let hint = bytes[42];
 
-        if bpp != BPP_BW && bpp != BPP_GRAY4 {
-            bail!("unsupported font bpp {bpp}: expected {BPP_BW} (bw) or {BPP_GRAY4} (gray4)");
+        if bpp != BPP_BW && bpp != BPP_GRAY4 && bpp != 4 {
+            bail!("unsupported font bpp {bpp}: expected 1 (bw), 2 (gray4), or 4 (alpha4)");
         }
-        if pixel_format > PIXEL_GRAY4 {
+        if pixel_format > 2 {
             bail!(
-                "unsupported font pixel format {pixel_format}: expected {PIXEL_BW} (bw) or {PIXEL_GRAY4} (gray4)"
+                "unsupported font pixel format {pixel_format}: expected 0 (bw), 1 (gray4), or 2 (alpha4)"
             );
         }
         if pixel_format == PIXEL_BW && bpp != BPP_BW {
@@ -240,6 +244,8 @@ impl FontLibrary {
         if pixel_format == PIXEL_GRAY4 && bpp != BPP_GRAY4 {
             bail!("font bpp {bpp} does not match pixel format gray4 ({BPP_GRAY4}bpp)");
         }
+        anyhow::ensure!((version == 3) == (pixel_format == 2) && (version != 3 || bpp == 4), "invalid alpha font format");
+        anyhow::ensure!(version < 2 || len <= 48 * 1024, "Unicode font exceeds 48 KiB");
         if (version == 1 && glyph_count != GLYPH_SLOTS as u32)
             || glyph_count < 95 || glyph_count > 4096 {
             bail!(
@@ -263,7 +269,7 @@ impl FontLibrary {
         // boundary and can be pointed at directly (docs/font-asset-format.md).
         let pad = (name_len & 1) + (family_len & 1) + (coverage_len & 1);
         let codepoint_off = HEADER_BYTES + name_len + family_len + coverage_len + pad;
-        let glyph_off = codepoint_off + if version == 2 { glyph_count as usize * 4 } else { 0 };
+        let glyph_off = codepoint_off + if version >= 2 { glyph_count as usize * 4 } else { 0 };
         if glyph_off % 2 != 0 {
             bail!(
                 "font descriptor table would start at odd offset {glyph_off}: string sections must be padded to even lengths"
@@ -302,7 +308,7 @@ impl FontLibrary {
         if coverage.is_empty() {
             bail!("font coverage is empty");
         }
-        if version == 2 {
+        if version >= 2 {
             anyhow::ensure!(coverage == "unicode", "font coverage must be unicode");
             let mut previous = 0;
             for i in 0..glyph_count as usize {
@@ -327,7 +333,7 @@ impl FontLibrary {
             if box_w > 127 || box_h > 127 {
                 bail!("font glyph {slot} box is {box_w}x{box_h} px, over the 127-pixel limit");
             }
-            let need = ((box_w as usize + 7) / 8) * box_h as usize;
+            let need = ((box_w as usize * if version == 3 { 4 } else { 1 } + 7) / 8) * box_h as usize;
             if off > blob_bytes || need > blob_bytes - off {
                 bail!(
                     "font glyph {slot} needs {need} bytes at blob offset {off}, over the {blob_bytes}-byte blob"
@@ -844,8 +850,8 @@ mod tests {
     #[test]
     fn unsupported_bpp_and_pixel_format_are_rejected() {
         let mut unknown_format = FontBuilder::new().build();
-        unknown_format[25] = 2;
-        assert!(error_of(&unknown_format).contains("pixel format 2"), "{}", error_of(&unknown_format));
+        unknown_format[25] = 3;
+        assert!(error_of(&unknown_format).contains("pixel format 3"), "{}", error_of(&unknown_format));
 
         let mut unknown_bpp = FontBuilder::new().build();
         unknown_bpp[24] = 3;
@@ -943,8 +949,8 @@ mod tests {
         assert!(error_of(&magic).contains("bad font magic"), "{}", error_of(&magic));
 
         let mut version = FontBuilder::new().build();
-        version[4] = 3;
-        assert!(error_of(&version).contains("unsupported font container version 3"), "{}", error_of(&version));
+        version[4] = 4;
+        assert!(error_of(&version).contains("unsupported font container version 4"), "{}", error_of(&version));
 
         let mut header = FontBuilder::new().build();
         header[6..8].copy_from_slice(&32u16.to_le_bytes());

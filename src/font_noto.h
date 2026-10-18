@@ -30,6 +30,7 @@ typedef struct {
     uint16_t          maxAdv;      // widest advance, 1/16 px (region estimates)
     const uint8_t    *codepoints;  // CSFN v2 LE u32 table; null = dense ASCII
     uint16_t          glyphCount; // v2 actual entries (v1 uses 95)
+    uint8_t alphaBpp; // zero for legacy BW masks; CSFN v3 uses alpha4
 } Note4PropFont;
 
 #include "font_noto_nt16.h"

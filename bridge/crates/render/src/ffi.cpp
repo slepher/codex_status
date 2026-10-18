@@ -15,6 +15,7 @@
 #include "v2_status_snapshot.h"
 #include "display_result.h"
 #include "network_display_state.h"
+#include "ap01_template_display.h"
 #include "v2_sync.h"
 #include "v2_sync_store.h"
 #include "bundle_store.h"
@@ -44,6 +45,7 @@ extern "C" int codex_compact_frame_golden(uint8_t *out, int cap) {
 }
 
 SerialClass Serial;
+extern "C" uint16_t codex_ap01_palette565(unsigned index) { return ap01Palette565(index); }
 DevLogger DevLog;
 extern "C" int codex_display_state_after_render(uint32_t writes_before, uint32_t writes_after,
                                                    uint32_t busy_before, uint32_t busy_after) {
@@ -112,13 +114,22 @@ struct SimBundleDevice {
 
 const char *simRender(SimBundleDevice &device) {
     if (!device.compiledValid) return "failed";
-    const size_t length = (size_t)((g_canvas_w + 7) / 8) * g_canvas_h;
+    const bool lcd=ap01TemplateCanvas(g_canvas_w,g_canvas_h);
+    const size_t length = templateFrameBytes(g_canvas_w,g_canvas_h);
     device.candidate.resize(length);
     Paint_NewImage(device.candidate.data(), g_canvas_w, g_canvas_h, ROTATE_0, WHITE);
-    Paint_Clear(WHITE);
+    if(lcd)Paint_SetScale(16);
+    Paint_Clear(lcd?1:WHITE);
     TplEnv env;
     env.channel = "PULL";
     env.syncHHMM = "--:--";
+    if(lcd && device.hasWallEpoch && device.lastBridgeContact) {
+        time_t epoch=device.lastBridgeContact;
+        if(struct tm *clock=localtime(&epoch)) {
+            char text[6];
+            if(strftime(text,sizeof(text),"%H:%M",clock))env.syncHHMM=text;
+        }
+    }
     env.battery = 75;
     env.mode = device.deep ? "deep" : "light";
     env.wifiState = device.deep ? "idle" : (device.wifiUp ? "connected" : "idle");
@@ -133,8 +144,10 @@ const char *simRender(SimBundleDevice &device) {
     std::vector<uint8_t> blank;
     if (device.frame.empty()) blank.assign(length, 0xFF);
     const uint8_t *previous = device.frame.empty() ? blank.data() : device.frame.data();
-    RfnDecision decision = rgnDecide(device.regions, previous, device.candidate.data(),
-                                     device.frameTrusted, false, false);
+    RfnDecision decision;
+    if(lcd)decision.action=device.frameTrusted && device.frame.size()==length &&
+        !memcmp(previous,device.candidate.data(),length)?RFN_NONE:RFN_FULL;
+    else decision=rgnDecide(device.regions,previous,device.candidate.data(),device.frameTrusted,false,false);
     if (decision.action == RFN_NONE) {
         device.bridgeOffline = env.offlineMins;
         device.displayState = 1;
@@ -234,6 +247,7 @@ int codex_sync_store_check() {
     LittleFS.dirs.clear();
     LittleFS.root.clear();
     LittleFS.capacity = 1024 * 1024;
+    LittleFS.externalUsed = 0;
     LittleFS.writeBudget = -1;
     if (!syncStoreBegin()) return 1;
     uint64_t serial = 0;
@@ -269,16 +283,20 @@ void *codex_sim_bundle_new(const char *data_dir, const char *target,
                            uint64_t boot_id, const char *wake_cause) {
     if (!data_dir || !target || !wake_cause) return nullptr;
     const bool note4 = !strcmp(target, "zectrix-note4-400x300");
-    if (!note4 && strcmp(target, "codex-status-154g")) return nullptr;
+    const bool lcd = !strcmp(target, "cuktech-ap01-0041");
+    if (!note4 && !lcd && strcmp(target, "codex-status-154g")) return nullptr;
+    g_canvas_w=lcd?320:note4?400:200;g_canvas_h=lcd?240:note4?300:200;
+    tplSetCanvas(g_canvas_w,g_canvas_h);rgnSetPanel(g_canvas_w,g_canvas_h);
     LittleFS.useDirectory(data_dir);
-    LittleFS.capacity = 1024 * 1024;
+    // Verified 0041 /resource geometry, not a claim of physical free space.
+    LittleFS.capacity = lcd ? 0x140000 : 1024 * 1024;
     LittleFS.writeBudget = -1;
     bool restored = bsBegin();
     auto *device = new SimBundleDevice();
     device->firmwareTarget = target;
-    device->renderTarget = note4 ? "epd-ssd2683-400x300-1bpp" : "epd-ssd1681-200x200-1bpp";
-    g_canvas_w = note4 ? 400 : 200;
-    g_canvas_h = note4 ? 300 : 200;
+    device->renderTarget = lcd?"lcd-jd9853-320x240-palette4":note4 ? "epd-ssd2683-400x300-1bpp" : "epd-ssd1681-200x200-1bpp";
+    g_canvas_w = lcd?320:note4 ? 400 : 200;
+    g_canvas_h = lcd?240:note4 ? 300 : 200;
     tplSetCanvas(g_canvas_w, g_canvas_h);
     rgnSetPanel(g_canvas_w, g_canvas_h);
     if (restored) {
@@ -376,6 +394,13 @@ int codex_sim_store_budget(void *p, long long budget) {
     if (!p || budget < -1 || budget > 1048576) return 0;
     LittleFS.writeBudget = budget;
     return 1;
+}
+
+int codex_sim_store_capacity(void *p, uint32_t capacity, uint32_t external_used) {
+    if(!p || !capacity || capacity>16u*1024*1024 || external_used>capacity)return 0;
+    size_t fileBytes=LittleFS.usedBytes()-LittleFS.externalUsed;
+    if(fileBytes>capacity-external_used)return 0;
+    LittleFS.capacity=capacity;LittleFS.externalUsed=external_used;return 1;
 }
 
 int codex_sim_store_crash_after_sync(void *p, const char *kind, int count) {
@@ -645,7 +670,7 @@ int codex_bundle_compressed_check(const char *json, const uint8_t *packed, size_
     const char *fw = document["firmware_target"] | "", *rt = document["render_target"] | "";
     LittleFS.root.clear(); LittleFS.files.clear(); LittleFS.capacity = 2 * 1024 * 1024;
     LittleFS.writeBudget = -1; bsBegin(); String err;
-    if (!bsInstall(String(json), fw, rt, "old", err)) return 1;
+    if (!bsInstall(String(json), fw, rt, "old", err)) { fprintf(stderr, "bundle install: %s\n", err.c_str()); return 1; }
     const auto original = LittleFS.files;
     // Outer transport CRC is recomputed: rejects must come from actual decoder checks.
     for (size_t index : {size_t(4), size_t(8), size_t(12), size_t(16), size_t(20), size_t(24), size - 1, size}) {
@@ -812,9 +837,10 @@ int codex_bundle_font_reboot() {
 int codex_render(const char *tmpl, const char *usage, const char *channel, const char *ip,
                  const char *sync_hhmm, int battery, const char *wifi_state, int wifi_blink, int ble_manual, int offline_mins,
                  const char *mode, uint8_t *out, int out_len) {
-    if (!tmpl || !out || out_len < ((g_canvas_w + 7) / 8) * g_canvas_h) return -2;
+    if (!tmpl || !out || out_len < (int)templateFrameBytes(g_canvas_w, g_canvas_h)) return -2;
     Paint_NewImage(out, g_canvas_w, g_canvas_h, ROTATE_0, WHITE);
-    Paint_Clear(WHITE);
+    if (ap01TemplateCanvas(g_canvas_w, g_canvas_h)) Paint_SetScale(16);
+    Paint_Clear(ap01TemplateCanvas(g_canvas_w, g_canvas_h) ? 1 : WHITE);
     TplEnv env;
     env.channel = channel ? channel : "";
     env.ip = ip ? ip : "";
@@ -889,10 +915,11 @@ int codex_render_compiled(const char *usage, const char *channel, const char *ip
                           const char *sync_hhmm, int battery,
                          const char *wifi_state, int wifi_blink, int ble_manual,
                           int offline_mins, const char *mode, uint8_t *out, int out_len) {
-    if (!out || out_len < ((g_canvas_w + 7) / 8) * g_canvas_h) return -2;
+    if (!out || out_len < (int)templateFrameBytes(g_canvas_w, g_canvas_h)) return -2;
     if (!g_ct_valid) return -4;
     Paint_NewImage(out, g_canvas_w, g_canvas_h, ROTATE_0, WHITE);
-    Paint_Clear(WHITE);
+    if (ap01TemplateCanvas(g_canvas_w, g_canvas_h)) Paint_SetScale(16);
+    Paint_Clear(ap01TemplateCanvas(g_canvas_w, g_canvas_h) ? 1 : WHITE);
     TplEnv env;
     env.channel = channel ? channel : "";
     env.ip = ip ? ip : "";

@@ -62,3 +62,11 @@ v2 每个资产 <=48 KiB，glyphCount <=4096；双重边界同时生效，不保
 持久字节为 `64 + padded metadata + 12*N + blobBytes`；运行期拥有一份该资产字节，码点表在其中，不另拷贝。新增每个字体视图为一个指针和计数（ESP32 32位上通常增8 B，由实际构建核对）；查字为 O(log N)，UTF-8 解码固定局部标量、无递归/额外堆。Bundle 仍需 JSON/base64 解码临时开销，不能把资产字节当整机峰值。分配失败沿用 `font_oom` 明拒。
 
 空/单 glyph 文件因少于95项拒绝；最小 v2 为95项 ASCII；测试夹具98项（含中/文/四字节字符）为1467 B。字节上限和4096项超限拒绝另有测试；完整字体/多模板/典型与上限安装的真实峰值RAM、栈、刷新视觉和掉电恢复归 C5 实机缺口。当前候选宿主测试不能替代这些实机证据。
+
+## CSFN v3：LCD alpha4（AP01 软件候选）
+
+v3沿用v2的64字节头、Unicode码点表及8字节字形描述符；version=3，bpp=4，pixelFormat=2（`alpha4`）。每字形每行占`ceil(width/2)`字节，左像素在高半字节，行尾奇数像素的低半字节为填充；0透明、15完全覆盖。字形范围按该步长严格校验，资产仍<=48 KiB、95..4096码点，ASCII95必须在前。v1/v2不接受alpha4，v3不接受其他格式；坏长度、CRC、码点和越界字形整份拒绝。
+
+AP01完整Bundle接受BW或alpha4字形；`bundle_font_protocol=3`才可发布v3，旧屏仍只接受原有格式且能力声明不得升级到3。宿主可以装载alpha4，但在EPD模板dry-run/绘制时拒绝。`tplFontDrawClock`是1bpp局部窗口API，明确拒绝alpha4。
+
+本地生成：`pwsh -File tools/generate-ap01-font.ps1`，分别加`-Digits`和`-Medium`生成三种槽位；使用Windows System.Drawing灰度抗锯齿并量化为alpha4，打包器不改旧v1/v2写法。字体文件仅留artifacts，使用者自行确认本机字体授权。共享模板覆盖率与AP01调色板v2详见[接入设计](../project-workflow/ap01-template-integration/design.md)。v3不等于已有真实设备支持，现场与实机验收以PROGRESS/C9为准。

@@ -1,68 +1,38 @@
-#include "template_engine.h"
+#include "template_renderer.h"
 #include "platform_target.h"
 #include "v2_state.h"
 #include <ArduinoJson.h>
 #include <math.h>
 #include <string.h>
 #include <time.h>
+#include <memory>
+#include <new>
 #include <mbedtls/base64.h>
 #include "GUI_Paint.h"
 #include "fonts.h"
 #include "font_noto.h"
 #include "font_asset.h"
+#include "ap01_template_display.h"
 
-// Canvas size is a target property (v2 §5): set once at boot (or by the host
-// harness) instead of being compiled in, so one engine serves 200x200 and
-// 400x300 render targets.
-static int sCanvasW = TARGET_WIDTH;
-static int sCanvasH = TARGET_HEIGHT;
-static inline int tplCanvasW() { return sCanvasW; }
-static inline int tplCanvasH() { return sCanvasH; }
+// Explicit request-local allocator avoids ArduinoJson's writable singleton in XIP.
+namespace {
+class TplJsonAllocator : public ArduinoJson::Allocator {
+public:
+    void *allocate(size_t n) override { return malloc(n); }
+    void deallocate(void *p) override { free(p); }
+    void *reallocate(void *p, size_t n) override { return realloc(p, n); }
+};
+}
+
 #define TPL_W (tplCanvasW())
 #define TPL_H (tplCanvasH())
-void tplSetCanvas(int w, int h) {
-    if (w > 0 && h > 0) {
-        sCanvasW = w;
-        sCanvasH = h;
-    }
-}
+
 static const UWORD COLOR_NONE = 0xFF;
-
-enum BindKind {
-    B_PLAN, B_LABEL, B_HOSTID, B_SERVER_TIME,
-    B_RESET_COUNT, B_RESET_EXPIRES,
-    B_BUCKET_USED, B_BUCKET_REMAIN, B_BUCKET_RESET, B_BUCKET_WINMINS,
-    B_DEV_CHANNEL, B_DEV_IP, B_DEV_SYNC, B_DEV_BATTERY,
-    // Serialized tag 14 is retired; never reuse it for another field.
-    B_DEV_OFFLINE = 15, B_DEV_NOW, B_DEV_MODE, B_DEV_DATE,
-    B_DEV_WIFI_STATE, B_DEV_WIFI_BLINK, B_DEV_BLE_MANUAL
-};
-
-// The optional JSON "time_format" accepts exactly "date" (the compact local
-// MM-DD HH:MM default) or "hhmm" (reserved for epoch bindings).
-enum TextTimeFormat { TTF_DATE, TTF_HHMM };
-
-// winMode: 0 = weekly, 1 = 5h, 2 = index (winIndex)
-struct BindSpec {
-    BindKind kind;
-    String   bucket;
-    int      winMode  = 0;
-    int      winIndex = 0;
-};
-
-// `when` accepts either {"bind":…,"exists":bool} or {"bind":…,"equals":…}
-// (string or integer compared against the bind's rendered text).
-struct DrawCondition {
-    bool active = false;
-    BindSpec bind;
-    bool exists = false;
-    bool useEquals = false;
-    String equals;
-};
 
 // Font glyph tables are ASCII-only; keep multi-byte/UTF-8 text from walking
 // out of bounds in Paint_DrawChar.
-static String asciiOnly(const String &in) {
+String TemplateRenderer::asciiOnly(const String &in)
+{
     String out;
     out.reserve(in.length());
     for (size_t i = 0; i < in.length(); i++) {
@@ -74,7 +44,8 @@ static String asciiOnly(const String &in) {
 
 // B/W panel: the 4-color accents (yellow/red) collapse to black ink so
 // templates written for the old panel stay readable.
-static int colorVal(JsonVariant v, int def) {
+int TemplateRenderer::colorVal(JsonVariant v, int def)
+{
     int c = def;
     if (v.is<int>()) {
         c = v.as<int>();
@@ -83,16 +54,25 @@ static int colorVal(JsonVariant v, int def) {
         if (s) {
             if (!strcmp(s, "black"))       c = 0;
             else if (!strcmp(s, "white"))  c = 1;
-            else if (!strcmp(s, "yellow")) c = 2;
-            else if (!strcmp(s, "red"))    c = 3;
+            else if (!strcmp(s, "yellow")) c = ap01TemplateCanvas(TPL_W, TPL_H) ? 3 : 2;
+            else if (!strcmp(s, "red"))    c = ap01TemplateCanvas(TPL_W, TPL_H) ? 6 : 3;
             else if (!strcmp(s, "none"))   c = COLOR_NONE;
+            else if (ap01TemplateCanvas(TPL_W, TPL_H)) {
+                if (!strcmp(s, "cyan")) c = 2;
+                else if (!strcmp(s, "orange")) c = 3;
+                else if (!strcmp(s, "muted")) c = 4;
+                else if (!strcmp(s, "track")) c = 5;
+                else if (!strcmp(s, "alert")) c = 6;
+                else c = -1;
+            }
         }
     }
-    if (c == 2 || c == 3) c = 0;
+    if (!ap01TemplateCanvas(TPL_W, TPL_H) && (c == 2 || c == 3)) c = 0;
     return c;
 }
 
-static bool parseBind(const String &path, BindSpec &s) {
+bool TemplateRenderer::parseBind(const String &path, BindSpec &s)
+{
     if (path == "account.plan")               { s.kind = B_PLAN; return true; }
     if (path == "bridge.label")               { s.kind = B_LABEL; return true; }
     if (path == "bridge.hostId")              { s.kind = B_HOSTID; return true; }
@@ -142,12 +122,14 @@ static bool parseBind(const String &path, BindSpec &s) {
     return false;
 }
 
-static bool isEpochBind(const BindSpec &s) {
+bool TemplateRenderer::isEpochBind(const BindSpec &s)
+{
     return s.kind == B_SERVER_TIME || s.kind == B_RESET_EXPIRES ||
            s.kind == B_BUCKET_RESET;
 }
 
-static bool parseTimeFormat(JsonVariant v, const BindSpec &s, TextTimeFormat &fmt) {
+bool TemplateRenderer::parseTimeFormat(JsonVariant v, const BindSpec &s, TextTimeFormat &fmt)
+{
     if (v.isNull()) return false;
     const char *value = v.as<const char *>();
     if (!value || !isEpochBind(s)) return false;
@@ -162,7 +144,8 @@ static bool parseTimeFormat(JsonVariant v, const BindSpec &s, TextTimeFormat &fm
     return false;
 }
 
-static bool findWindow(JsonDocument &usage, const BindSpec &s, JsonObject &w) {
+bool TemplateRenderer::findWindow(JsonDocument &usage, const BindSpec &s, JsonObject &w)
+{
     JsonArray buckets = usage["buckets"].as<JsonArray>();
     if (buckets.isNull()) return false;
     JsonObject bucket;
@@ -190,20 +173,33 @@ static bool findWindow(JsonDocument &usage, const BindSpec &s, JsonObject &w) {
     return false;
 }
 
-static String fmtEpoch(long long epoch, TextTimeFormat format = TTF_DATE) {
+static bool templateCalendar(time_t epoch, struct tm &value) {
+#if defined(CODEX_AP01_NATIVE)
+    extern bool ap01Calendar(time_t, struct tm &);
+    return ap01Calendar(epoch, value);
+#else
+    struct tm *local = localtime(&epoch);
+    if (!local) return false;
+    value = *local; return true;
+#endif
+}
+
+String TemplateRenderer::fmtEpoch(long long epoch, TextTimeFormat format)
+{
     char b[24] = "--";
     if (epoch > 0) {
         time_t t = (time_t)epoch;
-        struct tm *lt = localtime(&t);
-        if (lt && t > 1600000000) {
-            strftime(b, sizeof(b), format == TTF_HHMM ? "%H:%M" : "%m-%d %H:%M", lt);
+        struct tm lt;
+        if (t > 1600000000 && templateCalendar(t, lt)) {
+            strftime(b, sizeof(b), format == TTF_HHMM ? "%H:%M" : "%m-%d %H:%M", &lt);
         }
     }
     return String(b);
 }
 
-static bool evalBind(const BindSpec &s, TextTimeFormat format, JsonDocument &usage,
-                     const TplEnv &env, String &out) {
+bool TemplateRenderer::evalBind(const BindSpec &s, TextTimeFormat format, JsonDocument &usage,
+                     const TplEnv &env, String &out)
+{
     switch (s.kind) {
     case B_PLAN:    out = String((const char *)(usage["account"]["plan"] | "--")); return true;
     case B_LABEL:   out = String((const char *)(usage["bridge"]["label"] | "--")); return true;
@@ -228,20 +224,20 @@ static bool evalBind(const BindSpec &s, TextTimeFormat format, JsonDocument &usa
         // per minute while the active template references this bind.
         time_t n = (time_t)(env.hasNowEpoch ? env.nowEpochSecs : time(nullptr));
         if (n < 1600000000) return false;
-        struct tm *lt = localtime(&n);
-        if (!lt) return false;
+        struct tm lt;
+        if (!templateCalendar(n, lt)) return false;
         char b[8];
-        strftime(b, sizeof(b), "%H:%M", lt);
+        strftime(b, sizeof(b), "%H:%M", &lt);
         out = b;
         return true;
     }
     case B_DEV_DATE: {
         time_t n = (time_t)(env.hasNowEpoch ? env.nowEpochSecs : time(nullptr));
         if (n < 1600000000) return false;
-        struct tm *lt = localtime(&n);
-        if (!lt) return false;
+        struct tm lt;
+        if (!templateCalendar(n, lt)) return false;
         char b[6];
-        strftime(b, sizeof(b), "%m/%d", lt);
+        strftime(b, sizeof(b), "%m/%d", &lt);
         out = b;
         return true;
     }
@@ -283,8 +279,9 @@ static bool evalBind(const BindSpec &s, TextTimeFormat format, JsonDocument &usa
     }
 }
 
-static bool evalBindNum(const BindSpec &s, JsonDocument &usage,
-                        const TplEnv &env, double &v) {
+bool TemplateRenderer::evalBindNum(const BindSpec &s, JsonDocument &usage,
+                        const TplEnv &env, double &v)
+{
     if (s.kind == B_DEV_BLE_MANUAL) { v = env.bleManualActive; return true; }
     if (s.kind == B_DEV_WIFI_BLINK) {
         if (env.wifiState != "connecting" || env.wifiBlink < 0) return false;
@@ -322,8 +319,9 @@ static bool evalBindNum(const BindSpec &s, JsonDocument &usage,
     }
 }
 
-static bool bindExists(const BindSpec &s, JsonDocument &usage, const TplEnv &env,
-                       bool haveUsage) {
+bool TemplateRenderer::bindExists(const BindSpec &s, JsonDocument &usage, const TplEnv &env,
+                       bool haveUsage)
+{
     switch (s.kind) {
     case B_DEV_CHANNEL: return env.channel.length() > 0;
     case B_DEV_IP:      return env.ip.length() > 0;
@@ -356,7 +354,8 @@ static bool bindExists(const BindSpec &s, JsonDocument &usage, const TplEnv &env
     }
 }
 
-static bool parseCondition(JsonObject e, DrawCondition &condition) {
+bool TemplateRenderer::parseCondition(JsonObject e, DrawCondition &condition)
+{
     JsonVariant raw = e["when"];
     if (!e.containsKey("when")) return true;
     if (raw.isNull()) return false;
@@ -389,14 +388,16 @@ static bool parseCondition(JsonObject e, DrawCondition &condition) {
     return true;
 }
 
-static bool textScale(JsonVariant value, int &scale) {
+bool TemplateRenderer::textScale(JsonVariant value, int &scale)
+{
     if (value.isNull()) return false;
     if (!value.is<int>()) return false;
     scale = value.as<int>();
     return scale >= 1 && scale <= 3;
 }
 
-static bool textRegion(JsonVariant value, int &x, int &y, int &w, int &h) {
+bool TemplateRenderer::textRegion(JsonVariant value, int &x, int &y, int &w, int &h)
+{
     if (value.isNull()) return false;
     JsonArray r = value.as<JsonArray>();
     if (r.isNull() || r.size() != 4) return false;
@@ -407,9 +408,10 @@ static bool textRegion(JsonVariant value, int &x, int &y, int &w, int &h) {
            x <= TPL_W - w && y <= TPL_H - h;
 }
 
-static bool parseTextLayout(JsonObject e, BindSpec *spec, int &scale,
+bool TemplateRenderer::parseTextLayout(JsonObject e, BindSpec *spec, int &scale,
                             bool &hasRegion, int &rx, int &ry, int &rw, int &rh,
-                            TextTimeFormat &format) {
+                            TextTimeFormat &format)
+{
     if (e.containsKey("scale")) {
         if (!textScale(e["scale"], scale)) return false;
     } else {
@@ -431,16 +433,18 @@ static bool parseTextLayout(JsonObject e, BindSpec *spec, int &scale,
     return true;
 }
 
-static bool decodeBase64(const char *in, uint8_t *out, size_t outLen) {
+bool TemplateRenderer::decodeBase64(const char *in, uint8_t *out, size_t outLen)
+{
     size_t olen = 0;
     int rc = mbedtls_base64_decode(out, outLen, &olen,
                                    (const unsigned char *)in, strlen(in));
     return rc == 0 && olen == outLen;
 }
 
-static void drawScaledText(const String &value, sFONT *font, int x, int y,
+void TemplateRenderer::drawScaledText(const String &value, sFONT *font, int x, int y,
                            int scale, int fg, int bg, bool clipped,
-                           int clipX, int clipY, int clipW, int clipH) {
+                           int clipX, int clipY, int clipW, int clipH)
+{
     int bytesPerRow = (font->Width + 7) / 8;
     int cursor = x;
     for (size_t i = 0; i < value.length(); i++) {
@@ -477,7 +481,8 @@ static void drawScaledText(const String &value, sFONT *font, int x, int y,
 
 // Decode only asset-backed Unicode fonts. Legacy ASCII fonts keep their byte
 // sanitization behavior. Invalid UTF-8 consumes one byte and renders '?'.
-static uint32_t fontNextChar(const Note4PropFont &f, const char *text, size_t len, size_t &at) {
+uint32_t TemplateRenderer::fontNextChar(const Note4PropFont &f, const char *text, size_t len, size_t &at)
+{
     const uint8_t first = (uint8_t)text[at++];
     if (first < 128 || !f.codepoints) return first;
     unsigned n = first >= 0xc2 && first <= 0xdf ? 1 :
@@ -496,7 +501,8 @@ static uint32_t fontNextChar(const Note4PropFont &f, const char *text, size_t le
     return cp;
 }
 
-static const Note4Glyph &fontGlyph(const Note4PropFont &f, uint32_t cp) {
+const Note4Glyph &TemplateRenderer::fontGlyph(const Note4PropFont &f, uint32_t cp)
+{
     if (cp >= 32 && cp <= 126) return f.glyphs[cp - 32];
     if (f.codepoints) {
         size_t lo = 95, hi = f.glyphCount;
@@ -512,7 +518,8 @@ static const Note4Glyph &fontGlyph(const Note4PropFont &f, uint32_t cp) {
     return f.glyphs['?' - ' '];
 }
 
-static int propTextWidth(const Note4PropFont &f, const String &value, int scale) {
+int TemplateRenderer::propTextWidth(const Note4PropFont &f, const String &value, int scale)
+{
     long adv = 0;
     for (size_t i = 0; i < value.length();) {
         adv += fontGlyph(f, fontNextChar(f, value.c_str(), value.length(), i)).adv;
@@ -520,9 +527,10 @@ static int propTextWidth(const Note4PropFont &f, const String &value, int scale)
     return (int)((adv * scale + 8) / 16);
 }
 
-static void drawPropText(const Note4PropFont &f, const String &value, int x, int y,
+void TemplateRenderer::drawPropText(const Note4PropFont &f, const String &value, int x, int y,
                          int scale, int fg, int bg, bool clipped,
-                         int clipX, int clipY, int clipW, int clipH) {
+                         int clipX, int clipY, int clipW, int clipH)
+{
     if (scale < 1) scale = 1;
     int baseline = y + (int)f.lineHeight - (int)f.baseLine;
     long pen = (long)x << 4;   // 1/16 px fixed point
@@ -530,12 +538,14 @@ static void drawPropText(const Note4PropFont &f, const String &value, int x, int
         const Note4Glyph &g = fontGlyph(f, fontNextChar(f, value.c_str(), value.length(), i));
         int gx = (int)(pen >> 4) + g.ox;
         int gy = baseline - g.oy - g.h;
-        int stride = (g.w + 7) / 8;
+        int stride = (g.w * (f.alphaBpp == 4 ? 4 : 1) + 7) / 8;
         for (int row = 0; row < g.h; row++) {
             for (int col = 0; col < g.w; col++) {
                 bool ink = (f.blob[g.off + row * stride + col / 8] &
                             (0x80 >> (col % 8))) != 0;
-                if (!ink && bg == COLOR_NONE) continue;
+                unsigned alpha = f.alphaBpp == 4 ?
+                    ((f.blob[g.off + row * stride + col / 2] >> (col % 2 ? 0 : 4)) & 15) : (ink ? 15 : 0);
+                if (!alpha && bg == COLOR_NONE) continue;
                 for (int sy = 0; sy < scale; sy++) {
                     for (int sx = 0; sx < scale; sx++) {
                         int px = gx + col * scale + sx;
@@ -543,7 +553,13 @@ static void drawPropText(const Note4PropFont &f, const String &value, int x, int
                         if (px < 0 || py < 0 || px >= TPL_W || py >= TPL_H) continue;
                         if (clipped && (px < clipX || py < clipY ||
                                         px >= clipX + clipW || py >= clipY + clipH)) continue;
-                        Paint_SetPixel((UWORD)px, (UWORD)py, (UWORD)(ink ? fg : bg));
+                        unsigned color = alpha ? fg : bg;
+                        if (f.alphaBpp == 4 && ap01TemplateCanvas(TPL_W,TPL_H)) {
+                            unsigned under = Paint.Image[py * Paint.WidthByte + px / 2];
+                            under = px % 2 ? under & 15 : under >> 4;
+                            color = ap01Blend(fg, bg == COLOR_NONE ? under : bg, alpha);
+                        }
+                        Paint_SetPixel((UWORD)px, (UWORD)py, (UWORD)color);
                     }
                 }
             }
@@ -552,7 +568,8 @@ static void drawPropText(const Note4PropFont &f, const String &value, int x, int
     }
 }
 
-static bool drawIcon(const uint8_t *bits, int x, int y, int w, int h, int fg) {
+bool TemplateRenderer::drawIcon(const uint8_t *bits, int x, int y, int w, int h, int fg)
+{
     int stride = (w + 7) / 8;
     for (int row = 0; row < h; row++) {
         for (int col = 0; col < w; col++) {
@@ -565,7 +582,8 @@ static bool drawIcon(const uint8_t *bits, int x, int y, int w, int h, int fg) {
     return true;
 }
 
-static bool clampRect(JsonArray r, int &x, int &y, int &w, int &h) {
+bool TemplateRenderer::clampRect(JsonArray r, int &x, int &y, int &w, int &h)
+{
     if (r.isNull() || r.size() < 4) return false;
     x = r[0] | 0; y = r[1] | 0; w = r[2] | 0; h = r[3] | 0;
     if (w <= 0 || h <= 0) return false;
@@ -615,15 +633,17 @@ static const TplFontEntry TPL_FONTS[] = {
     {"ntreg96",  FONT_KIND_PROP, nullptr, &note4_ntreg96},   // large text, Regular 400 @96
 #endif
 };
+static_assert(sizeof(TPL_FONTS) / sizeof(TPL_FONTS[0]) == TPL_FONT_SLOT_COUNT,
+              "Renderer state must match the complete persisted font registry");
 
-static Note4PropFont sAssetFonts[sizeof(TPL_FONTS) / sizeof(TPL_FONTS[0])];
-static bool sAssetBound[sizeof(TPL_FONTS) / sizeof(TPL_FONTS[0])] = {};
 
-void tplFontClearAssets() {
+void TemplateRenderer::tplFontClearAssets()
+{
     memset(sAssetBound, 0, sizeof(sAssetBound));
 }
 
-bool tplFontBindAsset(const uint8_t *bytes, size_t len) {
+bool TemplateRenderer::tplFontBindAsset(const uint8_t *bytes, size_t len)
+{
     FontAssetInfo info;
     String err;
     if (!fontAssetValidate(bytes, len, info, err) ||
@@ -636,11 +656,13 @@ bool tplFontBindAsset(const uint8_t *bytes, size_t len) {
     return true;
 }
 
-int tplFontCount() {
+int TemplateRenderer::tplFontCount()
+{
     return (int)(sizeof(TPL_FONTS) / sizeof(TPL_FONTS[0]));
 }
 
-int tplFontFixedCount() {
+int TemplateRenderer::tplFontFixedCount()
+{
     int n = 0;
     for (int i = 0; i < tplFontCount(); i++) {
         if (TPL_FONTS[i].kind == FONT_KIND_BITMAP) n++;
@@ -649,11 +671,12 @@ int tplFontFixedCount() {
 }
 
 static const TplFontEntry *fontEntry(int idx) {
-    if (idx < 0 || idx >= tplFontCount()) return nullptr;
+    if (idx < 0 || idx >= int(sizeof(TPL_FONTS) / sizeof(TPL_FONTS[0]))) return nullptr;
     return &TPL_FONTS[idx];
 }
 
-int tplFontIndexByName(const char *name) {
+int TemplateRenderer::tplFontIndexByName(const char *name)
+{
     if (!name) return -1;
     for (int i = 0; i < tplFontCount(); i++) {
         if (!strcmp(name, TPL_FONTS[i].name)) return i;
@@ -661,7 +684,8 @@ int tplFontIndexByName(const char *name) {
     return -1;
 }
 
-const char *tplFontNameByIndex(int idx) {
+const char *TemplateRenderer::tplFontNameByIndex(int idx)
+{
     const TplFontEntry *e = fontEntry(idx);
     return e ? e->name : nullptr;
 }
@@ -672,19 +696,22 @@ static sFONT *fontByIndex(int idx) {
 }
 
 // The proportional large-display family; index >= tplFontFixedCount().
-static const Note4PropFont *propFontByIndex(int idx) {
+const Note4PropFont *TemplateRenderer::propFontByIndex(int idx)
+{
     const TplFontEntry *e = fontEntry(idx);
     return (e && e->kind == FONT_KIND_PROP)
         ? (sAssetBound[idx] ? &sAssetFonts[idx] : e->prop) : nullptr;
 }
 
-bool tplFontCellByName(const char *name, int &cellW, int &cellH) {
+bool TemplateRenderer::tplFontCellByName(const char *name, int &cellW, int &cellH)
+{
     int idx = tplFontIndexByName(name);
     if (idx < 0) return false;
     return tplFontCellByIndex(idx, cellW, cellH);
 }
 
-bool tplFontCellByIndex(int idx, int &cellW, int &cellH) {
+bool TemplateRenderer::tplFontCellByIndex(int idx, int &cellW, int &cellH)
+{
     sFONT *f = fontByIndex(idx);
     if (f) {
         cellW = f->Width;
@@ -698,7 +725,8 @@ bool tplFontCellByIndex(int idx, int &cellW, int &cellH) {
     return true;
 }
 
-bool tplFontClockBox(int idx, int scale, int &w, int &h) {
+bool TemplateRenderer::tplFontClockBox(int idx, int scale, int &w, int &h)
+{
     if (scale < 1) scale = 1;
     sFONT *f = fontByIndex(idx);
     if (f) {
@@ -726,10 +754,11 @@ bool tplFontClockBox(int idx, int scale, int &w, int &h) {
 }
 
 // Ink pixels dropped by the last tplFontDrawClock() call (see the accessor).
-static int sClockClipped = 0;
 
-bool tplFontDrawClock(uint8_t *win, int bw, int rows, int xOff, int idx,
-                      const char *text, int scale) {
+
+bool TemplateRenderer::tplFontDrawClock(uint8_t *win, int bw, int rows, int xOff, int idx,
+                      const char *text, int scale)
+{
     if (!win || !text || bw <= 0 || rows <= 0 || xOff < 0 || scale < 1) return false;
     const int bufW = bw * 8;
     // Ink only: the window buffer already holds the background (the caller
@@ -764,7 +793,7 @@ bool tplFontDrawClock(uint8_t *win, int bw, int rows, int xOff, int idx,
         return true;
     }
     const Note4PropFont *p = propFontByIndex(idx);
-    if (!p) return false;
+    if (!p || p->alphaBpp) return false; // This clock-window API writes 1bpp.
     const int baseline = (int)p->lineHeight - (int)p->baseLine;
     long pen = (long)xOff << 4;   // 1/16 px fixed point, same as drawPropText
     for (size_t i = 0, len = strlen(text); i < len;) {
@@ -790,7 +819,8 @@ bool tplFontDrawClock(uint8_t *win, int bw, int rows, int xOff, int idx,
 // Ink pixels the last tplFontDrawClock() blit had to drop because they fell
 // outside the window. Non-zero means the reserved window is too small for the
 // string; the caller must not trust that partial write. Reading it clears it.
-int tplFontClockClipped() {
+int TemplateRenderer::tplFontClockClipped()
+{
     const int v = sClockClipped;
     sClockClipped = 0;
     return v;
@@ -799,7 +829,8 @@ int tplFontClockClipped() {
 // Advance width (px) of `text` in the proportional family, same metrics the
 // renderer uses, so a caller can verify a reserved window really fits before
 // writing it.
-int tplFontPropWidth(int idx, int scale, const char *text) {
+int TemplateRenderer::tplFontPropWidth(int idx, int scale, const char *text)
+{
     if (!text || scale < 1) return 0;
     const Note4PropFont *p = propFontByIndex(idx);
     if (!p) return 0;
@@ -810,7 +841,8 @@ int tplFontPropWidth(int idx, int scale, const char *text) {
     return (int)((adv * scale + 8) / 16);
 }
 
-static void ctCopy(char *dst, size_t cap, const char *src) {
+void TemplateRenderer::ctCopy(char *dst, size_t cap, const char *src)
+{
     if (!src) { dst[0] = 0; return; }
     size_t n = strlen(src);
     if (n >= cap) n = cap - 1;
@@ -818,14 +850,16 @@ static void ctCopy(char *dst, size_t cap, const char *src) {
     dst[n] = 0;
 }
 
-static int ctFindReq(const CtTemplate &ct, const String &path) {
+int TemplateRenderer::ctFindReq(const CtTemplate &ct, const String &path)
+{
     for (int i = 0; i < ct.reqCount; i++) {
         if (path == ct.reqs[i].path) return i;
     }
     return -1;
 }
 
-static int ctAddReq(CtTemplate &ct, const BindSpec &spec, const String &path) {
+int TemplateRenderer::ctAddReq(CtTemplate &ct, const BindSpec &spec, const String &path)
+{
     int found = ctFindReq(ct, path);
     if (found >= 0) return found;
     if (ct.reqCount >= CT_MAX_REQS) return -1;
@@ -839,14 +873,16 @@ static int ctAddReq(CtTemplate &ct, const BindSpec &spec, const String &path) {
     return ct.reqCount++;
 }
 
-static int ctFindRes(const CtTemplate &ct, const char *bits) {
+int TemplateRenderer::ctFindRes(const CtTemplate &ct, const char *bits)
+{
     for (int i = 0; i < ct.resCount; i++) {
         if (!strcmp(ct.res[i].bits, bits)) return i;
     }
     return -1;
 }
 
-static bool ctBind(const CtReq &r, BindSpec &s) {
+bool TemplateRenderer::ctBind(const CtReq &r, BindSpec &s)
+{
     s.kind = (BindKind)r.kind;
     s.bucket = r.bucket;
     s.winMode = r.winMode;
@@ -854,24 +890,27 @@ static bool ctBind(const CtReq &r, BindSpec &s) {
     return true;
 }
 
-static bool ctEvalText(const CtTemplate &ct, uint8_t idx, TextTimeFormat fmt,
-                       JsonDocument &usage, const TplEnv &env, String &out) {
+bool TemplateRenderer::ctEvalText(const CtTemplate &ct, uint8_t idx, TextTimeFormat fmt,
+                       JsonDocument &usage, const TplEnv &env, String &out)
+{
     if (idx == CT_NONE_IDX || idx >= ct.reqCount) return false;
     BindSpec s;
     ctBind(ct.reqs[idx], s);
     return evalBind(s, fmt, usage, env, out);
 }
 
-static bool ctExists(const CtTemplate &ct, uint8_t idx, JsonDocument &usage,
-                     const TplEnv &env, bool haveUsage) {
+bool TemplateRenderer::ctExists(const CtTemplate &ct, uint8_t idx, JsonDocument &usage,
+                     const TplEnv &env, bool haveUsage)
+{
     if (idx == CT_NONE_IDX || idx >= ct.reqCount) return false;
     BindSpec s;
     ctBind(ct.reqs[idx], s);
     return bindExists(s, usage, env, haveUsage);
 }
 
-static bool ctCondMatches(const CtTemplate &ct, const CtOp &op, JsonDocument &usage,
-                          const TplEnv &env, bool haveUsage) {
+bool TemplateRenderer::ctCondMatches(const CtTemplate &ct, const CtOp &op, JsonDocument &usage,
+                          const TplEnv &env, bool haveUsage)
+{
     if (op.whenMode == CTW_NONE) return true;
     if (op.whenMode == CTW_EQ_NUM || op.whenMode == CTW_EQ_STR) {
         String v;
@@ -884,7 +923,15 @@ static bool ctCondMatches(const CtTemplate &ct, const CtOp &op, JsonDocument &us
 }
 
 // Parse one element into a compiled op (also the validator for the JSON path).
-static bool parseElementCompiled(JsonObject e, CtTemplate &ct, CtOp &op) {
+bool TemplateRenderer::parseElementCompiled(JsonObject e, CtTemplate &ct, CtOp &op)
+{
+    if (ap01TemplateCanvas(TPL_W, TPL_H)) {
+        for (const char *key : {"color", "fg", "bg"}) {
+            if (!e.containsKey(key)) continue;
+            int c = colorVal(e[key], -1);
+            if (c < 0 || (c > 6 && !(c == COLOR_NONE && !strcmp(key, "bg")))) return false;
+        }
+    }
     memset(&op, 0, sizeof(op));
     op.bindIdx = CT_NONE_IDX;
     op.whenIdx = CT_NONE_IDX;
@@ -1013,6 +1060,23 @@ static bool parseElementCompiled(JsonObject e, CtTemplate &ct, CtOp &op) {
         op.maxVal = (int16_t)maxV;
         return true;
     }
+    if (!strcmp(type, "ring")) {
+        if (!ap01TemplateCanvas(TPL_W, TPL_H)) return false;
+        int x = e["x"] | -1, y = e["y"] | -1;
+        int r = e["radius"] | 0, thickness = e["thickness"] | 0;
+        const char *bind = e["bind"] | "";
+        BindSpec spec;
+        if (!e["x"].is<int>() || !e["y"].is<int>() || !e["radius"].is<int>() || !e["thickness"].is<int>() ||
+            r < 1 || r >= TPL_W || thickness < 1 || thickness > r || x < r || y < r ||
+            x > TPL_W - r - 1 || y > TPL_H - r - 1 || !parseBind(bind, spec) ||
+            (spec.kind != B_BUCKET_REMAIN && spec.kind != B_BUCKET_USED)) return false;
+        int idx = ctAddReq(ct, spec, String(bind));
+        if (idx < 0) return false;
+        op.type = CT_RING; op.bindIdx = (uint8_t)idx;
+        op.x = x; op.y = y; op.w = r; op.h = thickness;
+        op.fg = colorVal(e["fg"], 2); op.bg = colorVal(e["bg"], 5);
+        return true;
+    }
     if (!strcmp(type, "rect")) {
         int x, y, w, h;
         if (!clampRect(e["rect"].as<JsonArray>(), x, y, w, h)) return false;
@@ -1054,14 +1118,16 @@ static bool parseElementCompiled(JsonObject e, CtTemplate &ct, CtOp &op) {
     return false;
 }
 
-static bool drawCtOp(const CtTemplate &ct, const CtOp &op, JsonDocument &usage,
-                     const TplEnv &env, bool haveUsage, bool dry) {
+bool TemplateRenderer::drawCtOp(const CtTemplate &ct, const CtOp &op, JsonDocument &usage,
+                     const TplEnv &env, bool haveUsage, bool dry)
+{
     if (!dry && !ctCondMatches(ct, op, usage, env, haveUsage)) return true;
     sFONT *font = nullptr;
     switch (op.type) {
     case CT_TEXT: {
-        if (dry) return true;
         const Note4PropFont *prop = propFontByIndex(op.font);
+        if (prop && prop->alphaBpp == 4 && !ap01TemplateCanvas(TPL_W,TPL_H)) return false;
+        if (dry) return true;
         font = prop ? nullptr : fontByIndex(op.font);
         if (!prop && !font) return false;
         String val;
@@ -1144,8 +1210,44 @@ static bool drawCtOp(const CtTemplate &ct, const CtOp &op, JsonDocument &usage,
         }
         return true;
     }
+    case CT_RING: {
+        if (dry) return true;
+        BindSpec spec;
+        ctBind(ct.reqs[op.bindIdx], spec);
+        double value = 0;
+        bool present = evalBindNum(spec, usage, env, value);
+        value = present ? fmax(0.0, fmin(100.0, value)) : 0;
+        // Area coverage smooths the circular edges and percentage endpoint.
+        double outer = op.w * op.w, inner = (op.w - op.h) * (op.w - op.h);
+        for (int dy = -op.w; dy <= op.w; ++dy) {
+            for (int dx = -op.w; dx <= op.w; ++dx) {
+                int fgSamples=0, bgSamples=0;
+                for (int sy=0;sy<4;++sy) for (int sx=0;sx<4;++sx) {
+                    double x=dx+(sx+0.5)/4-0.5, y=dy+(sy+0.5)/4-0.5;
+                    double distance=x*x+y*y;
+                    if (distance>outer || distance<inner) continue;
+                    double angle=atan2(x,-y);
+                    if (angle<0) angle+=6.283185307179586;
+                    if (value>0 && angle<value*0.06283185307179586) ++fgSamples;
+                    else ++bgSamples;
+                }
+                if (!fgSamples && !bgSamples) continue;
+                int px=op.x+dx, py=op.y+dy;
+                unsigned under=Paint.Image[py*Paint.WidthByte+px/2];
+                under=px%2 ? under&15 : under>>4;
+                unsigned color=ap01Coverage(op.fg==COLOR_NONE ? under : op.fg,
+                    op.bg==COLOR_NONE ? under : op.bg,under,fgSamples,bgSamples,16);
+                Paint_SetPixel(px,py,color);
+            }
+        }
+        return true;
+    }
     case CT_RECT:
         if (dry) return true;
+        if (ap01TemplateCanvas(TPL_W, TPL_H) && (op.flags & 0x01) &&
+            op.x == 0 && op.y == 0 && op.w == TPL_W && op.h == TPL_H) {
+            Paint_Clear(op.color); return true;
+        }
         Paint_DrawRectangle(op.x, op.y, op.x + op.w - 1, op.y + op.h - 1,
                             (UWORD)op.color, DOT_PIXEL_1X1,
                             (op.flags & 0x01) ? DRAW_FILL_FULL : DRAW_FILL_EMPTY);
@@ -1172,7 +1274,8 @@ static bool drawCtOp(const CtTemplate &ct, const CtOp &op, JsonDocument &usage,
     }
 }
 
-bool tplValidateCt(const CtTemplate &ct, String &err) {
+bool TemplateRenderer::tplValidateCt(const CtTemplate &ct, String &err)
+{
     if (ct.abi != CT_ABI) { err = "ct_abi"; return false; }
     if (ct.opCount == 0 || ct.opCount > CT_MAX_OPS) { err = "ct_ops"; return false; }
     if (ct.reqCount > CT_MAX_REQS || ct.resCount > CT_MAX_RES) { err = "ct_bounds"; return false; }
@@ -1183,7 +1286,16 @@ bool tplValidateCt(const CtTemplate &ct, String &err) {
             !memchr(op.suffix, 0, sizeof(op.suffix)) || !memchr(op.whenEqStr, 0, sizeof(op.whenEqStr))) {
             err = "ct_string"; return false;
         }
-        if (op.type > CT_ICON) { err = "ct_op_type"; return false; }
+        if (op.type > CT_RING || (op.type == CT_RING && !ap01TemplateCanvas(TPL_W, TPL_H))) {
+            err = "ct_op_type"; return false;
+        }
+        if (ap01TemplateCanvas(TPL_W, TPL_H) &&
+            (op.color > 6 || op.fg > 6 || (op.bg > 6 && op.bg != COLOR_NONE))) {
+            err = "ct_color"; return false;
+        }
+        if (op.type == CT_RING && (op.w < 1 || op.h < 1 || op.h > op.w ||
+            op.x < op.w || op.y < op.w || op.x + op.w >= TPL_W || op.y + op.w >= TPL_H ||
+            op.bindIdx == CT_NONE_IDX)) { err = "ct_ring"; return false; }
         if (op.bindIdx != CT_NONE_IDX && op.bindIdx >= ct.reqCount) { err = "ct_bind"; return false; }
         if (op.whenIdx != CT_NONE_IDX && op.whenIdx >= ct.reqCount) { err = "ct_when"; return false; }
         if ((op.flags & 0x10) && (op.type != CT_TEXT || op.resourceIdx >= ct.reqCount)) {
@@ -1210,16 +1322,23 @@ bool tplValidateCt(const CtTemplate &ct, String &err) {
     for (int i = 0; i < ct.resCount; i++) {
         if (!memchr(ct.res[i].bits, 0, sizeof(ct.res[i].bits))) { err = "ct_string"; return false; }
     }
+    for (int i = 0; i < ct.opCount; ++i) {
+        const CtOp &op = ct.ops[i];
+        if (op.type == CT_RING && ct.reqs[op.bindIdx].kind != B_BUCKET_REMAIN &&
+            ct.reqs[op.bindIdx].kind != B_BUCKET_USED) { err = "ct_ring_bind"; return false; }
+    }
     return true;
 }
 
-bool tplDrawCt(const CtTemplate &ct, const String &usageJson, const TplEnv &env) {
+bool TemplateRenderer::tplDrawCt(const CtTemplate &ct, const String &usageJson, const TplEnv &env)
+{
     String err;
     if (!tplValidateCt(ct, err)) {
         Serial.printf("[tpl] ct reject: %s\n", err.c_str());
         return false;
     }
-    JsonDocument ud;
+    TplJsonAllocator allocator;
+    JsonDocument ud(&allocator);
     bool haveUsage = usageJson.length() > 0 && !deserializeJson(ud, usageJson);
     for (int i = 0; i < ct.opCount; i++) {
         if (!drawCtOp(ct, ct.ops[i], ud, env, haveUsage, false)) return false;
@@ -1227,7 +1346,8 @@ bool tplDrawCt(const CtTemplate &ct, const String &usageJson, const TplEnv &env)
     return true;
 }
 
-static bool parseTemplate(const String &tmplJson, JsonDocument &td, JsonArray &els, String &err) {
+bool TemplateRenderer::parseTemplate(const String &tmplJson, JsonDocument &td, JsonArray &els, String &err)
+{
     if (deserializeJson(td, tmplJson)) { err = "json"; return false; }
     if ((td["schema"] | 0) != 1) { err = "schema"; return false; }
     JsonObject canvas = td["canvas"].as<JsonObject>();
@@ -1235,13 +1355,19 @@ static bool parseTemplate(const String &tmplJson, JsonDocument &td, JsonArray &e
         err = "canvas";
         return false;
     }
+    if (ap01TemplateCanvas(TPL_W, TPL_H) &&
+        strcmp(td["render_target"] | "", "lcd-jd9853-320x240-palette4")) {
+        err = "render_target"; return false;
+    }
     els = td["elements"].as<JsonArray>();
     if (els.isNull() || els.size() == 0) { err = "elements"; return false; }
     return true;
 }
 
-bool tplCompile(const String &tmplJson, CtTemplate &out, String &err) {
-    JsonDocument td;
+bool TemplateRenderer::tplCompile(const String &tmplJson, CtTemplate &out, String &err)
+{
+    TplJsonAllocator allocator;
+    JsonDocument td(&allocator);
     JsonArray els;
     if (!parseTemplate(tmplJson, td, els, err)) return false;
     memset(&out, 0, sizeof(out));
@@ -1258,25 +1384,31 @@ bool tplCompile(const String &tmplJson, CtTemplate &out, String &err) {
     return tplValidateCt(out, err);
 }
 
-bool tplValidate(const String &tmplJson, String &err) {
-    static CtTemplate scratch;
-    return tplCompile(tmplJson, scratch, err);
+bool TemplateRenderer::tplValidate(const String &tmplJson, String &err)
+{
+    std::unique_ptr<CtTemplate> scratch(new (std::nothrow) CtTemplate);
+    if (!scratch) { err = "allocation_failed"; return false; }
+    return tplCompile(tmplJson, *scratch, err);
 }
 
-bool tplDraw(const String &tmplJson, const String &usageJson, const TplEnv &env) {
-    static CtTemplate scratch;
+bool TemplateRenderer::tplDraw(const String &tmplJson, const String &usageJson, const TplEnv &env)
+{
+    std::unique_ptr<CtTemplate> scratch(new (std::nothrow) CtTemplate);
+    if (!scratch) return false;
     String err;
-    if (!tplCompile(tmplJson, scratch, err)) {
+    if (!tplCompile(tmplJson, *scratch, err)) {
         Serial.printf("[tpl] reject: %s\n", err.c_str());
         return false;
     }
-    return tplDrawCt(scratch, usageJson, env);
+    return tplDrawCt(*scratch, usageJson, env);
 }
 
-size_t tplCtSize() { return sizeof(CtTemplate); }
+size_t TemplateRenderer::tplCtSize()
+{ return sizeof(CtTemplate); }
 
 // Fixed-layout record: magic | size | abi | crc32 | CtTemplate bytes.
-bool tplCtSerialize(const CtTemplate &ct, uint8_t *out, size_t cap, size_t &written) {
+bool TemplateRenderer::tplCtSerialize(const CtTemplate &ct, uint8_t *out, size_t cap, size_t &written)
+{
     const size_t payload = sizeof(CtTemplate);
     const size_t total = 4 + 2 + 2 + 4 + payload;
     written = total;
@@ -1293,7 +1425,8 @@ bool tplCtSerialize(const CtTemplate &ct, uint8_t *out, size_t cap, size_t &writ
     return true;
 }
 
-bool tplCtDeserialize(const uint8_t *in, size_t len, CtTemplate &out, String &err) {
+bool TemplateRenderer::tplCtDeserialize(const uint8_t *in, size_t len, CtTemplate &out, String &err)
+{
     if (len < 12) { err = "ct_short"; return false; }
     uint32_t magic = 0;
     memcpy(&magic, in, 4);
@@ -1309,3 +1442,30 @@ bool tplCtDeserialize(const uint8_t *in, size_t len, CtTemplate &out, String &er
     memcpy(&out, in + 12, size);
     return tplValidateCt(out, err);
 }
+
+#if !defined(CODEX_AP01_NATIVE)
+static TemplateRenderer defaultRenderer(Paint, TARGET_WIDTH, TARGET_HEIGHT);
+TemplateRenderer &tplDefaultRenderer() { return defaultRenderer; }
+void tplFontClearAssets() { defaultRenderer.tplFontClearAssets(); }
+bool tplFontBindAsset(const uint8_t *bytes, size_t len) { return defaultRenderer.tplFontBindAsset(bytes, len); }
+int tplFontCount() { return defaultRenderer.tplFontCount(); }
+int tplFontFixedCount() { return defaultRenderer.tplFontFixedCount(); }
+int tplFontIndexByName(const char *name) { return defaultRenderer.tplFontIndexByName(name); }
+const char * tplFontNameByIndex(int idx) { return defaultRenderer.tplFontNameByIndex(idx); }
+bool tplFontCellByName(const char *name, int &cellW, int &cellH) { return defaultRenderer.tplFontCellByName(name, cellW, cellH); }
+bool tplFontCellByIndex(int idx, int &cellW, int &cellH) { return defaultRenderer.tplFontCellByIndex(idx, cellW, cellH); }
+bool tplFontClockBox(int idx, int scale, int &w, int &h) { return defaultRenderer.tplFontClockBox(idx, scale, w, h); }
+bool tplFontDrawClock(uint8_t *win, int bw, int rows, int xOff, int idx,
+                      const char *text, int scale) { return defaultRenderer.tplFontDrawClock(win, bw, rows, xOff, idx, text, scale); }
+int tplFontClockClipped() { return defaultRenderer.tplFontClockClipped(); }
+int tplFontPropWidth(int idx, int scale, const char *text) { return defaultRenderer.tplFontPropWidth(idx, scale, text); }
+bool tplValidateCt(const CtTemplate &ct, String &err) { return defaultRenderer.tplValidateCt(ct, err); }
+bool tplDrawCt(const CtTemplate &ct, const String &usageJson, const TplEnv &env) { return defaultRenderer.tplDrawCt(ct, usageJson, env); }
+bool tplCompile(const String &tmplJson, CtTemplate &out, String &err) { return defaultRenderer.tplCompile(tmplJson, out, err); }
+bool tplValidate(const String &tmplJson, String &err) { return defaultRenderer.tplValidate(tmplJson, err); }
+bool tplDraw(const String &tmplJson, const String &usageJson, const TplEnv &env) { return defaultRenderer.tplDraw(tmplJson, usageJson, env); }
+size_t tplCtSize() { return defaultRenderer.tplCtSize(); }
+bool tplCtSerialize(const CtTemplate &ct, uint8_t *out, size_t cap, size_t &written) { return defaultRenderer.tplCtSerialize(ct, out, cap, written); }
+bool tplCtDeserialize(const uint8_t *in, size_t len, CtTemplate &out, String &err) { return defaultRenderer.tplCtDeserialize(in, len, out, err); }
+void tplSetCanvas(int w, int h) { defaultRenderer.tplSetCanvas(w, h); }
+#endif

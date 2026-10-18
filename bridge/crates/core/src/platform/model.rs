@@ -22,6 +22,8 @@ pub const MAX_SNAPSHOT_BYTES: usize = 8192;
 pub const RENDER_TARGET_154G: &str = "epd-ssd1681-200x200-1bpp";
 pub const RENDER_TARGET_NOTE4: &str = "epd-ssd2683-400x300-1bpp";
 pub const RENDER_TARGET_GRAY4: &str = "epd-200x200-2bpp-gray4";
+pub const RENDER_TARGET_AP01: &str = "lcd-jd9853-320x240-palette4";
+pub const FIRMWARE_TARGET_AP01: &str = "cuktech-ap01-0041";
 pub const FIRMWARE_TARGET_154G: &str = "codex-status-154g";
 pub const FIRMWARE_TARGET_NOTE4: &str = "zectrix-note4-400x300";
 pub const FIRMWARE_TARGET_GRAY4: &str = "codex-status-154g-gray4";
@@ -80,6 +82,16 @@ impl Default for DeviceCapabilities {
 }
 
 impl DeviceCapabilities {
+    /// AP01 keeps its network/UI service active without a power scheduling protocol.
+    pub fn uses_power_plan(&self) -> bool { self.render_target != RENDER_TARGET_AP01 }
+
+    pub fn ap01() -> Self {
+        Self { firmware_target:FIRMWARE_TARGET_AP01.into(),render_target:RENDER_TARGET_AP01.into(),
+            width:320,height:240,pixel_format:"4bpp".into(),colors:"ap01-palette-v2".into(),
+            ble:false,wifi:true,partial:false,hardware_verified:false,max_light_s:0,
+            bundle_font_protocol:3,..Self::ssd1681_154g() }
+    }
+
     pub fn ssd1681_154g() -> Self {
         Self {
             firmware_target: FIRMWARE_TARGET_154G.into(),
@@ -173,6 +185,7 @@ impl DeviceCapabilities {
             RENDER_TARGET_154G => (200, 200, "1bpp", "bw"),
             RENDER_TARGET_NOTE4 => (400, 300, "1bpp", "bw"),
             RENDER_TARGET_GRAY4 => (200, 200, "2bpp", "gray4"),
+            RENDER_TARGET_AP01 => (320, 240, "4bpp", "ap01-palette-v2"),
             other => bail!("capabilities: unsupported render_target {other}"),
         };
         if (self.width, self.height, self.pixel_format.as_str(), self.colors.as_str()) != expected {
@@ -181,10 +194,14 @@ impl DeviceCapabilities {
         if self.render_target == RENDER_TARGET_NOTE4 && self.firmware_target != FIRMWARE_TARGET_NOTE4 {
             bail!("capabilities: Note4 firmware target mismatch");
         }
+        if self.render_target == RENDER_TARGET_AP01 &&
+            (self.firmware_target != FIRMWARE_TARGET_AP01 || self.partial || self.hardware_verified || self.ble || !self.wifi) {
+            bail!("capabilities: AP01 is an unverified full-frame target");
+        }
         if self.asset_publish_protocol > 0 && (self.max_object_bytes == 0 || self.max_manifest_bytes == 0 || self.install_peak_bytes == 0 || self.free_bytes == 0) {
             bail!("capabilities: incremental publish limits missing");
         }
-        if self.bundle_font_protocol > 2 {
+        if self.bundle_font_protocol > 3 || (self.bundle_font_protocol == 3 && self.render_target != RENDER_TARGET_AP01) {
             bail!("capabilities: unsupported bundle_font_protocol");
         }
         if !(1..=COMPILER_ABI).contains(&self.compiler_abi) {
@@ -304,6 +321,7 @@ impl FamilyProfile {
             RENDER_TARGET_154G,
             RENDER_TARGET_NOTE4,
             RENDER_TARGET_GRAY4,
+            RENDER_TARGET_AP01,
         ]
         .contains(&self.render_target.as_str())
         {
@@ -635,7 +653,9 @@ impl Bundle {
             if info.name != font.name || info.id != font.font_id {
                 bail!("bundle font {} identity mismatch", font.name);
             }
-            info.check_target(&self.render_target_pixel_format())?;
+            // LCD accepts BW or alpha4 masks; EPD retains its original format.
+            let font_format = self.render_target_pixel_format();
+            info.check_target(&font_format)?;
         }
         if !self
             .profile
@@ -648,7 +668,11 @@ impl Bundle {
     }
 
     fn render_target_pixel_format(&self) -> String {
-        if self.render_target == RENDER_TARGET_GRAY4 { "2bpp" } else { "1bpp" }.into()
+        match self.render_target.as_str() {
+            RENDER_TARGET_GRAY4 => "2bpp",
+            RENDER_TARGET_AP01 => "4bpp",
+            _ => "1bpp",
+        }.into()
     }
 
     /// Bounded BEGIN/CHUNK/COMMIT framing used by LAN and BLE transports.

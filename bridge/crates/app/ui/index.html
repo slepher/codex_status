@@ -177,6 +177,8 @@
   .metric span { display: block; margin-top: 5px; color: var(--muted); font-size: 11px; }
   .metric small { display: block; margin-top: 5px; color: var(--muted); font-size: 11px; line-height: 1.3; overflow-wrap: anywhere; }
   .action-strip { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 14px; }
+  #ap01-candidates span { flex-basis: 100%; min-width: 0; overflow-wrap: anywhere; }
+  .ap01-code { margin: 12px 0; font: 48px/1.2 ui-monospace, Consolas, monospace; letter-spacing: .16em; }
   .mono { font-family: ui-monospace, Consolas, monospace; font-size: 11px; }
   .device-name { font-weight: 700; color: var(--accent); cursor: pointer; }
   .device-name:hover { text-decoration: underline; }
@@ -307,7 +309,13 @@
       <div class="card">
         <h2>当前屏幕</h2>
         <div id="registered-devices" class="plist muted">加载中…</div>
-        <div class="action-strip"><button onclick="wifiAddDevice()">通过蓝牙添加设备</button></div>
+        <div class="action-strip"><button onclick="ap01Search()">添加 AP01 · 局域网</button><button onclick="wifiAddDevice()">通过蓝牙添加设备</button></div>
+        <div id="ap01-add" hidden>
+          <p id="ap01-code" class="ap01-code" hidden aria-label="设备配对码"></p>
+          <p id="ap01-result" role="status" aria-live="polite"></p>
+          <div id="ap01-candidates" class="plist"></div>
+          <div class="action-strip"><button onclick="ap01CancelSearch()">停止搜索</button></div>
+        </div>
       </div>
       <div class="card wifi-card" id="wifi-card">
         <h2>Wi-Fi 方案 · <span id="wifi-target">选择设备</span></h2>
@@ -1422,6 +1430,54 @@
   }
   async function wifiSelect(i){const n=wifiScheme?.networks?.[i];if(n?.writable&&window.confirm(`启用 ${n.network.network_id} 的 v${n.network.version}？将尝试切换网络。`))await wifiRun('activate',{network_id:n.network.network_id,version:n.network.version});}
   async function wifiCancel(){ $('wifi-password').value='';if(wifiBusyMac)await invoke('platform_wifi',{mac:wifiBusyMac,op:'cancel',body:{}}); }
+  let ap01Poll = 0;
+  async function ap01CancelSearch(){ await invoke('platform_ap01',{op:'cancel_search',body:{}}); }
+  function ap01Message(value){
+    const reply=value.reply||{};
+    const state=['paired','cancelled','expired','rejected','error','unknown'].includes(value.result)
+      ?value.result:reply.state||value.state||value.result;
+    $('ap01-code').textContent=value.display_code||'';
+    $('ap01-code').hidden=!value.display_code||['paired','cancelled','expired','rejected'].includes(state);
+    const labels={pending_display:'等待设备显示确认界面',awaiting_confirmation:'核对两端四位码后，在 AP01 上按下并松开旋钮',
+      approved:'设备已确认',paired:'配对完成；请在设备列表中配置模板并发布',cancelled:'配对已取消',expired:'配对已过期',unknown:'结果未知，请查询原配对事务'};
+    $('ap01-result').textContent=[value.display_code?`配对码 ${value.display_code}`:'',labels[state]||state,
+      value.error||reply.error||'',value.action||''].filter(Boolean).join(' · ');
+    return state;
+  }
+  async function ap01Pair(mac,op='pair'){
+    const generation=++ap01Poll;
+    try{
+      let result=await invoke('platform_ap01',{op,body:{mac}});
+      let state=ap01Message(result);
+      const deadline=Date.now()+125000;
+      while(generation===ap01Poll && Date.now()<deadline &&
+        !['paired','cancelled','expired','rejected','error'].includes(state)){
+        await new Promise(resolve=>setTimeout(resolve,1200));
+        if(generation!==ap01Poll)return;
+        result=await invoke('platform_ap01',{op:'pair_status',body:{mac}});state=ap01Message(result);
+      }
+      if(state==='paired'){selectedDeviceMac=mac;deviceSelectionGeneration++;clearDeviceView();await refreshPlatformDevice();}
+      else if(Date.now()>=deadline)$('ap01-result').textContent+=' · 已停止自动查询，可查询原事务';
+    }catch(e){$('ap01-result').textContent=String(e);}
+  }
+  async function ap01Search(){
+    $('ap01-add').hidden=false;$('ap01-result').textContent='正在搜索局域网中的 AP01…';
+    $('ap01-candidates').replaceChildren();
+    try{
+      const result=await invoke('platform_ap01',{op:'search',body:{}});
+      if(result.result==='error'){ap01Message(result);return;}
+      $('ap01-result').textContent=result.candidates?.length?'选择设备，核对两端四位码后按下设备旋钮':
+        `未发现 AP01。请确认电脑与设备位于同一局域网，并允许本地网络通信。${(result.errors||[]).join(' · ')}`;
+      for(const candidate of result.candidates||[]){
+        const row=document.createElement('div');row.className='action-strip';
+        const label=document.createElement('span');label.textContent=`${candidate.name} · ${candidate.device_mac}`;row.append(label);
+        for(const [text,op] of [['配对','pair'],['查询原事务','pair_status'],['取消配对','cancel_pair']]){
+          const button=document.createElement('button');button.textContent=text;button.onclick=()=>ap01Pair(candidate.device_mac,op);row.append(button);
+        }
+        $('ap01-candidates').append(row);
+      }
+    }catch(e){$('ap01-result').textContent=String(e);}
+  }
   async function wifiAddDevice(){
     wifiSetResult('扫描目标，请单击 BOOT 开启维护窗口');
     try{const candidate=await invoke('platform_wifi',{mac:'',op:'scan',body:{}});const mac=candidate.mac;
@@ -1442,6 +1498,7 @@
   }
 
   function clearDeviceView() {
+    $('device-power').hidden=false;$('wifi-card').hidden=false;
     wifiRenderOnline(null);
     wifiEditingId=null;$('wifi-id').readOnly=false;
     wifiShowTab('bridge');$('wifi-editor').open=false;
@@ -1586,6 +1643,8 @@
       if (!isCurrentDevice(mac, generation) || request !== deviceStatusRequest) return;
       const d = result.device;
       if (!d || d.device_mac !== mac) throw new Error('设备身份与所选 MAC 不符');
+      $('device-power').hidden=d.power_mode==='always_on';
+      $('wifi-card').hidden=d.power_mode==='always_on';
       $('dev-name').textContent = d.identity.name || mac;
       $('device-state').textContent = d.contact.label;
       const separateContact = d.contact.last_authenticated_at &&

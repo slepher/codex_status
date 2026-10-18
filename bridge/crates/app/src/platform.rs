@@ -135,7 +135,10 @@ pub fn device_link(ctx: &AppCtx) -> Option<DeviceLink> {
 pub(super) fn device_link_for_mac(ctx: &AppCtx, requested_mac: &str) -> Option<DeviceLink> {
     let mac = DeviceIdentity::normalized_mac(requested_mac)?;
     let device = service(ctx).device_get(&mac)?;
-    device_link_from_identity(&mac, Some(&device), &ctx.config.token, &ctx.bridge_id)
+    let token=if crate::ap01::is_ap01(ctx,&mac) {
+        bridge_mcp::load_device_token_at(service(ctx).data_root(),&mac)?
+    } else { ctx.config.token.clone() };
+    device_link_from_identity(&mac, Some(&device), &token, &ctx.bridge_id)
 }
 
 fn device_link_from_identity(
@@ -290,6 +293,11 @@ pub(super) async fn revalidate_registered_device_endpoint(
     let Some(existing) = service(ctx).device_get(&mac) else {
         return Ok(false);
     };
+    if crate::ap01::is_ap01(ctx,&mac) {
+        // Reconnect owns the authenticated identity update, including runtime
+        // records. An unverified announcement cannot update persistence.
+        return crate::ap01::revalidate(ctx,&mac,&endpoint).await;
+    }
     let previous_endpoint = existing["ip"].as_str().map(str::to_string);
     if previous_endpoint.as_deref() == Some(&endpoint) {
         return Ok(false);
@@ -719,6 +727,7 @@ fn project_device(raw: &Value, identity: &Value, now: u64) -> Value {
         "identity":{"name":identity["name"].as_str().filter(|name| !name.is_empty())
             .unwrap_or_else(|| raw["name"].as_str().unwrap_or("")),"model":match target {
             "zectrix-note4-400x300" => "Note4 400×300",
+            "cuktech-ap01-0041" => "AP01 320×240",
             "codex-status-154g" => "书桌屏 200×200", _ => target},
             "source":"bridge_registration"},
         "contact":{"state":contact_state,"label":contact_label,"ble_recovery":recovery,"last_authenticated_at":contact_at,
@@ -731,6 +740,7 @@ fn project_device(raw: &Value, identity: &Value, now: u64) -> Value {
         "display":{"installed":installed,"active_template":active_template,
             "data_applied":applied,"screen_state":display_state,"label":screen_label},
         "battery":reading(body,"power.battery","power"),
+        "power_mode":if raw["capabilities"]["render_target"]==bridge_core::platform::model::RENDER_TARGET_AP01 {"always_on"}else{"power_plan"},
         "delivery":{"enabled":raw["sync_enabled"],"source":"bridge_setting",
             "required_fields":raw["data_contract"]["requirements"].as_array().map(|fields|
                 fields.iter().filter(|field| field["local"] == false).count())},
@@ -1089,13 +1099,14 @@ pub fn data_sync_save(ctx: &AppCtx, mac: &str, enabled: bool) -> Result<Value, S
 
 pub fn family_profiles(ctx: &AppCtx, render_target: Option<&str>) -> Value {
     use bridge_core::platform::model::{
-        RENDER_TARGET_154G, RENDER_TARGET_GRAY4, RENDER_TARGET_NOTE4,
+        RENDER_TARGET_154G, RENDER_TARGET_GRAY4, RENDER_TARGET_NOTE4, RENDER_TARGET_AP01,
     };
 
     let mut families = vec![
         (RENDER_TARGET_154G, "200×200 黑白"),
         (RENDER_TARGET_NOTE4, "Note4 400×300 黑白"),
         (RENDER_TARGET_GRAY4, "200×200 灰阶"),
+        (RENDER_TARGET_AP01, "AP01 320×240 彩色（待实机验收）"),
     ];
     families.sort_unstable_by_key(|(render_target, _)| *render_target);
     json!({
@@ -1357,6 +1368,9 @@ pub async fn send_plan(
     wake_reason: &str,
     provisional_remaining_s: u32,
 ) -> Value {
+    if service(ctx).uses_power_plan(mac).is_ok_and(|uses| !uses) {
+        return json!({"result":"unsupported","error":"power_plan_unsupported","stage":"capability"});
+    }
     let lock = delivery_lock(ctx, mac);
     let _delivery = lock.lock().await;
     let Some(link) = device_link_for_mac(ctx, mac) else {
@@ -1654,6 +1668,9 @@ async fn refresh_status_mode(ctx: &AppCtx, mac: &str, compact: bool) -> Value {
             json!({"result": "ok", "status": status})
         }
         Err(e) => {
+            if crate::ap01::is_ap01(ctx,mac) && crate::ap01::reconnect(ctx,mac).await.unwrap_or(false) {
+                return Box::pin(refresh_status_mode(ctx,mac,compact)).await;
+            }
             let outcome = if e.contains("401") || e.contains("403") || e.contains("409") {
                 "blocked"
             } else { "offline" };
@@ -1785,7 +1802,7 @@ pub fn caps_from_status(raw: &Value) -> Result<DeviceCapabilities, String> {
     let checked_u32 = |value: u64, key: &str| -> Result<u32, String> {
         u32::try_from(value).map_err(|_| format!("device {key} exceeds u32"))
     };
-    let (width, height, pixel_format, colors, partial) = if note4 {
+    let (width, height, pixel_format, colors, partial) = if note4 || render_target == bridge_core::platform::model::RENDER_TARGET_AP01 {
         (
             checked_u32(required("width")?, "width")?,
             checked_u32(required("height")?, "height")?,
@@ -1826,6 +1843,7 @@ pub fn caps_from_status(raw: &Value) -> Result<DeviceCapabilities, String> {
     let caps = DeviceCapabilities {
         firmware_target: fw_target.to_string(),
         render_target: render_target.to_string(),
+        ble: render_target != bridge_core::platform::model::RENDER_TARGET_AP01,
         width,
         height,
         pixel_format,
@@ -1885,6 +1903,20 @@ pub fn caps_from_status(raw: &Value) -> Result<DeviceCapabilities, String> {
 #[cfg(test)]
 mod capability_tests {
     use super::*;
+
+    #[test]
+    fn ap01_requires_explicit_palette_geometry_and_is_wifi_only_unverified() {
+        let mut raw=json!({"fw_target":"cuktech-ap01-0041", "render_target":"lcd-jd9853-320x240-palette4",
+            "width":320,"height":240,"pixel_format":"4bpp","colors":"ap01-palette-v2","partial":false,
+            "max_templates":8,"max_bundle_bytes":262144});
+        let caps=caps_from_status(&raw).unwrap();
+        assert!(!caps.ble && caps.wifi && !caps.hardware_verified && !caps.partial);
+        raw["fw_target"]=json!("cuktech-ap01-0031");
+        assert!(caps_from_status(&raw).is_err(),"0031 must not be accepted as the new 0041 ROM target");
+        raw["fw_target"]=json!("cuktech-ap01-0041");
+        raw["width"]=json!(200); assert!(caps_from_status(&raw).is_err());
+        raw["width"]=json!(320); raw["hardware_verified"]=json!(true); assert!(caps_from_status(&raw).is_err());
+    }
 
     #[test]
     fn note4_requires_reported_geometry_and_never_infers_hardware_verification() {
@@ -2162,8 +2194,9 @@ pub async fn cycle(ctx: &AppCtx, mac: &str, refresh: bool, deliver_now: bool) {
     if ota_first && bridge_mcp::load_device_token_at(&crate::mcp_config(ctx).data_root, &mac).is_none() {
         return;
     }
-    let mut ota_window = ota_online_window(&refreshed);
-    if refresh && !(ota_first && ota_window) {
+    let always_on = service(ctx).uses_power_plan(&mac).is_ok_and(|uses| !uses);
+    let mut ota_window = always_on || ota_online_window(&refreshed);
+    if refresh && !always_on && !(ota_first && ota_window) {
         // Formal plan for the current rendezvous: the Bridge is the only source
         // of light/sleep decisions. A BOOT wake is answered with the *remaining*
         // provisional window; everything else is a fresh decision. Repeats are
@@ -2572,7 +2605,7 @@ fn target_mac(ctx: &AppCtx, args: &Value) -> Result<String, String> {
 /// `disconnect()` future for a peripheral already removed by a natural link
 /// loss can stay pending forever, and `link.close()` has no timeout.
 #[cfg(test)]
-mod ble_close_lock_tests {
+pub(crate) mod ble_close_lock_tests {
     use super::*;
     use std::collections::{BTreeMap, HashMap};
     use std::io::{Read as _, Write as _};
@@ -2942,7 +2975,7 @@ mod ble_close_lock_tests {
 
     /// The smallest production `AppCtx` that can run `ble_cycle`: same lock
     /// fields, same PlatformService, no Tauri handle, no tray, no server.
-    fn test_ctx(root: &std::path::Path, macs: &[&str]) -> AppCtx {
+    pub(crate) fn test_ctx(root: &std::path::Path, macs: &[&str]) -> AppCtx {
         let platform = Arc::new(PlatformService::open(root).expect("open platform state"));
         for mac in macs {
             platform
@@ -2961,6 +2994,7 @@ mod ble_close_lock_tests {
         let mcp_port = config.mcp_port;
         let (mcp_tx, _mcp_rx) = tokio::sync::watch::channel(mcp_port);
         AppCtx {
+            ap01: crate::ap01::Control::default(),
             instance: crate::instance::Instance {
                 name: None,
                 shape: crate::icon::Shape::Square,

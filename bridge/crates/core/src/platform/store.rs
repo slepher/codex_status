@@ -32,12 +32,15 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
     std::io::Write::write_all(&mut file,bytes)?;
+    file.sync_all().with_context(||format!("sync {}",tmp.display()))?;
     drop(file);
     if let Err(e) = fs::rename(&tmp, path) {
         // Best effort cleanup so a failed replace does not leave litter.
         let _ = fs::remove_file(&tmp);
         return Err(e).with_context(|| format!("replace {}", path.display()));
     }
+    #[cfg(unix)]
+    if let Some(parent)=path.parent() { fs::File::open(parent)?.sync_all()?; }
     Ok(())
 }
 

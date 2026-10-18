@@ -1,13 +1,13 @@
 use std::path::PathBuf;
 
 use bridge_render::{
-    bits_to_png_size, canvas_size, compile, compiled_deserialize, compiled_serialize,
+    bits_to_png_size, canvas_size, compile, compiled_serialize,
     png_to_bits_size, render_bits, render_compiled_bits_size, validate, Env,
 };
 
 struct Args {
     template: PathBuf,
-    font: Option<PathBuf>,
+    fonts: Vec<PathBuf>,
     usage: Option<PathBuf>,
     out: Option<PathBuf>,
     diff: Option<PathBuf>,
@@ -27,7 +27,7 @@ struct Args {
 fn parse_args() -> Args {
     let mut args = Args {
         template: PathBuf::new(),
-        font: None,
+        fonts: Vec::new(),
         usage: None,
         out: None,
         diff: None,
@@ -48,7 +48,7 @@ fn parse_args() -> Args {
         let mut value = || iter.next().expect("missing value");
         match flag.as_str() {
             "--template" => args.template = PathBuf::from(value()),
-            "--font" => args.font = Some(PathBuf::from(value())),
+            "--font" => args.fonts.push(PathBuf::from(value())),
             "--usage" => args.usage = Some(PathBuf::from(value())),
             "--out" => args.out = Some(PathBuf::from(value())),
             "--diff" => args.diff = Some(PathBuf::from(value())),
@@ -70,6 +70,10 @@ fn parse_args() -> Args {
 }
 
 fn bit_diff(a: &[u8], b: &[u8], width: u32, height: u32) -> anyhow::Result<usize> {
+    if (width, height) == (320, 240) {
+        anyhow::ensure!(a.len() == 38400 && b.len() == 38400, "palette frame size");
+        return Ok(a.iter().zip(b).map(|(a,b)| usize::from(a>>4 != b>>4) + usize::from(a&15 != b&15)).sum());
+    }
     let row_bytes = ((width + 7) / 8) as usize;
     anyhow::ensure!(a.len() == b.len(), "bitmaps differ in size");
     let mut diff = 0usize;
@@ -88,9 +92,9 @@ fn bit_diff(a: &[u8], b: &[u8], width: u32, height: u32) -> anyhow::Result<usize
 fn main() -> anyhow::Result<()> {
     let args = parse_args();
     let template = std::fs::read_to_string(&args.template)?;
-    let font_bytes = args.font.as_ref().map(std::fs::read).transpose()?;
+    let font_bytes: Vec<Vec<u8>> = args.fonts.iter().map(std::fs::read).collect::<Result<_,_>>()?;
     bridge_render::font_clear_assets();
-    if let Some(bytes) = &font_bytes {
+    for bytes in &font_bytes {
         anyhow::ensure!(bridge_render::font_bind_asset(bytes), "font asset cannot bind to template font slot");
     }
     let usage = match &args.usage {
@@ -115,7 +119,7 @@ fn main() -> anyhow::Result<()> {
     let (width, height) =
         canvas_size(&template).ok_or_else(|| anyhow::anyhow!("unsupported canvas"))?;
     let row_bytes = ((width + 7) / 8) as usize;
-    anyhow::ensure!(bits.len() == row_bytes * height as usize, "render size");
+    anyhow::ensure!(bits.len() == bridge_render::frame_bytes(width,height), "render size");
     if let Some(out) = &args.out {
         std::fs::write(out, bits_to_png_size(&bits, width, height)?)?;
         println!("wrote {} ({}x{})", out.display(), width, height);
@@ -139,7 +143,7 @@ fn main() -> anyhow::Result<()> {
         let compiled = render_compiled_bits_size(&usage, &env, width, height)?;
         let json_vs_compiled = bit_diff(&bits, &compiled, width, height)?;
         let blob = compiled_serialize()?;
-        compiled_deserialize(&blob).map_err(|e| anyhow::anyhow!("deserialize: {e}"))?;
+        bridge_render::compiled_deserialize_with_canvas(&blob, width, height).map_err(|e| anyhow::anyhow!("deserialize: {e}"))?;
         let reloaded = render_compiled_bits_size(&usage, &env, width, height)?;
         let round_trip = bit_diff(&compiled, &reloaded, width, height)?;
         println!("compiled record: {} bytes", blob.len());
@@ -155,6 +159,7 @@ fn main() -> anyhow::Result<()> {
         );
     }
     if let Some(reference) = &args.diff {
+        anyhow::ensure!((width,height) != (320,240), "AP01 palette reference diff is not supported; use --compare-compiled for exact palette parity");
         let reference_png = std::fs::read(reference)?;
         let reference_bits = png_to_bits_size(&reference_png, width, height)?;
         let mut diff = 0usize;

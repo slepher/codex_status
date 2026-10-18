@@ -6,15 +6,6 @@
 
 inline int mbedtls_base64_decode(unsigned char *dst, size_t dlen, size_t *olen,
                                  const unsigned char *src, size_t slen) {
-    static int table[256];
-    static bool ready = false;
-    if (!ready) {
-        for (int i = 0; i < 256; i++) table[i] = -1;
-        const char *alphabet =
-            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        for (int i = 0; i < 64; i++) table[(unsigned char)alphabet[i]] = i;
-        ready = true;
-    }
     size_t out = 0;
     unsigned buf = 0;
     int bits = 0;
@@ -26,7 +17,10 @@ inline int mbedtls_base64_decode(unsigned char *dst, size_t dlen, size_t *olen,
             continue;
         }
         if (c == '\r' || c == '\n' || c == ' ' || c == '\t') continue;
-        int v = table[c];
+        int v = c >= 'A' && c <= 'Z' ? c - 'A'
+              : c >= 'a' && c <= 'z' ? c - 'a' + 26
+              : c >= '0' && c <= '9' ? c - '0' + 52
+              : c == '+' ? 62 : c == '/' ? 63 : -1;
         if (v < 0) return -1;
         if (pad) return -1;
         buf = (buf << 6) | (unsigned)v;

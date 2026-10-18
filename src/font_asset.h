@@ -29,6 +29,7 @@
 // pixelFormat values (header byte 25).
 #define FONT_PIXEL_BW1   0
 #define FONT_PIXEL_GRAY4 1
+#define FONT_PIXEL_ALPHA4 2
 
 struct FontAssetInfo {
     uint16_t version;

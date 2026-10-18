@@ -84,5 +84,5 @@ subprocess.run(['c++', '-std=c++17', '-DARDUINOJSON_ENABLE_ARDUINO_STRING=1',
     '-I' + str(ROOT / 'bridge/crates/render/shim'),
     '-I' + str(ROOT / '.pio/libdeps/zectrix-note4-b/ArduinoJson/src'),
     '-I' + str(ROOT / 'src'), str(cpp), str(ROOT / 'src/ble_wire.cpp'),
-    str(ROOT / 'src/v2_sync.cpp'), '-o', str(binary)], check=True)
+    str(ROOT / 'src/v2_sync.cpp'), str(ROOT / 'src/sha256.cpp'), '-o', str(binary)], check=True)
 subprocess.run([str(binary.resolve())], check=True)

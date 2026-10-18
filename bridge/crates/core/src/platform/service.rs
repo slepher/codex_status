@@ -1266,8 +1266,8 @@ impl PlatformService {
         profile.validate_publishable(&caps)?;
         let font_plan = self.profile_fonts(&inner, &profile)?;
         for font in &font_plan.required {
-            if font.version == 2 && caps.bundle_font_protocol < 2 {
-                bail!("Unicode font {} requires device bundle_font_protocol 2; upgrade firmware first", font.name);
+            if u32::from(font.version) > caps.bundle_font_protocol {
+                bail!("Unicode font {} requires device bundle_font_protocol {}; upgrade firmware first", font.name, font.version);
             }
         }
         if !profile.sync_enabled {
@@ -2715,6 +2715,11 @@ impl PlatformService {
     /// window that later rendezvous must not cut short: the effective deadline is
     /// `max(formal plan, t_boot + BOOT_PROVISIONAL_S)`. Pending work may extend
     /// it; only the explicit entry points may end it earlier.
+    pub fn uses_power_plan(&self, mac: &str) -> Result<bool> {
+        Ok(self.inner.lock().unwrap().devices.get(&mac.to_uppercase())
+            .context("unknown device")?.capabilities.uses_power_plan())
+    }
+
     pub fn plan_for_rendezvous(&self,mac:&str,now:u64,wake_reason:&str,provisional_remaining_s:u32)->Result<PowerPlan> {
         self.plan_for_rendezvous_network_work(mac,now,wake_reason,provisional_remaining_s,false)
     }
@@ -2727,6 +2732,7 @@ impl PlatformService {
         provisional_remaining_s: u32,
         network_work: bool,
     ) -> Result<PowerPlan> {
+        anyhow::ensure!(self.uses_power_plan(mac)?, "power_plan_unsupported");
         let mac = mac.to_uppercase();
         let mut inner = self.inner.lock().unwrap();
         if let Some(pending) = inner.coordinators.get(&mac)
@@ -2835,6 +2841,7 @@ impl PlatformService {
     /// Durable explicit light request, shared by UI and MCP. The plan is
     /// frozen until an authenticated HTTP/BLE ACK or status reconciliation.
     pub fn queue_explicit_light(&self, mac: &str, now: u64) -> Result<(PowerPlan, bool)> {
+        anyhow::ensure!(self.uses_power_plan(mac)?, "power_plan_unsupported");
         let mut inner = self.inner.lock().unwrap();
         let c = inner.coordinators.get_mut(&mac.to_uppercase()).context("unknown device")?;
         let already_pending = c.plan.pending_explicit_light.is_some();
@@ -2853,6 +2860,7 @@ impl PlatformService {
         light_s: u32,
         reason: &str,
     ) -> Result<PowerPlan> {
+        anyhow::ensure!(self.uses_power_plan(mac)?, "power_plan_unsupported");
         let mut inner = self.inner.lock().unwrap();
         let c = inner
             .coordinators

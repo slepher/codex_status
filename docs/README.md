@@ -8,7 +8,8 @@
 | 你要做什么 | 依次读 |
 |---|---|
 | 接手项目、想知道现状 | `AGENTS.md`（操作约定）→ `PROGRESS.md`（当前交接卡）→ 按需查 `docs/roadmap/backlog.md` 相关条目（唯一待办来源） |
-| 继续 AP01 对接（本仓库实现与设计） | [backlog C9](roadmap/backlog.md)；原厂界面/OTA 模拟依据在同父目录 `cuktech-ap01-firmware` 仓库 `reverse/reports/ap01/qemu-display-handoff-20261017.md`，不要用宿主 SIM 替代原 ROM 画面，不刷实机 |
+| 继续 AP01 对接（本仓库实现与设计） | [彩色通用模板/原有切页接入](../project-workflow/ap01-template-integration/status.md) → [backlog C9](roadmap/backlog.md)；原厂界面/OTA 模拟依据在同父目录 `cuktech-ap01-firmware` 仓库 `reverse/reports/ap01/qemu-display-handoff-20261017.md`，不要用宿主 SIM 替代原 ROM 画面，不刷实机 |
+| AP01 独立 OTA HTTP / 稳定槽回切 | [服务与协议](../project-workflow/ap01-template-integration/ota-stable-slots.md) → [0041 含稳定槽的 ROM](../project-workflow/ap01-template-integration/release-0041-ota-slots.md)；18080维护与18081业务隔离，模拟与物理边界见状态卡 |
 | 构建、Bridge 启停/数据路径、模板缺省或串口/dump 操作 | [Agent 操作细则](agent-operations.md) 中对应节；从精简前 AGENTS 原文提取，历史现场不代替当前交接卡 |
 | clone 后编译/安装当前系统 Bridge，或让 Agent 完成 USB 分区刷机配网 | [构建与安装指南](build-install.md)：可复制提示词、Windows/macOS 原生构建、双 ROM CI 与逐阶段验收 |
 | 决定下一步做什么 | `docs/roadmap/backlog.md` §2 紧急 / §3 暂缓 |

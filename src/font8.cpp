@@ -995,7 +995,7 @@ const uint8_t Font8_Table[] =
 	0x00, //      
 };
 
-sFONT Font8 = {
+CODEX_FONT_STORAGE sFONT Font8 = {
   Font8_Table,
   5, /* Width */
   8, /* Height */
