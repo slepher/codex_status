@@ -85,6 +85,8 @@ Data 在同 context 下允许 `seq` 跳号：同序号同内容不重复绘屏�
 
 字段需求以认证 `/api/status` 的 `data_contract` 为准，不从 Bridge 本地模板或 Profile 推导。BLE仅在同context/active且合同已知时复用；未知或变更合同先有界读取HTTP状态。发布/激活ACK改变上下文时立即清除旧合同，即使template_id同名也不能复用旧字段索引；认证回读完成后才允许Data。回读失败返回next_stage=read_device_contract，不发空字段包。只有成功 ACK 更新 Bridge 确认指纹和 full-sync deadline。push/pull 是 Bridge 数据绑定合同，设备只收到完整最新快照。
 
+Bridge重启后，所需数据源尚无首份成功快照时，不生成新的missing Data覆盖设备已有值。HTTP/BLE共用投递入口返回`waiting_for_data_source`、`next_stage=read_data_source`，不pin新Data、不推进seq或确认基线，也不因此创建正式Light意图。成功读取后的真实字段缺失仍按模板规则投递；已固定的未确认Data继续原seq/原内容恢复，不因源暂不可用换包。2026-10-18源码与宿主回归状态见[调查与修复](../project-workflow/bridge-macos/first-contact-usage-20261018.md)，部署以PROGRESS为准；设备wire未变。
+
 PowerPlan在已授权principal范围内使用单调plan_id，PPL1保存原ID/参数/实际授予量/RTC起止；重启不清除可验证的重放围栏。重复同内容不延长期限，同ID不同内容冲突，旧ID拒绝。claim、读状态、传数据、传 Bundle 都不续电源期限。BOOT provisional 从物理唤醒起算 300s，timer wake 不获得该兜底；USB 在线与正式 light 模式分别描述。
 
 ### 4.2 结果与恢复

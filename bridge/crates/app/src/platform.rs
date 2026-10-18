@@ -1345,7 +1345,7 @@ pub async fn deliver(ctx: &AppCtx, mac: &str) -> Value {
                 }
             }
         }
-        "waiting_for_rendezvous" => json!(decision),
+        "waiting_for_rendezvous" | "waiting_for_data_source" => json!(decision),
         other => json!({"result": other}),
     }
 }

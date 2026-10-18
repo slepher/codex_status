@@ -111,6 +111,8 @@
 
 ### A9. PowerPlan 与 Data 同轮联合下发（2026-10-05）
 
+- **2026-10-18 Bridge重启首轮用量修复已部署Windows**：HTTP/BLE新Data区分源未就绪与真实missing，首次成功前明确等待、不制造正式Light，原in_flight保留。285回归通过/3条件忽略；补字段摘要日志后core159通过，11:43重启首轮Data738获ACK、认证displayed，源快照重建CRC一致，周剩余98%非missing，仅5h真实缺失。原data/凭据保留；本次首联系时源已ready，冷源等待仅回归覆盖，未目视验屏/未部署Mac。[部署、首包与验收边界](../../project-workflow/bridge-macos/first-contact-usage-20261018.md)。
+
 - **2026-10-11 22:09配套部署完成与恢复缺口**：最新.83哈希/v5/最终Bridge均认证核验，见PROGRESS与[部署记录](../../project-workflow/bridge-macos/device-fields-deploy-20261011.md)。新Bridge拒绝旧设备合同，需先交接有效模板；本次原Bridge完成交接后恢复新版。BLE网络准入提前把Bundle标Sending、重启变Unknown后挡住OTA且不自动查询原BEGIN；本次按原ID/冻结字节查询并续传成功。后续补发送前与未知结果恢复，不以本次人工闭环代替自动恢复验收。
 
 - **2026-10-11 当前设备字段收敛（候选未部署）**：删除模板 `device.state` 兼容，使用独立 Wi-Fi/BLE/mode 字段；已持久化 CT 在加载时校验未知绑定、编号一致性和字符串边界，失效进入内置恢复界面，保留文件直到显式发布替换。[实施与回归](../../project-workflow/bridge-macos/device-fields-only-20261011.md)。实际 v4 模板升级前须配套准备有效 v5 Bundle，不以宿主测试代替实机验收。

@@ -2599,6 +2599,7 @@ impl PlatformService {
         let mac = mac.to_uppercase();
         let contract_known = inner.devices.get(&mac)
             .is_some_and(|record| record.data_contract.is_some());
+        let sources_ready = data_sources_ready(&inner, &mac);
         let Some(c) = inner.coordinators.get_mut(&mac) else {
             return json!({"decision": "unknown_device"});
         };
@@ -2612,6 +2613,15 @@ impl PlatformService {
             }
             if c.requirements.is_empty() {
                 return json!({"decision":"idle"});
+            }
+            // Retry pinned content even if a source is currently unavailable;
+            // only new snapshots must wait for their sources' first success.
+            if c.data.in_flight.is_none() && !sources_ready {
+                tracing::info!(event="data_source_wait", device_mac=%mac,
+                    next_stage="read_data_source", "new Data deferred until required source is ready");
+                return json!({"decision":"waiting_for_data_source",
+                    "next_stage":"read_data_source",
+                    "reason":"required source has no successful snapshot yet"});
             }
         }
         let mut out = match &decision {
@@ -2636,8 +2646,18 @@ impl PlatformService {
             Delivery::Plan(plan) => json!({"decision": "plan", "plan": plan}),
         };
         if matches!(decision, Delivery::BleData(_) | Delivery::LightData(_)) {
+            let new_snapshot = c.data.in_flight.is_none();
             match c.note_delivery_started(&decision, now) {
                 Ok(flight) => {
+                    if new_snapshot {
+                        let missing_fields: Vec<_> = flight.payload.fields.iter()
+                            .filter(|(_, field)| field.value.is_null())
+                            .map(|(name, _)| name.as_str()).collect();
+                        tracing::info!(event="data_snapshot_prepared", device_mac=%mac,
+                            seq=flight.seq, content_crc=%flight.content_crc,
+                            field_count=flight.payload.fields.len(), missing_fields=?missing_fields,
+                            "complete Data snapshot pinned from initialized sources");
+                    }
                     out["temporary_data"] = json!(c.data.acked_push_fp == Some(flight.push_fp));
                     out["data_seq"] = json!(flight.seq);
                     out["active_context_id"] = json!(flight.payload.active_context_id);
@@ -2732,6 +2752,7 @@ impl PlatformService {
         // the radio on (v2 §7). Pending data/jobs/activation do.
         let contract_known = inner.devices.get(&mac)
             .is_some_and(|record| record.data_contract.is_some());
+        let sources_ready = data_sources_ready(&inner, &mac);
         let contract_needed = inner.devices.get(&mac).is_some_and(|record|
             record.sync_enabled && !contract_known &&
             record.observed.active_context_id.as_deref().is_some_and(|id| !id.is_empty()) &&
@@ -2755,7 +2776,7 @@ impl PlatformService {
             .coordinators
             .get(&mac)
             .map(|c| {
-                (contract_known && c.sync_enabled && !c.sources.is_empty() && c.data.push_dirty)
+                (contract_known && sources_ready && c.sync_enabled && !c.sources.is_empty() && c.data.push_dirty)
                     || c.data.in_flight.as_ref().is_some_and(|flight|
                         c.data.acked_push_fp != Some(flight.push_fp))
                     || c.pending_activate.is_some()
@@ -3118,6 +3139,35 @@ fn device_requirements(inner: &Inner, mac: &str, template_id: &str) -> Vec<Field
     inner.devices.get(mac).and_then(|record| record.data_contract.as_ref())
         .filter(|contract| contract.template_id == template_id)
         .map(|contract| contract.requirements.clone()).unwrap_or_default()
+}
+
+/// Missing fields are meaningful only after their source has been read. Source
+/// snapshots are volatile across Bridge restarts; the device's values are not.
+fn data_sources_ready(inner: &Inner, mac: &str) -> bool {
+    let Some(c) = inner.coordinators.get(mac) else { return false; };
+    let profile = inner.devices.get(mac).and_then(|d| d.profile.as_ref());
+    c.requirements.iter().all(|r| {
+        let (canonical, _) = crate::datasource::resolve_field(&r.field);
+        let bound_source = profile.and_then(|p|
+            p.binding_for(c.active_template_id.as_deref().unwrap_or(""), &r.field)
+                .or_else(|| p.binding_for("", &r.field)))
+            .and_then(|b| inner.sources.get(&b.source_id));
+        // Without an explicit binding, an initialized source that supplies the
+        // field is sufficient (e.g. static-only displays without Codex).
+        if bound_source.is_none() && c.sources.values().any(|s|
+            s.last_success_at > 0 && s.fields.contains_key(&canonical)) {
+            return true;
+        }
+        let source = bound_source.or_else(|| inner.sources.values()
+            .find(|s| s.enabled && source_has_field(s, &canonical)))
+            .or_else(|| inner.sources.values().find(|s|
+                s.enabled && s.kind == DataSourceKind::Codex));
+        match source {
+            Some(s) => !s.enabled || c.sources.get(&s.source_id)
+                .is_some_and(|snapshot| snapshot.last_success_at > 0),
+            None => c.sources.values().any(|s| s.last_success_at > 0),
+        }
+    })
 }
 
 fn triggers_for(
@@ -3515,6 +3565,160 @@ mod tests {
                 for trigger in ["push", "pull"] {
                     check_remaining_delivery(ble, restart, Some(trigger));
                 }
+            }
+        }
+    }
+
+    fn first_contact_service(dir: &Path) -> PlatformService {
+        let svc = PlatformService::open(dir).unwrap();
+        let mac = "AABBCCDDEEFF";
+        svc.device_upsert(DeviceIdentity::new(mac, "Test").unwrap(),
+            DeviceCapabilities::ssd1681_154g()).unwrap();
+        svc.note_device_status(mac, &json!({"device_mac":mac,"configured":true,
+            "active_context_id":"first-contact","active_template_id":"device-only",
+            "data_contract":{"template_id":"device-only","compiler_abi":2,
+                "source_crc":"12345678","requirements":[
+                    {"index":0,"field":"account.plan","kind":"text","missing":"hide","local":false},
+                    {"index":1,"field":"buckets[codex].weekly.remaining","kind":"number","missing":"hide","local":false}
+                ]}})).unwrap();
+        svc.set_data_sync(mac, true).unwrap();
+        svc
+    }
+
+    #[test]
+    fn restart_first_contact_waits_for_source_before_pinning_data() {
+        let mac = "AABBCCDDEEFF";
+        let env = json!({"account":{"plan":"plus"},"buckets":[{"id":"codex",
+            "windows":[{"usedPercent":0,"windowMins":10080}]}]});
+        for ble in [false, true] {
+            for missing in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let svc = first_contact_service(dir.path());
+                let now = crate::now_secs();
+                let deliver = |svc: &PlatformService| if ble {
+                    svc.next_delivery(mac, true, now)
+                } else { svc.next_http_delivery(mac, true, now) };
+                let kind = if ble { DeliveryKind::BleData } else { DeliveryKind::LightData };
+                svc.note_codex_envelope(&env).unwrap();
+                let first = deliver(&svc);
+                assert_eq!(svc.note_ack(mac, kind, first["data_seq"].as_u64().unwrap(),
+                    first["content_crc"].as_str().unwrap(), true, "displayed")["outcome"], "applied");
+                drop(svc);
+                let svc = PlatformService::open(dir.path()).unwrap();
+                let before = svc.coordinator_summary(mac, now).unwrap();
+                for probe in [false, true] {
+                    if probe {
+                        assert_eq!(svc.data_probe("codex").unwrap().last_success_at, 0);
+                    }
+                    let waiting = deliver(&svc);
+                    assert_eq!(waiting["decision"], "waiting_for_data_source", "ble={ble}, {waiting}");
+                    assert_eq!(waiting["next_stage"], "read_data_source");
+                    assert!(svc.data_message_body(mac).is_none());
+                    let waiting_state = svc.coordinator_summary(mac, now).unwrap();
+                    assert_eq!(waiting_state["context"], before["context"]);
+                    assert_eq!(waiting_state["acked_push_fp"], before["acked_push_fp"]);
+                    assert_eq!(waiting_state["acked_full_fp"], before["acked_full_fp"]);
+                    assert_eq!(svc.plan_for_rendezvous(mac, now, "rendezvous", 0).unwrap().mode, PlanMode::Sleep);
+                }
+                // A successful read with absent fields is business missing, not startup.
+                let ready_env = if missing { json!({}) } else { env.clone() };
+                svc.note_codex_envelope(&ready_env).unwrap();
+                let ready = deliver(&svc);
+                assert_eq!(ready["decision"], if ble { "ble_data" } else { "light_data" });
+                let body = svc.data_message_body(mac).unwrap();
+                assert_eq!(body["fields"][1]["v"], if missing { Value::Null } else { json!(100) });
+                assert_eq!(body["fields"][1]["q"], if missing { "missing" } else { "good" });
+                assert_eq!(svc.note_ack(mac, kind, ready["data_seq"].as_u64().unwrap(),
+                    ready["content_crc"].as_str().unwrap(), true, "displayed")["outcome"], "applied");
+                assert_eq!(deliver(&svc)["decision"], "idle");
+            }
+        }
+    }
+
+    #[test]
+    fn first_contact_static_source_and_partial_readiness() {
+        for ble in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let svc = first_contact_service(dir.path());
+            let mac = "AABBCCDDEEFF";
+            let now = crate::now_secs();
+            let deliver = || if ble { svc.next_delivery(mac, true, now) }
+                else { svc.next_http_delivery(mac, true, now) };
+            svc.data_source_save(DataSource { source_id:"static".into(), kind:DataSourceKind::StaticJson,
+                config:json!({"values":{"account.plan":"static"}}), credential_ref:None, enabled:true }).unwrap();
+            svc.data_probe("static").unwrap();
+            assert_eq!(deliver()["decision"], "waiting_for_data_source");
+            assert_eq!(svc.plan_for_rendezvous(mac, now, "rendezvous", 0).unwrap().mode, PlanMode::Sleep);
+            svc.data_source_save(DataSource { source_id:"static".into(), kind:DataSourceKind::StaticJson,
+                config:json!({"values":{"account.plan":"static","buckets[codex].weekly.usedPercent":0}}),
+                credential_ref:None, enabled:true }).unwrap();
+            svc.data_probe("static").unwrap();
+            assert!(!svc.codex_envelope_available());
+            assert_eq!(deliver()["decision"], if ble { "ble_data" } else { "light_data" });
+            let body = svc.data_message_body(mac).unwrap();
+            assert_eq!(body["fields"][0]["v"], "static");
+            assert_eq!(body["fields"][1]["v"], 100);
+        }
+    }
+
+    #[test]
+    fn source_wait_preserves_original_unconfirmed_data() {
+        for ble in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let svc = first_contact_service(dir.path());
+            let mac = "AABBCCDDEEFF";
+            let now = crate::now_secs();
+            let deliver = || if ble { svc.next_delivery(mac, true, now) }
+                else { svc.next_http_delivery(mac, true, now) };
+            svc.note_codex_envelope(&json!({"account":{"plan":"plus"}})).unwrap();
+            let original = deliver();
+            let body = svc.data_message_body(mac).unwrap();
+            // A failed refresh must not replace an already pinned transaction.
+            svc.inner.lock().unwrap().codex_envelope = None;
+            svc.data_probe("codex").unwrap();
+            let retry = deliver();
+            assert_eq!(retry["data_seq"], original["data_seq"]);
+            assert_eq!(retry["content_crc"], original["content_crc"]);
+            assert_eq!(svc.data_message_body(mac).unwrap(), body);
+        }
+    }
+
+    #[test]
+    fn first_contact_bound_static_source_can_report_real_missing() {
+        for ble in [false, true] {
+            for other_source_ready in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let svc = first_contact_service(dir.path());
+                let mac = "AABBCCDDEEFF";
+                let now = crate::now_secs();
+                let deliver = || if ble { svc.next_delivery(mac, true, now) }
+                    else { svc.next_http_delivery(mac, true, now) };
+                svc.data_source_save(DataSource { source_id:"static".into(), kind:DataSourceKind::StaticJson,
+                    config:json!({"values":{}}), credential_ref:None, enabled:true }).unwrap();
+                {
+                    let mut inner = svc.inner.lock().unwrap();
+                    let mut profile = Profile::draft(mac);
+                    for r in &inner.coordinators[mac].requirements {
+                        // Active-template bindings take precedence over generic ones.
+                        for (template_id, source_id) in [("", "codex"), ("device-only", "static")] {
+                            profile.bindings.push(Binding {
+                                template_id:template_id.into(), field:r.field.clone(), source_id:source_id.into(),
+                                source_field:crate::datasource::resolve_field(&r.field).0,
+                            });
+                        }
+                    }
+                    inner.devices.get_mut(mac).unwrap().profile = Some(profile);
+                }
+                if other_source_ready {
+                    svc.note_codex_envelope(&json!({"account":{"plan":"plus"}})).unwrap();
+                }
+                assert_eq!(deliver()["decision"], "waiting_for_data_source");
+                assert_eq!(svc.plan_for_rendezvous(mac, now, "rendezvous", 0).unwrap().mode, PlanMode::Sleep);
+                svc.data_probe("static").unwrap();
+                assert_eq!(deliver()["decision"], if ble { "ble_data" } else { "light_data" });
+                let body = svc.data_message_body(mac).unwrap();
+                assert!(body["fields"][1]["v"].is_null());
+                assert_eq!(body["fields"][1]["q"], "missing");
             }
         }
     }
