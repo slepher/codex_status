@@ -1,20 +1,16 @@
 # Codex Status 当前交接
 
-更新时间：2026-10-19 15:34 香港时间
+更新时间：2026-10-19 19:59 香港时间
 
 ## 部署与工作区
 
-- macOS托管Bridge 15:26已部署AP01族菜单；exe80,984,128 B，SHA256 `cc81bf028101309f00b4b472417b737c4b317378fd7d911f8adc766c99e535d6`，health204。停机冻结App/data备份 `~/Library/Application Support/dev.codexstatus.bridge/backups/cross-family-sync-20261019-152556`；159文件哈希一致、启动前data未变、签名及部署包一致。
-- Note4 `7C4FADB93408` v7此前已发布：job `cac235bb` succeeded，认证source_crc `6d54e167`、context `9c3bd636edcd32e4`、commit/data802 displayed；固件`.104-note4/ota_0`。本轮保留其Profile/发布jobs与合同，不重复发布、不刷机。实物屏幕未目视。
-- **本轮已同步Bridge**：1.54 `quad` v15/CRC `abd79ca9`；AP01 `codex-status-a` v3/CRC `9bc56e9a`。重启后源码与项目逐字段一致，族配置「1.54 Codex额度」「AP01 Codex额度」及原Note4配置均在；AP01/1.54未登记或发布实机，Windows实例未同步。
+- 独立 worktree `D:/CodexHome/worktrees/wifi-switch-fix`，分支 `codex/fix-wifi-switch`，基线 `4868c8c`。包含 `724f3a3` Wi-Fi事务修复，排除 `ea64ff8` 未部署协议收敛；本轮改动随本次提交保存。
+- Windows Bridge 19:55:58已部署：原运行路径 `D:/Documents/PlatformIO/Projects/codex_status/bridge/target/debug/bridge-app.exe`，38,739,968 B，SHA256 `66E8E7F2EA64F9569A24ECBE49B6C57C0064D1F6AADC7FF7BD7CCD0A06B937E6`，PID36464、health204。停机冻结备份 `artifacts/wifi-switch-backup-20261019-195530` 位于原仓库；264个data文件逐一哈希相同，启动前data未变。
+- Note4 `7C4FADB93408` 固件仍 `.104-note4`，boot_id保持；无刷机/BOOT/网络配置重写。Windows主机 `wd21-wo` → 设备 `wd21-la`，认证HTTP ready/IP `192.168.3.177`；active `home/v8`、revision342。
 
 ## 本轮结果与边界
 
-- quad修复monthly余额/重置，保留四象限、缺5h静态100；PLAN/label/reset/RC固定行且缺RC/用户名仍隐藏。AP01恢复历史仅WEEK并叠加MONTH，5h双栏优先。新增AP01菜单；此前Note4旧空缓存问题已修复且用户确认窗口可见。
-- core9/AP01 3/render12、Node预览/UI、三目标Python canonical通过；WK74窄宽截图已审（合成IPC，不冒充真实窗口）。AP01中文CSFN未导入，本轮只同步模板/配置，不宣称中文预览或实机验收。**本轮修改随本次提交保存**。[状态/证据](project-workflow/free-month-metering/status.md)。
-
-## 其他活跃事项
-
-- B6/C8事务终点修复已部署；历史未知事务保留，长期RF矩阵仍开放。[依据](project-workflow/bridge-macos/wifi-transaction-finality-20261019.md)。
-- C9 AP01自动启动安全窗口仍待物理验收，候选22/23未部署。[续作及ROM哈希](project-workflow/ap01-template-integration/boot-safety-handoff.md)。不关闭C9。
-- [前卡全文/部署历史](docs/history/progress-archive-2026-10-19-before-cross-family-sync.md)；待办唯一来源[backlog](docs/roadmap/backlog.md)。
+- Windows旧exe早于已有修复：异步activate ACK后立即断开，漏发network_start，反复window_closed。复用已有修复并补现场失败初态回归；19:57自然会合发network_start accepted，原事务 `w3_000000000000017a` completed/operation_result、回执已ACK。14条旧Job逐字段完全不变。
+- 19:58独立读取SSID/MAC、认证HTTP和完整配置快照一致；context `9c3bd636edcd32e4`、commit802保留，Data823 displayed。用户确认Wi-Fi OFF/Bridge OFF图标已恢复。332项Bridge回归通过，5项条件忽略；没有wire或固件变更。[计划/验收/回滚](project-workflow/wifi-switch-fix/status.md)，私有证据 `artifacts/wifi-switch-fix/{before,deployment,verified}.json`。
+- 回滚须配套冻结data备份，不能直接让旧exe读取可能含新增确认计数的数据。本轮单次恢复闭环，长期RF验收仍归B6/C8，不关闭专项。
+- macOS/AP01及模板此前现场见主线交接和[模板专项](project-workflow/free-month-metering/status.md)；本轮未更新其部署。待办唯一来源[backlog](docs/roadmap/backlog.md)。
