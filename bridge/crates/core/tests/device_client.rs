@@ -95,7 +95,7 @@ fn complete_ack_does_not_wait_for_socket_close() {
         respond(&mut stream, 200, &json!({"result": "applied", "device_mac":"AABBCCDDEEFF"}));
         std::thread::sleep(Duration::from_secs(1));
     });
-    let status = device_client::status(&addr.to_string(), "tok", Duration::from_millis(300)).unwrap();
+    let status = http(device_client::status(&addr.to_string(), "tok", Duration::from_millis(300))).unwrap();
     assert_eq!(status["result"], "applied");
 }
 
@@ -115,7 +115,7 @@ fn paged_status_preserves_the_complete_contract_and_rejects_changed_read_id() {
                 if tamper && index==1 {break;}
             }
         });
-        let actual=device_client::status(&addr.to_string(),"synthetic-pages",Duration::from_secs(2));
+        let actual=http(device_client::status(&addr.to_string(),"synthetic-pages",Duration::from_secs(2)));
         if tamper {assert!(actual.unwrap_err().to_string().contains("status page identity mismatch"));}
         else {assert_eq!(actual.unwrap(),expected);}
         server.join().unwrap();
@@ -178,7 +178,7 @@ fn spawn_fake() -> (String, FakeDevice) {
                 let command: Value = serde_json::from_slice(&body).unwrap();
                 assert!(command.get("protocol").is_none());
                 assert_eq!(command["bridge_id"], "bridge-1");
-                assert_eq!(command["session_nonce"], "0123456789abcdef0123456789abcdef");
+                assert!(command["session_nonce"].is_null());
                 assert_eq!(command["request_id"], "bundle-job-1");
                 len.store(command["length"].as_u64().unwrap() as usize, Ordering::SeqCst);
                 offset.store(0, Ordering::SeqCst);
@@ -229,7 +229,7 @@ fn spawn_fake() -> (String, FakeDevice) {
                 assert_eq!(command["expected_active_context_id"], "0000000000000001");
                 assert_eq!(command["request_id"], "activate-0000000000000001-mini");
                 assert_eq!(command["template_id"], "mini");
-                assert_eq!(command["session_nonce"], "0123456789abcdef0123456789abcdef");
+                assert!(command["session_nonce"].is_null());
                 respond(
                     &mut stream,
                     200,
@@ -248,31 +248,31 @@ fn status_data_plan_activate_round_trip() {
     let (addr, fake) = spawn_fake();
     let token = "tok";
     let timeout = Duration::from_secs(2);
-    let status = device_client::status(&addr, token, timeout).unwrap();
+    let status = http(device_client::status(&addr, token, timeout)).unwrap();
     assert_eq!(status["active_template_id"], "quad");
     assert_eq!(status["power"]["plan_id"], 7);
 
-    let ack = device_client::data(
+    let ack = http(device_client::data(
         &addr,
         token,
         "70:04:1D:D7:A3:40",
         &json!({"context_id": "0000000000000001", "seq": 5, "fields": []}),
         timeout,
-    )
+    ))
     .unwrap();
     assert_eq!(ack["result"], "applied");
 
-    let ack = device_client::plan(
+    let ack = http(device_client::plan(
         &addr,
         token,
         "70:04:1D:D7:A3:40",
         &json!({"plan_id": 8, "mode": "light", "light_duration_s": 300, "rendezvous_period_s": 60}),
         timeout,
-    )
+    ))
     .unwrap();
     assert_eq!(ack["accepted_remaining_s"], 300);
 
-    let ack = device_client::activate(&addr, token, "70:04:1D:D7:A3:40", "bridge-1", "mini", "0000000000000001", timeout).unwrap();
+    let ack = http(device_client::activate(&addr, token, "70:04:1D:D7:A3:40", "bridge-1", "mini", "0000000000000001", timeout)).unwrap();
     assert_eq!(ack["active_context_id"], "0000000000000002");
     let calls = fake.calls.lock().unwrap().clone();
     assert_eq!(calls[0], "POST /api/status");
@@ -300,7 +300,7 @@ fn bundle_install_is_ordered_and_complete() {
         }
         v
     };
-    let ack = device_client::install_bundle(
+    let ack = http(device_client::install_bundle(
         &addr,
         "tok",
         "70:04:1D:D7:A3:40",
@@ -308,7 +308,7 @@ fn bundle_install_is_ordered_and_complete() {
         &padded,
         device_client::BUNDLE_CHUNK_BYTES,
         Duration::from_secs(2),
-    )
+    ))
     .unwrap();
     assert_eq!(ack["result"], "applied");
     assert_eq!(fake.payload.lock().unwrap().len(), padded.len());
@@ -332,13 +332,13 @@ fn wrong_target_mac_stops_all_writes_after_status_read() {
     let timeout = Duration::from_secs(2);
     let wrong_mac = "AA:BB:CC:DD:EE:FF";
 
-    assert!(device_client::data(&addr, "tok", wrong_mac, &json!({"seq": 1}), timeout).is_err());
-    assert!(device_client::plan(&addr, "tok", wrong_mac, &json!({"plan_id": 1}), timeout).is_err());
-    assert!(device_client::activate(&addr, "tok", wrong_mac, "bridge-1", "mini", "0000000000000001", timeout).is_err());
+    assert!(http(device_client::data(&addr, "tok", wrong_mac, &json!({"seq": 1}), timeout)).is_err());
+    assert!(http(device_client::plan(&addr, "tok", wrong_mac, &json!({"plan_id": 1}), timeout)).is_err());
+    assert!(http(device_client::activate(&addr, "tok", wrong_mac, "bridge-1", "mini", "0000000000000001", timeout)).is_err());
     let bundle = serde_json::to_vec(&json!({"job_id": "job-guard"})).unwrap();
-    assert!(device_client::install_bundle(
+    assert!(http(device_client::install_bundle(
         &addr, "tok", wrong_mac, "bridge-1", &bundle, device_client::BUNDLE_CHUNK_BYTES, timeout
-    ).is_err());
+    )).is_err());
 
     assert_eq!(
         fake.calls.lock().unwrap().as_slice(),
@@ -363,13 +363,13 @@ fn owner_conflict_stops_the_write_without_retrying() {
             }
         }
     });
-    let ack = device_client::data(
+    let ack = http(device_client::data(
         &addr,
         "tok",
         "70:04:1D:D7:A3:40",
         &json!({"context_id": "ctx", "seq": 1}),
         Duration::from_secs(2),
-    )
+    ))
     .unwrap();
     assert_eq!(ack["result"], "rejected");
     assert_eq!(ack["error"], "occupied");
@@ -386,5 +386,12 @@ fn unauthorized_is_an_error_not_a_silent_success() {
             respond(&mut stream, 401, &json!({"result": "unauthorized"}));
         }
     });
-    assert!(device_client::status(&addr, "bad", Duration::from_secs(2)).is_err());
+    assert!(http(device_client::status(&addr, "bad", Duration::from_secs(2))).is_err());
+}
+
+// This synchronous process/socket harness joins the async client before returning.
+// A scoped runtime also works inside its existing BLE runtime fixtures.
+fn http<F: std::future::Future + Send>(future: F) -> F::Output where F::Output: Send {
+    std::thread::scope(|scope| scope.spawn(|| tokio::runtime::Builder::new_current_thread()
+        .enable_all().build().unwrap().block_on(future)).join().unwrap())
 }

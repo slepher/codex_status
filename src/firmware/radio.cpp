@@ -431,11 +431,11 @@ uint64_t wifiControlUntil(uint64_t now) {
     return until>now?until:0;
 }
 
-WifiControlContext wifiControlContext(const EndpointRec &endpoint,JsonDocument &request) {
+WifiControlContext wifiControlContext(const EndpointRec &endpoint) {
     WifiControlContext context;context.principal=endpoint.principal;context.nameSpace=endpoint.nameSpace;
     OwnerRec owner;bool owned=ownerGet(owner);context.claimed=owned && owner.id==endpoint.principal;context.occupied=owned && owner.id!=endpoint.principal;
     context.until=wifiControlUntil(clock::v2NowMs());context.physicalUntil=power::state.bleRecovery.physicalUntil();
-    context.sessionValid=String(request["session_nonce"]|"")==transport::v2Nonce();return context;
+    context.sessionValid=true;return context; // caller has admitted the authenticated frame session
 }
 
 void wifiDeviceStatus(JsonDocument &doc,const EndpointRec *endpoint) {
@@ -657,19 +657,14 @@ void handleWifiManagement(const char *op) {
     if(body.length()>8192 || deserializeJson(request,body) || String(request["device_mac"]|"")!=macText()) {
         transport::v2Response(400,"{\"ok\":false,\"error\":\"shape\"}");return;
     }
-    if(strcmp(op,"command"))request["op"]=op;
-    auto context=wifiControlContext(endpoint,request);
+    if(!request["op"].isNull() || !request["command"].isNull() || !request["session_nonce"].isNull()) {
+        transport::v2Response(400,"{\"ok\":false,\"error\":\"retired_protocol\"}");return;
+    }
+    request["op"]=compactOperationName(transport::state.v2HttpFrame.op);
+    auto context=wifiControlContext(endpoint);
     String response=wifiControlCommand(request,context,clock::v2NowMs());
     JsonDocument outcome;deserializeJson(outcome,response);
     transport::v2Response(200,response);
-}
-
-String wifiManagementRequest(JsonDocument &request,const char *op) {
-    EndpointRec endpoint;
-    if(!storeAuthenticate(request["token"]|"",endpoint)) return "{\"ok\":false,\"error\":\"unauthorized\"}";
-    request["op"]=op;
-    auto context=wifiControlContext(endpoint,request);
-    return wifiControlCommand(request,context,clock::v2NowMs());
 }
 
 void v2RendezvousBegin(bool deep) {

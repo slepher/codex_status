@@ -200,15 +200,13 @@ void Ap01Application::dispatch(const Ap01HttpRequest &request, const char *princ
     if (op != 11 && (deserializeJson(doc, request.body, request.length) || !doc.is<JsonObject>())) {
         error(reply, 400, "json", "command"); return;
     }
+    if (op != 11 && (!doc["op"].isNull() || !doc["command"].isNull() || !doc["session_nonce"].isNull())) { error(reply, 400, "retired_protocol", "command"); return; }
     if (op != 11 && (strcmp(doc["bridge_id"] | "", principal) || strcmp(doc["device_mac"] | "", mac))) {
         error(reply, 403, "identity", "binding"); return;
     }
-    if (op != 11 && op != 4 && strcmp(doc["session_nonce"] | "", nonce)) { error(reply, 409, "session", "command"); return; }
-    if (op == 10 || op == 12 || op == 13) {
-        String macText(mac), nonceText(nonce);
-        if (!v2CheckCommandSession(doc, macText, &nonceText).accepted) {
-            error(reply, 409, "session", "command"); return;
-        }
+    if (op == 10 || op == 12 || op == 13 || op==2) {
+        CommandContext context{mac,principal};
+        if(const char *reason=context.validateIdentity(doc)) {error(reply,409,reason,"command");return;}
     }
     {
         BindingGuard guard(port);

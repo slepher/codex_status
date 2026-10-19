@@ -261,6 +261,8 @@ fn device_occupancy_decision(
 }
 
 struct AppCtx {
+    /// Pending Wi-Fi credentials belong to this instance and stay in RAM.
+    wifi_inputs: Mutex<HashMap<String, std::collections::BTreeMap<String, String>>>,
     ap01: ap01::Control,
     instance: instance::Instance,
     config: Config,
@@ -1122,7 +1124,7 @@ async fn presence_hint(axum::extract::State(ctx):axum::extract::State<Arc<AppCtx
     let Ok(guard)=lock.try_lock() else{return (axum::http::StatusCode::ACCEPTED, axum::Json(reply));};
     tokio::spawn(async move {
         let sampled=std::time::Instant::now();let fetch=link.clone();
-        if let Ok(Ok(status))=tokio::task::spawn_blocking(move||bridge_core::device_client::status(&fetch.ip,&fetch.token,Duration::from_secs(2))).await {
+        if let Ok(status)=bridge_core::device_client::status(&fetch.ip,&fetch.token,Duration::from_secs(2)).await {
             if status["device_mac"].as_str().and_then(bridge_core::platform::model::DeviceIdentity::normalized_mac).as_deref()==Some(mac.as_str()) {
                 let now=device_now_secs(&mac).max(0) as u64;
                 if platform::service(&ctx).note_authenticated_status_at(&mac,&status,now).is_err(){return;}
@@ -1234,9 +1236,8 @@ async fn ready_report(axum::extract::State(ctx):axum::extract::State<Arc<AppCtx>
         let lock=platform::delivery_lock(&ctx,&mac);
         let Ok(_guard)=tokio::time::timeout(remaining,lock.lock()).await else{return;};
         let target_ip=device_ip.clone();
-        let result=tokio::task::spawn_blocking(move||
-            bridge_core::device_client::status(&target_ip,&endpoint_token,remaining)).await;
-        let Ok(Ok(status))=result else{return;};
+        let result=bridge_core::device_client::status(&target_ip,&endpoint_token,remaining).await;
+        let Ok(status)=result else{return;};
         if !report_fact_verified(&status,&mac,&boot,plan_id,&ctx.bridge_id) {return;}
         tracing::info!(event="ready_report",device_mac=%mac,plan_id,result="verified","device network report authenticated readback verified");
         let now=device_now_secs(&mac).max(0) as u64;
@@ -1537,9 +1538,8 @@ async fn post_claim_once(
         let (endpoint,token,mac)=(endpoint.to_owned(),token.to_owned(),target_mac.to_owned());
         let body=json!({"device_mac":mac,"bridge_id":bridge_id,"name":name,"host":host,"port":port,
             "lease_s":300,"request_id":uuid::Uuid::new_v4().simple().to_string()});
-        let (code,reply)=tokio::task::spawn_blocking(move ||bridge_core::device_client::claim(
-            &endpoint,&token,&token,&body,budget.remaining())).await
-            .map_err(|_|ClaimError::Other("AP01 claim worker failed".into()))?
+        let (code,reply)=bridge_core::device_client::claim(
+            &endpoint,&token,&token,&body,budget.remaining()).await
             .map_err(|_|ClaimError::Other("AP01 claim result unknown; read authenticated status".into()))?;
         return Ok((reqwest::StatusCode::from_u16(code).map_err(|e|ClaimError::Other(e.to_string()))?,reply.to_string()));
     }
@@ -1615,15 +1615,11 @@ async fn post_claim_to_endpoint_budget(
             let device_endpoint = endpoint.clone();
             let device_token = device_token.to_owned();
             let fallback=budget.capped(Duration::from_secs(2));
-            let device_status = tokio::task::spawn_blocking(move || {
-                bridge_core::device_client::status_compact(
+            let device_status = bridge_core::device_client::status_compact(
                     &device_endpoint,
                     &device_token,
                     fallback.remaining(),
-                )
-            })
-            .await
-            .map_err(|e| ClaimError::Other(format!("device identity check failed: {e}")))?
+                ).await
             .map_err(|e| {
                 tracing::warn!(event = "preflight_result", device_mac = %expected_mac,
                     elapsed_ms = started.elapsed().as_millis() as u64, error_category = "http_or_status",
@@ -1660,21 +1656,13 @@ async fn post_claim_to_endpoint_budget(
     let endpoint_token=device_token.to_owned();
     let operation_token=claim_token.to_owned();
     let claim_budget=budget.capped(Duration::from_secs(5));
-    let resp = match tokio::task::spawn_blocking(move ||
-        bridge_core::device_client::claim(&endpoint_for_claim,&endpoint_token,
-            &operation_token,&claim,claim_budget.remaining())).await {
-        Ok(Ok(resp)) => resp,
-        Err(error) => {
-            tracing::warn!(event = "result", device_mac = %expected_mac, operation = "/claim",
-                elapsed_ms = claim_started.elapsed().as_millis() as u64,
-                error_category = "task",
-                "claim request failed");
-            return Err(ClaimError::Other(format!("device unreachable: {error}")));
-        }
-        Ok(Err(error)) if error.chain().any(|cause|
+    let resp = match bridge_core::device_client::claim(&endpoint_for_claim,&endpoint_token,
+            &operation_token,&claim,claim_budget.remaining()).await {
+        Ok(resp) => resp,
+        Err(error) if error.chain().any(|cause|
             cause.downcast_ref::<bridge_core::device_client::HttpStatus>()
                 .is_some_and(|status|status.0==401)) => return Err(ClaimError::Unauthorized),
-        Ok(Err(error)) => return Err(ClaimError::Other(format!("device claim failed: {error}"))),
+        Err(error) => return Err(ClaimError::Other(format!("device claim failed: {error}"))),
     };
     let code = reqwest::StatusCode::from_u16(resp.0)
         .map_err(|error|ClaimError::Other(format!("invalid claim response: {error}")))?;
@@ -3738,6 +3726,7 @@ fn main() {
 
     let (mcp_tx, _mcp_rx) = tokio::sync::watch::channel(mcp_port);
     let ctx = Arc::new(AppCtx {
+        wifi_inputs: Mutex::new(HashMap::new()),
         ap01: ap01::Control::default(),
         instance,
         config,

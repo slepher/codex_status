@@ -5,8 +5,9 @@
 //! All calls carry the device endpoint token + `bridge_id`; none of them create
 //! or renew an owner (only the explicit `POST /claim` does).
 
-use std::io::{Read, Write};
-use std::net::TcpStream;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::Mutex as AsyncMutex;
 use std::time::{Duration, Instant};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,20 +42,9 @@ pub enum HttpRequestError {
 
 struct HttpProgress { outcome: DispatchOutcome, stage: &'static str }
 
-fn write_until(stream: &mut TcpStream, bytes: &[u8], deadline: Instant, progress: &mut HttpProgress) -> Result<()> {
-    write_until_with(bytes, deadline, progress, |bytes, remaining| {
-        stream.set_write_timeout(Some(remaining))?;
-        stream.write(bytes)
-    })
-}
-
-fn write_until_with(mut bytes: &[u8], deadline: Instant, progress: &mut HttpProgress,
-    mut write: impl FnMut(&[u8], Duration) -> std::io::Result<usize>) -> Result<()>
-{
+async fn write_until(stream: &mut (impl tokio::io::AsyncWrite + Unpin), mut bytes: &[u8], deadline: Instant, progress: &mut HttpProgress) -> Result<()> {
     while !bytes.is_empty() {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        anyhow::ensure!(!remaining.is_zero(), "wifi_window_budget");
-        let written = write(bytes, remaining)?;
+        let written = tokio::time::timeout_at(deadline.into(), stream.write(bytes)).await??;
         anyhow::ensure!(written != 0, "device HTTP write incomplete");
         progress.outcome = DispatchOutcome::WriteUnknown;
         bytes = &bytes[written..];
@@ -63,7 +53,7 @@ fn write_until_with(mut bytes: &[u8], deadline: Instant, progress: &mut HttpProg
 }
 
 /// One HTTP round trip with a bounded body.
-fn transport_request(
+async fn transport_request(
     ip: &str,
     method: &str,
     path: &str,
@@ -81,13 +71,11 @@ fn transport_request(
     } else {
         format!("{ip}:80")
     };
-    let addr = target
+    let addr: std::net::SocketAddr = target
         .parse()
         .map_err(|e| anyhow!("bad device address {ip}: {e}"))?;
     progress.stage = "http_connect";
-    let mut stream = TcpStream::connect_timeout(&addr, timeout)?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
+    let mut stream = tokio::time::timeout_at(deadline.into(), TcpStream::connect(addr)).await??;
     let mut head = format!(
         "{method} {path} HTTP/1.1\r\nHost: device\r\nConnection: close\r\nAccept: {content_type}\r\n"
     );
@@ -108,8 +96,8 @@ fn transport_request(
     }
     head.push_str("\r\n");
     progress.stage = "http_write";
-    write_until(&mut stream, head.as_bytes(), deadline, progress)?;
-    if let Some(bytes) = body { write_until(&mut stream, bytes, deadline, progress)?; }
+    write_until(&mut stream, head.as_bytes(), deadline, progress).await?;
+    if let Some(bytes) = body { write_until(&mut stream, bytes, deadline, progress).await?; }
     progress.outcome = DispatchOutcome::AckUnknown;
     progress.stage = "http_ack";
     let mut raw = Vec::new();
@@ -118,8 +106,7 @@ fn transport_request(
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         anyhow::ensure!(!remaining.is_zero(), "wifi_window_budget");
-        stream.set_read_timeout(Some(remaining))?;
-        let read = stream.read(&mut chunk)?;
+        let read = tokio::time::timeout_at(deadline.into(), stream.read(&mut chunk)).await??;
         if read == 0 {
             break;
         }
@@ -165,8 +152,8 @@ fn transport_request(
 
 #[derive(Default)]
 struct HttpFrameSession { id: [u8; 16], next_no: u64, context: [u8; 16] }
-static FRAME_SESSIONS: OnceLock<Mutex<HashMap<String, Arc<Mutex<HttpFrameSession>>>>> = OnceLock::new();
-static STATUS_READS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+static FRAME_SESSIONS: OnceLock<Mutex<HashMap<String, Arc<AsyncMutex<HttpFrameSession>>>>> = OnceLock::new();
+static STATUS_READS: OnceLock<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>> = OnceLock::new();
 static NEXT_OPEN_NONCE: AtomicU64 = AtomicU64::new(1);
 
 fn new_open_nonce() -> [u8; 16] {
@@ -178,11 +165,11 @@ fn new_open_nonce() -> [u8; 16] {
     digest[..16].try_into().unwrap()
 }
 
-fn frame_session(ip: &str, token: &str) -> Arc<Mutex<HttpFrameSession>> {
+fn frame_session(ip: &str, token: &str) -> Arc<AsyncMutex<HttpFrameSession>> {
     use sha2::{Digest, Sha256};
     let key = format!("{ip}:{:x}", Sha256::digest(token.as_bytes()));
     FRAME_SESSIONS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap()
-        .entry(key).or_insert_with(|| Arc::new(Mutex::new(HttpFrameSession::default()))).clone()
+        .entry(key).or_insert_with(|| Arc::new(AsyncMutex::new(HttpFrameSession::default()))).clone()
 }
 
 fn frame_operation(path: &str) -> Result<u16> {
@@ -197,39 +184,47 @@ fn frame_operation(path: &str) -> Result<u16> {
         "/api/sync/ack" => "sync_ack", "/api/sync/complete" => "sync_complete",
         "/api/wifi/snapshot" => "wifi_snapshot", "/api/wifi/apply" => "wifi_apply",
         "/api/wifi/result" => "wifi_result", "/api/wifi/result_ack" => "wifi_result_ack",
-        "/api/wifi/command" => "wifi_command",
+        "/api/wifi/command" => "wifi_match",
         _ => return Err(HttpRequestError::UnsupportedOperation.into()),
     };
     crate::compact_frame::operation(name).context("unregistered frame operation")
 }
 
-fn request(
+async fn request(
     ip: &str, _method: &str, path: &str, token: &str, body: Option<&[u8]>,
     extra_headers: &[(&str, &str)], timeout: Duration,
 ) -> Result<(u16, String)> {
     use crate::compact_frame::{Header, CONTENT_TYPE, HEADER_LEN, MAX_HTTP_FRAME};
     let mut progress = HttpProgress { outcome: DispatchOutcome::NotSent, stage: "http_prepare" };
-    let result = (|| {
+    let result = async {
     let deadline = Instant::now() + timeout;
-    let op = frame_operation(path)?;
+    let mut op = frame_operation(path)?;
+    let command_payload = if path.split('?').next()==Some("/api/wifi/command") {
+        let mut value:Value=serde_json::from_slice(body.unwrap_or(b"{}"))?;
+        op=crate::compact_frame::operation(&format!("wifi_{}",value["op"].as_str().unwrap_or("")))
+            .context("invalid_wifi_operation")?;
+        value.as_object_mut().context("invalid_wifi_command")?.remove("op");
+        Some(serde_json::to_vec(&value)?)
+    }else{None};
+    let body=command_payload.as_deref().or(body).filter(|b|!b.is_empty());
     progress.stage = "http_session";
     let session = frame_session(ip, token);
-    if op != 1 && op != 19 && lock_session_until(&session, deadline)?.id == [0; 16] {
-        status(ip, token, deadline.saturating_duration_since(Instant::now())).context("establish device HTTP session")?;
+    if op != 1 && op != 19 && lock_session_until(&session, deadline).await?.id == [0; 16] {
+        Box::pin(status(ip, token, deadline.saturating_duration_since(Instant::now()))).await.context("establish device HTTP session")?;
     }
-    let mut session = lock_session_until(&session, deadline)?;
+    let mut session = lock_session_until(&session, deadline).await?;
     let opening = op == 1 || (op == 19 && session.id == [0; 16]);
     anyhow::ensure!(opening || session.id != [0; 16], "device HTTP session is not established");
     let number = session.next_no.checked_add(1).context("HTTP request number exhausted")?;
     session.next_no = number;
     let open_payload;
     let payload = if opening && op == 19 {
-        let mut value:Value=serde_json::from_slice(body.unwrap_or(b"{}"))?;
+        let mut value:Value=serde_json::from_slice(body.filter(|b|!b.is_empty()).unwrap_or(b"{}"))?;
         value["open"]=json!(true);
         open_payload=serde_json::to_vec(&value)?;
         open_payload.as_slice()
     }
-        else { body.unwrap_or(b"{}") };
+        else { body.filter(|b|!b.is_empty()).unwrap_or(b"{}") };
     if payload.len() + HEADER_LEN > MAX_HTTP_FRAME { return Err(HttpRequestError::FrameLimit.into()); }
     let header = Header { kind: 0, op, result: 0,
         payload_len: payload.len().try_into().context("HTTP payload too large")?,
@@ -238,12 +233,12 @@ fn request(
     let mut frame = header.encode().map_err(anyhow::Error::msg)?.to_vec();
     frame.extend_from_slice(payload);
     let (status, response) = transport_request(ip, "POST", path, token, Some(&frame),
-        extra_headers, CONTENT_TYPE, deadline.saturating_duration_since(Instant::now()), &mut progress)?;
+        extra_headers, CONTENT_TYPE, deadline.saturating_duration_since(Instant::now()), &mut progress).await?;
     progress.stage = "http_response";
     if matches!(status, 401 | 403) && op != 4 { return Err(HttpStatus(status).into()); }
     // Admission/lifecycle errors can precede frame dispatch. Preserve their
     // bounded explanation instead of misreporting a software-version mismatch.
-    if status >= 400 && response.first() != Some(&0xc1) {
+    if status >= 400 && response.first() != Some(&crate::compact_frame::MARKER) {
         if let Ok(value) = serde_json::from_slice::<Value>(&response) {
             let field = |key: &str| value[key].as_str().filter(|text|
                 !text.is_empty() && text.len() <= 64 &&
@@ -279,7 +274,7 @@ fn request(
         }
     }
     Ok((status, std::str::from_utf8(bytes).context("device frame payload UTF-8")?.to_owned()))
-    })();
+    }.await;
     result.map_err(|error: anyhow::Error| {
         if error.chain().any(|cause| cause.downcast_ref::<HttpStatus>().is_some()) { return error; }
         let reason = crate::rendezvous::wifi_error(&error).1;
@@ -287,30 +282,21 @@ fn request(
     })
 }
 
-fn lock_session_until<T>(session: &Mutex<T>, deadline: Instant)
-    -> Result<std::sync::MutexGuard<'_, T>> {
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        anyhow::ensure!(!remaining.is_zero(), "wifi_window_budget");
-        match session.try_lock() {
-            Ok(guard) => return Ok(guard),
-            Err(std::sync::TryLockError::Poisoned(_)) => bail!("device_http_session_poisoned"),
-            Err(std::sync::TryLockError::WouldBlock) =>
-                std::thread::sleep(remaining.min(Duration::from_millis(2))),
-        }
-    }
+async fn lock_session_until<T>(session: &AsyncMutex<T>, deadline: Instant)
+    -> Result<tokio::sync::MutexGuard<'_, T>> {
+    tokio::time::timeout_at(deadline.into(), session.lock()).await.context("wifi_window_budget")
 }
 
 /// Low-level framed exchange for diagnostics and same-source protocol tests.
 /// It shares the production session and request numbering with business calls.
-pub fn raw_frame_request(ip: &str, path: &str, token: &str, body: &[u8],
+pub async fn raw_frame_request(ip: &str, path: &str, token: &str, body: &[u8],
                          timeout: Duration) -> Result<(u16, Vec<u8>)> {
     let until = Instant::now() + timeout;
-    let response = request(ip, "POST", path, token, Some(body), &[], timeout);
+    let response = request(ip, "POST", path, token, Some(body), &[], timeout).await;
     let (status, payload) = match response {
         Err(error) if frame_operation(path).ok()==Some(19) &&
             error.downcast_ref::<HttpSessionExpired>().is_some() =>
-            request(ip, "POST", path, token, Some(body), &[], until.saturating_duration_since(Instant::now()))?,
+            request(ip, "POST", path, token, Some(body), &[], until.saturating_duration_since(Instant::now())).await?,
         result => result?,
     };
     Ok((status, payload.into_bytes()))
@@ -318,17 +304,17 @@ pub fn raw_frame_request(ip: &str, path: &str, token: &str, body: &[u8],
 
 /// Explicit owner operation. The endpoint token binds the HTTP frame session;
 /// the separately negotiated device token gates the claim itself.
-pub fn claim(ip: &str, endpoint_token: &str, device_token: &str,
+pub async fn claim(ip: &str, endpoint_token: &str, device_token: &str,
              body: &Value, timeout: Duration) -> Result<(u16, String)> {
     let payload = serde_json::to_vec(body)?;
     request(ip, "POST", "/claim", endpoint_token, Some(&payload),
-        &[("X-Device-Token",device_token)], timeout)
+        &[("X-Device-Token",device_token)], timeout).await
 }
 
 /// AP01's explicitly advertised screen-confirm bootstrap is ordinary bounded
 /// JSON HTTP on the maintenance listener, including authenticated health reads.
 /// It is independent from the business listener's compact-frame session.
-pub fn pairing_request(endpoint: &str, method: &str, path: &str, token: &str,
+pub async fn pairing_request(endpoint: &str, method: &str, path: &str, token: &str,
                        body: Option<&Value>, timeout: Duration) -> Result<(u16, Value)> {
     let valid_path = path == "/api/pairing/info" || path == "/api/pairing" ||
         (method=="GET" && matches!(path,"/health"|"/api/maintenance/status")) ||
@@ -339,15 +325,17 @@ pub fn pairing_request(endpoint: &str, method: &str, path: &str, token: &str,
     anyhow::ensure!(payload.as_ref().is_none_or(|p| p.len() <= 4096),"pairing_request_too_large");
     let mut progress=HttpProgress{outcome:DispatchOutcome::NotSent,stage:"pairing_prepare"};
     let (status,bytes)=transport_request(endpoint,method,path,token,payload.as_deref(),&[],
-        "application/json",timeout.min(Duration::from_secs(5)),&mut progress)?;
+        "application/json",timeout.min(Duration::from_secs(5)),&mut progress).await?;
     anyhow::ensure!(bytes.len() <= 8192,"pairing_response_too_large");
     let reply=serde_json::from_slice(&bytes).context("pairing_response_json")?;
     Ok((status,reply))
 }
 
-fn post_json(ip: &str, path: &str, token: &str, body: &Value, timeout: Duration) -> Result<Value> {
+async fn post_json(ip: &str, path: &str, token: &str, body: &Value, timeout: Duration) -> Result<Value> {
     let started = Instant::now();
-    let text = serde_json::to_vec(body)?;
+    let mut payload=body.clone();
+    if path!="/api/wifi/command" {if let Some(object)=payload.as_object_mut(){object.remove("op");}}
+    let text = serde_json::to_vec(&payload)?;
     let request_id = event_id(body, "request_id");
     let device_mac = event_id(body, "device_mac");
     let seq = body["seq"].as_u64();
@@ -363,7 +351,7 @@ fn post_json(ip: &str, path: &str, token: &str, body: &Value, timeout: Duration)
         job_id = job_id.as_deref().unwrap_or(""),
         "device HTTP request"
     );
-    let response = request(ip, "POST", path, token, Some(&text), &[], timeout);
+    let response = request(ip, "POST", path, token, Some(&text), &[], timeout).await;
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let (status, response_body) = match response {
         Ok(response) => response,
@@ -458,27 +446,27 @@ fn safe_error_category(error: &anyhow::Error) -> &'static str {
 }
 
 /// Authenticated Status read: the only authoritative device state.
-pub fn status(ip: &str, token: &str, timeout: Duration) -> Result<Value> {
-    status_mode(ip, token, timeout, false)
+pub async fn status(ip: &str, token: &str, timeout: Duration) -> Result<Value> {
+    status_mode(ip, token, timeout, false).await
 }
 
 /// Stable 900 s observation. The active context identifies an unchanged
 /// device-authenticated data contract; a changed context requires a full read.
-pub fn status_compact(ip: &str, token: &str, timeout: Duration) -> Result<Value> {
-    status_mode(ip, token, timeout, true)
+pub async fn status_compact(ip: &str, token: &str, timeout: Duration) -> Result<Value> {
+    status_mode(ip, token, timeout, true).await
 }
 
-fn status_mode(ip: &str, token: &str, timeout: Duration, compact: bool) -> Result<Value> {
+async fn status_mode(ip: &str, token: &str, timeout: Duration, compact: bool) -> Result<Value> {
     let started = Instant::now();
     let deadline = started + timeout;
     use sha2::{Digest, Sha256};
     let key = format!("{ip}:{:x}", Sha256::digest(token.as_bytes()));
     let lock = STATUS_READS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap()
-        .entry(key).or_insert_with(|| Arc::new(Mutex::new(()))).clone();
-    let _read = lock_session_until(&lock, deadline)?;
+        .entry(key).or_insert_with(|| Arc::new(AsyncMutex::new(()))).clone();
+    let _read = lock_session_until(&lock, deadline).await?;
     tracing::info!(event = "send", operation = "/api/status", "device HTTP request");
     let projection = compact.then_some(br#"{"compact":true}"#.as_slice());
-    let response = request(ip, "POST", "/api/status", token, projection, &[], deadline.saturating_duration_since(Instant::now()));
+    let response = request(ip, "POST", "/api/status", token, projection, &[], deadline.saturating_duration_since(Instant::now())).await;
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let (status, body) = match response {
         Ok(response) => response,
@@ -529,13 +517,13 @@ fn status_mode(ip: &str, token: &str, timeout: Duration, compact: bool) -> Resul
             if next==0 {anyhow::ensure!(bytes.len()==total,"incomplete status read");break;}
             anyhow::ensure!(next==bytes.len() as u64 && bytes.len()<total,"status read does not advance");
             let body=serde_json::to_vec(&json!({"status_read":id,"offset":next}))?;
-            let (code,reply)=request(ip,"POST","/api/status",token,Some(&body),&[],deadline.saturating_duration_since(Instant::now()))?;
+            let (code,reply)=request(ip,"POST","/api/status",token,Some(&body),&[],deadline.saturating_duration_since(Instant::now())).await?;
             anyhow::ensure!(code==200,"status continuation HTTP {code}");
             value=serde_json::from_str(&reply)?;
         }
         value=parse_status_body(std::str::from_utf8(&bytes)?)?;
         let session=frame_session(ip,token);
-        let mut session=lock_session_until(&session,deadline)?;
+        let mut session=lock_session_until(&session,deadline).await?;
         if let Some(ctx)=value["active_context_id"].as_str().filter(|s|s.len()==16 && s.bytes().all(|c|c.is_ascii_hexdigit())) {session.context.copy_from_slice(ctx.as_bytes());}
         return Ok(value);
     }
@@ -560,14 +548,14 @@ fn parse_status_body(body: &str) -> Result<Value> {
 }
 
 /// Running OTA partition hash, authorized by the device operation token alone.
-pub fn ota_image(ip: &str, token: &str, mac: &str, image_bytes: usize, timeout: Duration) -> Result<Value> {
+pub async fn ota_image(ip: &str, token: &str, mac: &str, image_bytes: usize, timeout: Duration) -> Result<Value> {
     let until = Instant::now() + timeout;
     let expected_mac = DeviceIdentity::normalized_mac(mac).context("invalid OTA target MAC")?;
     let path = "/api/ota/image";
     let payload=serde_json::to_vec(&json!({"image_bytes":image_bytes}))?;
-    let (status, body) = match request(ip, "POST", path, token, Some(&payload), &[], timeout) {
+    let (status, body) = match request(ip, "POST", path, token, Some(&payload), &[], timeout).await {
         Err(error) if error.downcast_ref::<HttpSessionExpired>().is_some() =>
-            request(ip, "POST", path, token, Some(&payload), &[], until.saturating_duration_since(Instant::now()))?,
+            request(ip, "POST", path, token, Some(&payload), &[], until.saturating_duration_since(Instant::now())).await?,
         result => result?,
     };
     if status != 200 { bail!("device /api/ota/image HTTP {status}"); }
@@ -581,7 +569,7 @@ pub fn ota_image(ip: &str, token: &str, mac: &str, image_bytes: usize, timeout: 
 
 /// sync-v1 keeps the device's precise error code (notably claim_required,
 /// digest_mismatch and batch_lost) and validates every response identity.
-pub fn sync(
+pub async fn sync(
     ip: &str, token: &str, mac: &str, bridge_id: &str, nonce: &str,
     op: &str, request_id: &str, fields: &Value, timeout: Duration,
 ) -> Result<Value> {
@@ -598,11 +586,10 @@ pub fn sync(
     body["sync_version"] = json!(1);
     body["device_mac"] = json!(wire_mac);
     body["bridge_id"] = json!(bridge_id);
-    body["session_nonce"] = json!(nonce);
     body["request_id"] = json!(request_id);
     let bytes = serde_json::to_vec(&body)?;
     if bytes.len() > 4096 { bail!("sync request body exceeds 4096 bytes"); }
-    let (status, text) = request(ip, "POST", &path, token, Some(&bytes), &[], timeout)?;
+    let (status, text) = request(ip, "POST", &path, token, Some(&bytes), &[], timeout).await?;
     let reply: Value = serde_json::from_str(&text).context("sync response JSON")?;
     if status == 401 { bail!("sync unauthorized (401)"); }
     if reply["device_mac"].as_str().and_then(DeviceIdentity::normalized_mac).as_deref()
@@ -619,27 +606,26 @@ pub fn sync(
 }
 
 /// Complete bounded Data snapshot (atomic apply + simple ACK).
-pub fn data(ip: &str, token: &str, expected_mac: &str, message: &Value, timeout: Duration) -> Result<Value> {
-    session_post(ip, "/api/data", token, expected_mac, message, timeout)
+pub async fn data(ip: &str, token: &str, expected_mac: &str, message: &Value, timeout: Duration) -> Result<Value> {
+    session_post(ip, "/api/data", token, expected_mac, message, timeout).await
 }
 
 /// Formal PowerPlan (the only thing that changes the light deadline).
-pub fn plan(ip: &str, token: &str, expected_mac: &str, plan: &Value, timeout: Duration) -> Result<Value> {
-    session_post(ip, "/api/plan", token, expected_mac, plan, timeout)
+pub async fn plan(ip: &str, token: &str, expected_mac: &str, plan: &Value, timeout: Duration) -> Result<Value> {
+    session_post(ip, "/api/plan", token, expected_mac, plan, timeout).await
 }
 
-fn session_post(ip: &str, path: &str, token: &str, expected_mac: &str, message: &Value, timeout: Duration) -> Result<Value> {
+async fn session_post(ip: &str, path: &str, token: &str, expected_mac: &str, message: &Value, timeout: Duration) -> Result<Value> {
     let mut command = message.clone();
-    let (nonce, device_mac) = session_nonce(ip, token, expected_mac, timeout)?;
-    command["session_nonce"] = json!(nonce);
+    let (_, device_mac) = session_nonce(ip, token, expected_mac, timeout).await?;
     command["device_mac"] = json!(device_mac);
     command["request_id"] = json!(format!("{}-{:08x}", path.rsplit('/').next().unwrap_or("command"),
         crc32fast::hash(&crate::template::canonical_bytes(message))));
-    post_json(ip, path, token, &command, timeout)
+    post_json(ip, path, token, &command, timeout).await
 }
 
 /// Explicit remote activation.
-pub fn activate(
+pub async fn activate(
     ip: &str,
     token: &str,
     expected_mac: &str,
@@ -648,17 +634,17 @@ pub fn activate(
     expected_context: &str,
     timeout: Duration,
 ) -> Result<Value> {
-    let (nonce, device_mac) = session_nonce(ip, token, expected_mac, timeout)?;
+    let (_, device_mac) = session_nonce(ip, token, expected_mac, timeout).await?;
     let request_id = format!("activate-{expected_context}-{template_id}");
     post_json(ip, "/api/activate", token, &json!({
-        "device_mac": device_mac, "bridge_id": bridge_id, "session_nonce": nonce,
+        "device_mac": device_mac, "bridge_id": bridge_id,
         "request_id": request_id, "template_id": template_id,
         "expected_active_context_id": expected_context,
-    }), timeout)
+    }), timeout).await
 }
 
-fn session_nonce(ip: &str, token: &str, expected_mac: &str, timeout: Duration) -> Result<(String, String)> {
-    let state = status(ip, token, timeout)?;
+async fn session_nonce(ip: &str, token: &str, expected_mac: &str, timeout: Duration) -> Result<(String, String)> {
+    let state = status(ip, token, timeout).await?;
     let mac = state["device_mac"].as_str()
         .with_context(|| format!("authenticated status is missing device MAC for target {expected_mac}"))?;
     let expected = DeviceIdentity::normalized_mac(expected_mac)
@@ -682,7 +668,7 @@ fn session_nonce(ip: &str, token: &str, expected_mac: &str, timeout: Duration) -
 }
 
 /// Bounded BEGIN/CHUNK/COMMIT install of a complete Bundle payload.
-pub fn install_bundle(
+pub async fn install_bundle(
     ip: &str,
     token: &str,
     expected_mac: &str,
@@ -695,7 +681,7 @@ pub fn install_bundle(
         bail!("bundle payload size {} out of range", payload.len());
     }
     let chunk_bytes = chunk_bytes.clamp(256, BUNDLE_CHUNK_BYTES);
-    let (nonce, device_mac) = session_nonce(ip, token, expected_mac, timeout)?;
+    let (nonce, device_mac) = session_nonce(ip, token, expected_mac, timeout).await?;
     let content_crc = format!("{:08x}", crc32fast::hash(payload));
     // Service freezes CSZ1 bytes at publish time; retries send those exact bytes.
     let decoded = bridge_render::bundle_codec::decode(payload, 16 * 1024 * 1024)
@@ -708,9 +694,9 @@ pub fn install_bundle(
         bail!("invalid bundle job_id");
     }
     let command = json!({"device_mac": device_mac, "bridge_id": bridge_id,
-        "request_id": request_id, "session_nonce": nonce,
+        "request_id": request_id,
         "length": payload.len(), "content_crc": content_crc});
-    let ack = post_json(ip, "/api/bundle/begin", token, &command, timeout)?;
+    let ack = post_json(ip, "/api/bundle/begin", token, &command, timeout).await?;
     if ack["result"] != "applied" {
         return Ok(ack);
     }
@@ -738,7 +724,7 @@ pub fn install_bundle(
             Some(&payload[offset..end]),
             &[("X-Request-Id", &request_id), ("X-Session-Nonce", &nonce), ("X-Offset", &offset_text)],
             timeout,
-        );
+        ).await;
         let elapsed_ms = started.elapsed().as_millis() as u64;
         let (status, body) = match response {
             Ok(response) => response,
@@ -777,7 +763,7 @@ pub fn install_bundle(
         token,
         &command,
         timeout,
-    )
+    ).await
 }
 
 /// Where the next chunk would go (used by tests/diagnostics).
@@ -796,12 +782,29 @@ pub fn chunk_plan(payload_len: usize, chunk_bytes: usize) -> Vec<(usize, usize)>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
     use std::net::TcpListener;
     use std::thread;
+    use std::io::{Read, Write};
 
-    #[test]
-    fn pre_dispatch_json_errors_keep_stage_without_exposing_other_fields() {
+    #[tokio::test]
+    async fn cancelled_zero_and_partial_writes_preserve_dispatch_evidence() {
+        for full_before in [true,false] {
+            let (mut writer,mut reader)=tokio::io::duplex(16);
+            if full_before {writer.write_all(&[9;16]).await.unwrap();}
+            let mut progress=HttpProgress{outcome:DispatchOutcome::NotSent,stage:"http_write"};
+            // Outer cancellation drops the pending writer future; no worker can
+            // send the remaining suffix after the caller releases its permit.
+            let result=tokio::time::timeout(Duration::from_millis(20),
+                write_until(&mut writer,&[7;64],Instant::now()+Duration::from_secs(2),&mut progress)).await;
+            assert!(result.is_err());drop(writer);
+            let mut received=Vec::new();reader.read_to_end(&mut received).await.unwrap();
+            assert_eq!(received,vec![if full_before{9}else{7};16]);
+            assert_eq!(progress.outcome,if full_before{DispatchOutcome::NotSent}else{DispatchOutcome::WriteUnknown});
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_dispatch_json_errors_keep_stage_without_exposing_other_fields() {
         for result in ["rejected","unknown"] {
             let listener=TcpListener::bind("127.0.0.1:0").unwrap();
             let address=listener.local_addr().unwrap().to_string();
@@ -816,7 +819,7 @@ mod tests {
                 let body=json!({"result":result,"error":"business_offline","stage":"lifecycle","action":"read_device_status","secret":"response-secret"}).to_string();
                 write!(stream,"HTTP/1.1 503 Busy\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
             });
-            let error=request(&address,"POST","/api/status","request-secret",None,&[],Duration::from_secs(2)).unwrap_err();
+            let error=request(&address,"POST","/api/status","request-secret",None,&[],Duration::from_secs(2)).await.unwrap_err();
             server.join().unwrap();let text=format!("{error:#}");
             assert!(text.contains("business_offline")&&text.contains("lifecycle")&&text.contains("read_device_status"));
             assert!(!text.contains("protocol mismatch")&&!text.contains("response-secret")&&!text.contains("request-secret"));
@@ -852,7 +855,7 @@ mod tests {
                     assert_eq!(frame.op==1,opening);
                     if frame.op==14 {
                         let body:Value=serde_json::from_slice(body).unwrap();
-                        assert_eq!(body["session_nonce"],"snapshot-test-nonce");
+                        assert!(body["session_nonce"].is_null());
                         assert!(body.get("permit").is_none(), "retired permit must not enter the frame");
                     }
                     let code = if opening { if status==401 {401}else{200} } else {status};
@@ -869,48 +872,12 @@ mod tests {
         (address, server)
     }
 
-    #[test]
-    fn partial_http_write_keeps_unknown_and_never_restarts_the_frame() {
-        for written_before_failure in [0, 2, 7] {
-            let mut progress = HttpProgress { outcome: DispatchOutcome::NotSent, stage: "http_write" };
-            let mut accepted = Vec::new();
-            let mut calls = 0;
-            let mut previous_remaining = Duration::from_secs(1);
-            let error = write_until_with(b"request", Instant::now() + previous_remaining, &mut progress,
-                |bytes, remaining| {
-                    assert!(remaining <= previous_remaining);
-                    previous_remaining = remaining;
-                    calls += 1;
-                    if accepted.len() == written_before_failure {
-                        return Err(std::io::ErrorKind::TimedOut.into());
-                    }
-                    let count = 1.min(bytes.len());
-                    accepted.extend_from_slice(&bytes[..count]);
-                    Ok(count)
-                });
-            assert_eq!(accepted, b"request"[..written_before_failure]);
-            assert_eq!(progress.outcome, if written_before_failure == 0 {
-                DispatchOutcome::NotSent
-            } else { DispatchOutcome::WriteUnknown });
-            if written_before_failure == 7 { assert!(error.is_ok()); }
-            else { assert!(error.is_err()); }
-            assert_eq!(calls, written_before_failure + usize::from(written_before_failure < 7));
-        }
-        let mut progress = HttpProgress { outcome: DispatchOutcome::NotSent, stage: "http_write" };
-        assert!(write_until_with(b"request", Instant::now(), &mut progress,
-            |_, _| panic!("expired deadline must not reach the socket")).is_err());
-        assert_eq!(progress.outcome, DispatchOutcome::NotSent);
-        assert!(write_until_with(b"request", Instant::now() + Duration::from_secs(1), &mut progress,
-            |_, _| Ok(0)).is_err());
-        assert_eq!(progress.outcome, DispatchOutcome::NotSent);
-    }
-
-    #[test]
-    fn http_progress_distinguishes_connect_failure_session_open_and_sent_frame() {
+    #[tokio::test]
+    async fn http_progress_distinguishes_connect_failure_session_open_and_sent_frame() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap().to_string();
         drop(listener);
-        let error = request(&address, "POST", "/api/status", "connect-test", None, &[], Duration::from_millis(100)).unwrap_err();
+        let error = request(&address, "POST", "/api/status", "connect-test", None, &[], Duration::from_millis(100)).await.unwrap_err();
         let evidence = crate::rendezvous::command_failure(&error).unwrap();
         assert_eq!(evidence.outcome, DispatchOutcome::NotSent);
         assert_eq!(evidence.stage, "http_connect");
@@ -919,7 +886,7 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap().to_string();
             let token = if established { "sent-test" } else { "opening-test" };
-            if established { frame_session(&address, token).lock().unwrap().id = [7; 16]; }
+            if established { frame_session(&address, token).lock().await.id = [7; 16]; }
             let server = thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
                 stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -941,7 +908,7 @@ mod tests {
                 }
                 // Complete frame received, but no ACK is returned.
             });
-            let error = request(&address, "POST", "/api/wifi/command", token, Some(b"{}"), &[], Duration::from_secs(2)).unwrap_err();
+            let error = request(&address, "POST", "/api/wifi/command", token, Some(br#"{"op":"match"}"#), &[], Duration::from_secs(2)).await.unwrap_err();
             server.join().unwrap();
             let evidence = crate::rendezvous::command_failure(&error).unwrap();
             assert_eq!(evidence.outcome, if established { DispatchOutcome::AckUnknown } else { DispatchOutcome::NotSent });
@@ -949,15 +916,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn chunk_plan_is_bounded_and_contiguous() {
+    #[tokio::test]
+    async fn chunk_plan_is_bounded_and_contiguous() {
         let plan = chunk_plan(10_000, 4096);
         assert_eq!(plan, vec![(0, 4096), (4096, 4096), (8192, 1808)]);
         assert_eq!(plan.iter().map(|(_, n)| n).sum::<usize>(), 10_000);
     }
 
-    #[test]
-    fn status_deadline_includes_session_lock_without_sending_or_consuming_number() {
+    #[tokio::test]
+    async fn status_deadline_includes_session_lock_without_sending_or_consuming_number() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap().to_string();
@@ -965,13 +932,13 @@ mod tests {
         let held = session.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let _guard = held.lock().unwrap();
+            let _guard = held.blocking_lock();
             ready_tx.send(()).unwrap();
             std::thread::sleep(Duration::from_millis(200));
         });
         ready_rx.recv().unwrap();
         let started = Instant::now();
-        let error = status(&address, "synthetic-lock-test", Duration::from_millis(30)).unwrap_err();
+        let error = status(&address, "synthetic-lock-test", Duration::from_millis(30)).await.unwrap_err();
         assert!(started.elapsed() < Duration::from_millis(150));
         let evidence = crate::rendezvous::command_failure(&error).unwrap();
         assert_eq!(evidence.outcome, DispatchOutcome::NotSent);
@@ -979,19 +946,19 @@ mod tests {
         assert_eq!(evidence.reason, "window_budget_exhausted");
         assert!(matches!(listener.accept(), Err(error) if error.kind()==std::io::ErrorKind::WouldBlock));
         worker.join().unwrap();
-        assert_eq!(session.lock().unwrap().next_no, 0);
+        assert_eq!(session.lock().await.next_no, 0);
     }
 
-    #[test]
-    fn status_error_payload_is_not_an_identity_failure_or_success() {
+    #[tokio::test]
+    async fn status_error_payload_is_not_an_identity_failure_or_success() {
         let error = parse_status_body(r#"{"result":"unknown","error":"reply_limit","stage":"frame"}"#).unwrap_err();
         assert_eq!(error.to_string(), "device Status failed: reply_limit");
         assert_eq!(parse_status_body("{}").unwrap_err().to_string(), "device Status missing identity");
         assert!(parse_status_body(r#"{"device_mac":"AA:BB:CC:DD:EE:FF","result":"applied"}"#).is_ok());
     }
 
-    #[test]
-    fn event_metadata_keeps_correlators_and_rejects_unbounded_values() {
+    #[tokio::test]
+    async fn event_metadata_keeps_correlators_and_rejects_unbounded_values() {
         let body = json!({"request_id": "data-0012", "device_mac": "AABBCCDDEEFF",
             "seq": 12, "plan_id": 7, "job_id": "job-1", "token": "must-not-log"});
         assert_eq!(event_id(&body, "request_id").as_deref(), Some("data-0012"));
@@ -1008,9 +975,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn post_json_reports_http_status_without_exposing_request_or_response_bodies() {
-        fn serve_once(status: u16, payload: &'static str) -> String {
+    #[tokio::test]
+    async fn post_json_reports_http_status_without_exposing_request_or_response_bodies() {
+        async fn serve_once(status: u16, payload: &'static str) -> String {
             let (address, server) = respond_once(status, payload.to_owned());
             let result = post_json(
                 &address,
@@ -1019,7 +986,7 @@ mod tests {
                 &json!({"device_mac": "AABBCCDDEEFF", "request_id": "data-1", "seq": 1,
                     "session_nonce": "request-secret", "snapshot": {"account": "request-secret"}}),
                 Duration::from_secs(2),
-            );
+            ).await;
             server.join().unwrap();
             match result {
                 Ok(value) => value.to_string(),
@@ -1028,10 +995,10 @@ mod tests {
         }
 
         assert_eq!(
-            serve_once(200, r#"{"result":"applied","data_seq":1}"#),
+            serve_once(200, r#"{"result":"applied","data_seq":1}"#).await,
             r#"{"data_seq":1,"result":"applied"}"#
         );
-        let failed = serve_once(503, r#"{"secret":"response-secret"}"#);
+        let failed = serve_once(503, r#"{"secret":"response-secret"}"#).await;
         assert!(failed.contains("HTTP 503"));
         assert!(!failed.contains("request-secret"));
         assert!(!failed.contains("response-secret"));
@@ -1041,8 +1008,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn wifi_snapshot_http_errors_and_invalid_pages_keep_finite_categories() {
+    #[tokio::test]
+    async fn wifi_snapshot_http_errors_and_invalid_pages_keep_finite_categories() {
         let mac = "AABBCCDDEEFF";
         for (status, body, expected) in [
             (401, json!({"secret":"must-not-expose"}).to_string(), ("failed", "unauthorized")),
@@ -1055,15 +1022,15 @@ mod tests {
             (200, json!({"device_mac":mac,"ok":true,"schema":2,"snapshot_id":"s","revision":1,"total":2,"offset":1,"next_offset":2,"chunk":"{}","done":true}).to_string(), ("failed", "snapshot_mismatch")),
         ] {
             let (ip, server) = respond_once(status, body);
-            let error = wifi_snapshot(&ip, "synthetic-token", mac, "bridge", "snapshot-test-nonce", Duration::from_secs(2)).unwrap_err();
+            let error = wifi_snapshot(&ip, "synthetic-token", mac, "bridge", Duration::from_secs(2)).await.unwrap_err();
             server.join().unwrap();
             assert_eq!(crate::rendezvous::wifi_error(&error), expected);
             assert!(!error.to_string().contains("must-not-expose"));
         }
     }
 
-    #[test]
-    fn ota_image_uses_token_without_sync_owner_and_checks_device_mac() {
+    #[tokio::test]
+    async fn ota_image_uses_token_without_sync_owner_and_checks_device_mac() {
         for (reported, accepted) in [("AA:BB:CC:DD:EE:FF", true), ("11:22:33:44:55:66", false)] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap().to_string();
@@ -1099,7 +1066,7 @@ mod tests {
                 let reply = format!("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.codex-status.frame\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len());
                 stream.write_all(reply.as_bytes()).unwrap();stream.write_all(&bytes).unwrap();
             });
-            let result = ota_image(&address, "secret-token", "AABBCCDDEEFF", 1024, Duration::from_secs(2));
+            let result = ota_image(&address, "secret-token", "AABBCCDDEEFF", 1024, Duration::from_secs(2)).await;
             server.join().unwrap();
             if accepted { assert_eq!(result.unwrap()["device_mac"], "AABBCCDDEEFF"); }
             else { assert!(result.unwrap_err().to_string().contains("MAC mismatch")); }
@@ -1109,13 +1076,13 @@ mod tests {
 
 /// Wi-Fi management uses the endpoint token and borrows the current window.
 /// It never claims ownership or sends a PowerPlan.
-pub fn wifi_request(ip: &str, token: &str, mac: &str, bridge: &str, op: &str,
+pub async fn wifi_request(ip: &str, token: &str, mac: &str, bridge: &str, op: &str,
                     mut body: Value, timeout: Duration) -> Result<Value> {
     if !matches!(op, "snapshot" | "apply" | "result" | "result_ack") { bail!("invalid_wifi_operation"); }
     let compact = DeviceIdentity::normalized_mac(mac).context("invalid_device_mac")?;
     let wire_mac = compact.as_bytes().chunks(2).map(|p| std::str::from_utf8(p).unwrap()).collect::<Vec<_>>().join(":");
     body["device_mac"] = json!(wire_mac); body["bridge_id"] = json!(bridge);
-    let reply = post_json(ip, &format!("/api/wifi/{op}"), token, &body, timeout)?;
+    let reply = post_json(ip, &format!("/api/wifi/{op}"), token, &body, timeout).await?;
     if reply["device_mac"].as_str().and_then(DeviceIdentity::normalized_mac).as_deref()
         != DeviceIdentity::normalized_mac(mac).as_deref() {
         if reply["error"] == "occupied" { bail!("occupied"); }
@@ -1125,7 +1092,7 @@ pub fn wifi_request(ip: &str, token: &str, mac: &str, bridge: &str, op: &str,
 }
 
 /// New control transport, same identity and transaction envelope as GATT.
-pub fn wifi_command(ip:&str,token:&str,mac:&str,bridge:&str,op:&str,nonce:&str,mut body:Value,timeout:Duration)->Result<Value> {
+pub async fn wifi_command(ip:&str,token:&str,mac:&str,bridge:&str,op:&str,mut body:Value,timeout:Duration)->Result<Value> {
     let compact=DeviceIdentity::normalized_mac(mac).context("invalid_device_mac")?;
     // Setup reads share the GATT correlation envelope. Mutation IDs must always
     // come from the durable job; never generate a new transaction here.
@@ -1133,15 +1100,15 @@ pub fn wifi_command(ip:&str,token:&str,mac:&str,bridge:&str,op:&str,nonce:&str,m
         body["request_id"]=json!(format!("query-{op}-{:08x}",crc32fast::hash(&crate::template::canonical_bytes(&body))));
     }
     body["device_mac"]=json!(compact.as_bytes().chunks(2).map(|p|std::str::from_utf8(p).unwrap()).collect::<Vec<_>>().join(":"));
-    body["bridge_id"]=json!(bridge);body["op"]=json!(op);body["protocol"]=json!(2);body["session_nonce"]=json!(nonce);
-    let reply=post_json(ip,"/api/wifi/command",token,&body,timeout)?;
+    body["bridge_id"]=json!(bridge);body["op"]=json!(op);
+    let reply=post_json(ip,"/api/wifi/command",token,&body,timeout).await?;
     anyhow::ensure!(reply["device_mac"].as_str().and_then(DeviceIdentity::normalized_mac).as_deref()==Some(compact.as_str()),"wifi_mac_mismatch");
     Ok(reply)
 }
 
 /// Freeze and consume every page before exposing a complete snapshot. One hard
 /// deadline covers the entire read; a failed page never becomes an empty list.
-pub fn wifi_snapshot(ip: &str, token: &str, mac: &str, bridge: &str, nonce: &str,
+pub async fn wifi_snapshot(ip: &str, token: &str, mac: &str, bridge: &str,
                      timeout: Duration) -> Result<crate::platform::wifi::Snapshot> {
     let until = Instant::now() + timeout;
     let mut offset = 0usize; let mut snapshot = String::new(); let mut revision = None;
@@ -1150,7 +1117,7 @@ pub fn wifi_snapshot(ip: &str, token: &str, mac: &str, bridge: &str, nonce: &str
         let remaining = until.saturating_duration_since(Instant::now());
         if remaining.is_zero() { bail!("wifi_snapshot_timeout"); }
         let reply = wifi_request(ip, token, mac, bridge, "snapshot",
-            json!({"offset":offset,"snapshot_id":snapshot,"session_nonce":nonce}), remaining)?;
+            json!({"offset":offset,"snapshot_id":snapshot}), remaining).await?;
         if reply["ok"] != true { bail!("{}", reply["error"].as_str().unwrap_or("wifi_snapshot_rejected")); }
         let current = reply["snapshot_id"].as_str().context("wifi_snapshot_id")?;
         let rev = reply["revision"].as_u64().context("wifi_revision")?;

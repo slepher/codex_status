@@ -57,7 +57,7 @@ async fn main()->Result<()> {
     link.close_bounded(Duration::from_secs(2)).await;
     let http_until=Instant::now()+Duration::from_secs(25);
     let status=loop {
-        if let Ok(s)=bridge_core::device_client::status(ip,&token,Duration::from_secs(2)) {break s}
+        if let Ok(s)=bridge_core::device_client::status(ip,&token,Duration::from_secs(2)).await {break s}
         ensure!(Instant::now()<http_until,"HTTP not reachable");
         tokio::time::sleep(Duration::from_millis(400)).await;
     };
@@ -69,7 +69,7 @@ async fn main()->Result<()> {
         ensure!(left>0 && left<=60,"invalid formal remaining");
         tokio::time::sleep(Duration::from_secs(left+1)).await;
     }
-    let current=bridge_core::device_client::status(ip,&token,Duration::from_secs(3))?;
+    let current=bridge_core::device_client::status(ip,&token,Duration::from_secs(3)).await?;
     ensure!(current["power"]["remaining_s"]==0,"formal Light still active");
     ensure!(current["sync"]["phase"]=="WIFI_SYNC_ONCE" && current["sync"]["remaining_ms"].as_u64().unwrap()>5000,"temporary window cut off");
     events.push(json!({"stage":"formal_expired_http_alive","status":current,"at":bridge_core::now_secs()}));
@@ -85,7 +85,7 @@ async fn main()->Result<()> {
     let fields:Vec<Value>=c.requirements.iter().map(|r| {let f=full.fields.get(&r.field).unwrap();json!({"i":r.index,"k":r.field,"v":f.value,"q":f.quality})}).collect();
     let data=json!({"bridge_id":owner,"active_context_id":current["active_context_id"],"seq":seq,
         "crc":format!("{:08x}",bridge_core::coordinator::data_fields_crc(&fields)),"fields":fields});
-    let ack=bridge_core::device_client::data(ip,&token,MAC,&data,Duration::from_secs(10))?;
+    let ack=bridge_core::device_client::data(ip,&token,MAC,&data,Duration::from_secs(10)).await?;
     ensure!(ack["result"]=="applied","Data not applied: {ack}");
     events.push(json!({"stage":"full_data_ack","ack":ack,"seq":seq,"field_count":data["fields"].as_array().unwrap().len(),"payload_bytes":serde_json::to_vec(&data)?.len(),"at":bridge_core::now_secs()}));
     fs::write(&events.path,serde_json::to_vec_pretty(&events.events)?)?;

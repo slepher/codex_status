@@ -1,10 +1,13 @@
-# 实施切片记录
+# 协议收敛实施切片
 
-任务来源为 backlog B6/C8；本文件只记录 [计划](protocol-convergence-plan.md) 的执行拆分，不独立增添需求。
+任务唯一来源backlog B6/C8；执行合同见[计划](protocol-convergence-plan.md)，结果及证据见[状态](protocol-convergence-status.md)。
 
-- R1a：共享已知 MAC 执行许可入口，覆盖 authorize/run/recover_save；自动会合连接后只try_lock，忙则有界关闭以消除反向等待；竞争、期限与取消回归。
-- R1b：自动会合发现与连接拆分，按候选设备取得许可；双设备公平性、MAC复核回归。
-- R2：原事务有限查询/ACK、持久预算与显式收尾重试；合并HTTP执行后与定期ACK路径，生产Fake验证取消/过期/预算耗尽与容量释放。
-- R3–R5：依次按计划推进，每片先记录具体合同与测试再改；四端 wire 门禁不可跳过。
+- [x] R1：设备→BLE有界准入，发现/连接拆分，忙设备在建链前跳过。
+- [x] R2：原ID有限查询/ACK、跨重启预算及终点围栏，HTTP/BLE共用收尾。
+- [x] R3：AcceptedPending/Unknown；单一trial/activate Job路径；移除OPERATIONS/SCHEMES；INPUTS实例所有；持久策略/RAM观察/联系及共享投影分离。
+- [x] R4：RendezvousContext替换13私有JSON键、大元组与无用副本。
+- [x] R5 HTTP：原生异步TCP与session/status锁；删除同步worker/许可追踪/同步核心适配器；取消及发送阶段回归。
+- [x] R5 wire：C2唯一操作表、CommandContext；删除旧JSON会话/op包装与串口旧写入口；四端同步、双ESP构建/栈、Fake、AP01应用编译及宿主执行。
+- [x] 持久迁移/回滚说明、候选哈希、资源预算、权威协议文档同步。
 
-完成情况和当前下一步以 [status](protocol-convergence-status.md) 为准。
+2026-10-19用户要求的fix-wifi-switch合并独立完成；R3–R5工作保持未提交/未部署。源码验收完成不关闭B6/C8长期实机矩阵或C9。无新增第二份待办。

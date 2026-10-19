@@ -32,16 +32,15 @@ fn pending_path(ctx:&AppCtx,mac:&str)->std::path::PathBuf {
 
 async fn http(endpoint:String,method:&str,path:String,token:String,body:Option<Value>)->Result<(u16,Value),String> {
     let method=method.to_owned();
-    tokio::task::spawn_blocking(move ||device_client::pairing_request(&endpoint,&method,&path,&token,
-        body.as_ref(),Duration::from_secs(3))).await.map_err(|_|"pairing_worker_failed".to_string())?
+    device_client::pairing_request(&endpoint,&method,&path,&token,
+        body.as_ref(),Duration::from_secs(3)).await
         .map_err(|_|"pairing_transport_unknown".into())
 }
 
 pub async fn verify_endpoint(ctx:&AppCtx,mac:&str,endpoint:&str)->Result<Value,String> {
     let token=bridge_mcp::load_device_token_at(platform::service(ctx).data_root(),mac).ok_or("ap01_pairing_required")?;
     let endpoint=endpoint.to_owned();
-    let status=tokio::task::spawn_blocking(move ||device_client::status(&endpoint,&token,Duration::from_secs(3)))
-        .await.map_err(|_|"status_worker_failed")?.map_err(|_|"authenticated_status_failed")?;
+    let status=device_client::status(&endpoint,&token,Duration::from_secs(3)).await.map_err(|_|"authenticated_status_failed")?;
     if status["device_mac"].as_str().and_then(DeviceIdentity::normalized_mac).as_deref()!=Some(mac) ||
         status["render_target"]!=bridge_core::platform::model::RENDER_TARGET_AP01 ||
         status["fw_target"]!="cuktech-ap01-0041" {return Err("authenticated_identity_mismatch".into());}

@@ -1420,26 +1420,8 @@ void handleSerialCli() {
         if (rx.length()) memset(const_cast<char *>(rx.c_str()), 0, rx.length());
         rx = "";
         line.trim();
-        if (line.startsWith("wifi-json ")) {
-            JsonDocument request;
-            String body = line.substring(10);
-            bool authorized = false;
-            if (body.length() <= 8192 && !deserializeJson(request, body)) {
-                const String token = request["token"] | "";
-                for (int i = 0; i < storeCount(); ++i) {
-                    EndpointRec endpoint;
-                    if (storeGet(i, endpoint) && token.length() && token == endpoint.token) authorized = true;
-                }
-            }
-            if (!authorized) Serial.println("{\"ok\":false,\"error\":\"unauthorized\"}");
-            else {
-                const String op = request["op"] | "";
-                if (op != "apply" && op != "result") Serial.println("{\"ok\":false,\"error\":\"shape\"}");
-                else Serial.println(radio::wifiManagementRequest(request, op.c_str()));
-            }
-            if (body.length()) memset(const_cast<char *>(body.c_str()), 0, body.length());
-        } else if (line.startsWith("wifi ")) {
-            Serial.println("Legacy Wi-Fi writes retired. Use Bridge bonded setup or authenticated wifi-json transactions.");
+        if (line.startsWith("wifi-json ") || line.startsWith("wifi ")) {
+            Serial.println("{\"ok\":false,\"error\":\"retired_protocol\",\"action\":\"use_authenticated_bridge\"}");
         } else if (line == "status") {
             DevLog.printf("[cli] fw=%s state=%s ip=%s rssi=%d heap=%u\n",
                           application::state.firmwareVersion, wifiPhaseText(radio::wifiPhase()), radio::ipText().c_str(),

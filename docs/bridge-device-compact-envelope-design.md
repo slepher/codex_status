@@ -1,6 +1,6 @@
 # Bridge—设备 48 B 信封设计
 
-核对日期：2026-10-11，基线9c38e45。固定48 B外层信封已在当前固件及Bridge实现，Note4 .82现场见[PROGRESS](../PROGRESS.md)。请求、响应及报告共用布局；业务JSON仍保留共享处理器需要的身份字段，不能把设计中的去重目标写成已经完成。业务合同见[协议总览](bridge-device-protocol.md)，完整实机故障矩阵仍未结项。
+核对日期：2026-10-19。当前源码统一C2标记及显式操作表，删除JSON op/command/session_nonce和旧C1接收路径；认证凭据、业务身份、回执围栏保留。四端候选及回归见[收敛状态](../project-workflow/bridge-macos/protocol-convergence-status.md)，部署以[PROGRESS](../PROGRESS.md)为准。
 
 ## 1. 范围与分层
 
@@ -16,7 +16,7 @@
 
 | 偏移 | 字节数 | 字段 | 定义 |
 |---|---:|---|---|
-| 0 | 1 | marker | 固定帧标记0xC1，仅校验唯一格式，不是协议版本协商 |
+| 0 | 1 | marker | 固定帧标记0xC2（0xC1拒绝），仅校验唯一格式，不是协议版本协商 |
 | 1 | 1 | kind | 0=request，1=response，2=report；其他值拒绝 |
 | 2 | 2 | op | 操作编号，独立登记；不因 HTTP 路由不同改变含义 |
 | 4 | 2 | result | request/report 必须为 0；response 使用下述结果码 |
@@ -26,7 +26,16 @@
 | 32 | 16 | context_ref | 固定格式内完整 context 的 16 字节 ASCII；不涉及上下文的操作填全零 |
 | **合计** | **48** | | 不设置可变扩展头 |
 
-操作编号1–27的登记含义见[实施计划 P0](../project-workflow/bridge-macos/bridge-device-compact-protocol-implementation-plan.md#p0-冻结值2026-10-08)。管理凭据和业务事务不因编号统一而合并；编号登记不自动表示两载体均有该入口，实际路由见协议总览§5。编码源码为[固件](../src/v2_command_envelope.cpp)与[Bridge](../bridge/crates/core/src/compact_frame.rs)。
+当前唯一操作表如下；未知名称（包括wifi_save/wifi_command/wifi_migrate）不生成帧。编号不意味着两载体或所有设备都提供该功能；未实现功能明确拒绝。
+
+| 编号 | 操作 |
+|---|---|
+| 1–9 | status、data、plan、claim、renew、sync_begin、sync_page、sync_ack、sync_complete |
+| 10–18 | bundle_begin、bundle_chunk、bundle_commit、activate、wifi_snapshot、wifi_apply、wifi_result、wifi_result_ack、wifi_match |
+| 19–27 | ota_image、ready_report、business_query、network_start、sync_config、sync_open、history、wifi_owner、wifi_info |
+| 28–35 | wifi_active、wifi_trial、wifi_activate、wifi_setup_status、wifi_setup_cancel、wifi_status、wifi_scheme_get、wifi_capabilities |
+
+Rust/C++逐项对拍；编码源码为[固件](../src/v2_command_envelope.cpp)与[Bridge](../bridge/crates/core/src/compact_frame.rs)。
 
 初始结果码：0=applied（读取为 completed），1=accepted（尚未完成），2=rejected，3=unknown。具体错误代码、失败阶段、实际 seq/plan_id、remaining_s 和恢复入口放在结果载荷中。不能只有一个 false，也不能把 accepted 当作最终成功。
 
@@ -40,7 +49,7 @@
 - 设备重启、凭据轮换/撤销或会话过期后失效。owner/lease 在每次执行时按现行规则检查，握手通过不等于永久占用；读写不隐式 claim，也不续电源期限。
 - 会话状态按实际连接/会话分配，有界数量和有效期；无空槽预分配。核心固定标识需要 16 B session_id 加完整 nonce/身份及元数据，实际结构、峰值RAM与栈需按匹配版本证据核对，不能以 48 B wire 大小代替 RAM 预算。会话是临时 RAM 状态，不为每次握手写 NVS；设备重启统一作废。
 
-当前实现增加frame会话校验，但HTTP和BLE的JSON业务载荷仍保留device_mac、bridge_id、request_id、session_nonce等字段，BLE还携token/op；尚未删除重复身份。客户端直接把该JSON放在48 B头后，共享业务处理器继续校验。HTTP认证头仍存在，设备operation token与endpoint token仍分开；48 B不代表整个认证开销或消息小于50 B。
+当前帧提供op/session，客户端移除语义调用中的op/command/session_nonce，接收端拒绝这些旧字段以及protocol/rv，不提供双协议翻译。载体完成token/session/replay/context准入后，CommandContext只校验业务device_mac、bridge_id和request_id。HTTP认证头、BLE token及claim的operation_token仍存在；它们是凭据，不由帧ID取代。状态响应仍提供启动/连接代次，Bundle二进制chunk仍带接收代次关联；这两者不是旧JSON命令会话检查。48 B不代表整个认证开销。
 
 ## 4. 请求、上下文与重放
 
@@ -73,12 +82,12 @@ BLE 分片层在协商 MTU 允许的容量内发送，不能固定假设 180 B �
 ## 7. 已实施范围与验收边界
 
 1. 一次性替换为最终frame编码、固定content type及编解码。Bridge与设备分别更新软件版本；不提供旧JSON兼容、协议版本历史、能力矩阵、双协议、猜测解码或降级重发。软件不匹配明确报错并提示更新，不绕过认证。
-2. 会话绑定及完整context编码/校验已覆盖Status/Data/Plan；普通业务复用有效HTTP frame会话，Status显式读取会打开新会话。业务nonce/身份检查仍存在，失效后有界重建并查询原事务。
+2. 会话绑定及完整context编码/校验已覆盖Status/Data/Plan；普通业务复用有效HTTP frame会话，Status显式读取会打开新会话。重复JSON nonce检查已删除，业务身份检查保留；帧会话失效后有界重建并查询原事务。
 3. 原业务处理器接收解析后的完整身份/上下文，保留 owner、seq、plan_id、错误阶段、持久事务和未知结果合同。载体转换不创建新的业务事务，不自动换号重发可能已提交的操作。
-4. 当前BLE客户端仍可在JSON载荷附校时字段；删除重复身份/改独立校时并未由固定头自动完成。业务载荷编码独立评估。Bundle/OTA/Activate的HTTP分配不变，multipart ROM上传不套此头。
+4. 当前BLE客户端仍可在JSON载荷附校时字段；op/session重复字段已删除，校时及持久业务身份保持原合同。业务载荷编码独立评估。Bundle/OTA/Activate的HTTP分配不变，multipart ROM上传不套此头。
 5. 验收包括 48 B 精确布局与大端对拍，错误长度/错误帧标记，MAC/principal/credential 范围不符，重启/断线旧会话，owner 过期，上下文切换，同号异载荷、乱序和重放，丢 ACK 查询原事务，BLE 残片隔离、跨 Read Blob 快照冻结、512 B 边界及 RAM/栈预算。宿主尺寸计算不是固件/实机验收。
 
-当前固定头、HTTP分页、会合报告已有软件测试和特定Note4部署证据，见[实施验收](../project-workflow/bridge-macos/protocol-implementation-20261011.md)。本次只是文档同步，不新运行测试或部署；普通BLE畸形/未授权/队列满时可能静默丢弃的边界、完整RF/掉电矩阵继续归backlog B6/C8。
+当前固定头、HTTP分页、会合报告已有软件测试和特定Note4部署证据，见[实施验收](../project-workflow/bridge-macos/protocol-implementation-20261011.md)。2026-10-19四端源码及候选回归见收敛状态，未部署；普通BLE畸形/未授权/队列满时可能静默丢弃的边界、完整RF/掉电矩阵继续归backlog B6/C8。
 
 ## 8. 执行场景的独立入口
 

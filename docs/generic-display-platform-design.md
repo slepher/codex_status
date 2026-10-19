@@ -185,7 +185,7 @@ Wi-Fi light 有效且链路可达期间，后续 push 可立即排完整数据�
 
 ## 8. 最小消息与幂等规则
 
-所有业务副作用在已认证会话执行。当前载体使用48 B二进制头，HTTP业务统一POST；业务JSON仍带device_mac/bridge_id/request_id/session_nonce，通用Data/Plan禁止protocol/rv。frame request_no与持久业务ID独立，具体映射以[协议总览](bridge-device-protocol.md)为准。公开发现只作hint；bridge_first及其Directive/StatusBeacon是已废弃方向，不属于当前入口。完整MAC/上下文/能力由认证状态核对。
+所有业务副作用在已认证会话执行。当前源码载体使用C2标记的48 B二进制头，HTTP业务统一POST；op/session只在帧中编码，业务JSON保留device_mac/bridge_id/request_id及业务上下文，拒绝旧op/command/session_nonce/protocol/rv。载体完成凭据、会话及重放准入后构造CommandContext供共享业务校验身份。frame request_no与持久业务ID独立，具体映射以[协议总览](bridge-device-protocol.md)为准。公开发现只作hint；bridge_first及其Directive/StatusBeacon是已废弃方向，不属于当前入口。完整MAC/上下文/能力由认证状态核对。
 
 | 消息 | 必需业务字段 | 语义 |
 |---|---|---|

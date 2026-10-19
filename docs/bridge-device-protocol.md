@@ -6,7 +6,7 @@
 
 设备模板字段统一使用当前独立绑定，退役device.state无兼容入口；C++/Rust/预览均拒绝该绑定。持久CT中旧字段返回ct_bind_unsupported，路径与编号不一致返回ct_bind_mismatch，字符串边界无效返回ct_req/ct_string；当前有效字段的数字标识不重排，退役14号不重用。已安装模板加载失败进入内置恢复界面，认证status的content_error报告原因，等待显式发布有效Bundle；文件不因读取失败自动删除。[字段退役与恢复回归](../project-workflow/bridge-macos/device-fields-only-20261011.md)。
 
-核对日期：2026-10-11，源码基线 `9c38e45`。Note4已认证运行0.18.82-note4，配套Windows Bridge已部署；具体镜像和验收以[PROGRESS](../PROGRESS.md)为准。本次只同步文档，不新增测试或设备操作，不证明其他设备/macOS已部署。
+当前源码核对：2026-10-19，C2协议收敛R3–R5；[四端验证与候选](../project-workflow/bridge-macos/protocol-convergence-status.md)。历史现场说明不代表本轮已部署，实际版本以[PROGRESS](../PROGRESS.md)为准。
 
 当前 wire 为固定48 B二进制头加业务载荷，认证业务HTTP使用POST；详细布局见[48 B信封](bridge-device-compact-envelope-design.md)。普通BLE接纳开网后提前结束，设备通过独立HTTP会话报告；单份Bundle暂存后覆盖，正式计划跨重启保留。下文区分外层frame、仍存在的JSON业务字段及实际成功证据。
 
@@ -49,7 +49,7 @@ Codex app-server → Bridge 的 JSON-RPC、UI IPC、Bridge MCP 不属于本协�
 | namespace | Wi-Fi 事务回执及重放围栏的隔离维度；不是配置编辑权限的创建者隔离 |
 | endpoint token | 设备业务通道认证；HTTP Bearer 或 BLE 命令 `token` |
 | device operation token | claim、OTA、诊断等管理入口凭据；与 endpoint token 分开，仅经受控绑定 BLE 链路获取/轮换 |
-| `session_nonce` / frame `session_id` | nonce是业务身份检查使用的32位十六进制值；frame session是16 B原始认证会话标识，HTTP打开后由设备分配，BLE绑定连接代次。不能混同持久事务或凭据 |
+| `session_nonce` / frame `session_id` | nonce在状态响应及二进制Bundle接收中关联连接/接收代次，不再放入JSON命令校验；frame session是16 B原始认证会话标识，HTTP打开后由设备分配，BLE绑定连接代次。不能混同持久事务或凭据 |
 | owner / lease | 只由显式 claim 建立；有效他人 owner 拒绝写入，lease 到期清空；与电源期限独立 |
 | `active_context_id` | 设备当前激活上下文；模板切换产生新上下文，旧上下文数据不能应用 |
 | `request_id` | 请求关联；具体幂等条件仍由各操作定义，不能假定所有请求都有同一持久回执机制 |
@@ -116,7 +116,7 @@ Bridge 持久确认原终态后才能 `result_ack(query_id)`；设备删除可�
 
 配置保存版本和当前活动版本独立：更新/删除保存项不等于当前连接副本立刻替换，显式启用才切换。主机 host_ssid→设备 ssid 映射允许两端SSID不同；metadata/credential匹配只是保存内容判断，不替代原事务 committed 回执或实际 HTTP 认证。
 
-旧槽迁移是显式受控兼容操作，不是自动 read/import。当前 BLE `wifi_migrate` 要求绑定认证、匹配 owner 与物理恢复机会，读取设备自身旧 NVS，原子迁移并验证后逐键退役；不把凭据返回或写日志，不启用网络/续期。`retirement_pending` 表示新数据可能已持久而旧键清理未完成，不等于迁移回滚。兼容代码最终移除需独立验收。
+当前不提供在线wifi_migrate操作；离线历史归档工具及现行WFS4/WTX1读取规则见agent-operations。不得用未知操作或旧协议回退恢复旧写入入口。
 
 ### 4.5 正式计划恢复与启动通道
 
@@ -158,7 +158,7 @@ HTTP每次保留Bearer鉴权：普通业务使用endpoint token；claim的Bearer
 | `/api/bundle/begin`、`chunk`、`commit` | 10–12 | 完整Bundle安装，仅HTTP |
 | `/api/activate` | 13 | 模板激活，仅HTTP |
 | `/api/wifi/snapshot`、`apply`、`result`、`result_ack` | 14–17 | Wi-Fi共享处理器 |
-| `/api/wifi/command` | 18 | 统一Wi-Fi控制 |
+| `/api/wifi/command` | 对应具体wifi_*编号 | 共用HTTP路由，操作由frame op唯一选择，不再发送JSON op/command |
 | `/api/ota/image` | 19 | 载荷image_bytes=N；认证运行分区指定前缀SHA256证明 |
 
 GET `/update`与POST `/doUpdate`仍为鉴权页面/multipart原生ROM上传，不包装48 B业务帧，也未采用CSZ1压缩。公开`/status.json`、`/log`、`/pmstats`是恢复/诊断视图，不能代替认证状态。POST `/diag`、GET `/history`及`/frame`按各自handler授权。
@@ -167,14 +167,13 @@ GET `/update`与POST `/doUpdate`仍为鉴权页面/multipart原生ROM上传，�
 
 外层头负责kind/op/result/payload_len、16 B session、非零u64 request_no及16 B完整context；布局见[48 B编码](bridge-device-compact-envelope-design.md#2-固定布局)。Status打开使用本次唯一的客户端打开标识，设备返回独立服务端session；OTA op19打开还带open=true。会话失效先有界重建，再查询原业务，不换ID盲重发可能已提交的写入。
 
-**当前JSON载荷仍包含共享处理器所需的身份/关联字段**，并没有全部由会话替代；48 B只约束外层头。Data载荷结构如下，实际身份和fields须从当前认证状态取得：
+**当前JSON只保留业务身份/关联字段**；op/session由C2帧提供，旧op/command/session_nonce/protocol/rv明确拒绝。Data载荷结构如下，实际身份和fields须从当前认证状态取得：
 
 ```json
 {
   "device_mac": "7C:4F:AD:B9:34:08",
   "bridge_id": "<stable-bridge-id>",
   "request_id": "<stable-business-request-id>",
-  "session_nonce": "<current-business-nonce>",
   "active_context_id": "<current-context>",
   "seq": 42,
   "fields": []
@@ -185,7 +184,7 @@ GET `/update`与POST `/doUpdate`仍为鉴权页面/multipart原生ROM上传，�
 
 ### 5.2 单份Bundle、动态容量与压缩
 
-BEGIN/COMMIT载荷关联同一业务request/nonce及length/content_crc；完整正文带job、目标/预期context、对象内容。CHUNK的frame载荷是原始冻结字节，offset/request_id/session_nonce仍由查询参数及对应X-*头关联。Bridge chunk范围256–4048 B（默认4048），设备返回next_offset并严格核对。长度/CRC/offset全部针对冻结传输字节。
+BEGIN/COMMIT载荷关联同一业务request及length/content_crc；完整正文带job、目标/预期context、对象内容。CHUNK的frame载荷是原始冻结字节，offset/request_id/session_nonce仍由查询参数及对应X-*头关联。Bridge chunk范围256–4048 B（默认4048），设备返回next_offset并严格核对。长度/CRC/offset全部针对冻结传输字节。
 
 `bundle_storage_protocol=2`的max_bundle_bytes来自实时空闲空间，零容量明确拒绝，不能恢复固定256/512 KiB产品上限。下载使用incoming，原内容继续运行；完成预检后才停止内容、显示内置维护画面，退役旧context/合同并覆盖content.bin；缓存/字体校验和小型BCS2提交记录完成后可运行。覆盖失败回内置恢复并认证重传，无旧包回退；原生固件OTA双槽保留。AP01应用加载/退出仍待实机验证。
 
@@ -193,7 +192,7 @@ BEGIN/COMMIT载荷关联同一业务request/nonce及length/content_crc；完整�
 
 ### 5.3 Wi-Fi载荷差异与错误
 
-Wi-Fi HTTP command的业务JSON当前仍可带protocol:2，BLE对应业务入口拒绝protocol/rv；二者外层都必须使用frame，不能把这一载荷差异解释成双协议降级。HTTP command的op=apply与BLE op=wifi_command/command=apply进入共享处理器，业务事务身份保持。
+HTTP/BLE都以具体frame opcode进入同一Wi-Fi处理器；apply使用wifi_apply，删除wifi_command包装及wifi_save别名。两端拒绝JSON op/command/session_nonce/protocol/rv，原持久事务ID、principal/namespace和回执高水位保留。
 
 401/403的发送前失败或明确拒绝进入确定失败；查询历史未知事务遇拒绝不能抹掉原sent/unknown。409保留revision_conflict/context等真实error/stage，不统一伪装occupied。格式/content-type/鉴权错误可能是未封帧的载体错误，不能因收到HTTP200或非frame错误页就当业务成功。
 
@@ -217,7 +216,7 @@ Service UUID：`e7f1a000-4b2a-4c9e-9a11-3c0d5e9a0000`。
 
 绑定并加密后写 Endpoint JSON：`schema=2`、host、port、token、bridge_id。设备将其与实际 bond identity 关联；不能通过提交任意 principal 绕过已有绑定更新规则。
 
-普通命令写 `e7f1a005`，使用48 B二进制头加JSON载荷；载荷包含 `op/request_id/device_mac/bridge_id/session_nonce/token`，Bridge 可附校时字段。`status` 是取得当前 nonce 的握手例外，不要求调用者已经知道 nonce。claim 另传 `operation_token`，当前普通入口拒绝 force/release。
+普通命令写 `e7f1a005`，使用48 B二进制头加JSON载荷；载荷包含 `request_id/device_mac/bridge_id/token`，op/session只在帧中编码，Bridge 可附校时字段。`status` 是取得当前 nonce 的握手例外，不要求调用者已经知道 nonce。claim 另传 `operation_token`，当前普通入口拒绝 force/release。
 
 其他已实现BLE命令包括`network_start`、`sync_config`、`sync_open`、有界 `history` 及 `wifi_*` 管理查询/控制。不能把未实现操作转发到旧 Usage/Template Data 特征以规避 `http_required`。
 
@@ -286,7 +285,7 @@ Bridge业务写入对完整frame分片；按48 B头中的payload_len判定完整
 
 ## 10. 相关实现与验收
 
-- [48 B编码](bridge-device-compact-envelope-design.md)：已实现外层frame，保留当前JSON字段的实际边界。
+- [48 B编码](bridge-device-compact-envelope-design.md)：C2唯一操作表及保留的业务身份/凭据边界。
 - [协议闭环](../project-workflow/bridge-macos/protocol-implementation-20261011.md)：BLE-only准入、ready与HTTP能力、401/403及409、Wi-Fi元数据修复。
 - [BOOT/GATT与计划/OTA](../project-workflow/bridge-macos/note4-boot-gatt-followup-20261011.md)：PPL1、物理窗口、原期限恢复、OTA确认和同名模板合同失效。
 - [电量平滑](../project-workflow/bridge-macos/note4-battery-smoothing-20261011.md)：仅本地显示处理，不改原始保护和数据协议。

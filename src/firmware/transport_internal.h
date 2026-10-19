@@ -28,6 +28,7 @@ struct State {
     // carry it there (the query/form fallback exists for simple curl tests).
     bool v2ReplyOverBle = false;
     String v2RequestId;
+    String commandPrincipal;
     bool v2HttpFrameActive = false;
     String v2HttpRaw, v2HttpToken, v2HttpLastFrame;
     CompactFrameHeader v2HttpFrame;

@@ -50,40 +50,27 @@ bool compactFrameDecode(const uint8_t *frame, size_t length, CompactFrameHeader 
     return true;
 }
 
+static const char *const operationNames[] = {"", "status", "data", "plan", "claim", "renew", "sync_begin", "sync_page", "sync_ack", "sync_complete", "bundle_begin", "bundle_chunk", "bundle_commit", "activate", "wifi_snapshot", "wifi_apply", "wifi_result", "wifi_result_ack", "wifi_match", "ota_image", "ready_report", "business_query", "network_start", "sync_config", "sync_open", "history", "wifi_owner", "wifi_info", "wifi_active", "wifi_trial", "wifi_activate", "wifi_setup_status", "wifi_setup_cancel", "wifi_status", "wifi_scheme_get", "wifi_capabilities"};
+const char *compactOperationName(uint16_t op) {return op && op <= COMPACT_FRAME_MAX_OP ? operationNames[op] : nullptr;}
 uint16_t compactOperation(const char *name) {
-    if (!name) return 0;
-    static const char *const names[] = {"", "status", "data", "plan", "claim", "renew",
-        "sync_begin", "sync_page", "sync_ack", "sync_complete", "bundle_begin",
-        "bundle_chunk", "bundle_commit", "activate", "wifi_snapshot", "wifi_apply",
-        "wifi_result", "wifi_result_ack", "wifi_command", "ota_image",
-        "ready_report", "business_query", "network_start", "sync_config",
-        "sync_open", "history", "wifi_owner", "wifi_info"};
-    for (uint16_t i = 1; i <= COMPACT_FRAME_MAX_OP; ++i)
-        if (!strcmp(name, names[i])) return i;
-    return !strncmp(name, "wifi_", 5) ? 18 : 0;
+    if (name) for (uint16_t i=1;i<=COMPACT_FRAME_MAX_OP;++i) if (!strcmp(name,operationNames[i])) return i;
+    return 0;
 }
 
 const char *v2ParseCommand(const String &body, JsonDocument &doc) {
     return deserializeJson(doc, body) ? "json" : nullptr;
 }
 
-V2CommandSessionDecision v2CheckCommandSession(
-    JsonDocument &doc, const String &currentMac, const String *sessionNonce) {
-    V2CommandSessionDecision decision;
+const char *CommandContext::validateIdentity(JsonDocument &doc) const {
     JsonString id = doc["request_id"].as<JsonString>();
     const char *request = doc["request_id"] | "";
-    if (!doc["protocol"].isNull() || !doc["rv"].isNull() ||
-        String(doc["device_mac"] | "") != currentMac ||
-        !id || id.size() != strlen(request) || !*request || strlen(request) > 64) return decision;
-    if (!sessionNonce) {
-        decision.needsNonce = true;
-        decision.error = nullptr;
-        return decision;
-    }
-    if (*sessionNonce != (doc["session_nonce"] | "")) return decision;
-    decision.accepted = true;
-    decision.error = nullptr;
-    return decision;
+    if (!doc["protocol"].isNull() || !doc["rv"].isNull() || !doc["session_nonce"].isNull()) return "retired_protocol";
+    if (strcmp(doc["device_mac"] | "", deviceMac) || !id ||
+        id.size()!=strlen(request) || !*request || id.size()>64) return "identity";
+    JsonString bridge=doc["bridge_id"].as<JsonString>();
+    if (!bridge || bridge.size()!=strlen(bridge.c_str()) || !bridge.size() ||
+        (principal && strcmp(bridge.c_str(),principal))) return "principal_mismatch";
+    return nullptr;
 }
 
 String v2BuildAck(const char *op, const char *result, const char *display,

@@ -422,10 +422,12 @@ class NativeProvider(OriginalProvider):
         session=secrets.token_bytes(16);number=0;nonce=''
         def frame(op,path,payload,claim=False,expected_status=200):
             nonlocal session,number
+            if not isinstance(payload,bytes):
+                payload={k:v for k,v in payload.items() if k not in ('op','session_nonce')}
             body=payload if isinstance(payload,bytes) else json.dumps(payload,separators=(',',':')).encode()
             for attempt in range(5):
                 number+=1
-                raw=struct.pack('>BBHHH',0xc1,0,op,0,len(body))+session+struct.pack('>Q',number)+bytes(16)+body
+                raw=struct.pack('>BBHHH',0xc2,0,op,0,len(body))+session+struct.pack('>Q',number)+bytes(16)+body
                 for transport_attempt in range(3):
                     try:
                         code,reply=self.http(self.port+1,'POST',path,raw,token,True,claim);break
@@ -435,7 +437,7 @@ class NativeProvider(OriginalProvider):
                         time.sleep(.1) # Query the SAME wire request/session/number.
                 if reply[:1]==b'{':value=json.loads(reply)
                 else:
-                    if len(reply)<48 or reply[0]!=0xc1 or int.from_bytes(reply[24:32],'big')!=number:raise RuntimeError('native CompactFrame correlation')
+                    if len(reply)<48 or reply[0]!=0xc2 or int.from_bytes(reply[24:32],'big')!=number:raise RuntimeError('native CompactFrame correlation')
                     session=reply[8:24];value=json.loads(reply[48:])
                 if code==503 and value.get('error')=='bindings_busy' and value.get('result')=='rejected':
                     self.report['native_binding_admission_retries']=self.report.get('native_binding_admission_retries',0)+1

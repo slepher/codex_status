@@ -31,6 +31,7 @@
 #include <string>
 #include <vector>
 
+extern "C" int codex_compact_operation(const char *name) {return compactOperation(name);}
 extern "C" int codex_compact_frame_golden(uint8_t *out, int cap) {
     if (!out || cap < int(COMPACT_FRAME_HEADER + 2)) return 0;
     CompactFrameHeader header;
@@ -1425,17 +1426,16 @@ int codex_v2_command_parse(const char *message, char *out, int cap) {
     else result["bridge_id"] = doc["bridge_id"] | "";
     return (int)serializeJson(result, out, (size_t)cap);
 }
-int codex_v2_command_check(const char *message, const char *current_mac,
-                           const char *nonce, char *out, int cap) {
-    if (!message || !current_mac || !nonce || !out || cap <= 0) return -99;
+int codex_command_identity(const char *message, const char *current_mac,
+                           const char *principal, char *out, int cap) {
+    if (!message || !current_mac || !out || cap <= 0) return -99;
     JsonDocument doc;
     if (v2ParseCommand(String(message), doc)) return -2;
-    String sessionNonce(nonce);
-    V2CommandSessionDecision decision = v2CheckCommandSession(
-        doc, String(current_mac), &sessionNonce);
+    CommandContext context{current_mac,principal};
+    const char *error=context.validateIdentity(doc);
     JsonDocument result;
-    result["accepted"] = decision.accepted;
-    if (decision.error) result["error"] = decision.error;
+    result["accepted"] = !error;
+    if (error) result["error"] = error;
     result["bridge_id"] = doc["bridge_id"] | "";
     result["request_id"] = doc["request_id"] | "";
     return (int)serializeJson(result, out, (size_t)cap);

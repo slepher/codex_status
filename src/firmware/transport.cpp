@@ -395,13 +395,9 @@ bool v2Command(const String &body, JsonDocument &doc) {
     const char *request = doc["request_id"] | "";
     state.v2RequestId = request;
     String currentMac = radio::macText();
-    V2CommandSessionDecision session = v2CheckCommandSession(doc, currentMac, nullptr);
-    if (session.needsNonce) {
-        const String &nonce = v2Nonce();
-        session = v2CheckCommandSession(doc, currentMac, &nonce);
-    }
-    if (!session.accepted) {
-        v2Ack("command", "rejected", "unchanged", "ram", "session", -1, 0, nullptr, UINT32_MAX);
+    CommandContext context{currentMac.c_str(),state.commandPrincipal.c_str()};
+    if (const char *error=context.validateIdentity(doc)) {
+        v2Ack("command", "rejected", "unchanged", "ram", error, -1, 0, nullptr, UINT32_MAX);
         return false;
     }
     if (!v2OwnerOk(doc["bridge_id"] | "")) return false;
@@ -438,7 +434,7 @@ static bool v2HttpBegin(uint16_t op) {
     CompactFrameHeader request;
     if (v2HttpRawOverflow || !compactFrameDecode(reinterpret_cast<const uint8_t *>(state.v2HttpRaw.c_str()),
                             state.v2HttpRaw.length(), request, 4096) ||
-        request.kind != 0 || request.op != op) {
+        request.kind != 0 || (request.op != op && !(op==18 && !strncmp(compactOperationName(request.op),"wifi_",5)))) {
         state.server.send(400, "application/json", "{\"error\":\"protocol_mismatch\",\"stage\":\"frame\"}");
         return false;
     }
@@ -452,6 +448,7 @@ static bool v2HttpBegin(uint16_t op) {
         !(op == 19 && authValid() && token == state.authToken)) {
         state.server.send(401, "application/json", "{\"error\":\"unauthorized\"}"); return false;
     }
+    state.commandPrincipal=endpoint.principal;
     state.v2HttpFrame = request;
     state.v2HttpFrameActive = true;
     compactDigest(state.v2HttpRaw, v2HttpCurrentDigest);
@@ -507,6 +504,18 @@ static bool v2HttpBegin(uint16_t op) {
                 "{\"result\":\"rejected\",\"error\":\"retired\",\"query\":\"original_business_id\"}");
         }
         return false;
+    }
+    if(op!=11) {
+        JsonDocument command;
+        if(deserializeJson(command,state.v2HttpBody) || !command.is<JsonObject>() ||
+            !command["op"].isNull() || !command["command"].isNull() || !command["session_nonce"].isNull() ||
+            !command["protocol"].isNull() || !command["rv"].isNull()) {
+            v2Response(400,"{\"result\":\"rejected\",\"error\":\"retired_protocol\",\"stage\":\"command\"}");return false;
+        }
+        const char *principal=op==4 ? (command["id"]|"") : (command["bridge_id"]|"");
+        if((op==4 || *principal) && endpoint.principal!=principal) {
+            v2Response(403,"{\"result\":\"rejected\",\"error\":\"principal_mismatch\",\"stage\":\"command\"}");return false;
+        }
     }
     v2HttpCacheReply = true;
     return true;
@@ -567,9 +576,11 @@ static void handleOtaImage() {
 
 // Keep claim temporaries off the already busy BLE dispatcher stack frame.
 static void __attribute__((noinline)) handleBleClaim(JsonDocument &doc) {
-    const V2CommandSessionDecision session = v2CheckCommandSession(doc, radio::macText(), &v2Nonce());
+    String mac=radio::macText();
+    CommandContext context{mac.c_str(),state.commandPrincipal.c_str()};
+    const bool identityValid=!context.validateIdentity(doc);
     const JsonString operationToken = doc["operation_token"].as<JsonString>();
-    const bool allowed = session.accepted && authValid() && operationToken &&
+    const bool allowed = identityValid && authValid() && operationToken &&
         operationToken.size() == strlen(operationToken.c_str()) &&
         state.authToken == operationToken.c_str() &&
         doc["force"].isNull() && doc["release"].isNull();
@@ -643,11 +654,11 @@ void serviceV2Ble() {
         v2Ack("command", "rejected", "unchanged", "ram", "payload", -1, 0, nullptr, UINT32_MAX);
         return;
     }
-    const char *frameOp = doc["op"] | "";
-    if (compactOperation(frameOp) != frame.op) {
-        v2Ack("command", "rejected", "unchanged", "ram", "operation", -1, 0, nullptr, UINT32_MAX);
+    if (!doc["op"].isNull() || !doc["command"].isNull() || !doc["session_nonce"].isNull()) {
+        v2Ack("command", "rejected", "unchanged", "ram", "retired_protocol", -1, 0, nullptr, UINT32_MAX);
         return;
     }
+    doc["op"] = compactOperationName(frame.op);
     uint8_t expectedSession[16] = {};
     if (frame.op == 1) {
         uint8_t empty[16] = {};
@@ -688,7 +699,7 @@ void serviceV2Ble() {
         if (storeGet(i, endpoint) && endpoint.token.length() &&
             endpoint.token == (doc["token"] | "") && endpoint.identity == identity &&
             endpoint.principal == (doc["bridge_id"]|"")) {
-            authenticated = true; break;
+            state.commandPrincipal=endpoint.principal;authenticated = true; break;
         }
     }
     String operation = doc["op"] | "";
@@ -709,15 +720,14 @@ void serviceV2Ble() {
             out["device_mac"]=radio::macText(); out["ok"]=false; out["error"]="unauthorized";
             v2BleNotify(out); return;
         }
-        if (operation=="wifi_command" || operation=="wifi_save" || operation=="wifi_result" || operation=="wifi_result_ack" ||
+        if (operation=="wifi_apply" || operation=="wifi_result" || operation=="wifi_result_ack" ||
             operation=="wifi_match" || operation=="wifi_active" || operation=="wifi_trial" || operation=="wifi_activate" ||
             operation=="wifi_setup_status" || operation=="wifi_setup_cancel" || operation=="wifi_snapshot" || operation=="wifi_status" || operation=="wifi_scheme_get") {
             EndpointRec endpoint;JsonDocument out;
             if(!storeAuthenticate(doc["token"]|"",endpoint) || endpoint.identity!=identity || endpoint.principal!=(doc["bridge_id"]|"")) {
                 out["ok"]=false;out["error"]="binding_required";out["device_mac"]=radio::macText();
             } else {
-                auto context=radio::wifiControlContext(endpoint,doc);context.generation=generation;
-                if(operation=="wifi_command")doc["op"]=doc["command"];
+                auto context=radio::wifiControlContext(endpoint);context.generation=generation;
                 if(operation=="wifi_status"){
                     JsonDocument status;radio::wifiDeviceStatus(status,&endpoint);status["session_nonce"]=v2Nonce();status["ok"]=true;
                     String text;serializeJson(status,text);deserializeJson(out,wifiSetupReadPage(doc,endpoint.nameSpace,generation,text));
@@ -796,8 +806,10 @@ void serviceV2Ble() {
             handleBleClaim(doc);
         } else if (!strcmp(op, "sync_config")) {
             OwnerRec current;
-            V2CommandSessionDecision session = v2CheckCommandSession(doc, radio::macText(), &v2Nonce());
-            if (!session.accepted || !doc["enabled"].is<bool>() || !ownerGet(current) ||
+            String mac=radio::macText();
+            CommandContext context{mac.c_str(),state.commandPrincipal.c_str()};
+            const bool identityValid=!context.validateIdentity(doc);
+            if (!identityValid || !doc["enabled"].is<bool>() || !ownerGet(current) ||
                 current.id != (doc["bridge_id"] | "") || !syncStoreAvailable()) {
                 v2Ack("sync_config", "rejected", "unchanged", "ram", "shape", -1, 0,
                       nullptr, UINT32_MAX);
@@ -824,7 +836,9 @@ void serviceV2Ble() {
             }
         } else if (!strcmp(op, "sync_open")) {
             OwnerRec current;
-            V2CommandSessionDecision session = v2CheckCommandSession(doc, radio::macText(), &v2Nonce());
+            String mac=radio::macText();
+            CommandContext context{mac.c_str(),state.commandPrincipal.c_str()};
+            const bool identityValid=!context.validateIdentity(doc);
             String openId = doc["open_id"] | "";
             String reason = doc["reason"] | "";
             bool idValid = openId.length() == 32;
@@ -838,7 +852,7 @@ void serviceV2Ble() {
             bool retry = reason == "retry" &&
                          (syncStoreActive(pending) || (sync::retained.syncRtc.flags & 4) || sync::retained.syncRtc.reasonBits);
             bool periodic = reason == "periodic" && sync::retained.syncRtc.rounds == 15 && (sync::retained.syncRtc.flags & 1);
-            const char *error = !session.accepted || !idValid || !wakeValid ? "session" :
+            const char *error = !identityValid || !idValid || !wakeValid ? "session" :
                                 !ownerGet(current) ? "claim_required" :
                                 current.id != (doc["bridge_id"] | "") ? "occupied" :
                                 !sync::state.syncEnabled || sync::state.syncOwner != current.id ? "disabled" :

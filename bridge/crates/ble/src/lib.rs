@@ -1486,9 +1486,8 @@ impl DeviceConnection {
             Box::pin(self.command_with_id_budget("status", json!({}), "session",
                 deadline.saturating_duration_since(tokio::time::Instant::now()))).await?;
         }
-        body["op"] = json!(op);
+        if let Some(object)=body.as_object_mut() {object.remove("op");object.remove("command");object.remove("session_nonce");}
         body["request_id"] = json!(id);
-        body["session_nonce"] = json!(self.nonce);
         body["bridge_id"] = json!(self.bridge_id);
         body["device_mac"] = json!(self.device_mac);
         body["token"] = json!(self.token);

@@ -92,6 +92,9 @@ pub fn wifi_error(error: &anyhow::Error) -> (&'static str, &'static str) {
                 _ => ("waiting_rendezvous", "http_unavailable"),
             };
         }
+        if cause.downcast_ref::<tokio::time::error::Elapsed>().is_some() {
+            return ("waiting_rendezvous", "transport_timeout");
+        }
         if let Some(io) = cause.downcast_ref::<std::io::Error>() {
             return if matches!(
                 io.kind(),

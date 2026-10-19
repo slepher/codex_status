@@ -21,8 +21,8 @@ impl Fake {
         let ready: Value = serde_json::from_str(&line).unwrap();
         let fake = Self { child, address: ready["http"].as_str().unwrap().trim_start_matches("http://").into(), dir };
         fake.post("/sim/power", "synthetic-control", br#"{"plugged":true}"#);
-        assert_eq!(bridge_core::device_client::claim(&fake.address, TOKEN, "synthetic-device",
-            &json!({"id":"bridge-test"}), Duration::from_secs(3)).unwrap().0, 200);
+        assert_eq!(http(bridge_core::device_client::claim(&fake.address, TOKEN, "synthetic-device",
+            &json!({"id":"bridge-test"}), Duration::from_secs(3))).unwrap().0, 200);
         fake
     }
     fn post(&self, path: &str, token: &str, body: &[u8]) {
@@ -33,11 +33,10 @@ impl Fake {
         let mut response = String::new(); stream.read_to_string(&mut response).unwrap();
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     }
-    fn status(&self) -> Value { bridge_core::device_client::status(&self.address, TOKEN, Duration::from_secs(3)).unwrap() }
+    fn status(&self) -> Value { http(bridge_core::device_client::status(&self.address, TOKEN, Duration::from_secs(3))).unwrap() }
     fn command(&self, op: &str, body: Value) -> anyhow::Result<Value> {
         let status = self.status();
-        bridge_core::device_client::wifi_command(&self.address, TOKEN, MAC, "bridge-test", op,
-            status["session_nonce"].as_str().unwrap(), body, Duration::from_secs(3))
+        http(bridge_core::device_client::wifi_command(&self.address, TOKEN, MAC, "bridge-test", op, body, Duration::from_secs(3)))
     }
     fn restart(self) -> Self {
         let dir = self.dir.clone(); drop(self); Self::start(dir)
@@ -75,18 +74,18 @@ fn stopped_job_settles_original_id_after_ack_loss_and_both_restarts() {
     let job = committed_job(&fake, &svc, &namespace, 0, 100);
     let before = serde_json::to_value(svc.wifi_state(MAC).snapshot).unwrap();
     let mut calls = Vec::new();
-    let pending = svc.wifi_settle(MAC, &job.job_id, "bridge-test", &namespace, 104, |op, body| {
+    let pending = ready(svc.wifi_settle_async(MAC, &job.job_id, "bridge-test", &namespace, 104,&mut |op: &str, body: Value| {
         calls.push(op.to_owned()); assert_eq!(body["query_id"], job.request_id);
         let reply = fake.command(op, body)?;
         if op == "result_ack" { assert_eq!(reply["outcome"], "retired"); anyhow::bail!("transport_timeout"); }
         Ok(reply)
-    }).unwrap().unwrap();
+    })).unwrap().unwrap();
     assert_eq!(calls, ["result", "result_ack"]); assert!(pending.receipt_ack_pending);
     assert!(!pending.confirmation_pending());
     drop(svc); let fake = fake.restart(); let svc = PlatformService::open(&root.join("bridge")).unwrap();
-    let done = svc.wifi_settle(MAC, &job.job_id, "bridge-test", &namespace, 165, |op, body| {
+    let done = ready(svc.wifi_settle_async(MAC, &job.job_id, "bridge-test", &namespace, 165,&mut |op: &str, body: Value| {
         assert_eq!(op, "result_ack"); assert_eq!(body["query_id"], job.request_id); fake.command(op, body)
-    }).unwrap().unwrap();
+    })).unwrap().unwrap();
     assert_eq!(done.state, "cancelled"); assert!(!done.runnable(1000)); assert!(!done.receipt_ack_pending);
     assert_eq!(before, serde_json::to_value(svc.wifi_state(MAC).snapshot).unwrap());
     assert_eq!(fake.command("result", json!({"query_id":job.request_id})).unwrap()["outcome"], "retired");
@@ -101,20 +100,20 @@ fn unknown_and_identity_mismatch_never_ack_and_budget_requires_explicit_retry() 
     svc.wifi_mark_sent(MAC, &job.job_id, 101).unwrap();
     svc.wifi_finish(MAC, &job.job_id, "cancelled", None, 102).unwrap();
     for (principal, ns) in [("other", namespace.as_str()), ("bridge-test", "another")] {
-        assert!(svc.wifi_settle(MAC, &job.job_id, principal, ns, 103, |_, _| panic!("identity mismatch sent a command")).is_err());
+        assert!(ready(svc.wifi_settle_async(MAC, &job.job_id, principal, ns, 103,&mut |_: &str, _: Value| panic!("identity mismatch sent a command"))).is_err());
     }
     for now in [103, 164, 225] {
-        let unresolved = svc.wifi_settle(MAC, &job.job_id, "bridge-test", &namespace, now, |op, body| {
+        let unresolved = ready(svc.wifi_settle_async(MAC, &job.job_id, "bridge-test", &namespace, now,&mut |op: &str, body: Value| {
             assert_eq!(op, "result"); fake.command(op, body)
-        }).unwrap().unwrap();
+        })).unwrap().unwrap();
         assert!(unresolved.confirmation_pending()); assert!(!unresolved.receipt_ack_pending);
     }
     drop(svc); let svc = PlatformService::open(&root.join("bridge")).unwrap();
-    assert!(svc.wifi_settle(MAC, &job.job_id, "bridge-test", &namespace, 999, |_, _| panic!("exhausted budget sent command")).unwrap().is_none());
+    assert!(ready(svc.wifi_settle_async(MAC, &job.job_id, "bridge-test", &namespace, 999,&mut |_: &str, _: Value| panic!("exhausted budget sent command"))).unwrap().is_none());
     svc.wifi_retry_settlement(MAC, &job.job_id).unwrap();
-    let still_unknown = svc.wifi_settle(MAC, &job.job_id, "bridge-test", &namespace, 1000, |op, body| {
+    let still_unknown = ready(svc.wifi_settle_async(MAC, &job.job_id, "bridge-test", &namespace, 1000,&mut |op: &str, body: Value| {
         assert_eq!(op, "result"); fake.command(op, body)
-    }).unwrap().unwrap();
+    })).unwrap().unwrap();
     assert_eq!(still_unknown.state, "cancelled"); assert!(still_unknown.confirmation_pending());
 }
 
@@ -134,13 +133,13 @@ fn eight_device_receipts_and_thirty_two_bridge_jobs_require_proven_ack_to_releas
     }
     assert_eq!(svc.wifi_queue_control(MAC, "bridge-test", "activate", json!({"network_id":"home","version":1}), 300).unwrap_err().to_string(), "wifi_job_capacity");
     let first = &jobs[0];
-    svc.wifi_settle(MAC, &first.job_id, "bridge-test", &namespace, 301, |op, body| {
+    ready(svc.wifi_settle_async(MAC, &first.job_id, "bridge-test", &namespace, 301,&mut |op: &str, body: Value| {
         if op == "result_ack" { anyhow::bail!("transport_timeout"); } fake.command(op, body)
-    }).unwrap();
+    })).unwrap();
     assert_eq!(svc.wifi_queue_control(MAC, "bridge-test", "activate", json!({"network_id":"home","version":1}), 302).unwrap_err().to_string(), "wifi_job_capacity");
-    svc.wifi_settle(MAC, &first.job_id, "bridge-test", &namespace, 362, |op, body| {
+    ready(svc.wifi_settle_async(MAC, &first.job_id, "bridge-test", &namespace, 362,&mut |op: &str, body: Value| {
         assert_eq!(op, "result_ack"); fake.command(op, body)
-    }).unwrap();
+    })).unwrap();
     let next = svc.wifi_queue_control(MAC, "bridge-test", "activate", json!({"network_id":"home","version":1}), 363).unwrap();
     assert_eq!(svc.wifi_state(MAC).jobs.len(), 32);
     let accepted = fake.command("apply", json!({"request_id":next.request_id,"expected_revision":8,
@@ -156,12 +155,12 @@ fn committed_write_settles_after_expiry_or_execution_confirmation_budget_exhaust
     for reason in ["expired", "budget"] {
         let (_root, fake, svc, namespace) = fixture(reason);
         let job = svc.wifi_queue(MAC, "bridge-test", "recovery_save", vec!["home".into()], 100).unwrap();
-        let initial = svc.wifi_attempt(MAC, &job.job_id, "bridge-test", &namespace, true,
-            &Default::default(), 101, |op, body| {
+        let initial = ready(svc.wifi_attempt_async(MAC, &job.job_id, "bridge-test", &namespace, true,
+            &Default::default(), 101,&mut |op: &str, body: Value| {
                 let reply = fake.command(op, body)?;
                 if op == "apply" { assert_eq!(reply["outcome"], "committed"); anyhow::bail!("transport_timeout"); }
                 Ok(reply)
-            }).unwrap().unwrap();
+            })).unwrap().unwrap();
         assert!(initial.sent && initial.confirmation_pending());
         let terminal = if reason == "expired" {
             // Admission expiration uses the job's real persisted expiry.
@@ -170,23 +169,38 @@ fn committed_write_settles_after_expiry_or_execution_confirmation_budget_exhaust
         } else {
             let mut terminal = initial;
             for now in [201, 301, 401] {
-                terminal = svc.wifi_attempt(MAC, &job.job_id, "bridge-test", &namespace, true,
-                    &Default::default(), now, |op, body| {
+                terminal = ready(svc.wifi_attempt_async(MAC, &job.job_id, "bridge-test", &namespace, true,
+                    &Default::default(), now,&mut |op: &str, body: Value| {
                         assert_eq!(op, "result"); assert_eq!(body["query_id"], job.request_id);
                         anyhow::bail!("transport_timeout")
-                    }).unwrap().unwrap();
+                    })).unwrap().unwrap();
             }
             assert_eq!(terminal.error_code.as_deref(), Some("confirmation_budget_exhausted"));
             terminal
         };
         assert!(terminal.terminal());
-        let settled = svc.wifi_settle(MAC, &job.job_id, "bridge-test", &namespace,
-            terminal.expires_at + 2, |op, body| {
+        let settled = ready(svc.wifi_settle_async(MAC, &job.job_id, "bridge-test", &namespace,
+            terminal.expires_at + 2,&mut |op: &str, body: Value| {
                 assert!(matches!(op, "result" | "result_ack"));
                 assert_eq!(body["query_id"], job.request_id); fake.command(op, body)
-            }).unwrap().unwrap();
+            })).unwrap().unwrap();
         assert_eq!(settled.state, terminal.state);
         assert!(!settled.confirmation_pending() && !settled.receipt_ack_pending);
         assert!(!settled.runnable(u64::MAX));
+    }
+}
+
+// This synchronous process/socket harness joins the async client before returning.
+// A scoped runtime also works inside its existing BLE runtime fixtures.
+fn http<F: std::future::Future + Send>(future: F) -> F::Output where F::Output: Send {
+    std::thread::scope(|scope| scope.spawn(|| tokio::runtime::Builder::new_current_thread()
+        .enable_all().build().unwrap().block_on(future)).join().unwrap())
+}
+
+fn ready<F: std::future::Future>(future:F)->F::Output {
+    let mut future=std::pin::pin!(future);
+    match future.as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop())) {
+        std::task::Poll::Ready(value)=>value,
+        std::task::Poll::Pending=>panic!("synchronous fixture suspended"),
     }
 }

@@ -413,11 +413,7 @@ impl Store {
 
 /// Run a frozen transfer over the existing Bridge -> device HTTP direction.
 /// A transport error leaves the checkpoint intact for the next Wi-Fi opening.
-pub fn transfer(data_root: &Path, link: &DeviceLink) -> Result<Value> {
-    transfer_with_budget(data_root, link, bridge_core::rendezvous::Budget::new(Duration::from_secs(90)))
-}
-
-pub fn transfer_with_budget(data_root: &Path, link: &DeviceLink, budget: bridge_core::rendezvous::Budget) -> Result<Value> {
+pub async fn transfer_with_budget(data_root: &Path, link: &DeviceLink, budget: bridge_core::rendezvous::Budget) -> Result<Value> {
     let compact_mac = DeviceIdentity::normalized_mac(&link.mac)
         .context("sync device MAC invalid")?;
     let wire_mac = compact_mac.as_bytes().chunks(2)
@@ -426,11 +422,11 @@ pub fn transfer_with_budget(data_root: &Path, link: &DeviceLink, budget: bridge_
     let timeout = Duration::from_secs(15);
     let mut status = None;
     for attempt in 0..3 {
-        match device_client::status(&link.ip, &link.token, budget.remaining().min(timeout)) {
+        match device_client::status(&link.ip, &link.token, budget.remaining().min(timeout)).await {
             Ok(value) => { status = Some(value); break; }
             Err(error) if error.to_string().contains("401") => return Err(error),
             Err(error) if attempt == 2 => return Err(error).context("sync Wi-Fi association unavailable"),
-            Err(_) => std::thread::sleep(budget.remaining().min(Duration::from_secs(if attempt == 0 { 1 } else { 3 }))),
+            Err(_) => tokio::time::sleep(budget.remaining().min(Duration::from_secs(if attempt == 0 { 1 } else { 3 }))).await,
         }
     }
     let status = status.context("sync Wi-Fi status unavailable")?;
@@ -443,15 +439,15 @@ pub fn transfer_with_budget(data_root: &Path, link: &DeviceLink, budget: bridge_
     let mut store = Store::open(data_root, &compact_mac, &link.bridge_id)?;
     store.retire_lost_ack(&status)?;
     let mut request = 0u32;
-    let mut call = |op: &str, fields: Value| -> Result<Value> {
+    let mut call = async |op: &str, fields: Value| -> Result<Value> {
         request += 1;
         let id = format!("sync-{op}-{request}");
         device_client::sync(&link.ip, &link.token, &wire_mac, &link.bridge_id,
-            nonce, op, &id, &fields, budget.remaining().min(timeout))
+            nonce, op, &id, &fields, budget.remaining().min(timeout)).await
     };
     if store.awaiting_ack() {
         let id = store.batch_id().context("missing completed batch id")?.to_owned();
-        let reply = call("complete", json!({"batch_id":id,"bytes":store.bytes(),"sha256":store.hash()}))?;
+        let reply = call("complete", json!({"batch_id":id,"bytes":store.bytes(),"sha256":store.hash()})).await?;
         store.mark_complete()?;
         return Ok(json!({"result":"complete","receipt":reply["receipt"]}));
     }
@@ -468,7 +464,7 @@ pub fn transfer_with_budget(data_root: &Path, link: &DeviceLink, budget: bridge_
                       if due { reasons.push(json!("periodic")); }
                       Value::Array(reasons)
                   };
-    let manifest = call("begin", json!({"client_serial":serial.to_string(),"reasons":reasons}))?;
+    let manifest = call("begin", json!({"client_serial":serial.to_string(),"reasons":reasons})).await?;
     if manifest["result"] == "already_complete" {
         bail!("archive_lost: device completed a batch without a durable local archive");
     }
@@ -480,12 +476,12 @@ pub fn transfer_with_budget(data_root: &Path, link: &DeviceLink, budget: bridge_
     let mut failures = 0u8;
     if store.offset() > 0 {
         let (_, prefix) = store.append_page(0, &[])?;
-        call("ack", json!({"batch_id":id,"offset":store.offset(),"prefix_sha256":prefix}))?;
+        call("ack", json!({"batch_id":id,"offset":store.offset(),"prefix_sha256":prefix})).await?;
     }
     while store.offset() < bytes {
         if last_progress.elapsed() >= Duration::from_secs(90) { bail!("sync_incomplete: 90s without durable progress"); }
         let offset = store.offset();
-        let page = match call("page", json!({"batch_id":id,"offset":offset,"limit":1024})) {
+        let page = match call("page", json!({"batch_id":id,"offset":offset,"limit":1024})).await {
             Ok(page) => { failures = 0; page },
             Err(error) => {
                 failures += 1;
@@ -504,7 +500,7 @@ pub fn transfer_with_budget(data_root: &Path, link: &DeviceLink, budget: bridge_
         last_progress = Instant::now();
         let mut ack_errors = 0;
         loop {
-            match call("ack", json!({"batch_id":id,"offset":durable,"prefix_sha256":prefix})) {
+            match call("ack", json!({"batch_id":id,"offset":durable,"prefix_sha256":prefix})).await {
                 Ok(reply) if reply["acked_offset"] == durable => break,
                 Ok(_) => bail!("sync ACK offset mismatch"),
                 Err(error) => {
@@ -515,7 +511,7 @@ pub fn transfer_with_budget(data_root: &Path, link: &DeviceLink, budget: bridge_
         }
     }
     store.finish()?;
-    let reply = call("complete", json!({"batch_id":id,"bytes":bytes,"sha256":hash}))?;
+    let reply = call("complete", json!({"batch_id":id,"bytes":bytes,"sha256":hash})).await?;
     store.mark_complete()?;
     Ok(json!({"result":"complete","batch_id":id,"bytes":bytes,"receipt":reply["receipt"]}))
 }
@@ -529,9 +525,9 @@ mod tests {
     // Run explicitly with CODEX_STATUS_SYNC_TEST_SIM_EXE set to the isolated
     // device-sim binary. The production Bridge archive path drives a real
     // Note4 Fake ROM HTTP server; no in-memory page stub is involved.
-    #[test]
+    #[tokio::test]
     #[ignore = "requires CODEX_STATUS_SYNC_TEST_SIM_EXE"]
-    fn sync_v1_bridge_archive_against_note4_fake_rom() {
+    async fn sync_v1_bridge_archive_against_note4_fake_rom() {
         let exe = std::env::var("CODEX_STATUS_SYNC_TEST_SIM_EXE")
             .expect("set CODEX_STATUS_SYNC_TEST_SIM_EXE");
         let dir = tempfile::tempdir().unwrap();
@@ -543,7 +539,7 @@ mod tests {
             .env("CODEX_STATUS_SIM_DEVICE_TOKEN", "sync-device")
             .env("CODEX_STATUS_SIM_CONTROL_TOKEN", "sync-control")
             .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-        let result = (|| -> Result<()> {
+        let result: Result<()> = async {
             let mut line = String::new();
             BufReader::new(child.stdout.as_mut().unwrap()).read_line(&mut line)?;
             let ready: Value = serde_json::from_str(&line).context("Fake ROM startup ready JSON")?;
@@ -551,14 +547,13 @@ mod tests {
                 .trim_start_matches("http://").to_owned();
             let (claim_code,claim_body)=bridge_core::device_client::claim(
                 &address,"sync-endpoint","sync-device",
-                &json!({"id":"bridge-test","lease":"120"}),Duration::from_secs(3))?;
+                &json!({"id":"bridge-test","lease":"120"}),Duration::from_secs(3)).await?;
             anyhow::ensure!(claim_code==200,"Fake ROM claim HTTP {claim_code}");
             let claim:Value=serde_json::from_str(&claim_body)?;
             anyhow::ensure!(claim["owner"]["id"] == "bridge-test", "Fake ROM claim failed: {claim}");
             std::env::set_var("CODEX_STATUS_SIM_BLE_ENDPOINTS",
                 json!({"0200000000B2":ready["http"]}).to_string());
-            let runtime=tokio::runtime::Runtime::new()?;
-            let ack=runtime.block_on(async {
+            let ack=async {
                 let mut link=bridge_ble::DeviceConnection::connect(
                     "0200000000B2","sync-endpoint","bridge-test").await?
                     .context("Fake ROM BLE endpoint unavailable")?;
@@ -566,12 +561,12 @@ mod tests {
                 let ack=link.command("sync_config",json!({"enabled":true})).await?;
                 link.close_bounded(Duration::from_millis(200)).await;
                 Ok::<Value,anyhow::Error>(ack)
-            })?;
+            }.await?;
             std::env::remove_var("CODEX_STATUS_SIM_BLE_ENDPOINTS");
             anyhow::ensure!(ack["result"] == "applied", "Fake ROM config failed: {ack}");
             let link = DeviceLink { mac: "0200000000B2".into(), ip: address,
                 token: "sync-endpoint".into(), bridge_id: "bridge-test".into() };
-            let transfer_result = transfer(&dir.path().join("bridge"), &link)?;
+            let transfer_result = transfer_with_budget(&dir.path().join("bridge"), &link, bridge_core::rendezvous::Budget::new(Duration::from_secs(90))).await?;
             anyhow::ensure!(transfer_result["result"] == "complete",
                 "Bridge transfer incomplete: {transfer_result}");
             let archive = dir.path().join("bridge/platform/diagnostics/0200000000B2")
@@ -582,10 +577,10 @@ mod tests {
                 .and_then(DeviceIdentity::normalized_mac).as_deref() == Some(link.mac.as_str()) &&
                 body["format"] == "device-sync-1",
                 "Bridge archive identity mismatch");
-            anyhow::ensure!(transfer(&dir.path().join("bridge"), &link)?["result"] == "idle",
+            anyhow::ensure!(transfer_with_budget(&dir.path().join("bridge"), &link, bridge_core::rendezvous::Budget::new(Duration::from_secs(90))).await?["result"] == "idle",
                 "completed batch did not become idle");
             Ok(())
-        })();
+        }.await;
         let _ = child.kill();
         let _ = child.wait();
         let mut diagnostic = String::new();

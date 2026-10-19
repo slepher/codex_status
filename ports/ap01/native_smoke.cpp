@@ -60,7 +60,7 @@ struct Client {
         return reply;
     }
     std::string body(const Ap01HttpReply &r) { return text(r.bytes).substr(r.frame?48:0); }
-    std::string command(const char *id) { return "\"bridge_id\":\"bridge-test\",\"device_mac\":\"AABBCCDDEEFF\",\"session_nonce\":\""+nonce+"\",\"request_id\":\""+id+"\""; }
+    std::string command(const char *id) { return std::string("\"bridge_id\":\"bridge-test\",\"device_mac\":\"AABBCCDDEEFF\",\"request_id\":\"")+id+"\""; }
     void status() {
         auto reply=send(1,"/api/status","{}"); assert(reply.status==200);
         LocalJsonAllocator a; JsonDocument doc(&a); assert(!deserializeJson(doc,body(reply).c_str())); nonce=doc["session_nonce"].as<const char *>();
@@ -141,7 +141,7 @@ int main(int argc,char **argv) {
         auto receipt=content.store.bsActivationReceipt(); assert(receipt && !strcmp(receipt->request,"activate-test"));
         Ap01Application app(fs,content,{&host,randomBytes,lock,unlock},"AABBCCDDEEFF",2); assert(app.begin()); app.businessOnline(true);
         Client client{app}; client.status(); client.claim();
-        LocalJsonAllocator a; JsonDocument old(&a); auto activation=readAll(argv[3]); assert(!deserializeJson(old,activation.c_str())); old["session_nonce"]=client.nonce.c_str();
+        LocalJsonAllocator a; JsonDocument old(&a); auto activation=readAll(argv[3]); assert(!deserializeJson(old,activation.c_str())); old.remove("session_nonce");
         String refreshed; serializeJson(old,refreshed);
         auto replay=client.send(13,"/api/activate",text(refreshed)); assert(replay.status==200); assert(content.active()==1);
         std::string discover="{\"magic\":\"codex-status\",\"kind\":\"discover\",\"discovery_v\":1,\"nonce\":\"0123456789abcdef0123456789abcdef\"}";

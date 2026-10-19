@@ -35,7 +35,7 @@ fn data(endpoint:&str,mac:&str,status:&Value,seq:u64,usage:&Value)->Value {
     }).collect();
     let body=json!({"bridge_id":BRIDGE,"active_context_id":status["active_context_id"],"seq":seq,
         "crc":format!("{:08x}",data_fields_crc(&fields)),"fields":fields});
-    client::data(endpoint,TOKEN,mac,&body,TIMEOUT).unwrap()
+    http(client::data(endpoint,TOKEN,mac,&body,TIMEOUT)).unwrap()
 }
 
 #[test]
@@ -48,37 +48,37 @@ fn discover_pair_publish_and_sync_without_power_plan() {
     assert_eq!(discovery.candidates.len(),1);let candidate=&discovery.candidates[0];
     assert_eq!(candidate.device_mac,"02000000A001");
     let maintenance=&candidate.maintenance_endpoint;let endpoint=&candidate.endpoint;assert_ne!(maintenance,endpoint);let mac=&candidate.device_mac;
-    let (code,info)=client::pairing_request(maintenance,"GET","/api/pairing/info","",None,TIMEOUT).unwrap();
+    let (code,info)=http(client::pairing_request(maintenance,"GET","/api/pairing/info","",None,TIMEOUT)).unwrap();
     assert_eq!(code,200);ap01::validate_info(candidate,&info).unwrap();
     let request=format!("pair-{}",candidate.boot_id);
     let body=json!({"device_mac":mac,"boot_id":info["boot_id"],"pairing_revision":info["pairing_revision"],
         "request_id":request,"bridge_id":BRIDGE,"name":"AP01 test computer","display_code":"4827","binding_token":TOKEN});
-    let (code,reply)=client::pairing_request(maintenance,"POST","/api/pairing","",Some(&body),TIMEOUT).unwrap();
+    let (code,reply)=http(client::pairing_request(maintenance,"POST","/api/pairing","",Some(&body),TIMEOUT)).unwrap();
     assert_eq!(code,202,"{reply}");assert_eq!(reply["result"],"pending_display");
-    assert!(client::status(endpoint,TOKEN,TIMEOUT).is_err(),"candidate token must not authenticate before the knob confirmation");
+    assert!(http(client::status(endpoint,TOKEN,TIMEOUT)).is_err(),"candidate token must not authenticate before the knob confirmation");
     stage(&root,"pending-display",&json!({}));gate(&root,"pending-display");
     let deadline=Instant::now()+Duration::from_secs(15);
     loop {
-        let (_,reply)=client::pairing_request(maintenance,"GET",&format!("/api/pairing/{request}"),TOKEN,None,TIMEOUT).unwrap();
+        let (_,reply)=http(client::pairing_request(maintenance,"GET",&format!("/api/pairing/{request}"),TOKEN,None,TIMEOUT)).unwrap();
         if reply["state"]=="awaiting_confirmation"{break;}
         assert!(Instant::now()<deadline,"UI never confirmed the actual popup: {reply}");std::thread::sleep(Duration::from_millis(50));
     }
     stage(&root,"awaiting_confirmation",&json!({"mac":mac,"code":"4827"}));
     gate(&root,"stale-release");
-    let (_,reply)=client::pairing_request(maintenance,"GET",&format!("/api/pairing/{request}"),TOKEN,None,TIMEOUT).unwrap();
+    let (_,reply)=http(client::pairing_request(maintenance,"GET",&format!("/api/pairing/{request}"),TOKEN,None,TIMEOUT)).unwrap();
     assert_eq!(reply["state"],"awaiting_confirmation","old held button must not approve");
     stage(&root,"fresh-confirmation",&json!({}));
     let deadline=Instant::now()+Duration::from_secs(20);
     loop {
-        let (_,reply)=client::pairing_request(maintenance,"GET",&format!("/api/pairing/{request}"),TOKEN,None,TIMEOUT).unwrap();
+        let (_,reply)=http(client::pairing_request(maintenance,"GET",&format!("/api/pairing/{request}"),TOKEN,None,TIMEOUT)).unwrap();
         if reply["state"]=="approved"{break;}
         assert!(Instant::now()<deadline,"physical confirmation not persisted: {reply}");std::thread::sleep(Duration::from_millis(50));
     }
-    let before=client::status(endpoint,TOKEN,TIMEOUT).unwrap();assert_eq!(before["configured"],false);
+    let before=http(client::status(endpoint,TOKEN,TIMEOUT)).unwrap();assert_eq!(before["configured"],false);
     assert_eq!(before["fw_target"],"cuktech-ap01-0041");
     assert_eq!(before["power_mode"],"always_on");assert_eq!(before["power_plan"],false);
-    let (code,claim)=client::claim(endpoint,TOKEN,TOKEN,&json!({"device_mac":mac,"bridge_id":BRIDGE,
-        "request_id":"claim-test","name":"AP01 test computer","host":"127.0.0.1","port":18765,"lease_s":300}),TIMEOUT).unwrap();
+    let (code,claim)=http(client::claim(endpoint,TOKEN,TOKEN,&json!({"device_mac":mac,"bridge_id":BRIDGE,
+        "request_id":"claim-test","name":"AP01 test computer","host":"127.0.0.1","port":18765,"lease_s":300}),TIMEOUT)).unwrap();
     assert_eq!(code,200,"{claim}");
     let mut source:Value=serde_json::from_str(include_str!("../../../../tools/test-bridge/templates/codex-status-ap01.json")).unwrap();
     let compiled=bridge_core::compile::compile(&source,RENDER_TARGET_AP01).unwrap();
@@ -98,56 +98,63 @@ fn discover_pair_publish_and_sync_without_power_plan() {
         "templates":[{"key":{"template_id":"codex-status-a","render_target":RENDER_TARGET_AP01},"source":source,"compiled":compiled},
             {"key":{"template_id":"codex-status-b","render_target":RENDER_TARGET_AP01},"source":second,"compiled":second_compiled}],
         "resources":[],"fonts":fonts});
-    let installed=client::install_bundle(endpoint,TOKEN,mac,BRIDGE,&bridge_core::template::canonical_bytes(&bundle),1024,TIMEOUT).unwrap();
+    let installed=http(client::install_bundle(endpoint,TOKEN,mac,BRIDGE,&bridge_core::template::canonical_bytes(&bundle),1024,TIMEOUT)).unwrap();
     assert_eq!(installed["result"],"applied","{installed}");
-    let status=client::status(endpoint,TOKEN,TIMEOUT).unwrap();
+    let status=http(client::status(endpoint,TOKEN,TIMEOUT)).unwrap();
     assert_eq!(status["active_template_id"],"codex-status-a");assert!(!status["data_contract"].is_null());
-    assert_eq!(client::plan(endpoint,TOKEN,mac,&json!({"bridge_id":BRIDGE,"mode":"light","plan_id":1}),TIMEOUT).unwrap()["error"],"power_plan_unsupported");
+    assert_eq!(http(client::plan(endpoint,TOKEN,mac,&json!({"bridge_id":BRIDGE,"mode":"light","plan_id":1}),TIMEOUT)).unwrap()["error"],"power_plan_unsupported");
     let original_boot=status["boot_id"].clone();
     for (seq,name,remain,five,rc) in [(1,"weekly",98,None,true),(2,"both",72,Some(86),true),
         (3,"no-rc",72,Some(86),false),(4,"zero",0,Some(0),true)] {
         let ack=data(endpoint,mac,&status,seq,&envelope(remain,five,rc));assert_eq!(ack["result"],"applied","{ack}");
-        let actual=client::status(endpoint,TOKEN,TIMEOUT).unwrap();assert_eq!(actual["applied_seq"],seq);
+        let actual=http(client::status(endpoint,TOKEN,TIMEOUT)).unwrap();assert_eq!(actual["applied_seq"],seq);
         stage(&root,name,&actual);gate(&root,name);
-        let displayed=client::status(endpoint,TOKEN,TIMEOUT).unwrap();
+        let displayed=http(client::status(endpoint,TOKEN,TIMEOUT)).unwrap();
         assert_eq!(displayed["frame_generation"],displayed["displayed_generation"],"real UI must acknowledge the frame");
         let duplicate=data(endpoint,mac,&status,seq,&envelope(remain,five,rc));
         assert_eq!(duplicate["display_state"],"unchanged");
     }
     stage(&root,"rotate-next",&json!({}));gate(&root,"rotate-next");
-    let second_status=client::status(endpoint,TOKEN,TIMEOUT).unwrap();
+    let second_status=http(client::status(endpoint,TOKEN,TIMEOUT)).unwrap();
     assert_eq!(second_status["active_template_id"],"codex-status-b");
     assert_ne!(second_status["active_context_id"],status["active_context_id"]);
     assert_eq!(data(endpoint,mac,&second_status,1,&envelope(98,None,true))["result"],"applied");
-    stage(&root,"second",&client::status(endpoint,TOKEN,TIMEOUT).unwrap());gate(&root,"second");
+    stage(&root,"second",&http(client::status(endpoint,TOKEN,TIMEOUT)).unwrap());gate(&root,"second");
     // An occupied device never shows a different Bridge's popup.
-    let (_,info)=client::pairing_request(maintenance,"GET","/api/pairing/info","",None,TIMEOUT).unwrap();
+    let (_,info)=http(client::pairing_request(maintenance,"GET","/api/pairing/info","",None,TIMEOUT)).unwrap();
     let mut other=body.clone();other["bridge_id"]=json!("other-computer");other["request_id"]=json!("other-pair");
     other["binding_token"]=json!("fedcba98765432100123456789abcdef");other["pairing_revision"]=info["pairing_revision"].clone();
-    let (code,reply)=client::pairing_request(maintenance,"POST","/api/pairing","",Some(&other),TIMEOUT).unwrap();
+    let (code,reply)=http(client::pairing_request(maintenance,"POST","/api/pairing","",Some(&other),TIMEOUT)).unwrap();
     assert_eq!(code,409);assert_eq!(reply["error"],"occupied");
     stage(&root,"restart",&json!({"boot_id":original_boot}));gate(&root,"restart");
-    let recovered=client::status(endpoint,TOKEN,TIMEOUT).unwrap();
+    let recovered=http(client::status(endpoint,TOKEN,TIMEOUT)).unwrap();
     assert_ne!(recovered["boot_id"],original_boot);assert_eq!(recovered["configured"],true);
     assert_eq!(recovered["active_template_id"],"codex-status-b");
-    let (code,_)=client::claim(endpoint,TOKEN,TOKEN,&json!({"device_mac":mac,"bridge_id":BRIDGE,
-        "request_id":"claim-reboot","lease_s":300}),TIMEOUT).unwrap();assert_eq!(code,200);
+    let (code,_)=http(client::claim(endpoint,TOKEN,TOKEN,&json!({"device_mac":mac,"bridge_id":BRIDGE,
+        "request_id":"claim-reboot","lease_s":300}),TIMEOUT)).unwrap();assert_eq!(code,200);
     assert_eq!(data(endpoint,mac,&recovered,1,&envelope(98,None,true))["result"],"applied");
-    stage(&root,"restored",&client::status(endpoint,TOKEN,TIMEOUT).unwrap());gate(&root,"restored");
-    let (code,health)=client::pairing_request(maintenance,"GET","/health",TOKEN,None,TIMEOUT).unwrap();
+    stage(&root,"restored",&http(client::status(endpoint,TOKEN,TIMEOUT)).unwrap());gate(&root,"restored");
+    let (code,health)=http(client::pairing_request(maintenance,"GET","/health",TOKEN,None,TIMEOUT)).unwrap();
     assert_eq!(code,200);assert_eq!(health["service"],"ap01-maintenance");
-    assert_eq!(client::pairing_request(maintenance,"GET","/health","",None,TIMEOUT).unwrap().0,401);
+    assert_eq!(http(client::pairing_request(maintenance,"GET","/health","",None,TIMEOUT)).unwrap().0,401);
     // No Codex data/status surface is served from the maintenance listener.
-    assert!(client::status(maintenance,TOKEN,TIMEOUT).is_err());
+    assert!(http(client::status(maintenance,TOKEN,TIMEOUT)).is_err());
     stage(&root,"business-stop",&json!({}));gate(&root,"business-stop");
-    assert!(client::status(endpoint,TOKEN,Duration::from_millis(500)).is_err());
-    let (code,health)=client::pairing_request(maintenance,"GET","/health",TOKEN,None,TIMEOUT).unwrap();
+    assert!(http(client::status(endpoint,TOKEN,Duration::from_millis(500))).is_err());
+    let (code,health)=http(client::pairing_request(maintenance,"GET","/health",TOKEN,None,TIMEOUT)).unwrap();
     assert_eq!(code,200);assert_eq!(health["business_online"],false);
-    let (code,info)=client::pairing_request(maintenance,"GET","/api/pairing/info","",None,TIMEOUT).unwrap();
+    let (code,info)=http(client::pairing_request(maintenance,"GET","/api/pairing/info","",None,TIMEOUT)).unwrap();
     assert_eq!(code,200);assert_eq!(info["mac"].as_str(),Some(mac.as_str()));
     // Keep the source variable alive to make its lifetime distinct from the
     // installed bundle; editing a draft does not mutate the installed profile.
     source["version"]=json!(2);
     stage(&root,"complete",&json!({"result":"passed","discovery":true,"physical_pairing":true,
         "full_bundle_fonts":true,"independent_maintenance_http":true,"local_profile_activation":true,"rc_and_missing_5h":true,"persistent_reconnect":true,"power_plan":"unsupported"}));
+}
+
+// This synchronous process/socket harness joins the async client before returning.
+// A scoped runtime also works inside its existing BLE runtime fixtures.
+fn http<F: std::future::Future + Send>(future: F) -> F::Output where F::Output: Send {
+    std::thread::scope(|scope| scope.spawn(|| tokio::runtime::Builder::new_current_thread()
+        .enable_all().build().unwrap().block_on(future)).join().unwrap())
 }

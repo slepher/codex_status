@@ -41,21 +41,27 @@ pub enum OperationReply<'a> {
     Committed { revision: u64, bond: Option<&'a str> },
     Completed { revision: Option<u64> },
     Rejected { code: &'a str, durable: bool },
-    Pending { code: Option<&'a str> },
+    AcceptedPending,
+    Unknown { code: Option<&'a str> },
 }
 impl<'a> OperationReply<'a> {
     pub fn decode(source: ReplySource, reply: &'a Value) -> Result<Self> {
         let error = reply["error"].as_str();
         if matches!(source, ReplySource::ResultQuery) && reply["ok"] != true {
-            return Ok(Self::Pending { code: Some(error.unwrap_or("receipt_unknown")) });
+            return Ok(Self::Unknown { code: Some(error.unwrap_or("receipt_unknown")) });
         }
         if reply["ok"] == true {
             match reply["outcome"].as_str() {
+                Some("accepted") => return Ok(Self::AcceptedPending),
                 Some("committed") => return Ok(Self::Committed {
                     revision: reply["revision"].as_u64().context("receipt_revision_required")?,
                     bond: reply["bond"].as_str(),
                 }),
                 Some("completed") => return Ok(Self::Completed { revision: reply["revision"].as_u64() }),
+                // Initial control replies expose stage; result queries expose outcome.
+                None if matches!(source, ReplySource::OriginalWrite) &&
+                    matches!(reply["stage"].as_str(), Some("accepted" | "connecting")) =>
+                    return Ok(Self::AcceptedPending),
                 _ => {}
             }
         }
@@ -65,7 +71,7 @@ impl<'a> OperationReply<'a> {
         if reply["ok"] == false && error != Some("storage_unknown") {
             return Ok(Self::Rejected { code: error.unwrap_or("wifi_rejected"), durable: false });
         }
-        Ok(Self::Pending { code: error })
+        Ok(Self::Unknown { code: error })
     }
 }
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,19 +201,6 @@ pub struct Connection {
     pub ip: Option<String>,
 }
 impl Connection {
-    pub fn fail_http(&mut self, error: &str) {
-        self.http_ready = false;
-        self.bridge_error = Some(error.to_owned());
-    }
-    pub fn confirm_http(&mut self) {
-        self.state = "connected".into();
-        self.error = None;
-        self.reason = 0;
-        self.attempts = 0;
-        self.next_attempt_at = 0;
-        self.http_ready = true;
-        self.bridge_error = None;
-    }
     pub fn automatic_state(&self) -> &str {
         if self.attempts >= 3 && !self.http_ready &&
             matches!(self.state.as_str(), "waiting_for_window" | "connection_failed") &&
@@ -219,16 +212,82 @@ impl Connection {
     }
 }
 
-#[cfg(test)] mod connection_state_tests {
-    use super::*;
-    #[test] fn bridge_rejection_does_not_change_device_network_state() {
-        let mut c:Connection=serde_json::from_value(json!({"host_ssid":"Host","network_id":"home","local_revision":1,"version":8,"state":"connected","error":null,"reason":0,"observed_at":10,"attempts":0,"next_attempt_at":0,"http_ready":true,"actual_ssid":"Device","ip":"192.168.3.177"})).unwrap();
-        c.fail_http("unauthorized");assert_eq!(c.state,"connected");assert!(c.error.is_none());
-        assert_eq!(c.actual_ssid.as_deref(),Some("Device"));assert_eq!(c.ip.as_deref(),Some("192.168.3.177"));
-        assert_eq!(c.bridge_error.as_deref(),Some("unauthorized"));assert!(!c.http_ready);
-        c.confirm_http();assert!(c.bridge_error.is_none());assert!(c.http_ready);
+/// Only intent and retry policy are durable. Observations belong to this process
+/// and are invalidated on reboot; they cannot restore a fictitious connection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectionFacts {
+    pub schema: u8,
+    pub host_ssid: String,
+    pub network_id: String,
+    pub local_revision: u64,
+    pub version: u64,
+    pub requested: bool,
+    pub attempts: u32,
+    pub next_attempt_at: u64,
+    pub admission_error: Option<String>,
+    #[serde(skip)]
+    pub observation: Option<NetworkObservation>,
+    #[serde(skip)]
+    pub contact: Option<HttpContact>,
+}
+#[derive(Debug, Clone)]
+pub struct NetworkObservation {
+    pub boot_id: String,
+    pub at: u64,
+    pub state: String,
+    pub error: Option<String>,
+    pub reason: u16,
+    pub ssid: Option<String>,
+    pub ip: Option<String>,
+}
+#[derive(Debug, Clone)]
+pub struct HttpContact { pub boot_id: String, pub at: u64, pub error: Option<String> }
+impl ConnectionFacts {
+    pub fn new(target: &Network, revision: u64) -> Self {
+        Self { schema:2, host_ssid:target.host_ssid.clone(), network_id:target.network_id.clone(),
+            local_revision:revision, version:0, requested:false, attempts:0, next_attempt_at:0,
+            admission_error:None, observation:None, contact:None }
+    }
+    pub fn view(&self, now: u64, jobs: &[Job]) -> Connection {
+        let observed=self.observation.as_ref().filter(|o|now>=o.at && now-o.at<=360);
+        let contact=self.contact.as_ref().filter(|c|now>=c.at && now-c.at<=360 &&
+            observed.is_none_or(|o|o.boot_id==c.boot_id && c.at>=o.at));
+        let pending=jobs.iter().rev().find(|j|matches!(j.kind.as_str(),"trial"|"activate") &&
+            j.command.as_ref().is_some_and(|v|v["network_id"]==self.network_id) && !j.terminal());
+        let http_ready=!self.requested && contact.is_some_and(|c|c.error.is_none());
+        let state=if self.requested {"requested"} else if http_ready {"connected"}
+            else if let Some(job)=pending {if !job.sent {"waiting_for_window"}else if job.permits_network_start(){"connecting"}else{"awaiting_confirmation"}}
+            else if let Some(o)=observed {&o.state} else {"waiting_for_window"};
+        Connection { host_ssid:self.host_ssid.clone(),network_id:self.network_id.clone(),
+            local_revision:self.local_revision,version:self.version,state:state.into(),
+            error:if http_ready || self.requested {None}else{self.admission_error.clone().or_else(||observed.and_then(|o|o.error.clone()))},
+            reason:if http_ready {0}else{observed.map_or(0,|o|o.reason)}, observed_at:observed.map_or(0,|o|o.at),
+            attempts:self.attempts,next_attempt_at:self.next_attempt_at,http_ready,
+            bridge_error:contact.and_then(|c|c.error.clone()),actual_ssid:observed.and_then(|o|o.ssid.clone()),
+            ip:observed.and_then(|o|o.ip.clone()) }
+    }
+    pub fn note_http(&mut self, boot_id: String, at: u64, error: Option<String>) {
+        if self.observation.as_ref().is_some_and(|o|o.boot_id!=boot_id) {self.observation=None;}
+        if error.is_none() && !self.requested {self.attempts=0;self.next_attempt_at=0;self.admission_error=None;}
+        self.contact=Some(HttpContact{boot_id,at,error});
+    }
+    pub fn from_legacy(c: Connection) -> Self {
+        Self {schema:2,host_ssid:c.host_ssid,network_id:c.network_id,local_revision:c.local_revision,
+            version:c.version,requested:c.state=="requested",attempts:c.attempts,next_attempt_at:c.next_attempt_at,
+            admission_error:c.error.filter(|e|matches!(e.as_str(),"authentication_failed"|"security_mismatch")),observation:None,contact:None}
     }
 }
+fn connection_from_disk<'de,D:serde::Deserializer<'de>>(d:D)->std::result::Result<Option<ConnectionFacts>,D::Error> {
+    let value=Option::<Value>::deserialize(d)?;
+    value.map(|value| {
+        if value.get("schema").is_none() {
+            serde_json::from_value::<Connection>(value).map(ConnectionFacts::from_legacy).map_err(serde::de::Error::custom)
+        } else if value["schema"]==2 {serde_json::from_value(value).map_err(serde::de::Error::custom)}
+        else {Err(serde::de::Error::custom("unsupported_wifi_connection_schema"))}
+    }).transpose()
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WifiState {
@@ -240,8 +299,8 @@ pub struct WifiState {
     pub snapshot: Option<Snapshot>,
     pub baseline: BTreeMap<String, Value>,
     pub jobs: Vec<Job>,
-    #[serde(default)]
-    pub connection: Option<Connection>,
+    #[serde(default, rename="connection", deserialize_with="connection_from_disk")]
+    pub connection_facts: Option<ConnectionFacts>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -299,6 +358,11 @@ pub struct Job {
     pub command: Option<Value>,
 }
 impl Job {
+    /// Only explicit acceptance or completion permits the caller's network start.
+    pub fn permits_network_start(&self) -> bool {
+        matches!(self.kind.as_str(), "trial" | "activate") && self.sent && self.error_code.is_none() &&
+            (self.state == "completed" || (self.state == "awaiting_confirmation" && self.last_stage == "accepted"))
+    }
     /// Historical reconciliation is query-only and never creates a wake intent.
     pub fn settlement_due(&self, now: u64) -> bool {
         self.terminal() && (self.receipt_ack_pending || self.confirmation_pending())
@@ -365,6 +429,20 @@ impl Job {
 #[cfg(test)]
 mod retirement_tests {
     use super::*;
+    #[test]
+    fn accepted_evidence_respects_reply_source() {
+        for stage in ["accepted", "connecting"] {
+            let reply=json!({"ok":true,"stage":stage});
+            assert!(matches!(OperationReply::decode(ReplySource::OriginalWrite,&reply).unwrap(),OperationReply::AcceptedPending));
+            assert!(matches!(OperationReply::decode(ReplySource::ResultQuery,&reply).unwrap(),OperationReply::Unknown{..}));
+        }
+        for source in [ReplySource::OriginalWrite,ReplySource::ResultQuery] {
+            for reply in [json!({"ok":true,"outcome":"unknown","stage":"accepted"}),
+                json!({"ok":true,"outcome":"pending"}),json!({"ok":true})] {
+                assert!(matches!(OperationReply::decode(source,&reply).unwrap(),OperationReply::Unknown{..}));
+            }
+        }
+    }
     #[test]
     fn unknown_wifi_results_do_not_revive_cancelled_expired_or_unidentifiable_jobs() {
         for reason in ["cancelled", "expired", "missing", "changed"] {
@@ -440,12 +518,27 @@ impl WifiState {
         let row=rows.next()?;
         rows.next().is_none().then_some(row)
     }
-    pub fn matching_connection(&self, host_ssid: &str) -> Option<&Connection> {
+    pub fn matching_connection(&self, host_ssid: &str) -> Option<&ConnectionFacts> {
         let target=self.matching_target(host_ssid)?;
-        self.connection.as_ref().filter(|c| c.host_ssid==host_ssid && c.network_id==target.network_id && c.local_revision==self.local_revision)
+        self.connection_facts.as_ref().filter(|c| c.host_ssid==host_ssid && c.network_id==target.network_id && c.local_revision==self.local_revision)
+    }
+    pub fn connection_at(&self, now: u64) -> Option<Connection> {
+        self.connection_facts.as_ref().filter(|c|c.local_revision==self.local_revision)
+            .map(|c|c.view(now,&self.jobs))
+    }
+    #[cfg(test)]
+    pub fn connection(&self) -> Option<Connection> {
+        let at=self.connection_facts.as_ref().map_or(0,|c|c.observation.as_ref().map_or(0,|o|o.at)
+            .max(c.contact.as_ref().map_or(0,|h|h.at)));
+        self.connection_at(at)
     }
     pub fn recover(&mut self) {
         for j in &mut self.jobs {
+            // The old decoder also used operation_pending for missing outcomes;
+            // it is not evidence of acceptance. Preserve the original query ID.
+            if j.error_code.as_deref() == Some("operation_pending") {
+                j.error_code = Some("result_unknown".into());
+            }
             if j.state == "cancelled" { j.execution_intent = ExecutionIntent::Cancelled; }
             if j.state == "expired" { j.execution_intent = ExecutionIntent::Expired; }
             j.reconcile_execution();
@@ -760,5 +853,38 @@ impl WifiState {
             json!({"network_id":id,"state":state,"bridge":local,"device":remote,"fields":fields,
                 "writable":selected.map_or(remote.is_empty(),|n|n.writable),"password":password})
         }).collect()
+    }
+}
+
+#[cfg(test)] mod connection_facts_tests {
+    use super::*;
+    fn facts() -> ConnectionFacts {
+        let target:Network=serde_json::from_value(json!({"network_id":"home","host_ssid":"Host","ssid":"Device"})).unwrap();
+        let mut c=ConnectionFacts::new(&target,1);
+        c.observation=Some(NetworkObservation{boot_id:"boot-a".into(),at:100,state:"connected".into(),error:None,reason:0,ssid:Some("Device".into()),ip:Some("192.168.1.2".into())});c
+    }
+    #[test] fn contact_errors_do_not_rewrite_network_evidence_and_boot_change_invalidates_it() {
+        let mut c=facts();c.note_http("boot-a".into(),101,Some("unauthorized".into()));
+        let view=c.view(101,&[]);assert_eq!(view.state,"connected");assert_eq!(view.bridge_error.as_deref(),Some("unauthorized"));assert!(!view.http_ready);
+        c.note_http("boot-b".into(),102,None);assert!(c.observation.is_none());assert!(c.view(102,&[]).http_ready);
+        assert!(!c.view(463,&[]).http_ready);assert_eq!(c.view(463,&[]).state,"waiting_for_window");
+    }
+    #[test] fn newer_device_failure_supersedes_old_http_success() {
+        let mut c=facts();c.note_http("boot-a".into(),100,None);
+        assert!(c.view(100,&[]).http_ready);
+        let o=c.observation.as_mut().unwrap();o.at=101;o.state="connection_failed".into();o.error=Some("connect_timeout".into());
+        let view=c.view(101,&[]);assert!(!view.http_ready);assert_eq!(view.error.as_deref(),Some("connect_timeout"));
+    }
+    #[test] fn restart_keeps_intent_backoff_but_cannot_restore_online_evidence() {
+        let mut state=WifiState::default();let mut c=facts();c.requested=true;c.attempts=2;c.next_attempt_at=180;c.note_http("boot-a".into(),101,None);state.connection_facts=Some(c);
+        let bytes=serde_json::to_vec(&state).unwrap();let restarted:WifiState=serde_json::from_slice(&bytes).unwrap();
+        let c=restarted.connection_facts.unwrap();assert!(c.requested);assert_eq!(c.attempts,2);assert_eq!(c.next_attempt_at,180);assert!(c.contact.is_none()&&c.observation.is_none());assert_eq!(c.view(101,&[]).state,"requested");
+        let mut old=serde_json::to_value(&state).unwrap();old["connection"]=serde_json::to_value(facts().view(100,&[])).unwrap();
+        let migrated:WifiState=serde_json::from_value(old.clone()).unwrap();assert_eq!(migrated.connection_facts.unwrap().view(100,&[]).state,"waiting_for_window");
+        old["connection"]["error"]=json!("connect_timeout");
+        let migrated:WifiState=serde_json::from_value(old.clone()).unwrap();assert!(migrated.connection_facts.unwrap().admission_error.is_none());
+        old["connection"]["error"]=json!("authentication_failed");
+        let migrated:WifiState=serde_json::from_value(old.clone()).unwrap();assert_eq!(migrated.connection_facts.unwrap().admission_error.as_deref(),Some("authentication_failed"));
+        old["connection"]["schema"]=json!(3);assert!(serde_json::from_value::<WifiState>(old).is_err());
     }
 }

@@ -1185,9 +1185,6 @@ async fn sync_endpoint(state: SimState, request: Request<Body>, op: &'static str
         message["device_mac"] != state.mac || bridge.is_empty() || id.is_empty() || id.len() > 64 {
         return reject("shape", StatusCode::BAD_REQUEST);
     }
-    if message["session_nonce"] != nonce {
-        return reject("session", StatusCode::BAD_REQUEST);
-    }
     let Some(clock) = clock_snapshot(&state) else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
@@ -2045,7 +2042,7 @@ async fn device_command_impl(state: SimState, request: Request<Body>, operation:
     }
     let nonce = session_snapshot(&state).nonce;
     let uptime_ms = device_uptime_ms(&state, clock);
-    let session = match bridge_render::simulator_command_check(message, &state.mac, &nonce) {
+    let session = match bridge_render::simulator_command_identity(message, &state.mac, None) {
         Ok(session) => session,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error":"session_check_failed"}))).into_response(),
@@ -2260,8 +2257,7 @@ async fn plan_impl(state: SimState, request: Request<Body>, gate: bool) -> Respo
             }
         }
     }
-    let session = match bridge_render::simulator_command_check(message, &state.mac,
-        &session_snapshot(&state).nonce) {
+    let session = match bridge_render::simulator_command_identity(message, &state.mac, None) {
         Ok(session) => session,
         Err(_) => {
             return (
@@ -2499,7 +2495,7 @@ async fn sim_ready_reports(state: SimState) {
                     *byte=u8::from_str_radix(&id[index*2..index*2+2],16)?;
                 }
                 let report=json!({"device_mac":state.mac,"boot_id":boot,"principal":principal,
-                    "instance_id":principal,"origin_session":intent["session_nonce"],
+                    "instance_id":principal,"origin_session":session_snapshot(&state).nonce,
                     "origin_request_no":intent["origin_request_no"],"business_id":intent["plan_id"].to_string(),
                     "context_id":"","ip":state.report_ip.to_string(),"port":80,"http_ready":true,
                     "plan_result":"applied","data_result":"none","network_result":"ready",
@@ -2652,14 +2648,13 @@ async fn sim_ble_business(State(state): State<SimState>, request: Request<Body>)
             device_command_impl(state.clone(), request, "data", false).await
         }
         "network_start" => {
-            let session = session_snapshot(&state);
             let (_, _, plan_id, _, _) = state.plan.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
                 .status_fields();
             let owner = state.owner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get_valid(now_seconds(&state, clock)).ok().flatten();
             let address = message["bridge_addr"].as_str().and_then(|s| s.parse::<std::net::Ipv4Addr>().ok());
             let valid = message["device_mac"] == state.mac &&
-                message["session_nonce"] == session.nonce &&
+
                 owner.as_ref().is_some_and(|o| message["bridge_id"] == o.id) &&
                 message["plan_id"].as_u64().is_some_and(|id| id > 0 && id == plan_id) &&
                 message["origin_request_no"].as_u64().is_some_and(|id| id > 0) &&
@@ -2680,7 +2675,7 @@ async fn sim_ble_business(State(state): State<SimState>, request: Request<Body>)
                 "error":if admitted {None} else {Some("plan_window")}})).into_response()
         }
         "history" => {
-            if message["device_mac"]!=state.mac||message["session_nonce"]!=session_snapshot(&state).nonce {
+            if message["device_mac"]!=state.mac||!message["session_nonce"].is_null() {
                 Json(json!({"op":"history","result":"rejected","error":"session"})).into_response()
             } else {
                 let reply=state.sync.lock().unwrap().history(message["since"].as_u64().unwrap_or(0) as u32,
@@ -2696,9 +2691,8 @@ async fn sim_ble_business(State(state): State<SimState>, request: Request<Body>)
                 Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
             };
             let bridge = message["bridge_id"].as_str().unwrap_or("");
-            let current_nonce = session_snapshot(&state).nonce;
             let error = if message["device_mac"].as_str() != Some(state.mac.as_str()) ||
-                message["session_nonce"].as_str() != Some(current_nonce.as_str()) {
+                !message["session_nonce"].is_null() {
                 Some("session")
             } else if owner.as_ref().is_none() { Some("claim_required") }
             else if owner.as_ref().is_some_and(|owner| owner.id != bridge) { Some("occupied") }
@@ -2858,10 +2852,10 @@ async fn wifi_http(State(state): State<SimState>, request: Request<Body>) -> Res
         let power=state.power.lock().unwrap().clone();let principal=wifi.principal.clone();
         let allowed=state.owner.lock().unwrap().get_valid(now_seconds(&state,clock)).ok().flatten().is_some_and(|o|o.id==principal);
         let until=wifi_control_until(&state,&power,physical,clock.monotonic_ms);
-        let session_valid=message["session_nonce"]==session_snapshot(&state).nonce;
+        let session_valid=true;
         wifi.engine.control(&message,&principal,&peer,0,clock.monotonic_ms,until,physical,allowed,session_valid)
     };
-    if message["op"] == "apply" && wifi.drop_http_ack { wifi.drop_http_ack = false; return StatusCode::GATEWAY_TIMEOUT.into_response(); }
+    if matches!(message["op"].as_str(),Some("apply"|"wifi_apply")) && wifi.drop_http_ack { wifi.drop_http_ack = false; return StatusCode::GATEWAY_TIMEOUT.into_response(); }
     match reply { Ok(reply) => Json(reply).into_response(), Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response() }
 }
 
@@ -2908,9 +2902,10 @@ async fn sim_ble_command(State(state): State<SimState>, request: Request<Body>) 
     let Ok(bytes) = to_bytes(request.into_body(), 8192).await else { return StatusCode::PAYLOAD_TOO_LARGE.into_response(); };
     let Ok((frame, payload)) = Header::decode(&bytes, 8192) else { return StatusCode::BAD_REQUEST.into_response(); };
     if frame.kind != 0 { return StatusCode::BAD_REQUEST.into_response(); }
-    let Ok(message) = serde_json::from_slice::<Value>(payload) else { return StatusCode::BAD_REQUEST.into_response(); };
-    let op = message["op"].as_str().unwrap_or("command");
-    if bridge_core::compact_frame::operation(op) != Some(frame.op) { return StatusCode::BAD_REQUEST.into_response(); }
+    let Ok(mut message) = serde_json::from_slice::<Value>(payload) else { return StatusCode::BAD_REQUEST.into_response(); };
+    if !message["op"].is_null() || !message["command"].is_null() || !message["session_nonce"].is_null() {return StatusCode::BAD_REQUEST.into_response();}
+    let op = bridge_core::compact_frame::operation_name(frame.op).unwrap();
+    message["op"]=json!(op);
     if (op == "status" && frame.session != [0; 16]) ||
         (op != "status" && frame.session != ble_frame_session(&state)) {
         return StatusCode::CONFLICT.into_response();
@@ -2973,7 +2968,7 @@ async fn sim_ble_command(State(state): State<SimState>, request: Request<Body>) 
             let _ = wifi.engine.poll(now, &peer, generation, true, outcome);
             let principal=wifi.principal.clone();let claimed=state.owner.lock().unwrap().get_valid(now_seconds(&state,clock)).ok().flatten().is_some_and(|o|o.id==principal);
             let until=wifi_control_until(&state,&power,physical,now);
-            wifi.engine.control(&message,&principal,&peer,generation,now,until,physical,claimed,message["session_nonce"]==session_snapshot(&state).nonce)
+            wifi.engine.control(&message,&principal,&peer,generation,now,until,physical,claimed,true)
         };
         let Ok(mut reply) = reply else { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); };
         reply["ack"]=json!("wifi");reply["op"]=json!("wifi");reply["request_id"]=message["request_id"].clone();
@@ -2984,7 +2979,7 @@ async fn sim_ble_command(State(state): State<SimState>, request: Request<Body>) 
     }
     let request = Request::builder().uri("/sim/ble/business")
         .header(header::AUTHORIZATION, format!("Bearer {}", state.endpoint_token))
-        .body(Body::from(payload.to_vec())).unwrap();
+        .body(Body::from(serde_json::to_vec(&message).unwrap())).unwrap();
     let response = sim_ble_business(State(state.clone()), request).await;
     // A business refusal is a device ACK too, not an HTTP upload failure.
     let business_status = response.status();
@@ -3301,7 +3296,7 @@ where F: FnOnce(State<SimState>, Request<Body>) -> Fut,
     let Ok((frame, payload)) = Header::decode(&raw, 4096) else {
         return (StatusCode::BAD_REQUEST, Json(json!({"error":"protocol_mismatch","stage":"frame"}))).into_response();
     };
-    if frame.kind != 0 || frame.op != op {
+    if frame.kind != 0 || (frame.op != op && !(op==18 && bridge_core::compact_frame::operation_name(frame.op).is_some_and(|n|n.starts_with("wifi_")))) {
         return (StatusCode::BAD_REQUEST, Json(json!({"error":"operation","stage":"frame"}))).into_response();
     }
     let mut session = state.http_frame.lock().await;
@@ -3367,7 +3362,13 @@ where F: FnOnce(State<SimState>, Request<Body>) -> Fut,
         }
         session.status_pages = None;
     }
-    let request = Request::from_parts(parts, Body::from(payload.to_vec()));
+    let payload = if op!=11 {
+        let Ok(mut message)=serde_json::from_slice::<Value>(payload) else{return framed_http_response(StatusCode::BAD_REQUEST,frame,session.id,2,br#"{"result":"rejected","error":"json","stage":"command"}"#);};
+        if !message["op"].is_null() || !message["command"].is_null() || !message["session_nonce"].is_null() {return framed_http_response(StatusCode::BAD_REQUEST,frame,session.id,2,br#"{"result":"rejected","error":"retired_protocol","stage":"command"}"#);}
+        if op==18 {message["op"]=json!(bridge_core::compact_frame::operation_name(frame.op).unwrap());}
+        serde_json::to_vec(&message).unwrap()
+    }else{payload.to_vec()};
+    let request = Request::from_parts(parts, Body::from(payload));
     let response = handler(State(state.clone()),request).await;
     let status = response.status();
     let Ok(bytes) = to_bytes(response.into_body(), BODY_LIMIT).await else {
@@ -3390,7 +3391,7 @@ where F: FnOnce(State<SimState>, Request<Body>) -> Fut,
         br#"{"result":"unknown","error":"reply_limit","stage":"frame","query":"original_business_id"}"#.to_vec()
     };
     let result = if page.is_some(){0}else if bytes.len() + HEADER_LEN > 4096 {3} else {result};
-    let mut reply = Header {kind:1,op,result,payload_len:payload.len() as u16,
+    let mut reply = Header {kind:1,op:frame.op,result,payload_len:payload.len() as u16,
         session:session.id,request_no:frame.request_no,context:frame.context}.encode().unwrap().to_vec();
     reply.extend_from_slice(&payload);
     session.fence.retain(frame.request_no,&raw,&reply);

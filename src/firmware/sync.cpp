@@ -170,9 +170,6 @@ static bool syncCommand(const char *op, JsonDocument &doc) {
         String(doc["device_mac"] | "") != radio::macText()) {
         syncReply(op, "rejected", "shape", 400); return false;
     }
-    if (String(doc["session_nonce"] | "") != transport::v2Nonce()) {
-        syncReply(op, "rejected", "session", 400); return false;
-    }
     OwnerRec owner;
     if (!ownerGet(owner)) {
         syncReply(op, "rejected", "claim_required", 409); return false;

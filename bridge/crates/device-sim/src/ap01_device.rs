@@ -209,6 +209,7 @@ fn dispatch(device:&mut Device,principal:&str,token:&str,operation_token:&str,pa
     if path=="/api/status" {return Ok((200,device.status()?));}
     if path=="/api/plan" {return Ok((409,fail("power_plan_unsupported","capability")));}
     let body:Value=if path=="/api/bundle/chunk" {json!({})}else{serde_json::from_slice(payload)?};
+    if !body["op"].is_null() || !body["command"].is_null() || !body["session_nonce"].is_null() {return Ok((400,fail("retired_protocol","command")));}
     if path!="/api/bundle/chunk" && (body["bridge_id"]!=principal||body["device_mac"]!=device.mac) {
         return Ok((403,fail("identity","binding")));
     }

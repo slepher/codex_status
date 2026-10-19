@@ -3,6 +3,48 @@
 use super::*;
 use bridge_core::rendezvous::{Budget, CLOSE_BUDGET, HTTP_PROOF_BUDGET};
 
+/// Ephemeral evidence for one rendezvous; never enters the device observation cache.
+#[derive(Clone)]
+pub(super) struct RendezvousContext {
+    observation: Value,
+    admitted_wifi: Vec<String>,
+    admitted_at: std::time::Instant,
+    http_window: Budget,
+    command_budget: Budget,
+    plan: Option<bridge_core::platform::model::PowerPlan>,
+    temporary_data_seq: Option<u64>,
+    http_reachable: bool,
+    need_http: bool,
+    wifi_repair: bool,
+    plan_ack_unknown: bool,
+    sync_open_id: Option<String>,
+    sync_open_unknown: bool,
+    sync_open_read_safe: bool,
+    pub(super) network_start: Option<bool>,
+    sync_enabled: bool,
+    sync_opened: bool,
+    light: bool,
+}
+impl RendezvousContext {
+    pub(super) fn new(observation: Value) -> Self {
+        Self { observation, admitted_wifi: Vec::new(), admitted_at: std::time::Instant::now(),
+            http_window: Budget::new(Duration::from_secs(90)), command_budget: Budget::new(Duration::from_secs(10)),
+            plan: None, temporary_data_seq: None, http_reachable: false, need_http: false,
+            wifi_repair: false, plan_ack_unknown: false, sync_open_id: None,
+            sync_open_unknown: false, sync_open_read_safe: false, network_start: None,
+            sync_enabled: false, sync_opened: false, light: false }
+    }
+    fn plan_id(&self) -> u64 { self.plan.as_ref().map_or(0, |p| p.plan_id) }
+    fn plan_mode(&self) -> Option<&str> {
+        self.plan.as_ref().map(|p| match p.mode {
+            bridge_core::platform::model::PlanMode::Light => "light",
+            bridge_core::platform::model::PlanMode::Sleep => "sleep",
+        })
+    }
+    fn needs_proof(&self) -> bool { self.need_http && (self.http_reachable || self.network_start.is_some()) }
+    fn sync_work(&self) -> bool { self.need_http && (self.sync_opened || (self.sync_enabled && self.light)) }
+}
+
 fn report_route(target: &str) -> Result<std::net::Ipv4Addr, String> {
     let device = target.split(':').next().unwrap_or(target)
         .parse::<std::net::Ipv4Addr>().map_err(|_| "report_device_address_invalid")?;
@@ -92,17 +134,15 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             .and_then(DeviceIdentity::normalized_mac)
             == Some(mac.clone())
     });
-    let http_window = Budget::new(Duration::from_secs(90));
-    let mut admitted_wifi: Vec<String> = service(ctx)
+    let mut round = RendezvousContext::new(Value::Null);
+    round.admitted_wifi = service(ctx)
         .wifi_state(&mac)
         .jobs
         .iter()
         .filter(|job| bridge_core::rendezvous::admit_wifi(job, device_now(&mac)))
         .map(|job| job.job_id.clone())
         .collect();
-    let mut admitted_at = std::time::Instant::now();
-    let command_budget = Budget::new(Duration::from_secs(10));
-    link.set_command_budget(Some(command_budget));
+    link.set_command_budget(Some(round.command_budget));
     let work = async {
         if !still_registered {
             return Err(format!(
@@ -113,24 +153,24 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
         link.write_endpoint(&bridge_ble::lan_ip(), ctx.config.port, &ctx.config.token)
             .await
             .map_err(err_text)?;
-        let mut state = link.command("status", json!({})).await.map_err(err_text)?;
-        if state["result"] != "applied" {
+        round.observation = link.command("status", json!({})).await.map_err(err_text)?;
+        if round.observation["result"] != "applied" {
             return Err("BLE status rejected".to_owned());
         }
         let received_at = device_now(&mac);
         service(ctx)
-            .note_device_status_at(&mac, &state, "ble", received_at)
+            .note_device_status_at(&mac, &round.observation, "ble", received_at)
             .map_err(err_text)?;
         service(ctx)
             .note_ble_contact_at(&mac, received_at)
             .map_err(err_text)?;
         // BOOT may expose GATT while all normal contact remains on HTTP.
-        if state["automatic_contact"] == false {
-            return Ok((state, false, false, false));
+        if round.observation["automatic_contact"] == false {
+            return Ok(());
         }
         claim_on_ble(ctx, &mac, &mut link).await?;
-        let sync_capable = state["sync"]["v"] == 1;
-        let mut sync_enabled = state["sync"]["enabled"] == true;
+        let sync_capable = round.observation["sync"]["v"] == 1;
+        let mut sync_enabled = round.observation["sync"]["enabled"] == true;
         if sync_capable && !sync_enabled {
             if let Ok(reply) = link.command("sync_config", json!({"enabled":true})).await {
                 sync_enabled = reply["result"] == "applied";
@@ -139,39 +179,40 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
         let decision = service(ctx).next_delivery(&mac, true, device_now(&mac));
         let temporary_data_seq = (decision["decision"] == "light_data" && decision["temporary_data"] == true)
             .then(|| decision["data_seq"].as_u64()).flatten();
-        state["_temporary_data_seq"] = json!(temporary_data_seq);
+        round.temporary_data_seq = temporary_data_seq;
         let pending_data = (decision["decision"] == "ble_data")
             .then(|| service(ctx).data_message_body(&mac)).flatten();
-        let remaining = state["power"]["provisional_remaining_s"]
+        let remaining = round.observation["power"]["provisional_remaining_s"]
             .as_u64().unwrap_or(0).min(300) as u32;
-        let failure_report = state["network_error"].as_str().is_some();
+        let failure_report = round.observation["network_error"].as_str().is_some();
         let needs_http = !failure_report && (remaining > 0 ||
-            (state["power"]["mode"] == "light" && state["power"]["remaining_s"].as_u64().unwrap_or(0) > 0) ||
+            (round.observation["power"]["mode"] == "light" && round.observation["power"]["remaining_s"].as_u64().unwrap_or(0) > 0) ||
             service(ctx).wifi_state(&mac).jobs.iter().any(|j| j.execution_active(device_now(&mac)) &&
                 bridge_core::rendezvous::admit_wifi(j, device_now(&mac)))
-            || service(ctx).wifi_state(&mac).connection.is_some_and(|c| c.state == "requested")
+            || service(ctx).wifi_state(&mac).connection_facts.is_some_and(|c| c.requested)
             || matches!(decision["decision"].as_str(), Some("light_data" | "bundle" | "activate" | "waiting_for_device_contract"))
             || service(ctx).ota_job(&mac).is_some_and(|job|
                 matches!(job.state.as_str(), "queued" | "awaiting_confirmation"))
-            || (sync_enabled && state["sync"]["retry_skip"] == 0
-                && (state["sync"]["due"] == true || state["sync"]["pending"] == true)));
+            || (sync_enabled && round.observation["sync"]["retry_skip"] == 0
+                && (round.observation["sync"]["due"] == true || round.observation["sync"]["pending"] == true)));
         if failure_report {
-            crate::wifi::network_failed(ctx, &mac, state["network_error"].as_str().unwrap_or("network_failed"));
+            crate::wifi::network_failed(ctx, &mac, round.observation["network_error"].as_str().unwrap_or("network_failed"));
             tracing::info!(event="wifi_failure_report", device_mac=%mac,
-                reason=state["network_error"].as_str().unwrap_or("unknown"),
+                reason=round.observation["network_error"].as_str().unwrap_or("unknown"),
                 "device network attempt ended; next period may retry");
         }
         tracing::info!(event="network_admission",device_mac=%mac,needs_http,
             delivery=decision["decision"].as_str().unwrap_or("unknown"),
-            wifi_jobs=admitted_wifi.len(),
+            wifi_jobs=round.admitted_wifi.len(),
             ota_state=service(ctx).ota_job(&mac).map(|job|job.state).as_deref().unwrap_or("none"),
-            diagnostics_due=state["sync"]["due"]==true,
+            diagnostics_due=round.observation["sync"]["due"]==true,
             "rendezvous network work admission");
         // A reachable HTTP service can complete admitted work directly.
         let reachable = if !needs_http { false } else if let Some(target) = device_link_for_mac(ctx, &mac) {
             let expected = mac.clone();
-            let probe = blocking(move || {
-                match device_client::status_compact(&target.ip, &target.token, command_budget.remaining().min(Duration::from_millis(400))) {
+            let probe_budget = round.command_budget;
+            let probe: Result<bool,String> = (async move {
+                match device_client::status_compact(&target.ip, &target.token, probe_budget.remaining().min(Duration::from_millis(400))).await {
                     Ok(s) if DeviceIdentity::normalized_mac(s["device_mac"].as_str().unwrap_or("")) == Some(expected) => Ok(true),
                     Ok(_) => Err("http_identity_mismatch".into()),
                     Err(error) if bridge_core::rendezvous::wifi_error(&error).1 == "unauthorized" => Err("unauthorized".into()),
@@ -180,16 +221,16 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             }).await;
             match probe { Ok(ready) => ready, Err(error) => { crate::wifi::http_failed(ctx, &mac, &error); return Err(error); } }
         } else { false };
-        state["_http_reachable"] = json!(reachable);
-        state["_need_http"] = json!(needs_http);
-        let requested = service(ctx).wifi_state(&mac).connection.is_some_and(|c| c.state=="requested");
-        state["_wifi_repair"] = json!(needs_http && (!reachable || requested));
+        round.http_reachable = reachable;
+        round.need_http = needs_http;
+        let requested = service(ctx).wifi_state(&mac).connection_facts.is_some_and(|c| c.requested);
+        round.wifi_repair = needs_http && (!reachable || requested);
         if reachable && !requested { crate::wifi::http_ready(ctx, &mac); }
         else if needs_http && remaining == 0 {
-            crate::wifi::prepare_connection(ctx,&mac,&mut link,remaining>0,command_budget).await?;
+            crate::wifi::prepare_connection(ctx,&mac,&mut link,remaining>0,round.command_budget).await?;
             if !reachable { crate::wifi::http_failed(ctx,&mac,"http_unavailable"); }
         }
-        admitted_wifi = service(ctx).wifi_state(&mac).jobs.iter()
+        round.admitted_wifi = service(ctx).wifi_state(&mac).jobs.iter()
             .filter(|job| bridge_core::rendezvous::admit_wifi(job, device_now(&mac))).map(|j| j.job_id.clone()).collect();
         let plan = service(ctx)
             .plan_for_rendezvous_network_work(
@@ -209,23 +250,22 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
         if let Some(data) = &pending_data {
             plan_body["data"] = data.clone();
         }
-        if !sync_enabled && wake_history_sync_due(&mac, &state) {
+        if !sync_enabled && wake_history_sync_due(&mac, &round.observation) {
             plan_body["history_sync_ms"] = json!(2500);
         }
         // Timeout means unknown, not rejected. The device may already have
         // applied the persisted plan and started HTTP. Reconcile the same ID.
-        state["_sent_plan"] = serde_json::to_value(&plan).map_err(err_text)?;
-        state["_plan_ack_unknown"] = json!(true);
-        state["_sync_enabled"] = json!(sync_enabled);
-        admitted_at = std::time::Instant::now();
+        round.plan = Some(plan.clone());
+        round.plan_ack_unknown = true;
+        round.sync_enabled = sync_enabled;
+        round.admitted_at = std::time::Instant::now();
         let reply = link.command("plan", plan_body).await;
         if reply.as_ref().is_err_and(bridge_core::rendezvous::not_dispatched) {
             return Err("not_sent".into());
         }
         let ack_unknown = reply.is_err();
         let ack = reply.unwrap_or_else(|_| json!({"result":"unknown"}));
-        state["_sent_plan"] = serde_json::to_value(&plan).map_err(err_text)?;
-        state["_plan_ack_unknown"] = json!(ack_unknown);
+        round.plan_ack_unknown = ack_unknown;
         let accepted = ack["result"] == "applied" && ack["plan_id"].as_u64() == Some(plan.plan_id);
         let ack_category = if !accepted {
             "ack_rejected"
@@ -287,41 +327,40 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
         // A confirmed Plan has already changed the device RF phase. Refresh
         // before SyncOpen as well as the later configuration work.
         if accepted && needs_http {
-            link.refresh_info(http_window.remaining().min(Duration::from_secs(1)))
+            link.refresh_info(round.http_window.remaining().min(Duration::from_secs(1)))
                 .await.map_err(|_| "ble_info_refresh_failed".to_owned())?;
         }
         let should_open = !failure_report && (temporary_data_seq.is_some() || (sync_enabled
-            && state["sync"]["retry_skip"] == 0
-            && (state["sync"]["due"] == true || state["sync"]["pending"] == true)));
+            && round.observation["sync"]["retry_skip"] == 0
+            && (round.observation["sync"]["due"] == true || round.observation["sync"]["pending"] == true)));
         if should_open && !ack_unknown {
             let reason = if temporary_data_seq.is_some() {
                 "data"
-            } else if state["sync"]["rounds"] == 15 && state["sync"]["pending"] != true {
+            } else if round.observation["sync"]["rounds"] == 15 && round.observation["sync"]["pending"] != true {
                 "periodic"
             } else {
                 "retry"
             };
             let open_id = uuid::Uuid::new_v4().simple().to_string();
-            state["_sync_open_id"] = json!(open_id);
-            state["_sync_open_unknown"] = json!(true);
+            round.sync_open_id = Some(open_id.clone());
+            round.sync_open_unknown = true;
             match link
                 .command(
                     "sync_open",
                     json!({
                         "reason":reason, "open_id":open_id, "data_seq":temporary_data_seq,
-                        "wake_generation":state["wake_generation"],
-                        "wake_seq":state["wake_seq"],
+                        "wake_generation":round.observation["wake_generation"],
+                        "wake_seq":round.observation["wake_seq"],
                     }),
                 )
                 .await
             {
                 Ok(open) if open["result"] == "applied" => {
                     sync_opened = true;
-                    state["_sync_open_unknown"] = json!(false);
+                    round.sync_open_unknown = false;
                 }
                 Ok(_) if accepted && plan.mode == bridge_core::platform::model::PlanMode::Light => {
-                    state["_sync_open_unknown"] = json!(false);
-                    state["_sync_open_error"] = json!("sync_open_rejected");
+                    round.sync_open_unknown = false;
                     tracing::warn!(device_mac=%mac,stage="sync_open",error_category="sync_open_rejected","sync window rejected; accepted light plan remains valid");
                 }
                 Ok(_) => return Err("sync_open_rejected".into()),
@@ -331,8 +370,8 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
                     // ACK failures prove the frame was fully written. A read
                     // may follow; a timed-out fragment write must not reuse it.
                     if bridge_core::rendezvous::not_dispatched(&error) { return Err("not_sent".into()); }
-                    state["_sync_open_read_safe"] = json!(bridge_core::rendezvous::command_failure(&error)
-                        .is_some_and(|failure| failure.outcome == bridge_core::rendezvous::DispatchOutcome::AckUnknown));
+                    round.sync_open_read_safe = bridge_core::rendezvous::command_failure(&error)
+                        .is_some_and(|failure| failure.outcome == bridge_core::rendezvous::DispatchOutcome::AckUnknown);
                     sync_opened = true;
                 }
             }
@@ -345,24 +384,24 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
         } else {
             ack["accepted_remaining_s"].as_u64().unwrap_or(0) > 0
         };
-        Ok((state, sync_enabled, sync_opened, light_plan))
+        { round.sync_opened = sync_opened; round.light = light_plan; Ok(()) }
     };
     let mut normal_result = work.await;
     link.set_command_budget(None);
-    let shared_tail = Budget::at(admitted_at, HTTP_PROOF_BUDGET).capped(http_window.remaining());
-    let mut http_budget = http_window;
+    let shared_tail = Budget::at(round.admitted_at, HTTP_PROOF_BUDGET).capped(round.http_window.remaining());
+    let mut http_budget = round.http_window;
     let mut wifi_repair_error = None;
-    if let Ok((state, _, opened, light)) = &mut normal_result {
-        if *opened || (*light && state["_need_http"] == true) {
-            if state["_sync_open_unknown"] == true && state["_sync_open_read_safe"] != true {
+    if normal_result.is_ok() {
+        if round.sync_opened || (round.light && round.need_http) {
+            if round.sync_open_unknown && !round.sync_open_read_safe {
                 drop(_device_delivery);drop(_delivery);
                 link.close_bounded(CLOSE_BUDGET).await;
                 return Err("ble_write_result_unknown".into());
             }
-            let plan_id = state["_sent_plan"]["plan_id"].as_u64().unwrap_or(0);
-            let unknown = state["_plan_ack_unknown"] == true || state["_sync_open_unknown"] == true;
-            let read_only = link.info["wifi_management"] == 3 && link.info["rf_remaining_ms"].as_u64().is_some() && state["_plan_ack_unknown"] != true &&
-                (state["_sync_open_unknown"] != true || state["_sync_open_read_safe"] == true) &&
+            let plan_id = round.plan_id();
+            let unknown = round.plan_ack_unknown || round.sync_open_unknown;
+            let read_only = link.info["wifi_management"] == 3 && link.info["rf_remaining_ms"].as_u64().is_some() && !round.plan_ack_unknown &&
+                (!round.sync_open_unknown || round.sync_open_read_safe) &&
                 service(ctx).wifi_state(&mac).jobs.iter().find(|j| j.runnable(device_now(&mac)))
                     .is_some_and(|j| j.kind == "read");
             // Plan/SyncOpen can change the device's RF phase. The deadline
@@ -374,7 +413,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
                 return Err("ble_info_refresh_failed".into());
             }
             // These optional commands consume a short shared tail.
-            if !admitted_wifi.is_empty() && !read_only {
+            if !round.admitted_wifi.is_empty() && !read_only {
                 // Cancelling a fragmented write leaves a partial JSON frame.
                 // Use the shared deadline; on timeout never reuse this link.
                 let noted=crate::wifi::note_link_budget(ctx,&mac,&mut link,shared_tail).await;
@@ -396,21 +435,21 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             } else if !unknown || confirmation_only {
                 crate::wifi::recover_on_link_budget(ctx, &mac, &mut link, shared_tail).await;
             }
-            if !unknown && state["_wifi_repair"] == true {
+            if !unknown && round.wifi_repair {
                 if let Err(error) = crate::wifi::automatic_on_link(
                     ctx,
                     &mac,
                     &mut link,
                     shared_tail,
-                    state["power"]["provisional_remaining_s"].as_u64().unwrap_or(0) > 0,
+                    round.observation["power"]["provisional_remaining_s"].as_u64().unwrap_or(0) > 0,
                 )
                 .await { wifi_repair_error = Some(error); }
             }
-            if state["_need_http"] == true && state["_http_reachable"] != true &&
+            if round.need_http && !round.http_reachable &&
                 wifi_repair_error.is_none() {
                 // A lost SyncOpen reply does not make the already acknowledged
                 // Plan uncertain or block its independently admitted HTTP work.
-                let confirmed = if state["_plan_ack_unknown"] == true {
+                let confirmed = if round.plan_ack_unknown {
                     link.command("status", json!({})).await.ok().is_some_and(|check|
                         check["power"]["plan_id"].as_u64()==Some(plan_id))
                 } else { true };
@@ -423,8 +462,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
                             "bridge_port":ctx.config.port,"origin_request_no":plan_id});
                         match network_start_on_link(&mut link, fields, shared_tail).await {
                             Ok(applied) => {
-                                state["_network_start_accepted"] = json!(applied);
-                                state["_network_start_unknown"] = json!(!applied);
+                                round.network_start = Some(applied);
                             }
                             Err(error) => wifi_repair_error = Some(error),
                         }
@@ -441,11 +479,11 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
     }
     if let Some(error) = wifi_repair_error { normal_result = Err(error); }
     let mut tail_error=None;
-    if let Ok((state, enabled, _, light)) = &normal_result {
-        if !enabled {
-            tail_error=sync_wake_history(&mut link,&mac,state,shared_tail.capped(Duration::from_secs(2))).await.err();
+    if normal_result.is_ok() {
+        if !round.sync_enabled {
+            tail_error=sync_wake_history(&mut link,&mac,&round.observation,shared_tail.capped(Duration::from_secs(2))).await.err();
         }
-        if tail_error.is_none() && !light {
+        if tail_error.is_none() && !round.light {
             let _ = crate::wifi::recover_on_link_budget(
                 ctx,
                 &mac,
@@ -465,40 +503,34 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
     drop(_device_delivery);
     drop(_delivery);
     link.close_bounded(CLOSE_BUDGET).await;
-    if let Ok((state, _, opened, light)) = &mut normal_result {
-        if state["_need_http"] == true &&
-            (state["_http_reachable"] == true ||
-             state["_network_start_accepted"] == true || state["_network_start_unknown"] == true) {
-            let plan_id=state["_sent_plan"]["plan_id"].as_u64().unwrap_or(0);
-            let explicit=state["rendezvous_v"]==1;
+    if normal_result.is_ok() {
+        if round.needs_proof() {
+            let plan_id=round.plan_id();
+            let explicit=round.observation["rendezvous_v"]==1;
             let proof_budget=shared_tail;
-            match wait_for_device_http(ctx,&mac,state,plan_id,explicit,proof_budget,http_window).await {
+            match wait_for_device_http(ctx,&mac,&round,plan_id,explicit,proof_budget,round.http_window).await {
                 Ok((status,budget,sampled_at)) => {
                     http_budget=budget;
                     if let Err(error)=service(ctx).note_device_status_at(&mac,&status,"http",sampled_at) {
                         normal_result=Err(err_text(error));
                     } else {
-                        *light=status["power"]["mode"]=="light" &&
+                        round.light=status["power"]["mode"]=="light" &&
                             status["power"]["remaining_s"].as_u64().unwrap_or(0)>0;
-                        *opened=status["sync"]["phase"]=="WIFI_SYNC_ONCE";
+                        round.sync_opened=status["sync"]["phase"]=="WIFI_SYNC_ONCE";
                     }
                 }
                 Err(error) => {crate::wifi::http_failed(ctx,&mac,&error);normal_result=Err(error);}
             }
         }
     }
-    let sync_opened = normal_result.as_ref()
-        .is_ok_and(|(state, enabled, opened, light)|
-            state["_need_http"] == true && (*opened || (*enabled && *light)));
-    let may_continue = normal_result.as_ref().is_ok_and(|(state, _, _, light)|
-        *light && state["_need_http"] == true);
-    let temporary_data = normal_result.as_ref().is_ok_and(|(state, _, _, _)|
-        state["_temporary_data_seq"].as_u64().is_some());
-    let result = normal_result.map(|_| ());
+    let sync_opened = normal_result.is_ok() && round.sync_work();
+    let may_continue = normal_result.is_ok() && round.light && round.need_http;
+    let temporary_data = normal_result.is_ok() && round.temporary_data_seq.is_some();
+    let result = normal_result;
     if let Err(error) = &result {
         crate::wifi::network_failed(ctx, &mac, error);
         for job in service(ctx).wifi_state(&mac).jobs.into_iter()
-            .filter(|job| admitted_wifi.contains(&job.job_id) && !job.terminal()) {
+            .filter(|job| round.admitted_wifi.contains(&job.job_id) && !job.terminal()) {
             let code = match error.as_str() {
                 "not_sent" | "result_unknown" | "network_not_found" | "http_proof_budget_exhausted" | "plan_unconfirmed" |
                 "http_identity_mismatch" | "http_session_mismatch" | "http_wake_mismatch" | "unauthorized" |
@@ -509,17 +541,17 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
                 if job.sent { "awaiting_confirmation" } else { "waiting_rendezvous" }, Some(code), device_now(&mac));
         }
     }
-    if sync_opened || (may_continue && !admitted_wifi.is_empty()) {
+    if sync_opened || (may_continue && !round.admitted_wifi.is_empty()) {
         let lock = delivery_lock(ctx, &mac);
         let _device_delivery = lock.lock().await;
         // Reads must finish before a Data-only completion releases the window.
-        for job_id in &admitted_wifi {
+        for job_id in &round.admitted_wifi {
             crate::wifi::opportunity_admitted(ctx, &mac, job_id, http_budget).await;
         }
     }
     if temporary_data && sync_opened {
         if service(ctx).wifi_state(&mac).jobs.iter()
-            .any(|j| admitted_wifi.contains(&j.job_id) && !j.terminal()) {
+            .any(|j| round.admitted_wifi.contains(&j.job_id) && !j.terminal()) {
             return Ok(BleOpportunity::Connected { mac, result: Err("temporary_read_incomplete".into()) });
         }
         // Complete admitted Data before diagnostic complete can close the window.
@@ -532,7 +564,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             _ => return Ok(BleOpportunity::Connected { mac, result: Err("temporary_data_unknown".into()) }),
         }
     }
-    if sync_opened || (may_continue && !admitted_wifi.is_empty()) {
+    if sync_opened || (may_continue && !round.admitted_wifi.is_empty()) {
         // `sync_http_inner` does not take the lock itself; re-acquire only the
         // per-MAC lock to keep admitted HTTP work serialized.
         let lock = delivery_lock(ctx, &mac);
@@ -541,7 +573,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             .wifi_state(&mac)
             .jobs
             .iter()
-            .filter(|j| admitted_wifi.contains(&j.job_id))
+            .filter(|j| round.admitted_wifi.contains(&j.job_id))
             .all(|j| j.terminal());
         // An admitted read that is still waiting owns the current window;
         // diagnostic complete would close it before the original job finishes.
@@ -555,7 +587,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
 fn matching_http(
     status: &Value,
     mac: &str,
-    ble: &Value,
+    ble: &RendezvousContext,
     plan_id: u64,
     explicit: bool,
 ) -> Result<(), String> {
@@ -567,7 +599,7 @@ fn matching_http(
     {
         return Err("http_identity_mismatch".into());
     }
-    if status["session_nonce"] != ble["session_nonce"]
+    if status["session_nonce"] != ble.observation["session_nonce"]
         || status["session_nonce"].as_str().is_none_or(str::is_empty)
     {
         return Err("http_session_mismatch".into());
@@ -575,7 +607,7 @@ fn matching_http(
     if status["power"]["plan_id"].as_u64() != Some(plan_id) {
         return Err("plan_unconfirmed".into());
     }
-    if let Some(mode) = ble["_sent_plan"]["mode"].as_str() {
+    if let Some(mode) = ble.plan_mode() {
         let expired_in_sync = mode == "light"
             && status["power"]["mode"] == "sleep"
             && status["power"]["remaining_s"] == 0
@@ -586,7 +618,7 @@ fn matching_http(
             && status["power"]["mode"] == "light"
             && status["power"]["remaining_s"] == 0
             && status["sync"]["phase"] == "WIFI_SYNC_ONCE"
-            && ble["_sync_open_id"].as_str().is_some_and(|id| !id.is_empty());
+            && ble.sync_open_id.as_ref().is_some_and(|id| !id.is_empty());
         if status["power"]["mode"].as_str() != Some(mode) && !expired_in_sync && !sleep_in_sync {
             return Err("plan_unconfirmed".into());
         }
@@ -597,15 +629,15 @@ fn matching_http(
             return Err("plan_expired".into());
         }
     }
-    if ble["_sync_open_unknown"] == true
-        && ble["_sent_plan"]["mode"] == "sleep"
+    if ble.sync_open_unknown
+        && ble.plan_mode() == Some("sleep")
         && status["sync"]["phase"] != "WIFI_SYNC_ONCE"
     {
         return Err("sync_open_unconfirmed".into());
     }
     if explicit {
         for key in ["wake_generation", "wake_seq"] {
-            if status[key] != ble[key] || status[key].as_u64().is_none() {
+            if status[key] != ble.observation[key] || status[key].as_u64().is_none() {
                 return Err("http_wake_mismatch".into());
             }
         }
@@ -651,7 +683,7 @@ pub(crate) async fn network_start_on_link(link: &mut bridge_ble::DeviceConnectio
 pub(super) async fn wait_for_device_http(
     ctx: &AppCtx,
     mac: &str,
-    ble: &Value,
+    ble: &RendezvousContext,
     plan_id: u64,
     explicit: bool,
     budget: Budget,
@@ -662,9 +694,9 @@ pub(super) async fn wait_for_device_http(
         if budget.remaining().is_zero() {
             tracing::warn!(event="http_proof",device_mac=%mac,plan_id,stage="http_proof",
                 error_category="http_proof_budget_exhausted",last_error=%last,remaining_ms=0,
-                start_result=if ble["_network_start_unknown"]==true {"result_unknown"}else if ble["_network_start_accepted"]==true {"accepted"} else {"not_required"},
+                start_result=if ble.network_start == Some(false) {"result_unknown"}else if ble.network_start == Some(true) {"accepted"} else {"not_required"},
                 "HTTP proof budget exhausted");
-            return Err(if ble["_network_start_unknown"]==true {"result_unknown"} else {"http_proof_budget_exhausted"}.into());
+            return Err(if ble.network_start == Some(false) {"result_unknown"} else {"http_proof_budget_exhausted"}.into());
         }
         // The ready report may have supplied a new IP after BLE closed.
         let Some(target) = device_link_for_mac(ctx, mac) else {
@@ -676,8 +708,8 @@ pub(super) async fn wait_for_device_http(
         let read_budget = budget;
         let sample_start = std::time::Instant::now();
         let sampled_at = device_now(mac);
-        let observed = blocking(move || {
-            device_client::status(&ip, &token, read_budget.remaining()).map_err(|e| if bridge_core::rendezvous::wifi_error(&e).1=="unauthorized" {"unauthorized".into()} else {"http_unavailable".into()})
+        let observed: Result<Value,String> = (async move {
+            device_client::status(&ip, &token, read_budget.remaining()).await.map_err(|e| if bridge_core::rendezvous::wifi_error(&e).1=="unauthorized" {"unauthorized".into()} else {"http_unavailable".into()})
         })
         .await;
         if observed.as_ref().is_err_and(|e| e=="unauthorized") { return Err("unauthorized".into()); }
@@ -746,8 +778,9 @@ mod tests {
 
     #[test]
     fn protocol_http_remains_usable_after_ready_report_ack() {
-        let ble=json!({"session_nonce":"boot","wake_generation":2,"wake_seq":9,
-            "_sent_plan":{"mode":"light"}});
+        let mut ble=RendezvousContext::new(json!({"session_nonce":"boot","wake_generation":2,"wake_seq":9}));
+        ble.plan=Some(bridge_core::platform::model::PowerPlan::sleep(101,900,"test"));
+        ble.plan.as_mut().unwrap().mode=bridge_core::platform::model::PlanMode::Light;
         let mut status=json!({"device_mac":"7C4FADB93408","session_nonce":"boot",
             "wake_generation":2,"wake_seq":9,"power":{"plan_id":101,"mode":"light","remaining_s":100},
             "transports":{"http":{"ready":true}},"rendezvous":{"v":1,"ready":false,"id":"rv","remaining_ms":0}});
@@ -757,7 +790,9 @@ mod tests {
     }
     #[test]
     fn device_http_status_rejects_wrong_session_wake_and_plan() {
-        let ble = json!({"session_nonce":"boot","wake_generation":2,"wake_seq":9,"_sent_plan":{"mode":"light"}});
+        let mut ble=RendezvousContext::new(json!({"session_nonce":"boot","wake_generation":2,"wake_seq":9}));
+        ble.plan=Some(bridge_core::platform::model::PowerPlan::sleep(101,900,"test"));
+        ble.plan.as_mut().unwrap().mode=bridge_core::platform::model::PlanMode::Light;
         let status = json!({"device_mac":"7C4FADB93408","session_nonce":"boot","wake_generation":2,"wake_seq":9,
             "power":{"plan_id":101,"mode":"light","remaining_s":100},"transports":{"http":{"ready":true}},"rendezvous":{"v":1,"ready":true,"id":"rv"}});
         assert!(matching_http(&status, "7C4FADB93408", &ble, 101, true).is_ok());
@@ -785,14 +820,14 @@ mod tests {
             Err("plan_unconfirmed".into())
         );
         let mut sleep_ble = ble.clone();
-        sleep_ble["_sent_plan"]["mode"] = json!("sleep");
-        sleep_ble["_sync_open_unknown"] = json!(true);
+        sleep_ble.plan.as_mut().unwrap().mode = bridge_core::platform::model::PlanMode::Sleep;
+        sleep_ble.sync_open_unknown = true;
         expired["power"]["mode"] = json!("sleep");
         assert!(matching_http(&expired, "7C4FADB93408", &sleep_ble, 101, true).is_ok());
-        sleep_ble["_sync_open_id"]=json!("original-sync-open");
+        sleep_ble.sync_open_id=Some("original-sync-open".into());
         expired["power"]["mode"]=json!("light");
         assert!(matching_http(&expired, "7C4FADB93408", &sleep_ble, 101, true).is_ok());
-        let mut unbound=sleep_ble.clone();unbound.as_object_mut().unwrap().remove("_sync_open_id");
+        let mut unbound=sleep_ble.clone();unbound.sync_open_id=None;
         assert_eq!(matching_http(&expired,"7C4FADB93408",&unbound,101,true),Err("plan_unconfirmed".into()));
         expired["power"]["mode"]=json!("sleep");
         expired["sync"]["phase"] = json!("DEEP");

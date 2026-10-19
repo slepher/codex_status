@@ -222,7 +222,7 @@
 
 ### B6. 离线 BLE 配 Wi-Fi 与 BOOT 蓝牙恢复入口（2026-10-03 新开）
 
-- **2026-10-19协议收敛已授权启动（关联C8）**：按[核验与方案](../../project-workflow/bridge-macos/protocol-review-validation-20261019.md)和[实施计划](../../project-workflow/bridge-macos/protocol-convergence-plan.md)推进锁顺序、历史事务收尾、类型/投影、会合上下文和异步HTTP。wire变更覆盖Note4、1.54、Fake ROM及ports/ap01当前应用，不做旧版兼容；升级致Bridge OTA协议通道失效时用户允许走受鉴权裸OTA。当前切片与验证见[状态](../../project-workflow/bridge-macos/protocol-convergence-status.md)，不据此结项或宣称已部署。
+- **2026-10-19协议收敛R1–R5源码完成（关联C8，未部署）**：已删除重复Wi-Fi执行/全局缓存、私有JSON会合状态、同步HTTP worker及旧JSON会话/op路径；C2显式35操作覆盖Bridge、Note4、1.54、Fake及AP01应用。491回归通过/5条件忽略、双ESP构建/匹配ELF栈、AP01 RV32/宿主ASan通过。新schema部署须冻结exe/data，不兼容旧wire；AP01完整候选仍flashable=false，不关闭C9。切网fix分支合并与现场部署证据另列，长期RF/Flash/原生BLE矩阵仍开放。[删除清单、候选哈希与验收边界](../../project-workflow/bridge-macos/protocol-convergence-status.md)。
 
 - **2026-10-19 Windows切网恢复已验收**：独立基线4868c8c排除未部署协议收敛，复用724f3a3修复旧Windows exe异步激活后漏network_start；332回归通过/5条件忽略。冻结264文件备份后部署，自然会合切至wd21-la、认证HTTP ready，原ID017a completed/revision342、14条历史Job不变，用户确认OFF图标恢复；无刷机。长期RF及本项其他验收仍开放。[证据](../../project-workflow/wifi-switch-fix/status.md)。
 
@@ -440,6 +440,8 @@
 - 前置：C3 的记录格式（否则没有可信的对照口径）。
 
 ### C8. 设备同步与诊断协议（device-sync-diagnostics）
+
+- 2026-10-19 R1–R5源码/软件验收完成，C2四端改动及删除清单见B6本日收敛条目；当前现场仍运行此前协议，未将源码完成记作部署或长期RF验收。
 
 - **2026-10-16隔夜断连/自动恢复修复已部署，授权后自然恢复通过**：昨晚服务发现未完成与11:40系统加密失败719都经4s超时进入隔离，休眠不是必要触发。11:58部署supervisor退避重建、持久化UI/MCP错误提示及发现失败回执，保留未知隔离；App107/BLE28/回放3/Node/WK68和supervisor红→绿通过。两项权限allowed后14:03自然wake2104完成Plan4050/认证HTTP/sync，独立认证MAC/.104/Bridge可达；正式Sleep4051后14:05自然wake2106再次会合。9旧Wi-Fi作业哈希不变，无BOOT/刷机/手动重启。真实隔离后自动child重建尚未现场触发，最初原生失败深层原因与长期矩阵仍开放。[证据/部署/边界](../../project-workflow/bridge-macos/sleep-resume-disconnect-20261016.md)。
 - **2026-10-15 .104已正式部署**：用户授权后OTA d1199896一次succeeded/image_verified，独立完整hash/MAC/版本/ota_0一致，.103保留ota_1。SPI初始化自锁宿主red→green与实际ELF门禁通过；电池deep网络醒的实机复测仍开放，不以部署代替。[部署证据](../../project-workflow/bridge-macos/clock-stall-20261015.md)。

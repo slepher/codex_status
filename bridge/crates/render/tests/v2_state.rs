@@ -144,7 +144,7 @@ extern "C" {
         out: *mut std::os::raw::c_char,
         cap: c_int,
     ) -> c_int;
-    fn codex_v2_command_check(
+    fn codex_command_identity(
         message: *const std::os::raw::c_char,
         current_mac: *const std::os::raw::c_char,
         nonce: *const std::os::raw::c_char,
@@ -517,11 +517,11 @@ fn shared_command_envelope_checks_session_and_builds_ack_shape() {
     fn check(message: &serde_json::Value) -> serde_json::Value {
         let message = std::ffi::CString::new(message.to_string()).unwrap();
         let mac = std::ffi::CString::new("70:04:1D:AA:BB:CC").unwrap();
-        let nonce = std::ffi::CString::new("session-nonce").unwrap();
+        let principal = std::ffi::CString::new("owner-to-check-outside").unwrap();
         let mut out = vec![0i8; 2048];
         let rc = unsafe {
-            codex_v2_command_check(
-                message.as_ptr(), mac.as_ptr(), nonce.as_ptr(),
+            codex_command_identity(
+                message.as_ptr(), mac.as_ptr(), principal.as_ptr(),
                 out.as_mut_ptr(), out.len() as c_int,
             )
         };
@@ -565,7 +565,6 @@ fn shared_command_envelope_checks_session_and_builds_ack_shape() {
         "bridge_id": "owner-to-check-outside",
         "device_mac": "70:04:1D:AA:BB:CC",
         "request_id": "r",
-        "session_nonce": "session-nonce",
     });
     let parsed = output_from_parse(&message.to_string());
     assert_eq!(parsed["parsed"], true);
@@ -575,24 +574,27 @@ fn shared_command_envelope_checks_session_and_builds_ack_shape() {
     assert_eq!(accepted["accepted"], true);
     assert!(accepted.get("error").is_none());
     assert_eq!(accepted["bridge_id"], "owner-to-check-outside");
+    message["bridge_id"]="other-principal".into();
+    assert_eq!(check(&message)["error"],"principal_mismatch");
+    message["bridge_id"]="owner-to-check-outside".into();
     assert!(message.get("protocol").is_none());
     message["protocol"] = 2.into();
-    assert_eq!(check(&message)["error"], "session");
+    assert_eq!(check(&message)["error"], "retired_protocol");
     message.as_object_mut().unwrap().remove("protocol");
     message["rv"] = 2.into();
-    assert_eq!(check(&message)["error"], "session");
+    assert_eq!(check(&message)["error"], "retired_protocol");
     message.as_object_mut().unwrap().remove("rv");
     message["device_mac"] = "70:04:1D:AA:BB:CD".into();
-    assert_eq!(check(&message)["error"], "session");
+    assert_eq!(check(&message)["error"], "identity");
     message["device_mac"] = "70:04:1D:AA:BB:CC".into();
     message["request_id"] = "".into();
-    assert_eq!(check(&message)["error"], "session");
+    assert_eq!(check(&message)["error"], "identity");
     message["request_id"] = "x".repeat(65).into();
-    assert_eq!(check(&message)["error"], "session");
+    assert_eq!(check(&message)["error"], "identity");
     message["request_id"] = "x".repeat(64).into();
     assert_eq!(check(&message)["accepted"], true);
     message["session_nonce"] = "other".into();
-    assert_eq!(check(&message)["error"], "session");
+    assert_eq!(check(&message)["error"], "retired_protocol");
 
     let minimal = ack(std::ptr::null(), -1, 0, std::ptr::null(), u32::MAX);
     assert_eq!(minimal, serde_json::json!({

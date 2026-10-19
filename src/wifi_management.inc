@@ -238,8 +238,6 @@ String wifiControlCommand(JsonDocument &doc,const WifiControlContext &ctx,uint64
     if (String(doc["bridge_id"]|"")!=ctx.principal) return reply(doc,"principal_mismatch");
     String op=doc["op"]|"";
     if (op.startsWith("wifi_")) op=op.substring(5);
-    if (op=="command") op=doc["command"]|"";
-    if (op=="save") op="apply";
     if (op=="snapshot" || op=="apply" || op=="result" || op=="result_ack") {
         JsonDocument request; request.set(doc);request["op"]=op;request["result_peer"]=ctx.nameSpace;
         return wifiManagementWithContext(request,now,legacy,ctx);

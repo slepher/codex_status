@@ -569,6 +569,7 @@ extern "C" {
     fn codex_rgn_on_full() -> c_int;
     fn codex_rgn_dump(out: *mut c_char, out_len: c_int) -> c_int;
     fn codex_ble_wire(kind: *const c_char, input: *const c_char, out: *mut c_char, cap: c_int) -> c_int;
+    fn codex_compact_operation(name: *const c_char) -> c_int;
     fn codex_compact_frame_golden(out: *mut u8, cap: c_int) -> c_int;
     fn codex_v2_status_snapshot(input: *const c_char, out: *mut c_char, cap: c_int) -> c_int;
     fn codex_v2_plan_new() -> *mut std::ffi::c_void;
@@ -586,10 +587,10 @@ extern "C" {
         provisional: c_int, boot_ms: u64, safety_deadline_ms: u64, now_ms: u64) -> c_int;
     fn codex_v2_battery_power_off(plugged: c_int, battery_pct: c_int) -> c_int;
     fn codex_v2_command_parse(message: *const c_char, out: *mut c_char, cap: c_int) -> c_int;
-    fn codex_v2_command_check(
+    fn codex_command_identity(
         message: *const c_char,
         current_mac: *const c_char,
-        nonce: *const c_char,
+        principal: *const c_char,
         out: *mut c_char,
         cap: c_int,
     ) -> c_int;
@@ -875,6 +876,10 @@ impl Drop for SimulatorBundle {
 }
 
 /// Cross-language fixed frame vector from the firmware encoder and decoder.
+pub fn simulator_compact_operation(name: &str) -> u16 {
+    let name=std::ffi::CString::new(name).unwrap();
+    unsafe {codex_compact_operation(name.as_ptr()) as u16}
+}
 pub fn simulator_compact_frame_golden() -> anyhow::Result<[u8; 50]> {
     let mut out = [0; 50];
     let rc = unsafe { codex_compact_frame_golden(out.as_mut_ptr(), out.len() as c_int) };
@@ -957,21 +962,21 @@ pub fn simulator_command_parse(message: &str) -> anyhow::Result<serde_json::Valu
     simulator_ffi_json(rc, &out, "command parse")
 }
 
-pub fn simulator_command_check(
+pub fn simulator_command_identity(
     message: &str,
     mac: &str,
-    nonce: &str,
+    principal: Option<&str>,
 ) -> anyhow::Result<serde_json::Value> {
     let message = CString::new(message)?;
     let mac = CString::new(mac)?;
-    let nonce = CString::new(nonce)?;
+    let principal = principal.map(CString::new).transpose()?;
     let mut out = vec![0i8; 8192];
     let rc = unsafe {
-        codex_v2_command_check(
-            message.as_ptr(), mac.as_ptr(), nonce.as_ptr(), out.as_mut_ptr(), out.len() as c_int,
+        codex_command_identity(
+            message.as_ptr(), mac.as_ptr(), principal.as_ref().map_or(std::ptr::null(),|p|p.as_ptr()), out.as_mut_ptr(), out.len() as c_int,
         )
     };
-    simulator_ffi_json(rc, &out, "command session check")
+    simulator_ffi_json(rc, &out, "command identity")
 }
 
 /// The firmware's pure BLE-to-HTTP rendezvous state machine. The caller

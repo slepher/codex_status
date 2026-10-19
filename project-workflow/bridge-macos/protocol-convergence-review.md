@@ -1,13 +1,13 @@
-# 收敛审阅
+# 协议收敛审阅
 
-2026-10-19。原评审核验见 [报告](protocol-review-validation-20261019.md)，当前测试结果见 [状态](protocol-convergence-status.md)。
+2026-10-19，R1–R5源码完成。依据[原核验](protocol-review-validation-20261019.md)，验证与产物以[状态](protocol-convergence-status.md)为准。
 
-R1最终实现替代临时“连接后忙则关闭”：扫描阶段不持设备锁；退出扫描释放radio，选中候选后按设备→radio顺序取得许可，再建链并核对完整MAC。忙设备在连接前跳过；所有等待受单次准入截止约束。保留同步HTTP worker执行许可直到worker真正结束，不能提前放锁假装已取消。
+替换路径已经删除：Wi-Fi只有core Job/Transport执行与收尾；Connection输出不再被HTTP结果反向改写；本轮会合用具名上下文，不再藏私有JSON状态。同步HTTP已移除，取消会结束TCP future并释放许可，不再需要worker存活跟踪。原生BLE/系统查询线程不属于被替换的HTTP机制。
 
-R2复用OperationReply和现有Transport，只增加停止执行后的原ID查询/ACK。确定证据落盘先于ACK，ACK丢失可跨双重启重试，unknown不退役，历史receipt不更新当前配置缓存。HTTP执行后的独立ACK循环已删除，与定期HTTP收尾使用同一入口，BLE使用同一core实现；否则独立循环会绕过有限预算。取消/过期/预算耗尽终点不因确认成功而改回可执行。
+CommandContext建于载体认证、session/replay/context准入之后，业务身份与原事务围栏保留。C2拒绝C1及旧JSON命令字段，Wi-Fi操作使用显式编号，未知名称不能回落到通配编号。删除旧串口wifi-json写入及无会话管理函数，避免设置sessionValid=true后留下非帧绕路。裸OTA仍需设备token。
 
-本轮净增不是纯结构重构的成果：生产增加的是缺失的发现边界及历史收尾能力，测试另计。当前没有删除R3/R4拟替代的JSON投影/上下文，不能宣称整个协议复杂度下降。后续每一替代必须同时删除旧分支，不能永久并存两套调度或协议路径。不得用压缩排版、删除边界验证或减少实质回归凑负行数。
+持久connection schema2只恢复意图/退避；旧瞬时观察/HTTP成功不恢复，认证安全错误保留。观察和联系按boot/时间投影；较新设备失败不能被旧HTTP成功覆盖。终态未知仍阻挡不安全重发，只能查询原事务；接受不等于完成，不提前ACK。
 
-wire未变；Note4/1.54继续使用共享result/result_ack合同，Fake运行该生产路径，AP01应用协议没有新增ESP Wi-Fi管理。后续wire变更四端同时核对，无旧版兼容，保留鉴权/owner/业务ID/回执围栏；裸OTA仅为用户授权更新路径。AP01应用可修改，整ROM发布耦合记录C9。
+491项完整回归通过，5条件忽略；合并后的现场失败初态与最终迁移断言另作定向复验。两款ESP的版本/产物/匹配ELF栈门禁通过；AP01真实应用宿主ASan/UBSan与RV32链接通过，完整候选不可据此直接刷写。未执行本轮实机RF、Flash掉电、原生BLE取消、AP01恢复ABI/屏幕验收；没有部署新协议。
 
-尚未运行真实RF、实体设备OTA、Flash掉电、Windows原生BLE取消验证；没有把宿主测试算作这些验收。Bridge持久字段变化要求部署前冻结备份，旧Bridge不能直接回读新Job字段。
+旧Bridge不能读取新持久schema作为回滚方式，须恢复冻结exe/data。代码行总数不是验收指标：删除旧执行/状态/协议路径，同时增加必要失败与迁移回归；不以删校验或压缩排版凑净减少。

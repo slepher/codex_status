@@ -1,31 +1,19 @@
 //! Fixed 48-byte Bridge/device frame header. Payload and carrier headers are separate.
 
 pub const HEADER_LEN: usize = 48;
-pub const MARKER: u8 = 0xC1;
+pub const MARKER: u8 = 0xC2;
 pub const CONTENT_TYPE: &str = "application/vnd.codex-status.frame";
-pub const MAX_OP: u16 = 27;
+pub const MAX_OP: u16 = 35;
 pub const MAX_HTTP_FRAME: usize = 4096;
 pub const MAX_BLE_FRAME: usize = 8192;
 pub const MAX_ATTRIBUTE: usize = 512;
 
+const OPERATIONS: [&str; 36] = ["", "status", "data", "plan", "claim", "renew", "sync_begin", "sync_page", "sync_ack", "sync_complete", "bundle_begin", "bundle_chunk", "bundle_commit", "activate", "wifi_snapshot", "wifi_apply", "wifi_result", "wifi_result_ack", "wifi_match", "ota_image", "ready_report", "business_query", "network_start", "sync_config", "sync_open", "history", "wifi_owner", "wifi_info", "wifi_active", "wifi_trial", "wifi_activate", "wifi_setup_status", "wifi_setup_cancel", "wifi_status", "wifi_scheme_get", "wifi_capabilities"];
 pub fn operation(name: &str) -> Option<u16> {
-    match name {
-        "status" => Some(1), "data" => Some(2), "plan" => Some(3),
-        "claim" => Some(4), "renew" => Some(5),
-        "sync_begin" => Some(6), "sync_page" => Some(7),
-        "sync_ack" => Some(8), "sync_complete" => Some(9),
-        "bundle_begin" => Some(10), "bundle_chunk" => Some(11),
-        "bundle_commit" => Some(12), "activate" => Some(13),
-        "wifi_snapshot" => Some(14), "wifi_apply" => Some(15),
-        "wifi_result" => Some(16), "wifi_result_ack" => Some(17),
-        "wifi_command" => Some(18), "ota_image" => Some(19),
-        "ready_report" => Some(20), "business_query" => Some(21),
-        "network_start" => Some(22), "sync_config" => Some(23),
-        "sync_open" => Some(24), "history" => Some(25),
-        "wifi_owner" => Some(26), "wifi_info" => Some(27),
-        other if other.starts_with("wifi_") => Some(18),
-        _ => None,
-    }
+    OPERATIONS.iter().position(|&n| !n.is_empty() && n == name).map(|i|i as u16)
+}
+pub fn operation_name(op: u16) -> Option<&'static str> {
+    OPERATIONS.get(usize::from(op)).copied().filter(|n|!n.is_empty())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,12 +122,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_operation_matches_firmware_without_alias_or_wildcard() {
+        for op in 1..=MAX_OP {
+            let name=operation_name(op).unwrap();assert_eq!(operation(name),Some(op));
+            assert_eq!(bridge_render::simulator_compact_operation(name),op);
+        }
+        for name in ["wifi_command","wifi_save","wifi_future_unknown",""] {
+            assert_eq!(operation(name),None);assert_eq!(bridge_render::simulator_compact_operation(name),0);
+        }
+    }
+    #[test]
     fn golden_frame_and_boundaries() {
         let header = Header { kind: 0, op: 3, result: 0, payload_len: 2,
             session: *b"0123456789abcdef", request_no: 0x0102_0304_0506_0708,
             context: *b"0123456789abcdef" };
         let bytes = header.encode().unwrap();
-        assert_eq!(&bytes[..8], &[0xC1, 0, 0, 3, 0, 0, 0, 2]);
+        assert_eq!(&bytes[..8], &[0xC2, 0, 0, 3, 0, 0, 0, 2]);
         assert_eq!(&bytes[8..24], b"0123456789abcdef");
         assert_eq!(&bytes[24..32], &[1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(&bytes[32..48], b"0123456789abcdef");
@@ -147,6 +145,7 @@ mod tests {
         assert_eq!(frame, bridge_render::simulator_compact_frame_golden().unwrap());
         assert_eq!(Header::decode(&frame, 50).unwrap(), (header, b"{}".as_slice()));
         assert!(Header::decode(&frame, 49).is_err());
+        frame[0] = 0xC1; assert!(Header::decode(&frame, 50).is_err());
         frame[0] = 0; assert!(Header::decode(&frame, 50).is_err());
         frame[0] = MARKER; frame.push(0); assert!(Header::decode(&frame, 51).is_err());
         let mut header = header;
