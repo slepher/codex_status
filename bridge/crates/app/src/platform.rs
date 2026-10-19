@@ -80,9 +80,54 @@ pub(super) fn delivery_lock(ctx: &AppCtx, mac: &str) -> Arc<DeliveryLock> {
         .or_insert_with(|| Arc::new(DeliveryLock::default())).clone()
 }
 
+/// Known-device maintenance never reserves the shared radio while waiting for
+/// an HTTP worker. Both permit waits consume the same admission deadline.
+pub(crate) async fn lock_device_ble<'a>(
+    device: &DeliveryLock,
+    radio: &'a tokio::sync::Mutex<()>,
+    deadline: tokio::time::Instant,
+) -> Result<(Arc<tokio::sync::OwnedMutexGuard<()>>, tokio::sync::MutexGuard<'a, ()>), String> {
+    tokio::time::timeout_at(deadline, async {
+        let device = device.lock().await;
+        let radio = radio.lock().await;
+        (device, radio)
+    }).await.map_err(|_| "device_channel_busy".to_owned())
+}
+
 #[cfg(test)]
 mod delivery_worker_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn known_device_wait_does_not_reserve_radio_and_cancellation_releases_permits() {
+        let device = DeliveryLock::default();
+        let other = DeliveryLock::default();
+        let radio = tokio::sync::Mutex::new(());
+        let held = device.lock().await;
+        let waiting = lock_device_ble(&device, &radio, tokio::time::Instant::now() + Duration::from_secs(2));
+        tokio::pin!(waiting);
+        // Poll the real admission path while the device's HTTP permit is held.
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut waiting).await.is_err());
+        let (other_device, other_radio) = lock_device_ble(&other, &radio,
+            tokio::time::Instant::now() + Duration::from_millis(100)).await.unwrap();
+        drop(other_radio); drop(other_device); drop(held);
+        let (device_guard, radio_guard) = waiting.await.unwrap();
+        drop(radio_guard); drop(device_guard);
+
+        let radio_guard = radio.lock().await;
+        // Timing out on the second permit must also release the first.
+        assert!(lock_device_ble(&device, &radio,
+            tokio::time::Instant::now() + Duration::from_millis(20)).await.is_err());
+        assert!(device.try_lock().is_ok());
+        let mut cancelled = Box::pin(lock_device_ble(&device, &radio,
+            tokio::time::Instant::now() + Duration::from_secs(2)));
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut cancelled).await.is_err());
+        assert!(device.try_lock().is_err());
+        drop(cancelled);
+        assert!(device.try_lock().is_ok());
+        drop(radio_guard);
+        assert!(radio.try_lock().is_ok());
+    }
 
     #[tokio::test]
     async fn cancelled_http_waiter_keeps_device_exclusive_until_socket_deadline() {
@@ -2675,6 +2720,7 @@ pub(crate) mod ble_close_lock_tests {
         provisional_remaining_s: AtomicU64,
         status_extra: Mutex<Value>,
         closes: AtomicUsize,
+        info_reads: AtomicUsize,
         status_reads: AtomicUsize,
         fragments: Mutex<Vec<u8>>,
         ack: Mutex<Option<Vec<u8>>>,
@@ -2718,6 +2764,7 @@ pub(crate) mod ble_close_lock_tests {
     }
 
     async fn info(State(fake): State<Arc<FakeBle>>) -> impl IntoResponse {
+        fake.info_reads.fetch_add(1,Ordering::SeqCst);
         let initial = fake.rf_initial_ms.load(Ordering::SeqCst);
         let after = fake.rf_after_plan_ms.load(Ordering::SeqCst);
         let limit = if fake.applied_plan.load(Ordering::SeqCst) > 0 && after > 0 { after } else { initial };
@@ -2943,6 +2990,7 @@ pub(crate) mod ble_close_lock_tests {
             provisional_remaining_s: AtomicU64::new(0),
             status_extra: Mutex::new(json!({})),
             closes: AtomicUsize::new(0),
+            info_reads: AtomicUsize::new(0),
             status_reads: AtomicUsize::new(0),
             fragments: Mutex::new(Vec::new()),
             ack: Mutex::new(None),
@@ -3500,7 +3548,9 @@ pub(crate) mod ble_close_lock_tests {
     #[tokio::test(flavor="multi_thread",worker_threads=4)]
     async fn completed_wifi_receipt_retires_on_ble_cycle_without_a_runnable_job() {
         let _serial=SIM_ENV.lock().unwrap_or_else(|p|p.into_inner());
+        const HUNG_MAC:&str="0200000000E1";
         for case in ["success","lost_ack","status_timeout","wrong_namespace"] {
+            bridge_core::device_clock::configure(HUNG_MAC,0,2_000_000_000_000,0).unwrap();
             let dir=tempfile::tempdir().unwrap();
             let (ble,url)=start_fake_ble(HUNG_MAC,false).await;
             ble.protocol.store(true,Ordering::SeqCst);
@@ -3517,6 +3567,7 @@ pub(crate) mod ble_close_lock_tests {
             std::env::set_var("CODEX_STATUS_SIM_BLE_ENDPOINTS",json!({HUNG_MAC:url}).to_string());
             let retry=matches!(case,"lost_ack"|"status_timeout");
             for round in 0..if retry {2}else{1} {
+                if round>0 {bridge_core::device_clock::step(HUNG_MAC,61_000).unwrap();}
                 *ble.blocked_op.lock().unwrap()=if round==0 && retry {
                     if case=="lost_ack" {"wifi_result_ack".into()}else{"wifi_status".into()}
                 }else{String::new()};
@@ -3534,6 +3585,7 @@ pub(crate) mod ble_close_lock_tests {
             assert!(acks.iter().all(|c|c["query_id"]==job.request_id));
             assert!(!commands.iter().any(|c|matches!(c["op"].as_str(),Some("wifi_activate"|"wifi_trial"|"wifi_save"|"wifi_result"|"plan"|"network_start"))));
         }
+        bridge_core::device_clock::clear(HUNG_MAC);
     }
 
     #[tokio::test(flavor="multi_thread",worker_threads=4)]
@@ -4138,6 +4190,43 @@ pub(crate) mod ble_close_lock_tests {
         assert_eq!(plan["last_accepted_id"],0);
         assert!(ctx.device_delivery.try_lock().is_ok());
         assert!(delivery_lock(&ctx,HUNG_MAC).try_lock().is_ok());
+    }
+
+    #[tokio::test(flavor="multi_thread",worker_threads=4)]
+    async fn rendezvous_busy_device_is_skipped_before_connect() {
+        let _serial=SIM_ENV.lock().unwrap_or_else(|p|p.into_inner());
+        let dir=tempfile::tempdir().unwrap();
+        let (ble,url)=start_fake_ble(HUNG_MAC,false).await;
+        let ctx=test_ctx_with_ip(dir.path(),HUNG_MAC,"127.0.0.1:9");
+        let lock=delivery_lock(&ctx,HUNG_MAC);let held=lock.lock().await;
+        std::env::set_var("CODEX_STATUS_SIM_BLE_ENDPOINTS",json!({HUNG_MAC:url}).to_string());
+        let result=tokio::time::timeout(Duration::from_secs(3),ble_cycle(&ctx,&[HUNG_MAC.into()])).await;
+        std::env::remove_var("CODEX_STATUS_SIM_BLE_ENDPOINTS");
+        assert!(matches!(result,Ok(Ok(BleOpportunity::NoDevice))),"{result:?}");
+        assert_eq!(ble.closes.load(Ordering::SeqCst),0);
+        assert_eq!(ble.info_reads.load(Ordering::SeqCst),0);
+        assert!(ble.events.lock().unwrap().is_empty());
+        assert!(ctx.device_delivery.try_lock().is_ok());
+        assert!(lock.try_lock().is_err(),"the HTTP owner still holds its permit");
+        drop(held);
+        assert!(lock.try_lock().is_ok());
+    }
+
+    #[tokio::test(flavor="multi_thread",worker_threads=4)]
+    async fn rendezvous_skips_busy_candidate_and_connects_other_device() {
+        let _serial=SIM_ENV.lock().unwrap_or_else(|p|p.into_inner());
+        let dir=tempfile::tempdir().unwrap();
+        let (busy,busy_url)=start_fake_ble(HUNG_MAC,false).await;
+        let (other,other_url)=start_fake_ble(OTHER_MAC,false).await;
+        let ctx=test_ctx(dir.path(),&[HUNG_MAC,OTHER_MAC]);
+        let lock=delivery_lock(&ctx,HUNG_MAC);let _held=lock.lock().await;
+        std::env::set_var("CODEX_STATUS_SIM_BLE_ENDPOINTS",json!({HUNG_MAC:busy_url,OTHER_MAC:other_url}).to_string());
+        let result=ble_cycle(&ctx,&[HUNG_MAC.into(),OTHER_MAC.into()]).await;
+        std::env::remove_var("CODEX_STATUS_SIM_BLE_ENDPOINTS");
+        assert!(matches!(result,Ok(BleOpportunity::Connected {ref mac,..}) if mac==OTHER_MAC),"{result:?}");
+        assert_eq!(busy.info_reads.load(Ordering::SeqCst),0);
+        assert!(other.info_reads.load(Ordering::SeqCst)>0);
+        assert!(ctx.device_delivery.try_lock().is_ok());
     }
 
     #[tokio::test(flavor="multi_thread",worker_threads=4)]

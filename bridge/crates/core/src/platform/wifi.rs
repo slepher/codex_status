@@ -245,6 +245,16 @@ pub struct WifiState {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct Settlement {
+    pub attempts: u32,
+    pub next_attempt_at: u64,
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    pub result_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Job {
     pub job_id: String,
     pub request_id: String,
@@ -284,9 +294,18 @@ pub struct Job {
     #[serde(default)]
     pub receipt_ack_pending: bool,
     #[serde(default, skip_serializing_if="Option::is_none")]
+    pub settlement: Option<Settlement>,
+    #[serde(default, skip_serializing_if="Option::is_none")]
     pub command: Option<Value>,
 }
 impl Job {
+    /// Historical reconciliation is query-only and never creates a wake intent.
+    pub fn settlement_due(&self, now: u64) -> bool {
+        self.terminal() && (self.receipt_ack_pending || self.confirmation_pending())
+            && self.request_id.starts_with("w3_")
+            && self.transaction_namespace.as_deref().is_some_and(|s| !s.is_empty())
+            && self.settlement.as_ref().is_none_or(|s| s.attempts < 3 && now >= s.next_attempt_at)
+    }
     pub fn check_transaction_context(&self, principal: &str, namespace: &str) -> Result<()> {
         if principal != self.bridge_id { bail!("transaction_principal_changed"); }
         if namespace.is_empty() || namespace.len() > 21 { bail!("transaction_namespace_invalid"); }
@@ -507,7 +526,7 @@ impl WifiState {
             transaction_namespace: None, state: "queued".into(), execution_intent: ExecutionIntent::Active, created_at: now, expires_at: now.saturating_add(INTENT_TTL_S), updated_at: now,
             local_revision: self.local_revision, attempt_count: 0, confirmation_attempts: 0, last_attempt_at: None, next_attempt_at: now,
             last_stage: "accepted".into(), error_code: None, sent: false, may_have_committed: false,
-            selected, frozen, fields, expected_revision: self.snapshot.as_ref().map(|s| s.revision), host_ssid: None, before, confirmed_revision: None, confirmation: None, receipt_ack_pending: false, command: None };
+            selected, frozen, fields, expected_revision: self.snapshot.as_ref().map(|s| s.revision), host_ssid: None, before, confirmed_revision: None, confirmation: None, receipt_ack_pending: false, settlement: None, command: None };
         self.jobs.push(j.clone());
         Ok(j)
     }

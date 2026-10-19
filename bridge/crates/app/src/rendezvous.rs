@@ -58,20 +58,34 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
         return Ok(BleOpportunity::NoDevice);
     }
     crate::host_wifi::require_device_bluetooth()?;
-    let _delivery = ctx.device_delivery.lock().await;
-    let (mac, mut link) = match bridge_ble::DeviceConnection::connect_any(
-        candidates,
-        &ctx.config.token,
-        &ctx.bridge_id,
-    )
-    .await
-    .map_err(err_text)?
-    {
-        Some((mac, link)) => (mac, link),
-        None => return Ok(BleOpportunity::NoDevice),
+    let admission_deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+    let mut remaining = candidates.iter().map(|mac| DeviceIdentity::normalized_mac(mac)
+        .ok_or_else(|| "invalid_device_mac".to_owned())).collect::<Result<Vec<_>,_>>()?;
+    let (mac, mut link, _device_delivery, _delivery) = loop {
+        // This is only an availability hint. Reserve the selected device again
+        // after scanning; no device permit is held during discovery.
+        remaining.retain(|mac| delivery_lock(ctx, mac).try_lock().is_ok());
+        if remaining.is_empty() || tokio::time::Instant::now() >= admission_deadline {
+            return Ok(BleOpportunity::NoDevice);
+        }
+        let candidate = {
+            let _scan = tokio::time::timeout_at(admission_deadline, ctx.device_delivery.lock())
+                .await.map_err(|_| "device_channel_busy".to_owned())?;
+            bridge_ble::DeviceConnection::discover_any(&remaining, admission_deadline).await.map_err(err_text)?
+        };
+        let Some(candidate) = candidate else { return Ok(BleOpportunity::NoDevice); };
+        let mac = candidate.mac.clone();
+        remaining.retain(|other| other != &mac);
+        let lock = delivery_lock(ctx, &mac);
+        let Ok(device_permit) = lock.try_lock() else { continue; };
+        let radio_permit = tokio::time::timeout_at(admission_deadline, ctx.device_delivery.lock())
+            .await.map_err(|_| "device_channel_busy".to_owned())?;
+        if tokio::time::Instant::now() >= admission_deadline { return Err("device_channel_busy".into()); }
+        match bridge_ble::DeviceConnection::connect_candidate(candidate, &ctx.config.token, &ctx.bridge_id, admission_deadline).await.map_err(err_text)? {
+            Some((verified, link)) => break (verified, link, device_permit, radio_permit),
+            None => continue,
+        }
     };
-    let lock = delivery_lock(ctx, &mac);
-    let _device_delivery = lock.lock().await;
     let still_registered = service(ctx).devices().into_iter().any(|device| {
         device["device_mac"]
             .as_str()

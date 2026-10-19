@@ -222,6 +222,8 @@
 
 ### B6. 离线 BLE 配 Wi-Fi 与 BOOT 蓝牙恢复入口（2026-10-03 新开）
 
+- **2026-10-19协议收敛已授权启动（关联C8）**：按[核验与方案](../../project-workflow/bridge-macos/protocol-review-validation-20261019.md)和[实施计划](../../project-workflow/bridge-macos/protocol-convergence-plan.md)推进锁顺序、历史事务收尾、类型/投影、会合上下文和异步HTTP。wire变更覆盖Note4、1.54、Fake ROM及ports/ap01当前应用，不做旧版兼容；升级致Bridge OTA协议通道失效时用户允许走受鉴权裸OTA。当前切片与验证见[状态](../../project-workflow/bridge-macos/protocol-convergence-status.md)，不据此结项或宣称已部署。
+
 - **2026-10-19 事务终点逻辑修复已部署，关联C8**：终态未知历史释放准入，缺失/变化身份与三次原ID确认预算结束执行，保留未知结果；异步激活继续network_start，已发控制事务纳入恢复查询。Rust334项通过（含显式保护用例）/剩余4条件忽略，Node/WK68及窄宽截图通过。最终Bridge10:35部署后自然会合自动切回办公室Xiaomi_1EBB，003f按原IDcompleted、revision341/active office/v235、认证HTTP200；三条原未知历史逐字段及SHA不变。未刷机/BOOT/手动切网，图标未目视；长期RF及B6其他验收不因此结项。[修复与证据](../../project-workflow/bridge-macos/wifi-transaction-finality-20261019.md)。
 
 - **2026-10-14 连接结束修复与离线日志已部署**：服务发现期间断开漏回pending connect导致12:20永久隔离；14:28 BOOT为同一隔离延续。Bridge根因修复14:44部署，真实handler7项/共享Fake红→绿及App94/BLE26/Fake68通过（3条件忽略）。.101完成跨深睡读回；最终Note4 .102于15:48单次原生OTA、认证运行hash匹配，LittleFS保留24小时内/384KiB日志，补薄唤醒RTC回填和过期去重，不改分区/NVS。正式Sleep→自然醒次3 BLE ACK/关闭0ms→Light3948/认证HTTP恢复，Flash40条3504B CRC正常、薄唤醒2摘要回填、原27条保持，无认证401。生产存储到期/轮换/截断/资源及最终Fake68/匹配ELF栈通过。初始物理链路超时因旧记录覆盖仍未知，长期RF/真实24h矩阵未验，不结项。[实施与部署](../../project-workflow/bridge-macos/offline-log-connect-fix-20261014.md)、[调查](../../project-workflow/bridge-macos/ble-connect-disconnect-20261014.md)。
@@ -345,6 +347,8 @@
 ## 4. 战略/长线（C 级：需要独立 initiative，不在近期窗口）
 
 ### C9. 取消项目自管A/B、动态容量与内置更新界面
+
+- **2026-10-19 AP01应用代码独立更新缺口**：用户要求核对并记录。应用源码在`ports/ap01/`，可修改；`tools/link-ap01-native.py`生成XIP模块，`tools/build-ap01-rom.py`将其打包进完整0041 ROM，当前代码更新与整ROM发布耦合。完整Bundle更新模板/资源，不等于更新应用可执行代码。后续评估并定义独立应用更新边界/ABI、原子提交与恢复、认证/完整性、资源预算及宿主/原生验收；未实现前继续明确使用完整ROM更新，不记为“源码无法修改”，也不把原厂逆向仓库缺失当作本轮协议重构阻塞。不得以新增应用双槽违反单份应用/Bundle及保留原生固件双槽的既定约束。
 
 - **2026-10-19 01:36 独立OTA稳定槽完成模拟**：维护18080加入slots/stable/switch/持久查询及响应后重启，与业务18081及owner/context/Bundle隔离。候选22/原生49、50、51验证有焦点模板时完整OTA、直接稳定槽回切、原槽重启回执；ff13重放只提交一次，两槽及保护区字节不变、三轮四场景零像素差异。修复实际LVGL绘制事件误入OTA输入分支的断言。新ROM6993160 B，SHA256 `63eb98e51c9cb1e0b2783d63b51c50da0dadb3db95b1ad107fcbb0fbb970df94`，未刷机/部署Bridge；物理与传统OTA旁路边界保留，C9不关闭。见[交付](../../project-workflow/ap01-template-integration/release-0041-ota-slots.md)。
 

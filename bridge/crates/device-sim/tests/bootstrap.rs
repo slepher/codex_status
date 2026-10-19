@@ -571,8 +571,7 @@ fn sync_v1_s01_note4_fifteenth_deep_round_requires_explicit_open() {
         ENDPOINT, "02:00:00:00:00:B3", "bridge-test", &bytes, 4096,
         Duration::from_secs(3)).unwrap()["result"], "applied");
     assert_eq!(claim(&sim, "id=bridge-test&lease=3600", Some(DEVICE)).0, 200);
-    let status = json_body(&request(sim.address(), "GET", "/api/status",
-        Some(ENDPOINT), b"").1);
+    let status = authenticated_status(&sim);
     let config = serde_json::json!({"op":"sync_config","request_id":"config-rounds",
         "token":ENDPOINT,"device_mac":"02:00:00:00:00:B3",
         "session_nonce":status["session_nonce"],"bridge_id":"bridge-test","enabled":true});
@@ -643,8 +642,7 @@ fn sync_v1_s01_note4_fifteenth_deep_round_requires_explicit_open() {
         Some(ENDPOINT), open.to_string().as_bytes()).1);
     assert_eq!(replay["result"], "applied", "{replay}");
     assert_eq!(sim_state(&sim)["power"]["sync_open"], true);
-    assert_eq!(json_body(&request(sim.address(), "GET", "/api/status",
-        Some(ENDPOINT), b"").1)["sync"]["phase"], "WIFI_SYNC_ONCE");
+    assert_eq!(authenticated_status(&sim)["sync"]["phase"], "WIFI_SYNC_ONCE");
     let nonce2 = current["session_nonce"].as_str().unwrap();
     let call2 = |op: &str, id: &str, fields: Value| bridge_core::device_client::sync(&ip,
         ENDPOINT, "02:00:00:00:00:B3", "bridge-test", nonce2, op, id,
@@ -718,9 +716,13 @@ fn sync_v1_s12_note4_auth_owner_session_and_low_battery() {
     assert_eq!(low["sync"]["pending_batch"], Value::Null);
 }
 
+fn authenticated_status(sim: &Simulator) -> Value {
+    bridge_core::device_client::status(&sim.address().to_string(), ENDPOINT,
+        Duration::from_secs(3)).unwrap()
+}
+
 fn note4_sync_roundtrip(sim: &Simulator, serial: u64, reasons: &[&str]) -> Value {
-    let state = json_body(&request(sim.address(), "GET", "/api/status",
-        Some(ENDPOINT), b"").1);
+    let state = authenticated_status(&sim);
     let nonce = state["session_nonce"].as_str().unwrap();
     let mac = state["device_mac"].as_str().unwrap();
     let ip = sim.address().to_string();
@@ -772,8 +774,7 @@ fn configured_note4_sync_sim_with_options(mac: &str, options: &[&str]) -> Simula
         mac, "bridge-test", &bytes, 4096, Duration::from_secs(3)).unwrap()["result"],
         "applied");
     assert_eq!(claim(&sim, "id=bridge-test&lease=3600", Some(DEVICE)).0, 200);
-    let status = json_body(&request(sim.address(), "GET", "/api/status",
-        Some(ENDPOINT), b"").1);
+    let status = authenticated_status(&sim);
     let config = serde_json::json!({"op":"sync_config","request_id":"config-light",
         "token":ENDPOINT,"device_mac":mac,
         "session_nonce":status["session_nonce"],"bridge_id":"bridge-test","enabled":true});
@@ -811,8 +812,7 @@ fn current_device_protocol_rejects_retired_routes_and_ble_markers() {
 #[test]
 fn sync_v1_s02_note4_light_entry_and_exit_each_drain() {
     let sim = configured_note4_sync_sim("02:00:00:00:00:B5");
-    let before = json_body(&request(sim.address(), "GET", "/api/status",
-        Some(ENDPOINT), b"").1);
+    let before = authenticated_status(&sim);
     let sleep = plan_message(&before, "bridge-test", "sleep-light", 1, "sleep", None);
     assert_eq!(post_plan(&sim, Some(ENDPOINT), &sleep).1["result"], "applied");
     assert_eq!(sim_state(&sim)["power"]["mode"], "deep");
@@ -925,8 +925,7 @@ fn sync_v1_s08_note4_ring_overflow_crc_and_text_redaction() {
 #[test]
 fn sync_v1_s03_note4_frozen_pages_survive_light_deadline() {
     let sim = configured_note4_sync_sim("02:00:00:00:00:B7");
-    let status = json_body(&request(sim.address(), "GET", "/api/status",
-        Some(ENDPOINT), b"").1);
+    let status = authenticated_status(&sim);
     let sleep = plan_message(&status, "bridge-test", "sleep-s03", 1, "sleep", None);
     assert_eq!(post_plan(&sim, Some(ENDPOINT), &sleep).1["result"], "applied");
     assert_eq!(set_time(&sim, Some(CONTROL),
@@ -951,8 +950,7 @@ fn sync_v1_s03_note4_frozen_pages_survive_light_deadline() {
     let deadline = before["power"]["boot_ms"].as_u64().unwrap()
         + before["plan"]["accepted_at_ms"].as_u64().unwrap()
         + before["plan"]["granted_s"].as_u64().unwrap() * 1000;
-    let state = json_body(&request(sim.address(), "GET", "/api/status",
-        Some(ENDPOINT), b"").1);
+    let state = authenticated_status(&sim);
     let nonce = state["session_nonce"].as_str().unwrap();
     let mac = state["device_mac"].as_str().unwrap();
     let ip = sim.address().to_string();
@@ -1006,8 +1004,7 @@ fn sync_v1_s03_note4_frozen_pages_survive_light_deadline() {
 #[test]
 fn sync_v1_s05_note4_stalled_transfer_skips_full_retry_window() {
     let sim = configured_note4_sync_sim("02:00:00:00:00:B9");
-    let status = json_body(&request(sim.address(), "GET", "/api/status",
-        Some(ENDPOINT), b"").1);
+    let status = authenticated_status(&sim);
     let sleep = plan_message(&status, "bridge-test", "s05-sleep", 1, "sleep", None);
     assert_eq!(post_plan(&sim, Some(ENDPOINT), &sleep).1["result"], "applied");
     for _ in 0..15 {
@@ -1078,8 +1075,7 @@ fn sync_v1_s07_note4_hard_restart_resumes_frozen_batch() {
         assert_eq!(request(sim.address(), "POST", "/sim/diagnostics", Some(CONTROL),
             text.to_string().as_bytes()).0, 200);
     }
-    let initial = json_body(&request(sim.address(), "GET", "/api/status",
-        Some(ENDPOINT), b"").1);
+    let initial = authenticated_status(&sim);
     let sleep = plan_message(&initial, "bridge-test", "s07-sleep", 1, "sleep", None);
     assert_eq!(post_plan(&sim, Some(ENDPOINT), &sleep).1["result"], "applied");
     for _ in 0..15 {
@@ -1097,8 +1093,7 @@ fn sync_v1_s07_note4_hard_restart_resumes_frozen_batch() {
         "wake_generation":current["wake_generation"],"wake_seq":current["wake_seq"]});
     assert_eq!(json_body(&request(sim.address(), "POST", "/sim/ble/command",
         Some(ENDPOINT), open.to_string().as_bytes()).1)["result"], "applied");
-    let state = json_body(&request(sim.address(), "GET", "/api/status",
-        Some(ENDPOINT), b"").1);
+    let state = authenticated_status(&sim);
     let first = bridge_core::device_client::sync(&sim.address().to_string(), ENDPOINT,
         "02:00:00:00:00:BA", "bridge-test", state["session_nonce"].as_str().unwrap(),
         "begin", "s07-begin", &serde_json::json!({"client_serial":"2",
@@ -1153,8 +1148,7 @@ fn sync_v1_s07_note4_hard_restart_resumes_frozen_batch() {
 #[test]
 fn sync_v1_s07_note4_crash_before_blob_reference_keeps_previous_metadata() {
     let mut sim = configured_note4_sync_sim("02:00:00:00:00:BB");
-    let state = json_body(&request(sim.address(), "GET", "/api/status",
-        Some(ENDPOINT), b"").1);
+    let state = authenticated_status(&sim);
     for (id, enabled) in [("s07-disable", false), ("s07-enable", true)] {
         let config = serde_json::json!({"op":"sync_config","request_id":id,
             "token":ENDPOINT,"device_mac":"02:00:00:00:00:BB",
@@ -3450,9 +3444,11 @@ fn rendezvous_audit_queued_wifi_read_grants_bounded_light_window() {
 fn rendezvous_audit_sync_completion_closes_window_before_wifi_snapshot() {
     let mac = "02:00:00:00:00:C2";
     let sim = configured_note4_sync_sim(mac);
-    let state = json_body(&request(sim.address(),"GET","/api/status",Some(ENDPOINT),b"").1);
+    let state = authenticated_status(&sim);
     let light = plan_message(&state,"bridge-test","audit-light",1,"light",Some(120));
-    assert_eq!(post_plan(&sim,Some(ENDPOINT),&light).1["result"],"applied");
+    let (code, reply) = post_plan(&sim,Some(ENDPOINT),&light);
+    assert_eq!(code, 200, "light plan reply: {reply}");
+    assert_eq!(reply["result"],"applied", "light plan reply: {reply}");
     assert_eq!(set_time(&sim,Some(CONTROL),
         &serde_json::json!({"op":"step","delta_ms":120000})).0,200);
     assert_eq!(sim_state(&sim)["power"]["sync_open"],true);

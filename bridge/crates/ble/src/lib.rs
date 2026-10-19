@@ -850,6 +850,15 @@ fn stamp_clock(body: &mut serde_json::Value, mac: &str) {
     body["tz_offset_min"] = json!(bridge_core::local_offset_minutes());
 }
 
+/// An unconnected advertisement candidate. Its MAC is a scheduling hint only;
+/// connect_candidate verifies the full authenticated INFO identity again.
+pub struct DeviceCandidate {
+    pub mac: String,
+    carrier: CandidateCarrier,
+    found_ms: u128,
+}
+enum CandidateCarrier { Fake(String), Native(u64, Peripheral) }
+
 /// Authenticated device opportunity on the existing GATT table. The status value
 /// is read as a long attribute, so an ACK is not lost to notification MTU cuts.
 pub struct DeviceConnection {
@@ -982,28 +991,71 @@ impl DeviceConnection {
             .map(|(_, connection)| connection))
     }
 
-    /// Scan once for any registered target. The advertisement name is only a
+    /// Discover and connect registered targets within one admission deadline.
+    /// The advertisement name is only a
     /// candidate filter; the full Wi-Fi MAC in GATT info authorizes the link.
     pub async fn connect_any(
         target_macs: &[String],
         token: &str,
         bridge_id: &str,
     ) -> Result<Option<(String, Self)>> {
-        let targets = normalize_target_macs(target_macs)?;
-        if targets.is_empty() {
-            return Ok(None);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+        let mut remaining = normalize_target_macs(target_macs)?;
+        while let Some(candidate) = Self::discover_any(&remaining, deadline).await? {
+            remaining.retain(|mac| mac != &candidate.mac);
+            if let Some(link) = Self::connect_candidate(candidate, token, bridge_id, deadline).await? {
+                return Ok(Some(link));
+            }
         }
+        Ok(None)
+    }
+
+    /// Scan without opening GATT or creating a device session. The caller must
+    /// release its scan permit before acquiring this candidate's device permit.
+    pub async fn discover_any(target_macs: &[String], deadline: tokio::time::Instant) -> Result<Option<DeviceCandidate>> {
+        let targets = normalize_target_macs(target_macs)?;
+        if targets.is_empty() { return Ok(None); }
+        anyhow::ensure!(deadline > tokio::time::Instant::now(), "ble_discovery_budget_exhausted");
         if let Ok(raw) = std::env::var("CODEX_STATUS_SIM_BLE_ENDPOINTS") {
             let endpoints: serde_json::Value = serde_json::from_str(&raw)
                 .context("invalid fake BLE endpoint registry")?;
-            let client = reqwest::Client::builder().timeout(Duration::from_secs(3)).build()?;
-            for mac in &targets {
-                let Some(url) = endpoints[mac].as_str() else { continue; };
+            for mac in targets {
+                let Some(url) = endpoints[&mac].as_str() else { continue; };
                 let parsed = reqwest::Url::parse(url)?;
                 if parsed.scheme() != "http" || !matches!(parsed.host_str(),
                     Some("127.0.0.1" | "localhost")) || parsed.port().is_none() {
                     bail!("fake BLE endpoint must be an explicit loopback HTTP address");
                 }
+                return Ok(Some(DeviceCandidate { mac, carrier: CandidateCarrier::Fake(url.trim_end_matches('/').to_owned()), found_ms: 0 }));
+            }
+            return Ok(None);
+        }
+        let adapter = tokio::time::timeout_at(deadline.min(tokio::time::Instant::now() + Duration::from_secs(3)), Pusher::adapter()).await
+            .context("ble_adapter_timeout")??;
+        let started = Instant::now();
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        anyhow::ensure!(remaining > CLOSE_BUDGET, "ble_scan_budget_exhausted");
+        let found = Pusher::find_device_matching(&adapter, (remaining - CLOSE_BUDGET).min(Duration::from_secs(3)), |name| {
+            advertisement_matches_any_target(name, &targets)
+        }).await?;
+        let Some((scan_id, peripheral)) = found else { return Ok(None); };
+        let properties = tokio::time::timeout_at(deadline.min(tokio::time::Instant::now() + Duration::from_secs(1)), peripheral.properties()).await
+            .context("ble_advertisement_timeout")??;
+        let name = properties.and_then(|p| p.local_name).unwrap_or_default();
+        let mac = advertisement_target(&name, &targets).context("ble_candidate_identity_ambiguous")?;
+        Ok(Some(DeviceCandidate { mac, carrier: CandidateCarrier::Native(scan_id, peripheral), found_ms: started.elapsed().as_millis() }))
+    }
+
+    /// Connect only the reserved candidate, never a different registered MAC.
+    pub async fn connect_candidate(candidate: DeviceCandidate, token: &str, bridge_id: &str, deadline: tokio::time::Instant)
+        -> Result<Option<(String, Self)>> {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        anyhow::ensure!(remaining > CLOSE_BUDGET, "ble_open_budget_exhausted");
+        let DeviceCandidate { mac, carrier, found_ms } = candidate;
+        let targets = vec![mac.clone()];
+        let (scan_id, peripheral) = match carrier {
+            CandidateCarrier::Fake(url) => {
+                let client = reqwest::Client::builder().timeout((remaining - CLOSE_BUDGET).min(Duration::from_secs(3))).build()?;
                 let mut native_lease = if std::env::var("CODEX_STATUS_SIM_BLE_LIFECYCLE").as_deref() == Ok("1") {
                     Some(NativeLease::acquire(&SIM_RADIO_STATE)?)
                 } else { None };
@@ -1018,22 +1070,23 @@ impl DeviceConnection {
                             if let Some(lease) = native_lease.as_mut() { lease.stopped = true; }
                         }
                         tracing::warn!(device_mac = mac, %error, "fake BLE candidate unavailable");
-                        continue;
+                        return Ok(None);
                     }
                 };
                 if matches!(response.status().as_u16(), 400 | 401 | 403 | 404) {
                     if let Some(lease) = native_lease.as_mut() { lease.stopped = true; }
                 }
-                if response.status() == reqwest::StatusCode::NOT_FOUND { continue; }
+                if response.status() == reqwest::StatusCode::NOT_FOUND { return Ok(None); }
                 let response = response.error_for_status()?;
                 let generation = response.headers().get("x-sim-ble-generation").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok()).context("fake BLE connection generation missing")?;
                 let mut info = decode_wire(&response.bytes().await?)?;
                 info["_sim_generation"] = json!(generation);
                 if native_lease.is_some() {
-                    let result=tokio::time::timeout(Duration::from_secs(4),
+                    let work_deadline=deadline-CLOSE_BUDGET;
+                    let result=tokio::time::timeout_at(work_deadline.min(tokio::time::Instant::now()+Duration::from_secs(4)),
                         sim_peripheral::discover(url.trim_end_matches('/'),token,generation)).await;
                     if !matches!(&result,Ok(Ok(()))) {
-                        let stopped=disconnect_bounded(None,CLOSE_BUDGET,
+                        let stopped=disconnect_bounded(None,deadline.saturating_duration_since(tokio::time::Instant::now()).min(CLOSE_BUDGET),
                             sim_peripheral::disconnect(url.trim_end_matches('/'),token,generation)).await;
                         if let Some(lease)=native_lease.as_mut(){lease.stopped=stopped && result.is_ok();}
                         return match result {
@@ -1045,7 +1098,7 @@ impl DeviceConnection {
                 }
                 let authorized_mac = info_authorized_target(&info, &targets)
                     .context("fake BLE device identity mismatch")?;
-                if authorized_mac != *mac || info["rendezvous"] != true {
+                if authorized_mac != mac || info["rendezvous"] != true {
                     bail!("fake BLE rendezvous identity/version mismatch");
                 }
                 let device_mac = authorized_mac.as_bytes().chunks(2)
@@ -1066,20 +1119,10 @@ impl DeviceConnection {
                     device_last_stage: "info".into(), timings: vec![],
                 })));
             }
-            return Ok(None);
-        }
-        let open_deadline = tokio::time::Instant::now() + Duration::from_secs(25);
-        let adapter = Pusher::adapter().await?;
-        let find_start = Instant::now();
-        let found = Pusher::find_device_matching(&adapter, Duration::from_secs(3), |name| {
-            advertisement_matches_any_target(name, &targets)
-        })
-        .await;
-        let Some((scan_id, peripheral)) = found? else {
-            return Ok(None);
+            CandidateCarrier::Native(scan_id, peripheral) => (scan_id, peripheral),
         };
-        let mut timings: Vec<(String, u128)> =
-            vec![("find".to_string(), find_start.elapsed().as_millis())];
+        let open_deadline = deadline.min(tokio::time::Instant::now() + Duration::from_secs(18));
+        let mut timings: Vec<(String, u128)> = vec![("find".to_string(), found_ms)];
         let info_started = tokio::time::Instant::now();
         let connect_start = Instant::now();
         let ((info, authorized_mac), native_lease) = open_link(&NATIVE_RADIO_STATE, scan_id,
@@ -1791,6 +1834,13 @@ fn normalize_target_macs(target_macs: &[String]) -> Result<Vec<String>> {
     Ok(normalized)
 }
 
+fn advertisement_target(name: &str, target_macs: &[String]) -> Option<String> {
+    let mut matches = target_macs.iter().filter(|mac| name.starts_with(&format!("CodexStatus-{}", &mac[6..])));
+    let mac = matches.next()?;
+    // A suffix collision cannot safely select one device execution permit.
+    matches.next().is_none().then(|| mac.clone())
+}
+
 fn advertisement_matches_any_target(name: &str, target_macs: &[String]) -> bool {
     target_macs
         .iter()
@@ -1811,6 +1861,15 @@ fn info_authorized_target(info: &serde_json::Value, target_macs: &[String]) -> O
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn discovery_candidate_requires_unique_suffix_and_full_info_identity() {
+        let targets=vec!["001122334455".to_owned(),"AABBCC334455".to_owned()];
+        assert!(super::advertisement_target("CodexStatus-334455",&targets).is_none());
+        let single=&targets[..1];
+        assert_eq!(super::advertisement_target("CodexStatus-334455",single).as_deref(),Some("001122334455"));
+        assert!(super::info_authorized_target(&serde_json::json!({"mac":"AABBCC334455"}),single).is_none());
+    }
+
     use super::{
         advertisement_matches_any_target, classify_advertisement, empty_scan_suppressed_windows,
         info_authorized_target, normalize_target_macs, should_log_empty_window,
