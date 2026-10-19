@@ -1,8 +1,10 @@
 # Codex Status 当前交接
 
-更新时间：2026-10-19 18:16 香港时间
+更新时间：2026-10-19 19:59 香港时间
 
 ## 部署与工作区
+
+- Windows 19:55已部署切网修复，exe38,739,968 B，SHA256 `66e8e7f2ea64f9569a24ecbe49b6c57c0064d1f6aadc7ff7bd7ccd0a06b937e6`。264文件冻结备份 `artifacts/wifi-switch-backup-20261019-195530`；19:57自然会合恢复wd21-la/认证HTTP，原ID017a completed/revision342，14条旧Job不变，用户确认OFF图标恢复；固件仍.104-note4。合并 `codex/fix-wifi-switch`，详情及回滚见[切网验收](project-workflow/wifi-switch-fix/status.md)。
 
 - macOS托管Bridge 15:26已部署AP01族菜单；exe80,984,128 B，SHA256 `cc81bf028101309f00b4b472417b737c4b317378fd7d911f8adc766c99e535d6`，health204。停机冻结App/data备份 `~/Library/Application Support/dev.codexstatus.bridge/backups/cross-family-sync-20261019-152556`；159文件哈希一致、启动前data未变、签名及部署包一致。
 - Note4 `7C4FADB93408` v7此前已发布：job `cac235bb` succeeded，认证source_crc `6d54e167`、context `9c3bd636edcd32e4`、commit/data802 displayed；固件`.104-note4/ota_0`。本轮保留其Profile/发布jobs与合同，不重复发布、不刷机。实物屏幕未目视。

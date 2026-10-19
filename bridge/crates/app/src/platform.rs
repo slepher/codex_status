@@ -4552,7 +4552,7 @@ pub(crate) mod ble_close_lock_tests {
         let (ble,url)=start_fake_ble_with(HUNG_MAC,false,true,Arc::new(Mutex::new(Vec::new()))).await;
         ble.protocol.store(true,Ordering::SeqCst);
         ble.status_extra.lock().unwrap()["_activate_pending"]=json!(true);
-        *ble.wifi_match_reply.lock().unwrap()=json!({"network_id":"office","active":false,"connected":false,"stage":"saved"});
+        *ble.wifi_match_reply.lock().unwrap()=json!({"network_id":"office","active":false,"connected":false,"stage":"failed","error":"window_closed","reason":201});
         let (http,ip,server)=start_full_http(ble.clone(),"bridge-lock-repro").await;
         let ctx=test_ctx_with_ip(dir.path(),HUNG_MAC,&ip);let svc=service(&ctx);let now=device_now(HUNG_MAC);
         ble.ble_claim.store(true,Ordering::SeqCst);*ble.claim_owner.lock().unwrap()=ctx.bridge_id.clone();
@@ -4564,10 +4564,10 @@ pub(crate) mod ble_close_lock_tests {
         svc.wifi_mark_sent(HUNG_MAC,&job.job_id,now).unwrap();
         svc.wifi_finish(HUNG_MAC,&job.job_id,"cancelled",Some("transaction_identity_unknown"),now).unwrap();
         let history=serde_json::to_value(&svc.wifi_state(HUNG_MAC).jobs).unwrap();
-        // Reproduce the stale local error inherited by later wifi_match replies.
+        // Windows live failure: an inactive target retains the previous window_closed result.
         let mut connection:bridge_core::platform::wifi::Connection=serde_json::from_value(json!({
             "host_ssid":"OfficeHost","network_id":"office","local_revision":1,"version":2,
-            "state":"waiting_for_window","error":"wifi_confirmation_pending","reason":0,"observed_at":now,
+            "state":"connection_failed","error":"window_closed","reason":201,"observed_at":now,
             "attempts":0,"next_attempt_at":0})).unwrap();
         svc.wifi_note_connection(HUNG_MAC,connection.clone()).unwrap();
         std::env::set_var("CODEX_STATUS_SIM_BLE_ENDPOINTS",json!({HUNG_MAC:url}).to_string());
