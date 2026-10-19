@@ -1,7 +1,6 @@
 // Host ASan/UBSan only. Uses a complete real candidate as the stream fixture;
 // flash callbacks are a private byte array, never a physical device.
 #include "http.h"
-#include "reference_0041.h"
 #include "local_json_allocator.h"
 #include "v2_sync.h"
 #include "v2_command_envelope.h"
@@ -45,7 +44,7 @@ struct Flash {
     static int commit(void *p){auto &f=*(Flash *)p;++f.commits;return f.unknown?-1:1;}
     static void close(void *p){++((Flash *)p)->closes;}
     static void reboot(void *p){++((Flash *)p)->reboots;}
-    Ap01FirmwarePort port(){return {this,isBusy,begin,write,verify,commit,close,ap01ReferenceHeader,build,reboot};}
+    Ap01FirmwarePort port(){return {this,isBusy,begin,write,verify,commit,close,build,reboot};}
 };
 std::string readAll(const char *p){std::ifstream f(p,std::ios::binary);return {std::istreambuf_iterator<char>(f),{}};}
 std::string text(const String &s){return {s.c_str(),s.length()};}
@@ -261,5 +260,24 @@ int main(int argc,char **argv){
             }
         }
     }
-    puts("firmware: authenticated full-image chunks, 32KiB HTTP, exact replay/conflict, revision fences, lost rename ACK, inactive byte guard, explicit reboot, durable boot receipt, interrupted/verify/unknown/storage failures; isolated stable-slot confirmation/protection/switch/replay/restart with business stopped passed");
+    for(unsigned scenario=0;scenario<2;++scenario) {
+        std::string opaque=scenario?std::string(296,'\0'):image;
+        if(!scenario)memset(&opaque[0x675000],0,52); // No proprietary App manifest.
+        opaque[0x10]^=0x5a;opaque[0xb0]^=0x33; // Different board config and entry.
+        memcpy(&opaque[opaque.size()-40],"0x5245434f56455259544147",24);
+        for(unsigned i=0;i<4;++i)opaque[opaque.size()-8+i]=char(opaque.size()>>(8*(3-i)));
+        put32((uint8_t *)&opaque[252],v2Crc32((const uint8_t *)opaque.data(),252));
+        uint32_t crc=0;for(size_t i=0;i<opaque.size()-4;++i){crc^=uint8_t(opaque[i]);for(unsigned j=0;j<8;++j)crc=(crc>>1)^(0xedb88320u&(0u-(crc&1)));}
+        put32((uint8_t *)&opaque[opaque.size()-4],crc);
+        Flash fake;fake.expected=opaque;std::string folder=root+"/f"+std::to_string(18+scenario);LittleFSClass fs(ops,folder.c_str());
+        Ap01Firmware fw(fs,fake.port(),"AABBCCDDEEFF");assert(fw.begin());
+        assert(fw.handle(request("POST","/api/firmware/begin",beginBody(opaque)),"bridge-test",1).status==200);
+        for(size_t at=0;at<opaque.size();at+=32768) {
+            auto offset=std::to_string(at),body=opaque.substr(at,32768);auto r=request("POST","/api/firmware/chunk",body);
+            r.contentType="application/octet-stream";r.requestId="fw-test";r.offset=offset.c_str();
+            assert(fw.handle(r,"bridge-test",2).status==200);
+        }
+        assert(fw.handle(request("POST","/api/firmware/commit",commitBody),"bridge-test",3).status==200&&fake.commits==1);
+    }
+    puts("firmware: authenticated OTA, replay/conflict, revision fences, readback, unknown/storage failures, stable-slot protection/recovery, 9s health/30s timeout/fault cases; opaque board/entry, no App manifest and minimal integrity-valid image accepted");
 }

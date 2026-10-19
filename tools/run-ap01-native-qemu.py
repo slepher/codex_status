@@ -113,13 +113,17 @@ class NativeRSP(OriginalRSP):
         result=super().request(packet)
         if packet=='g' and len(result)>=264:
             regs=struct.unpack_from('<33I',bytes.fromhex(result));pc=regs[32]
+            if native_provider:
+                for call in native_provider.report.get('native_ff13_calls',[]):
+                    if 'result' in call and 'guest_uptime_ms' not in call:
+                        call['guest_uptime_ms']=int.from_bytes(bytes.fromhex(super().request(f"m{profile['tick']:x},4")),'little')
             if native_provider and native_qmp and not native_provider.report.get('native_boot_prearmed'):
                 calls=native_provider.report.get('native_ff13_calls',[])
                 if calls and calls[0].get('result')==0 and '--active-slot' in sys.argv and sys.argv[sys.argv.index('--active-slot')+1]=='1':
                     path=Path(sys.argv[sys.argv.index('--output')+1]).with_suffix('.trial-armed.flash.bin').resolve()
                     native_qmp.command('qom-set',{'path':'/machine','property':'flash-snapshot','value':str(path)})
                     tables=partition_tables(path.read_bytes());assert tables[-1]['slot']==0
-                    native_provider.report['native_boot_prearmed']={'path':str(path),'tables':tables,'ff13_calls':len(calls)}
+                    native_provider.report['native_boot_prearmed']={'path':str(path),'tables':tables,'ff13_calls':len(calls),'guest_uptime_ms':calls[0]['guest_uptime_ms']}
                     if trial_cut:
                         native_provider.report['native_boot_trial_cut']=True
                         native_provider.report['native_probe_finished']=True
@@ -412,7 +416,9 @@ class NativeProvider(OriginalProvider):
                 assert len(tables)==2 and tables[0]['slot']==0 and tables[0]['age']==armed['tables'][-1]['age']
                 before=Path(armed['path']).read_bytes();after=path.read_bytes()
                 for start,end in ((0,0xe000),(0x10000,0xeb0000),(0xff0000,0x1000000)):assert before[start:end]==after[start:end]
-                self.report['native_boot_health_verified']={'path':str(path),'tables':tables,'firmware_slots_unchanged':True}
+                calls=self.report['native_ff13_calls'];assert len(calls)==2 and all(call['result']==0 for call in calls)
+                elapsed=calls[1]['guest_uptime_ms']-calls[0]['guest_uptime_ms'];assert 9000<=elapsed<30000
+                self.report['native_boot_health_verified']={'path':str(path),'tables':tables,'firmware_slots_unchanged':True,'elapsed_ms':elapsed}
         session=secrets.token_bytes(16);number=0;nonce=''
         def frame(op,path,payload,claim=False,expected_status=200):
             nonlocal session,number

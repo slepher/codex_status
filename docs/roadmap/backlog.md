@@ -350,6 +350,8 @@
 
 - **2026-10-19 AP01应用代码独立更新缺口**：用户要求核对并记录。应用源码在`ports/ap01/`，可修改；`tools/link-ap01-native.py`生成XIP模块，`tools/build-ap01-rom.py`将其打包进完整0041 ROM，当前代码更新与整ROM发布耦合。完整Bundle更新模板/资源，不等于更新应用可执行代码。后续评估并定义独立应用更新边界/ABI、原子提交与恢复、认证/完整性、资源预算及宿主/原生验收；未实现前继续明确使用完整ROM更新，不记为“源码无法修改”，也不把原厂逆向仓库缺失当作本轮协议重构阻塞。不得以新增应用双槽违反单份应用/Bundle及保留原生固件双槽的既定约束。
 
+- **2026-10-19 13:13 AP01自动启动安全窗口完成模拟交付**：独立OTA预置稳定槽、9003ms健康锁回、30秒超时/unknown/显式救援围栏；宿主ASan/UBSan、双PT模型防护及原生59–63通过。同升级NOR预置后中断→稳定0恢复绑定/Bundle/激活/业务与原回执，16组画面零像素差异。候选24完整待刷ROM6995352 B，SHA256 `a7d1962b5b7d3ef6f590857632f5d27ffbef5f8481039bf96b98cccdbe6b8194`，匹配ELF/包与严格放行41份证据见[交付](../../project-workflow/ap01-template-integration/release-0041-boot-safety.md)。未刷机/部署Bridge；保护从成功预置开始，物理Boot2/掉电/首启/LCD/free/高水位仍未验，C9不关闭。
+
 - **2026-10-19 01:36 独立OTA稳定槽完成模拟**：维护18080加入slots/stable/switch/持久查询及响应后重启，与业务18081及owner/context/Bundle隔离。候选22/原生49、50、51验证有焦点模板时完整OTA、直接稳定槽回切、原槽重启回执；ff13重放只提交一次，两槽及保护区字节不变、三轮四场景零像素差异。修复实际LVGL绘制事件误入OTA输入分支的断言。新ROM6993160 B，SHA256 `63eb98e51c9cb1e0b2783d63b51c50da0dadb3db95b1ad107fcbb0fbb970df94`，未刷机/部署Bridge；物理与传统OTA旁路边界保留，C9不关闭。见[交付](../../project-workflow/ap01-template-integration/release-0041-ota-slots.md)。
 
 - **2026-10-19 AP01完整0041 ROM模拟收尾**：原生维护/业务HTTP、VFS/Bundle/持久激活、发现/配对和原厂UI接线完成；候选16原生31/32/33验证八模板/四场景、完整ROM写非活动槽与保护区、同NOR新槽回执恢复。正式待刷ROM 6981976 B，SHA256 `6adb31dcaa0a35c77a38c729d298764f0c72ae7e729b6c77a21dd0b7beeb56bc`，配套Bridge隔离构建未部署。保留五GIF、AP01无PowerPlan；ASan/UBSan、core162/render15/v2_state21、存储8组合及Note4兼容/栈检查通过。**不关闭C9**：未刷机，物理首启/LCD-SPI/真实free和高水位、0031旧接收器跨升及macOS WK仍未验；QEMU显式模型限制见[完整交付](../../project-workflow/ap01-template-integration/release-0041.md)。下方早期“无ROM/接线待完成”保留历史语义。

@@ -17,5 +17,7 @@
 
 - **B6/C8协议收敛R1/R2已改未部署**：自动发现/连接拆分，忙设备连接前跳过；历史事务原ID有限查询/ACK，HTTP/BLE共用收尾。主回归345通过/5条件忽略，Sol Fake专项4通过，扩展Fake分页夹具错误已修复，Note4关联15通过。R3–R5未完成。wire须覆盖Note4/1.54/Fake/AP01应用，无旧版兼容；用户允许升级失配时受鉴权裸OTA。[计划/证据](project-workflow/bridge-macos/protocol-convergence-status.md)。AP01源码在ports/ap01可修改，代码随整ROM发布的独立更新缺口记C9。
 - B6/C8事务终点修复已部署；历史未知事务保留，长期RF矩阵仍开放。[依据](project-workflow/bridge-macos/wifi-transaction-finality-20261019.md)。
-- C9 AP01自动启动安全窗口仍待物理验收，候选22/23未部署。[续作及ROM哈希](project-workflow/ap01-template-integration/boot-safety-handoff.md)。不关闭C9。
+- C9 AP01本地进度：0031过渡接收器 `ap01-http/tail3-minimal` 已认证运行槽2（MAC34F01557210B，build ef8319734dcaa8e63d5151bfd512a69a）。最后记录为单次安装完整0041候选25到槽1，当前结果未知，禁止重派；物理首启/断电/LCD/资源仍未验。候选24模拟已交付，不再沿用远端候选22/23状态。[安装记录](project-workflow/ap01-template-integration/flash-0041-20261019.md)、[模拟交付](project-workflow/ap01-template-integration/release-0041-boot-safety.md)。不关闭C9。
 - [前卡全文/部署历史](docs/history/progress-archive-2026-10-19-before-cross-family-sync.md)；待办唯一来源[backlog](docs/roadmap/backlog.md)。
+
+本地AP01未提交工作已与远端ea64ff8合并；原始本地文件保存在Git stash `codex-before-pull-20261019`。用户要求先提交本地再pull；冲突已解决，本地AP01工作随本次提交保存，B6/C8继续项为R3–R5，未部署。

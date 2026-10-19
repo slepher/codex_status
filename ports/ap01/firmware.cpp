@@ -8,7 +8,7 @@ extern "C" {
 }
 
 namespace {
-constexpr uint32_t MIN_ROM=6769704, MAX_ROM=0x700000, MANIFEST=0x675000;
+constexpr uint32_t MIN_ROM=296, MAX_ROM=0x700000, MANIFEST=0x675000;
 enum Phase { Receiving=1, Committing=2, Applied=3, Failed=4, Unknown=5 };
 uint32_t le32(const uint8_t *p) {return uint32_t(p[0])|uint32_t(p[1])<<8|uint32_t(p[2])<<16|uint32_t(p[3])<<24;}
 void put32(uint8_t *p,uint32_t n) {for(unsigned i=0;i<4;++i)p[i]=uint8_t(n>>(8*i));}
@@ -119,7 +119,7 @@ Ap01Firmware::Ap01Firmware(LittleFSClass &filesystem,const Ap01FirmwarePort &cal
     :fs(filesystem),port(callbacks) {memcpy(mac,identity,13);}
 Ap01Firmware::~Ap01Firmware() {close();}
 void Ap01Firmware::afterResponse(bool sent) {bool requested=rebootPending;rebootPending=false;if(requested&&sent&&port.reboot)port.reboot(port.context);}
-bool Ap01Firmware::available() const {return port.busy&&port.open&&port.write&&port.verify&&port.commit&&port.close&&port.referenceHeader&&port.build;}
+bool Ap01Firmware::available() const {return port.busy&&port.open&&port.write&&port.verify&&port.commit&&port.close&&port.build;}
 void Ap01Firmware::close() {if(opened){port.close(port.context);opened=false;}}
 bool Ap01Firmware::blocksBusiness() const {
     return corrupt||(record&&(record->phase==Receiving||record->phase==Committing||record->phase==Unknown||(record->phase==Applied&&!booted)));
@@ -333,13 +333,12 @@ Ap01HttpReply Ap01Firmware::handle(const Ap01HttpRequest &request,const char *pr
         }
     } else if(committing&&record->phase==Receiving) {
         if(!opened||record->position!=record->length)return reject(409,"incomplete");
-        if(!ota_image_valid(&record->image,port.referenceHeader)||record->image.recovery_crc!=record->recoveryCrc) {
+        if(!ota_image_valid(&record->image)||record->image.recovery_crc!=record->recoveryCrc) {
             failed("image_integrity");return reject(400,"image_integrity","firmware_verify");
         }
-        if(record->length>=MANIFEST+256) {
-            if(memcmp(record->manifest,"AP01APP1",8)||le32(record->manifest+8)!=1||le32(record->manifest+12)!=record->length||le32(record->manifest+16)!=MANIFEST) {
-                failed("application_manifest");return reject(400,"application_manifest","firmware_verify");
-            }
+        // Optional receipt metadata, never an image-admission requirement.
+        if(record->length>=MANIFEST+52&&!memcmp(record->manifest,"AP01APP1",8)&&le32(record->manifest+8)==1&&
+           le32(record->manifest+12)==record->length&&le32(record->manifest+16)==MANIFEST) {
             char build[33];const char *hex="0123456789abcdef";
             for(unsigned i=0;i<16;++i){build[2*i]=hex[record->manifest[36+i]>>4];build[2*i+1]=hex[record->manifest[36+i]&15];}build[32]=0;record->targetBuild=build;
             if(record->targetBuild.length()!=32){failed("firmware_oom");return reject(503,"firmware_oom");}

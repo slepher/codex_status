@@ -10,7 +10,7 @@ state=out/('t'+str(time.time_ns()%1000000))
 assert out.is_dir()
 state.mkdir(exist_ok=True)
 assert not any(state.iterdir()), 'Use a fresh private test directory; never delete runtime data'
-for i in range(18):(state/('f'+str(i))).mkdir()
+for i in range(20):(state/('f'+str(i))).mkdir()
 (state/'f6/bundle').mkdir()
 def linux(p):
     p=p.resolve(); return '/mnt/'+p.drive[0].lower()+p.as_posix()[2:]
@@ -67,6 +67,7 @@ assert not firmware_result.returncode,firmware_result.stderr
 (out/'native-firmware-host-report.json').write_text(json.dumps({'passed':True,
     'scope':'host ASan/UBSan exact native firmware service; fake flash callbacks, no ROM ABI proof',
     'image_sha256':hashlib.sha256(args.image.read_bytes()).hexdigest(),
+    'test_source_sha256':hashlib.sha256(firmware_source.read_bytes()).hexdigest(),
     'binary_sha256':hashlib.sha256(firmware_binary.read_bytes()).hexdigest(),
     'checks':firmware_result.stdout.strip()},indent=2),encoding='utf-8')
 report.write_text(json.dumps({'passed':True,'flashable':False,'scope':'native application on Linux host ASan/UBSan; no recovered VFS/UI ABI execution',

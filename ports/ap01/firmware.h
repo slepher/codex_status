@@ -17,7 +17,6 @@ struct Ap01FirmwarePort {
     bool (*verify)(void *, uint32_t) = nullptr;
     int (*commit)(void *) = nullptr; // 1 confirmed; -1 result unknown.
     void (*close)(void *) = nullptr;
-    const uint8_t *referenceHeader = nullptr;
     const char *build = nullptr;
     void (*reboot)(void *) = nullptr;
     int (*runningSlot)(void *) = nullptr;

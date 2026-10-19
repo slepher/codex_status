@@ -7,7 +7,7 @@ from importlib.util import spec_from_file_location,module_from_spec
 ROOT=Path(__file__).resolve().parents[1];out=ROOT/'artifacts/ap01-platform-integration/device'
 firmware=ROOT.parent/'cuktech-ap01-firmware';evidence=firmware/'evidence/qemu/0041-20261017'
 spec=spec_from_file_location('native_builder',ROOT/'tools/build-ap01-rom.py');builder=module_from_spec(spec);spec.loader.exec_module(builder)
-parser=argparse.ArgumentParser();parser.add_argument('--candidate',default='01');parser.add_argument('--run',default='01');parser.add_argument('--resume-nor',type=Path);a=parser.parse_args()
+parser=argparse.ArgumentParser();parser.add_argument('--candidate',default='01');parser.add_argument('--run',default='01');parser.add_argument('--resume-nor',type=Path);parser.add_argument('--boot-safety-model',action='store_true');a=parser.parse_args()
 assert a.candidate.isdigit() and a.run.isdigit()
 image=out/('ap01-native-0041-candidate-'+a.candidate+'.bin');manifest=image.with_suffix('.manifest.json')
 builder.validate_candidate(image.read_bytes(),manifest)
@@ -27,11 +27,15 @@ for i,field in enumerate(machine):
     if field.startswith('otp-fixture='):machine[i]='otp-fixture='+linux(evidence/'otp-synthetic-ap01.bin')
 command[command.index('-M')+1]=','.join(machine)
 profile_path=out/'native-0041-qemu-profile.json';profile_path.write_text(json.dumps({'command':command}),encoding='utf-8')
-engine=out/'native-qemu-engine'
+engine=out/('native-qemu-boot-safety-engine' if a.boot_safety_model else 'native-qemu-engine')
+if a.boot_safety_model:
+    model=json.loads((out/'boot-safety-qemu-model.json').read_text())
+    assert model['passed'] and hashlib.sha256(engine.read_bytes()).hexdigest()==model['engine_sha256']
+    assert hashlib.sha256((ROOT/'tools/build-ap01-boot-safety-qemu.py').read_bytes()).hexdigest()==model['builder_sha256']
 if not engine.exists():subprocess.run(['wsl','-d','Ubuntu-24.04','--','cp','/home/slepher/qemu-ap01-0041/build/qemu-system-riscv32',linux(engine)],check=True)
 # Latest native model, recorded by sibling qemu-ota-0031-20261017.md P4/P5.
 # This is deliberately not labelled as the older 0041 7246b77a engine.
-assert hashlib.sha256(engine.read_bytes()).hexdigest()=='a549e66f1f7680e30a7d491733ff2b95ff2de5a9f972dd70b7fa306b1c50da18'
+if not a.boot_safety_model:assert hashlib.sha256(engine.read_bytes()).hexdigest()=='a549e66f1f7680e30a7d491733ff2b95ff2de5a9f972dd70b7fa306b1c50da18'
 args=['wsl','-d','Ubuntu-24.04','--','python3','-B',linux(ROOT/'tools/run-ap01-native-qemu.py'),
       '--qemu',linux(engine),'--image',linux(image),'--manifest',linux(manifest),
       '--flash-fixture',linux(target),'--rom-shim',linux(evidence/'qemu-bootrom-shim-v12.bin'),

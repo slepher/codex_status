@@ -4,7 +4,6 @@
 #include "vfs_0041.h"
 #include "ap01_template_display.h"
 #include "local_json_allocator.h"
-#include "reference_0041.h"
 #include <atomic>
 #include <new>
 #include <stddef.h>
@@ -441,7 +440,7 @@ void *Runtime::bootstrap(void *p) {
     const char *hex="0123456789abcdef";
     for(unsigned i=0;i<16;++i){uint8_t v=ap01_native_manifest[36+i];r.firmwareBuild[2*i]=hex[v>>4];r.firmwareBuild[2*i+1]=hex[v&15];}
     Ap01ApplicationPort callbacks{&r,randomBytes,lockBindings,unlockBindings,
-        {&r,firmwareBusy,firmwareOpen,firmwareWrite,firmwareVerify,firmwareCommit,firmwareClose,ap01ReferenceHeader,r.firmwareBuild,firmwareReboot,runningSlot,inspectSlot,selectSlot,bootHealthy}};
+        {&r,firmwareBusy,firmwareOpen,firmwareWrite,firmwareVerify,firmwareCommit,firmwareClose,r.firmwareBuild,firmwareReboot,runningSlot,inspectSlot,selectSlot,bootHealthy}};
     r.app.reset(new(std::nothrow) Ap01Application(r.fs,r.business,callbacks,mac,r.bootId));
     if(!r.app||!r.app->begin(nowMs()))return nullptr;
     uint32_t initializing=0;

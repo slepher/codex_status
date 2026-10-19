@@ -1,6 +1,5 @@
 // Exact 0041 partition table/posix ABI. No erase or write of firmware slots.
 #include "slot_0041.h"
-#include "reference_0041.h"
 #include "v2_sync.h"
 #include "v2_runtime.h"
 #include <string.h>
@@ -47,7 +46,7 @@ bool ap01InspectSlot0041(unsigned slot,bool running,Ap01SlotImage &out) {
         if(!file.read(at,bytes,n)||(running&&!at&&memcmp(bytes,(const void *)(uintptr_t)0x9ffff000,256))||ota_image_chunk(&image,bytes,n))return false;
         at+=n;
     }
-    if(!ota_image_valid(&image,ap01ReferenceHeader))return false;
+    if(!ota_image_valid(&image))return false;
     out.length=length;out.crc=image.recovery_crc;
     const char *hex="0123456789abcdef";
     // An all-zero build explicitly represents unmodified stock 0041.
