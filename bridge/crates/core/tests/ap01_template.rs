@@ -7,7 +7,8 @@ fn source() -> Value {
     serde_json::from_str(include_str!("../../../../tools/test-bridge/templates/codex-status-ap01.json")).unwrap()
 }
 fn usage(remaining: u32, five: Option<u32>) -> Value {
-    let mut windows = vec![json!({"windowMins":10080,"usedPercent":100-remaining,"resetsAt":1792749600})];
+    // Paid plans expose 5h + weekly; free/Go plans expose only the monthly window.
+    let mut windows = vec![json!({"windowMins":if five.is_some(){10080}else{43200},"usedPercent":100-remaining,"resetsAt":1792749600})];
     if let Some(five) = five { windows.push(json!({"windowMins":300,"usedPercent":100-five,"resetsAt":1792308600})); }
     let mut value=json!({"server_time":1792305600,"account":{"plan":"pro"},"bridge":{"label":"username"},"buckets":[{"id":"codex","windows":windows}]});
     value["resetCredits"]=json!({"availableCount":2});
@@ -47,7 +48,7 @@ fn ap01_shared_compiler_layouts_and_boundaries() {
     }
     let mut env = Env::default();
     env.sync_hhmm = "12:40";
-    for (name, remain, five) in [("weekly-only",98,None),("both-windows",72,Some(86)),("zero",0,None),("full",100,None)] {
+    for (name, remain, five) in [("monthly-only",98,None),("both-windows",72,Some(86)),("zero",0,None),("full",100,None)] {
         let data = usage(remain,five).to_string();
         if let Ok(dir)=std::env::var("AP01_PREVIEW_DIR") {
             std::fs::write(std::path::Path::new(&dir).join(format!("{name}.usage.json")), &data).unwrap();

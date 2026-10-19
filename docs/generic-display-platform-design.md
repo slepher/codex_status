@@ -79,9 +79,11 @@ UI 和 MCP 调用同一套保存、预览、发布、同步开关、激活、cla
 
 从设备读取模板仅放恢复/迁移入口：等自然可读机会，读源/顺序/active；不自动唤醒、claim、发布或改 active。缺源标 unresolved，同 ID 不同内容要求选择是否替换 Bridge 当前内容；恢复得到的本地 Profile 默认不开同步。读取前后上下文变化则重试一次或报告不一致，不声称原子导出。
 
+**窗口标签规则（2026-10-19，Note4 已部署）**：模板不按 `account.plan` 名称推断额度形态，按数据里的 `windowMins` 分类选窗口：`300`→5h、`≥10080`→weekly、`≥43200`→monthly。付费账号继续显示 5H+WEEK（或彩色周环+5h 栏）；免费/Go 只有月度窗口时，只显示 `buckets[codex].monthly.remaining`（大字与 %）和 `buckets[codex].monthly.resetsAt`（到期/重置时间），Note4 标签 `MONTH`、AP01 彩色标签 `月额度剩余`，不再出现 WEEK 或空的 5H 占位。`when` 只支持单个条件（无 AND），因此该规则依赖两种账户形态互斥（付费=5h+weekly，免费=仅 monthly）；若两者同时出现，双栏与月度区块会重叠，属已知边界。无 5h、无月度的历史周窗口账号不再单独布局，配额区留空，等现场出现再设计。Note4 `codex-status-a` v6 已按用户显式发布部署（Bundle job `436b7227`，applied/displayed）；AP01 `codex-status-a` v2 仍为候选、未部署。
+
 ## 5. 硬件适配与容量
 
-模板本地元数据补充（2026-10-11源码候选）：`device.wifi_state`提供idle/connecting/connected/off生命周期，`device.wifi_blink`只在connecting时提供0/1相位，`device.ble_manual_active`独立表示手动BLE窗口。均为local_dependencies，不进入Bridge Data要求或上下文数据快照。`device.state`已退役，固件与Bridge拒绝，不保留映射或自动迁移。codex-status-a v5、quad v14使用当前独立字段；深睡主动关闭为idle而非失败off。Bridge明确不可达立即提供offline_mins=0，恢复后回归原联系新鲜度策略。模板选择视觉表达，固件提供事实并触发重绘。已存储CT在每次加载和绘制前重新验证支持字段、序列化编号/路径一致性与字符串边界；不支持则停止使用并进入内置恢复界面，报告content_error，保留存储待显式发布替换。受支持字段的数据缺失由when处理，与未知字段不同。状态语义见[电源状态 §7](power-state.md#7-屏幕状态字与模板协议)。
+模板本地元数据补充（2026-10-11源码候选）：`device.wifi_state`提供idle/connecting/connected/off生命周期，`device.wifi_blink`只在connecting时提供0/1相位，`device.ble_manual_active`独立表示手动BLE窗口。均为local_dependencies，不进入Bridge Data要求或上下文数据快照。`device.state`已退役，固件与Bridge拒绝，不保留映射或自动迁移。codex-status-a v6（已部署）、quad v14使用当前独立字段；深睡主动关闭为idle而非失败off。Bridge明确不可达立即提供offline_mins=0，恢复后回归原联系新鲜度策略。模板选择视觉表达，固件提供事实并触发重绘。已存储CT在每次加载和绘制前重新验证支持字段、序列化编号/路径一致性与字符串边界；不支持则停止使用并进入内置恢复界面，报告content_error，保留存储待显式发布替换。受支持字段的数据缺失由when处理，与未知字段不同。状态语义见[电源状态 §7](power-state.md#7-屏幕状态字与模板协议)。
 
 .81 统一合同：`device.ble_manual_active` 是数字 0/1，本地依赖，不向 Bridge 索取 Data 字段；它仅表示物理短按开启的手动 GATT 窗口，首次唤醒临时 BLE、自动交汇及实际射频均不冒充该值。CompiledTemplate 追加绑定编号 21，既有编号及 ABI 2 不变；固件/宿主解析、序列化和数字条件一致。新模板发布仍冻结完整 Bundle，保存与 OTA 不等于发布。正式 PowerPlan 的 PPL1 持久化、时间连续性和 BOOT/USB/OTA 优先级见 [电源合同](power-state.md)，重复请求不重算 Light 期限。
 

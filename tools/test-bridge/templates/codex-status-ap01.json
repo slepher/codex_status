@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "id": "codex-status-a",
-  "version": 1,
+  "version": 2,
   "render_target": "lcd-jd9853-320x240-palette4",
   "canvas": {
     "w": 320,
@@ -51,30 +51,30 @@
       "y": 104,
       "radius": 61,
       "thickness": 4,
-      "bind": "buckets[codex].weekly.remaining",
+      "bind": "buckets[codex].monthly.remaining",
       "fg": "cyan",
       "bg": "track",
       "when": {
-        "bind": "buckets[codex].5h.remaining",
-        "exists": false
+        "bind": "buckets[codex].monthly.remaining",
+        "exists": true
       }
     },
     {
       "type": "text",
-      "text": "周额度剩余",
+      "text": "月额度剩余",
       "x": 130,
       "y": 62,
       "font": "ntthin18",
       "color": "cyan",
       "bg": "black",
       "when": {
-        "bind": "buckets[codex].5h.remaining",
-        "exists": false
+        "bind": "buckets[codex].monthly.remaining",
+        "exists": true
       }
     },
     {
       "type": "text",
-      "bind": "buckets[codex].weekly.remaining",
+      "bind": "buckets[codex].monthly.remaining",
       "x": 111,
       "y": 78,
       "font": "ntreg64",
@@ -88,8 +88,8 @@
       ],
       "align": "center",
       "when": {
-        "bind": "buckets[codex].5h.remaining",
-        "exists": false
+        "bind": "buckets[codex].monthly.remaining",
+        "exists": true
       }
     },
     {
@@ -101,10 +101,10 @@
       "color": "white",
       "bg": "black",
       "when": {
-        "bind": "buckets[codex].5h.remaining",
-        "exists": false
+        "bind": "buckets[codex].monthly.remaining",
+        "exists": true
       },
-      "digit_bind": "buckets[codex].weekly.remaining",
+      "digit_bind": "buckets[codex].monthly.remaining",
       "digit_x": [
         181,
         195,
@@ -113,15 +113,15 @@
     },
     {
       "type": "text",
-      "bind": "buckets[codex].weekly.resetsAt",
+      "bind": "buckets[codex].monthly.resetsAt",
       "x": 106,
       "y": 128,
       "font": "ntthin18",
       "color": "muted",
       "bg": "black",
       "when": {
-        "bind": "buckets[codex].5h.remaining",
-        "exists": false
+        "bind": "buckets[codex].monthly.remaining",
+        "exists": true
       },
       "region": [
         106,

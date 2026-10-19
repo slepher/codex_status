@@ -300,6 +300,10 @@ mod tests {
         let compiled = compile(&source, crate::platform::model::RENDER_TARGET_NOTE4).unwrap();
         assert_eq!((compiled.canvas_w, compiled.canvas_h), (400, 300));
         assert_eq!(decode(&encode(&compiled)).unwrap(), compiled);
+        // The free/Go monthly branch must reach the Bridge contract even when
+        // the paid windows are absent.
+        assert!(compiled.requirements.iter().any(|r| r.field == "buckets[codex].monthly.remaining"));
+        assert!(compiled.requirements.iter().any(|r| r.field == "buckets[codex].monthly.resetsAt"));
         let usage = serde_json::json!({"account":{"plan":"Pro"},"bridge":{"label":"ACCOUNT"},
             "buckets":[{"id":"codex","windows":[{"windowMins":300,"usedPercent":6,"resetsAt":1800000000},
                 {"windowMins":10080,"usedPercent":75,"resetsAt":1800500000}]}],

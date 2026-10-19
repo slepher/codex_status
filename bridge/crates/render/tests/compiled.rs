@@ -184,6 +184,52 @@ fn compiled_regions_match_the_json_region_derivation() {
     }
 }
 
+#[test]
+fn note4_free_monthly_plan_shows_only_monthly_balance_and_reset() {
+    let _guard = SERIAL.lock().unwrap();
+    let source = std::fs::read_to_string(repo_root().join(
+        "bridge/crates/core/tests/fixtures/codex-status-a-400x300.json",
+    ))
+    .unwrap();
+    // 400 wide, 1bpp: 50 bytes per row, MSB first.
+    // 1bpp frames store 1 = white, 0 = ink.
+    let ink = |bits: &[u8], x0: usize, x1: usize, y0: usize, y1: usize| {
+        (y0..y1).any(|y| (x0..x1).any(|x| bits[y * 50 + x / 8] & (0x80 >> (x % 8)) == 0))
+    };
+    let data = |window_mins: i64| json!({
+        "schema": 1, "server_time": 1_700_000_000i64, "account": {"plan": "free"},
+        "buckets": [{"id": "codex", "windows": [
+            {"windowMins": window_mins, "usedPercent": 23, "resetsAt": 1_800_000_000i64}
+        ]}]
+    }).to_string();
+    let monthly = render_bits(&source, &data(43200), &Env::default()).unwrap();
+    // Free/Go accounts only expose the monthly window: draw its balance, % and
+    // reset time, and nothing from the paid 5H/WEEK layout.
+    assert!(ink(&monthly, 12, 388, 66, 217), "monthly quota must render");
+    let legacy_weekly = render_bits(&source, &data(10080), &Env::default()).unwrap();
+    assert!(!ink(&legacy_weekly, 120, 388, 66, 217), "no WEEK block without monthly/5h");
+    // Paid data keeps the two-column layout.
+    let paid = json!({
+        "schema": 1, "server_time": 1_700_000_000i64, "account": {"plan": "plus"},
+        "buckets": [{"id": "codex", "windows": [
+            {"windowMins": 300, "usedPercent": 10, "resetsAt": 1_700_010_000i64},
+            {"windowMins": 10080, "usedPercent": 30, "resetsAt": 1_700_500_000i64}
+        ]}]
+    }).to_string();
+    let paid_bits = render_bits(&source, &paid, &Env::default()).unwrap();
+    assert!(ink(&paid_bits, 12, 188, 66, 217), "5H column must render");
+    assert!(ink(&paid_bits, 212, 388, 66, 217), "WEEK column must render");
+    compile(&source).unwrap();
+    assert_eq!(
+        monthly,
+        render_compiled_bits_size(&data(43200), &Env::default(), 400, 300).unwrap()
+    );
+    assert_eq!(
+        paid_bits,
+        render_compiled_bits_size(&paid, &Env::default(), 400, 300).unwrap()
+    );
+}
+
 /// The region policy keeps one global panel size, so a 400x300 template must be
 /// derived against its own canvas rather than the 200x200 default. A wrong panel
 /// size makes ops fall outside the panel, which the policy answers with the

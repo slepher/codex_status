@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "id": "codex-status-a",
-  "version": 5,
+  "version": 6,
   "min_fw": "0.18.75-note4",
   "render_target": "epd-ssd2683-400x300-1bpp",
   "canvas": {
@@ -426,10 +426,10 @@
       "y": 66,
       "font": "ntthin18",
       "color": "black",
-      "text": "WEEK",
+      "text": "MONTH",
       "when": {
-        "bind": "buckets[codex].5h.remaining",
-        "exists": false
+        "bind": "buckets[codex].monthly.remaining",
+        "exists": true
       }
     },
     {
@@ -438,7 +438,7 @@
       "y": 73,
       "font": "ntreg96",
       "color": "black",
-      "bind": "buckets[codex].weekly.remaining",
+      "bind": "buckets[codex].monthly.remaining",
       "region": [
         12,
         73,
@@ -447,8 +447,8 @@
       ],
       "align": "center",
       "when": {
-        "bind": "buckets[codex].5h.remaining",
-        "exists": false
+        "bind": "buckets[codex].monthly.remaining",
+        "exists": true
       }
     },
     {
@@ -459,10 +459,10 @@
       "color": "black",
       "text": "%",
       "when": {
-        "bind": "buckets[codex].5h.remaining",
-        "exists": false
+        "bind": "buckets[codex].monthly.remaining",
+        "exists": true
       },
-      "digit_bind": "buckets[codex].weekly.remaining",
+      "digit_bind": "buckets[codex].monthly.remaining",
       "digit_x": [
         230,
         259,
@@ -475,7 +475,7 @@
       "y": 191,
       "font": "ntthin18",
       "color": "black",
-      "bind": "buckets[codex].weekly.resetsAt",
+      "bind": "buckets[codex].monthly.resetsAt",
       "region": [
         100,
         191,
@@ -483,8 +483,8 @@
         26
       ],
       "when": {
-        "bind": "buckets[codex].5h.remaining",
-        "exists": false
+        "bind": "buckets[codex].monthly.remaining",
+        "exists": true
       },
       "align": "center"
     },
