@@ -1,6 +1,6 @@
 # 协议收敛状态
 
-2026-10-19，R1–R5源码完成；R3–R5未提交、未部署。用户要求的 `codex/fix-wifi-switch` 已合入master（93bb386），worktree已移除，分支保留。该分支的Windows部署是旧协议切网修复，不代表本轮C2已经上线。待办归B6/C8，C9继续开放。
+2026-10-19，R1–R5源码完成；R3–R5已提交9e748eb；Windows Bridge与Note4随后已部署，15分钟短时观察完成，见[部署记录](protocol-convergence-rollout.md)。用户要求的 `codex/fix-wifi-switch` 已合入master（93bb386），worktree已移除，分支保留。该分支的Windows部署是旧协议切网修复，不代表本轮C2已经上线。待办归B6/C8，C9继续开放。
 
 ## 已完成与删除清单
 
@@ -32,14 +32,14 @@
 
 | 目标 | 实际验证 | 未执行 |
 |---|---|---|
-| Note4 | 0.18.105-note4构建、版本marker、匹配ELF Wi-Fi栈门禁 | OTA、实体屏幕/RF/Flash掉电 |
+| Note4 | 0.18.105-note4构建/匹配ELF栈、直接OTA完整运行哈希证明、15分钟观察及自然BLE交汇，见rollout | 实体屏幕目视、长期RF/Flash掉电完整矩阵 |
 | 1.54 | 0.18.37-bw构建、版本marker、匹配ELF Wi-Fi栈门禁 | 实机刷写及RF |
 | Fake | 真实共享C++核心、HTTP/BLE、bootstrap69+收尾4 | 不代替原生BLE/RF |
 | AP01 | RV32编译链接、完整0041候选打包、真实application宿主ASan/UBSan通过 | 本轮未跑恢复VFS/UI ABI执行/实机，manifest仍flashable=false |
 
 Note4/1.54栈命令为 `python tools/check-wifi-stack.py <matching.elf> --no-online-wifi-migration --no-legacy-management-entry`，对应源码已无这两个入口。证据 `artifacts/bridge-macos/protocol-convergence-{note4,154g}-{build,stack}.log`。AP01证据同目录 `protocol-convergence-ap01-{build,package,host}.log` 与 `artifacts/ap01-platform-integration/device/native-app-report.json`、候选manifest。
 
-## 候选产物（全部未部署）
+## 构建产物（Note4随后已部署，1.54/AP01未部署）
 
 | 目标/路径 | 字节 | SHA256 |
 |---|---:|---|
@@ -59,4 +59,4 @@ Bridge每设备至多一个ConnectionFacts，观察/联系在RAM；紧凑JSON co
 
 AP01现行预算未变：绑定空16 B/单典型121 B/8条典型856 B/单最大281 B/8条最大2136 B，提交堆上限6816 B；应用事务488 B、chunk堆32768 B、HTTP头/小体6145 B、持久记录1036 B、pending+record2072 B、native scratch栈1024 B。预算不含allocator/完整UI调用链；详见native-core-audit.json及 `protocol-convergence-resources.json`。
 
-本轮没有启停Bridge、访问真实data、发布Bundle或刷机。未改UI文件，不把合成IPC/宿主结果当产品实机验收；B6/C8长期RF、Flash、原生BLE取消及C9独立更新/实机闸门继续按backlog管理。
+源码验收阶段没有启停Bridge、访问真实data或刷机；用户随后授权的Windows/Note4部署独立见rollout，未发布Bundle。未改UI文件，不把合成IPC/宿主结果当产品实机验收；B6/C8长期RF、Flash、原生BLE取消及C9独立更新/实机闸门继续按backlog管理。

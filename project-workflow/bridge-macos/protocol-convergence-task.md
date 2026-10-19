@@ -10,4 +10,6 @@
 - [x] R5 wire：C2唯一操作表、CommandContext；删除旧JSON会话/op包装与串口旧写入口；四端同步、双ESP构建/栈、Fake、AP01应用编译及宿主执行。
 - [x] 持久迁移/回滚说明、候选哈希、资源预算、权威协议文档同步。
 
-2026-10-19用户要求的fix-wifi-switch合并独立完成；R3–R5工作保持未提交/未部署。源码验收完成不关闭B6/C8长期实机矩阵或C9。无新增第二份待办。
+2026-10-19用户要求的fix-wifi-switch合并独立完成；R3–R5提交9e748eb后，用户已授权Windows/Note4部署及观察，详见[rollout](protocol-convergence-rollout.md)。源码验收完成不关闭B6/C8长期实机矩阵或C9。无新增第二份待办。
+
+- [x] 用户后续授权：提交9e748eb、重编译并部署Windows Bridge、Note4受鉴权直接OTA、完整运行哈希核验及15分钟自然交汇观察；详见rollout。
