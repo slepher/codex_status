@@ -79,7 +79,7 @@ UI 和 MCP 调用同一套保存、预览、发布、同步开关、激活、cla
 
 从设备读取模板仅放恢复/迁移入口：等自然可读机会，读源/顺序/active；不自动唤醒、claim、发布或改 active。缺源标 unresolved，同 ID 不同内容要求选择是否替换 Bridge 当前内容；恢复得到的本地 Profile 默认不开同步。读取前后上下文变化则重试一次或报告不一致，不声称原子导出。
 
-**窗口标签规则（2026-10-19，Note4 已部署）**：模板不按 `account.plan` 名称推断额度形态，按数据里的 `windowMins` 分类选窗口：`300`→5h、`≥10080`→weekly、`≥43200`→monthly。付费账号继续显示 5H+WEEK（或彩色周环+5h 栏）；免费/Go 只有月度窗口时，只显示 `buckets[codex].monthly.remaining`（大字与 %）和 `buckets[codex].monthly.resetsAt`（到期/重置时间），Note4 标签 `MONTH`、AP01 彩色标签 `月额度剩余`，不再出现 WEEK 或空的 5H 占位。`when` 只支持单个条件（无 AND），因此该规则依赖两种账户形态互斥（付费=5h+weekly，免费=仅 monthly）；若两者同时出现，双栏与月度区块会重叠，属已知边界。无 5h、无月度的历史周窗口账号不再单独布局，配额区留空，等现场出现再设计。Note4 `codex-status-a` v6 已按用户显式发布部署（Bundle job `436b7227`，applied/displayed）；AP01 `codex-status-a` v2 仍为候选、未部署。
+**窗口标签规则（2026-10-19 修复）**：模板按实际窗口存在性显示，不按 `account.plan` 推断：`300`→5h、`≥10080`→weekly、`≥43200`→monthly。仅 weekly（包括现场 prolite）恢复历史全宽 WEEK/周额度布局；仅 monthly 保留 MONTH/月额度布局；存在 5h 时保留原双栏。现有 `when` 每元素仅一个条件，因此按顺序绘制 weekly 通栏、monthly 条件清除额度区并覆盖、5h 条件清除额度区并绘制双栏；优先级 5h双栏 > monthly > weekly，标题/账号/RC 不在清除区。无窗口时不画额度内容。1.54 `quad` v15保留四象限及缺5h静态100，长期窗口数值/重置明确绑定weekly或monthly（monthly优先），信息行固定以解除RC与重置位置耦合。Note4 `codex-status-a` v7、AP01 v3；部署结果见 PROGRESS 和 free-month-metering 工作流。
 
 ## 5. 硬件适配与容量
 

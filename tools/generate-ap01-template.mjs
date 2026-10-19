@@ -7,7 +7,6 @@ const five = 'buckets[codex].5h.remaining';
 const week = 'buckets[codex].weekly.remaining';
 const month = 'buckets[codex].monthly.remaining';
 const condition = exists => ({bind: five, exists});
-const monthly = {bind: month, exists: true};
 const elements = [];
 const text = (value, x, y, font, color='white', extras={}) => elements.push({type:'text', text:value, x,y,font,color,bg:'black',...extras});
 const bound = (bind,x,y,font,color='white',extras={}) => elements.push({type:'text',bind,x,y,font,color,bg:'black',...extras});
@@ -16,12 +15,14 @@ const ring = (x,y,radius,when,bind=week) => elements.push({type:'ring',x,y,radiu
 elements.push({type:'rect',rect:[0,0,320,240],fill:true,color:'black'});
 text('CODEX STATUS',16,11,'ntthin18'); text('AP01',274,13,'ntthin18','muted'); line(35);
 // Independent layouts, selected by source existence, not a device-side Codex rule.
-// Paid plans expose the 5h + weekly pair; free/Go plans expose only the monthly
-// window, so that branch shows the monthly balance and reset time and no WEEK.
-for (const dual of [false,true]) {
-  const when=dual?condition(true):monthly, cx=dual?73:160, long=dual?week:month;
+// Recover the original weekly-only layout, then overlay monthly and paid layouts.
+// Clear only the quota area so a single-condition when cannot leave stale labels.
+for (const layout of ['weekly','monthly','dual']) {
+  const dual=layout==='dual', long=layout==='monthly'?month:week;
+  const when=dual?condition(true):{bind:long,exists:true}, cx=dual?73:160;
+  if (layout!=='weekly') elements.push({type:'rect',rect:[16,43,288,126],fill:true,color:'black',when});
   ring(cx,104,dual?54:61,when,long);
-  text(dual?'周额度剩余':'月额度剩余',cx-30,dual?65:62,'ntthin18','cyan',{when});
+  text(layout==='monthly'?'月额度剩余':'周额度剩余',cx-30,dual?65:62,'ntthin18','cyan',{when});
   bound(long,cx-49,78,'ntreg64','white',{region:[cx-49,78,98,64],align:'center',when});
   text('%',cx+35,109,'ntthin18','white',{when,digit_bind:long,digit_x:[cx+21,cx+35,cx+48]});
   if (dual) {
@@ -33,7 +34,7 @@ for (const dual of [false,true]) {
     text('周额度重置',160,130,'ntthin18','cyan',{when});
     bound('buckets[codex].weekly.resetsAt',153,150,'ntthin18','white',{when,region:[153,149,151,18],align:'center'});
   } else {
-    bound('buckets[codex].monthly.resetsAt',106,128,'ntthin18','muted',{when,region:[106,126,108,18],align:'center'});
+    bound(long.replace('.remaining','.resetsAt'),106,128,'ntthin18','muted',{when,region:[106,126,108,18],align:'center'});
   }
 }
 line(176);
@@ -44,7 +45,7 @@ line(211);
 bound('device.sync_hhmm',16,220,'ntthin18','muted',{prefix:'SYNC ',when:{bind:'device.offline_mins',exists:false}});
 bound('device.offline_mins',16,220,'ntthin18','orange',{prefix:'OFF ',suffix:'m',when:{bind:'device.offline_mins',exists:true}});
 text('额度看板',260,219,'ntthin18','muted');
-const template={schema:1,id:'codex-status-a',version:2,render_target:'lcd-jd9853-320x240-palette4',canvas:{w:320,h:240},elements};
+const template={schema:1,id:'codex-status-a',version:3,render_target:'lcd-jd9853-320x240-palette4',canvas:{w:320,h:240},elements};
 fs.writeFileSync(path.join(root,'tools/test-bridge/templates/codex-status-ap01.json'),JSON.stringify(template,null,2)+'\n');
 // Only the characters required by this template; font assets remain Bundle data.
 const characters=[...new Set(elements.flatMap(e=>[e.text??'',e.prefix??'',e.suffix??'']).join(''))].sort().join('');

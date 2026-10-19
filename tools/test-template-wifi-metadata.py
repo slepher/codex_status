@@ -10,8 +10,9 @@ encoder = next(n for n in module.body if isinstance(n, ast.FunctionDef) and n.na
 scope = {"json": json}
 exec(compile(ast.Module(body=[encoder], type_ignores=[]), "bridge.py:tpl_canon", "exec"), scope)
 for path, expected in [
-    ("tools/test-bridge/templates/quad.json", "44fa7e21"),
-    ("bridge/crates/core/tests/fixtures/codex-status-a-400x300.json", "eb628a93"),
+    ("tools/test-bridge/templates/quad.json", "abd79ca9"),
+    ("bridge/crates/core/tests/fixtures/codex-status-a-400x300.json", "6d54e167"),
+    ("tools/test-bridge/templates/codex-status-ap01.json", "9bc56e9a"),
 ]:
     template = json.loads((root / path).read_text(encoding="utf-8"))
     raw = scope["tpl_canon"](template)

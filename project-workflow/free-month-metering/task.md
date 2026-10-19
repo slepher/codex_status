@@ -36,3 +36,29 @@
 ## T4. 文档
 
 - `docs/generic-display-platform-design.md` §4/§15 追加统一窗口规则与候选状态。
+
+## T5. 2026-10-19 weekly-only 回归与发布（本轮覆盖先前验收预期）
+
+- [x] 从7b0cf83父提交恢复原Note4/AP01 weekly-only布局；只调整存在性条件，保留历史坐标字体与数值对齐。
+- [x] 在原WEEK上叠加现有MONTH；两组条件清除只覆盖额度区域，5h原双栏最终优先。无窗口隐藏标签。
+- [x] 旧v6回归断言失败、新v7通过；compiled12、AP01 3、template8、core note4 1均通过。
+- [x] Note4 weekly与v5、monthly/paid与v6全图像素差0；AP01三个场景与对应历史PNG完全一致。JSON/compiled往返一致；混合窗口优先级覆盖。
+- [x] 运行Bridge模板与仓库v6逐字段一致，备份后保存v7，source_crc6d54e167/compiled_crcbc0a0a3a；现有Profile保持。
+- [x] Note4 job cac235bb succeeded、认证source_crc6d54e167、commit802/data802 ACK displayed；屏幕仍需实机目视。
+- [x] 补齐模板页族配置codex-status（Note4 Codex 额度），接口读回包含v7模板引用。
+
+## T6. 族配置已写入但原生模板页仍空
+
+- [x] 回归先红：空缓存→后台新增族配置→打开菜单仍空；新版改为打开菜单读取服务，Node转绿。
+- [x] MCP族配置save/copy/delete成功复用templates-changed通知。
+- [x] Node通过、原生WK70场景及窄宽配置菜单截图已审阅（合成IPC）。
+- [x] 托管Bridge冻结159文件备份、签名校验、部署/重启；health204、配置与v7合同读回保留，app114通过/3条件忽略。
+- [x] 真实运行窗口显示验收：用户确认已显示「Note4 Codex 额度」及codex-status-a模板。
+
+## T7. AP01与1.54先修改同步（不发布）
+
+- [x] quad v15真实monthly余额/重置，固定元数据行并保留四象限、缺5h静态100、RC/用户名缺失隐藏。
+- [x] 从真实codex_snapshot→assemble_payload验证monthly.remaining=77、monthly.resetsAt=1800000000，weekly缺失为null而非借用monthly；旧版先红、新版通过。
+- [x] AP01 v3、quad v15已保存运行Bridge；各自族配置已保存，id均codex-status、按render_target隔离。
+- [x] UI支持AP01族选择，Node先红后绿；core template9/AP01 3/render compiled12；三目标Python canonical；WK74窄宽截图通过并审阅。
+- [x] 15:26新Bridge部署/health204；真实MCP读回两目标源码逐字段一致、三族配置保留，Note4 Profile/发布jobs保持；未发布设备。

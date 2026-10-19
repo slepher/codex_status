@@ -465,3 +465,26 @@ assert.equal(run("ap01Message({result:'paired'})"),'paired');
 assert.match(element('ap01-result').textContent,/配置模板并发布/);
 assert(script.includes("$('device-power').hidden=d.power_mode==='always_on'"));
 console.log('AP01 onboarding: fixed four-digit code, unknown-query guidance, terminal storage rejection, separate publication and always-on UI OK');
+
+// A family draft saved through MCP must become visible when opening the menu,
+// even if the panel missed an event while it was already open.
+let savedFamilyProfiles = [];
+handlers.platform_family_profiles = ({ renderTarget }) => {
+  assert.equal(renderTarget, 'epd-ssd2683-400x300-1bpp');
+  return { profiles: savedFamilyProfiles };
+};
+run("selectedRenderTarget = RENDER_TARGET_NOTE4; selectedFamilyProfileId = null");
+await run('refreshProfiles()');
+assert.match(element('menu-profile').innerHTML, /此族暂无 Profile/);
+savedFamilyProfiles = [{id:'codex-status',name:'Note4 Codex 额度',
+  render_target:'epd-ssd2683-400x300-1bpp',template_ids:[]}];
+await run("toggleMenu('menu-profile', { stopPropagation() {} })");
+assert.match(element('menu-profile').innerHTML, /Note4 Codex 额度/);
+assert.equal(run('selectedFamilyProfileId'), 'codex-status');
+console.log('Family menu reloads persisted drafts instead of keeping an empty panel cache');
+
+handlers.platform_family_profiles = () => ({ profiles: [] });
+await run("selectFamily('lcd-jd9853-320x240-palette4')");
+assert.equal(run('selectedRenderTarget'), 'lcd-jd9853-320x240-palette4');
+assert.match(element('menu-family').innerHTML, /AP01/);
+console.log('AP01 template family is selectable in the same configuration menu');

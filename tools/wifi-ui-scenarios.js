@@ -76,6 +76,34 @@ window.__wifiUiScenario = async function(scenario) {
     if(scenario==='permission-request')$('wifi-permission-result').textContent='';
 
   } else check($('wifi-permissions').hidden,'Granted permissions should hide setup');
+  if (['family-menu-refresh','ap01-family-menu','154-family-menu'].includes(scenario)) {
+    document.querySelectorAll('.panel').forEach(p => p.classList.toggle('on', p.id === 'tab-templates'));
+    const target=scenario==='ap01-family-menu'?RENDER_TARGET_AP01:scenario==='154-family-menu'?RENDER_TARGET_154G:RENDER_TARGET_NOTE4;
+    const templateId=target===RENDER_TARGET_154G?'quad':'codex-status-a';
+    const profileName=scenario==='ap01-family-menu'?'AP01 Codex 额度':scenario==='154-family-menu'?'1.54 Codex 额度':'Note4 Codex 额度';
+    selectedRenderTarget=target;selectedFamilyProfileId=null;
+    renderFamilyMenu();
+    document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('on',b.dataset.tab==='templates'));
+    $('sub').textContent='原生 WKWebView · 配置菜单回归（合成 IPC）';
+    platformTemplates=[{template_id:templateId,render_target:target}];
+    let profiles=[];
+    window.__wifiRoundtripInvoke=async(name,args)=>{
+      if(name==='platform_family_profiles')return {profiles};
+      return {templates:platformTemplates};
+    };
+    try {
+      await refreshProfiles();
+      check($('menu-profile').textContent.includes('此族暂无 Profile'),'expected initial empty cache');
+      profiles=[{id:'codex-status',name:profileName,render_target:target,
+        template_ids:[templateId],sync_enabled:true}];
+      closeMenus();
+      await toggleMenu('menu-profile',{stopPropagation(){}});
+      await wait();
+      check($('menu-profile').textContent.includes(profileName),'menu kept stale empty cache');
+      check($('profile-rows').textContent.includes(templateId),'template row missing');
+      return {scenario,width:innerWidth};
+    } finally {window.__wifiRoundtripInvoke=null;}
+  }
   if (scenario === 'ble-recovery') {
     const fixture = {device:{device_mac:'7C4FADB93408',identity:{name:'Note4'},
       contact:{label:'蓝牙异常，正在自动恢复',ble_recovery:{state:'recovering',attempt:2},wifi_sampled_at:Math.floor(Date.now()/1000)-60},

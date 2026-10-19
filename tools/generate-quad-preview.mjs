@@ -199,7 +199,7 @@ function findWindow(usage, spec) {
   const bucket = usage?.buckets?.find((candidate) => candidate?.id === spec.bucket);
   if (!bucket || !Array.isArray(bucket.windows)) return null;
   if (spec.win.mode === 'index') return bucket.windows[spec.win.index] || null;
-  const expected = spec.win.mode === 'weekly' ? (window) => window.windowMins >= 10080
+  const expected = spec.win.mode === 'weekly' ? (window) => window.windowMins >= 10080 && window.windowMins < 43200
     : spec.win.mode === 'monthly' ? (window) => window.windowMins >= 43200
     : spec.win.mode === '5h' ? (window) => window.windowMins === 300 : null;
   if (expected) return bucket.windows.find(expected) || null;

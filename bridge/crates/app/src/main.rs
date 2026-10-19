@@ -1063,7 +1063,8 @@ async fn mcp_handler(
                 .unwrap_or_else(|| json!({}));
             let response = match platform::tool(&ctx, name, &args).await {
                 Ok(text) => {
-                    if name == "platform_template_save" {
+                    if matches!(name, "platform_template_save" | "family_platform_profile_save"
+                        | "platform_family_profile_delete" | "platform_family_profile_copy") {
                         if let Some(handle) = ctx.app_handle.get() {
                             let _ = handle.emit("templates-changed", ());
                         }

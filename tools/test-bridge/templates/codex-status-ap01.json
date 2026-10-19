@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "id": "codex-status-a",
-  "version": 2,
+  "version": 3,
   "render_target": "lcd-jd9853-320x240-palette4",
   "canvas": {
     "w": 320,
@@ -44,6 +44,107 @@
       "x2": 303,
       "y2": 35,
       "color": "track"
+    },
+    {
+      "type": "ring",
+      "x": 160,
+      "y": 104,
+      "radius": 61,
+      "thickness": 4,
+      "bind": "buckets[codex].weekly.remaining",
+      "fg": "cyan",
+      "bg": "track",
+      "when": {
+        "bind": "buckets[codex].weekly.remaining",
+        "exists": true
+      }
+    },
+    {
+      "type": "text",
+      "text": "周额度剩余",
+      "x": 130,
+      "y": 62,
+      "font": "ntthin18",
+      "color": "cyan",
+      "bg": "black",
+      "when": {
+        "bind": "buckets[codex].weekly.remaining",
+        "exists": true
+      }
+    },
+    {
+      "type": "text",
+      "bind": "buckets[codex].weekly.remaining",
+      "x": 111,
+      "y": 78,
+      "font": "ntreg64",
+      "color": "white",
+      "bg": "black",
+      "region": [
+        111,
+        78,
+        98,
+        64
+      ],
+      "align": "center",
+      "when": {
+        "bind": "buckets[codex].weekly.remaining",
+        "exists": true
+      }
+    },
+    {
+      "type": "text",
+      "text": "%",
+      "x": 195,
+      "y": 109,
+      "font": "ntthin18",
+      "color": "white",
+      "bg": "black",
+      "when": {
+        "bind": "buckets[codex].weekly.remaining",
+        "exists": true
+      },
+      "digit_bind": "buckets[codex].weekly.remaining",
+      "digit_x": [
+        181,
+        195,
+        208
+      ]
+    },
+    {
+      "type": "text",
+      "bind": "buckets[codex].weekly.resetsAt",
+      "x": 106,
+      "y": 128,
+      "font": "ntthin18",
+      "color": "muted",
+      "bg": "black",
+      "when": {
+        "bind": "buckets[codex].weekly.remaining",
+        "exists": true
+      },
+      "region": [
+        106,
+        126,
+        108,
+        18
+      ],
+      "align": "center"
+    },
+    {
+      "type": "rect",
+      "rect": [
+        16,
+        43,
+        288,
+        126
+      ],
+      "fill": true,
+      "color": "black",
+      "when": {
+        "bind": "buckets[codex].monthly.remaining",
+        "exists": true
+      }
     },
     {
       "type": "ring",
@@ -130,6 +231,21 @@
         18
       ],
       "align": "center"
+    },
+    {
+      "type": "rect",
+      "rect": [
+        16,
+        43,
+        288,
+        126
+      ],
+      "fill": true,
+      "color": "black",
+      "when": {
+        "bind": "buckets[codex].5h.remaining",
+        "exists": true
+      }
     },
     {
       "type": "ring",

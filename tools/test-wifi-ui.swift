@@ -49,7 +49,7 @@ final class Runner: NSObject, WKNavigationDelegate {
                 var results: [Any] = []
                 for (width,height) in [(560,680),(1000,800)] {
                     window.setContentSize(NSSize(width:width,height:height))
-                    for scenario in ["ble-recovery","empty","bridge","device","compare","waiting","error","permission-request","permission-settings","current-missing","current-connecting","current-error","current-ready","rename","delete","current-unreachable","sync-guard","imported-edit","save-error","delivery-alignment","roundtrip-own","roundtrip-other","online-usb","online-boot","stale-cache","job-feedback","job-feedback-error","job-blocked","failure-sent","failure-unknown","failure-network","failure-budget","endpoint-rejected","endpoint-unknown"] {
+                    for scenario in ["family-menu-refresh","ap01-family-menu","154-family-menu","ble-recovery","empty","bridge","device","compare","waiting","error","permission-request","permission-settings","current-missing","current-connecting","current-error","current-ready","rename","delete","current-unreachable","sync-guard","imported-edit","save-error","delivery-alignment","roundtrip-own","roundtrip-other","online-usb","online-boot","stale-cache","job-feedback","job-feedback-error","job-blocked","failure-sent","failure-unknown","failure-network","failure-budget","endpoint-rejected","endpoint-unknown"] {
                         let result = try await web.callAsyncJavaScript("return await window.__wifiUiScenario(name)",arguments:["name":scenario],in:nil,contentWorld:.page)
                         results.append(result ?? NSNull())
                         let config=WKSnapshotConfiguration()

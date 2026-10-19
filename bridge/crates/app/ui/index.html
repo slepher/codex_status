@@ -585,8 +585,9 @@
   let paused = false;
   const RENDER_TARGET_154G = 'epd-ssd1681-200x200-1bpp';
   const RENDER_TARGET_NOTE4 = 'epd-ssd2683-400x300-1bpp';
+  const RENDER_TARGET_AP01 = 'lcd-jd9853-320x240-palette4';
   let selectedRenderTarget = localStorage.getItem('codex-status-family-target');
-  if (![RENDER_TARGET_154G, RENDER_TARGET_NOTE4].includes(selectedRenderTarget)) {
+  if (![RENDER_TARGET_154G, RENDER_TARGET_NOTE4, RENDER_TARGET_AP01].includes(selectedRenderTarget)) {
     selectedRenderTarget = RENDER_TARGET_154G;
   }
   let familyProfiles = [];
@@ -621,14 +622,14 @@
     }
   });
 
-  function toggleMenu(id, event) {
+  async function toggleMenu(id, event) {
     event.stopPropagation();
     const menu = $(id);
     const wasOpen = menu.classList.contains('open');
     document.querySelectorAll('.menu.open').forEach((m) => m.classList.remove('open'));
     if (!wasOpen) {
       menu.classList.add('open');
-      if (id === 'menu-profile') renderProfileMenu();
+      if (id === 'menu-profile') await refreshProfiles();
       if (id === 'menu-actions') renderActionsMenu();
       if (id === 'menu-family') renderFamilyMenu();
     }
@@ -677,11 +678,11 @@
   /* ---------- menus ---------- */
 
   function familyLabel(renderTarget) {
-    return renderTarget === RENDER_TARGET_NOTE4 ? 'Note4' : '1.54 黑白';
+    return renderTarget === RENDER_TARGET_AP01 ? 'AP01 彩色' : renderTarget === RENDER_TARGET_NOTE4 ? 'Note4' : '1.54 黑白';
   }
 
   function renderFamilyMenu() {
-    const families = [RENDER_TARGET_154G, RENDER_TARGET_NOTE4];
+    const families = [RENDER_TARGET_154G, RENDER_TARGET_NOTE4, RENDER_TARGET_AP01];
     $('menu-family').innerHTML = families.map(renderTarget =>
       `<div class="item" onclick="selectFamily('${renderTarget}')">` +
       `<span class="check">${renderTarget === selectedRenderTarget ? '✓' : ''}</span>` +
@@ -690,7 +691,7 @@
   }
 
   async function selectFamily(renderTarget) {
-    if (![RENDER_TARGET_154G, RENDER_TARGET_NOTE4].includes(renderTarget) || renderTarget === selectedRenderTarget) {
+    if (![RENDER_TARGET_154G, RENDER_TARGET_NOTE4, RENDER_TARGET_AP01].includes(renderTarget) || renderTarget === selectedRenderTarget) {
       closeMenus();
       return;
     }

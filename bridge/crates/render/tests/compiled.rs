@@ -185,7 +185,7 @@ fn compiled_regions_match_the_json_region_derivation() {
 }
 
 #[test]
-fn note4_free_monthly_plan_shows_only_monthly_balance_and_reset() {
+fn note4_window_layouts_cover_free_prolite_and_paid() {
     let _guard = SERIAL.lock().unwrap();
     let source = std::fs::read_to_string(repo_root().join(
         "bridge/crates/core/tests/fixtures/codex-status-a-400x300.json",
@@ -206,8 +206,15 @@ fn note4_free_monthly_plan_shows_only_monthly_balance_and_reset() {
     // Free/Go accounts only expose the monthly window: draw its balance, % and
     // reset time, and nothing from the paid 5H/WEEK layout.
     assert!(ink(&monthly, 12, 388, 66, 217), "monthly quota must render");
-    let legacy_weekly = render_bits(&source, &data(10080), &Env::default()).unwrap();
-    assert!(!ink(&legacy_weekly, 120, 388, 66, 217), "no WEEK block without monthly/5h");
+    let mut weekly = serde_json::from_str::<serde_json::Value>(&data(10080)).unwrap();
+    weekly["account"]["plan"] = json!("prolite");
+    let weekly = weekly.to_string();
+    let weekly_bits = render_bits(&source, &weekly, &Env::default()).unwrap();
+    assert!(ink(&weekly_bits, 120, 388, 66, 217), "weekly-only prolite quota must render");
+    let mut empty = serde_json::from_str::<serde_json::Value>(&weekly).unwrap();
+    empty["buckets"][0]["windows"] = json!([]);
+    let empty_bits = render_bits(&source, &empty.to_string(), &Env::default()).unwrap();
+    assert!(!ink(&empty_bits, 12, 388, 73, 217), "no quota labels without windows");
     // Paid data keeps the two-column layout.
     let paid = json!({
         "schema": 1, "server_time": 1_700_000_000i64, "account": {"plan": "plus"},
@@ -219,7 +226,20 @@ fn note4_free_monthly_plan_shows_only_monthly_balance_and_reset() {
     let paid_bits = render_bits(&source, &paid, &Env::default()).unwrap();
     assert!(ink(&paid_bits, 12, 188, 66, 217), "5H column must render");
     assert!(ink(&paid_bits, 212, 388, 66, 217), "WEEK column must render");
+    // Monthly overlays weekly-only; 5h restores the original paid layout even
+    // when a source temporarily supplies monthly as well.
+    let mut mixed = serde_json::from_str::<serde_json::Value>(&paid).unwrap();
+    mixed["buckets"][0]["windows"].as_array_mut().unwrap().push(
+        json!({"windowMins":43200,"usedPercent":23,"resetsAt":1_800_000_000i64}));
+    assert_eq!(paid_bits, render_bits(&source, &mixed.to_string(), &Env::default()).unwrap());
+    mixed["buckets"][0]["windows"] = json!([
+        {"windowMins":10080,"usedPercent":75,"resetsAt":1_800_000_001i64},
+        {"windowMins":43200,"usedPercent":23,"resetsAt":1_800_000_000i64}]);
+    mixed["account"] = json!({"plan":"free"});
+    mixed.as_object_mut().unwrap().remove("resetCredits");
+    assert_eq!(monthly, render_bits(&source, &mixed.to_string(), &Env::default()).unwrap());
     compile(&source).unwrap();
+    assert_eq!(weekly_bits, render_compiled_bits_size(&weekly, &Env::default(), 400, 300).unwrap());
     assert_eq!(
         monthly,
         render_compiled_bits_size(&data(43200), &Env::default(), 400, 300).unwrap()

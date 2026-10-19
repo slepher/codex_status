@@ -48,8 +48,13 @@ fn ap01_shared_compiler_layouts_and_boundaries() {
     }
     let mut env = Env::default();
     env.sync_hhmm = "12:40";
-    for (name, remain, five) in [("monthly-only",98,None),("both-windows",72,Some(86)),("zero",0,None),("full",100,None)] {
-        let data = usage(remain,five).to_string();
+    for (name, remain, five) in [("monthly-only",98,None),("weekly-only",98,None),("both-windows",72,Some(86)),("zero",0,None),("full",100,None)] {
+        let mut input = usage(remain,five);
+        if name == "weekly-only" {
+            input["account"]["plan"] = json!("prolite");
+            input["buckets"][0]["windows"][0]["windowMins"] = json!(10080);
+        }
+        let data = input.to_string();
         if let Ok(dir)=std::env::var("AP01_PREVIEW_DIR") {
             std::fs::write(std::path::Path::new(&dir).join(format!("{name}.usage.json")), &data).unwrap();
         }
@@ -66,7 +71,7 @@ fn ap01_shared_compiler_layouts_and_boundaries() {
         }
         // RC is independent of the 5h window, in both layouts.
         assert!((184..205).any(|y| (249..304).any(|x| pixel(&frame,x,y)==3)));
-        let mut no_rc=usage(remain,five);
+        let mut no_rc=input.clone();
         no_rc.as_object_mut().unwrap().remove("resetCredits");
         let hidden=bridge_render::render_bits(&src.to_string(),&no_rc.to_string(),&env).unwrap();
         assert!((184..205).all(|y| (249..304).all(|x| pixel(&hidden,x,y)==0)));

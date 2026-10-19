@@ -150,7 +150,45 @@
         68
       ],
       "scale": 3,
-      "type": "text"
+      "type": "text",
+      "when": {
+        "bind": "buckets[codex].weekly.remaining",
+        "exists": true
+      }
+    },
+    {
+      "type": "rect",
+      "rect": [
+        8,
+        12,
+        88,
+        68
+      ],
+      "fill": true,
+      "color": "black",
+      "when": {
+        "bind": "buckets[codex].monthly.remaining",
+        "exists": true
+      }
+    },
+    {
+      "align": "center",
+      "bg": "black",
+      "bind": "buckets[codex].monthly.remaining",
+      "color": "white",
+      "font": "f20",
+      "region": [
+        8,
+        12,
+        88,
+        68
+      ],
+      "scale": 3,
+      "type": "text",
+      "when": {
+        "bind": "buckets[codex].monthly.remaining",
+        "exists": true
+      }
     },
     {
       "align": "center",
@@ -255,11 +293,7 @@
         84,
         18
       ],
-      "type": "text",
-      "when": {
-        "bind": "resetCredits.availableCount",
-        "exists": true
-      }
+      "type": "text"
     },
     {
       "align": "right",
@@ -280,71 +314,6 @@
     },
     {
       "align": "right",
-      "bind": "bridge.label",
-      "color": "black",
-      "font": "f12",
-      "region": [
-        112,
-        64,
-        84,
-        18
-      ],
-      "type": "text",
-      "when": {
-        "bind": "bridge.label",
-        "exists": true
-      }
-    },
-    {
-      "color": "white",
-      "fill": true,
-      "rect": [
-        112,
-        46,
-        84,
-        18
-      ],
-      "type": "rect",
-      "when": {
-        "bind": "resetCredits.availableCount",
-        "exists": false
-      }
-    },
-    {
-      "align": "right",
-      "bind": "account.plan",
-      "color": "black",
-      "font": "f12",
-      "prefix": "PLAN ",
-      "region": [
-        112,
-        46,
-        84,
-        18
-      ],
-      "type": "text",
-      "when": {
-        "bind": "resetCredits.availableCount",
-        "exists": false
-      }
-    },
-    {
-      "color": "white",
-      "fill": true,
-      "rect": [
-        112,
-        64,
-        84,
-        18
-      ],
-      "type": "rect",
-      "when": {
-        "bind": "resetCredits.availableCount",
-        "exists": true
-      }
-    },
-    {
-      "align": "right",
       "bind": "buckets[codex].weekly.resetsAt",
       "color": "black",
       "font": "f12",
@@ -357,26 +326,41 @@
       "time_format": "date",
       "type": "text",
       "when": {
-        "bind": "resetCredits.availableCount",
+        "bind": "buckets[codex].weekly.remaining",
+        "exists": true
+      }
+    },
+    {
+      "type": "rect",
+      "rect": [
+        112,
+        64,
+        84,
+        18
+      ],
+      "fill": true,
+      "color": "white",
+      "when": {
+        "bind": "buckets[codex].monthly.remaining",
         "exists": true
       }
     },
     {
       "align": "right",
-      "bind": "buckets[codex].weekly.resetsAt",
+      "bind": "buckets[codex].monthly.resetsAt",
       "color": "black",
       "font": "f12",
       "region": [
         112,
-        82,
+        64,
         84,
         18
       ],
       "time_format": "date",
       "type": "text",
       "when": {
-        "bind": "resetCredits.availableCount",
-        "exists": false
+        "bind": "buckets[codex].monthly.remaining",
+        "exists": true
       }
     },
     {
@@ -468,5 +452,5 @@
   "id": "quad",
   "min_fw": "0.18.75",
   "schema": 1,
-  "version": 14
+  "version": 15
 }

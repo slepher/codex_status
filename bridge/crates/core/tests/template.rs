@@ -20,10 +20,10 @@ fn hashes_match_python_test_bridge() {
     assert_eq!(full.version, 3);
     assert_eq!(mini.version, 2);
     let quad = library.get("quad").expect("quad template");
-    assert_eq!(quad.version, 14);
+    assert_eq!(quad.version, 15);
     assert_eq!(quad.min_fw.as_deref(), Some("0.18.75"));
     // Shared with tools/test-template-wifi-metadata.py; C++ hashes the same canonical bytes.
-    assert_eq!(quad.hash, "44fa7e21");
+    assert_eq!(quad.hash, "abd79ca9");
     let compiled = bridge_core::compile::compile(&quad.json, "epd-1bpp-200x200").unwrap();
     assert_eq!(compiled.source_crc, quad.hash);
 }
@@ -207,4 +207,19 @@ fn chunks_are_sequential_with_offset_prefix() {
     assert_eq!(rebuilt, data);
     assert_eq!(chunks.last().unwrap().len(), 2 + 1000 % 180);
     assert_eq!(template_hash(&data), format!("{:08x}", crc32fast::hash(&data)));
+}
+
+#[test]
+fn quad_monthly_contract_delivers_balance_and_reset_without_weekly_alias() {
+    let source = Library::load(&template_dir()).unwrap().get("quad").unwrap().json.clone();
+    let compiled = bridge_core::compile::compile(&source,
+        bridge_core::platform::model::RENDER_TARGET_154G).unwrap();
+    let env = serde_json::json!({"server_time":1700000000,"buckets":[{"id":"codex","windows":[
+        {"windowMins":43200,"usedPercent":23,"resetsAt":1800000000}]}]});
+    let snapshot = bridge_core::datasource::codex_snapshot("codex", &env, 3600);
+    let payload = bridge_core::datasource::assemble_payload(&snapshot, &compiled.requirements);
+    assert_eq!(payload.get("buckets[codex].monthly.remaining"), Some(&serde_json::json!(77)));
+    assert_eq!(payload.get("buckets[codex].monthly.resetsAt"), Some(&serde_json::json!(1800000000)));
+    assert!(!snapshot.fields.contains_key("buckets[codex].weekly.usedPercent"));
+    assert!(payload["buckets[codex].weekly.remaining"].is_null());
 }

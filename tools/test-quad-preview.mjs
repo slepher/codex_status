@@ -68,7 +68,7 @@ assert.equal(bindResult(rcBind, usageFixture(), env).exists, false, 'missing res
 const withReset = render(template, usageFixture({ fiveHourUsed: 11, resetCount: 2 }), env);
 assert.equal(bindResult(rcBind, usageFixture({ resetCount: 2 }), env).value, 2, 'reset credit count is readable');
 assert.ok(different(normal, withReset), 'reset credits change visible pixels');
-assert.equal(countColor(render(template, usageFixture({ fiveHourUsed: 11, label: null }), env), 112, 64, 84, 18, 0), 0, 'missing username hides the label row');
+assert.equal(countColor(render(template, usageFixture({ fiveHourUsed: 11, label: null }), env), 112, 46, 84, 18, 0), 0, 'missing username hides the label row');
 const labelElement = template.elements.find((element) => element.bind === 'bridge.label');
 assert.ok(labelElement && !labelElement.prefix, 'bridge label has no LABEL prefix');
 
@@ -151,3 +151,12 @@ assert.deepEqual(render(template, usageFixture({ fiveHourUsed: 11 }), offlineEnv
 
 assert.ok(fs.existsSync(new URL('test-bridge/templates/quad.json', import.meta.url)));
 console.log('quad preview tests: 7 fixtures, bounds/palette/fit/date/conditions/RC/label/state/offline/determinism passed');
+
+const monthlyChanged = structuredClone(monthlyUsage);
+monthlyChanged.buckets[0].windows[0].usedPercent = 63;
+monthlyChanged.buckets[0].windows[0].resetsAt += 86400;
+const changedMonth = render(template, monthlyChanged, env);
+assert.notDeepEqual(regionSlice(monthly, 8, 12, 88, 68), regionSlice(changedMonth, 8, 12, 88, 68), 'monthly balance uses actual monthly data');
+assert.notDeepEqual(regionSlice(monthly, 112, 64, 84, 18), regionSlice(changedMonth, 112, 64, 84, 18), 'monthly reset uses actual monthly data');
+assert.equal(countColor(monthly, 112, 82, 84, 18, 0), 0, 'missing RC keeps its fixed row blank');
+console.log('quad monthly balance/reset change with the source; missing RC stays hidden');

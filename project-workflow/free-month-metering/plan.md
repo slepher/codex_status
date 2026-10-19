@@ -28,3 +28,17 @@
 
 - 不改固件/协议/引擎（`monthly` 选择器自 0.12.5 已存在，Note4 运行 0.18.104 支持）。
 - 不保存模板到 Bridge 库、不发布 Bundle、不刷机、不提交 git；发布是用户显式动作。
+
+## 2026-10-19 prolite 回归修复计划
+
+用户已授权修改项目模板、更新 Bridge 并发布 Note4。恢复按实际窗口组合显示：weekly-only 通栏、monthly-only 通栏、5h 存在时原双栏优先；月度优先于周度通栏。使用现有顺序绘制：单窗口区块在前，5h 条件清屏后绘制原双栏，避免单条件 when 的重叠，无协议/固件改动。同步修正 AP01 候选，不发布 AP01。
+
+任务：先修订 weekly-only 回归并运行失败；修改 Note4 v7 与 AP01 v3；跑 compiled/core 模板测试及单/双/混合窗口像素对照；读取运行 Bridge 模板/Profile 后校验保存，预览并发布 Note4 完整 Bundle，等待同 job 终态并认证核对合同与数据 ACK；记录部署边界。保持现有运行 Bridge，无需重编/重启；不提交 git。
+
+## 14:30后模板页缓存修复
+
+用户两次截图确认仍空：只读MCP配置存在不等于窗口已刷新。回归先红复现：UI首次读取空配置→MCP持久新增→打开配置菜单，仅重画内存数组，仍显示此族暂无Profile。修复菜单打开时调用现有refreshProfiles；MCP族配置save/copy/delete成功复用templates-changed通知。运行Node+WK窄宽截图、Rust app测试；构建隔离候选，冻结App/data备份，按托管服务停止/部署/启动，保留v7/族配置与历史未知事务，验收真实MCP读回及窗口。设备模板不重复发布。
+
+## 后续：AP01与1.54先修改同步（不发布设备）
+
+用户明确授权。AP01核验既有v3；1.54 quad v15增加真实monthly数值/重置合同，保留四象限及缺5h静态100，元信息固定PLAN28/label46/长期窗口reset64/RC82，使周/月分支与RC独立；保留用户名/RC缺失隐藏。回归从编译需求经过真实codex_snapshot/assemble_payload验证月度字段，避免旧预览weekly选择器吞月度掩盖缺失合同。UI补AP01族可选，Node先红后绿及WK窄宽验证。保存两目标模板及可见族Profile，冻结备份重建重启Bridge以嵌入UI，核对两族配置/源CRC和Note4发布不受影响；不注册/发布AP01或1.54实机，不提交。
