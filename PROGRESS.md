@@ -1,22 +1,20 @@
 # Codex Status 当前交接
 
-更新时间：2026-10-19 20:43 香港时间
+更新时间：2026-10-20 02:21 香港时间
 
 ## 部署与工作区
 
-- Windows 19:55切网修复已部署：exe SHA256 `66e8e7f2ea64f9569a24ecbe49b6c57c0064d1f6aadc7ff7bd7ccd0a06b937e6`；冻结264文件备份 `artifacts/wifi-switch-backup-20261019-195530`。自然会合认证HTTP恢复、原ID017a completed/revision342，14条旧Job不变，用户确认OFF图标恢复。[验收/回滚](project-workflow/wifi-switch-fix/status.md)。
-- Note4 `7C4FADB93408` 已升级 `.105-note4/ota_1`，冷启动保护生成context `443f617ea34aa91a`/commit803，原Bundle Job保留，Data828 displayed。macOS 15:26已部署AP01菜单与族配置；具体模板/部署哈希见[前卡](docs/history/progress-archive-2026-10-19-before-r3-r5.md)。本轮Windows Bridge已重编译/部署，Note4直接OTA已完成；未发布Bundle。
-- 用户要求的 `codex/fix-wifi-switch` 已合并至master（`93bb386`）；其worktree已移除，分支保留。R3–R5已提交 `9e748eb`。
+- AP01 `34F01557210B`/DID2232184842：候选32运行**槽1**，build `6b60914b9f64a7117a53c45b6d93501e`。两次经0031基础ROM槽0启动/核对头尾后单次OTA更新应用槽，**救援槽0保留且实机回切已验**。本轮事务 `artifacts/ap01-app-rollout-20261020/navigation-rollout-task.json`。
+- 模板v5/完整Bundle `b097bacb`（CRC4b72d7d7）保留；真实Data seq9/displayed，commit_seq4。用户确认**当前时间已正确**，重置UTC+8转换沿用已确认版本。**切页仍未通过：左旋钮偶发反向动画，页序不可靠**。
+- 用户要求先快速结束并提交，停止后续实现/刷写。默认Bridge既有AP01版本格式修复/core175已部署，本轮无再次重建，Note4 ROM未刷写。
 
-## 本轮结果与后续边界
+## 待续与边界
 
-- **B6/C8 R1–R5已部署Windows/Note4、短时验收完成**：删除重复Wi-Fi执行/全局缓存、私有JSON会合状态、同步HTTP worker及旧JSON会话/op路径；共享Job、ConnectionFacts、RendezvousContext、异步HTTP与CommandContext已替换。491回归通过/5条件忽略，合并后App114通过/3条件忽略；两款ESP构建及匹配ELF栈通过，AP01 RV32/宿主ASan通过。[删除清单、迁移、验证与资源](project-workflow/bridge-macos/protocol-convergence-status.md)。已冻结264文件备份；不做旧wire兼容，旧Bridge回滚须恢复备份。15分钟/31采样完成：OTA后7次自然BLE交汇、Data828 displayed，16条Wi-Fi Job/Profile未变，末态Sleep，health204。
-- C9：既有AP01候选25单次安装结果未知，禁止重派；本轮C2候选未刷写且flashable=false。物理首启/掉电/LCD/恢复ABI及独立更新未验。[现场](project-workflow/ap01-template-integration/flash-0041-20261019.md)。B6/C8长期RF/原生BLE/Flash实机矩阵仍开放，下一步按[backlog](docs/roadmap/backlog.md)独立验收。
+- C9剩余导航问题：最新原厂反编译确认key0x13的动画参数为2、key0x14为1，当前应用退出用相反参数；页面图也非简单连续索引。尚未修改/验证这项发现，不能称导航修复完成。对照原厂事件图和方向映射后再模拟/实机验收。
+- 32宿主ASan/UBSan及原生120完整OTA/RTC归一化、121回切、122同NOR恢复通过；123旧版同页退出复现。125原始固定下一页=1断言失败（实际到原厂7且未回应用），独立后置条件复核通过；该模拟未覆盖实机方向问题，不冒充完整硬件验收。物理掉电/Boot2前回退/高水位未保证。
+- [部署与详细边界](project-workflow/ap01-template-integration/release-0041-20261020.md)；物理反馈 `artifacts/ap01-app-rollout-20261020/physical-verification-navigation.json`；[待办 C9](docs/roadmap/backlog.md)。
 
-## 镜像与部署
+## 精确ROM
 
-- Note4 **已认证运行ota_1** `0.18.105-note4`：`.pio/build/zectrix-note4-b/firmware.bin`，1850016 B；SHA256 `5433769a050a7fe717f52d3d1b5c0c1f76e66a2ce12b5e4cce1880eee7059608`。
-- 1.54候选未部署 `0.18.37-bw`：`.pio/build/esp32-s3-epaper-154g/firmware.bin`，1831776 B；SHA256 `b76365e408f338be39a393c64dcf143da5c4506ff2c9da2b4cc72e2f2397e7a4`。
-- AP01候选未部署：`artifacts/ap01-platform-integration/device/ap01-native-0041-c2-candidate.bin`，6994312 B；SHA256 `c2305894caf41af7e30501d5a3c39a8458ff0f0fae179d1b27573e8463b53221`。匹配ELF/manifest及边界见状态文档。
-
-新Windows exe SHA256 `33595924e6d9791e4c9fef1405710b3ce58b9e154855dc400d5f37b807e291ed`；冻结264文件备份 `artifacts/protocol-convergence-backup-20261019-c2`。[部署/15分钟观察结果](project-workflow/bridge-macos/protocol-convergence-rollout.md)。
+- 已部署：`artifacts/ap01-platform-integration/device/ap01-0041-app-navigation-20261020.bin`，6994856 B，SHA256 `7f3789d37ad0ca8b8c1bbd7733729ec69262f7e3248501b40e05e750cf37a33c`；匹配ELF SHA256 `1ad5735dd7a443078106859ee2a0ad07be9666952eae6de6653195c86cff4bc0`。
+- 救援槽0：`artifacts/ap01-base0031-20261019/ap01-base0031-v2-rom.bin`，6822344 B，SHA256 `d843aae4e097c31ce06a315c62e1a66f4fb3bf9299db289b6f31562d0ef2231b`；未写槽0，本轮回切巡检CRC/运行/头尾通过，未声称全片实读哈希。

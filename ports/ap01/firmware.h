@@ -8,6 +8,7 @@ struct Ap01HttpReply;
 struct Ap01SlotImage {
     uint32_t length=0, crc=0;
     char build[33]={};
+    const char *error="slot_image_invalid"; // Inspection detail, never persisted.
 };
 struct Ap01FirmwarePort {
     void *context = nullptr;
@@ -35,7 +36,7 @@ class Ap01Firmware {
     std::unique_ptr<Record> record;
     std::unique_ptr<Stable> stable;
     char mac[13];
-    bool corrupt = false, opened = false, booted = false, commitConfirmed = false, rebootPending = false;
+    bool corrupt = false, stableCorrupt = false, opened = false, booted = false, commitConfirmed = false, rebootPending = false;
     enum BootSafety { Unconfigured, StableRunning, Armed, Healthy, RetainedStable, SafetyUnknown } safety=Unconfigured;
     uint64_t armedAt=0, healthySince=0;
     bool healthyObserved=false;

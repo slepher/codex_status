@@ -75,6 +75,14 @@ bool Ap01Business::render() {
     if (!ui.present || !ui.present(ui.context, frame.get(), generation + 1)) return failed();
     frame.release(); ++generation; frameCrc = crc; return true;
 }
+void Ap01Business::clock(const char *hhmm) {
+    if(!strcmp(currentTime.c_str(),hhmm))return;
+    currentTime=hhmm;
+    if(configured&&compiled)for(unsigned i=0;i<compiled->reqCount;++i) {
+        const char *path=compiled->reqs[i].path;
+        if(!strcmp(path,"device.now")||!strcmp(path,"device.date")){render();break;}
+    }
+}
 bool Ap01Business::localActivate(uint8_t index, uint64_t now) {
     if (storageUnknown || !configured || index >= profile.count) return false;
     char next[BS_CTX_LEN]; newContext(next); String error;

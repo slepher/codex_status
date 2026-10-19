@@ -87,6 +87,7 @@ Ap01HttpReply Ap01Firmware::slots(const Ap01HttpRequest &request,const char *pri
     int running=port.runningSlot(port.context);if(running<0||running>1)return reject(503,"running_slot_unknown","slot_inspect");
     bool marking=!strcmp(request.path,"/api/firmware/stable");
     if(marking) {
+        if(stableCorrupt)return reject(503,"stable_storage_unavailable","firmware_storage");
         if(strcmp(request.method,"POST"))return reject(405,"method");
         if(safety==Armed||safety==RetainedStable||safety==SafetyUnknown)return reject(409,"boot_safety_pending","boot_safety");
         if(blocksBusiness()||port.busy(port.context))return reject(409,"firmware_busy");
@@ -103,13 +104,14 @@ Ap01HttpReply Ap01Firmware::slots(const Ap01HttpRequest &request,const char *pri
             std::unique_ptr<Stable> value(new(std::nothrow) Stable);if(!value)return reject(503,"slot_oom");
             value->slot=running;value->revision=revision+1;value->owner=principal;value->request=requestId;
             if(value->owner!=principal||value->request!=requestId)return reject(503,"slot_oom");
-            if(!port.inspectSlot(port.context,running,value->image))return reject(409,"slot_image_invalid","slot_inspect");
-            if(!saveStable(*value)){corrupt=true;return reject(503,"stable_storage_unknown","firmware_storage",true);}
+            if(!port.inspectSlot(port.context,running,value->image))return reject(409,value->image.error,"slot_inspect");
+            if(!saveStable(*value)){stableCorrupt=true;return reject(503,"stable_storage_unknown","firmware_storage",true);}
             stable=std::move(value);
         }
     } else if(strcmp(request.method,"GET"))return reject(405,"method");
     LocalJsonAllocator a;JsonDocument out(&a);out["result"]=marking?"applied":"ok";out["device_mac"]=mac;
     out["running_slot"]=running;out["stable_revision"]=stable?stable->revision:0;
+    if(stableCorrupt)out["stable_error"]="stable_storage_unavailable";
     out["boot_safety"]=safetyName();out["health_window_ms"]=9000;out["trial_timeout_ms"]=30000;
     if(stable){out["stable_slot"]=stable->slot;out["stable_image_crc"]=stable->image.crc;out["stable_image_length"]=stable->image.length;out["stable_build"]=stable->image.build;out["stability"]="explicitly_confirmed";}
     else {out["stable_slot"]=nullptr;out["stability"]="unconfirmed";}
@@ -219,13 +221,19 @@ bool Ap01Firmware::begin(uint64_t now) {
     __attribute__((used,section(".ap01_firmware_budget"))) static const uint32_t budget[]={
         sizeof(Ap01Firmware),sizeof(Record),32768,6145,1036,1024};
     if(!available())return true;
-    if(!load()||!loadStable()){corrupt=true;record.reset();return false;}
+    if(!load()){corrupt=true;record.reset();return false;}
+    if(!loadStable()){stableCorrupt=true;stable.reset();}
     if(record&&record->phase==Receiving)failed("interrupted_before_commit");
     else if(record&&!record->trialPending&&(record->phase==Committing||record->phase==Unknown||record->phase==Applied)) {
         if(record->targetBuild.length()==32&&record->targetBuild==port.build&&
            (record->targetSlot<0||(port.runningSlot&&port.runningSlot(port.context)==record->targetSlot))) {
             record->phase=Applied;record->error="";booted=true;
             if(!save()){record->phase=Unknown;record->error="receipt_storage";booted=false;}
+        } else if(record->phase==Applied&&record->targetSlot>=0&&port.runningSlot&&
+                  port.runningSlot(port.context)>=0&&port.runningSlot(port.context)!=record->targetSlot) {
+            // A confirmed historical selection must not fence a later boot
+            // reached through the independent rescue ROM's update channel.
+            record->phase=Failed;record->error="booted_other_slot";save();
         } else if(record->phase==Committing) {record->phase=Unknown;record->error="commit_unknown";save();}
     }
     armBoot(now);return true;
@@ -254,10 +262,9 @@ Ap01HttpReply Ap01Firmware::handle(const Ap01HttpRequest &request,const char *pr
     } else if(chunk)queryId=request.requestId;
     if(switching) {
         if(!port.runningSlot||!port.inspectSlot||!port.selectSlot)return reject(501,"slot_port_unavailable");
-        if(!input["target_slot"].is<unsigned>()||!input["expected_revision"].is<unsigned>()||
-           !input["expected_stable_revision"].is<unsigned>()||!input["expected_image_crc"].is<uint32_t>())return reject(400,"switch_envelope");
+        if(!input["target_slot"].is<unsigned>()||input["target_slot"].as<unsigned>()>1||!input["expected_revision"].is<unsigned>()||
+           (!input["expected_image_crc"].isNull()&&!input["expected_image_crc"].is<uint32_t>()))return reject(400,"switch_envelope");
         unsigned target=input["target_slot"],revision=input["expected_revision"];
-        if(!stable||stable->slot!=target||input["expected_stable_revision"]!=stable->revision||input["expected_image_crc"]!=stable->image.crc)return reject(409,"stable_identity_conflict");
         bool same=record&&record->owner==principal&&record->request==queryId;
         if(same) {
             if(!record->switching||record->targetSlot!=int(target)||revision!=record->revision-1)return reject(409,"request_conflict");
@@ -267,7 +274,8 @@ Ap01HttpReply Ap01Firmware::handle(const Ap01HttpRequest &request,const char *pr
             int running=port.runningSlot(port.context);if(running<0||running>1)return reject(503,"running_slot_unknown");
             if(target==unsigned(running))return reject(409,"already_running");
             Ap01SlotImage image;
-            if(!port.inspectSlot(port.context,target,image)||image.length!=stable->image.length||image.crc!=stable->image.crc||strcmp(image.build,stable->image.build))return reject(409,"stable_image_changed","slot_inspect");
+            if(!port.inspectSlot(port.context,target,image))return reject(409,image.error,"slot_inspect");
+            if(!input["expected_image_crc"].isNull()&&input["expected_image_crc"]!=image.crc)return reject(409,"image_crc_conflict","slot_inspect");
             std::unique_ptr<Record> next(new(std::nothrow) Record);if(!next)return reject(503,"slot_oom");
             next->owner=principal;next->request=queryId;next->targetBuild=image.build;
             if(next->owner!=principal||next->request!=queryId||next->targetBuild!=image.build)return reject(503,"slot_oom");
@@ -296,8 +304,7 @@ Ap01HttpReply Ap01Firmware::handle(const Ap01HttpRequest &request,const char *pr
             int target=-1;
             if(port.runningSlot) {
                 int running=port.runningSlot(port.context);if(running<0||running>1)return reject(503,"running_slot_unknown");target=running^1;
-                if(!stable)return reject(409,"stable_confirmation_required");
-                if(stable->slot==unsigned(target))return reject(409,"stable_slot_protected");
+                if(stable&&stable->slot==unsigned(target))return reject(409,"stable_slot_protected");
             }
             std::unique_ptr<Record> next(new(std::nothrow) Record);if(!next)return reject(503,"firmware_oom");
             next->owner=principal;next->request=queryId;

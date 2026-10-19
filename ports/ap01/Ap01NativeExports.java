@@ -60,12 +60,15 @@ public class Ap01NativeExports extends GhidraScript {
             JsonArray callees = new JsonArray();
             for (Function callee : f.getCalledFunctions(monitor)) callees.add("0x" + callee.getEntryPoint().toString());
             object.add("callees", callees); functions.add(object);
+            JsonArray callers = new JsonArray();
+            for (Function caller : f.getCallingFunctions(monitor)) callers.add("0x" + caller.getEntryPoint().toString());
+            object.add("callers", callers);
         }
         decompiler.dispose(); report.add("functions", functions);
         JsonArray literals = new JsonArray();
         byte[] image = new byte[6769704];
         currentProgram.getMemory().getBytes(base, image);
-        for (String word : new String[]{"wlan0", "netlib_getmacaddr", "wapi_get_mac", "get_mac", "getmac", "lv_image_cache_drop", "lv_image_cache_resize", "lv_image_cache_is_enabled", "lv_event_get_user_data", "lv_obj_send_event", "lv_obj_event_send", "lv_event_send", "lv_event_get_key"}) {
+        for (String word : new String[]{"wlan0", "netlib_getmacaddr", "wapi_get_mac", "get_mac", "getmac", "lv_image_cache_drop", "lv_image_cache_resize", "lv_image_cache_is_enabled", "lv_event_get_user_data", "lv_obj_send_event", "lv_obj_event_send", "lv_event_send", "lv_event_get_key", "lv_obj_update_layout", "lv_obj_get_width", "lv_obj_refr_size"}) {
             byte[] needle = (word + "\0").getBytes(StandardCharsets.UTF_8);
             for (int pos = 0; pos + needle.length <= image.length; ++pos) {
                 boolean match = true;

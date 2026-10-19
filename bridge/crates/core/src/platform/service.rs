@@ -1385,7 +1385,7 @@ impl PlatformService {
                     .and_then(|status| status.body["fw"].as_str())
                     .context("device firmware version is unknown; refresh authenticated status before publishing digit_x")?;
                 let revision = |version: &str| -> Result<Vec<u32>> {
-                    version.split('-').next().unwrap_or("").split('.')
+                    version.split('-').next().unwrap_or("").split(['.', '_'])
                         .map(|part| part.parse::<u32>().map_err(Into::into)).collect()
                 };
                 if revision(observed)? < revision(required)? {
@@ -5706,6 +5706,32 @@ mod tests {
         assert!(bundle.total_len <= 262_144);
         assert_eq!(bundle.profile.template_ids, ["codex-status-a"]);
         bundle.verify().unwrap();
+    }
+
+    #[test]
+    fn ap01_digit_layout_requires_authenticated_native_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = PlatformService::open(dir.path()).unwrap();
+        let mac = "34F01557210B";
+        let caps = DeviceCapabilities::ap01();
+        let target = caps.render_target.clone();
+        svc.device_upsert(DeviceIdentity::new(mac, "AP01").unwrap(), caps).unwrap();
+        let source = json!({"schema":1,"id":"digits","version":1,"min_fw":"1.0.2_0041",
+            "render_target":target,"canvas":{"w":320,"h":240},"elements":[
+                {"type":"text","text":"%","x":10,"y":10,"font":"f12",
+                 "digit_bind":"buckets[codex].weekly.remaining","digit_x":[10,20,30]}]});
+        svc.template_save("digits", &target, &source, 1000).unwrap();
+        let mut profile = Profile::draft(mac);
+        profile.template_ids = vec!["digits".into()];
+        profile.initial_active_id = Some("digits".into());
+        svc.profile_save(profile, 1000).unwrap();
+        assert!(svc.publish(mac, 1001).unwrap_err().to_string().contains("version is unknown"));
+        for version in ["1.0.2_0031", "1.0.2_0041", "1.0.2_bad"] {
+            svc.inner.lock().unwrap().devices.get_mut(mac).unwrap().last_authenticated = Some(
+                crate::platform::model::AuthenticatedStatus { observed_at:1000, transport:"wifi".into(),
+                    schema_version:1, body:json!({"fw":version}) });
+            assert_eq!(svc.publish(mac, 1001).is_ok(), version=="1.0.2_0041");
+        }
     }
 
     #[test]

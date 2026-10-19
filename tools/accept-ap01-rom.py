@@ -43,6 +43,7 @@ def main():
     parser.add_argument('--fallback', help='exact interrupted NOR stable-slot recovery report')
     parser.add_argument('--image-admission-report', type=Path, help='cross-version integrity-only validator regression report')
     parser.add_argument('--name', required=True)
+    parser.add_argument('--template-count',type=int,choices=range(1,9),default=8)
     args = parser.parse_args()
     assert all(x.isdigit() for x in (args.candidate,args.fresh,args.update,args.recovery))
     assert args.switch is None or args.switch.isdigit()
@@ -77,7 +78,7 @@ def main():
         if phase != 'update':
             assert report['native_application_smoke_passed']
             nav = report['native_navigation']
-            assert nav['template_count'] == 8 and nav['forward_reverse_and_original_return']
+            assert nav['template_count'] == args.template_count and nav['forward_reverse_and_original_return']
             for scene in ('codex','weekly-only','zero','full'):
                 pixels = OUT/f'native-qemu-{number}.{scene}.pixels.json'
                 assert json.loads(pixels.read_text())['passed'], pixels

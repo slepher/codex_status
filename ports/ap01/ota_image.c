@@ -88,7 +88,11 @@ int ota_image_chunk(ota_image *image, const void *buffer, size_t bytes)
 
 int ota_image_valid(const ota_image *image)
 {
-    static const unsigned char tag[] = "0x5245434f56455259544147";
+    /* Original recovery scans the second occurrence in the whole ROM. */
+    static const unsigned char encoded[] = {
+        0xb0,0xf8,0xb5,0xb2,0xb4,0xb5,0xb4,0xb3,0xb4,0xe6,0xb5,0xb6,
+        0xb4,0xb5,0xb5,0xb2,0xb5,0xb9,0xb5,0xb4,0xb4,0xb1,0xb4,0xb7
+    };
     uint32_t header_crc;
 
     if (!image || image->position != image->length)
@@ -96,8 +100,10 @@ int ota_image_valid(const ota_image *image)
     header_crc = crc32_update(0xffffffffu, image->header, 252) ^ 0xffffffffu;
     if (header_crc != le32(image->header + 252))
         return 0;
-    if (memcmp(image->tail, tag, sizeof(tag)-1) ||
-        be32(image->tail + 32) != image->length ||
+    for (unsigned i = 0; i < sizeof(encoded); ++i)
+        if ((unsigned char)(image->tail[i] ^ 0x80u) != encoded[i])
+            return 0;
+    if (be32(image->tail + 32) != image->length ||
         le32(image->tail + 36) != image->recovery_crc)
         return 0;
     return 1;

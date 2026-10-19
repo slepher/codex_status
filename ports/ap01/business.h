@@ -40,7 +40,7 @@ public:
     BundleStore store;
     Ap01Business(BundleFilesystem &filesystem, const Ap01BusinessPort &port, uint64_t bootId);
     bool begin(uint64_t now);
-    void clock(const char *hhmm) { currentTime = hhmm; }
+    void clock(const char *hhmm);
     void displayed(uint32_t value) { displayedGeneration.store(value, std::memory_order_release); }
     void displayFailed(uint32_t value) {failedGeneration.store(value,std::memory_order_release);}
     uint8_t count() const { return configured ? profile.count : 0; }

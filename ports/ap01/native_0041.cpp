@@ -102,7 +102,7 @@ struct Runtime {
     unsigned previousNative=0,followingNative=0;
     uint8_t contentPage=255,dialogPage=255;
     char pairRequest[65]={};
-    bool focused=false,pairPending=false,pairWoken=false;
+    bool focused=false,pairPending=false,pairWoken=false,contentLeaving=false;
     uint8_t virtualIndex=0;
     explicit Runtime(void *window,void (*callback)(void *),uint64_t boot)
         :fs(ap01RomVfs(),"/resource/codex-status"),business(fs,{this,present,retire},boot),bootId(boot),root(window),original(callback) {}
@@ -157,13 +157,14 @@ struct Runtime {
         auto &r=*(Runtime *)p;uint32_t beat=r.uiHeartbeat.load(std::memory_order_acquire);
         return r.ready.load(std::memory_order_acquire)==1&&r.maintenanceListening.load(std::memory_order_acquire)&&beat&&uint32_t(nowMs())-beat<=1000;
     }
-    bool mainRootActive() const {
+    bool mainRootVisible() const {
         // theme+0x4c is actual UI initialization. 62fc4038 is the original
         // MiHome onboarding gate; Bridge pairing must not depend on that account.
-        return *((uint8_t *)root+0x4c) && !*(volatile uint8_t *)(uintptr_t)0x62fc4053 &&
+        return !*(volatile uint8_t *)(uintptr_t)0x62fc4053 &&
             *(volatile uint32_t *)(uintptr_t)0x62fc95bc==*(uint32_t *)((uint8_t *)root+0x30) &&
             !*((uint8_t *)root+0x4d);
     }
+    bool mainRootActive() const {return *((uint8_t *)root+0x4c)&&mainRootVisible();}
     bool mainFocused() const { return mainRootActive() && *(volatile uint8_t *)(uintptr_t)0x62fc4039==1; }
     void hidden(void *object,bool value) {
         if(!object)return;
@@ -283,18 +284,18 @@ bool ap01ImageReplace(Runtime &r,const uint8_t *pixels) {
 void Runtime::tick() {
     if(ready.load(std::memory_order_acquire)!=1)return;
     Frame *frame=pending.exchange(nullptr,std::memory_order_acq_rel);
-    if(frame&&frame->pixels&&!content&&!mainRootActive()) {
+    if(frame&&frame->pixels&&!content&&!mainRootActive()&&!focused) {
         Frame *empty=nullptr;
         if(pending.compare_exchange_strong(empty,frame,std::memory_order_acq_rel))frame=nullptr;
         else {delete[] frame->pixels;delete frame;frame=nullptr;}
     }
     if(frame) {
-        if(!frame->pixels) {hidden(content,true);focused=false;retired.store(true,std::memory_order_release);}
+        if(!frame->pixels) {hidden(content,true);focused=contentLeaving=false;retired.store(true,std::memory_order_release);}
         else {
             // Native cache preparation/drop is bound by the matching linker
             // script only after its 0041 ABI has been independently recovered.
             extern bool ap01ImageReplace(Runtime &,const uint8_t *);
-            if(ensureContent(nativePage())&&ap01ImageReplace(*this,frame->pixels)) {shownGeneration=frame->generation;virtualIndex=frame->index;}
+            if(ensureContent(contentLeaving?contentPage:nativePage())&&ap01ImageReplace(*this,frame->pixels)) {shownGeneration=frame->generation;virtualIndex=frame->index;}
             else if(++frame->tries<3) {
                 Frame *empty=nullptr;if(pending.compare_exchange_strong(empty,frame,std::memory_order_acq_rel))frame=nullptr;
             } else {business.displayFailed(frame->generation);focused=false;hidden(content,true);}
@@ -339,10 +340,13 @@ void Runtime::tick() {
         uiStage=26;
     }
     if(!pairPending)pairWoken=false;
-    if(focused&&mainRootActive())ensureContent(nativePage());
-    bool available=mainFocused();
-    hidden(content,!focused||pairPending||!available||app->maintenanceActive());
-    hidden(dialog,!pairPending||!available);
+    if(contentLeaving&&mainRootActive())contentLeaving=false;
+    if(focused&&mainRootVisible())ensureContent(nativePage());
+    // +0x4c is cleared for the complete native slide. The image must already
+    // be visible in its moving window, including the outgoing virtual page.
+    bool visible=mainRootVisible()&&*(volatile uint8_t *)(uintptr_t)0x62fc4039==1;
+    hidden(content,(!focused&&!contentLeaving)||pairPending||!visible||app->maintenanceActive());
+    hidden(dialog,!pairPending||!mainFocused());
     uiStage=27;
 }
 void Runtime::key(void *eventPointer) {
@@ -351,7 +355,7 @@ void Runtime::key(void *eventPointer) {
     // invalidates LVGL while rendering; only input events may change focus.
     if(code!=1&&code!=0xb&&code!=0x11)return;
     if(ready.load(std::memory_order_acquire)==1&&app->maintenanceActive()) {
-        focused=false;hidden(content,true);if(code==0x11)original(eventPointer);return;
+        focused=contentLeaving=false;hidden(content,true);if(code==0x11)original(eventPointer);return;
     }
     if(ready.load(std::memory_order_acquire)==1&&pairPending&&mainFocused()) {
         if(code==1||code==0xb||code==0x11)*(volatile uint8_t *)(uintptr_t)0x62fc403a=1;
@@ -359,6 +363,8 @@ void Runtime::key(void *eventPointer) {
         if(code==1||code==0xb||code==0x11)return;
     }
     if(code!=0x11)return;
+    // Do not let the stock handler navigate under an in-flight virtual slide.
+    if(ready.load(std::memory_order_acquire)==1&&mainRootVisible()&&!*((uint8_t *)root+0x4c))return;
     if(ready.load(std::memory_order_acquire)!=1||!mainFocused()) {original(eventPointer);return;}
     *(volatile uint8_t *)(uintptr_t)0x62fc403a=1;
     int key=ROM_FN(0xa00d8af6,int (*)(void *))(eventPointer);
@@ -368,8 +374,19 @@ void Runtime::key(void *eventPointer) {
     if(focused) {
         int next=int(virtualIndex)+direction;
         if(next<0||unsigned(next)>=count) {
-            focused=false;hidden(content,true);
-            ROM_FN(0xa019d422,void (*)(void *,int))(root,direction>0?followingNative:previousNative);
+            focused=false;contentLeaving=content!=nullptr;
+            unsigned target=direction>0?followingNative:previousNative;
+            if(target==nativePage()) {
+                // The virtual page occupies the incoming stock window. Move
+                // its image to the other neighbour before animating back to
+                // the exposed stock page; selecting the same index is a no-op.
+                unsigned outgoing=direction>0?previousNative:followingNative;
+                if(outgoing==target)outgoing=target==0?8:0;
+                if(!ensureContent(outgoing)){focused=true;contentLeaving=false;return;}
+                ROM_FN(0xa00b3106,void (*)(void *,int,int))(root,outgoing,0);
+            }
+            ROM_FN(0xa00b3106,void (*)(void *,int,int))(root,target,direction>0?1:2);
+            tick();
         } else if(activate(next))virtualIndex=next;
         return;
     }
@@ -385,7 +402,7 @@ void Runtime::key(void *eventPointer) {
         unsigned index=direction>0?0:count-1;
         if(activate(index)) {
             previousNative=direction>0?before:after;followingNative=direction>0?after:before;
-            focused=true;virtualIndex=index;tick();
+            focused=true;contentLeaving=false;virtualIndex=index;tick();
         }
     }
 }
@@ -395,16 +412,18 @@ void Runtime::serve(bool maintenancePort) {
     if(!maintenancePort)app->businessOnline(true);
     while(!stop.load(std::memory_order_acquire)) {
         if(maintenancePort)app->maintenanceTick(nowMs());
+        else if(!app->maintenanceActive()&&!businessLock.test_and_set(std::memory_order_acquire)) {
+            time_t epoch=time(nullptr);struct tm local{};char hhmm[6]="--:--";
+            if(epoch>1600000000&&ap01Calendar(epoch,local)&&local.tm_hour>=0&&local.tm_hour<24&&local.tm_min>=0&&local.tm_min<60)
+                snprintf(hhmm,sizeof(hhmm),"%02u:%02u",unsigned(local.tm_hour),unsigned(local.tm_min));
+            business.clock(hhmm);businessLock.clear(std::memory_order_release);
+        }
         if(!waitFd(fd,1,nowMs()+1000))continue;
         int client=ROM_FN(0xa01a192a,int (*)(int,void *,void *))(fd,nullptr,nullptr);if(client<0)continue;
         Ap01Stream io{&client,receive,send};uint64_t now=nowMs();
         bool maintenanceSent=false;
         if(maintenancePort)maintenanceSent=ap01ServeHttp(*app,true,io,now,now+5000);
         else if(!businessLock.test_and_set(std::memory_order_acquire)) {
-            time_t epoch=time(nullptr);struct tm local{};char hhmm[6]="--:--";
-            if(epoch>1600000000&&ap01Calendar(epoch,local)&&local.tm_hour>=0&&local.tm_hour<24&&local.tm_min>=0&&local.tm_min<60)
-                snprintf(hhmm,sizeof(hhmm),"%02u:%02u",unsigned(local.tm_hour),unsigned(local.tm_min));
-            business.clock(hhmm);
             ap01ServeHttp(*app,false,io,now,now+5000);businessLock.clear(std::memory_order_release);
         } else {
             const char body[]="{\"result\":\"rejected\",\"error\":\"busy\",\"stage\":\"admission\",\"action\":\"read_status\"}";

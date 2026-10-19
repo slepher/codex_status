@@ -5,12 +5,12 @@ from pathlib import Path
 import hashlib, json, struct, subprocess, zlib, time, argparse
 repo=Path(__file__).resolve().parents[1]
 out=repo/'artifacts/ap01-platform-integration/device'
-parser=argparse.ArgumentParser();parser.add_argument('--image',type=Path,default=out/'ap01-native-0041-candidate-13.bin');args=parser.parse_args()
+parser=argparse.ArgumentParser();parser.add_argument('--image',type=Path,default=out/'ap01-native-0041-candidate-13.bin');parser.add_argument('--bundle',type=Path);args=parser.parse_args()
 state=out/('t'+str(time.time_ns()%1000000))
 assert out.is_dir()
 state.mkdir(exist_ok=True)
 assert not any(state.iterdir()), 'Use a fresh private test directory; never delete runtime data'
-for i in range(20):(state/('f'+str(i))).mkdir()
+for i in range(21):(state/('f'+str(i))).mkdir()
 (state/'f6/bundle').mkdir()
 def linux(p):
     p=p.resolve(); return '/mnt/'+p.drive[0].lower()+p.as_posix()[2:]
@@ -26,7 +26,7 @@ if payload[:4]==b'CSZ1':
     for length in lengths:
         parts.append(zlib.decompress(payload[at:at+length])); at+=length
     payload=b''.join(parts); assert len(payload)==decoded and zlib.crc32(payload)==crc
-bundle=json.loads(payload); bundle['bridge_id']='bridge-test'
+bundle=json.loads(args.bundle.read_text(encoding='utf-8') if args.bundle else payload); bundle['bridge_id']='bridge-test'
 payload=json.dumps(bundle,ensure_ascii=False,separators=(',',':')).encode()
 bundle_file=out/'native-app-bundle.json';bundle_file.write_bytes(payload)
 sources=['template_engine.cpp','GUI_Paint.cpp','font_asset.cpp','bundle_store.cpp','bundle_payload.cpp',

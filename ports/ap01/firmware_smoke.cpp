@@ -166,7 +166,6 @@ int main(int argc,char **argv){
             Ap01Business business(fs,{nullptr,present},20);
             Ap01Application app(fs,business,{&disk,randomBytes,lock,unlock,fake.callbacks()},"AABBCCDDEEFF",20);assert(app.begin());
             assert(app.maintenanceHttp(request("POST","/api/firmware/switch",change,""),1).status==401);
-            assert(app.maintenanceHttp(request("POST","/api/firmware/begin",beginBody(image)),1).status==409);
             assert(app.maintenanceHttp(request("POST","/api/firmware/stable",mark),1).status==200);
             assert(app.maintenanceHttp(request("POST","/api/firmware/stable",mark),2).status==200);
             assert(app.maintenanceHttp(request("POST","/api/firmware/switch",change),2).status==409&&!fake.selections);
@@ -214,8 +213,23 @@ int main(int argc,char **argv){
         {
             std::string badFolder=root+"/f9";LittleFSClass badFs(ops,badFolder.c_str());
             std::ofstream(badFolder+"/stable.bin",std::ios::binary)<<"APS9-corrupt";
-            Ap01Firmware fw(badFs,fake.callbacks(),"AABBCCDDEEFF");assert(!fw.begin());
-            assert(fw.handle(request("POST","/api/firmware/switch",change),"bridge-test",1).status==503);
+            Ap01Firmware fw(badFs,fake.callbacks(),"AABBCCDDEEFF");assert(fw.begin());
+            auto reply=fw.handle(request("GET","/api/firmware/slots",{}),"bridge-test",1);
+            assert(text(reply.bytes).find("stable_storage_unavailable")!=std::string::npos);
+            assert(fw.handle(request("POST","/api/firmware/begin",beginBody(image)),"bridge-test",1).status==200);
+            assert(fw.handle(request("DELETE","/api/firmware/fw-test",{}),"bridge-test",2).status==200);
+            const std::string manual="{\"device_mac\":\"AABBCCDDEEFF\",\"request_id\":\"rescue-no-stable\",\"target_slot\":1,\"expected_revision\":1}";
+            assert(fw.handle(request("POST","/api/firmware/switch",manual),"bridge-test",3).status==200);
+            fake.opens=0;fake.writes=0;
+        }
+        {
+            std::string rescuedFolder=root+"/f20";LittleFSClass rescuedFs(ops,rescuedFolder.c_str());
+            auto receipt=readAll((folder+"/firmware.bin").c_str());
+            std::ofstream(rescuedFolder+"/firmware.bin",std::ios::binary).write(receipt.data(),receipt.size());
+            fake.running=1;
+            Ap01Firmware rescued(rescuedFs,fake.callbacks(),"AABBCCDDEEFF");assert(rescued.begin()&&!rescued.blocksBusiness());
+            auto result=rescued.handle(request("GET","/api/firmware/status",{}),"bridge-test",1);
+            assert(text(result.bytes).find("booted_other_slot")!=std::string::npos);
         }
         for(unsigned scenario=0;scenario<8;++scenario) {
             std::string trialFolder=root+"/f"+std::to_string(10+scenario);LittleFSClass trialFs(ops,trialFolder.c_str());

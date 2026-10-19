@@ -9,6 +9,13 @@ NATIVE_RUNNER_SHA=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 FIRMWARE=ROOT.parent/'cuktech-ap01-firmware'
 sys.path.insert(0,str(FIRMWARE/'tooling/scripts'))
 synthetic_mac=None
+transition_probe='--transition-probe' in sys.argv
+if transition_probe:sys.argv.remove('--transition-probe')
+animation_wexti_model='--animation-wexti-model' in sys.argv
+if animation_wexti_model:sys.argv.remove('--animation-wexti-model')
+model_epoch=None
+if '--model-wall-epoch' in sys.argv:
+    i=sys.argv.index('--model-wall-epoch');model_epoch=[int(sys.argv[i+1])];del sys.argv[i:i+2]
 input_model='--lvgl-input-model' in sys.argv
 if input_model:sys.argv.remove('--lvgl-input-model')
 fb_ready_model='--fb-ready-api-model' in sys.argv
@@ -23,6 +30,8 @@ if '--native-bundle' in sys.argv:
     i=sys.argv.index('--native-bundle');native_bundle=Path(sys.argv[i+1]);del sys.argv[i:i+2]
 firmware_probe='--firmware-probe' in sys.argv
 if firmware_probe:sys.argv.remove('--firmware-probe')
+unconfigured_slots='--unconfigured-slots' in sys.argv
+if unconfigured_slots:sys.argv.remove('--unconfigured-slots')
 firmware_only='--firmware-only' in sys.argv
 if firmware_only:sys.argv.remove('--firmware-only')
 assert not firmware_only or firmware_probe and resume_report
@@ -44,9 +53,9 @@ def module(name,path):
     spec=importlib.util.spec_from_file_location(name,path);m=importlib.util.module_from_spec(spec)
     if name=='ap01_frozen_ota_runner' and (synthetic_mac or input_model):
         source=path.read_text(encoding='utf-8')
-        if synthetic_mac:
+        if synthetic_mac or model_epoch:
             needle="name == 'socket' or args6[0]";assert source.count(needle)==1
-            source=source.replace(needle,"name in ('socket','wifi_mac') or args6[0]")
+            source=source.replace(needle,"name in ('socket','wifi_mac','wall_epoch') or args6[0]")
         if input_model:
             # Full application/recovery probes include many bounded requests.
             # Extend only this private wrapper's wall-clock cap; frozen runner
@@ -74,12 +83,14 @@ class NativeBuilder:
         m=json.loads(Path(path).read_text(encoding='utf-8'))
         for key in ('original','payload','image'):m[key]['path']=linux(m[key]['path'])
         payload=Path(m['payload']['path']).read_bytes();original=Path(m['original']['path']).read_bytes()
-        if builder.sha(payload)!=m['payload']['sha256'] or data!=builder.assemble(original,payload,int(m['payload']['entry'],16)):
+        if builder.sha(payload)!=m['payload']['sha256'] or data!=builder.assemble(original,payload,int(m['payload']['entry'],16),m.get('unsigned_ota',False)):
             raise ValueError('native candidate reconstruction mismatch')
         return m
 profile=dict(base.PROFILES['ap01-ota-channel-0041-v1'])
 profile['apis']=dict(profile['apis']);profile['apis'][0xa003942c]='recvfrom'
 if synthetic_mac:profile['apis'][0xa005f240]='wifi_mac'
+if model_epoch:profile['apis'][0xa019fc3e]='wall_epoch'
+if animation_wexti_model:profile['apis'][0xa008a876]='animation_wexti_instruction'
 base.builder_for=lambda path:(NativeBuilder,builder.FORMAT,profile)
 OriginalProvider=base.Provider
 OriginalRSP=base.BufferedRSP
@@ -108,11 +119,37 @@ def partition_tables(data):
 timer_va=int(manifest.get('native_abi',{}).get('ui_timer','0'),16)
 send_event_va=int(manifest.get('native_abi',{}).get('lv_obj_send_event','0'),16)
 class NativeRSP(OriginalRSP):
+    def ui_state(self):
+        def read(address,count):return bytes.fromhex(super(NativeRSP,self).request(f'm{address:x},{count:x}'))
+        offsets=manifest['native_abi']['runtime_offsets']
+        state={'root_ready':read(native_ui_root+0x4c,1)[0],
+               'page':int.from_bytes(read(native_ui_root+0x34,4),'little'),
+               'focused':read(native_runtime+offsets['focused'],1)[0],
+               'generation':int.from_bytes(read(native_runtime+offsets['shownGeneration'],4),'little')}
+        for name in ('content','image'):
+            pointer=int.from_bytes(read(native_runtime+offsets[name],4),'little')
+            state[name]=pointer
+            if pointer:
+                state[name+'_hidden']=bool(int.from_bytes(read(pointer+0x24,4),'little')&1)
+                state[name+'_coords']=list(struct.unpack('<4i',read(pointer+0x14,16)))
+        return state
     def request(self,packet):
         global native_ui_root,native_runtime,injected
         result=super().request(packet)
         if packet=='g' and len(result)>=264:
             regs=struct.unpack_from('<33I',bytes.fromhex(result));pc=regs[32]
+            if animation_wexti_model and pc==0xa008a876:
+                # The frozen CPU lacks this observed RV32 P instruction.
+                # Execute only WEXTI a1,s6,22; leave the native curve, window
+                # positions, timer and completion callback running unchanged.
+                assert super().request('ma008a876,4')=='f7056bdf'
+                value=(((regs[23]<<32)|regs[22])>>22)&0xffffffff
+                super().request(f'Pb={value.to_bytes(4,"little").hex()}')
+                super().request('P20=7aa808a0')
+                if native_provider:
+                    native_provider.report['animation_wexti_model_steps']=native_provider.report.get('animation_wexti_model_steps',0)+1
+                super().request('c')
+                return self.request('g')
             if native_provider:
                 for call in native_provider.report.get('native_ff13_calls',[]):
                     if 'result' in call and 'guest_uptime_ms' not in call:
@@ -134,6 +171,10 @@ class NativeRSP(OriginalRSP):
                 if native_runtime is None:native_runtime=int.from_bytes(bytes.fromhex(super().request(f'm{regs[10]+12:x},4')),'little')
                 if injected:
                     saved,action=injected;injected=None
+                    if action.get('sample'):action['value']=self.ui_state()
+                    if action.get('calendar') is not None:
+                        action['value']=list(struct.unpack('<9i',bytes.fromhex(super().request(f"m{action['calendar_output']:x},24"))))
+                    if action.get('wall_time'):action['value']=regs[10]
                     for register in range(1,33):
                         if saved[register]!=regs[register]:super().request(f'P{register:x}={saved[register].to_bytes(4,"little").hex()}')
                     action['done'].set();input_trace.append({'event':action.get('event','framebuffer_ready'),'key':action.get('key',0),'completed':True})
@@ -165,11 +206,23 @@ class NativeRSP(OriginalRSP):
                                     data=int.from_bytes(descriptor[16:20],'little')
                                     path.with_suffix('.palette4').write_bytes(native_provider.read(data+64,38400))
                         action['done'].set()
+                    elif action.get('observe'):
+                        action['value']=self.ui_state();action['done'].set()
+                    elif action.get('onboarded'):
+                        super().request('M62fc4038,1:01');action['done'].set()
                     else:
                         saved=list(regs);temporary=(regs[2]-128)&~15
                         param=temporary+64
                         super().request(f'M{param:x},4:{struct.pack("<I",action.get("key",0)).hex()}')
-                        if 'framebuffer_ready' in action:
+                        if action.get('calendar') is not None:
+                            output=temporary+64;action['calendar_output']=output
+                            super().request(f'M{output:x},24:'+bytes(36).hex())
+                            changes={1:timer_va,2:temporary,10:action['calendar'],11:output,32:int(manifest['native_abi']['calendar'],16)}
+                        elif action.get('wall_time'):
+                            changes={1:timer_va,2:temporary,10:0,32:int(manifest['native_abi']['wall_time'],16)}
+                        elif action.get('native_page') is not None:
+                            changes={1:timer_va,2:temporary,10:native_ui_root,11:action['native_page'],12:action.get('direction',1),32:0xa00b3106}
+                        elif 'framebuffer_ready' in action:
                             changes={1:timer_va,2:temporary,10:action['framebuffer_ready'],11:0,12:2,32:0xa00806d0}
                         else:
                             changes={1:timer_va,2:temporary,10:native_ui_root,11:action['event'],12:param if action['event']==0x11 else 0,32:send_event_va}
@@ -201,6 +254,9 @@ class NativeProvider(OriginalProvider):
         threading.Thread(target=self.probe,daemon=True).start()
     def handle(self,name,args):
         fd,a1,a2,a3,a4,a5=args
+        if name=='wall_epoch':
+            self.report['rtc_model']='native AP01 RTC civil seconds = UTC + 28800; payload time() must normalize to UTC'
+            return model_epoch[0]+28800
         if name=='wifi_mac':
             self.write(fd,synthetic_mac)
             self.report['synthetic_wifi_mac']=synthetic_mac.hex().upper()
@@ -238,9 +294,19 @@ class NativeProvider(OriginalProvider):
                 reply+=chunk
             head,payload=reply.split(b'\r\n\r\n',1)
             return int(head.split(b' ')[1]),payload if frame else json.loads(payload)
-    def input(self,event,key=0):
-        action={'event':event,'key':key,'done':threading.Event()};input_actions.put(action)
+    def action(self,**values):
+        action={**values,'done':threading.Event()};input_actions.put(action)
         if not action['done'].wait(20):raise TimeoutError('native LVGL input API')
+        return action.get('value')
+    def input(self,event,key=0,**values):
+        result=self.action(event=event,key=key,**values)
+        if event==0x11 and not values.get('sample'):
+            until=time.monotonic()+30
+            while time.monotonic()<until:
+                if self.action(observe=True)['root_ready']:break
+                time.sleep(.2)
+            else:raise TimeoutError('navigation slide did not finish')
+        return result
     def snapshot(self,name):
         path=Path(sys.argv[sys.argv.index('--output')+1]).with_suffix('.'+name+'.ppm')
         action={'snapshot':str(path.resolve()),'done':threading.Event()};input_actions.put(action)
@@ -251,6 +317,52 @@ class NativeProvider(OriginalProvider):
         action={'nor_snapshot':str(path),'done':threading.Event()};input_actions.put(action)
         if not action['done'].wait(30):raise TimeoutError('native NOR capture')
         return path
+    def transition_probe(self,count):
+        def settled():
+            until=time.monotonic()+30
+            while time.monotonic()<until:
+                state=self.action(observe=True)
+                if state['root_ready']:return state
+                time.sleep(.2) # Let fbdev readiness run between observations.
+            raise TimeoutError('native slide did not complete')
+        # The offline fixture has no MiHome account. Enter its virtual group
+        # normally, then drive the real native slide API while it is focused.
+        # This exercises the original readiness bit and moving window objects.
+        for _ in range(count):self.input(0x11,0x13);settled()
+        settled()
+        self.action(native_page=8);settled()
+        samples=[]
+        for enter,leave,label in ((0x13,0x14,'forward'),(0x14,0x13,'reverse')):
+            self.input(0x11,enter);self.action(native_page=0)
+            state=self.action(observe=True);state['transition']=label+'-entry';samples.append(state)
+            self.report['native_transition_samples']=samples
+            assert state['root_ready']==0 and state['focused'],label+' entry did not animate'
+            assert state['content'] and not state['content_hidden'] and state['image'],label+' entry showed stock content'
+            settled()
+            state=self.input(0x11,leave,sample=True);state['transition']=label+'-exit';samples.append(state)
+            assert state['root_ready']==0 and not state['focused'],label+' exit did not animate'
+            assert state['content'] and not state['content_hidden'] and state['image'],label+' exit showed stock content'
+            settled()
+        # The previous probe used a different underlying stock index on exit.
+        # A real wrap also exits toward the very index occupied by the overlay.
+        # Reproduce that naturally on the offline page and inject a rapid key
+        # before the native 300ms slide completes.
+        same=[]
+        for key,label in ((0x13,'forward'),(0x14,'reverse')):
+            self.action(native_page=8,direction=0);settled()
+            self.input(0x11,key);settled()
+            for _ in range(count-1):self.input(0x11,key);settled()
+            before=self.action(observe=True);assert before['focused'] and before['page']==8
+            state=self.input(0x11,key,sample=True)
+            assert not state['focused'] and state['root_ready']==0 and state['page']==8,label+' same-window exit skipped animation'
+            assert not state['content_hidden'] and not state['image_hidden']
+            burst=self.input(0x11,key,sample=True)
+            assert burst['root_ready']==0 and not burst['focused'] and burst['page']==8,label+' busy input changed navigation'
+            final=settled();assert not final['focused'] and final['page']==8,label+' exit reentered application'
+            same.append({'direction':label,'before':before,'exit':state,'busy_input':burst,'settled':final})
+        self.report['native_same_window_exit']=same
+        self.action(native_page=8);settled();self.input(0x11,0x13);settled()
+        self.report['native_transition_passed']=True
     def slot_probe(self,token,identity):
         def call(method,path,body=b'',expected=200,credential=token):
             for attempt in range(5):
@@ -260,17 +372,19 @@ class NativeProvider(OriginalProvider):
                 return value
             raise RuntimeError('slot bounded retry exhausted')
         slots=call('GET','/api/firmware/slots');status=call('GET','/api/firmware/status')
-        assert slots['running_slot']==1 and slots['stable_slot']==0
+        assert slots['running_slot']==1 and slots['stable_slot']==(None if unconfigured_slots else 0)
         image=Path(sys.argv[sys.argv.index('--image')+1]).read_bytes()
         protected={'device_mac':identity,'request_id':'protected-slot','expected_revision':status['revision'],
                    'length':len(image),'recovery_crc':f'{int.from_bytes(image[-4:],"little"):08x}'}
-        reply=call('POST','/api/firmware/begin',json.dumps(protected).encode(),409)
-        assert reply['error']=='stable_slot_protected'
+        if not unconfigured_slots:
+            reply=call('POST','/api/firmware/begin',json.dumps(protected).encode(),409)
+            assert reply['error']=='stable_slot_protected'
         request={'device_mac':identity,'request_id':'switch-'+Path(sys.argv[sys.argv.index('--output')+1]).stem,
-                 'target_slot':0,'expected_revision':status['revision'],'expected_stable_revision':slots['stable_revision'],
-                 'expected_image_crc':slots['stable_image_crc']}
+                 'target_slot':0,'expected_revision':status['revision']}
+        if not unconfigured_slots:
+            request.update(expected_stable_revision=slots['stable_revision'],expected_image_crc=slots['stable_image_crc'])
         body=json.dumps(request).encode();call('POST','/api/firmware/switch',body,401,'!'*32)
-        stale={**request,'expected_image_crc':request['expected_image_crc']^1}
+        stale={**request,'expected_image_crc':request.get('expected_image_crc',0)^1}
         call('POST','/api/firmware/switch',json.dumps(stale).encode(),409)
         before=self.nor_snapshot('before-slot-switch')
         calls=len(self.report['native_ff13_calls'])
@@ -302,7 +416,7 @@ class NativeProvider(OriginalProvider):
                 return value
             raise RuntimeError('firmware bounded retry exhausted')
         slots=call('GET','/api/firmware/slots')
-        if slots.get('stable_slot') is None:
+        if slots.get('stable_slot') is None and not unconfigured_slots:
             stable={'device_mac':identity,'request_id':'stable-'+request_id,'slot':slots['running_slot'],
                     'expected_stable_revision':slots['stable_revision'],'confirm':True}
             call('POST','/api/firmware/stable',json.dumps(stable).encode())
@@ -400,6 +514,18 @@ class NativeProvider(OriginalProvider):
         return token,identity,principal
     def application_probe(self,info):
         token,identity,principal=self.pair_binding(info)
+        if model_epoch:
+            utc=self.action(wall_time=True)
+            assert utc==model_epoch[0],('RTC normalization',utc,model_epoch[0])
+            self.report['native_rtc_normalization']={'raw_civil_epoch':model_epoch[0]+28800,'utc_epoch':utc,'passed':True}
+            cases=[(1792429140,[2026,10,20,0,59]),(1798732800,[2027,1,1,0,0]),(1709224200,[2024,3,1,0,30])]
+            verified=[]
+            for epoch,expected in cases:
+                fields=self.action(calendar=epoch)
+                actual=[fields[5]+1900,fields[4]+1,fields[3],fields[2],fields[1]]
+                assert actual==expected,('native local calendar',actual,expected)
+                verified.append({'epoch':epoch,'local':actual})
+            self.report['native_local_calendar']=verified
         if not fallback_receipt:
             until=time.monotonic()+120
             while True:
@@ -499,7 +625,14 @@ class NativeProvider(OriginalProvider):
             if 'native_slot_transaction' in previous:self.report['native_slot_receipt_recovered']=True
         if firmware_only:
             self.firmware_probe(token,identity,frame);self.report['native_application_stage']='complete';return
-        self.input(0x11,0x13) # Enter the first page before sending its snapshot.
+        # A recovered native page need not be the last stock page. Navigate
+        # through actual input events, waiting for each native slide, rather
+        # than assuming that one key always enters the virtual group.
+        for _ in range(24):
+            state=self.action(observe=True)
+            if state['focused']:break
+            if state['root_ready']:self.input(0x11,0x13)
+        else:raise TimeoutError('native virtual group entry budget exhausted')
         status=frame(1,'/api/status',{})
         self.report['native_application_stage']='data'
         values={'buckets[codex].5h.remaining':86,'buckets[codex].weekly.remaining':72,
@@ -509,7 +642,7 @@ class NativeProvider(OriginalProvider):
                 for r in status['data_contract']['requirements'] if not r['local']]
         fingerprint=''.join(f'{f["i"]}:{f["k"]}:'+('~' if f['v'] is None else json.dumps(f['v'],ensure_ascii=False,separators=(',',':')))+f':{f["q"]};' for f in fields).encode()
         frame(2,'/api/data',{'bridge_id':principal,'device_mac':identity,'session_nonce':nonce,
-            'active_context_id':status['active_context_id'],'seq':1,'crc':f'{zlib.crc32(fingerprint):08x}','fields':fields})
+            'request_id':'native-data-1','active_context_id':status['active_context_id'],'seq':1,'crc':f'{zlib.crc32(fingerprint):08x}','fields':fields})
         self.report['native_data_applied']=True
         context=status['active_context_id']
         until=time.monotonic()+30
@@ -531,7 +664,7 @@ class NativeProvider(OriginalProvider):
                     for r in status['data_contract']['requirements'] if not r['local']]
             fingerprint=''.join(f'{f["i"]}:{f["k"]}:'+('~' if f['v'] is None else json.dumps(f['v'],ensure_ascii=False,separators=(',',':')))+f':{f["q"]};' for f in fields).encode()
             frame(2,'/api/data',{'bridge_id':principal,'device_mac':identity,'session_nonce':nonce,
-                  'active_context_id':context,'seq':seq,'crc':f'{zlib.crc32(fingerprint):08x}','fields':fields})
+                  'request_id':f'native-data-{seq}','active_context_id':context,'seq':seq,'crc':f'{zlib.crc32(fingerprint):08x}','fields':fields})
             until=time.monotonic()+30
             while time.monotonic()<until:
                 status=frame(1,'/api/status',{})
@@ -546,6 +679,23 @@ class NativeProvider(OriginalProvider):
         show_scene('weekly-only',weekly,2)
         show_scene('zero',{**values,'buckets[codex].5h.remaining':0,'buckets[codex].weekly.remaining':0,'resetCredits.availableCount':0},3)
         show_scene('full',{**values,'buckets[codex].5h.remaining':100,'buckets[codex].weekly.remaining':100},4)
+        if model_epoch:
+            before=self.action(observe=True);before_status=status.copy();model_epoch[0]+=60
+            until=time.monotonic()+40
+            while time.monotonic()<until:
+                observed=self.action(observe=True)
+                if observed['generation']>before['generation']:break
+            else:raise TimeoutError('clock did not refresh without network traffic')
+            until=time.monotonic()+30
+            while time.monotonic()<until:
+                status=frame(1,'/api/status',{})
+                if status['display_state']=='displayed':break
+            else:raise TimeoutError('minute clock frame was not drawn')
+            self.snapshot('clock-next-minute')
+            assert status['applied_seq']==before_status['applied_seq'] and status['active_context_id']==before_status['active_context_id']
+            assert status['frame_crc']!=before_status['frame_crc']
+            self.report['native_clock_minute_refresh']={'passed':True,'data_sequence_unchanged':True,
+                'context_unchanged':True,'business_requests_during_refresh_wait':0,'before':before,'after':observed}
         self.report['native_application_stage']='navigation'
         ids=status['template_ids'];navigation=[]
         for expected in ids[1:]:
@@ -563,6 +713,8 @@ class NativeProvider(OriginalProvider):
         self.input(0x11,0x14);self.input(0x11,0x13);status=frame(1,'/api/status',{})
         assert status['active_template_id']==ids[0]
         self.report['native_navigation']={'template_count':len(ids),'visited':navigation,'forward_reverse_and_original_return':True}
+        if transition_probe:
+            self.transition_probe(len(ids));status=frame(1,'/api/status',{})
         activation={'bridge_id':principal,'device_mac':identity,'session_nonce':nonce,
                     'request_id':'native-activate-'+Path(sys.argv[sys.argv.index('--output')+1]).stem,
                     'template_id':ids[1],'expected_active_context_id':status['active_context_id']}
@@ -650,9 +802,10 @@ if __name__=='__main__':
         (report.get('native_bundle_committed') or report.get('native_bundle_recovered')) and
         report.get('native_data_applied') and report.get('native_codex_display_ack') and len(report.get('native_scenes',[]))==4)
     functional=report.get('native_firmware_protocol_passed') if firmware_only else report['native_application_smoke_passed']
-    report['passed']=bool(report['native_execution_clean'] and report['native_service_probe_passed'] and
+    report['passed']=bool(not report.get('native_application_error') and report['native_execution_clean'] and report['native_service_probe_passed'] and
                           (functional if input_model else report['cpu_safety_passed']) and (report.get('native_firmware_protocol_passed') if firmware_probe else True) and
-                          (report.get('native_slot_switch_passed') if slot_probe else True))
+                          (report.get('native_slot_switch_passed') if slot_probe else True) and
+                          (report.get('native_transition_passed') if transition_probe else True))
     if trial_cut:report['passed']=bool(report.get('native_boot_trial_cut') and report['native_execution_clean'] and len(report['native_ff13_calls'])==1)
     report['full_application_verified']=bool(report['native_application_smoke_passed'] and all(report.get(key) for key in
         ('native_binding_recovered','native_bundle_recovered','native_activation_recovered','native_firmware_receipt_recovered')))

@@ -13,7 +13,8 @@ const bound = (bind,x,y,font,color='white',extras={}) => elements.push({type:'te
 const line = (y,color='track') => elements.push({type:'line',x1:16,y1:y,x2:303,y2:y,color});
 const ring = (x,y,radius,when,bind=week) => elements.push({type:'ring',x,y,radius,thickness:4,bind,fg:'cyan',bg:'track',when});
 elements.push({type:'rect',rect:[0,0,320,240],fill:true,color:'black'});
-text('CODEX STATUS',16,11,'ntthin18'); text('AP01',274,13,'ntthin18','muted'); line(35);
+text('CODEX STATUS',16,11,'ntthin18');
+bound('device.now',250,13,'ntthin18','muted',{region:[246,11,58,18],align:'right'}); line(35);
 // Independent layouts, selected by source existence, not a device-side Codex rule.
 // Recover the original weekly-only layout, then overlay monthly and paid layouts.
 // Clear only the quota area so a single-condition when cannot leave stale labels.
@@ -45,7 +46,7 @@ line(211);
 bound('device.sync_hhmm',16,220,'ntthin18','muted',{prefix:'SYNC ',when:{bind:'device.offline_mins',exists:false}});
 bound('device.offline_mins',16,220,'ntthin18','orange',{prefix:'OFF ',suffix:'m',when:{bind:'device.offline_mins',exists:true}});
 text('额度看板',260,219,'ntthin18','muted');
-const template={schema:1,id:'codex-status-a',version:3,render_target:'lcd-jd9853-320x240-palette4',canvas:{w:320,h:240},elements};
+const template={schema:1,id:'codex-status-a',version:5,min_fw:'1.0.2_0041',render_target:'lcd-jd9853-320x240-palette4',canvas:{w:320,h:240},elements};
 fs.writeFileSync(path.join(root,'tools/test-bridge/templates/codex-status-ap01.json'),JSON.stringify(template,null,2)+'\n');
 // Only the characters required by this template; font assets remain Bundle data.
 const characters=[...new Set(elements.flatMap(e=>[e.text??'',e.prefix??'',e.suffix??'']).join(''))].sort().join('');

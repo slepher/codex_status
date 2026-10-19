@@ -60,6 +60,9 @@ long strtol(const char *s,char **end,int base) noexcept {
 int *__errno() { return ROM_FN(0xa00267c0,int *(*)())(); }
 time_t time(time_t *out) noexcept {
     int32_t value=ROM_FN(0xa019fc3e,int32_t (*)())();
+    // The AP01 RTC stores Hong Kong civil seconds. Shared rendering expects
+    // UTC epochs, including device.date; timestamp fields are already UTC.
+    if(value>=8*60*60)value-=8*60*60;
     if(out)*out=value;return value;
 }
 size_t strftime(char *out, size_t length, const char *format, const struct tm *value) noexcept {

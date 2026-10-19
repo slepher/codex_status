@@ -124,6 +124,14 @@ int main(int argc,char **argv) {
         if(commit.status!=200)fprintf(stderr,"commit %s\n",client.body(commit).c_str()); assert(commit.status==200); assert(content.count()==2);
         auto replay=client.send(12,"/api/bundle/commit",envelope); assert(replay.status==200);
         LocalJsonAllocator a; JsonDocument status(&a); content.status(status);
+        bool hasClock=false;
+        for(JsonObject requirement:status["data_contract"]["requirements"].as<JsonArray>())
+            if(!strcmp(requirement["field"]|"","device.now"))hasClock=true;
+        unsigned displays=host.displays;std::string clockContext=content.context();
+        content.clock("00:59");assert(host.displays==displays+unsigned(hasClock));
+        content.clock("00:59");assert(host.displays==displays+unsigned(hasClock));
+        content.clock("01:00");assert(host.displays==displays+2*unsigned(hasClock));
+        assert(clockContext==content.context());content.status(status);assert((status["applied_seq"]|0u)==0);
         const char *second=status["template_ids"][1] | "";
         std::string activate="{"+client.command("activate-test")+",\"template_id\":\""+second+"\",\"expected_active_context_id\":\""+content.context()+"\"}";
         host.lostRename=true;

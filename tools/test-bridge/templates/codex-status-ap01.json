@@ -1,7 +1,8 @@
 {
   "schema": 1,
   "id": "codex-status-a",
-  "version": 3,
+  "version": 5,
+  "min_fw": "1.0.2_0041",
   "render_target": "lcd-jd9853-320x240-palette4",
   "canvas": {
     "w": 320,
@@ -30,12 +31,19 @@
     },
     {
       "type": "text",
-      "text": "AP01",
-      "x": 274,
+      "bind": "device.now",
+      "x": 250,
       "y": 13,
       "font": "ntthin18",
       "color": "muted",
-      "bg": "black"
+      "bg": "black",
+      "region": [
+        246,
+        11,
+        58,
+        18
+      ],
+      "align": "right"
     },
     {
       "type": "line",
