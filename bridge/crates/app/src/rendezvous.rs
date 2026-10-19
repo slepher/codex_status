@@ -373,7 +373,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             // An unknown plan may query an already sent transaction, but
             // does not authorize a fresh write before HTTP proves the plan.
             let confirmation_only = service(ctx).wifi_state(&mac).jobs.iter()
-                .find(|j| matches!(j.kind.as_str(),"sync"|"recovery_save") && j.runnable(device_now(&mac)))
+                .find(|j| (j.sent || matches!(j.kind.as_str(),"sync"|"recovery_save")) && j.runnable(device_now(&mac)))
                 .is_some_and(|j| j.sent);
             // A lost SyncOpen ACK cannot turn a legal configuration read into
             // a prerequisite for unavailable HTTP. Unified reads never apply.

@@ -312,3 +312,12 @@ BLE sync_open支持reason=data和正整数data_seq，绑定当前MAC/principal/s
 同一BLE阶段的token、自动恢复及Wi-Fi分页请求共用绝对截止；每条命令在carrier内取阶段剩余、单命令上限及认证RF截止最小值，业务外层不得用短timeout取消在途分片。首次token失败停止本轮；旧history只用一份有界诊断预算，不再嵌套500ms/2s/5s。NotSent、WriteUnknown、AckUnknown保留真实分类，真正未知写继续隔离，完整写后丢ACK不冒充部分写。
 
 HTTP快速就绪判断可读认证compact；需要sync窗口/data_contract的最终proof使用原总期限内的完整分页，不能周期性以3s重启全读或将单页200视为完成。claim身份预检、认证回退及socket发送共享原截止，后台worker排队不续期。宿主RPC与恢复GET的总预算覆盖锁/连接/发送/接收；取消半条RPC JSON后退役该stdin。实现与验收见 `project-workflow/bridge-macos/timeout-budget-followup-20261015.md`。
+
+
+### Bridge Wi-Fi 事务执行终点（2026-10-19）
+
+执行终点与设备结果证据独立。取消、过期、身份不可恢复，或未知结果的三次原ID确认查询机会耗尽（独立于发送前等待授权/输入的尝试次数）时，执行结束并释放后续事务准入；失败/取消/过期不会把设备结果改成拒绝或成功。历史request/principal/namespace/sent/may_have_committed/confirmation原样保留，未知结果仍可识别；不删除历史记录、猜测旧namespace、重发旧写或补造回执。仍在执行的未知事务只查询原ID并阻止冲突写；新事务独立通过当前认证、owner、版本与修订校验。确认成功可立即结束，未发送/待授权/待输入仍受既有24小时意图期限限制。过期检查先于控制事务去重，旧执行不得被相同意图复用而复活。
+
+已发送的激活/试连与保存一样，在后续会合按原ID查询；确认查询不依赖重新写入或当前网络重试退避。自动激活明确已接受但尚未完成时保留待确认状态，继续当前已确认Plan下的network_start，使设备在BLE释放后完成切网；待完成不等同于失败或成功。
+
+该修复适用于共享Wi-Fi事务层，并非跨网络特例；当前网络变更后重新用认证wifi_match读取目标，终结历史结果不会作为当前连接失败继续传播。实现/回归/部署见[执行记录](../project-workflow/bridge-macos/wifi-transaction-finality-20261019.md)。

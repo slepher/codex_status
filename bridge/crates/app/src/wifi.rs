@@ -276,7 +276,7 @@ pub async fn view(ctx: &AppCtx, mac: &str, refresh: bool) -> Result<Value, Strin
     let target=current_target(&state,&host);
     let matched=target.map(|n|n.network_id.as_str());
     let connection=host_wifi::current_ssid(&host).and_then(|ssid|state.matching_connection(ssid));
-    let result_pending=state.jobs.iter().any(|j|j.confirmation_pending());
+    let result_pending=state.jobs.iter().any(|j|j.blocks_mutations());
     let auto_state=if host["state"]!="connected" {host["state"].as_str().unwrap_or("unknown")}
         else if target.is_none(){"no_mapping"} else if let Some(c)=connection {
             if result_pending&&c.automatic_state()=="retry_exhausted" {"awaiting_confirmation"} else {c.automatic_state()}
@@ -329,6 +329,11 @@ fn note_match(ctx: &AppCtx, mac: &str, target: &Network, reply: &Value) -> Optio
 }
 fn project_match(state:&WifiState,target:&Network,reply:&Value,now:u64)->Option<Connection> {
     let mut result=fresh_connection(state,target,now);
+    // Admission errors describe the previous attempt, not device RF state.
+    // Recompute them at the queue boundary after every fresh device match.
+    if matches!(result.error.as_deref(),Some("wifi_confirmation_pending"|"wifi_control_busy"|"wifi_sync_busy")) {
+        result.error=None;
+    }
     let version=reply["version"].as_u64()?;
     if result.version!=version {result.attempts=0;result.next_attempt_at=0;result.http_ready=false;}
     result.version=version;result.observed_at=now;
@@ -503,7 +508,9 @@ pub async fn automatic_on_link(ctx: &AppCtx,mac:&str,link:&mut bridge_ble::Devic
         let was_sent=job.sent;
         unified_on_link(ctx,mac,link,budget,Some(&job.job_id)).await;
         let current=svc.wifi_state(mac).jobs.into_iter().find(|j|j.job_id==job.job_id).ok_or("wifi_job_not_found")?;
-        if let Some(error)=current.error_code.as_deref() {return Err(error.to_owned());}
+        // An accepted asynchronous activation needs the caller's network_start
+        // before BLE release; its result remains pending under the same ID.
+        if let Some(error)=current.error_code.as_deref().filter(|error|*error!="operation_pending") {return Err(error.to_owned());}
         if !was_sent {
             if !current.sent {
                 let code=current.error_code.unwrap_or("wifi_not_dispatched".into());connection.error=Some(code.clone());
@@ -806,7 +813,7 @@ pub async fn recover_on_link_budget(ctx: &AppCtx, mac: &str, link: &mut bridge_b
     }
     let now = crate::device_now_secs(mac).max(0) as u64;
     if let Some(job) = platform::service(ctx).wifi_state(mac).jobs.into_iter()
-        .find(|j| matches!(j.kind.as_str(), "sync" | "recovery_save") && j.runnable(now)) {
+        .find(|j| (j.sent || matches!(j.kind.as_str(), "sync" | "recovery_save")) && j.runnable(now)) {
         unified_on_link(ctx, mac, link, budget, Some(&job.job_id)).await;
     }
 }
@@ -878,6 +885,18 @@ mod tests {
         let mut c=fresh_connection(&state,&target,100);c.state="connection_failed".into();state.connection=Some(c);
         state.local_revision+=1;assert!(state.matching_connection("Current host").is_none());
         let mut renamed=target.clone();renamed.label="Different".into();assert_ne!(target_query(&target)["metadata_key"],target_query(&renamed)["metadata_key"]);
+    }
+    #[test]
+    fn fresh_match_recomputes_admission_errors_without_hiding_device_failure() {
+        let target:Network=serde_json::from_value(json!({"network_id":"office","host_ssid":"Office","ssid":"Office","version":7})).unwrap();
+        let mut state=WifiState::default();state.save(0,vec![target.clone()],100).unwrap();
+        for error in ["wifi_confirmation_pending","wifi_control_busy","wifi_sync_busy"] {
+            let mut c=fresh_connection(&state,&target,100);c.version=7;c.error=Some(error.into());state.connection=Some(c);
+            let reply=json!({"version":7,"matches":true,"active":false,"connected":false,"stage":"saved"});
+            assert!(project_match(&state,&target,&reply,101).unwrap().error.is_none());
+            let failed=json!({"version":7,"matches":true,"active":false,"connected":false,"stage":"failed","error":"authentication_failed"});
+            assert_eq!(project_match(&state,&target,&failed,101).unwrap().error.as_deref(),Some("authentication_failed"));
+        }
     }
     #[test]
     fn wifi_opportunity_never_promotes_deep_sleep_wrong_identity_or_old_capability() {

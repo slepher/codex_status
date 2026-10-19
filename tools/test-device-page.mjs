@@ -389,7 +389,7 @@ assert.match(element('wifi-online').textContent,/BOOT 在线.*剩余 (119|120) �
 run(`wifiRenderOnline({observed_at:Date.now()/1000-60,presence:{mode:'continuous',remaining_ms:null,reasons:['usb']}})`);
 assert.match(element('wifi-online').textContent,/在线状态待确认/);
 
-for(const [code,text] of [['not_sent','未发送'],['result_unknown','勿重复提交'],['network_not_found','未找到网络'],['window_budget_exhausted','预算已耗尽'],['http_proof_budget_exhausted','未能确认 HTTP']])
+for(const [code,text] of [['not_sent','未发送'],['confirmation_budget_exhausted','执行已结束；设备结果仍未知'],['result_unknown','勿重复提交'],['network_not_found','未找到网络'],['window_budget_exhausted','预算已耗尽'],['http_proof_budget_exhausted','未能确认 HTTP']])
   assert(run(`wifiError('${code}')`).includes(text));
 assert.match(run("wifiError('revision_conflict')"),/缓存已过期.*重新读取设备/);
 

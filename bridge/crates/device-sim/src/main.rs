@@ -2960,7 +2960,14 @@ async fn sim_ble_command(State(state): State<SimState>, request: Request<Body>) 
             return Json(json!({"result":"accepted"})).into_response();
         }
         let now = clock.monotonic_ms;
-        let reply = {
+        let reply = if op=="wifi_owner" {
+            // Match the firmware transport's owner query, outside the Wi-Fi store engine.
+            let mut reply=json!({"ok":true,"device_mac":state.mac});
+            if let Some(owner)=state.owner.lock().unwrap().get_valid(now_seconds(&state,clock)).ok().flatten() {
+                reply["owner_id"]=json!(owner.id);
+            }
+            Ok(reply)
+        } else {
             let mut wifi = state.wifi.lock().unwrap();
             let peer = wifi.peer.clone(); let outcome = wifi.outcome; let physical = wifi.physical_until;
             let _ = wifi.engine.poll(now, &peer, generation, true, outcome);

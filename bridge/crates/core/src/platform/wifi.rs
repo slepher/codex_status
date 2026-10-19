@@ -6,6 +6,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::model::DeviceIdentity;
 
 pub const INTENT_TTL_S: u64 = 86400;
+// A finite query-only budget, independent of pre-dispatch authorization/input waits.
+const MAX_CONFIRMATION_ATTEMPTS: u32 = 3;
+fn zero(value: &u32) -> bool { *value == 0 }
 
 /// Carrier I/O only; job identity and durable transitions belong to the service.
 pub trait Transport {
@@ -258,6 +261,8 @@ pub struct Job {
     pub updated_at: u64,
     pub local_revision: u64,
     pub attempt_count: u32,
+    #[serde(default, skip_serializing_if="zero")]
+    pub confirmation_attempts: u32,
     pub last_attempt_at: Option<u64>,
     pub next_attempt_at: u64,
     pub last_stage: String,
@@ -295,6 +300,10 @@ impl Job {
         self.sent && self.may_have_committed && !matches!(self.confirmation.as_deref(),
             Some("durable_receipt" | "operation_result" | "durable_rejection" | "receipt_and_readback" | "verified_post_state"))
     }
+    /// Unresolved evidence belongs to history after execution has ended.
+    pub fn blocks_mutations(&self) -> bool {
+        !self.terminal() && self.confirmation_pending()
+    }
     pub fn execution_active(&self, now: u64) -> bool {
         self.execution_intent == ExecutionIntent::Active && now < self.expires_at
             && !matches!(self.state.as_str(), "cancelled" | "expired")
@@ -326,7 +335,9 @@ impl Job {
         else if self.execution_intent == ExecutionIntent::Expired { self.state="expired".into(); }
         else if !self.terminal() {
             if let Some(reason)=self.blocking_reason().map(str::to_owned) {
-                self.state="needs_attention".into();self.error_code=Some(reason);
+                self.state="failed".into();self.error_code=Some(reason);
+            } else if self.confirmation_pending() && self.confirmation_attempts >= MAX_CONFIRMATION_ATTEMPTS {
+                self.state="failed".into();self.error_code=Some("confirmation_budget_exhausted".into());
             }
         }
     }
@@ -366,6 +377,25 @@ mod retirement_tests {
             state.recover();
             assert_eq!(state.jobs[0].state,"completed");
         }
+    }
+    #[test]
+    fn unknown_confirmation_has_a_finite_execution_budget() {
+        let mut state=WifiState::default();
+        let job=state.queue("0200000000D4","bridge-test","activate",vec!["home".into()],100,"first".into(),BTreeMap::new()).unwrap();
+        state.jobs[0].transaction_namespace=Some("original".into());
+        for attempt in 0..4 {
+            let now=101+attempt*61;
+            assert!(state.begin(&job.job_id,now).unwrap().is_some());
+            if attempt==0 {state.mark_sent(&job.job_id,now).unwrap();}
+            state.finish(&job.job_id,"awaiting_confirmation",Some("result_unknown"),now).unwrap();
+        }
+        let historical=state.jobs[0].clone();
+        assert_eq!(historical.state,"failed");
+        assert_eq!(historical.error_code.as_deref(),Some("confirmation_budget_exhausted"));
+        assert!(historical.confirmation_pending());
+        assert!(!historical.runnable(500));
+        state.queue("0200000000D4","bridge-test","activate",vec!["office".into()],500,"next".into(),BTreeMap::new()).unwrap();
+        assert_eq!(serde_json::to_value(&state.jobs[0]).unwrap(),serde_json::to_value(historical).unwrap());
     }
     #[test]
     fn wifi_retirement_preserves_unknown_submissions_and_pending_receipt_acks() {
@@ -428,6 +458,7 @@ impl WifiState {
     }
     pub fn expire(&mut self, now: u64) {
         for j in &mut self.jobs {
+            j.reconcile_execution();
             if !j.terminal() && j.execution_intent == ExecutionIntent::Active && now >= j.expires_at {
                 j.execution_intent = ExecutionIntent::Expired;
                 j.state = "expired".into(); j.updated_at = now;
@@ -459,7 +490,7 @@ impl WifiState {
             return Ok(j.clone());
         }
         if matches!(kind,"sync"|"recovery_save"|"trial"|"activate") &&
-            self.jobs.iter().any(Job::confirmation_pending) { bail!("wifi_confirmation_pending"); }
+            self.jobs.iter().any(Job::blocks_mutations) { bail!("wifi_confirmation_pending"); }
         if matches!(kind,"sync"|"recovery_save") && self.jobs.iter().any(|j| matches!(j.kind.as_str(),"sync"|"recovery_save") && !j.terminal()) { bail!("wifi_sync_busy"); }
         self.jobs.retain(|j| !j.safe_to_retire() || now.saturating_sub(j.updated_at) < INTENT_TTL_S);
         // Keep recent history when possible; confirmed, acknowledged results
@@ -474,7 +505,7 @@ impl WifiState {
             .map(|n| (n.network.network_id.clone(), n.network.metadata())).collect()).unwrap_or_default();
         let j = Job { request_id: if self.next_job_seq>0 { format!("w3_{:016x}",self.next_job_seq) } else { job_id.clone() }, job_id, device_mac: mac.into(), bridge_id: bridge.into(), kind: kind.into(),
             transaction_namespace: None, state: "queued".into(), execution_intent: ExecutionIntent::Active, created_at: now, expires_at: now.saturating_add(INTENT_TTL_S), updated_at: now,
-            local_revision: self.local_revision, attempt_count: 0, last_attempt_at: None, next_attempt_at: now,
+            local_revision: self.local_revision, attempt_count: 0, confirmation_attempts: 0, last_attempt_at: None, next_attempt_at: now,
             last_stage: "accepted".into(), error_code: None, sent: false, may_have_committed: false,
             selected, frozen, fields, expected_revision: self.snapshot.as_ref().map(|s| s.revision), host_ssid: None, before, confirmed_revision: None, confirmation: None, receipt_ack_pending: false, command: None };
         self.jobs.push(j.clone());
@@ -487,6 +518,7 @@ impl WifiState {
         if matches!(j.state.as_str(), "connecting" | "reading" | "applying") { return Ok(None); }
         j.state = if j.sent { "awaiting_confirmation" } else { "reading" }.into();
         j.last_stage = if j.sent { "query_result" } else { "snapshot" }.into();
+        if j.sent { j.confirmation_attempts = j.confirmation_attempts.saturating_add(1); }
         j.attempt_count = j.attempt_count.saturating_add(1); j.last_attempt_at = Some(now); j.updated_at = now;
         Ok(Some(j.clone()))
     }
