@@ -350,6 +350,8 @@
 
 ### C9. 取消项目自管A/B、动态容量与内置更新界面
 
+- **2026-10-20 AP01字体离线核查**：原厂0041中找到完整ASCII Montserrat14（含Y），67个原生fmt_txt描述符中旧55项清单漏12项；整套字形/映射/字距比对一致。页面子集裁剪与恢复遗漏同时存在；未改设备、ROM、Bundle或已有预览，详见[核查证据](../../project-workflow/ap01-template-integration/font-rom-audit.md)。
+
 - **2026-10-20 AP01导航33已部署并实机通过**：Pet边识别替代数字递减判环回，修正Pet→菜单/菜单→主界面重复插入应用和退出方向；用户确认“页序和动画均正常”。槽1/build967049b5…，031救援槽0保留且本轮实机回切已验；原v5 Bundle保留，Data seq12已应用、末次状态pending。130/133/134原生OTA/同NOR恢复/无稳定记录回切/原回执及12组像素、匹配宿主ASan/UBSan通过。导航项结案，C9其他验收边界仍开放。[证据与交接](../../project-workflow/ap01-template-integration/release-0041-20261020.md)。
 
 - **2026-10-20 0031基础ROM已实机部署**：单次原厂正常OTA写非活动槽0，保留当前正常原厂0031槽1；认证build53574b55…/BootROM0x11000/物理表age12一致，用户确认GIF/显示/旋钮正常，5次STATUS47–94ms及FLASH元数据/LOGS可读。临时服务关闭。独立OTA并发/掉电/高水位仍按各自证据边界，不追加刷写保留槽。[部署证据](../../project-workflow/ap01-base0031/status.md)。
