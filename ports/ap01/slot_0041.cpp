@@ -1,5 +1,6 @@
 // Exact 0041 partition table/raw Flash read ABI. No erase or write of slots.
 #include "slot_0041.h"
+#include "native_diagnostic_0041.h"
 #include "v2_sync.h"
 #include "v2_runtime.h"
 #include <string.h>
@@ -82,4 +83,10 @@ int ap01SelectSlot0041(unsigned slot) {
     // Advance only after success, so the next commit preserves that table.
     *copy=previous^1;
     return 1;
+}
+
+int ap01DiagnosticFlash0041(void *,uint32_t offset,uint8_t *bytes,unsigned length) {
+    if(!length||length>1024||offset>=0x1000000u||length>0x1000000u-offset)return -22;
+    int rc=FN(0xa0058e12,int (*)(uint32_t,void *,unsigned))(offset,bytes,length);
+    return rc? -5:int(length);
 }

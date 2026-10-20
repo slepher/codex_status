@@ -8,6 +8,7 @@ from pathlib import Path
 import argparse, hashlib, json, os, struct, subprocess
 
 repo = Path(__file__).resolve().parents[1]
+platform=repo.parent/"cuktech-ap01-firmware/tooling/firmware-modules"
 parser = argparse.ArgumentParser()
 parser.add_argument('--out', type=Path, default=repo/'artifacts/ap01-platform-integration/device')
 args = parser.parse_args()
@@ -19,7 +20,7 @@ flags = ['-march=rv32imafc', '-mabi=ilp32f', '-Os', '-std=c++17', '-ffreestandin
          '-fno-exceptions', '-fno-rtti', '-fno-pic', '-mno-relax', '-msmall-data-limit=0',
          '-ffunction-sections', '-fdata-sections', '-fstack-usage', '-nostdlib',
          '-DARDUINOJSON_ENABLE_STD_STRING=0', '-DARDUINOJSON_ENABLE_STD_STREAM=0',
-         '-DARDUINOJSON_ENABLE_ARDUINO_STRING=0', '-I'+str(repo/'src'), '-I'+str(json_header)]
+         '-DARDUINOJSON_ENABLE_ARDUINO_STRING=0', '-I'+str(platform), '-I'+str(repo/'src'), '-I'+str(json_header)]
 report = {'scope':'owned binding/render/Bundle/HTTP and recovered 0041 UI/VFS runtime RV32 audit; execution reported separately',
           'passed':False,
           'firmware_target':'cuktech-ap01-0041', 'flashable':False, 'hardware_verified':False,
@@ -32,7 +33,7 @@ report['input_headers']=[{'path':str(p),'sha256':hashlib.sha256(p.read_bytes()).
 report['generator_sha256']=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 path=args.out/'native-core-audit.json'
 path.write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
-sources = [repo/'src/ap01_binding.cpp', repo/'src/ap01_pairing.cpp', repo/'ports/ap01/abi_budget.cpp']
+sources = [platform/'native_wifi_profiles_0041.cpp', platform/'native_wifi_profiles_port_0041.cpp', platform/'native_diagnostic_0041.cpp', repo/'src/ap01_binding.cpp', repo/'src/ap01_pairing.cpp', repo/'ports/ap01/abi_budget.cpp']
 sources += [repo/'ports/ap01/vfs_0041.cpp', repo/'ports/ap01/business.cpp', repo/'ports/ap01/application.cpp', repo/'ports/ap01/http.cpp', repo/'ports/ap01/calendar.cpp', repo/'ports/ap01/runtime_0041.cpp', repo/'ports/ap01/native_0041.cpp', repo/'ports/ap01/manifest_0041.cpp']
 sources += [repo/'ports/ap01/firmware.cpp',repo/'ports/ap01/ota_image.c',repo/'ports/ap01/slot_0041.cpp']
 sources += [repo/'src'/name for name in ['template_engine.cpp', 'GUI_Paint.cpp', 'font_asset.cpp',

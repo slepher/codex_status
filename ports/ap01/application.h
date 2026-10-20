@@ -2,6 +2,8 @@
 #include "business.h"
 #include "ap01_pairing.h"
 #include "firmware.h"
+#include "native_wifi_profiles_0041.h"
+#include "native_diagnostic_0041.h"
 
 struct Ap01ApplicationPort {
     void *context;
@@ -10,18 +12,10 @@ struct Ap01ApplicationPort {
     bool (*lockBindings)(void *);
     void (*unlockBindings)(void *);
     Ap01FirmwarePort firmware{};
+    Ap01WifiProfilesPort wifiProfiles{};
+    Ap01DiagnosticPort diagnostic{};
 };
-struct Ap01HttpRequest {
-    const char *method, *path, *token, *deviceToken, *contentType;
-    const char *requestId = "", *offset = "", *nonce = "";
-    const uint8_t *body;
-    size_t length;
-};
-struct Ap01HttpReply {
-    int status = 500;
-    bool frame = false;
-    String bytes;
-};
+#include "native_http_0041.h"
 
 // One business executor owns this object. Maintenance and UI may independently
 // enter binding APIs while the business executor is rendering/installing.

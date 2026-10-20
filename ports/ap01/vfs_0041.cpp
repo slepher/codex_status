@@ -1,4 +1,5 @@
 #include "LittleFS.h"
+#include "native_diagnostic_0041.h"
 
 // 0041-only NuttX/LittleFS ABI. Evidence: 0041-littlefs-abi.json and the
 // matching immutable ROM. No public Linux ioctl/flag/struct assumptions.
@@ -121,4 +122,29 @@ int statFs(void *, const char *path, uint64_t *total, uint64_t *used) {
 Ap01VfsOps ap01RomVfs() {
     return {nullptr, prepare, openFile, closeFile, readFile, writeFile, seekFile,
             fileSize, exists, mkdirPath, removeFile, renameFile, statFs};
+}
+
+int ap01DiagnosticFile0041(void *, const char *path, uint32_t offset, uint8_t *bytes,
+                           unsigned length, uint32_t *total) {
+    bool log = !strcmp(path,"/dev/ramlog");
+    if (offset > INT32_MAX || (log && offset)) return -22;
+    // NuttX O_RDONLY=1, O_NONBLOCK=64. Reading an empty ramlog must not block maintenance.
+    int fd=ROM_FN(0xa003f4f6,int (*)(const char *,int,...))(path,log?65:1);
+    if(fd<0)return -*ROM_FN(0xa00267c0,int *(*)())();
+    int32_t size=log?-1:fileSize(nullptr,fd);
+    int result=0;
+    if(log) {
+        result=readFile(nullptr,fd,bytes,length);*total=UINT32_MAX;
+        if(result<0&&*ROM_FN(0xa00267c0,int *(*)())()==11)result=0;
+    } else if(size<0 || offset>uint32_t(size) || seekFile(nullptr,fd,offset,0)!=int32_t(offset)) result=-22;
+    else {
+        *total=size;
+        unsigned wanted=uint32_t(size)-offset;if(wanted>length)wanted=length;
+        while(unsigned(result)<wanted) {
+            int n=readFile(nullptr,fd,bytes+result,wanted-result);
+            if(n<=0||unsigned(n)>wanted-result){result=-5;break;}result+=n;
+        }
+        if(result>=0&&fileSize(nullptr,fd)!=size)result=-11;
+    }
+    closeFile(nullptr,fd);return result;
 }

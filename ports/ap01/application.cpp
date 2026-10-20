@@ -156,6 +156,14 @@ Ap01HttpReply Ap01Application::maintenanceHttp(const Ap01HttpRequest &request, u
     }
     const char *bound=ap01BindingPrincipal(&bindings, request.token);
     if (!bound) { error(reply, 401, "unauthorized", "maintenance_auth"); return reply; }
+    if(!strncmp(request.path,"/api/wifi/",10)) {
+        guard.release();
+        return ap01WifiProfilesHttp0041(port.wifiProfiles,request,mac);
+    }
+    if(!strncmp(request.path,"/api/diagnostic/",16)) {
+        guard.release();
+        return ap01DiagnosticHttp0041(port.diagnostic,request,mac,boot);
+    }
     if(!strncmp(request.path,"/api/firmware/",14)) {
         if(!firmware){error(reply,port.firmware.open?503:501,"firmware_port_unavailable","maintenance_router");return reply;}
         char principal[65];strcpy(principal,bound);

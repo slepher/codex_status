@@ -16,7 +16,7 @@
 struct Host {
     bool locked = false, lostRename = false, corruptReadback = false,failPresent=false;
     unsigned randomCounter = 1, displays = 0;
-    std::vector<uint8_t> frame;
+    std::vector<uint8_t> frame, wifiList;
 };
 int prepare(void *, const char *path) { struct stat s; return stat(path, &s) || !S_ISDIR(s.st_mode) ? -1 : 0; }
 int openFile(void *, const char *p, unsigned mode) { return open(p, mode == 0 ? O_RDONLY : O_WRONLY|O_CREAT|(mode == 1 ? O_TRUNC : O_APPEND), 0600); }
@@ -93,6 +93,9 @@ void binaryHttp(Ap01Application &app) {
     CompactFrameHeader response;assert(compactFrameDecode((const uint8_t *)stream.output.data()+body+4,stream.output.size()-body-4,response,4096));
     assert(response.kind==1&&response.op==1&&response.requestNo==1);
 }
+int wifiCurrent(void *p,char *ssid,unsigned,char *password,unsigned) {assert(!((Host*)p)->locked);strcpy(ssid,"Home");strcpy(password,"synthetic-current");return 0;}
+int wifiLoad(void *p,uint8_t *out,unsigned cap) {auto &h=*(Host*)p;assert(!h.locked);if(h.wifiList.empty())return -2;assert(h.wifiList.size()<=cap);memcpy(out,h.wifiList.data(),h.wifiList.size());return h.wifiList.size();}
+int wifiStore(void *p,const uint8_t *bytes,unsigned n) {auto &h=*(Host*)p;assert(!h.locked);h.wifiList.assign(bytes,bytes+n);return 0;}
 int main(int argc,char **argv) {
     assert(argc==4); Host host;
     Ap01VfsOps io{&host,prepare,openFile,closeFile,readFile,writeFile,seekFile,sizeFile,exists,mkdirFile,removeFile,renameFile,statFs};
@@ -100,7 +103,8 @@ int main(int argc,char **argv) {
     std::string recoveredContext;
     {
         Ap01Business content(fs,{&host,present},1); assert(content.begin(0));
-        Ap01Application app(fs,content,{&host,randomBytes,lock,unlock},"AABBCCDDEEFF",1); assert(app.begin()); app.businessOnline(true);
+        Ap01ApplicationPort callbacks{&host,randomBytes,lock,unlock};callbacks.wifiProfiles={&host,wifiCurrent,wifiLoad,wifiStore,nullptr};
+        Ap01Application app(fs,content,callbacks,"AABBCCDDEEFF",1); assert(app.begin()); app.businessOnline(true);
         http(app);
         const std::string pairing="{\"device_mac\":\"AABBCCDDEEFF\",\"bridge_id\":\"bridge-test\",\"name\":\"native-test\",\"display_code\":\"1234\",\"binding_token\":\"0123456789abcdef0123456789abcdef\",\"request_id\":\"pair-test\",\"boot_id\":1,\"pairing_revision\":0}";
         auto reply=app.maintenanceHttp(req("POST","/api/pairing","",pairing),1); assert(reply.status==202);
@@ -110,6 +114,15 @@ int main(int argc,char **argv) {
         auto result=app.maintenanceHttp(req("GET","/api/pairing/pair-test","0123456789abcdef0123456789abcdef",{}),4);
         assert(text(result.bytes).find("approved")==std::string::npos);
         assert(app.button(true,4,5)); assert(app.button(false,5,6));
+        assert(app.maintenanceHttp(req("GET","/api/wifi/profiles","bad",{}),7).status==401);
+        app.businessOnline(false);
+        auto list=app.maintenanceHttp(req("GET","/api/wifi/profiles","0123456789abcdef0123456789abcdef",{}),8);
+        assert(list.status==200&&strstr(list.bytes.c_str(),"Home")&&!strstr(list.bytes.c_str(),"synthetic-current"));
+        const std::string profiles=R"({"device_mac":"AABBCCDDEEFF","expected_revision":0,"profiles":[{"ssid":"Office","password":"synthetic-candidate"}]})";
+        auto saved=app.maintenanceHttp(req("PUT","/api/wifi/profiles","0123456789abcdef0123456789abcdef",profiles),9);
+        assert(saved.status==200&&strstr(saved.bytes.c_str(),"Office")&&strstr(saved.bytes.c_str(),"Home")&&!strstr(saved.bytes.c_str(),"synthetic-"));
+        assert(app.maintenanceHttp(req("POST","/api/wifi/activate","0123456789abcdef0123456789abcdef",{}),10).status==404);
+        app.businessOnline(true);
         binaryHttp(app);
         Client client{app}; client.status(); client.claim();
         char crc[9]; snprintf(crc,9,"%08x",v2Crc32((const uint8_t *)bundle.data(),bundle.size()));

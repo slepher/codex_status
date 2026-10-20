@@ -1,3 +1,3 @@
 #pragma once
-#include "LittleFS.h"
-Ap01VfsOps ap01RomVfs();
+// Compatibility include; implementation and ABI belong to the firmware platform.
+#include "../../../cuktech-ap01-firmware/tooling/firmware-modules/native_vfs_0041.h"

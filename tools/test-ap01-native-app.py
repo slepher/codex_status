@@ -4,6 +4,7 @@ Run elevated: precreates its private state directory and compiler temp files.
 from pathlib import Path
 import hashlib, json, struct, subprocess, zlib, time, argparse
 repo=Path(__file__).resolve().parents[1]
+platform=repo.parent/"cuktech-ap01-firmware/tooling/firmware-modules"
 out=repo/'artifacts/ap01-platform-integration/device'
 parser=argparse.ArgumentParser();parser.add_argument('--image',type=Path,default=out/'ap01-native-0041-candidate-13.bin');parser.add_argument('--bundle',type=Path);args=parser.parse_args()
 state=out/('t'+str(time.time_ns()%1000000))
@@ -42,8 +43,10 @@ cmd=['wsl','-d','Ubuntu-24.04','--','g++','-std=c++17','-O0','-g','-fno-omit-fra
      '-DARDUINOJSON_ENABLE_STD_STREAM=0','-Wno-deprecated-declarations']
 for folder in ('ports/ap01','bridge/crates/render/shim','src','.pio/libdeps/esp32-s3-epaper-154g/ArduinoJson/src'):
     cmd+=['-I',linux(repo/folder)]
+cmd+=['-I',linux(platform)]
 source_paths=[repo/'src'/s for s in sources]+[repo/'ports/ap01'/s for s in ('business.cpp','application.cpp','http.cpp','calendar.cpp','native_smoke.cpp')]
 source_paths += [repo/'ports/ap01/firmware.cpp',repo/'ports/ap01/ota_image.c']
+source_paths += [platform/'native_wifi_profiles_0041.cpp',platform/'native_diagnostic_0041.cpp']
 objects=[]
 headers=list((repo/'ports/ap01').glob('*.h'))+list((repo/'src').glob('*.h'))
 newest=max(p.stat().st_mtime_ns for p in headers)

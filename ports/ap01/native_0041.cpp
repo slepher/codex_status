@@ -2,6 +2,8 @@
 #include "http.h"
 #include "slot_0041.h"
 #include "vfs_0041.h"
+#include "native_wifi_profiles_port_0041.h"
+#include "native_diagnostic_0041.h"
 #include "ap01_template_display.h"
 #include "local_json_allocator.h"
 #include <atomic>
@@ -122,6 +124,7 @@ struct Runtime {
     static bool lockBindings(void *p) {return !((Runtime *)p)->bindingsLock.test_and_set(std::memory_order_acquire);}
     static void unlockBindings(void *p) {((Runtime *)p)->bindingsLock.clear(std::memory_order_release);}
     static bool firmwareBusy(void *) {return *(volatile uint8_t *)(uintptr_t)0x62fc4053!=0;}
+    static bool diagnosticBusy(void *p) {return firmwareBusy(p)||((Runtime *)p)->app->maintenanceActive();}
     static void firmwareClose(void *p) {
         Flash &f=((Runtime *)p)->updateFlash;
         if(f.fd>=0){ROM_FN(0xa01addc6,void (*)(Flash *))(&f);f.fd=-1;}
@@ -464,6 +467,8 @@ void *Runtime::bootstrap(void *p) {
     for(unsigned i=0;i<16;++i){uint8_t v=ap01_native_manifest[36+i];r.firmwareBuild[2*i]=hex[v>>4];r.firmwareBuild[2*i+1]=hex[v&15];}
     Ap01ApplicationPort callbacks{&r,randomBytes,lockBindings,unlockBindings,
         {&r,firmwareBusy,firmwareOpen,firmwareWrite,firmwareVerify,firmwareCommit,firmwareClose,r.firmwareBuild,firmwareReboot,runningSlot,inspectSlot,selectSlot,bootHealthy}};
+    callbacks.wifiProfiles=ap01WifiProfilesNativePort0041(&r,diagnosticBusy);
+    callbacks.diagnostic={&r,ap01DiagnosticFile0041,ap01DiagnosticFlash0041,diagnosticBusy};
     r.app.reset(new(std::nothrow) Ap01Application(r.fs,r.business,callbacks,mac,r.bootId));
     if(!r.app||!r.app->begin(nowMs()))return nullptr;
     uint32_t initializing=0;
