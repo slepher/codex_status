@@ -1,22 +1,21 @@
 # Codex Status 当前交接
 
-更新时间：2026-10-20 02:25 香港时间
+更新时间：2026-10-20 12:47 香港时间
 
 ## 部署与工作区
 
-- AP01 `34F01557210B`/DID2232184842：候选32运行**槽1**，build `6b60914b9f64a7117a53c45b6d93501e`。两次经0031基础ROM槽0启动/核对头尾后单次OTA更新应用槽，**救援槽0保留且实机回切已验**。本轮事务 `artifacts/ap01-app-rollout-20261020/navigation-rollout-task.json`。
-- 模板v5/完整Bundle `b097bacb`（CRC4b72d7d7）保留；真实Data seq9/displayed，commit_seq4。用户确认**当前时间已正确**，重置UTC+8转换沿用已确认版本。**切页仍未通过：左旋钮偶发反向动画，页序不可靠**。
-- 用户要求先快速结束并提交，停止后续实现/刷写。默认Bridge既有AP01版本格式修复/core175已部署，本轮无再次重建，Note4 ROM未刷写。
+- AP01 `34F01557210B`/DID2232184842：**33运行槽1**，build `967049b5f6a589b717e03d4abe312ed1`。本轮先认证回切0031槽0及头尾，再单次OTA槽1；**救援槽0保留，实机回切已验**。事务 `artifacts/ap01-app-rollout-20261020/navigation33-rollout-task.json`。
+- **导航问题已修复并实机通过**：原厂Pet7→菜单6及菜单→主界面被页号递减误判为环回、重复插入应用；现仅在进入Pet的边/反向边插入全部模板。退出动画key0x13→2、0x14→1。用户本轮明确回复“页序和动画均正常”。
+- v5完整Bundle `b097bacb`保留，commit_seq5；真实Data seq12已应用，最终读取display_state=pending，不冒充本次Data已取得显示回执。原先已确认的时间修复沿用。
+- 发现默认Bridge未监听，已按指定计划任务脚本启动既有EXE；force=false恢复既有占用并投递快照。未重建Bridge、未刷Note4、未提交Git。
 
-## 待续与边界
+## 下一步与验收边界
 
-- 用户补充实际顺时针序列：宠物 → 应用（左入）→ 菜单（右入）→ 应用（左入）→ 日期/瓦数/温度主界面（右入）。这是异常观察，非目标顺序；仅记录，详见部署文档末节。
-
-- C9剩余导航问题：最新原厂反编译确认key0x13的动画参数为2、key0x14为1，当前应用退出用相反参数；页面图也非简单连续索引。尚未修改/验证这项发现，不能称导航修复完成。对照原厂事件图和方向映射后再模拟/实机验收。
-- 32宿主ASan/UBSan及原生120完整OTA/RTC归一化、121回切、122同NOR恢复通过；123旧版同页退出复现。125原始固定下一页=1断言失败（实际到原厂7且未回应用），独立后置条件复核通过；该模拟未覆盖实机方向问题，不冒充完整硬件验收。物理掉电/Boot2前回退/高水位未保证。
-- [部署与详细边界](project-workflow/ap01-template-integration/release-0041-20261020.md)；物理反馈 `artifacts/ap01-app-rollout-20261020/physical-verification-navigation.json`；[待办 C9](docs/roadmap/backlog.md)。
+- 本次导航项可结案；C9整体仍开放，物理掉电/Boot2前回退、真实调用链高水位等既有边界不变。反向完整导航为原生模拟证据，用户本轮确认来自顺时针实测请求。
+- 130/133/134原生完整OTA、同NOR升级/回切/原事务回执恢复通过；12组原厂活动LVGL像素与共享引擎差异0，匹配33宿主ASan/UBSan通过。128旧32对照失败；126/127/129及131/132的测试路径/离线引导门控/漏传回执参数记录保留，未放宽放行。
+- [部署与边界](project-workflow/ap01-template-integration/release-0041-20261020.md)；实机证据 `artifacts/ap01-app-rollout-20261020/physical-verification-navigation33.json`；[待办C9](docs/roadmap/backlog.md)。
 
 ## 精确ROM
 
-- 已部署：`artifacts/ap01-platform-integration/device/ap01-0041-app-navigation-20261020.bin`，6994856 B，SHA256 `7f3789d37ad0ca8b8c1bbd7733729ec69262f7e3248501b40e05e750cf37a33c`；匹配ELF SHA256 `1ad5735dd7a443078106859ee2a0ad07be9666952eae6de6653195c86cff4bc0`。
-- 救援槽0：`artifacts/ap01-base0031-20261019/ap01-base0031-v2-rom.bin`，6822344 B，SHA256 `d843aae4e097c31ce06a315c62e1a66f4fb3bf9299db289b6f31562d0ef2231b`；未写槽0，本轮回切巡检CRC/运行/头尾通过，未声称全片实读哈希。
+- **已部署33**：`artifacts/ap01-platform-integration/device/ap01-0041-pet-navigation-20261020.bin`，6994872 B，SHA256 `a4a34b872815711094c68f4a5c6c1ded8c2316475520bff95e1d8ec25011c535`；匹配ELF SHA256 `5696ba3e8193d9b2458936edbc2394cf2372930ff1b3dd41d52bc4d4a149ecbd`。
+- 救援槽0：`artifacts/ap01-base0031-20261019/ap01-base0031-v2-rom.bin`，6822344 B，SHA256 `d843aae4e097c31ce06a315c62e1a66f4fb3bf9299db289b6f31562d0ef2231b`。本轮未写槽0，认证运行/头尾及回切前原生CRC检查通过；未声称全片实读哈希。

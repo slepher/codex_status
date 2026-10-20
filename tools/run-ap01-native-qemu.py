@@ -323,45 +323,61 @@ class NativeProvider(OriginalProvider):
             while time.monotonic()<until:
                 state=self.action(observe=True)
                 if state['root_ready']:return state
-                time.sleep(.2) # Let fbdev readiness run between observations.
+                time.sleep(.2)
             raise TimeoutError('native slide did not complete')
-        # The offline fixture has no MiHome account. Enter its virtual group
-        # normally, then drive the real native slide API while it is focused.
-        # This exercises the original readiness bit and moving window objects.
-        for _ in range(count):self.input(0x11,0x13);settled()
-        settled()
-        self.action(native_page=8);settled()
-        samples=[]
-        for enter,leave,label in ((0x13,0x14,'forward'),(0x14,0x13,'reverse')):
-            self.input(0x11,enter);self.action(native_page=0)
-            state=self.action(observe=True);state['transition']=label+'-entry';samples.append(state)
-            self.report['native_transition_samples']=samples
-            assert state['root_ready']==0 and state['focused'],label+' entry did not animate'
-            assert state['content'] and not state['content_hidden'] and state['image'],label+' entry showed stock content'
-            settled()
-            state=self.input(0x11,leave,sample=True);state['transition']=label+'-exit';samples.append(state)
-            assert state['root_ready']==0 and not state['focused'],label+' exit did not animate'
-            assert state['content'] and not state['content_hidden'] and state['image'],label+' exit showed stock content'
-            settled()
-        # The previous probe used a different underlying stock index on exit.
-        # A real wrap also exits toward the very index occupied by the overlay.
-        # Reproduce that naturally on the offline page and inject a rapid key
-        # before the native 300ms slide completes.
-        same=[]
-        for key,label in ((0x13,'forward'),(0x14,'reverse')):
-            self.action(native_page=8,direction=0);settled()
-            self.input(0x11,key);settled()
-            for _ in range(count-1):self.input(0x11,key);settled()
-            before=self.action(observe=True);assert before['focused'] and before['page']==8
+        # Complete the current offline virtual group before enabling the
+        # explicit onboarding fixture. Native Wi-Fi/account/page filters stay
+        # untouched; all transitions below use the real stock event handler.
+        for _ in range(count):
+            if not settled()['focused']:break
+            self.input(0x11,0x13)
+        assert not settled()['focused']
+        self.action(onboarded=True)
+        self.action(native_page=5,direction=0);settled()
+        trace=[]
+        self.report['native_pet_edge_trace']=trace
+        def turn(key,page,focused,label):
+            self.input(0x11,key)
+            state=settled();trace.append(dict(label=label,key=key,**state))
+            assert state['page']==page and bool(state['focused'])==focused,label
+            return state
+        # Date/Weather/Pet IDs are not a monotonic ring. Pet7->Settings6
+        # used to insert another app, as did Settings6->Power0 on hardware.
+        turn(0x13,7,True,'weather-to-first-template')
+        for i in range(count-1):turn(0x13,7,True,'next-template')
+        exits=[]
+        self.report['native_same_window_exit']=exits
+        def leave(key,page,label):
             state=self.input(0x11,key,sample=True)
-            assert not state['focused'] and state['root_ready']==0 and state['page']==8,label+' same-window exit skipped animation'
-            assert not state['content_hidden'] and not state['image_hidden']
+            exits.append(dict(label=label,exit=state))
+            assert not state['focused'] and state['page']==page and not state['root_ready'],label+' skipped animation'
+            assert not state['content_hidden'] and not state['image_hidden'],label+' hid outgoing app'
             burst=self.input(0x11,key,sample=True)
-            assert burst['root_ready']==0 and not burst['focused'] and burst['page']==8,label+' busy input changed navigation'
-            final=settled();assert not final['focused'] and final['page']==8,label+' exit reentered application'
-            same.append({'direction':label,'before':before,'exit':state,'busy_input':burst,'settled':final})
-        self.report['native_same_window_exit']=same
-        self.action(native_page=8);settled();self.input(0x11,0x13);settled()
+            assert not burst['focused'] and burst['page']==page and not burst['root_ready'],label+' busy key changed navigation'
+            exits[-1]['busy']=burst
+            end=settled();exits[-1]['settled']=end
+            assert end['page']==page and not end['focused'],label+' reentered app'
+        leave(0x13,7,'forward-exit-to-pet')
+        turn(0x13,6,False,'pet-to-settings')
+        # Offline account fixture selects MiHome8 after Settings, then its
+        # onboarding gate blocks rotation. Prepare Settings with the original
+        # page API to test the reverse stock edge independently of that gate.
+        turn(0x13,8,False,'settings-to-next-stock-page')
+        self.action(native_page=6,direction=0);settled()
+        turn(0x14,7,False,'settings-to-pet')
+        # Reverse Pet follows the original availability filter (Weather5
+        # when paired, Power0 in this offline fixture).
+        self.input(0x11,0x14);entry=settled()
+        trace.append(dict(label='pet-to-last-template',key=0x14,**entry))
+        assert entry['focused'] and entry['page']!=7
+        previous=entry['page']
+        for i in range(count-1):turn(0x14,previous,True,'previous-template')
+        leave(0x14,previous,'reverse-exit-to-stock')
+        # The reverse stock neighbour is MiHome8 when offline; its onboarding
+        # gate deliberately blocks further input. Prepare Weather as above,
+        # then re-enter via the original event rather than bypassing that gate.
+        self.action(native_page=5,direction=0);settled()
+        turn(0x13,7,True,'return-through-weather-pet-edge')
         self.report['native_transition_passed']=True
     def slot_probe(self,token,identity):
         def call(method,path,body=b'',expected=200,credential=token):
