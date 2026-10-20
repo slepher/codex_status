@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 use serde_json::{json, Value};
 use bridge_core::platform::model::DeviceIdentity;
+use bridge_core::rendezvous::Budget;
 use bridge_core::platform::wifi::{ConnectionFacts, NetworkObservation, Network, WifiState};
 #[cfg(test)] use bridge_core::platform::wifi::Connection;
 use sha2::{Digest, Sha256};
@@ -134,8 +135,7 @@ pub async fn action(ctx: &AppCtx, mac: &str, op: &str, body: Value) -> Result<Va
             }
             if let Ok(Some(mut link)) = bridge_ble::DeviceConnection::connect(&mac,&ctx.config.token,&ctx.bridge_id).await {
                 recover_on_link(ctx,&mac,&mut link).await;
-                link.close_bounded(bridge_core::rendezvous::CLOSE_BUDGET).await;
-                drop(_device_delivery); drop(_delivery);
+                platform::close_device_ble(link,_device_delivery,_delivery).await;
             }
             let result = svc.wifi_state(&mac).jobs.into_iter().find(|j|j.job_id==job.job_id).unwrap_or(job);
             return serde_json::to_value(result).map_err(|_|"wifi_job_encoding".into());
@@ -152,8 +152,7 @@ pub async fn action(ctx: &AppCtx, mac: &str, op: &str, body: Value) -> Result<Va
                 Ok(()) => note_link(ctx,&mac,&mut link).await,
                 Err(error) => endpoint_feedback(&error),
             };
-            link.close_bounded(bridge_core::rendezvous::CLOSE_BUDGET).await;
-            drop(_device_delivery); drop(_delivery);
+            platform::close_device_ble(link,_device_delivery,_delivery).await;
             return Ok(result);
         }
         "input" => {
@@ -224,8 +223,7 @@ async fn add_device(ctx: &AppCtx, mac: &str) -> Result<Value, String> {
             }
         Ok(json!({"device_mac":mac,"registered":true}))
     }.await;
-    link.close_bounded(bridge_core::rendezvous::CLOSE_BUDGET).await;
-    drop(_device_delivery); drop(_delivery);
+    platform::close_device_ble(link,_device_delivery,_delivery).await;
     result
 }
 
@@ -234,11 +232,12 @@ pub async fn view(ctx: &AppCtx, mac: &str, refresh: bool) -> Result<Value, Strin
     let queued = if refresh { Some(action(ctx, &mac, "get", json!({})).await?) } else { None };
     let (host, permissions) = tokio::task::spawn_blocking(|| (host_wifi::read(false), host_wifi::permissions(0))).await.map_err(|_| "host_network_unavailable")?;
     let _ = platform::service(ctx).wifi_expire(&mac, crate::device_now_secs(&mac).max(0) as u64);
-    let state = platform::service(ctx).wifi_state(&mac);
+    let mut state = platform::service(ctx).wifi_state(&mac);
+    let history=platform::service(ctx).wifi_archived_jobs(&mac).map_err(|_|"wifi_history_unavailable")?;
     let result=state.jobs.iter().rev().find(|j|matches!(j.kind.as_str(),"trial"|"activate"))
         .map(control_projection).unwrap_or_else(||json!({"stage":"idle"}));
-    let target=current_target(&state,&host);
-    let matched=target.map(|n|n.network_id.as_str());
+    let target=current_target(&state,&host).cloned();
+    let matched=target.as_ref().map(|n|n.network_id.as_str());
     let connection=host_wifi::current_ssid(&host).and_then(|ssid|state.matching_connection(ssid))
         .map(|c|c.view(crate::device_now_secs(&mac).max(0) as u64,&state.jobs));
     let result_pending=state.jobs.iter().any(|j|j.blocks_mutations());
@@ -247,6 +246,8 @@ pub async fn view(ctx: &AppCtx, mac: &str, refresh: bool) -> Result<Value, Strin
             if result_pending&&c.automatic_state()=="retry_exhausted" {"awaiting_confirmation"} else {c.automatic_state()}
         } else {"waiting_for_window"};
     for j in state.jobs.iter().filter(|j| j.terminal()) { ctx.wifi_inputs.lock().unwrap().remove(&j.job_id); }
+    // Terminal history is display-only; it never re-enters execution admission.
+    state.jobs.splice(0..0,history.into_iter().rev());
     Ok(json!({"device_mac":mac,"online":platform::service(ctx).device_get(&mac).map(|d|json!({"presence":d["last_authenticated"]["body"]["presence"],"transports":d["last_authenticated"]["body"]["transports"],"wifi_control":d["last_authenticated"]["body"]["wifi_control"],"observed_at":d["last_authenticated"]["observed_at"],"boot_id":d["last_authenticated"]["body"]["boot_id"],"status_seq":d["last_authenticated"]["body"]["status_seq"]})),"host":host,"permissions":permissions,"result":result,"automatic_state":auto_state,
         "matched_network_id":matched,"matched_target":target,"connection":connection,"differences":state.differences(),"wifi":state,"queued":queued}))
 }
@@ -270,6 +271,15 @@ fn target_query(target: &Network) -> Value {
     let mut query=json!({"network_id":target.network_id,"metadata_key":format!("{:x}",fingerprint.finalize()),"open":target.credential=="open"});
     if let Some(password)=&target.password {query["credential_key"]=json!(format!("{:x}",Sha256::digest(password.as_bytes())));}
     query
+}
+pub(crate) async fn plan_network(ctx: &AppCtx, mac: &str, address: std::net::Ipv4Addr, budget: Budget) -> Result<Value, String> {
+    let host=tokio::time::timeout(budget.remaining(),current_host(ctx)).await.map_err(|_|"host_wifi_timeout")?;
+    let state=platform::service(ctx).wifi_state(mac);
+    let target=current_target(&state,&host).ok_or("network_mapping_required")?;
+    let network=json!({"v":bridge_core::template::PLAN_ACTIVATION_VERSION,
+        "bridge_addr":address.to_string(),"bridge_port":ctx.config.port,"target":target_query(target)});
+    bridge_core::template::validate_plan_activation(&network).map_err(|_|"plan_network_shape")?;
+    Ok(network)
 }
 fn current_input_key(mac:&str,target:&Network,revision:u64)->String {
     format!("current:{mac}:{}:{revision}",target.network_id)
@@ -354,10 +364,11 @@ pub async fn prepare_connection(ctx:&AppCtx,mac:&str,link:&mut bridge_ble::Devic
     }
     Ok(())
 }
-pub fn http_ready(ctx:&AppCtx,mac:&str) {
+pub fn http_ready(ctx:&AppCtx,mac:&str,status:&Value,at:u64) {
+    if !status["boot_id"].is_string() {return;}
     let state=platform::service(ctx).wifi_state(mac);
     if let Some(mut c)=state.connection_facts.filter(|c|c.local_revision==state.local_revision) {
-        c.note_http(observed_boot(ctx,mac),crate::device_now_secs(mac).max(0) as u64,None);
+        c.note_http(status["boot_id"].to_string(),at,None);
         let _=platform::service(ctx).wifi_set_connection(mac,c);
     }
 }
@@ -485,7 +496,11 @@ pub async fn automatic_on_link(ctx: &AppCtx,mac:&str,link:&mut bridge_ble::Devic
                 if current.sent { "result_unknown" } else { "wifi_not_dispatched" }.into()));
         }
         if !was_sent {
-            connection.attempts+=1;connection.next_attempt_at=now+60;connection.requested=false;connection.contact=None;connection.admission_error=None;
+            // The exchange can update boot/contact facts; merge policy into the latest view.
+            connection=svc.wifi_state(mac).connection_facts
+                .filter(|c|c.local_revision==state.local_revision && c.network_id==target.network_id)
+                .ok_or("local_revision_conflict")?;
+            connection.attempts+=1;connection.next_attempt_at=now+60;connection.requested=false;connection.admission_error=None;
             svc.wifi_set_connection(mac,connection).map_err(|_|"persistence_failed".to_owned())?;
         }
         return Ok(());

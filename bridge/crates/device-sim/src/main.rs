@@ -64,6 +64,7 @@ struct SimState {
     wifi: Arc<Mutex<SimWifi>>,
     report_ip: Ipv4Addr,
     ready_report: Arc<Mutex<Option<Value>>>,
+    plan_activation: Arc<Mutex<Option<Value>>>,
 }
 
 struct SimWifi {
@@ -827,6 +828,7 @@ fn rotate_session(state: &SimState) -> Result<SimSession> {
 
 fn reboot_device(state: &SimState, cause: &str) -> Result<SimSession> {
     *state.ready_report.lock().unwrap() = None;
+    *state.plan_activation.lock().unwrap() = None;
     // Deep/button wakes retain the ROM's last-contact RTC fact. Resetting it
     // here would make every no-Data Sleep rendezvous forget Bridge freshness.
     let contact = if matches!(cause,"deep"|"button") {
@@ -2287,6 +2289,16 @@ async fn plan_impl(state: SimState, request: Request<Body>, gate: bool) -> Respo
     }
     if let Some(current) = state.owner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
         .owner.as_mut() { current.last_seen = now_s; }
+    let payload:Value=serde_json::from_str(message).unwrap_or(Value::Null);
+    let activation=if let Some(network)=payload.get("network") {
+        if gate {return Json(json!({"result":"rejected","error":"plan_network_transport"})).into_response();}
+        let previous=state.plan_activation.lock().unwrap().clone();
+        match bridge_render::simulator_plan_network(payload["plan_id"].as_u64().unwrap_or(0),
+            previous.as_ref().map(|p|(p["plan_id"].as_u64().unwrap_or(0),&p["network"])),network) {
+            Ok(network)=>Some(network),
+            Err(error)=>return Json(json!({"result":"rejected","error":error.to_string()})).into_response(),
+        }
+    } else {None};
     let decision = match state
         .plan
         .lock()
@@ -2314,6 +2326,19 @@ async fn plan_impl(state: SimState, request: Request<Body>, gate: bool) -> Respo
     ) {
         Ok(mut ack) => {
             if ack["result"] == "applied" {
+                if let Some(network)=activation {
+                    let mut admitted=state.plan_activation.lock().unwrap();
+                    if admitted.as_ref().is_none_or(|p|p["plan_id"]!=payload["plan_id"]) {
+                        *admitted=Some(json!({"plan_id":payload["plan_id"],"network":network}));
+                        let mut report=payload.clone();
+                        report["bridge_addr"]=network["bridge_addr"].clone();report["bridge_port"]=network["bridge_port"].clone();
+                        report["origin_request_no"]=payload["plan_id"].clone();
+                        *state.ready_report.lock().unwrap()=Some(report);
+                        let now=clock.monotonic_ms;
+                        let mut rv=state.rendezvous.lock().unwrap();rv.plan_received();rv.await_network(now,now+90000);
+                    }
+                    ack["network"]=json!({"result":"admitted"});
+                }
                 let mut bundle = state.bundle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if bundle.set_wall_secs((clock.wall_ms / 1000) as i64).is_err()
                     || bundle.note_bridge_contact().is_err() {
@@ -2357,7 +2382,7 @@ async fn sim_ble_info(State(state): State<SimState>, request: Request<Body>) -> 
     let bytes = match bridge_render::simulator_ble_wire("info", &json!({
         "mac":state.mac,"ip":"127.0.0.1","fw":fw,"peerBonded":true,"peerEncrypted":true,
         "wake_generation":generation,"wake_seq":power.wake_count,"bundle_configured":power.configured,
-        "wifi_setup_protocol":1,"wifi_management":3,"wifi_connection":1,"rf_remaining_ms":power.ble_window_until_ms.map(|until| until.saturating_sub(clock.monotonic_ms))})) {
+        "wifi_setup_protocol":1,"wifi_management":3,"wifi_connection":1,"plan_activation":1,"rf_remaining_ms":power.ble_window_until_ms.map(|until| until.saturating_sub(clock.monotonic_ms))})) {
         Ok(bytes) => bytes, Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     let connect = request.uri().query().is_some_and(|q| q == "connect=1");
@@ -2466,6 +2491,25 @@ async fn sim_ready_reports(state: SimState) {
         if clock_snapshot(&state).is_some_and(|clock| state.rendezvous.lock().unwrap().deadline()<=clock.monotonic_ms) {
             *state.ready_report.lock().unwrap()=None;
             continue;
+        }
+        if intent["network"].is_object() {
+            if state.ble.lock().unwrap().connected {continue;}
+            if let Some(clock)=clock_snapshot(&state) {
+                let matches=state.wifi.lock().unwrap().engine.plan_matches(&intent["network"]["target"]).unwrap_or(false);
+                if !matches {
+                    *state.ready_report.lock().unwrap()=None;
+                    state.ble.lock().unwrap().events.push_back(json!({"event":"network_failed","error":"plan_network_target_mismatch"}));
+                    continue;
+                }
+                let (_,_,_,granted,accepted_at)=state.plan.lock().unwrap().status_fields();
+                let power=state.power.lock().unwrap().clone();
+                let mut rv=state.rendezvous.lock().unwrap();
+                if rv.phase()==1 {
+                    let until=power.boot_ms+accepted_at+granted as u64*1000;
+                    let until=until.max(if power.sync_open {power.sync_opened_at_ms+90000}else{0});
+                    rv.admit_http(clock.monotonic_ms,until);
+                }
+            }
         }
         let request = Request::builder().uri("/api/status")
             .header(header::AUTHORIZATION, format!("Bearer {}", state.endpoint_token))
@@ -3522,6 +3566,7 @@ async fn main() -> Result<()> {
         })),
         report_ip: match options.listen.ip() { IpAddr::V4(ip) => ip, _ => unreachable!() },
         ready_report: Arc::new(Mutex::new(None)),
+        plan_activation: Arc::new(Mutex::new(None)),
     };
     let listener = tokio::net::TcpListener::bind(options.listen)
         .await

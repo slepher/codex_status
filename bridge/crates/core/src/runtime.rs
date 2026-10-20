@@ -32,6 +32,17 @@ pub struct PollerConfig {
     pub active_hold_seconds: u64,
     /// v0.14 activity tracker (usage_rev / last_change_at for mode decisions).
     pub activity: Arc<Activity>,
+    /// Successful source reads wake the app's delivery scheduler.
+    pub snapshot_ready: Option<Arc<tokio::sync::Notify>>,
+}
+
+async fn wait_for_source_refresh(signal: &tokio::sync::Notify, interval_secs: u64) {
+    tokio::select! {
+        _ = tokio::time::sleep(Duration::from_secs(interval_secs.clamp(1, 60))) => {}
+        _ = signal.notified() => {
+            tracing::info!("rate limit update notification: refreshing now");
+        }
+    }
 }
 
 pub async fn run_poller(cfg: PollerConfig, envelope: Arc<RwLock<Option<Value>>>) -> Result<()> {
@@ -95,7 +106,7 @@ pub async fn run_poller(cfg: PollerConfig, envelope: Arc<RwLock<Option<Value>>>)
                                         bridge_host_id: cfg.host_id.clone(),
                                         bridge_host: cfg.bridge_host.clone(),
                                         bridge_port: cfg.bridge_port,
-                                        next_sync_seconds: cfg.interval_secs,
+                                        next_sync_seconds: cfg.interval_secs.clamp(1, 60),
                                         templates: template_refs,
                                         active_hold_seconds: cfg.active_hold_seconds,
                                     };
@@ -107,6 +118,9 @@ pub async fn run_poller(cfg: PollerConfig, envelope: Arc<RwLock<Option<Value>>>)
                                         );
                                     }
                                     *envelope.write().await = Some(next_envelope);
+                                    if let Some(ready) = &cfg.snapshot_ready {
+                                        ready.notify_one();
+                                    }
                                     tracing::info!("usage refreshed");
                                 }
                                 Err(e) => {
@@ -117,13 +131,8 @@ pub async fn run_poller(cfg: PollerConfig, envelope: Arc<RwLock<Option<Value>>>)
                             // Event-driven primary path: the app-server pushes a
                             // rolling rate-limit update when quota changes, so
                             // refresh immediately. The interval is only the
-                            // fallback heartbeat (default 3 min).
-                            tokio::select! {
-                                _ = tokio::time::sleep(Duration::from_secs(cfg.interval_secs)) => {}
-                                _ = rate_limit.notified() => {
-                                    tracing::info!("rate limit update notification: refreshing now");
-                                }
-                            }
+                            // fallback heartbeat (at most one minute).
+                            wait_for_source_refresh(&rate_limit, cfg.interval_secs).await;
                         }
                     }
                     Err(e) => tracing::warn!("initialize: {e}"),
@@ -148,5 +157,32 @@ pub async fn run_poller(cfg: PollerConfig, envelope: Arc<RwLock<Option<Value>>>)
         }
         tokio::time::sleep(Duration::from_secs(backoff)).await;
         backoff = (backoff * 2).min(30);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn source_notification_is_immediate_and_fallback_is_one_minute() {
+        let signal = tokio::sync::Notify::new();
+        // A notification arriving between RPC completion and the wait is retained.
+        signal.notify_one();
+        let now = tokio::time::Instant::now();
+        wait_for_source_refresh(&signal, 180).await;
+        assert_eq!(now.elapsed(), Duration::ZERO);
+        // Old saved/configured 180-second intervals cannot retain the regression.
+        wait_for_source_refresh(&signal, 180).await;
+        assert_eq!(now.elapsed(), Duration::from_secs(60));
+        let wait = wait_for_source_refresh(&signal, 60);
+        tokio::pin!(wait);
+        tokio::select! {
+            _ = &mut wait => panic!("fallback fired before notification"),
+            _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+        }
+        signal.notify_one();
+        wait.await;
+        assert_eq!(now.elapsed(), Duration::from_secs(70));
     }
 }

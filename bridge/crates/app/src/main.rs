@@ -1243,7 +1243,7 @@ async fn ready_report(axum::extract::State(ctx):axum::extract::State<Arc<AppCtx>
         let now=device_now_secs(&mac).max(0) as u64;
         if platform::service(&ctx).note_device_status_at(&mac,&status,"http",now).is_err() ||
             platform::service(&ctx).note_authenticated_status_at(&mac,&status,now).is_err() {return;}
-        crate::wifi::http_ready(&ctx,&mac);
+        crate::wifi::http_ready(&ctx,&mac,&status,now);
         let _=platform::revalidate_registered_device_endpoint(&ctx,&mac,&device_ip).await;
         crate::wifi::opportunity_locked(&ctx,&mac).await;
     });
@@ -3389,6 +3389,95 @@ async fn device_status_poll_loop(ctx: Arc<AppCtx>) {
     }
 }
 
+/// New work is dispatched on its first opportunity. Only unconfirmed work
+/// shares the six-maintenance-tick retry gate.
+fn first_delivery_pending(summary: &Value, attempted_activation: Option<&str>) -> bool {
+    match summary["job"]["state"].as_str() {
+        Some("waiting") => return true,
+        Some("sending" | "unknown") => return false,
+        _ => {}
+    }
+    if let Some(id) = summary["pending_activate"].as_str() {
+        return Some(id) != attempted_activation;
+    }
+    summary["in_flight"].is_null()
+        && (summary["push_dirty"] == true || summary["full_sync_due"] == true)
+}
+
+async fn platform_sync_loop(ctx: Arc<AppCtx>, snapshot_ready: Arc<Notify>) {
+    let auto_deliver = std::env::var("CODEX_STATUS_PLATFORM_AUTODELIVER")
+        .map(|v| v != "0").unwrap_or(true);
+    let mut timer = tokio::time::interval(Duration::from_secs(10));
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    timer.tick().await; // The first maintenance tick is ten seconds from startup.
+    let mut tick = 0u64;
+    let mut source_pending = true;
+    // One coalescing mailbox per device: slow HTTP cannot hold up source
+    // ingestion, another MAC, or create an unbounded queue of delivery tasks.
+    let mut workers = HashMap::<String, tokio::sync::watch::Sender<u64>>::new();
+    loop {
+        let maintenance = tokio::select! {
+            _ = timer.tick() => { tick += 1; true },
+            _ = snapshot_ready.notified() => false,
+        };
+        source_pending |= !maintenance;
+        if ctx.status.lock().unwrap().paused { continue; }
+        if source_pending {
+            if let Some(env) = ctx.envelope.read().await.clone() {
+                platform::note_envelope(&ctx, &env);
+                source_pending = false;
+            }
+        }
+        let devices = automatic_devices(&ctx);
+        workers.retain(|mac, sender| !sender.is_closed() && devices.iter().any(|d| d["device_mac"] == *mac));
+        let targets = {
+            let cache = ctx.device_status_cache.lock().unwrap();
+            device_cycle_targets(&devices, &cache, maintenance && tick % 6 == 0)
+        };
+        for mac in targets {
+            if let Some(sender) = workers.get(&mac) {
+                sender.send_replace(tick);
+                continue;
+            }
+            let (sender, mut work) = tokio::sync::watch::channel(tick);
+            workers.insert(mac.clone(), sender);
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                let mut last_tick = None;
+                let mut last_delivery_tick = tick;
+                let mut attempted_activation = None;
+                loop {
+                    let tick = *work.borrow_and_update();
+                    let maintenance = last_tick != Some(tick);
+                    last_tick = Some(tick);
+                    if !ctx.status.lock().unwrap().paused
+                        && platform::device_link_for_mac(&ctx, &mac).is_some() {
+                        let summary = platform::service(&ctx).coordinator_summary(
+                            &mac, scheduled_now(&mac, now_secs()).max(0) as u64)
+                            .unwrap_or(Value::Null);
+                        let deliver_now = auto_deliver && (first_delivery_pending(
+                            &summary, attempted_activation.as_deref())
+                            || (maintenance && tick.saturating_sub(last_delivery_tick) >= 6));
+                        let refresh = (maintenance && tick > 0 && tick % 3 == 0) || {
+                            let cache = ctx.device_status_cache.lock().unwrap();
+                            cache.get(&mac).is_none_or(|status| !device_status_fresh(
+                                &mac, status, scheduled_now(&mac, now_secs()), 30))
+                        };
+                        platform::cycle(&ctx, &mac, refresh, deliver_now).await;
+                        if deliver_now {
+                            last_delivery_tick = tick;
+                            attempted_activation = platform::service(&ctx).coordinator_summary(
+                                &mac, scheduled_now(&mac, now_secs()).max(0) as u64)
+                                .and_then(|s| s["pending_activate"].as_str().map(str::to_owned));
+                        }
+                    }
+                    if work.changed().await.is_err() { break; }
+                }
+            });
+        }
+    }
+}
+
 async fn run_services(ctx: Arc<AppCtx>) {
     // A missing codex.exe must not block HTTP/MCP/BLE: the poller re-discovers
     // the CLI itself (Codex auto-upgrades move the binary).
@@ -3429,6 +3518,7 @@ async fn run_services(ctx: Arc<AppCtx>) {
         return;
     }
 
+    let snapshot_ready = Arc::new(Notify::new());
     let poller = PollerConfig {
         exe,
         codex_override: ctx.config.codex_path.clone(),
@@ -3439,6 +3529,7 @@ async fn run_services(ctx: Arc<AppCtx>) {
         templates: ctx.library.clone(),
         active_hold_seconds: ctx.config.active_hold_seconds,
         activity: ctx.activity.clone(),
+        snapshot_ready: Some(snapshot_ready.clone()),
     };
     tokio::spawn(run_poller(poller, ctx.envelope.clone()));
 
@@ -3451,75 +3542,14 @@ async fn run_services(ctx: Arc<AppCtx>) {
         tokio::spawn(async move { device_status_poll_loop(status_ctx).await });
     }
 
-    // platform loop: feed the Codex envelope into the DataSource and run one
-    // coordinator delivery per device on a bounded cadence. Never used to renew
-    // a light window (only data/publish/render actions trigger work).
-    {
-        let ctx = ctx.clone();
-        // Automatic delivery can be disabled for a debugging session
-        // (explicit publish/activate still delivers). Automatic attempts are
-        // throttled to one per minute so a device that hangs on install is not
-        // hammered every cycle.
-        let auto_deliver = std::env::var("CODEX_STATUS_PLATFORM_AUTODELIVER")
-            .map(|v| v != "0")
-            .unwrap_or(true);
-        tokio::spawn(async move {
-            let mut last_stamp = 0u64;
-            let mut tick = 0u64;
-            loop {
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                tick += 1;
-                if ctx.status.lock().unwrap().paused {
-                    continue;
-                }
-                {
-                    let envelope = ctx.envelope.read().await.clone();
-                    if let Some(env) = envelope {
-                        let stamp = env.get("server_time").and_then(|v| v.as_u64()).unwrap_or(0);
-                        if stamp != last_stamp {
-                            last_stamp = stamp;
-                            platform::note_envelope(&ctx, &env);
-                        }
-                    }
-                }
-                let devices = automatic_devices(&ctx);
-                let targets = {
-                    let cache = ctx.device_status_cache.lock().unwrap();
-                    device_cycle_targets(&devices, &cache, tick % 6 == 0)
-                };
-                for target_mac in targets {
-                    if platform::device_link_for_mac(&ctx, &target_mac).is_none() {
-                        continue;
-                    }
-                    if ctx.status.lock().unwrap().paused {
-                        break;
-                    }
-                    let refresh = tick % 3 == 0 || {
-                        let cache = ctx.device_status_cache.lock().unwrap();
-                        cache.get(&target_mac).is_none_or(|status|
-                            !device_status_fresh(&target_mac, status,
-                                scheduled_now(&target_mac, now_secs()), 30))
-                    };
-                    platform::cycle(
-                        &ctx,
-                        &target_mac,
-                        refresh,
-                        auto_deliver && tick % 6 == 0,
-                    )
-                    .await;
-                }
-            }
-        });
-    }
+    tokio::spawn(platform_sync_loop(ctx.clone(), snapshot_ready));
 
     // Only registered MACs enter the current rendezvous protocol. UDP hints
     // do not authorize writes; an unknown advertisement never triggers a fallback
     // endpoint write or implicit registration.
     // Preserve the 250 ms cadence and per-device attempt throttling.
     let mut last_device_attempt = HashMap::<String, i64>::new();
-    let mut ble_recovery = None;
     loop {
-        watchdog::recover_ble(&mut ble_recovery, bridge_ble::native_quarantined());
         if ctx.status.lock().unwrap().paused {
             tokio::time::sleep(Duration::from_secs(2)).await;
             continue;
@@ -3839,7 +3869,7 @@ fn main() {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             let _ = ctx_setup.app_handle.set(app.handle().clone());
             app.manage(ctx_setup.clone());
-            tauri::async_runtime::spawn(run_services(ctx_setup.clone()));
+            tauri::async_runtime::spawn(watchdog::supervise_services(run_services(ctx_setup.clone())));
             tauri::async_runtime::spawn(mcp_serve(ctx_setup.clone()));
 
             let open = MenuItem::with_id(app, "open", "打开面板", true, None::<&str>)?;
@@ -4187,6 +4217,24 @@ mod device_status_cache_tests {
     };
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn new_work_bypasses_retry_gate_but_unconfirmed_data_does_not() {
+        use super::first_delivery_pending;
+        let mut summary = json!({"push_dirty":true,"in_flight":null});
+        assert!(first_delivery_pending(&summary, None));
+        summary["in_flight"] = json!({"seq":42,"attempts":1});
+        assert!(!first_delivery_pending(&summary, None));
+        // A new source value cannot replace a pinned, unconfirmed transaction.
+        summary["push_fp"] = json!(1234);
+        assert!(!first_delivery_pending(&summary, None));
+        assert!(first_delivery_pending(&json!({"job":{"state":"waiting"}}), None));
+        assert!(!first_delivery_pending(&json!({"job":{"state":"sending"}}), None));
+        assert!(!first_delivery_pending(&json!({"job":{"state":"sending"},"push_dirty":true}), None));
+        assert!(first_delivery_pending(&json!({"pending_activate":"a"}), None));
+        assert!(!first_delivery_pending(&json!({"pending_activate":"a"}), Some("a")));
+        assert!(!first_delivery_pending(&json!({"pull_only_change":true}), None));
+    }
 
     #[test]
     fn cycle_targets_use_registered_mac_status_and_ignore_current_selection() {

@@ -325,6 +325,26 @@ static String wifiMetadataKey(const WifiNetwork &network, const char *label, boo
     for(size_t i=0;i<32;++i){text[2*i]=hex[hash[i]>>4];text[2*i+1]=hex[hash[i]&15];}text[64]=0;
     return String(text);
 }
+static bool wifiTargetMatches(const WifiNetwork &network, JsonVariantConst target) {
+    if (!target["open"].is<bool>()) return false;
+    const bool open=target["open"].as<bool>();
+    bool matches=String(network.id.c_str())==(target["network_id"]|"") &&
+        wifiMetadataKey(network,network.label.c_str(),open)==(target["metadata_key"]|"") &&
+        (!open || !*network.password);
+    if (!target["credential_key"].isNull()) {
+        uint8_t digest[32]; char hex[65]; const char *password=network.password;
+        mbedtls_sha256((const uint8_t *)password,strlen(password),digest,0);
+        static const char digits[]="0123456789abcdef";
+        for (size_t i=0;i<32;++i) {hex[2*i]=digits[digest[i]>>4];hex[2*i+1]=digits[digest[i]&15];}hex[64]=0;
+        matches=matches && String(target["credential_key"]|"")==hex;
+    }
+    return matches;
+}
+bool wifiPlanTargetMatches(JsonVariantConst target) {
+    if (!storeReady || wifiStorageUncertain) return false;
+    if (running && deferredSelection) return wifiTargetMatches(candidate,target);
+    return *wifiStore.active.id && wifiTargetMatches(*wifiStore.activeCredentials(),target);
+}
 String wifiSetupCommand(JsonDocument &doc, const String &peer, uint32_t generation,
                         uint64_t now, uint64_t physicalUntil, uint64_t lightUntil,
                         bool selectAllowed) {
@@ -348,20 +368,8 @@ String wifiSetupCommand(JsonDocument &doc, const String &peer, uint32_t generati
         out["device_mac"] = doc["device_mac"]; out["ok"] = true; out["network_id"] = networkId;
         out["version"] = slot < 0 ? 0 : schemes.networks[slot].version;
         if (!doc["open"].is<bool>() || String(doc["metadata_key"] | "").length()!=64) return reply(doc,"shape");
-        bool open = doc["open"].as<bool>();
-        bool matches = slot >= 0 && wifiMetadataKey(schemes.networks[slot],schemes.networks[slot].label.c_str(),open) == (doc["metadata_key"] | "") &&
-            (!open || !*schemes.networks[slot].password);
-        if(!doc["credential_key"].isNull()) {
-            String key=doc["credential_key"] | "";
-            if(key.length()!=64)return reply(doc,"shape");
-            if(slot>=0) {
-                uint8_t digest[32];char hex[65];const char *password=schemes.networks[slot].password;
-                mbedtls_sha256((const uint8_t *)password,strlen(password),digest,0);
-                static const char digits[]="0123456789abcdef";
-                for(size_t i=0;i<32;++i){hex[2*i]=digits[digest[i]>>4];hex[2*i+1]=digits[digest[i]&15];}hex[64]=0;
-                matches=matches&&key==hex;
-            }
-        }
+        if (!doc["credential_key"].isNull() && String(doc["credential_key"]|"").length()!=64) return reply(doc,"shape");
+        bool matches=slot>=0 && wifiTargetMatches(schemes.networks[slot],doc.as<JsonVariantConst>());
         out["matches"] = matches;
         bool active = slot >= 0 && String(schemes.networks[slot].bond) == wifiStore.active.bond && String(networkId) == wifiStore.active.id &&
             wifiStore.activeVersion == schemes.networks[slot].version;

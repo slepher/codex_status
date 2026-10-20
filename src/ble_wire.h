@@ -12,6 +12,7 @@ struct BleInfoSnapshot {
     uint8_t wifiManagement = 0;
     uint8_t wifiConnection = 0;
     uint8_t bleClaim = 0;
+    uint8_t planActivation = 0;
 };
 struct BleStatusSnapshot {
     String mac, nonce, context, activeTemplate, job;

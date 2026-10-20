@@ -444,6 +444,7 @@ extern "C" {
     fn codex_sim_wifi_constrain(now:u64,until:u64,owner_allowed:c_int);
     fn codex_sim_wifi_storage_status(out:*mut c_char,cap:c_int)->c_int;
     fn codex_sim_wifi_observe(out:*mut c_char,cap:c_int)->c_int;
+    fn codex_sim_wifi_plan_matches(target:*const c_char)->c_int;
 
     #[cfg(test)]
     fn codex_sync_core_check() -> c_int;
@@ -1037,6 +1038,20 @@ pub struct SimulatorPlan {
     accepted: Option<(u64, String, u64, u32)>,
 }
 
+/// Validate/freeze with the ROM's exact activation parser and replay fence.
+pub fn simulator_plan_network(id:u64, prior:Option<(u64,&serde_json::Value)>, network:&serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    unsafe extern "C" {fn codex_plan_network_prepare(id:u64,prior_id:u64,prior:*const c_char,network:*const c_char,out:*mut c_char,cap:c_int)->c_int;}
+    let prior_id=prior.map_or(0,|p|p.0);
+    let prior=CString::new(prior.map_or_else(String::new,|p|p.1.to_string()))?;
+    let network=CString::new(network.to_string())?;
+    let mut out=vec![0u8;512];
+    let n=unsafe {codex_plan_network_prepare(id,prior_id,prior.as_ptr(),network.as_ptr(),out.as_mut_ptr().cast(),out.len() as c_int)};
+    anyhow::ensure!(n>0,"plan_network_encode");
+    let reply:serde_json::Value=serde_json::from_slice(&out[..n as usize])?;
+    anyhow::ensure!(reply["error"].is_null(),"{}",reply["error"].as_str().unwrap_or("plan_network_shape"));
+    Ok(reply["network"].clone())
+}
+
 unsafe impl Send for SimulatorPlan {}
 
 impl SimulatorPlan {
@@ -1602,6 +1617,10 @@ impl SimulatorWifi {
         let mut out=vec![0i8;2048];let rc=unsafe{codex_sim_wifi_observe(out.as_mut_ptr(),out.len() as c_int)};
         simulator_ffi_json(rc,&out,"wifi_observe")
     }
+    pub fn plan_matches(&self,target:&serde_json::Value)->anyhow::Result<bool> {
+        let target=CString::new(target.to_string())?;
+        Ok(unsafe{codex_sim_wifi_plan_matches(target.as_ptr())}==1)
+    }
 }
 
 #[test]
@@ -1843,6 +1862,11 @@ fn physical_ble_hold_finishes_wifi_activation_without_starting_deferred_rf() {
     // Ordinary BLE defers a NEW association, then permits it after release.
     assert_eq!(sim.control(&activation("deferred"),"test","bond",1,1400,300000,0,true,true).unwrap()["ok"],true);
     assert!(sim.poll_with_start_allowed(1500,"bond",1,true,0,false).unwrap());
+    // SHA256 of Host\0Device\0\0 followed by the open-network byte 1.
+    let mut target=serde_json::json!({"network_id":"home","open":true,"metadata_key":"b733bca5c43500f3fcfd520711c18f89d0e4ea05ab1ce7b4cf6c23be82b656e2"});
+    assert!(sim.plan_matches(&target).unwrap(),"Plan matches the authorized deferred configuration before RF starts");
+    target["metadata_key"]=serde_json::json!("0".repeat(64));
+    assert!(!sim.plan_matches(&target).unwrap(),"Plan must not connect a different configuration");
     assert_eq!(sim.control(&serde_json::json!({"op":"result","bridge_id":"test","request_id":"query2","query_id":"deferred","device_mac":"AABBCCDDEEFF"}),"test","bond",1,1600,300000,0,true,true).unwrap()["outcome"],"accepted");
     assert!(!sim.poll_with_start_allowed(1700,"bond",1,false,1,true).unwrap());
     std::fs::remove_dir_all(dir).unwrap();

@@ -46,7 +46,7 @@ fn production_info_and_all_ack_classes_are_bounded() {
     let info = wire("info", &json!({"mac":"AA:BB:CC:DD:EE:FF","ip":"255.255.255.255",
         "fw":"\u{1}".repeat(64),"wake_generation":u32::MAX,"wake_seq":u32::MAX,
         "pairingWindow":true,"peerBonded":true,"peerEncrypted":true,"bundle_configured":true,
-        "wifi_setup_protocol":255,"wifi_management":2,"wifi_connection":1,"rf_remaining_ms":u32::MAX-1})).unwrap();
+        "wifi_setup_protocol":255,"wifi_management":2,"wifi_connection":1,"plan_activation":1,"rf_remaining_ms":u32::MAX-1})).unwrap();
     assert_eq!(serde_json::from_slice::<Value>(&info).unwrap()["wc"],1);
     println!("max INFO bytes={}", info.len());
     assert!(info.len() <= 512);
@@ -97,6 +97,23 @@ fn final_attribute_boundary_is_511_512_and_513_encoded_bytes() {
         assert_eq!(result.is_ok(), size <= 512);
         if let Ok(raw) = result { assert_eq!(raw.len(), size); }
     }
+}
+
+#[test]
+fn joint_plan_data_activation_ack_fits_compact_frame() {
+    let input=json!({"ack":"command","op":"plan","request_id":"rffffffffffffffff",
+        "result":"applied","display_state":"unchanged","retention":"nvs",
+        "plan_id":u64::MAX,"accepted_remaining_s":600,"active_context_id":"a".repeat(32),
+        "network":{"result":"admitted"},"data":{"result":"applied","display_state":"displayed",
+            "data_seq":u64::MAX,"active_context_id":"a".repeat(32)},
+        "wake_generation":u32::MAX,"wake_seq":u32::MAX});
+    let raw=wire("reply",&input).unwrap();
+    assert!(raw.len()+48<=512,"joint ACK frame bytes={}",raw.len()+48);
+    let reply:Value=serde_json::from_slice(&raw).unwrap();
+    assert_eq!(reply["network"]["result"],"admitted");
+    assert_eq!(reply["data"]["data_seq"],u64::MAX);
+    let info=wire("info",&json!({"mac":"AA:BB:CC:DD:EE:FF","ip":"192.168.1.1","fw":"0.18.106-note4","plan_activation":1})).unwrap();
+    assert_eq!(serde_json::from_slice::<Value>(&info).unwrap()["plan_activation"],1);
 }
 #[test]
 fn invalid_identity_is_not_echoed_and_oversize_is_unknown_after_execution() {

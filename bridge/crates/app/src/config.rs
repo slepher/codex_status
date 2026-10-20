@@ -39,7 +39,7 @@ impl Default for Config {
             token: "test-token-123".to_string(),
             templates: data.join("templates"),
             seeds: bridge_core::paths::seed_templates(),
-            interval_secs: 180,
+            interval_secs: 60,
             ble_interval_secs: 300,
             mcp_port: 8766,
             device_ip: "192.168.1.50".to_string(),

@@ -41,6 +41,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/battery_display_test.cpp");
     println!("cargo:rerun-if-changed=../../../src/status_pages.h");
     println!("cargo:rerun-if-changed=../../../src/network_display_state.h");
+    println!("cargo:rerun-if-changed=../../../src/plan_activation.h");
     println!("cargo:rerun-if-changed=src/sim_status.cpp");
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let root = manifest.join("../../..");

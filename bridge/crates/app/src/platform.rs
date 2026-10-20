@@ -55,6 +55,17 @@ pub(super) fn delivery_lock(ctx: &AppCtx, mac: &str) -> Arc<DeliveryLock> {
         .or_insert_with(|| Arc::new(DeliveryLock::default())).clone()
 }
 
+/// HTTP may proceed while the bounded disconnect still owns the native radio.
+pub(crate) async fn close_device_ble(
+    link: bridge_ble::DeviceConnection,
+    device: tokio::sync::OwnedMutexGuard<()>,
+    radio: tokio::sync::MutexGuard<'_, ()>,
+) {
+    drop(device);
+    link.close_bounded(bridge_core::rendezvous::CLOSE_BUDGET).await;
+    drop(radio);
+}
+
 /// Known-device maintenance never reserves the shared radio while waiting for
 /// an HTTP worker. Both permit waits consume the same admission deadline.
 pub(crate) async fn lock_device_ble<'a>(
@@ -1587,7 +1598,7 @@ async fn refresh_status_mode(ctx: &AppCtx, mac: &str, compact: bool) -> Value {
                 .is_none_or(|device|device["data_contract"].is_null()) {
                 return Box::pin(refresh_status_mode(ctx, mac, false)).await;
             }
-            crate::wifi::http_ready(ctx, mac);
+            crate::wifi::http_ready(ctx, mac, &status, received_at);
             if let Err(e) = service(ctx).note_authenticated_status_at(mac, &status, received_at) {
                 return json!({"result": "error", "error": format!("persist authenticated status: {e}")});
             }
@@ -2159,7 +2170,7 @@ async fn cache_device_token_if_missing(ctx: &AppCtx, link: &bridge_ble::DeviceCo
 /// gates HTTP delivery or the next rendezvous; it only bounds how long the
 /// rendezvous task waits on a possibly-stuck `peripheral.disconnect()`.
 /// Run one coordinator cycle for a registered device.
-pub async fn cycle(ctx: &AppCtx, mac: &str, refresh: bool, deliver_now: bool) {
+pub async fn cycle(ctx: &AppCtx, mac: &str, refresh: bool, mut deliver_now: bool) {
     let Some(mac) = DeviceIdentity::normalized_mac(mac) else {
         return;
     };
@@ -2198,6 +2209,19 @@ pub async fn cycle(ctx: &AppCtx, mac: &str, refresh: bool, deliver_now: bool) {
         && publish.as_ref().filter(|j| matches!(j["state"].as_str(), Some("waiting" | "sending" | "unknown")))
             .and_then(|j| j["created_at"].as_u64())
             .is_none_or(|created| ota.as_ref().unwrap().created_at <= created);
+    // An already-online device can accept Data before diagnostic transfers.
+    // Keep mutations/OTA ordering, and leave the formal power decision below:
+    // sending Data itself must never extend a light window.
+    let summary = service(ctx).coordinator_summary(&mac, device_now(&mac)).unwrap_or(Value::Null);
+    let data_first = deliver_now && !ota_first
+        && !matches!(publish.as_ref().and_then(|j| j["state"].as_str()), Some("waiting" | "sending"))
+        && summary["pending_activate"].is_null()
+        && (summary["push_dirty"] == true || summary["full_sync_due"] == true
+            || !summary["in_flight"].is_null());
+    if data_first {
+        let _ = deliver(ctx, &mac).await;
+        deliver_now = false;
+    }
     // A queued OTA has a bounded online window. A slow diagnostics transfer
     // must not consume the status freshness budget before its claim check.
     if refresh && !(ota_first && deliver_now) { sync_http(ctx, &mac, true).await; }
@@ -2739,6 +2763,7 @@ pub(crate) mod ble_close_lock_tests {
             Json(json!({"mac": fake.mac, "rendezvous": true, "fw": "lock-repro",
                 "peerBonded":true,"peerEncrypted":true,"endpoint_registration":1,
                 "wifi_management": 3,
+                "plan_activation":fake.status_extra.lock().unwrap()["_plan_activation"],
                 "rf_remaining_ms": if initial > 0 {json!(remaining)} else {Value::Null},
                 "wc":u8::from(fake.protocol.load(Ordering::SeqCst)),
                 "ble_claim":u8::from(fake.ble_claim.load(Ordering::SeqCst)),
@@ -2806,6 +2831,7 @@ pub(crate) mod ble_close_lock_tests {
             std::future::pending::<()>().await;
         }
         let mut reply = command_ack(&fake.mac, &command, fake.sync_due);
+        if op=="sync_config" && fake.status_extra.lock().unwrap()["_sync_config_rejected"]==true {reply["result"]=json!("rejected");}
         if op == "status" {
             reply["power"]["provisional_remaining_s"] = json!(fake.provisional_remaining_s.load(Ordering::SeqCst));
             for (key,value) in fake.status_extra.lock().unwrap().as_object().unwrap() { reply[key]=value.clone(); }
@@ -2823,6 +2849,13 @@ pub(crate) mod ble_close_lock_tests {
                 if fake.apply_plan.load(Ordering::SeqCst) { fake.applied_plan.store(command["plan_id"].as_u64().unwrap(), Ordering::SeqCst); }
                 if fake.rf_after_plan_ms.load(Ordering::SeqCst) > 0 { *fake.rf_epoch.lock().unwrap() = std::time::Instant::now(); }
                 reply["accepted_remaining_s"] = command["light_duration_s"].clone();
+                if !command["network"].is_null() {
+                    match bridge_render::simulator_plan_network(command["plan_id"].as_u64().unwrap(),None,&command["network"]) {
+                        Ok(_) => {reply["network"]=json!({"result":"admitted"});},
+                        Err(error) => {reply["result"]=json!("rejected");reply["error"]=json!(error.to_string());}
+                    }
+                }
+                if let Some(data)=command.get("data") {reply["data"]=json!({"result":"applied","data_seq":data["seq"],"active_context_id":data["active_context_id"],"display_state":"displayed"});}
             }
             if op == "network_start" { fake.network_started.store(true, Ordering::SeqCst); }
             if op == "sync_open" { fake.sync_opened.store(true, Ordering::SeqCst); }
@@ -2840,9 +2873,13 @@ pub(crate) mod ble_close_lock_tests {
                 "wifi_status" => {
                     // A paged status read can outlive the original short exchange.
                     if fake.rf_initial_ms.load(Ordering::SeqCst) > 0 {tokio::time::sleep(Duration::from_millis(450)).await;}
-                    let text=serde_json::to_vec(&json!({"device_mac":fake.mac,
+                    let mut status=json!({"device_mac":fake.mac,
                         "boot_id":"00112233445566778899aabbccddeeff",
-                        "wifi_control":{"principal":"bridge-lock-repro","namespace":"own","read_allowed":true,"write_allowed":true}})).unwrap();
+                        "wifi_control":{"principal":"bridge-lock-repro","namespace":"own","read_allowed":true,"write_allowed":true}});
+                    if fake.status_extra.lock().unwrap()["_wifi_status_continuous"]==true {
+                        status["wifi_management"]=json!(3);status["wifi_control"]["mode"]=json!("continuous");
+                    }
+                    let text=serde_json::to_vec(&status).unwrap();
                     let offset=command["offset"].as_u64().unwrap_or(0) as usize;
                     let end=(offset+100).min(text.len());
                     reply["snapshot"]=json!(1);reply["total"]=json!(text.len());reply["next_offset"]=json!(end);
@@ -2929,6 +2966,9 @@ pub(crate) mod ble_close_lock_tests {
     async fn close(State(fake): State<Arc<FakeBle>>) -> Response {
         fake.closes.fetch_add(1, Ordering::SeqCst);
         fake.events.lock().unwrap().push("ble:close".to_owned());
+        if fake.commands.lock().unwrap().iter().any(|c|c["op"]=="plan" && c["network"].is_object()) {
+            fake.network_started.store(true,Ordering::SeqCst);
+        }
         if fake.hang_close {
             // Accepted, never answered: the caller's disconnect never completes.
             std::future::pending::<()>().await;
@@ -3118,11 +3158,10 @@ pub(crate) mod ble_close_lock_tests {
         }
     }
 
-    /// task-1 RED case, now a regression: with `link.close_bounded` + locks
-    /// released before cleanup, a hanging `/sim/ble/close` no longer blocks
-    /// HTTP delivery or the next rendezvous. (task-4 recovery un-ignored it.)
+    /// A hanging native close releases HTTP immediately but reserves the radio
+    /// until bounded cleanup ends; a second BLE caller must not overlap it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn link_close_hang_must_not_block_http_delivery_or_next_rendezvous() {
+    async fn link_close_keeps_radio_reserved_but_releases_http() {
         let _serial = SIM_ENV.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let (fake, url) = start_fake_ble(HUNG_MAC, true).await;
@@ -3149,15 +3188,15 @@ pub(crate) mod ble_close_lock_tests {
             .await
             .is_err();
         let http_elapsed = http_started.elapsed();
-        // And the next rendezvous, for any device, never starts either.
+        // Another BLE operation waits while the native close owns the radio.
         let next_blocked =
             tokio::time::timeout(BLOCK_LIMIT, ble_cycle(&ctx, &[OTHER_MAC.to_owned()]))
                 .await
                 .is_err();
-        // Direct lock-level observation for the report (not an assertion: after
-        // the fix the locks are released and this must report `false`).
+        // HTTP has its own permit; the radio must still be reserved.
         let global_held = ctx.device_delivery.try_lock().is_err();
         let per_mac_held = delivery_lock(&ctx, HUNG_MAC).try_lock().is_err();
+        assert!(global_held,"radio permit released before native cleanup ended");
 
         eprintln!(
             "[task-1 red] /sim/ble/close observed={closes}; HTTP deliver({HUNG_MAC}) \
@@ -3167,16 +3206,13 @@ pub(crate) mod ble_close_lock_tests {
         );
 
         std::env::remove_var("CODEX_STATUS_SIM_BLE_ENDPOINTS");
-        // The hanging close must not leak either: `close_bounded` gives up at
-        // BLE_CLOSE_LIMIT and the rendezvous task still returns (task-4 added
-        // this, so the test proves both "locks released early" and "the close
-        // itself is bounded"). 5 s = BLE_CLOSE_LIMIT + generous margin.
+        // The radio reservation must end with the bounded cleanup.
         let rendezvous_started = tokio::time::Instant::now();
         let rendezvous_finished = tokio::time::timeout(Duration::from_secs(5), rendezvous).await;
         let rendezvous_elapsed_ms = rendezvous_started.elapsed().as_millis();
 
         assert!(
-            !http_blocked && !next_blocked,
+            !http_blocked && next_blocked && !per_mac_held,
             "RED(task-1): while link.close() hung (/sim/ble/close unanswered, observed={closes}), \
              production HTTP delivery blocked={http_blocked} (per-MAC lock held={per_mac_held}) and \
              the next production rendezvous blocked={next_blocked} (global device_delivery lock \
@@ -3188,6 +3224,7 @@ pub(crate) mod ble_close_lock_tests {
             rendezvous_elapsed_ms
         );
         let outcome = rendezvous_finished.unwrap().expect("rendezvous task panicked");
+        assert!(ctx.device_delivery.try_lock().is_ok(),"radio was not released after bounded cleanup");
         assert!(
             outcome.is_ok(),
             "ble_cycle returned an error after the bounded close: {outcome:?}"
@@ -3251,6 +3288,8 @@ pub(crate) mod ble_close_lock_tests {
         delay: Duration,
         slow_reply_sent: AtomicBool,
         status: Value,
+        data_bodies: Mutex<Vec<Value>>,
+        drop_data_ack: AtomicBool,
     }
     fn framed_test_reply(frame:bridge_core::compact_frame::Header,
         body:Value) -> Response {
@@ -3276,6 +3315,8 @@ pub(crate) mod ble_close_lock_tests {
             delay,
             slow_reply_sent: AtomicBool::new(false),
             status,
+            data_bodies: Mutex::new(Vec::new()),
+            drop_data_ack: AtomicBool::new(false),
         });
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -3325,8 +3366,16 @@ pub(crate) mod ble_close_lock_tests {
                         }
                     }
                     let start=raw.windows(4).position(|w|w==b"\r\n\r\n").unwrap()+4;
-                    let Ok((frame,_))=bridge_core::compact_frame::Header::decode(&raw[start..],4096) else {return;};
-                    let payload = serde_json::to_vec(&server.status).unwrap();
+                    let Ok((frame,input))=bridge_core::compact_frame::Header::decode(&raw[start..],4096) else {return;};
+                    let reply = if path == "/api/data" {
+                        let input: Value = serde_json::from_slice(input).unwrap();
+                        server.data_bodies.lock().unwrap().push(input.clone());
+                        if server.drop_data_ack.load(Ordering::SeqCst) { return; }
+                        json!({"result":"applied","device_mac":server.status["device_mac"],
+                            "data_seq":input["seq"],"active_context_id":input["active_context_id"],
+                            "display_state":"displayed"})
+                    } else { server.status.clone() };
+                    let payload = serde_json::to_vec(&reply).unwrap();
                     let header=bridge_core::compact_frame::Header{kind:1,op:frame.op,result:0,
                         payload_len:payload.len() as u16,session:[9;16],request_no:frame.request_no,context:frame.context};
                     let mut body=header.encode().unwrap().to_vec();body.extend_from_slice(&payload);
@@ -3356,6 +3405,99 @@ pub(crate) mod ble_close_lock_tests {
         ctx
     }
 
+    #[tokio::test(flavor="multi_thread", worker_threads=4)]
+    async fn source_event_dispatches_first_data_and_coalesces_while_device_busy() {
+        let _serial = SIM_ENV.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let status = json!({"device_mac":HUNG_MAC,"configured":true,
+            "session_nonce":"00112233445566778899aabbccddeeff",
+            "active_context_id":"event-context","active_template_id":"device-only",
+            "owner":{"id":"bridge-lock-repro","lease_remaining_s":120},
+            "data_contract":{"template_id":"device-only","compiler_abi":2,
+                "source_crc":"12345678","requirements":[
+                    {"index":0,"field":"buckets[codex].weekly.remaining","kind":"number","missing":"hide","local":false},
+                    {"index":1,"field":"buckets[codex].weekly.resetsAt","kind":"number","missing":"hide","local":false}]},
+            "sync_v1":0,"power":{"mode":"light","remaining_s":120}});
+        let (http, ip) = start_fake_http(Arc::new(Mutex::new(Vec::new())), status.clone(), 0, Duration::ZERO);
+        let ctx = Arc::new(test_ctx_with_ip(dir.path(), HUNG_MAC, &ip));
+        bridge_mcp::save_device_token(&crate::mcp_config(&ctx), HUNG_MAC, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        service(&ctx).note_device_status_at(HUNG_MAC, &status, "http", device_now(HUNG_MAC)).unwrap();
+        service(&ctx).set_data_sync(HUNG_MAC, true).unwrap();
+        {
+            let mut cache = ctx.device_status_cache.lock().unwrap();
+            crate::update_device_status_cache(&mut cache,HUNG_MAC,true,Some(status.clone()),crate::now_secs());
+            crate::update_device_claim_cache(&mut cache,HUNG_MAC,Some(status["owner"].clone()),crate::now_secs(),false);
+        }
+        let mut other_status = status.clone(); other_status["device_mac"] = json!(OTHER_MAC);
+        let (other_http, other_ip) = start_fake_http(Arc::new(Mutex::new(Vec::new())),other_status.clone(),0,Duration::ZERO);
+        let mut identity = DeviceIdentity::new(OTHER_MAC,"Other").unwrap(); identity.ip=Some(other_ip);
+        service(&ctx).device_upsert(identity,DeviceCapabilities::ssd1681_154g()).unwrap();
+        bridge_mcp::save_device_token(&crate::mcp_config(&ctx),OTHER_MAC,"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+        service(&ctx).note_device_status_at(OTHER_MAC,&other_status,"http",device_now(OTHER_MAC)).unwrap();
+        service(&ctx).set_data_sync(OTHER_MAC,true).unwrap();
+        {
+            let mut cache=ctx.device_status_cache.lock().unwrap();
+            crate::update_device_status_cache(&mut cache,OTHER_MAC,true,Some(other_status.clone()),crate::now_secs());
+            crate::update_device_claim_cache(&mut cache,OTHER_MAC,Some(other_status["owner"].clone()),crate::now_secs(),false);
+        }
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let scheduler = tokio::spawn(crate::platform_sync_loop(ctx.clone(), ready.clone()));
+        let envelope = |used, reset| json!({"server_time":1,"buckets":[{"id":"codex","windows":[
+            {"kind":"weekly","usedPercent":used,"resetsAt":reset,"windowMins":10080}]}]});
+        // A busy device must not block ingestion of a newer source snapshot.
+        let lock = delivery_lock(&ctx,HUNG_MAC);
+        let held = lock.lock().await;
+        *ctx.envelope.write().await = Some(envelope(10,2000000000)); ready.notify_one();
+        tokio::time::timeout(Duration::from_secs(2),async {
+            while service(&ctx).coordinator_summary(HUNG_MAC,device_now(HUNG_MAC)).unwrap()["push_fp"].is_null() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        let before = service(&ctx).coordinator_summary(HUNG_MAC,device_now(HUNG_MAC)).unwrap()["push_fp"].clone();
+        *ctx.envelope.write().await = Some(envelope(20,2000000000)); ready.notify_one();
+        tokio::time::timeout(Duration::from_secs(2),async {
+            while service(&ctx).coordinator_summary(HUNG_MAC,device_now(HUNG_MAC)).unwrap()["push_fp"] == before {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3),async {
+            while other_http.data_bodies.lock().unwrap().is_empty() {tokio::time::sleep(Duration::from_millis(10)).await;}
+        }).await.expect("one busy MAC must not block another MAC");
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(3),async {
+            while http.data_bodies.lock().unwrap().is_empty() {tokio::time::sleep(Duration::from_millis(10)).await;}
+        }).await.expect("first Data must not wait for six ticks");
+        assert_eq!(http.data_bodies.lock().unwrap()[0]["fields"][0]["v"],80);
+        tokio::time::timeout(Duration::from_secs(2),async {
+            while service(&ctx).coordinator_summary(HUNG_MAC,device_now(HUNG_MAC)).unwrap()["push_dirty"] == true {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        // Same server_time must not hide later notifications; pull-only stays cached.
+        *ctx.envelope.write().await = Some(envelope(20,2000000100)); ready.notify_one();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(http.data_bodies.lock().unwrap().len(),1);
+        *ctx.envelope.write().await = Some(envelope(30,2000000100)); ready.notify_one();
+        tokio::time::timeout(Duration::from_secs(3),async {
+            while http.data_bodies.lock().unwrap().len()<2 {tokio::time::sleep(Duration::from_millis(10)).await;}
+        }).await.unwrap();
+        assert_eq!(http.data_bodies.lock().unwrap()[1]["fields"][0]["v"],70);
+        // A lost ACK pins the original snapshot; another source event must
+        // neither resend it early nor replace its transaction with new bytes.
+        http.drop_data_ack.store(true, Ordering::SeqCst);
+        *ctx.envelope.write().await = Some(envelope(40,2000000100)); ready.notify_one();
+        tokio::time::timeout(Duration::from_secs(3),async {
+            while http.data_bodies.lock().unwrap().len()<3 {tokio::time::sleep(Duration::from_millis(10)).await;}
+        }).await.unwrap();
+        let pinned = service(&ctx).data_message_body(HUNG_MAC).unwrap();
+        *ctx.envelope.write().await = Some(envelope(50,2000000100)); ready.notify_one();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(http.data_bodies.lock().unwrap().len(),3);
+        assert_eq!(service(&ctx).data_message_body(HUNG_MAC).unwrap(),pinned);
+        assert!(!http.paths.lock().unwrap().iter().any(|p|p.contains("/sync/")||p=="/api/plan"));
+        scheduler.abort();
+    }
+
     fn queue_read_job(ctx: &AppCtx, mac: &str) -> String {
         service(ctx)
             .wifi_queue_fields(mac, &ctx.bridge_id, "read", vec![], BTreeMap::new(), device_now(mac))
@@ -3379,6 +3521,66 @@ pub(crate) mod ble_close_lock_tests {
         let plans:Vec<_> = ble.commands.lock().unwrap().iter().filter(|c| c["op"] == "plan")
             .map(|c| c["need_http"].clone()).collect();
         assert_eq!(plans, vec![json!(false)]);
+    }
+
+    #[tokio::test(flavor="multi_thread",worker_threads=4)]
+    async fn plan_activation_push_starts_same_round_without_network_start() {
+        const HUNG_MAC:&str="024FADB93408";
+        let _serial=SIM_ENV.lock().unwrap_or_else(|p|p.into_inner());
+        for case in ["push","periodic","unchanged","no_mapping"] {
+            let dir=tempfile::tempdir().unwrap();
+            let (ble,url)=start_fake_ble(HUNG_MAC,false).await;
+            ble.protocol.store(true,Ordering::SeqCst);
+            let (_http,ip,server)=start_full_http(ble.clone(),"bridge-lock-repro").await;
+            let ctx=test_ctx_with_ip(dir.path(),HUNG_MAC,&ip);
+            let now=device_now(HUNG_MAC);
+            let status=json!({"device_mac":HUNG_MAC,"configured":true,
+                "active_context_id":"event-context","active_template_id":"device-only",
+                "data_contract":{"template_id":"device-only","compiler_abi":2,"source_crc":"12345678",
+                    "requirements":[{"index":0,"field":"buckets[codex].weekly.remaining","kind":"number","missing":"hide","local":false}]}});
+            *ble.status_extra.lock().unwrap()=status.clone();
+            ble.status_extra.lock().unwrap()["_plan_activation"]=json!(1);
+            ble.status_extra.lock().unwrap()["_sync_config_rejected"]=json!(true);
+            let svc=service(&ctx);
+            svc.note_device_status_at(HUNG_MAC,&status,"http",now).unwrap();
+            svc.set_data_sync(HUNG_MAC,true).unwrap();
+            let envelope=|used|json!({"server_time":1,"buckets":[{"id":"codex","windows":[{"kind":"weekly","usedPercent":used,"resetsAt":2000000000,"windowMins":10080}]}]});
+            svc.note_codex_envelope(&envelope(40)).unwrap();
+            assert_eq!(svc.next_delivery(HUNG_MAC,true,now)["decision"],"ble_data");
+            let data=svc.data_message_body(HUNG_MAC).unwrap();
+            svc.note_ack(HUNG_MAC,DeliveryKind::BleData,data["seq"].as_u64().unwrap(),data["crc"].as_str().unwrap(),true,"displayed");
+            ble.status_extra.lock().unwrap()["applied_seq"]=data["seq"].clone();
+            ble.status_extra.lock().unwrap()["data_seq"]=data["seq"].clone();
+            ble.status_extra.lock().unwrap()["content_crc"]=data["crc"].clone();
+            if case!="no_mapping" {
+                svc.wifi_save(HUNG_MAC,0,serde_json::from_value(json!([
+                    {"network_id":"home","host_ssid":"Host","ssid":"Device","credential":"open"}
+                ])).unwrap(),now).unwrap();
+            }
+            if matches!(case,"push"|"no_mapping") {svc.note_codex_envelope(&envelope(41)).unwrap();}
+            if case=="periodic" {
+                bridge_core::device_clock::configure(HUNG_MAC,0,((now+7200)*1000) as i64,0).unwrap();
+            }
+            std::env::set_var("CODEX_STATUS_SIM_BLE_ENDPOINTS",json!({HUNG_MAC:url}).to_string());
+            std::env::set_var("CODEX_STATUS_TEST_HOST_WIFI",json!({"state":"connected","networks":[{"ssid":"Host"}]}).to_string());
+            let result=ble_cycle(&ctx,&[HUNG_MAC.into()]).await;
+            std::env::remove_var("CODEX_STATUS_SIM_BLE_ENDPOINTS");std::env::remove_var("CODEX_STATUS_TEST_HOST_WIFI");
+            bridge_core::device_clock::clear(HUNG_MAC);
+            let commands=ble.commands.lock().unwrap();
+            assert!(!commands.iter().any(|c|c["op"]=="network_start"),"{case}");
+            if case=="no_mapping" {
+                assert!(matches!(&result,Ok(BleOpportunity::Connected{result:Err(e),..}) if e=="network_mapping_required"),"{case}: {result:?}");
+                assert!(!commands.iter().any(|c|c["op"]=="plan"));
+            } else {
+                assert!(matches!(&result,Ok(BleOpportunity::Connected{result:Ok(()),..})),"{case}: {result:?}");
+                let plan=commands.iter().find(|c|c["op"]=="plan").unwrap();
+                assert_eq!(plan["mode"],if case=="push" {"light"}else{"sleep"},"{case}");
+                assert_eq!(plan["network"].is_object(),case=="push","{case}: {plan}");
+                assert_eq!(ble.network_started.load(Ordering::SeqCst),case=="push","{case}");
+                if case!="unchanged" {assert!(plan["data"].is_object(),"{case}");}
+            }
+            server.abort();
+        }
     }
 
     #[tokio::test]
@@ -3953,7 +4155,7 @@ pub(crate) mod ble_close_lock_tests {
                 Json(json!({"result":"rejected","stage":"http","error":"not_ready"}))).into_response();
         }
         let _ = f.proof_at.compare_exchange(0, device_now(HUNG_MAC), Ordering::SeqCst, Ordering::SeqCst);
-        Json(json!({"result":"applied","device_mac":HUNG_MAC,"session_nonce":"00112233445566778899aabbccddeeff",
+        Json(json!({"result":"applied","device_mac":f.ble.mac,"session_nonce":"00112233445566778899aabbccddeeff",
             "wake_generation":2,"wake_seq":9,"owner_id":*f.owner.lock().unwrap(),
             "power":{"plan_id":f.ble.applied_plan.load(Ordering::SeqCst),"mode":"light","remaining_s":110},
             "wifi_management":3,"wifi_control":{"mode":"window","remaining_ms":80000,"read_allowed":true,"write_allowed":true},"rendezvous":{"v":1,"id":"this-wake","challenge":"http-proof",
@@ -4893,7 +5095,7 @@ pub(crate) mod ble_close_lock_tests {
             seed_connection(svc,HUNG_MAC,c).unwrap();
             crate::wifi::http_failed(&ctx,HUNG_MAC,"http_unavailable");
             assert_eq!(svc.wifi_state(HUNG_MAC).connection().unwrap().attempts,3,"a failed read is not a new retry grant");
-            crate::wifi::http_ready(&ctx,HUNG_MAC);
+            crate::wifi::http_ready(&ctx,HUNG_MAC,&json!({"boot_id":"test-boot"}),device_now(HUNG_MAC));
             let c=svc.wifi_state(HUNG_MAC).connection().unwrap();
             assert_eq!(c.attempts,if state=="requested"{3}else{0});
             if state!="requested" {assert!(c.http_ready);assert_eq!(c.next_attempt_at,0);assert_eq!(c.error,None);}
@@ -4903,12 +5105,49 @@ pub(crate) mod ble_close_lock_tests {
         assert_eq!(svc.wifi_state(HUNG_MAC).connection().unwrap().attempts,3);
         // Persist the successful reset, then prove restart keeps the new budget.
         let mut c=svc.wifi_state(HUNG_MAC).connection().unwrap();c.state="connection_failed".into();seed_connection(svc,HUNG_MAC,c).unwrap();
-        crate::wifi::http_ready(&ctx,HUNG_MAC);
+        crate::wifi::http_ready(&ctx,HUNG_MAC,&json!({"boot_id":"test-boot"}),device_now(HUNG_MAC));
         drop(ctx);
         let ctx=test_ctx(dir.path(),&[HUNG_MAC]);let svc=service(&ctx);
         assert_eq!(svc.wifi_state(HUNG_MAC).connection().unwrap().attempts,0);
         let mut c=svc.wifi_state(HUNG_MAC).connection().unwrap();c.http_ready=false;c.state="waiting_for_window".into();seed_connection(svc,HUNG_MAC,c).unwrap();
         assert_eq!(svc.wifi_state(HUNG_MAC).connection().unwrap().automatic_state(),"waiting_for_window");
+    }
+
+    #[tokio::test(flavor="multi_thread",worker_threads=4)]
+    async fn review_activation_keeps_boot_invalidation_from_the_actual_exchange() {
+        let _serial=SIM_ENV.lock().unwrap_or_else(|p|p.into_inner());
+        let dir=tempfile::tempdir().unwrap();let (ble,url)=start_fake_ble(HUNG_MAC,false).await;
+        ble.protocol.store(true,Ordering::SeqCst);
+        *ble.wifi_match_reply.lock().unwrap()=json!({"active":false,"connected":false,"stage":"saved"});
+        ble.status_extra.lock().unwrap()["_wifi_status_continuous"]=json!(true);
+        let ctx=test_ctx(dir.path(),&[HUNG_MAC]);let svc=service(&ctx);let now=device_now(HUNG_MAC);
+        ble.ble_claim.store(true,Ordering::SeqCst);*ble.claim_owner.lock().unwrap()=ctx.bridge_id.clone();
+        svc.wifi_save(HUNG_MAC,0,serde_json::from_value(json!([{"network_id":"home","host_ssid":"Host","ssid":"Device","credential":"keep","version":2}])).unwrap(),now).unwrap();
+        std::env::set_var("CODEX_STATUS_SIM_BLE_ENDPOINTS",json!({HUNG_MAC:url}).to_string());
+        std::env::set_var("CODEX_STATUS_TEST_HOST_WIFI",json!({"state":"connected","networks":[{"ssid":"Host"}]}).to_string());
+        let mut link=bridge_ble::DeviceConnection::connect(HUNG_MAC,TOKEN,&ctx.bridge_id).await.unwrap().unwrap();
+        link.command("status",json!({})).await.unwrap();
+        let result=crate::wifi::automatic_on_link(&ctx,HUNG_MAC,&mut link,bridge_core::rendezvous::Budget::new(Duration::from_secs(3)),false).await;
+        link.close_bounded(Duration::from_millis(100)).await;
+        std::env::remove_var("CODEX_STATUS_SIM_BLE_ENDPOINTS");std::env::remove_var("CODEX_STATUS_TEST_HOST_WIFI");
+        assert!(result.is_ok(),"{result:?}");
+        assert_eq!(svc.device_get(HUNG_MAC).unwrap()["last_authenticated"]["body"]["boot_id"],"00112233445566778899aabbccddeeff");
+        let facts=svc.wifi_state(HUNG_MAC).connection_facts.unwrap();
+        assert!(facts.observation.is_none(),"old pre-exchange observation overwrote the new boot invalidation");
+        assert_eq!(facts.attempts,1);
+    }
+
+    #[test]
+    fn review_http_contact_uses_response_boot_and_sample_time_without_cached_status() {
+        let dir=tempfile::tempdir().unwrap();let ctx=test_ctx(dir.path(),&[HUNG_MAC]);let svc=service(&ctx);
+        svc.wifi_save(HUNG_MAC,0,serde_json::from_value(json!([{"network_id":"home","host_ssid":"Host","ssid":"Home"}])).unwrap(),100).unwrap();
+        let state=svc.wifi_state(HUNG_MAC);
+        let facts=bridge_core::platform::wifi::ConnectionFacts::new(&state.targets[0],state.local_revision);
+        svc.wifi_set_connection(HUNG_MAC,facts).unwrap();
+        assert_ne!(svc.device_get(HUNG_MAC).unwrap()["last_authenticated"]["body"]["boot_id"],"new-boot");
+        crate::wifi::http_ready(&ctx,HUNG_MAC,&json!({"boot_id":"new-boot"}),101);
+        let facts=svc.wifi_state(HUNG_MAC).connection_facts.unwrap();let contact=facts.contact.unwrap();
+        assert_eq!(contact.boot_id,json!("new-boot").to_string());assert_eq!(contact.at,101);
     }
 
     #[tokio::test(flavor="multi_thread",worker_threads=2)]

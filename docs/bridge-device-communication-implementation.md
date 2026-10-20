@@ -4,7 +4,7 @@
 
 ## 1. 当前路径
 
-当前为48 B frame加业务载荷，业务HTTP使用POST。普通BLE接纳network_start并分项反馈后提前结束；原网络工作保留，设备在合法期限准备HTTP并报告。旧WaitHandoff/challenge/显式handoff不再是正常执行合同。
+当前为48 B frame加业务载荷，业务HTTP使用POST。Plan激活候选由 `plan_activation:1` 显式发现：Plan原事务冻结网络目标与回报路由，BLE结束即执行，随后同MAC认证HTTP证明；不另发network_start。旧ROM保留原network_start兼容路径。部署版本以PROGRESS为准。旧WaitHandoff/challenge/显式handoff不再是正常执行合同。
 
 BLE-only本轮尾部继承_need_http，不能因Light或开启诊断而擅自转HTTP。已有健康HTTP直接执行业务；BOOT手动GATT、自动交汇和实际BLE射频独立。USB/有效Light重启直接恢复HTTP，Sleep普通重启一次有界BLE，实际电池Sleep重启矩阵仍未完成。
 
@@ -13,8 +13,8 @@ BLE-only本轮尾部继承_need_http，不能因Light或开启诊断而擅自转
 | 场景 | 当前源码机制 | 已有证据及边界 |
 |---|---|---|
 | S01/S02 HTTP直达 | app调度认证状态，continuous直接OTA准入；Bundle/Activate/Data通过device_client | .81/.82 OTA单次image_verified，实际模板发布成功；不能概括所有断链/权限组合 |
-| S03 BLE小数据 | 生产ble_cycle判断_need_http；固件Data/Plan共享处理器，显示结果独立 | BLE-only+Light+sync enabled软件零HTTP断言通过；不是物理功耗验收 |
-| S04/S05 准备HTTP | BLE network_start绑定原Plan/principal/回报地址；ACK grace后释放普通BLE，radio继续联网及报告 | 生产Fake验证close先于HTTP工作，.76一轮自然报告verified→complete→Data displayed |
+| S03 BLE小数据 | 新能力先算Plan再选传输；新push的Light与network随联合Data同轮发放，BLE结束启动Wi-Fi | 10-20候选生产回归通过：60→59当轮HTTP、periodic同值Sleep、unchanged无网络、缺映射明拒；旧ROM兼容路径保留，部署看PROGRESS |
+| S04/S05 准备HTTP | 新Plan.network绑定原Plan/principal/wake/目标摘要/回报地址，配置尾部结束再核对目标并建连；旧ROM用network_start | 共享C++/Fake重放、目标匹配与512 B联合ACK通过；不以Plan admitted冒充网络ready |
 | S06 失败/超时 | 原绝对deadline限制网络/报告；连接与Bridge HTTP失败分别记录；下轮恢复 | .76有三轮connect_timeout和后续恢复，不把失败计为成功或推断全部RF根因 |
 | S07 身份/权限 | frame会话、MAC、principal、owner及业务上下文核对；新写401/403确定失败，历史未知查询仍保留 | 真实HTTP客户端与生产Fake拒绝回归；409保留revision_conflict而非一律occupied |
 | S08/S09 丢ACK/断链 | 保留原plan/data/job身份；HTTP独立会话报告及认证原事务查询，不回旧BLE handoff收尾 | 丢Plan/network_start及原事务软件恢复覆盖；完整物理丢ACK矩阵未验 |

@@ -50,22 +50,52 @@ fn save_recovery(recovery: &BleRecovery) -> anyhow::Result<()> {
 
 /// Called even when paused or permissions are unavailable. The old native
 /// process exits before the supervisor is allowed to construct its replacement.
-pub(crate) fn recover_ble(pending: &mut Option<BleRecovery>, quarantined: bool) {
-    if !quarantined { return; }
+pub(crate) fn recover_ble(pending: &mut Option<BleRecovery>, failure: Option<&str>) {
+    let Some(failure)=failure else{return;};
     let automatic = cfg!(windows) || std::env::args().any(|arg| arg == "--managed-child");
     if pending.is_none() {
-        let recovery = BleRecovery::next(ble_recovery().as_ref(), now_secs(), automatic);
+        let mut recovery = BleRecovery::next(ble_recovery().as_ref(), now_secs(), automatic);
+        recovery.error=failure.into();
+        if failure!="ble_native_quarantined_restart_required" {recovery.stage="service_task".into();}
         if let Err(error) = save_recovery(&recovery) {
             tracing::error!(%error, "Cannot persist BLE recovery status");
         }
         tracing::warn!(attempt=recovery.attempt, retry_at=recovery.retry_at, automatic,
-            error="ble_native_quarantined_restart_required", "BLE service isolated; recovery scheduled");
+            error=failure, "Bridge service failed; recovery scheduled");
         *pending = Some(recovery);
     }
     if automatic && pending.as_ref().is_some_and(|p| now_secs() >= p.retry_at) {
         append_log("BLE recovery: ending isolated child before replacement");
         std::process::exit(BLE_RECOVERY_EXIT);
     }
+}
+
+/// Supervision never waits on the BLE worker or its delivery permits.
+async fn monitor_services<F: std::future::Future<Output=()>+Send+'static>(
+    services:F, native_failed:impl Fn()->bool,
+    mut report:impl FnMut(Option<&'static str>), period:std::time::Duration,
+) {
+    let mut services=tokio::spawn(services);
+    let mut task_failure=None;
+    let mut interval=tokio::time::interval(period);
+    loop {
+        tokio::select! {
+            result=&mut services, if task_failure.is_none() => {
+                let reason=if result.is_err_and(|e|e.is_panic()) {"service_task_panicked"}else{"service_task_exited"};
+                // Panic payloads may contain request data; record only the fixed category.
+                tracing::error!(error=reason,"Bridge service task ended unexpectedly");
+                task_failure=Some(reason);
+            }
+            _=interval.tick()=>{}
+        }
+        report(task_failure.or_else(||native_failed().then_some("ble_native_quarantined_restart_required")));
+    }
+}
+
+pub(crate) async fn supervise_services(services:impl std::future::Future<Output=()>+Send+'static) {
+    let mut pending=None;
+    monitor_services(services,bridge_ble::native_quarantined,
+        |failure|recover_ble(&mut pending,failure),std::time::Duration::from_secs(1)).await;
 }
 
 pub(crate) fn ble_recovered() {
@@ -264,6 +294,25 @@ fn supervise_command(command: &mut std::process::Command, path: &std::path::Path
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn review_supervisor_observes_quarantine_while_worker_is_stuck_and_task_panics() {
+        use std::sync::{Arc,atomic::{AtomicBool,Ordering}};
+        let native=Arc::new(AtomicBool::new(false));
+        let flag=native.clone();let (tx,mut rx)=tokio::sync::mpsc::unbounded_channel();
+        let monitor=tokio::spawn(monitor_services(std::future::pending(),move||flag.load(Ordering::SeqCst),
+            move|failure|{if let Some(failure)=failure{let _=tx.send(failure);}},std::time::Duration::from_millis(10)));
+        native.store(true,Ordering::SeqCst);
+        assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(1),rx.recv()).await.unwrap(),Some("ble_native_quarantined_restart_required"));
+        monitor.abort();
+        for panic in [false,true] {
+            let (tx,mut rx)=tokio::sync::mpsc::unbounded_channel();
+            let monitor=tokio::spawn(monitor_services(async move{assert!(!panic,"injected service panic");},||false,
+                move|failure|{if let Some(failure)=failure{let _=tx.send(failure);}},std::time::Duration::from_millis(10)));
+            assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(1),rx.recv()).await.unwrap(),Some(if panic{"service_task_panicked"}else{"service_task_exited"}));
+            monitor.abort();
+        }
+    }
 
     #[test]
     fn ble_recovery_backoff_survives_restarts_and_does_not_clear_on_startup() {

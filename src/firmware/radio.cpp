@@ -147,7 +147,7 @@ String ipText() {
 
 static String infoExtraJson() {
     String items = "\"mac\":\"" + macText() + "\",\"ip\":\"" + ipText() +
-                   "\",\"http_port\":80,\"rendezvous\":true,\"wifi_setup_protocol\":1,\"wifi_management\":3,\"wifi_connection\":1,\"ble_claim\":1" +
+                   "\",\"http_port\":80,\"rendezvous\":true,\"wifi_setup_protocol\":1,\"wifi_management\":3,\"wifi_connection\":1,\"ble_claim\":1,\"plan_activation\":1" +
                    ",\"wake_generation\":" + String((unsigned long)diagnostics::retained.rtcWakeGeneration) +
                    ",\"wake_seq\":" + String((unsigned long)diagnostics::retained.rtcTraceCurrentSeq) +
                    ",\"wake_stage\":\"" +
@@ -439,6 +439,7 @@ WifiControlContext wifiControlContext(const EndpointRec &endpoint) {
 }
 
 void wifiDeviceStatus(JsonDocument &doc,const EndpointRec *endpoint) {
+    doc["plan_activation"]=1;
     doc["power"]["plan_storage"] = power::state.planStore.status();
     doc["network"]["startup_contact"] = state.startupContact;
     const uint64_t now=clock::v2NowMs(),until=wifiPresenceUntil(now),controlUntil=wifiControlUntil(now);
@@ -742,7 +743,14 @@ void v2RendezvousTick() {
     if (bleIsConnected()) state.v2Rv.connected(now);
     const bool light = power::state.v2Plan.lightActive(now);
     const bool syncGuard = sync::state.syncEnabled && (sync::retained.syncRtc.flags & 1) && !sync::state.syncOpenThisWake && !sync::state.syncSkippedThisWake;
+    const char *activationError=nullptr;
     if (state.v2RvNetworkRequested && ((state.v2Rv.hasPlan() && light) || sync::state.syncOpenThisWake)) {
+        // Plan owns activation. Keep the bounded exchange open for configuration,
+        // then start immediately on central close; no second activation command.
+        if (state.readyReport.activation.active()) {
+            if (bleIsConnected() && now<state.v2RvBleReleaseAtMs) return;
+            if (!bleIsConnected()) state.v2RvBleReleaseAtMs=now;
+        }
         const uint64_t legalUntil = sync::httpUntil(now);
         state.v2Rv.admitHttp(now, legalUntil);
         if (state.v2Rv.needsHttp()) {
@@ -751,8 +759,18 @@ void v2RendezvousTick() {
                 state.v2RvBleReleased = true;
                 bleOff("network accepted");
             }
-            if (!v2RvWifiPhase) rendezvousWifiBegin();
-            rendezvousWifiTick();
+            if (!v2RvWifiPhase && state.readyReport.activation.active()) {
+                JsonDocument network;
+                if (deserializeJson(network,state.readyReport.activation.request()) ||
+                    !wifiPlanTargetMatches(network["target"])) {
+                    activationError="plan_network_target_mismatch";
+                    state.v2Rv.cancel();
+                }
+            }
+            if (!activationError) {
+                if (!v2RvWifiPhase) rendezvousWifiBegin();
+                rendezvousWifiTick();
+            }
             if (state.readyReport.received || state.readyReport.attempts >= 3)
                 state.v2Rv.finishExchange(now, sync::state.v2HistorySyncUntilMs);
         }
@@ -784,7 +802,7 @@ void v2RendezvousTick() {
     if (!reporting && !state.v2RvNetworkRequested && !wifiSetupBusy() && WiFi.status()!=WL_CONNECTED &&
         power::state.bleRecovery.lightRemaining(now)) startFallback();
     if (networkFailedThisRound && !reporting) {
-        networkFailed(WiFi.status()==WL_CONNECTED ? "bridge_http_unreachable" :
+        networkFailed(activationError ? activationError : WiFi.status()==WL_CONNECTED ? "bridge_http_unreachable" :
             wifiSetupConnectionFailure() ? wifiSetupConnectionFailure() : "connect_timeout");
     }
     const bool stayAwake = state.failureReportPending || power::state.bleRecovery.lightRemaining(now) || light || sync::state.syncOpenThisWake || power::v2ManualBleHoldActive() || (power::state.plugged && !power::retained.rtcDeepOnUsb);

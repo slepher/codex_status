@@ -5,6 +5,7 @@
 
 bool wifiSchemesBegin();
 bool wifiSchemesCredentials(String &ssid, String &password);
+bool wifiPlanTargetMatches(JsonVariantConst target);
 bool wifiSetupBusy();
 bool wifiSetupConnecting();
 bool wifiSetupFailed();

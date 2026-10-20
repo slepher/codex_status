@@ -183,6 +183,8 @@ deep 无在线无线，Bridge 无法即时叫醒。设周期 R、源变化检测
 
 Wi-Fi light 有效且链路可达期间，后续 push 可立即排完整数据投递，实际延迟仍包含源采集、调度、传输及面板波形。Bridge 可按 push 活跃策略显式发新 PowerPlan；数据包自身不续租。临近截止来不及传输时等下次会合。pull-only 变化仅搭车或到 Bridge 完整同步阈值，不能称为实时字段。
 
+从deep会合接收真实push并获正式Light时，Plan本身发放联网激活，Data即使已通过BLE联合Plan确认，也须在该Plan原事务内按当前网络选择启动Wi-Fi并验证HTTP机会，不等待下一次诊断周期或依赖额外的独立激活业务指令。正式Light授权与实际联网分别确认，图标只反映真实联网状态；周期同值全量Data仍按临时传输规则处理。当前network_start拆分实现尚未满足此合同，状态见A9。
+
 ## 8. 最小消息与幂等规则
 
 所有业务副作用在已认证会话执行。当前源码载体使用C2标记的48 B二进制头，HTTP业务统一POST；op/session只在帧中编码，业务JSON保留device_mac/bridge_id/request_id及业务上下文，拒绝旧op/command/session_nonce/protocol/rv。载体完成凭据、会话及重放准入后构造CommandContext供共享业务校验身份。frame request_no与持久业务ID独立，具体映射以[协议总览](bridge-device-protocol.md)为准。公开发现只作hint；bridge_first及其Directive/StatusBeacon是已废弃方向，不属于当前入口。完整MAC/上下文/能力由认证状态核对。

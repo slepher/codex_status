@@ -3,9 +3,30 @@
 #include "boot_capture.h"
 #include "ble_recovery.h"
 #include "network_display_state.h"
+#include "plan_activation.h"
 #define CHECK(x) do { if (!(x)) return __LINE__; } while (0)
 
 extern "C" int codex_plan_store_check() {
+    {
+        PlanActivation activation;
+        JsonDocument network;
+        network["v"]=1;network["bridge_addr"]="192.168.1.2";network["bridge_port"]=8765;
+        network["target"]["network_id"]="home";network["target"]["open"]=true;
+        network["target"]["metadata_key"]=String(std::string(64,'a'));
+        String frozen;
+        CHECK(!activation.prepare(12,network.as<JsonVariantConst>(),frozen));
+        CHECK(frozen.length()<=PLAN_NETWORK_MAX);
+        activation.commit(12,std::move(frozen));
+        CHECK(activation.active() && activation.planId()==12);
+        String replay;CHECK(!activation.prepare(12,network.as<JsonVariantConst>(),replay));
+        CHECK(replay==activation.request());
+        network["bridge_port"]=8766;
+        String conflict;CHECK(!strcmp(activation.prepare(12,network.as<JsonVariantConst>(),conflict),"plan_network_conflict"));
+        network["bridge_addr"]="127.0.0.1";
+        String invalid;CHECK(!strcmp(activation.prepare(13,network.as<JsonVariantConst>(),invalid),"plan_network_shape"));
+        network["bridge_addr"]="192.168.1.2";network["v"]=2;
+        CHECK(activation.prepare(13,network.as<JsonVariantConst>(),invalid));
+    }
     using namespace plan_test;
     reset();
     constexpr uint64_t utc=1800000000;

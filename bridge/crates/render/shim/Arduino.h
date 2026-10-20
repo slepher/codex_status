@@ -36,7 +36,7 @@ public:
 
     const char *c_str() const { return s_.c_str(); }
     size_t length() const { return s_.size(); }
-    void reserve(size_t n) { s_.reserve(n); }
+    bool reserve(size_t n) { s_.reserve(n); return true; }
 
     String &operator+=(const String &other) { s_ += other.s_; return *this; }
     String &operator+=(const char *other) { if (other) s_ += other; return *this; }

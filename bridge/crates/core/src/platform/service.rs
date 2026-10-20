@@ -480,6 +480,12 @@ impl PlatformService {
         if let Some(high)=inner.devices.get(&mac).and_then(|d|d.last_authenticated.as_ref())
             .and_then(|s|s.body["wifi_control"]["transaction_high_watermark"].as_u64()) {next.next_job_seq=next.next_job_seq.max(high);}
         let result = change(&mut next)?;
+        for job in &next.jobs {
+            if let Some(previous)=old.as_ref().and_then(|s|s.jobs.iter().find(|j|j.job_id==job.job_id)) {
+                if serde_json::to_value(previous)?==serde_json::to_value(job)? {continue;}
+            }
+            if self.wifi_history_path(&mac,&job.job_id)?.exists() {self.write_wifi_history_job(&mac,job)?;}
+        }
         inner.wifi.insert(mac.clone(), next);
         if let Err(error) = Self::persist(&inner, &self.state_path()) {
             if let Some(old) = old { inner.wifi.insert(mac, old); } else { inner.wifi.remove(&mac); }
@@ -487,18 +493,87 @@ impl PlatformService {
         }
         Ok(result)
     }
+    fn wifi_history_path(&self,mac:&str,id:&str)->Result<PathBuf> {
+        let mac=DeviceIdentity::normalized_mac(mac).context("invalid_device_mac")?;
+        anyhow::ensure!(!id.is_empty() && id.len()<=64 && id.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'_'||b==b'-'),"invalid_wifi_job_id");
+        Ok(self.dir.join(format!("wifi-history-{mac}-{id}.json")))
+    }
+    fn read_wifi_history_job(&self,mac:&str,id:&str)->Result<Option<WifiJob>> {
+        let path=self.wifi_history_path(mac,id)?;
+        if !path.exists(){return Ok(None);}
+        anyhow::ensure!(std::fs::metadata(&path)?.len()<=1024*1024,"wifi_history_too_large");
+        let record:Value=store::read_json(&path)?.context("wifi_history_missing")?;
+        anyhow::ensure!(record["schema"]==1,"unsupported_wifi_history_schema");
+        let payload=record["payload"].as_str().context("wifi_history_payload")?;
+        anyhow::ensure!(record["bytes"].as_u64()==Some(payload.len() as u64) &&
+            record["sha256"]==format!("{:x}",sha2::Sha256::digest(payload.as_bytes())),"wifi_history_corrupt");
+        let job:WifiJob=serde_json::from_str(payload)?;
+        anyhow::ensure!(job.device_mac==DeviceIdentity::normalized_mac(mac).unwrap() && job.job_id==id && job.terminal(),"wifi_history_identity");
+        Ok(Some(job))
+    }
+    fn write_wifi_history_job(&self,mac:&str,job:&WifiJob)->Result<()> {
+        let payload=serde_json::to_string(job)?;
+        let record=json!({"schema":1,"bytes":payload.len(),"sha256":format!("{:x}",sha2::Sha256::digest(payload.as_bytes())),"payload":payload});
+        anyhow::ensure!(serde_json::to_vec(&record)?.len()<=1024*1024,"wifi_history_too_large");
+        store::write_json(&self.wifi_history_path(mac,&job.job_id)?,&record)?;
+        let restored=self.read_wifi_history_job(mac,&job.job_id)?.context("wifi_history_missing")?;
+        anyhow::ensure!(serde_json::to_string(&restored)?==payload,"wifi_history_readback");
+        Ok(())
+    }
+    /// Read at most 32 archived records; the complete evidence remains on disk.
+    pub fn wifi_archived_jobs(&self,mac:&str)->Result<Vec<WifiJob>> {
+        let mac=DeviceIdentity::normalized_mac(mac).context("invalid_device_mac")?;
+        let active=self.wifi_state(&mac).jobs.into_iter().map(|j|j.job_id).collect::<BTreeSet<_>>();
+        let prefix=format!("wifi-history-{mac}-");let mut recent=Vec::new();
+        for entry in std::fs::read_dir(&self.dir)? {
+            let entry=entry?;let name=entry.file_name();let Some(name)=name.to_str() else{continue;};
+            let Some(id)=name.strip_prefix(&prefix).and_then(|s|s.strip_suffix(".json")) else{continue;};
+            if active.contains(id){continue;}
+            recent.push((entry.metadata()?.modified()?,id.to_owned()));
+            recent.sort_by(|a,b|b.cmp(a));recent.truncate(32);
+        }
+        recent.into_iter().map(|(_,id)|self.read_wifi_history_job(&mac,&id)?.context("wifi_history_missing")).collect()
+    }
+    fn wifi_archive_exhausted(&self,mac:&str)->Result<()> {
+        let mac=DeviceIdentity::normalized_mac(mac).context("invalid_device_mac")?;
+        let mut inner=self.inner.lock().unwrap();
+        let Some(old)=inner.wifi.get(&mac).cloned() else{return Ok(());};
+        let mut next=old.clone();
+        for job in &old.jobs {
+            if job.terminal() && (job.confirmation_pending()||job.receipt_ack_pending) && job.settlement.as_ref().is_some_and(|s|s.attempts>=3) {
+                self.write_wifi_history_job(&mac,job)?;
+                next.jobs.retain(|j|j.job_id!=job.job_id);
+            }
+        }
+        if next.jobs.len()!=old.jobs.len() {
+            inner.wifi.insert(mac.clone(),next);
+            if let Err(error)=Self::persist(&inner,&self.state_path()) {inner.wifi.insert(mac,old);return Err(error);}
+        }
+        Ok(())
+    }
     pub fn wifi_state(&self, mac: &str) -> WifiState {
         DeviceIdentity::normalized_mac(mac).and_then(|mac| self.inner.lock().unwrap().wifi.get(&mac).cloned()).unwrap_or_default()
     }
     pub fn wifi_clear_connection(&self, mac:&str) -> Result<()> {self.wifi_mutate(mac,|s|{s.connection_facts=None;Ok(())})}
     pub fn wifi_set_connection(&self, mac: &str, connection: super::wifi::ConnectionFacts) -> Result<()> {
-        self.wifi_mutate(mac, |s| {
-            if connection.schema!=2 {bail!("unsupported_wifi_connection_schema");}
-            let target=s.matching_target(&connection.host_ssid).context("network_not_configured")?;
-            if target.network_id!=connection.network_id || connection.local_revision!=s.local_revision { bail!("local_revision_conflict"); }
-            if connection.admission_error.as_ref().is_some_and(|e|e.len()>64 || !e.bytes().all(|c|c.is_ascii_alphanumeric()||c==b'_')) { bail!("invalid_error_code"); }
-            s.connection_facts=Some(connection);Ok(())
-        })
+        let mac=DeviceIdentity::normalized_mac(mac).context("invalid_device_mac")?;
+        let mut inner=self.inner.lock().unwrap();
+        let state=inner.wifi.get_mut(&mac).context("network_not_configured")?;
+        if connection.schema!=2 {bail!("unsupported_wifi_connection_schema");}
+        let target=state.matching_target(&connection.host_ssid).context("network_not_configured")?;
+        if target.network_id!=connection.network_id || connection.local_revision!=state.local_revision {bail!("local_revision_conflict");}
+        if connection.admission_error.as_ref().is_some_and(|e|e.len()>64 || !e.bytes().all(|c|c.is_ascii_alphanumeric()||c==b'_')) {bail!("invalid_error_code");}
+        let old=state.connection_facts.clone();
+        // Serialization excludes observations/contact: only durable intent changes write disk.
+        let changed=serde_json::to_value(&old)? != serde_json::to_value(Some(&connection))?;
+        state.connection_facts=Some(connection);
+        if changed {
+            if let Err(error)=Self::persist(&inner,&self.state_path()) {
+                inner.wifi.get_mut(&mac).unwrap().connection_facts=old;
+                return Err(error);
+            }
+        }
+        Ok(())
     }
     #[cfg(test)]
     pub fn wifi_note_connection(&self, mac:&str, c:super::wifi::Connection)->Result<()> {
@@ -523,6 +598,7 @@ impl PlatformService {
     pub fn wifi_queue_fields_checked(&self, mac: &str, bridge: &str, kind: &str, selected: Vec<String>,
         fields: BTreeMap<String, Vec<String>>, expected: Option<u64>, now: u64) -> Result<WifiJob> {
         let mac = DeviceIdentity::normalized_mac(mac).context("invalid_device_mac")?;
+        self.wifi_archive_exhausted(&mac)?;
         self.wifi_mutate(&mac, |s| {
             if expected.is_some_and(|v| v != s.local_revision) { bail!("local_revision_conflict"); }
             s.next_job_seq = s.next_job_seq.checked_add(1).context("wifi_id_exhausted")?;
@@ -538,6 +614,7 @@ impl PlatformService {
         let id=body["network_id"].as_str().context("network_id_required")?.to_owned();
         anyhow::ensure!(!id.is_empty() && id.len()<=32,"network_id_required");
         let mac=DeviceIdentity::normalized_mac(mac).context("invalid_device_mac")?;
+        self.wifi_archive_exhausted(&mac)?;
         self.wifi_mutate(&mac,|s| {
             s.expire(now);
             if let Some(job)=s.jobs.iter().find(|j|!j.terminal() && matches!(j.kind.as_str(),"trial"|"activate")) {
@@ -569,6 +646,7 @@ impl PlatformService {
     pub fn wifi_queue_manual_sync(&self, mac: &str, bridge: &str, selected: Vec<String>, expected: u64,
         snapshot_id: &str, host: &str, now: u64) -> Result<WifiJob> {
         let mac = DeviceIdentity::normalized_mac(mac).context("invalid_device_mac")?;
+        self.wifi_archive_exhausted(&mac)?;
         self.wifi_mutate(&mac, |s| {
             if expected != s.local_revision { bail!("local_revision_conflict"); }
             s.validate_manual_sync(&selected, host, snapshot_id)?;
@@ -614,7 +692,9 @@ impl PlatformService {
 
     /// Explicitly renew only the read/ACK budget, never the original execution.
     pub fn wifi_retry_settlement(&self, mac: &str, job_id: &str) -> Result<WifiJob> {
+        let archived=if self.wifi_state(mac).jobs.iter().any(|j|j.job_id==job_id) {None}else{self.read_wifi_history_job(mac,job_id)?};
         self.wifi_mutate(mac, |s| {
+            if let Some(job)=archived {anyhow::ensure!(s.jobs.len()<32,"wifi_job_capacity");s.jobs.push(job);}
             let j=s.jobs.iter_mut().find(|j|j.job_id==job_id).context("wifi_job_not_found")?;
             anyhow::ensure!(j.terminal() && (j.confirmation_pending() || j.receipt_ack_pending), "settlement_not_required");
             anyhow::ensure!(j.request_id.starts_with("w3_"),"settlement_identity_unsupported");
@@ -5192,6 +5272,71 @@ mod tests {
             assert_eq!(state.jobs[0].request_id,job.request_id);assert!(state.jobs[0].sent);
             assert!(!state.jobs[0].permits_network_start());
         }
+    }
+
+    #[test]
+    fn review_connection_observations_do_not_replace_state_file() {
+        let dir=tempfile::tempdir().unwrap();let svc=service_with_device(dir.path());let mac="AABBCCDDEEFF";
+        svc.wifi_save(mac,0,serde_json::from_value(json!([{"network_id":"home","host_ssid":"Host","ssid":"Home"}])).unwrap(),100).unwrap();
+        let state=svc.wifi_state(mac);
+        let mut c=crate::platform::wifi::ConnectionFacts::new(&state.targets[0],state.local_revision);
+        svc.wifi_set_connection(mac,c.clone()).unwrap();
+        let before=std::fs::metadata(svc.state_path()).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        c.note_http("boot-new".into(),101,None);
+        svc.wifi_set_connection(mac,c).unwrap();
+        assert_eq!(std::fs::metadata(svc.state_path()).unwrap().modified().unwrap(),before,"RAM-only HTTP evidence rewrote state.json");
+        assert!(svc.wifi_state(mac).connection_at(101).unwrap().http_ready);
+    }
+
+    #[test]
+    fn review_exhausted_unknown_history_does_not_consume_job_capacity() {
+        let dir=tempfile::tempdir().unwrap();let svc=service_with_device(dir.path());let mac="AABBCCDDEEFF";
+        for n in 0..32 {
+            let job=svc.wifi_queue_control(mac,"bridge","activate",json!({"network_id":"home","version":7}),100+n).unwrap();
+            svc.wifi_bind_transaction(mac,&job.job_id,"bridge","own").unwrap();
+            svc.wifi_mark_sent(mac,&job.job_id,101+n).unwrap();
+            svc.wifi_finish(mac,&job.job_id,"cancelled",None,102+n).unwrap();
+        }
+        svc.wifi_mutate(mac,|s|{for job in &mut s.jobs {job.settlement=Some(crate::platform::wifi::Settlement{attempts:3,next_attempt_at:999,error:Some("settlement_result_unknown".into()),result_error:None});}Ok(())}).unwrap();
+        svc.wifi_queue_control(mac,"bridge","activate",json!({"network_id":"home","version":7}),300).expect("exhausted history blocked new work");
+        let history=svc.wifi_archived_jobs(mac).unwrap();assert_eq!(history.len(),32);
+        assert!(history.iter().all(|j|j.sent && j.may_have_committed && j.confirmation.is_none() && j.terminal()));
+        let original=history[0].clone();drop(svc);
+        let svc=PlatformService::open(dir.path()).unwrap();assert_eq!(svc.wifi_archived_jobs(mac).unwrap().len(),32);
+        let retry=svc.wifi_retry_settlement(mac,&original.job_id).unwrap();
+        assert_eq!(retry.request_id,original.request_id);assert!(retry.sent && retry.terminal());
+        let after=ready(svc.wifi_settle_async(mac,&retry.job_id,"bridge","own",1000,&mut |op:&str,body:Value| {
+            assert_eq!(op,"result");assert_eq!(body["query_id"],original.request_id);
+            Ok(json!({"ok":true,"outcome":"unknown"}))
+        })).unwrap().unwrap();
+        assert!(after.confirmation.is_none() && after.may_have_committed);
+        ready(svc.wifi_settle_async(mac,&retry.job_id,"bridge","own",1060,&mut |op:&str,_:Value| {
+            Ok(if op=="result" {json!({"ok":true,"outcome":"committed","revision":8})}else{assert_eq!(op,"result_ack");json!({"ok":true,"outcome":"retired"})})
+        })).unwrap();
+        assert_eq!(svc.read_wifi_history_job(mac,&retry.job_id).unwrap().unwrap().confirmation.as_deref(),Some("operation_result"));
+
+        let path=svc.wifi_history_path(mac,&history[1].job_id).unwrap();
+        std::fs::write(path,b"{\"schema\":99}").unwrap();
+        assert!(svc.wifi_archived_jobs(mac).is_err(),"corrupt/unknown archive was accepted");
+
+    }
+
+    #[test]
+    fn review_history_state_failure_keeps_original_unknown_job() {
+        let dir=tempfile::tempdir().unwrap();let svc=service_with_device(dir.path());let mac="AABBCCDDEEFF";
+        let job=svc.wifi_queue_control(mac,"bridge","activate",json!({"network_id":"home","version":7}),100).unwrap();
+        svc.wifi_bind_transaction(mac,&job.job_id,"bridge","own").unwrap();svc.wifi_mark_sent(mac,&job.job_id,101).unwrap();
+        svc.wifi_finish(mac,&job.job_id,"cancelled",None,102).unwrap();
+        svc.wifi_mutate(mac,|s|{s.jobs[0].settlement=Some(crate::platform::wifi::Settlement{attempts:3,next_attempt_at:999,error:Some("settlement_result_unknown".into()),result_error:None});Ok(())}).unwrap();
+        let state=svc.state_path();let backup=state.with_extension("saved");
+        std::fs::rename(&state,&backup).unwrap();std::fs::create_dir(&state).unwrap();
+        assert!(svc.wifi_archive_exhausted(mac).is_err());
+        assert!(svc.wifi_state(mac).jobs.iter().any(|j|j.job_id==job.job_id && j.confirmation_pending()));
+        assert!(svc.read_wifi_history_job(mac,&job.job_id).unwrap().unwrap().confirmation_pending());
+        std::fs::remove_dir(&state).unwrap();std::fs::rename(backup,&state).unwrap();
+        drop(svc);let svc=PlatformService::open(dir.path()).unwrap();
+        assert!(svc.wifi_archived_jobs(mac).unwrap().is_empty(),"duplicate archive shadowed authoritative active evidence");
     }
 
     #[test]

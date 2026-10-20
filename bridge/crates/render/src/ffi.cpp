@@ -15,6 +15,7 @@
 #include "v2_status_snapshot.h"
 #include "display_result.h"
 #include "network_display_state.h"
+#include "plan_activation.h"
 #include "ap01_template_display.h"
 #include "v2_sync.h"
 #include "v2_sync_store.h"
@@ -32,6 +33,23 @@
 #include <vector>
 
 extern "C" int codex_compact_operation(const char *name) {return compactOperation(name);}
+extern "C" int codex_plan_network_prepare(uint64_t id, uint64_t priorId, const char *prior,
+    const char *network, char *out, int capacity) {
+    PlanActivation activation;
+    if (priorId) {
+        JsonDocument previous; String frozen;
+        if (deserializeJson(previous,prior) || activation.prepare(priorId,previous.as<JsonVariantConst>(),frozen)) return 0;
+        activation.commit(priorId,std::move(frozen));
+    }
+    JsonDocument doc;
+    String encoded;
+    const char *error=deserializeJson(doc,network)?"json":activation.prepare(id,doc.as<JsonVariantConst>(),encoded);
+    JsonDocument reply;
+    if (error) reply["error"]=error;
+    else reply["network"]=serialized(encoded);
+    if (capacity<=0 || measureJson(reply)>=size_t(capacity)) return 0;
+    return serializeJson(reply,out,capacity);
+}
 extern "C" int codex_compact_frame_golden(uint8_t *out, int cap) {
     if (!out || cap < int(COMPACT_FRAME_HEADER + 2)) return 0;
     CompactFrameHeader header;
@@ -1474,6 +1492,7 @@ int codex_ble_wire(const char *kind, const char *input, char *out, int cap) {
         snapshot.wifiManagement = doc["wifi_management"] | 0;
         snapshot.wifiConnection = doc["wifi_connection"] | 0;
         snapshot.bleClaim = doc["ble_claim"] | 0;
+        snapshot.planActivation = doc["plan_activation"] | 0;
         bytes = bleBuildInfo(snapshot);
     } else if (!strcmp(kind, "status")) {
         BleStatusSnapshot snapshot;

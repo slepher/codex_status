@@ -262,6 +262,27 @@ void handleV2Data() {
 void applyV2Plan(const String &body) {
     JsonDocument doc;
     if (!transport::v2Command(body, doc)) return;
+    const bool activateNetwork=!doc["network"].isNull();
+    String networkIntent;
+    EndpointRec endpoint;
+    int8_t endpointIndex=-1;
+    const char *networkError=nullptr;
+    if (activateNetwork) {
+        networkError=radio::state.readyReport.activation.prepare(doc["plan_id"]|0ULL,doc["network"],networkIntent);
+        if (!networkError && (!transport::state.v2ReplyOverBle || !radio::state.v2InRendezvous)) networkError="plan_network_transport";
+        if (!networkError) {
+            for (int i=0;i<storeCount();++i) {
+                if (storeGet(i,endpoint) && endpoint.principal==String(doc["bridge_id"]|"") &&
+                    endpoint.token==String(doc["token"]|"")) {endpointIndex=i;break;}
+            }
+            if (endpointIndex<0) networkError="report_binding";
+        }
+        if (networkError) {
+            transport::v2Ack("plan","rejected","unchanged","ram",networkError,-1,doc["plan_id"]|0ULL,
+                state.v2Profile.contextId,UINT32_MAX);
+            return;
+        }
+    }
     radio::markSynced();
     V2PlanDecision decision = power::state.planStore.apply(doc, power::state.v2Plan,
         clock::v2NowMs(), clock::planUtc(), power::state.v2Provisional);
@@ -281,10 +302,24 @@ void applyV2Plan(const String &body) {
     }
     if (radio::state.v2InRendezvous) {
         radio::state.v2Rv.planReceived();
-        radio::state.v2RvNetworkExpected = doc["need_http"] == true;
-        if (radio::state.v2RvNetworkExpected)
+        radio::state.v2RvNetworkExpected = doc["need_http"] == true || activateNetwork;
+        if (radio::state.v2RvNetworkExpected &&
+            !(activateNetwork && radio::state.readyReport.activation.planId()==decision.planId))
             radio::state.v2Rv.awaitNetworkStart(clock::v2NowMs(), power::state.v2Plan.lightActive(clock::v2NowMs()) ?
                 power::state.v2Plan.deadlineMs() : clock::v2NowMs() + RV_NETWORK_MS);
+    }
+    if (activateNetwork && radio::state.readyReport.activation.planId()!=decision.planId) {
+        auto &ready=radio::state.readyReport;
+        ready={};
+        ready.activation.commit(decision.planId,std::move(networkIntent));
+        ready.bridge.fromString(doc["network"]["bridge_addr"]|"");
+        ready.port=doc["network"]["bridge_port"]|0u;
+        ready.endpointIndex=endpointIndex;ready.principal=endpoint.principal;
+        ready.originSession=radio::state.v2RvId;ready.originRequestNo=decision.planId;ready.planId=decision.planId;
+        radio::state.v2RvNetworkExpected=true;radio::state.v2RvNetworkRequested=true;
+        const uint64_t now=clock::v2NowMs();
+        radio::state.v2Rv.awaitNetworkStart(now,power::state.v2Plan.lightActive(now)?power::state.v2Plan.deadlineMs():now+RV_NETWORK_MS);
+        radio::state.v2RvBleReleaseAtMs=radio::state.v2Rv.deadline();
     }
     const V2PowerPlan &plan = decision.plan;
     power::state.v2PlanReason = "bridge";
@@ -309,6 +344,7 @@ void applyV2Plan(const String &body) {
     JsonDocument ack;
     deserializeJson(ack, v2BuildAck("plan", decision.result, decision.display, "nvs",
         decision.error, -1, decision.planId, state.v2Profile.contextId, decision.grantedS, FW_TARGET_ID));
+    if (activateNetwork) ack["network"]["result"]="admitted";
     if (!doc["data"].isNull()) {
         JsonDocument data;
         data.set(doc["data"]);

@@ -23,7 +23,7 @@ struct Args {
     templates: PathBuf,
     #[arg(long)]
     codex_path: Option<PathBuf>,
-    #[arg(long, default_value = "180")]
+    #[arg(long, default_value = "60")]
     interval: u64,
     /// Fetch once, print the envelope, exit (no HTTP server).
     #[arg(long)]
@@ -107,6 +107,7 @@ async fn main() -> Result<()> {
         templates: library.clone(),
         active_hold_seconds: 600,
         activity,
+        snapshot_ready: None,
     };
     run_poller(poller, envelope).await
 }

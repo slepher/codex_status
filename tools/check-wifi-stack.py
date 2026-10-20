@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("elf", type=Path)
@@ -12,6 +13,12 @@ parser.add_argument("--no-online-wifi-migration", action="store_true", help="Req
 parser.add_argument("--no-legacy-management-entry", action="store_true", help="Require retired permit authorization and no-context management entry points to be absent")
 args = parser.parse_args()
 assembly = subprocess.check_output([str(args.objdump), "-d", "-C", str(args.elf)], text=True)
+# Some toolchain .xt.prop ranges mark entire C++ functions as literal data.
+# Decode a disposable copy as a fallback, preserving the original ELF/ROM.
+with tempfile.NamedTemporaryFile(suffix=".elf") as decoded:
+    objcopy=args.objdump.with_name(args.objdump.name.replace("objdump","objcopy"))
+    subprocess.run([str(objcopy),"--remove-section=.xt.prop",str(args.elf),decoded.name],check=True,capture_output=True)
+    assembly += subprocess.check_output([str(args.objdump),"-d","-C",decoded.name],text=True)
 functions = {}
 def adapter_name(name):
     if name.startswith("_Z") and "handleBleWifiMigration" in name:
@@ -22,8 +29,11 @@ for block in re.split(r"(?=^[0-9a-f]+ <[^\n]+>:\n)", assembly, flags=re.MULTILIN
     symbol = re.match(r"^[0-9a-f]+ <([^\n]+)>:\n", block)
     if not symbol:
         continue
-    frame = re.search(r"\bentry\s+a1,\s*(0x[0-9a-f]+|[0-9]+)", block[:250])
-    if frame:
+    # Long demangled ArduinoJson signatures can exceed the old 250-byte
+    # prefix by themselves. Inspect the first instructions, not the label.
+    instructions=block.split("\n",1)[1]
+    frame = re.search(r"\bentry\s+a1,\s*(0x[0-9a-f]+|[0-9]+)", instructions[:250])
+    if frame and adapter_name(symbol[1]) not in functions:
         functions[adapter_name(symbol[1])] = (int(frame[1], 0), set(adapter_name(name) for name in re.findall(r"\bcall\w*\s+[0-9a-f]+ <([^\n]+)>", block)))
 
 # Old ELF support keeps the .50 overflow regression runnable. v3 may inline
@@ -65,7 +75,7 @@ if args.no_legacy_management_entry:
     failed |= bool(retired)
 for prefix in ("pageStatus(", "StatusPages::"):
     required.extend(name for name in functions if name.startswith(prefix))
-for prefix in ("PlanStore::", "applyV2Plan("):
+for prefix in ("PlanStore::", "PlanActivation::", "applyV2Plan(", "v2RendezvousTick("):
     required.extend(name for name in functions if name.startswith(prefix))
 for name in required:
     if name is None:
@@ -87,7 +97,7 @@ def local(name):
                         "(anonymous namespace)::recoverTail(", "(anonymous namespace)::prune(",
                         "(anonymous namespace)::readFloor(", "(anonymous namespace)::saveFloor(")):
         return True
-    if name.startswith(("PlanStore::", "applyV2Plan(")):
+    if name.startswith(("PlanStore::", "PlanActivation::", "applyV2Plan(", "v2RendezvousTick(")):
         return True
     return name.startswith(("wifi", "Wifi", "readWifiStore(", "saveV2(", "save(Wifi", "Preferences::", "nvs_", "nvs::", "store", "load(Endpoints", "save(Endpoints", "legacyString(", "wifiDeviceStatus(", "handleWifiManagement(", "servicePresence(", "serviceReadyReport(", "v2Http", "v2Response(", "handleV2Status(", "pageStatus(", "StatusPages::", "buildPlatformStatus(", "handleClaim(", "serviceV2Ble(", "_ZL22handleBleWifiMigration", "handleBleWifiMigration(", "handleBleWifiCapabilities(", "v2BleNotify("))
 

@@ -4,10 +4,12 @@
 #include "config.h"
 #include "dependencies.h"
 #include "../network_display_state.h"
+#include "../plan_activation.h"
 
 namespace firmware::radio {
 
 struct ReadyReportState {
+    PlanActivation activation;
     IPAddress bridge;
     uint16_t port = 0;
     int8_t endpointIndex = -1;

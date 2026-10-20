@@ -28,6 +28,23 @@ pub const NOTE4_HEIGHT: i64 = 300;
 pub const AP01_WIDTH: i64 = 320;
 pub const AP01_HEIGHT: i64 = 240;
 pub const MAX_TEMPLATE_BYTES: usize = 32768;
+/// Versioned Plan activation envelope shared by firmware and Bridge.
+pub const PLAN_ACTIVATION_VERSION: u8 = 1;
+
+pub fn validate_plan_activation(network: &Value) -> Result<()> {
+    let object=network.as_object().context("plan_network_shape")?;
+    let target=network["target"].as_object().context("plan_network_shape")?;
+    let hex=|v:&Value|v.as_str().is_some_and(|s|s.len()==64 && s.bytes().all(|c|c.is_ascii_digit() || (b'a'..=b'f').contains(&c)));
+    let address=network["bridge_addr"].as_str().and_then(|s|s.parse::<std::net::Ipv4Addr>().ok());
+    anyhow::ensure!(object.len()==4 && network["v"]==PLAN_ACTIVATION_VERSION &&
+        address.is_some_and(|ip|ip.octets()[0]>0 && ip.octets()[0]!=127 && ip.octets()[0]<224) &&
+        network["bridge_port"].as_u64().is_some_and(|p|(1..=65535).contains(&p)) &&
+        target.len()==(if target.contains_key("credential_key"){4}else{3}) &&
+        network["target"]["network_id"].as_str().is_some_and(|s|!s.is_empty() && s.len()<=32 && !s.contains('\0')) &&
+        network["target"]["open"].is_boolean() && hex(&network["target"]["metadata_key"]) &&
+        (!target.contains_key("credential_key") || hex(&network["target"]["credential_key"])),"plan_network_shape");
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WinSel {

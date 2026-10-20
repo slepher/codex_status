@@ -68,6 +68,10 @@ extern "C" int codex_sim_wifi_storage_status(char *out,int cap) {
 }
 
 // Test-only RF observation: never export credential bytes.
+extern "C" int codex_sim_wifi_plan_matches(const char *target) {
+    JsonDocument doc;
+    return !deserializeJson(doc,target) && wifiPlanTargetMatches(doc.as<JsonVariantConst>());
+}
 extern "C" int codex_sim_wifi_observe(char *out,int cap) {
     JsonDocument doc;doc["begins"]=WiFi.begins;doc["ssid"]=WiFi.SSID();
     doc["connected"]=WiFi.status()==WL_CONNECTED;doc["has_ip"]=!(WiFi.localIP()==IPAddress(0,0,0,0));
