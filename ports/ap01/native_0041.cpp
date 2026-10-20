@@ -385,7 +385,8 @@ void Runtime::key(void *eventPointer) {
                 if(!ensureContent(outgoing)){focused=true;contentLeaving=false;return;}
                 ROM_FN(0xa00b3106,void (*)(void *,int,int))(root,outgoing,0);
             }
-            ROM_FN(0xa00b3106,void (*)(void *,int,int))(root,target,direction>0?1:2);
+            // Match the stock key handler: 0x13 slides with 2, 0x14 with 1.
+            ROM_FN(0xa00b3106,void (*)(void *,int,int))(root,target,direction>0?2:1);
             tick();
         } else if(activate(next))virtualIndex=next;
         return;
@@ -398,7 +399,10 @@ void Runtime::key(void *eventPointer) {
     }
     original(eventPointer);
     unsigned after=ROM_FN(0xa00b2ff4,unsigned (*)(void *))(root);
-    if(before!=after&&((direction>0&&after<before)||(direction<0&&after>before))) {
+    // Insert only on the stock edge into Pet (7), and its reverse edge.
+    // Numeric decreases also include ordinary Pet(7)->Settings(6) and the
+    // Settings->Power/Time edges; those must never enter the virtual group.
+    if(before!=after&&((direction>0&&after==7)||(direction<0&&before==7))) {
         unsigned index=direction>0?0:count-1;
         if(activate(index)) {
             previousNative=direction>0?before:after;followingNative=direction>0?after:before;
