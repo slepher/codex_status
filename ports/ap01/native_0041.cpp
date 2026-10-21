@@ -1,4 +1,5 @@
 #include "application.h"
+#include "native_wifi_switch_0041.h"
 #include "http.h"
 #include "slot_0041.h"
 #include "screen_port_0041.h"
@@ -32,6 +33,7 @@ struct Runtime {
     LittleFSClass fs;
     Ap01Business business;
     std::unique_ptr<Ap01Application> app;
+    Ap01WifiSwitch0041 wifi{ap01WifiSwitchNativePort0041(this,wifiBlocked)};
     std::atomic<bool> initialized{false};
     std::atomic<uint32_t> uiEpoch{1};
     uint32_t renderingEpoch=1; // Captured by the business executor before each operation.
@@ -109,7 +111,8 @@ struct Runtime {
     }
     static bool lockBindings(void *p) {return !((Runtime *)p)->bindingsLock.test_and_set(std::memory_order_acquire);}
     static void unlockBindings(void *p) {((Runtime *)p)->bindingsLock.clear(std::memory_order_release);}
-    static bool firmwareBusy(void *) {return ap01_native0041::firmwareBusy();}
+    static bool wifiBlocked(void *p) {auto &r=*(Runtime *)p;return (ap01_native0041::firmwareBusy()) || (r.app&&r.app->maintenanceActive());}
+    static bool firmwareBusy(void *p) {return (ap01_native0041::firmwareBusy()) || ((Runtime *)p)->wifi.busy();}
     static bool diagnosticBusy(void *p) {
         return firmwareBusy(p) || ((Runtime *)p)->app->maintenanceActive();
     }
@@ -403,7 +406,7 @@ void Runtime::serve(bool maintenancePort) {
     if(!maintenancePort)app->businessOnline(true);
     while(!stop.load(std::memory_order_acquire)) {
         if(!maintenancePort)processActivation();
-        if(maintenancePort)app->maintenanceTick(nowMs());
+        if(maintenancePort){app->maintenanceTick(nowMs());wifi.tick(nowMs());}
         else if(!app->maintenanceActive()&&!businessLock.test_and_set(std::memory_order_acquire)) {
             renderingEpoch=uiEpoch.load(std::memory_order_acquire);
             time_t epoch=time(nullptr);struct tm local{};char hhmm[6]="--:--";
@@ -459,6 +462,7 @@ void *Runtime::bootstrap(void *p) {
     callbacks.deviceCode=[](void *,char out[9]) {return ap01DeviceCodeLoad0041(ap01RomVfs(),out);};
     r.app.reset(new(std::nothrow) Ap01Application(r.fs,r.business,callbacks,mac,r.bootId));
     if(!r.app||!r.app->begin(nowMs()))return nullptr;
+    r.wifi.begin(nowMs());
     r.initialized.store(true,std::memory_order_release);
     uint32_t initializing=0;
     r.ready.compare_exchange_strong(initializing,1,std::memory_order_acq_rel);
@@ -567,3 +571,14 @@ unsigned ap01HostProbe0041(void *context,unsigned operation) {
     }
 }
 #endif
+
+namespace {
+Runtime *wifiRuntime() {
+    return (Runtime *)ap01_window_find(Runtime::timer);
+}
+}
+extern "C" int ap01WifiSelect0041(const char *ssid){
+    auto r=wifiRuntime();if(!r||r->ready.load(std::memory_order_acquire)!=1||Runtime::wifiBlocked(r))return -16;
+    return r->wifi.request(ssid,uint32_t(nowMs()));
+}
+extern "C" int ap01WifiSelectionState0041(){auto r=wifiRuntime();return r?int(r->wifi.feedback(uint32_t(nowMs()))):int(Ap01WifiSwitch0041::Unavailable);}

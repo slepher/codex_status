@@ -24,6 +24,8 @@
 
 ## 下一步与验收边界
 
+- **AP01 Wi-Fi选择菜单已按用户要求转待办（C9）**：现有原生菜单/异步切网/恢复代码作为阶段性实现保存；宿主核心ASan/UBSan通过，原生模拟12后段导航断言失败，尚未完成菜单、切网和预览验收。候选12未部署，设备仍应用06／救援0，Bridge未变。[续接状态](project-workflow/ap01-wifi-profiles/status.md)。
+
 - A9软件/Mac部署已修；本轮Data是启动重确认，真实新余量变化通知/屏幕时延、Windows部署未验。B6/C8合盖苏醒、长期RF/目视仍未验，BOOT旧网回退未改。上游跨会话通知未到达原因仍未知，现有60秒采集兜底。[原调查](project-workflow/bridge-macos/wifi-usage-latency-20261020.md)。
 - **A9 Plan同轮激活/图标实机已验**：用户已允许定位/蓝牙，14:20:08原Plan5904 BLE ACK明确network_activation=plan；3.304秒后同Plan ready报告，随后同MAC认证HTTP确认Wi-Fi连接、BLE关闭、Plan5904/剩余量递减，14:20:32本轮complete。14:21 Data876 ACK applied/displayed；用户确认Wi-Fi图标已显示。周期同值Sleep软件对照通过，自然余量变化完整时延未验。旧ROM维护兼容保留；[实机证据](artifacts/bridge-macos/plan-activation-physical-proof.json)。
 

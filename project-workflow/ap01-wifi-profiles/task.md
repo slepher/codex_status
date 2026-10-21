@@ -10,3 +10,7 @@
 - [x] Verify full rescue0 before/after image including PEC matches unchanged original.
 - [ ] Integrate menu/events into original0041 ROM; separate SIM GUI is not acceptance.
 - [ ] Verify safe original network-field writes, actual RF switching, failure recovery and cloud binding.
+
+- [ ] Add native Settings Wi-Fi entry, saved/current list, stock checkmarks and full wrap/return navigation on deployed06 baseline.
+- [ ] Implement network-only worker, confirmed success/failure rollback/restart recovery and OTA exclusion.
+- [ ] Build exact candidate and validate host/native menu/network recovery; present preview without device writes.

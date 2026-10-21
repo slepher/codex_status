@@ -83,6 +83,7 @@ sources += [repo/'src'/name for name in ['template_engine.cpp', 'GUI_Paint.cpp',
 
 if args.screen_host_probe:sources += [platform/'test_screen_peer_0041.cpp']
 
+sources += [platform/name for name in ['native_wifi_switch_0041.cpp','native_wifi_switch_port_0041.cpp']]
 for source in sources:
 
     output = args.out/(source.stem+'.o')
