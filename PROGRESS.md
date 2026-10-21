@@ -9,6 +9,7 @@
 
 ## 部署与工作区
 
+- **原厂0041设备码菜单候选02已通过真实ROM QEMU验收，未部署**：原列表新增设备码，三项子菜单沿用原厂风格；显式更新、完整点击、原返回、页面重建、同Flash重启摘要一致及帧缓冲人工检查均通过。修正裁剪字库构造顺序和24B FontData ABI。应用槽1仍为f52b12，救援槽0未动，网络不变；设备码尚未接入OTA/调试鉴权。[专项](project-workflow/ap01-device-code-menu/status.md)。
 - AP01 `34F01557210B`/DID2232184842：**配网列表后端已部署应用槽1**，build `f52b12b55b8aaa9b8d891b7f23e98097`。原版0031救援槽0未刷写；部署前后6822344 B全镜像（含PEC）SHA均与原版一致。通过原救援只上传一次槽1，列表实机保存/uniq、软重启revision1/密文保持均通过；测试项已清理至revision2。11份原网络/身份文件不变；用户确认原厂界面/旋钮正常。**新增Wi-Fi菜单只有独立SIM实现，实机未接入；原网络安全写入/切网回退未验。** [专项](project-workflow/ap01-wifi-profiles/status.md)。历史误刷及已完成的0031恢复保留原记录，不能描述为历史上从未写槽0。
 - **导航问题已修复并实机通过**：原厂Pet7→菜单6及菜单→主界面被页号递减误判为环回、重复插入应用；现仅在进入Pet的边/反向边插入全部模板。退出动画key0x13→2、0x14→1。用户本轮明确回复“页序和动画均正常”。
 - AP01保留单页v9布局/字体，验证后当前Bundle **`6a8d702a`/CRC4831c60d**，commit_seq13/source_crc3ce26768；Data23/displayed/current_template_drawn。原厂页发布不抢焦点及模板页发布自动恢复已实机通过，用户确认“自动返回，额度正常”；所有设备Profile不变。[部署与验收](project-workflow/ap01-template-integration/bundle-page-restore.md)。
