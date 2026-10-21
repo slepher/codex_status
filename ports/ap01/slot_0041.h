@@ -1,5 +1,3 @@
 #pragma once
-#include "firmware.h"
-int ap01SelectedSlot0041();
-bool ap01InspectSlot0041(unsigned slot, bool running, Ap01SlotImage &out);
-int ap01SelectSlot0041(unsigned slot);
+// Compatibility include; implementation and ABI belong to the firmware platform.
+#include "../../../cuktech-ap01-firmware/tooling/firmware-modules/native_slot_0041.h"

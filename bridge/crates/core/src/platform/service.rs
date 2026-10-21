@@ -2400,6 +2400,10 @@ impl PlatformService {
         }
         body["boot_id"] = status["boot_id"].clone();
         let mut field_samples = body["field_samples"].as_object().cloned().unwrap_or_default();
+        if status.get("display_state").is_some() && status.get("display_reason").is_none() {
+            body["display_reason"] = Value::Null;
+            field_samples.remove("display_reason");
+        }
         let groups: [(&str, &[&str]); 7] = [
             ("identity", &["device_mac", "configured"]),
             ("firmware", &["fw", "firmware_target", "running_slot", "reset_reason",
@@ -2407,7 +2411,7 @@ impl PlatformService {
             ("radio", &["radio", "presence", "transports", "wifi_control", "status_seq", "network"]),
             ("runtime", &["heap_free", "heap_min", "uptime_ms"]),
             ("display", &["display", "active_context_id", "active_template_id",
-                "template_ids", "display_state", "data_contract"]),
+                "template_ids", "display_state", "display_reason", "data_contract"]),
             ("power", &["power", "sync"]),
             ("jobs", &["committed_job_id", "commit_seq", "data_seq", "applied_seq"]),
         ];
@@ -4140,6 +4144,21 @@ mod tests {
         svc.adopt_activation_context(mac,"published",103).unwrap();
         assert_eq!(svc.device_get(mac).unwrap()["data_contract"]["requirements"][0]["index"],5);
         assert_eq!(svc.inner.lock().unwrap().coordinators[mac].requirements[0].index,5);
+    }
+
+    #[test]
+    fn authenticated_display_reason_tracks_its_receipt_and_clears_for_legacy_status() {
+        let dir=tempfile::tempdir().unwrap();let svc=PlatformService::open(dir.path()).unwrap();
+        let mac="AABBCCDDEEFF";
+        svc.device_upsert(DeviceIdentity::new(mac,"AP01").unwrap(),DeviceCapabilities::ssd1681_154g()).unwrap();
+        svc.note_authenticated_status_at(mac,&json!({"device_mac":mac,"boot_id":"one",
+            "active_template_id":"page-b","display_state":"pending",
+            "display_reason":"waiting_for_template_page"}),100).unwrap();
+        let raw=svc.device_get(mac).unwrap();
+        assert_eq!(raw["last_authenticated"]["body"]["display_reason"],"waiting_for_template_page");
+        svc.note_authenticated_status_at(mac,&json!({"device_mac":mac,"boot_id":"one",
+            "display_state":"pending"}),101).unwrap();
+        assert!(svc.device_get(mac).unwrap()["last_authenticated"]["body"]["display_reason"].is_null());
     }
 
     #[test]

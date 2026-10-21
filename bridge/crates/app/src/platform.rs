@@ -724,10 +724,18 @@ fn project_device(raw: &Value, identity: &Value, now: u64) -> Value {
     let display_state = if observed["display_state"] == "unchanged" &&
         !wifi_display["value"].is_null() { wifi_display }
         else { prefer_observed(wifi_display, observed, "display_state", wifi_at) };
-    let screen_label = match display_state["value"].as_str() {
+    let display_reason = if display_state["source"] == "ble_digest" { Value::Null }
+        else { reading(body,"display_reason","display") };
+    let screen_label = match (display_state["value"].as_str(),display_reason["value"].as_str()) {
+        (Some("pending"),Some("waiting_for_template_page")) => "已安装，等待进入模板页",
+        (Some("pending"),Some("pairing_dialog")) => "已安装，等待配对弹窗关闭",
+        (Some("pending"),Some("maintenance_active")) => "已安装，等待维护结束",
+        (Some("pending"),Some("screen_not_visible")) => "已安装，等待模板页可见",
+        (state,_) => match state {
         Some("displayed") => "屏幕已显示", Some("failed") => "显示失败",
         Some("pending") => "等待屏幕显示", Some("unchanged") => "显示状态未改变",
         _ => "尚无屏幕结果",
+        },
     };
     let owner_state = if identity["yielded"] == true { "yielded" }
         else if identity["owner_known"] != true { "unknown" }
@@ -759,7 +767,7 @@ fn project_device(raw: &Value, identity: &Value, now: u64) -> Value {
             "image_observed_at":image["observed_at"]},
         "upgrade_failure":upgrade_failure,
         "display":{"installed":installed,"active_template":active_template,
-            "data_applied":applied,"screen_state":display_state,"label":screen_label},
+            "data_applied":applied,"screen_state":display_state,"reason":display_reason,"label":screen_label},
         "battery":reading(body,"power.battery","power"),
         "power_mode":if raw["capabilities"]["render_target"]==bridge_core::platform::model::RENDER_TARGET_AP01 {"always_on"}else{"power_plan"},
         "delivery":{"enabled":raw["sync_enabled"],"source":"bridge_setting",
@@ -788,6 +796,21 @@ fn isolated_ble_is_visible_even_with_recent_http_and_survives_new_process() {
 
 #[cfg(test)]
 mod device_view_tests {
+    #[test]
+    fn ap01_pending_display_explains_which_page_is_waiting() {
+        let mut raw=json!({"device_mac":"0200000000A1",
+            "capabilities":{"firmware_target":"cuktech-ap01-0041"},
+            "last_authenticated":{"observed_at":100,"body":{"received_at":100,
+                "boot_id":"boot","display_state":"pending","display_reason":"waiting_for_template_page",
+                "active_template_id":"page-b","template_ids":["page-a","page-b"]}}});
+        let view=project_device(&raw,&Value::Null,100);
+        assert_eq!(view["display"]["label"],"已安装，等待进入模板页");
+        raw["last_authenticated"]["body"]["display_state"]=json!("displayed");
+        assert_eq!(project_device(&raw,&Value::Null,100)["display"]["label"],"屏幕已显示");
+        raw["last_authenticated"]["body"]["display_state"]=json!("pending");
+        raw["last_authenticated"]["body"].as_object_mut().unwrap().remove("display_reason");
+        assert_eq!(project_device(&raw,&Value::Null,100)["display"]["label"],"等待屏幕显示");
+    }
     use super::*;
 
     #[test]
@@ -956,7 +979,8 @@ pub fn device_detail(ctx: &AppCtx, requested_mac: &str, section: &str) -> Result
             "active_template_id":reading(body,"active_template_id","display"),
             "active_context_id":reading(body,"active_context_id","display"),
             "commit_seq":reading(body,"commit_seq","jobs"),
-            "display_state":reading(body,"display_state","display")}),
+            "display_state":reading(body,"display_state","display"),
+            "display_reason":reading(body,"display_reason","display")}),
         "sync_diagnostics" => json!({"sync":reading(body,"sync","power"),
             "archive":sync_diagnostics::summary(&crate::mcp_config(ctx).data_root,&mac)}),
         "power" => {

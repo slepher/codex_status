@@ -198,7 +198,7 @@ def main():
         assert admission['passed'] and len(admission['validators']) == 2
         for index, name in enumerate(('0041','0031')):
             item = admission['validators'][index]
-            validator_source = ROOT/'ports/ap01/ota_image.c' if name == '0041' else ROOT.parent/'cuktech-ap01-firmware/tooling/firmware-modules/ota_image.c'
+            validator_source = ROOT.parent/'cuktech-ap01-firmware/tooling/firmware-modules/native_ota_image_0041.c' if name == '0041' else ROOT.parent/'cuktech-ap01-firmware/tooling/firmware-modules/ota_image.c'
             assert item['passed'] and item['source_sha256'] == digest(validator_source) and item['checks'] == 29
             assert item['test_source_sha256'] == digest(ROOT/'ports/ap01/ota_image_smoke.c')
             assert item['binary_sha256'] == digest(path.parent/('image-host-'+name))

@@ -48,7 +48,15 @@ fn ap01_shared_compiler_layouts_and_boundaries() {
     }
     let mut env = Env::default();
     env.sync_hhmm = "12:40";
-    for (name, remain, five) in [("monthly-only",98,None),("weekly-only",98,None),("both-windows",72,Some(86)),("zero",0,None),("full",100,None)] {
+    let fonts: Vec<Vec<u8>> = ["AP01_PREVIEW_FONT", "AP01_PREVIEW_DIGITS", "AP01_PREVIEW_MEDIUM", "AP01_PREVIEW_LATIN"]
+        .into_iter().filter_map(|name| std::env::var(name).ok())
+        .map(|path| std::fs::read(path).unwrap()).collect();
+    let render = |input: &Value| {
+        if fonts.is_empty() { bridge_render::render_bits(&src.to_string(), &input.to_string(), &env).unwrap() }
+        else { bridge_render::render_bits_with_fonts(&src.to_string(), &input.to_string(), &env, fonts.clone()).unwrap() }
+    };
+    for (name, remain, five) in [("monthly-only",98,None),("weekly-only",98,None),("both-windows",72,Some(86)),("zero",0,None),("full",100,None),
+                               ("both-full",100,Some(100)),("both-zero",0,Some(0)),("both-one-digit",9,Some(9)),("both-99",99,Some(99))] {
         let mut input = usage(remain,five);
         if name == "weekly-only" {
             input["account"]["plan"] = json!("prolite");
@@ -58,31 +66,70 @@ fn ap01_shared_compiler_layouts_and_boundaries() {
         if let Ok(dir)=std::env::var("AP01_PREVIEW_DIR") {
             std::fs::write(std::path::Path::new(&dir).join(format!("{name}.usage.json")), &data).unwrap();
         }
-        let frame = if let Ok(font) = std::env::var("AP01_PREVIEW_FONT") {
-            let mut fonts = vec![std::fs::read(font).unwrap()];
-            if let Ok(font) = std::env::var("AP01_PREVIEW_DIGITS") { fonts.push(std::fs::read(font).unwrap()); }
-            if let Ok(font) = std::env::var("AP01_PREVIEW_MEDIUM") { fonts.push(std::fs::read(font).unwrap()); }
-            bridge_render::render_bits_with_fonts(&src.to_string(), &data, &env, fonts).unwrap()
-        } else { bridge_render::render_bits(&src.to_string(), &data, &env).unwrap() };
+        let frame = render(&input);
         assert_eq!(frame.len(),frame_bytes(320,240));
+        if !fonts.is_empty() {
+            // Compare actual ink rather than line boxes: the quota number is
+            // balanced between the heading and the percent below it.
+            let cx: usize=if five.is_some(){78}else{160};
+            let heading_bottom=(64..88).filter(|&y| ((cx-43)..(cx+42)).any(|x| pixel(&frame,x,y)==2)).max().unwrap();
+            let number_rows: Vec<usize>=(90..149).filter(|&y| ((cx-60)..(cx+60)).any(|x| pixel(&frame,x,y)==1)).collect();
+            let percent_top=(143..165).find(|&y| ((cx-10)..(cx+10)).any(|x| pixel(&frame,x,y)==1)).unwrap();
+            let upper=number_rows[0] as i32-heading_bottom as i32-1;
+            let lower=percent_top as i32-*number_rows.last().unwrap() as i32-1;
+            assert!(upper>=0 && lower>=0 && (upper-lower).abs()<=3,
+                    "{name}: quota ink must be vertically centered (upper={upper}, lower={lower})");
+            // Compare against an unrestricted rendering of the same glyphs:
+            // balanced spacing alone can still hide clipped top rows.
+            let isolated=json!({"schema":1,"id":"quota-ink","version":1,"render_target":RENDER_TARGET_AP01,
+                "canvas":{"w":320,"h":240},"elements":[
+                    {"type":"rect","rect":[0,0,320,240],"fill":true,"color":"black"},
+                    {"type":"text","text":remain.to_string(),"font":"ntreg64","x":50,"y":50,"color":"white","bg":"black"}]});
+            let reference=bridge_render::render_bits_with_fonts(&isolated.to_string(),"{}",&env,fonts.clone()).unwrap();
+            let full_ink=(0..240).map(|y| (0..320).filter(|&x| pixel(&reference,x,y)!=0).count()).sum::<usize>();
+            let displayed_ink=(90..149).map(|y| ((cx-60)..(cx+60)).filter(|&x| pixel(&frame,x,y)!=0).count()).sum::<usize>();
+            assert_eq!(displayed_ink,full_ink,"{name}: quota glyph pixels must not be clipped");
+            if let Some(value)=five {
+                let isolated=json!({"schema":1,"id":"five-hour-ink","version":1,"render_target":RENDER_TARGET_AP01,
+                    "canvas":{"w":320,"h":240},"elements":[
+                        {"type":"rect","rect":[0,0,320,240],"fill":true,"color":"black"},
+                        {"type":"text","text":value.to_string(),"font":"nt30","x":50,"y":50,"color":"white","bg":"black"},
+                        {"type":"text","text":"%","font":"nt16","x":250,"y":100,"color":"white","bg":"black"}]});
+                let reference=bridge_render::render_bits_with_fonts(&isolated.to_string(),"{}",&env,fonts.clone()).unwrap();
+                let full_ink=(0..240).map(|y| (0..320).filter(|&x| pixel(&reference,x,y)!=0).count()).sum::<usize>();
+                let displayed_ink=(82..132).map(|y| (166..304).filter(|&x| pixel(&frame,x,y)!=0).count()).sum::<usize>();
+                assert_eq!(displayed_ink,full_ink,"{name}: 5h glyph pixels and percent must not be clipped");
+            }
+        }
         assert!((43..166).any(|y| (99..222).any(|x| pixel(&frame,x,y)>=7)), "ring must contain coverage shades");
         if std::env::var("AP01_PREVIEW_FONT").is_ok() {
-            assert!((185..204).any(|y| (16..240).any(|x| pixel(&frame,x,y)>=7)), "text must contain coverage shades");
+            assert!((214..240).any(|y| (16..196).any(|x| pixel(&frame,x,y)>=7)), "sync text must contain coverage shades");
         }
         // RC is independent of the 5h window, in both layouts.
-        assert!((184..205).any(|y| (249..304).any(|x| pixel(&frame,x,y)==3)));
+        assert!((214..240).any(|y| (240..304).any(|x| pixel(&frame,x,y)==3)));
         let mut no_rc=input.clone();
         no_rc.as_object_mut().unwrap().remove("resetCredits");
-        let hidden=bridge_render::render_bits(&src.to_string(),&no_rc.to_string(),&env).unwrap();
-        assert!((184..205).all(|y| (249..304).all(|x| pixel(&hidden,x,y)==0)));
+        let hidden=render(&no_rc);
+        assert!((214..240).all(|y| (240..304).all(|x| pixel(&hidden,x,y)==0)));
         if let Ok(dir) = std::env::var("AP01_PREVIEW_DIR") {
             std::fs::write(std::path::Path::new(&dir).join(format!("{name}.png")), bridge_render::bits_to_png_size(&frame,320,240).unwrap()).unwrap();
         }
         if five.is_none() {
-            assert_eq!(pixel(&frame,164,44),if remain==0 {5}else{2});
+            let filled_start=(48..55).any(|y| (160..173).any(|x| pixel(&frame,x,y)==2));
+            assert_eq!(filled_start,remain>0,"quota arc starts only for nonzero remaining");
             // The former 5h area is clear; there is no label or placeholder.
             let unexpected = (52..100).flat_map(|y| (260..304).map(move |x| (x,y))).find(|&(x,y)| pixel(&frame,x,y)!=0);
             assert_eq!(unexpected,None,"unexpected pixel in hidden 5h block");
+        }
+        if name == "both-windows" {
+            let mut missing_account=input.clone();
+            missing_account.as_object_mut().unwrap().remove("bridge");
+            let missing=render(&missing_account);
+            assert!((10..36).all(|y| (76..239).all(|x| pixel(&missing,x,y)==0)));
+            let mut long_account=input.clone();
+            long_account["bridge"]["label"]=json!("a-very-long-account-name-that-must-not-cover-time");
+            let long=render(&long_account);
+            assert!((10..36).all(|y| (244..304).all(|x| pixel(&long,x,y)==pixel(&frame,x,y))),"account must not overwrite clock");
         }
         let png = bridge_render::bits_to_png_size(&frame,320,240).unwrap();
         if let Ok(dir) = std::env::var("AP01_PREVIEW_DIR") {

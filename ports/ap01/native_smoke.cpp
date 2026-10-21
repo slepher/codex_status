@@ -17,6 +17,7 @@ struct Host {
     bool locked = false, lostRename = false, corruptReadback = false,failPresent=false;
     unsigned randomCounter = 1, displays = 0;
     std::vector<uint8_t> frame, wifiList;
+    const char *waitReason="waiting_for_template_page";
 };
 int prepare(void *, const char *path) { struct stat s; return stat(path, &s) || !S_ISDIR(s.st_mode) ? -1 : 0; }
 int openFile(void *, const char *p, unsigned mode) { return open(p, mode == 0 ? O_RDONLY : O_WRONLY|O_CREAT|(mode == 1 ? O_TRUNC : O_APPEND), 0600); }
@@ -37,7 +38,8 @@ int statFs(void *, const char *, uint64_t *total, uint64_t *used) { *total = 0x1
 bool randomBytes(void *p, uint8_t *out, size_t n) { auto &h = *(Host *)p; for (size_t i = 0; i < n; ++i) out[i] = ++h.randomCounter; return true; }
 bool lock(void *p) { auto &h = *(Host *)p; assert(!h.locked); h.locked = true; return true; }
 void unlock(void *p) { auto &h = *(Host *)p; assert(h.locked); h.locked = false; }
-bool present(void *p, uint8_t *bytes, uint32_t) { auto &h = *(Host *)p; if(h.failPresent)return false;if (bytes) { h.frame.assign(bytes, bytes+38400); delete[] bytes; ++h.displays; } return true; }
+bool present(void *p, uint8_t *bytes, uint32_t) { auto &h = *(Host *)p; if(h.failPresent&&bytes)return false;if (bytes) { h.frame.assign(bytes, bytes+38400); delete[] bytes; ++h.displays; } return true; }
+const char *displayReason(void *p) {return ((Host *)p)->waitReason;}
 std::string readAll(const char *path) { std::ifstream f(path, std::ios::binary); return {std::istreambuf_iterator<char>(f), {}}; }
 std::string text(const String &s) { return {s.c_str(), s.length()}; }
 Ap01HttpRequest req(const char *method, const char *path, const char *token, const std::string &body) {
@@ -66,6 +68,16 @@ struct Client {
         LocalJsonAllocator a; JsonDocument doc(&a); assert(!deserializeJson(doc,body(reply).c_str())); nonce=doc["session_nonce"].as<const char *>();
     }
     void claim() { auto reply=send(4,"/claim","{\"device_mac\":\"AABBCCDDEEFF\",\"bridge_id\":\"bridge-test\"}"); assert(reply.status==200); }
+    Ap01HttpReply publish(const std::string &bundle,const char *id) {
+        char crc[9];snprintf(crc,9,"%08x",v2Crc32((const uint8_t *)bundle.data(),bundle.size()));
+        std::string envelope="{"+command(id)+",\"length\":"+std::to_string(bundle.size())+",\"content_crc\":\""+crc+"\"}";
+        assert(send(10,"/api/bundle/begin",envelope).status==200);
+        for(size_t at=0;at<bundle.size();at+=3072) {
+            auto offset=std::to_string(at);
+            assert(send(11,"/api/bundle/chunk",bundle.substr(at,3072),id,offset.c_str()).status==200);
+        }
+        return send(12,"/api/bundle/commit",envelope);
+    }
 };
 struct MemoryStream { std::string input, output; size_t offset=0, fragment=17; };
 int streamRead(void *p, uint8_t *out, size_t n, uint64_t) { auto &s=*(MemoryStream *)p; n=std::min(n,std::min(s.fragment,s.input.size()-s.offset)); memcpy(out,s.input.data()+s.offset,n); s.offset+=n; return n; }
@@ -174,6 +186,46 @@ int main(int argc,char **argv) {
         Ap01Business content(fs,{&host,present},2);assert(content.begin(0));
         assert(content.active()==1&&recoveredContext!=content.context());
         auto receipt=content.store.bsActivationReceipt();assert(receipt&&!strcmp(receipt->request,"activate-test"));
+    }
+    {
+        Ap01Business content(fs,{&host,present,nullptr,displayReason},3);assert(content.begin(0));
+        Ap01Application app(fs,content,{&host,randomBytes,lock,unlock},"AABBCCDDEEFF",3);
+        assert(app.begin());app.businessOnline(true);Client client{app};client.status();client.claim();
+        LocalJsonAllocator a;JsonDocument original(&a),next(&a),status(&a),ack(&a);
+        assert(!deserializeJson(original,bundle.c_str()));
+        auto variant=[&](unsigned count,bool keep,const char *job) {
+            next.set(original);next["job_id"]=job;
+            auto order=next["profile"]["template_ids"].to<JsonArray>();
+            auto templates=next["templates"].to<JsonArray>();
+            for(unsigned i=0;i<count;++i) {
+                std::string id=keep&&i==0?"codex-status-b":"page-"+std::to_string(i);
+                order.add(id.c_str());auto entry=templates.add<JsonObject>();entry.set(original["templates"][0]);
+                entry["key"]["template_id"]=id.c_str();entry["source"]["id"]=id.c_str();
+            }
+            next["profile"]["initial_active_id"]=order[count-1];
+            String out;serializeJson(next,out);return text(out);
+        };
+        content.status(status);auto stale=status["frame_generation"].as<uint32_t>();
+        auto reply=client.publish(variant(8,true,"pages8"),"replace8");assert(reply.status==200);
+        assert(content.count()==8&&content.active()==0);content.status(status);
+        assert(!strcmp(status["active_template_id"]|"","codex-status-b"));
+        assert(!deserializeJson(ack,client.body(reply).c_str()));
+        assert(!strcmp(ack["display_reason"]|"","waiting_for_template_page"));
+        assert(!strcmp(ack["active_template_id"]|"","codex-status-b"));
+        content.displayed(stale);content.status(status);assert(status["display_state"]=="pending");
+        for(unsigned i=0;i<8;++i) {
+            assert(content.localActivate(i,3000+i));content.status(status);
+            assert((status["applied_seq"]|0u)==0);
+        }
+        assert(content.localActivate(0,3010));
+        reply=client.publish(variant(1,false,"pages1"),"replace1");assert(reply.status==200);
+        content.status(status);assert(content.count()==1&&content.active()==0&&status["active_template_id"]=="page-0");
+        auto generation=status["frame_generation"].as<uint32_t>();content.displayed(generation);content.status(status);
+        assert(status["display_state"]=="displayed"&&status["display_reason"]=="current_template_drawn");
+        host.failPresent=true;
+        reply=client.publish(variant(2,false,"pages2"),"replacefail");assert(reply.status==409);
+        host.failPresent=false;content.status(status);assert(status["display_state"]=="failed");
+        fprintf(stdout,"Bundle page identity: 8-page reorder, all-page activation, removed-page initial fallback, 1-page replacement, stale draw receipt and render failure passed\n");
     }
     fprintf(stdout,"native application: physical confirmation, full Bundle chunks/commit replay, durable activation/lost rename ACK, restart, independent maintenance, discovery and HTTP parsing passed\n");
 }

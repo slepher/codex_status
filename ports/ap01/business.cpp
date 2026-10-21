@@ -88,6 +88,13 @@ bool Ap01Business::localActivate(uint8_t index, uint64_t now) {
     char next[BS_CTX_LEN]; newContext(next); String error;
     return store.bsSetActive(index, next, error) && loadActive(now) && render();
 }
+void Ap01Business::displayFeedback(JsonDocument &out, const char *state) {
+    out["active_template_id"] = configured ? profile.ids[profile.initial] : "";
+    out["display_reason"] = !strcmp(state,"pending")
+        ? (ui.displayReason ? ui.displayReason(ui.context) : "waiting_for_draw")
+        : !strcmp(state,"displayed") ? "current_template_drawn"
+        : !strcmp(state,"failed") ? "render_or_ui_allocation" : "unchanged";
+}
 void Ap01Business::status(JsonDocument &out) {
     out["result"] = "ok"; out["configured"] = configured;
     out["firmware_target"] = FW_TARGET_ID; out["fw_target"] = FW_TARGET_ID;
@@ -113,6 +120,7 @@ void Ap01Business::status(JsonDocument &out) {
     bool failed=generation==failedGeneration.load(std::memory_order_acquire);
     out["display_state"] = !configured ? (recovery?"failed":"builtin") : failed?"failed":
         generation && generation == displayedGeneration.load(std::memory_order_acquire) ? "displayed" : "pending";
+    displayFeedback(out, out["display_state"] | "unchanged");
     if(configured&&failed){out["display_error"]="render_or_ui_allocation";out["display_action"]="refresh_or_publish_complete_bundle";}
     out["frame_generation"] = generation; out["frame_crc"] = frameCrc;
     for (uint8_t i = 0; configured && i < profile.count; ++i) out["template_ids"].add(profile.ids[i]);
@@ -209,7 +217,8 @@ int Ap01Business::command(uint16_t op, JsonDocument &request, const char *nonce,
             File file = fs.open(store.bsReceivePath(), "r");
             replacing = false;
             if (!store.bsInstall(file, decision.length, decision.crc, FW_TARGET_ID,
-                RENDER_TARGET_ID, next, storageError)) {
+                RENDER_TARGET_ID, next, storageError, nullptr,
+                configured ? profile.ids[profile.initial] : nullptr)) {
                 if (!replacing) {
                     if (storageError == "ui_busy") render();
                     reply = v2BuildAck(operation, "rejected", "unchanged", "flash", storageError.c_str(),
@@ -289,5 +298,9 @@ int Ap01Business::command(uint16_t op, JsonDocument &request, const char *nonce,
     if (error) { result = "rejected"; status = 409; }
     reply = v2BuildAck(operation, result, display, op == 2 ? "ram" : "flash", error,
         includeSeq ? seq : -1, 0, ackContext, UINT32_MAX, FW_TARGET_ID, includeSeq);
+    LocalJsonAllocator feedbackAllocator; JsonDocument feedback(&feedbackAllocator);
+    if (!deserializeJson(feedback,reply)) {
+        displayFeedback(feedback,display); reply=""; serializeJson(feedback,reply);
+    }
     return status;
 }

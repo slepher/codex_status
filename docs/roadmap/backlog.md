@@ -354,6 +354,12 @@
 
 ### C9. 取消项目自管A/B、动态容量与内置更新界面
 
+- **2026-10-20 AP01共享宿主共存/热重建离线通过，未部署**：八模板+独立两页，跨应用焦点/发布及两次完整九页重建（含动画中途）、服务连续性、旧帧/revision拒绝通过；修正删除绑定、NULL定时器保护及旧窗口订阅。普通候选03原生回归/六场景像素/核心ASan通过；34设备未动，不关闭C9物理及精确OTA/资源边界。[专项](../../project-workflow/ap01-screen-host/status.md)。
+
+- **2026-10-20 AP01页面恢复34已部署并单页实机通过**：先启动/认证0031救援槽0，再单次OTA写应用槽1，build cc18eeb5…/6995768 B运行一致，救援未写。原厂页不抢焦点并反馈waiting_for_template_page；模板页保持旋钮不动发布后自动恢复，用户确认“自动返回，额度正常”。同内容v9最终Bundle6a8d702a/commit13、Data23/displayed；所有Profile保持。原生136页面恢复、137–139 OTA/同NOR/无稳定记录回切、12组像素零差异及匹配宿主ASan/UBSan通过；多页仍为模拟证据，Bridge未部署/WK未验，不关闭C9。[实现与证据](../../project-workflow/ap01-template-integration/bundle-page-restore.md)。
+
+- **2026-10-20 AP01布局v9 Bundle已部署**：首栏订阅/账号/时间、底部SYNC/RC合栏，完整Montserrat14、CJK20及额度64/60px；修复字体行高大于region造成上沿裁剪。九场景/完整像素/规范化CRC通过，Bundle3f4850d5/commit10、Data19 applied、最终显示回执pending；ROM与boot_id未变，其他设备Profile不变，不关闭C9实屏/长期边界。[部署与证据](../../project-workflow/ap01-template-integration/bundle-refresh.md)。
+
 - **2026-10-20 AP01字体离线核查**：原厂0041中找到完整ASCII Montserrat14（含Y），67个原生fmt_txt描述符中旧55项清单漏12项；整套字形/映射/字距比对一致。页面子集裁剪与恢复遗漏同时存在；未改设备、ROM、Bundle或已有预览，详见[核查证据](../../project-workflow/ap01-template-integration/font-rom-audit.md)。
 
 - **2026-10-20 AP01导航33已部署并实机通过**：Pet边识别替代数字递减判环回，修正Pet→菜单/菜单→主界面重复插入应用和退出方向；用户确认“页序和动画均正常”。槽1/build967049b5…，031救援槽0保留且本轮实机回切已验；原v5 Bundle保留，Data seq12已应用、末次状态pending。130/133/134原生OTA/同NOR恢复/无稳定记录回切/原回执及12组像素、匹配宿主ASan/UBSan通过。导航项结案，C9其他验收边界仍开放。[证据与交接](../../project-workflow/ap01-template-integration/release-0041-20261020.md)。

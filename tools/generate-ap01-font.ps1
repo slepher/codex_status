@@ -1,15 +1,21 @@
-param([string]$OutputDirectory = "$PSScriptRoot/../artifacts/ap01-template-integration", [switch]$Digits, [switch]$Medium)
+param([string]$OutputDirectory = "$PSScriptRoot/../artifacts/ap01-template-integration", [switch]$Digits, [switch]$Medium,
+      [ValidateRange(24,72)][int]$DigitPixels = 48, [ValidateRange(24,60)][int]$MediumPixels = 30,
+      [switch]$NumericOnly)
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 if (!(Test-Path -LiteralPath $OutputDirectory -PathType Container)) { throw 'Precreate output directory with escalation.' }
 $chars = Get-Content -LiteralPath "$PSScriptRoot/../project-workflow/ap01-template-integration/font-characters.txt" -Raw
 $points = @(32..126) + @($chars.ToCharArray() | ForEach-Object { [int]$_ } | Where-Object { $_ -gt 126 }) | Sort-Object -Unique
 if ($Digits -or $Medium) { $points = @(32..126) }
-$size = if ($Digits) { 48 } elseif ($Medium) { 30 } else { 13 }
+$size = if ($Digits) { $DigitPixels } elseif ($Medium) { $MediumPixels } else { 13 }
 $family = if ($Digits -or $Medium) { 'Bahnschrift' } else { 'Microsoft YaHei UI' }
-$baseline = if ($Digits) { 48 } elseif ($Medium) { 30 } else { 14 }
+$baseline = if ($Digits) { $DigitPixels } elseif ($Medium) { $MediumPixels } else { 14 }
 $font = [System.Drawing.Font]::new($family,$size,[System.Drawing.FontStyle]::Regular,[System.Drawing.GraphicsUnit]::Pixel)
 $glyphs = foreach($cp in $points) {
+    if ($NumericOnly -and $cp -ne 32 -and $cp -ne 37 -and $cp -ne 45 -and $cp -ne 46 -and ($cp -lt 48 -or $cp -gt 57)) {
+        @{cp=$cp;advance=0;width=0;height=0;left=0;offset_y=0;bits=''}
+        continue
+    }
     $bitmap = [System.Drawing.Bitmap]::new(96,80)
     $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
     $graphics.Clear([System.Drawing.Color]::Black)

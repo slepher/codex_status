@@ -7,6 +7,7 @@ ROOT=Path(__file__).resolve().parents[1]
 BASE=0x9ffff000
 OFFSET=0x675000
 HOOK=0x5e180
+TIMER_DELETE=0x8be58
 ORIGINAL_SHA='972db4c136c7ed9e24a83c07c1a7fd62040ca018b08ca285216d26b1fee3c6b9'
 FORMAT='ap01-native-app-0041-v1'
 def sha(data):return hashlib.sha256(data).hexdigest()
@@ -14,7 +15,11 @@ def call(target):
     delta=target-(BASE+HOOK)
     hi=(delta+0x800)>>12;lo=delta-(hi<<12)
     return struct.pack('<II',((hi&0xfffff)<<12)|(1<<7)|0x17,((lo&0xfff)<<20)|(1<<15)|(1<<7)|0x67)
-def assemble(original,payload,entry,unsigned_ota=False):
+def jump(target,site):
+    delta=target-site;hi=(delta+0x800)>>12;lo=delta-(hi<<12)
+    return struct.pack('<II',((hi&0xfffff)<<12)|(5<<7)|0x17,((lo&0xfff)<<20)|(5<<15)|0x67)
+
+def assemble(original,payload,entry,unsigned_ota=False,timer_guard=None):
     if sha(original)!=ORIGINAL_SHA or len(original)!=6769704:raise ValueError('exact original 0041 required')
     if original[HOOK:HOOK+8]!=bytes.fromhex('97001500e780404d'):raise ValueError('0041 UI callsite mismatch')
     if payload[:8]!=b'AP01APP1' or len(payload)<=256 or entry&1 or not BASE+OFFSET+256<=entry<BASE+OFFSET+len(payload):raise ValueError('native payload/entry')
@@ -24,6 +29,11 @@ def assemble(original,payload,entry,unsigned_ota=False):
     out[OFFSET:OFFSET+len(payload)]=payload
     out[HOOK:HOOK+8]=call(entry)
     stock=bytearray(original)
+    if timer_guard is not None:
+        if not BASE+OFFSET+256<=timer_guard<BASE+OFFSET+len(payload) or timer_guard&1:raise ValueError('timer guard bounds')
+        if original[TIMER_DELETE:TIMER_DELETE+8]!=bytes.fromhex('411106c622c426c2'):raise ValueError('timer delete prologue mismatch')
+        out[TIMER_DELETE:TIMER_DELETE+8]=jump(timer_guard,BASE+TIMER_DELETE)
+        stock[TIMER_DELETE:TIMER_DELETE+8]=out[TIMER_DELETE:TIMER_DELETE+8]
     if unsigned_ota:
         if stock[0x707fc:0x707fe]!=bytes.fromhex('dde7'):raise ValueError('unsigned OTA branch mismatch')
         stock[0x707fc:0x707fe]=bytes.fromhex('7da0')
@@ -47,11 +57,11 @@ def validate_candidate(data,manifest_path):
     if zlib.crc32(h)!=stored or struct.unpack_from('<I',h,28)[0]!=zlib.crc32(payload[256:]):raise ValueError('payload checksums')
     if struct.unpack_from('<4I',h,8)!=(1,len(data),OFFSET,len(payload)):raise ValueError('payload bounds')
     entry=struct.unpack_from('<I',h,24)[0]
-    if data!=assemble(original,payload,entry,m.get('unsigned_ota',False)) or sha(data)!=m['image']['sha256']:raise ValueError('candidate reconstruction mismatch')
+    if data!=assemble(original,payload,entry,m.get('unsigned_ota',False),int(m['timer_delete_guard']['entry'],16) if m.get('timer_delete_guard') else None) or sha(data)!=m['image']['sha256']:raise ValueError('candidate reconstruction mismatch')
     return m
 def main():
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--output',type=Path,required=True);a=p.parse_args()
-    output=a.output.resolve();out=ROOT/'artifacts/ap01-platform-integration/device'
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--output',type=Path,required=True);p.add_argument('--source-dir',type=Path,default=ROOT/'artifacts/ap01-platform-integration/device');a=p.parse_args()
+    output=a.output.resolve();out=a.source_dir.resolve()
     if not output.parent.is_dir():p.error('precreate output directory with elevation')
     original_path=ROOT.parent/'cuktech-ap01-firmware/roms/0041/ap01-1.0.2_0041.bin'
     original=original_path.read_bytes();payload=bytearray((out/'ap01-native-0041.module.bin').read_bytes())
@@ -70,7 +80,7 @@ def main():
     entry=symbols['ap01Register0041'];assert symbols['ap01_native_manifest']==BASE+OFFSET
     abi_file=out/'native-runtime-abi.bin'
     subprocess.run([str(tool)+'-objcopy.exe','-O','binary','--only-section=.abi',str(out/'ap01-native-0041.elf'),str(abi_file)],check=True)
-    abi=struct.unpack('<17I',abi_file.read_bytes());assert abi[0]==1
+    abi_raw=abi_file.read_bytes();abi=struct.unpack('<'+str(len(abi_raw)//4)+'I',abi_raw);assert abi[0]==1 and len(abi) in (17,23)
     length=((OFFSET+len(payload)+15)&~15)+40
     h=bytearray(256);h[:8]=b'AP01APP1';struct.pack_into('<7I',h,8,1,length,OFFSET,len(payload),entry,zlib.crc32(payload[256:]),0)
     h[36:52]=hashlib.sha256(payload[256:]).digest()[:16];struct.pack_into('<3I',h,52,7,18080,18081)
@@ -79,7 +89,7 @@ def main():
     h[128:160]=bytes.fromhex(ORIGINAL_SHA)
     h[160:192]=hashlib.sha256((out/'native-core-audit.json').read_bytes()).digest()
     struct.pack_into('<I',h,32,zlib.crc32(h));payload[:256]=h
-    image=assemble(original,bytes(payload),entry,True)
+    image=assemble(original,bytes(payload),entry,True,symbols['ap01TimerDelete0041'])
     payload_path=output.with_suffix('.payload.bin');manifest_path=output.with_suffix('.manifest.json')
     elf_path=output.with_suffix('.elf');audit_path=output.with_suffix('.audit.json');link_path=output.with_suffix('.link.json');map_path=output.with_suffix('.map')
     if any(path.exists() for path in (output,payload_path,manifest_path,elf_path,audit_path,link_path,map_path)):p.error('candidate outputs must be new files')
@@ -90,20 +100,23 @@ def main():
     manifest={'format':FORMAT,'firmware_target':'cuktech-ap01-0041','build_id':h[36:52].hex(),
         'flashable':False,'hardware_verified':False,'simulator_verified':False,'unsigned_ota':True,
         'native_recovery_compatible':True,'recovery_marker_count':2,
+        'timer_delete_guard':{'entry':hex(symbols['ap01TimerDelete0041']),'offset':hex(TIMER_DELETE),'bytes':8,'null_is_noop':True,'nonnull_tail':'0xa008ae60'},
         'original':{'path':str(original_path.resolve()),'sha256':ORIGINAL_SHA,'bytes':len(original)},
         'payload':{'path':str(payload_path),'sha256':sha(payload),'bytes':len(payload),'entry':hex(entry)},
         'elf':{'path':str(elf_path),'sha256':sha(elf_path.read_bytes()),'bytes':elf_path.stat().st_size},
         'audit':{'path':str(audit_path),'sha256':sha(audit_path.read_bytes())},
         'link':{'path':str(link_path),'sha256':sha(link_path.read_bytes())},
+        'screen_host':{'abi':1,'roots_per_template':True,'timer_context_direct':True,'host_offset':abi[17],'phase_offset':abi[18],'slot_bytes':abi[19],'slot_root_offset':abi[20],'slot_child_offset':abi[21],'slots_offset':abi[22],'template_capacity':8},
         'native_abi':{'calendar':hex(symbols['_Z12ap01CalendarlR2tm']),'wall_time':hex(symbols['time']),
             'ui_timer':hex(symbols['_ZN12_GLOBAL__N_17Runtime5timerEPv']),
-            'ui_event':hex(symbols['_ZN12_GLOBAL__N_17Runtime13eventCallbackEPv']),
+            'ui_event':hex(symbols['_ZN12_GLOBAL__N_17Runtime13eventCallbackEPvS1_']),
             'lv_obj_send_event':'0xa00d831a',
             'instance_bytes':dict(zip(('runtime','business','bundle_store','application'),abi[1:5])),
             'runtime_offsets':dict(zip(('root','content','dialog','image','pairPending','pairWoken','focused','shownGeneration','templateCount','retired','ready','uiStage'),abi[5:]))},
         'image':{'path':str(output),'sha256':sha(image),'bytes':len(image)},
-        'preserved':['boot header/entry','original ROMFS and rcS','all five pet GIFs','all original bytes outside one 8-byte UI hook and 2-byte unsigned OTA branch'],
+        'preserved':['boot header/entry','original ROMFS and rcS','all five pet GIFs','all original bytes outside 8-byte UI hook, 8-byte NULL-safe timer-delete hook and 2-byte unsigned OTA branch'],
         'limitations':['native application/update/recovery/resource acceptance pending','physical BSP/LCD and first 0041 hardware boot unverified']}
+    if 'ap01HostProbe0041' in symbols:manifest['screen_host_probe']={'entry':hex(symbols['ap01HostProbe0041']),'original_window_replay':True}
     manifest_path.write_text(json.dumps(manifest,indent=2),encoding='utf-8')
     validate_candidate(image,manifest_path)
     print(json.dumps(manifest['image']))

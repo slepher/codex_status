@@ -3,9 +3,10 @@ This script does NOT call an unverified module a flashable firmware.
 Run elevated: compiler/linker may create private temporary directories.
 """
 from pathlib import Path
-import os,subprocess,json,hashlib
+import os,subprocess,json,hashlib,argparse
 repo=Path(__file__).resolve().parents[1]
-out=repo/'artifacts/ap01-platform-integration/device'
+parser=argparse.ArgumentParser();parser.add_argument('--out',type=Path,default=repo/'artifacts/ap01-platform-integration/device');args=parser.parse_args()
+out=args.out.resolve();assert out.is_dir()
 audit=json.loads((out/'native-core-audit.json').read_text(encoding='utf-8'))
 assert audit['passed']
 for item in audit['objects']:
@@ -17,7 +18,7 @@ tool=Path(os.environ['USERPROFILE'])/'.platformio/packages/toolchain-riscv32-esp
 sources=[Path(x['file']) for x in audit['objects'] if not x['file'].endswith('abi_budget.o')]
 elf=out/'ap01-native-0041.elf'
 cmd=[str(tool)+'-g++.exe','-march=rv32imafc','-mabi=ilp32f','-nostdlib','-mno-relax',
-     '-Wl,--no-relax,--gc-sections','-Wl,-T,'+str(repo/'ports/ap01/native_0041.ld'),
+     '-Wl,--no-relax,--gc-sections','-Wl,-T,'+str(repo.parent/'cuktech-ap01-firmware/tooling/firmware-modules/native_application_0041.ld'),
      '-Wl,-Map,'+str(out/'ap01-native-0041.map'),*[str(p) for p in sources],
      '-Wl,--start-group','-lm','-lgcc','-Wl,--end-group','-o',str(elf)]
 subprocess.run(cmd,check=True)

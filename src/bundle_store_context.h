@@ -56,7 +56,8 @@ public:
                     const char *owner = "", const char *request = "");
     bool bsInstall(File &bundleFile, uint32_t bundleLength, uint32_t bundleCrc,
                const char *expectedFirmware, const char *expectedRender,
-               const char *newContextId, String &err, void (*beforeReplace)() = nullptr);
+               const char *newContextId, String &err, void (*beforeReplace)() = nullptr,
+               const char *preferredActiveId = nullptr);
     bool bsInstall(const String &bundleJson, const char *expectedFirmware,
                const char *expectedRender, const char *newContextId, String &err);
     bool bsLoadCompiled(uint8_t index, CtTemplate &out, String &err);

@@ -11,6 +11,16 @@ sys.path.insert(0,str(FIRMWARE/'tooling/scripts'))
 synthetic_mac=None
 transition_probe='--transition-probe' in sys.argv
 if transition_probe:sys.argv.remove('--transition-probe')
+host_rebuild_only='--host-rebuild-only' in sys.argv
+if host_rebuild_only:sys.argv.remove('--host-rebuild-only')
+host_lifecycle_probe='--host-lifecycle-probe' in sys.argv
+if host_lifecycle_probe:sys.argv.remove('--host-lifecycle-probe')
+assert not host_rebuild_only or host_lifecycle_probe
+screen_host_probe_only='--screen-host-probe-only' in sys.argv
+if screen_host_probe_only:sys.argv.remove('--screen-host-probe-only')
+assert not screen_host_probe_only or transition_probe
+bundle_replace_probe='--bundle-replace-probe' in sys.argv
+if bundle_replace_probe:sys.argv.remove('--bundle-replace-probe')
 animation_wexti_model='--animation-wexti-model' in sys.argv
 if animation_wexti_model:sys.argv.remove('--animation-wexti-model')
 model_epoch=None
@@ -83,7 +93,7 @@ class NativeBuilder:
         m=json.loads(Path(path).read_text(encoding='utf-8'))
         for key in ('original','payload','image'):m[key]['path']=linux(m[key]['path'])
         payload=Path(m['payload']['path']).read_bytes();original=Path(m['original']['path']).read_bytes()
-        if builder.sha(payload)!=m['payload']['sha256'] or data!=builder.assemble(original,payload,int(m['payload']['entry'],16),m.get('unsigned_ota',False)):
+        if builder.sha(payload)!=m['payload']['sha256'] or data!=builder.assemble(original,payload,int(m['payload']['entry'],16),m.get('unsigned_ota',False),int(m['timer_delete_guard']['entry'],16) if m.get('timer_delete_guard') else None):
             raise ValueError('native candidate reconstruction mismatch')
         return m
 profile=dict(base.PROFILES['ap01-ota-channel-0041-v1'])
@@ -103,6 +113,7 @@ input_actions=queue.Queue()
 injected=None
 input_trace=[]
 manifest=json.loads(Path(sys.argv[sys.argv.index('--manifest')+1]).read_text(encoding='utf-8'))
+assert not host_lifecycle_probe or manifest.get('screen_host_probe'), 'Requires an opt-in probe build'
 
 def partition_tables(data):
     import zlib
@@ -121,7 +132,10 @@ send_event_va=int(manifest.get('native_abi',{}).get('lv_obj_send_event','0'),16)
 class NativeRSP(OriginalRSP):
     def ui_state(self):
         def read(address,count):return bytes.fromhex(super(NativeRSP,self).request(f'm{address:x},{count:x}'))
+        global native_ui_root
         offsets=manifest['native_abi']['runtime_offsets']
+        native_ui_root=int.from_bytes(read(native_runtime+offsets['root'],4),'little')
+        if not native_ui_root:return {'root_ready':0,'page':-1,'focused':0,'generation':0,'host_phase':0}
         state={'root_ready':read(native_ui_root+0x4c,1)[0],
                'page':int.from_bytes(read(native_ui_root+0x34,4),'little'),
                'focused':read(native_runtime+offsets['focused'],1)[0],
@@ -132,6 +146,8 @@ class NativeRSP(OriginalRSP):
             if pointer:
                 state[name+'_hidden']=bool(int.from_bytes(read(pointer+0x24,4),'little')&1)
                 state[name+'_coords']=list(struct.unpack('<4i',read(pointer+0x14,16)))
+        if manifest.get('screen_host'):
+            host=manifest['screen_host'];state['host_phase']=int.from_bytes(read(native_runtime+host['host_offset']+host['phase_offset'],4),'little')
         return state
     def request(self,packet):
         global native_ui_root,native_runtime,injected
@@ -150,6 +166,21 @@ class NativeRSP(OriginalRSP):
                     native_provider.report['animation_wexti_model_steps']=native_provider.report.get('animation_wexti_model_steps',0)+1
                 super().request('c')
                 return self.request('g')
+            if injected and injected[1].get('host_probe')==3 and pc in (0xa008ae58,0xa0089d02):
+                if (pc==0xa008ae58 and regs[10]==0) or (pc==0xa0089d02 and regs[11]==0):
+                    item={'pc':hex(pc),'a0':hex(regs[10]),'a1':hex(regs[11]),'ra':hex(regs[1]),'sp':hex(regs[2])}
+                    item['stack']=super().request(f'm{regs[2]:x},100')
+                    native_provider.report.setdefault('null_delete_arguments',[]).append(item)
+                super().request(f'z0,{pc:x},2');super().request('s');super().request(f'Z0,{pc:x},2');super().request('c')
+                return self.request('g')
+            if injected and injected[1].get('rebuild_original') and pc in (0xa005d1a0,0xa005cdc2):
+                saved,action=injected;injected=None
+                super().request('z0,a005d1a0,2');super().request('z0,a005cdc2,2')
+                action['value']=pc==0xa005d1a0
+                self.ui_state()
+                for register in range(1,33):
+                    if saved[register]!=regs[register]:super().request(f'P{register:x}={saved[register].to_bytes(4,"little").hex()}')
+                action['done'].set();return struct.pack('<33I',*saved).hex()
             if native_provider:
                 for call in native_provider.report.get('native_ff13_calls',[]):
                     if 'result' in call and 'guest_uptime_ms' not in call:
@@ -168,9 +199,13 @@ class NativeRSP(OriginalRSP):
             if pc==0xa0080da6 and native_provider:
                 native_provider.report['native_display_refresh_calls']=native_provider.report.get('native_display_refresh_calls',0)+1
             if input_model and pc==timer_va:
-                if native_runtime is None:native_runtime=int.from_bytes(bytes.fromhex(super().request(f'm{regs[10]+12:x},4')),'little')
+                if native_runtime is None:native_runtime=regs[10] if manifest.get('screen_host',{}).get('timer_context_direct') else int.from_bytes(bytes.fromhex(super().request(f'm{regs[10]+12:x},4')),'little')
                 if injected:
                     saved,action=injected;injected=None
+                    if action.get('host_probe') is not None:
+                        if action['host_probe']==3:
+                            super().request('z0,a008ae58,2');super().request('z0,a0089d02,2')
+                        action['value']=regs[10];self.ui_state()
                     if action.get('sample'):action['value']=self.ui_state()
                     if action.get('calendar') is not None:
                         action['value']=list(struct.unpack('<9i',bytes.fromhex(super().request(f"m{action['calendar_output']:x},24"))))
@@ -179,16 +214,18 @@ class NativeRSP(OriginalRSP):
                         if saved[register]!=regs[register]:super().request(f'P{register:x}={saved[register].to_bytes(4,"little").hex()}')
                     action['done'].set();input_trace.append({'event':action.get('event','framebuffer_ready'),'key':action.get('key',0),'completed':True})
                     return struct.pack('<33I',*saved).hex()
-                try:action=input_actions.get_nowait()
-                except queue.Empty:action=None
-                if action is None and fb_ready_model:
-                    # Original uv_fb_init deletes the refresh timer and waits
-                    # for fbdev POLLOUT. Model that peripheral readiness only
-                    # while the original invalidation callback has armed it.
+                action=None
+                if fb_ready_model:
+                    # Honor an armed peripheral event even when a probe is
+                    # polling UI state. Dequeuing probes first starves POLLOUT
+                    # and prevents real LVGL draw callbacks indefinitely.
                     context=int.from_bytes(bytes.fromhex(super().request('m62fc961c,4')),'little')
                     if context and super().request(f'm{context+0x5c:x},1')=='01':
                         action={'framebuffer_ready':context+0x60,'done':threading.Event()}
-                if action and native_ui_root:
+                if action is None:
+                    try:action=input_actions.get_nowait()
+                    except queue.Empty:pass
+                if action and native_runtime:
                     if action.get('nor_snapshot'):
                         native_qmp.command('qom-set',{'path':'/machine','property':'flash-snapshot','value':action['nor_snapshot']});action['done'].set()
                     elif action.get('snapshot'):
@@ -214,7 +251,21 @@ class NativeRSP(OriginalRSP):
                         saved=list(regs);temporary=(regs[2]-128)&~15
                         param=temporary+64
                         super().request(f'M{param:x},4:{struct.pack("<I",action.get("key",0)).hex()}')
-                        if action.get('calendar') is not None:
+                        if action.get('rebuild_original'):
+                            # Replay the exact original inlined theme constructor,
+                            # excluding lv_init/fb/input setup and the UI main loop.
+                            temporary=(regs[2]-1152)&~15;frame=temporary+1024
+                            super().request(f'M{temporary:x},400:'+bytes(1024).hex())
+                            super().request(f'M{frame-964:x},4:'+struct.pack('<I',0x62fc957c).hex())
+                            assert super().request('Z0,a005d1a0,2')=='OK'
+                            assert super().request('Z0,a005cdc2,2')=='OK'
+                            changes={1:timer_va,2:temporary,8:frame,9:0xa01c4000,18:0xa01c4000,32:0xa005cd68}
+                        elif action.get('host_probe') is not None:
+                            if action['host_probe']==3:
+                                assert super().request('Z0,a008ae58,2')=='OK'
+                                assert super().request('Z0,a0089d02,2')=='OK'
+                            changes={1:timer_va,2:temporary,10:native_runtime,11:action['host_probe'],32:int(manifest['screen_host_probe']['entry'],16)}
+                        elif action.get('calendar') is not None:
                             output=temporary+64;action['calendar_output']=output
                             super().request(f'M{output:x},24:'+bytes(36).hex())
                             changes={1:timer_va,2:temporary,10:action['calendar'],11:output,32:int(manifest['native_abi']['calendar'],16)}
@@ -296,14 +347,15 @@ class NativeProvider(OriginalProvider):
             return int(head.split(b' ')[1]),payload if frame else json.loads(payload)
     def action(self,**values):
         action={**values,'done':threading.Event()};input_actions.put(action)
-        if not action['done'].wait(20):raise TimeoutError('native LVGL input API')
+        if not action['done'].wait(90 if values.get('rebuild_original') else 20):raise TimeoutError('native LVGL input API')
         return action.get('value')
     def input(self,event,key=0,**values):
         result=self.action(event=event,key=key,**values)
         if event==0x11 and not values.get('sample'):
             until=time.monotonic()+30
             while time.monotonic()<until:
-                if self.action(observe=True)['root_ready']:break
+                state=self.action(observe=True)
+                if state['root_ready'] and not state.get('host_phase'):break
                 time.sleep(.2)
             else:raise TimeoutError('navigation slide did not finish')
         return result
@@ -317,6 +369,25 @@ class NativeProvider(OriginalProvider):
         action={'nor_snapshot':str(path),'done':threading.Event()};input_actions.put(action)
         if not action['done'].wait(30):raise TimeoutError('native NOR capture')
         return path
+    def screen_host_transition_probe(self,count):
+        self.action(onboarded=True);self.action(native_page=5,direction=0)
+        self.input(0x11,0x13);state=self.action(observe=True)
+        assert state['page']==7 and not state['focused']
+        pages=[]
+        for _ in range(count):
+            self.input(0x11,0x13);state=self.action(observe=True)
+            assert state['page']>=9 and state['focused'];pages.append(state['page'])
+        assert len(set(pages))==count
+        self.input(0x11,0x13);state=self.action(observe=True)
+        assert state['page']==6 and not state['focused']
+        for expected in reversed(pages):
+            self.input(0x11,0x14);state=self.action(observe=True)
+            assert state['page']==expected and state['focused']
+        self.input(0x11,0x14);state=self.action(observe=True)
+        assert state['page']==7 and not state['focused']
+        self.input(0x11,0x13)
+        self.report['native_screen_host_navigation']={'passed':True,'distinct_roots':pages,'pet':7,'settings':6}
+        self.report['native_transition_passed']=True
     def transition_probe(self,count):
         def settled():
             until=time.monotonic()+30
@@ -528,6 +599,147 @@ class NativeProvider(OriginalProvider):
         if reply.get('state')!='approved':raise RuntimeError('native pairing confirmation failed')
         self.report['native_pairing_approved']=True
         return token,identity,principal
+    def lifecycle_probe(self,frame,bundle,status,token,identity,principal,nonce):
+        import copy,zlib
+        self.report['native_application_stage']='coexistence'
+        def probe(operation):return self.action(host_probe=operation)
+        def idle():
+            until=time.monotonic()+45
+            while time.monotonic()<until:
+                state=self.action(observe=True)
+                if state['root_ready'] and not state.get('host_phase'):return state
+                time.sleep(.1)
+            raise TimeoutError('lifecycle slide/prepare')
+        def drawn():
+            until=time.monotonic()+45
+            while time.monotonic()<until:
+                state=frame(1,'/api/status',{})
+                if state['display_state']=='displayed':return state
+                time.sleep(.1)
+            raise TimeoutError('rebuilt current template did not draw')
+        def peer_drawn():
+            until=time.monotonic()+45
+            while time.monotonic()<until:
+                if probe(10)>0:return
+                time.sleep(.1)
+            self.report['secondary_draw_diagnostic']={str(i):probe(i) for i in range(40,50)}
+            self.report['secondary_draw_diagnostic']['ui']=self.action(observe=True)
+            self.snapshot('peer-undrawn')
+            raise TimeoutError('secondary application did not receive a real draw')
+        def peer_pixels(scene,color):
+            self.snapshot(scene)
+            prefix=Path(sys.argv[sys.argv.index('--output')+1]).with_suffix('.'+scene)
+            expected=struct.pack('<H',color)*76800
+            diffs=[sum(a!=b for a,b in zip(Path(str(prefix)+f'.fb{i}.rgb565').read_bytes(),expected)) for i in (0,1)]
+            assert min(diffs)==0,(scene,diffs)
+            return {'scene':scene,'rgb565':color,'different_bytes':diffs}
+        runtime=probe(0);assert runtime==native_runtime
+        timer=probe(20);assert timer
+        assert (probe(17),probe(18))==(17,18)
+        threads=len(self.report['thread_create']);assert threads==3
+        polls=probe(9)
+        ids=status['template_ids']
+        if not host_rebuild_only:
+            assert len(ids)==8
+            # Visit all eight actual codex roots, then cross the application boundary.
+            for expected in ids[1:]:
+                self.input(0x11,0x13);state=frame(1,'/api/status',{})
+                assert state['active_template_id']==expected
+            self.input(0x11,0x13);peer=self.action(observe=True)
+            assert peer['page']==17 and not peer['focused']
+            assert probe(9)>polls
+            self.snapshot('peer-before-draw-ack')
+            peer_drawn()
+            pixels=[peer_pixels('peer-a',0xf800)]
+            assert probe(26)==1
+            for _ in range(3):self.action(observe=True)
+            assert probe(28)==1 and probe(1)==0xfffffffe
+            assert probe(27)==1
+            for _ in range(3):self.action(observe=True)
+            assert probe(28)==0
+            self.input(0x11,10);assert probe(11)==1
+            self.input(0x11,0x13);assert self.action(observe=True)['page']==17
+            # Publish to codex while the other app has focus locked.
+            replacement=copy.deepcopy(bundle);replacement['job_id']='peer-publish'
+            replacement['profile']={'template_ids':[ids[0]],'initial_active_id':ids[0]}
+            replacement['templates']=[next(t for t in bundle['templates'] if t['key']['template_id']==ids[0])]
+            raw=json.dumps(replacement,ensure_ascii=False,separators=(',',':')).encode()
+            request={'bridge_id':principal,'device_mac':identity,'session_nonce':nonce,'request_id':'peer-publish',
+                     'length':len(raw),'content_crc':f'{zlib.crc32(raw):08x}'}
+            frame(10,'/api/bundle/begin',request)
+            for at in range(0,len(raw),3072):frame(11,'/api/bundle/chunk?request_id=peer-publish&session_nonce='+nonce+'&offset='+str(at),raw[at:at+3072])
+            ack=frame(12,'/api/bundle/commit',request)
+            assert ack['result']=='applied'
+            for _ in range(3):
+                state=frame(1,'/api/status',{});ui=self.action(observe=True)
+                assert ui['page']==17 and not ui['focused'] and probe(11)==1
+                assert state['display_state']=='pending' and state['display_reason']=='waiting_for_template_page'
+            pixels.append(peer_pixels('peer-bundle-unchanged',0xf800))
+            # Real guest clock and button events: no synthetic timeout completion.
+            self.input(1);until=time.monotonic()+60
+            while probe(12)==0 and time.monotonic()<until:time.sleep(.1)
+            assert probe(12)==1 and probe(11)==0
+            self.input(0xb);self.input(0x11,10);assert probe(11)==0
+            assert probe(14)==0 # logical B,A; physical root identity is unchanged.
+            assert (probe(17),probe(18))==(17,18)
+            self.input(0x11,0x14);assert self.action(observe=True)['page']==18
+            pixels.append(peer_pixels('peer-b',0x07e0))
+            self.input(0x11,0x14);assert self.action(observe=True)['focused']
+            status=drawn();assert status['active_template_id']==ids[0]
+            own=self.action(observe=True)['page'];assert probe(16)==0
+            assert self.action(observe=True)['page']==own and probe(15)==0
+            self.report['native_coexistence']={'passed':True,'codex_templates_visited':ids,'peer_roots':[17,18],
+                'peer_hidden_poll':True,'system_modal_hides_peer_and_blocks_switch':True,'independent_draws_and_pixels':pixels,'foreign_bundle_preserves_focus_lock':True,
+                'real_3s_escape':True,'stable_peer_reorder':True,'peer_removal_preserves_codex_focus':True}
+        self.report['native_application_stage']='ui-rebuild'
+        cycles=[]
+        self.report['native_ui_rebuild']={'passed':False,'cycles':cycles}
+        for cycle in range(2):
+            before=self.action(observe=True);context=status['active_context_id'];epoch=probe(21)
+            revision=probe(23);assert probe(6)==1
+            deleting_phase=0;deleting_x=0
+            assert probe(50)==4
+            if cycle==1:
+                assert probe(52)==0
+                until=time.monotonic()+30
+                while probe(22)!=2 and time.monotonic()<until:time.sleep(.1)
+                deleting_phase=probe(53);deleting_x=probe(54)
+                if deleting_x>=0x80000000:deleting_x-=0x100000000
+                assert probe(22)==2 and deleting_phase==2 and 0<abs(deleting_x)<320, (deleting_phase,deleting_x)
+            else:assert probe(3)==2 and probe(22)==2
+            assert probe(51)==0
+            assert self.action(observe=True)['page']==-1
+            code,health=self.http(self.port,'GET','/health',token=token);assert code==200
+            request=json.dumps({'magic':'codex-status','kind':'discover','discovery_v':1,'nonce':'0123456789abcdef0123456789abcdef'}).encode()
+            with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as udp:
+                udp.bind(('127.0.0.1',0));udp.settimeout(10);udp.sendto(request,('127.0.0.1',self.port+2));reply,_=udp.recvfrom(1024)
+            assert json.loads(reply)['mac']==identity
+            assert probe(0)==runtime and probe(20)==timer and self.action(rebuild_original=True)
+            until=time.monotonic()+45
+            while time.monotonic()<until:
+                result=probe(5)
+                if result==0:break
+                time.sleep(.1)
+            else:raise TimeoutError('rebuilt screen set not published')
+            after=idle();status=drawn()
+            assert after['focused'] and status['active_context_id']==context
+            assert probe(21)==epoch+1 and probe(24)>revision and probe(25)==0xfffffffd
+            assert probe(0)==runtime and probe(20)==timer and probe(50)==4
+            assert probe(7)==1 # Present an old-epoch frame after reattachment.
+            for _ in range(3):
+                self.action(observe=True);state=frame(1,'/api/status',{})
+                assert self.action(observe=True)['generation']!=0xdeadbeef
+                assert state['active_context_id']==context
+            self.snapshot('rebuilt-'+str(cycle))
+            assert probe(8)==1 and probe(8)==1 # repeated hook calls create no new executor/timer.
+            assert len(self.report['thread_create'])==threads
+            assert probe(1)==0;assert idle()['page']==17
+            peer_drawn()
+            assert probe(5)==0;idle();status=drawn()
+            cycles.append({'cycle':cycle,'epoch':epoch+1,'deleted_host_phase':deleting_phase,'target_x_at_delete':deleting_x,'stock_bindings_retired_and_rebound':True,'runtime_reused':True,'timer_reused':True,
+                'thread_count':threads,'maintenance_and_discovery_while_detached':True,'old_revision_rejected':True,
+                'old_frame_rejected':True,'new_current_template_drawn':True,'peer_rebound':True})
+        self.report['native_ui_rebuild']={'passed':True,'cycles':cycles,'stock_page_bodies':'all nine created by replaying original theme constructor; lv_init/fb/input/main loop not replayed'}
     def application_probe(self,info):
         token,identity,principal=self.pair_binding(info)
         if model_epoch:
@@ -644,6 +856,8 @@ class NativeProvider(OriginalProvider):
         # A recovered native page need not be the last stock page. Navigate
         # through actual input events, waiting for each native slide, rather
         # than assuming that one key always enters the virtual group.
+        if manifest.get('screen_host'):
+            self.action(onboarded=True);self.action(native_page=7,direction=0)
         for _ in range(24):
             state=self.action(observe=True)
             if state['focused']:break
@@ -712,25 +926,87 @@ class NativeProvider(OriginalProvider):
             assert status['frame_crc']!=before_status['frame_crc']
             self.report['native_clock_minute_refresh']={'passed':True,'data_sequence_unchanged':True,
                 'context_unchanged':True,'business_requests_during_refresh_wait':0,'before':before,'after':observed}
+        if host_lifecycle_probe:
+            self.lifecycle_probe(frame,bundle,status,token,identity,principal,nonce)
+            self.report['native_application_stage']='complete'
+            return
         self.report['native_application_stage']='navigation'
         ids=status['template_ids'];navigation=[]
-        for expected in ids[1:]:
-            before=status['active_context_id'];self.input(0x11,0x13);status=frame(1,'/api/status',{})
-            assert status['active_template_id']==expected and status['active_context_id']!=before and status['applied_seq']==0
-            navigation.append(expected)
-        last=status['active_context_id'];self.input(0x11,0x13);status=frame(1,'/api/status',{})
-        assert status['active_context_id']==last # Exit to the original page.
-        self.input(0x11,0x14);status=frame(1,'/api/status',{})
-        assert status['active_template_id']==ids[-1] and status['active_context_id']==last
-        for expected in reversed(ids[:-1]):
+        if not screen_host_probe_only:
+            for expected in ids[1:]:
+                before=status['active_context_id'];self.input(0x11,0x13);status=frame(1,'/api/status',{})
+                assert status['active_template_id']==expected and status['active_context_id']!=before and status['applied_seq']==0
+                navigation.append(expected)
+            last=status['active_context_id'];self.input(0x11,0x13);status=frame(1,'/api/status',{})
+            assert status['active_context_id']==last # Exit to the original page.
             self.input(0x11,0x14);status=frame(1,'/api/status',{})
-            assert status['active_template_id']==expected and status['applied_seq']==0
-            navigation.append(expected)
-        self.input(0x11,0x14);self.input(0x11,0x13);status=frame(1,'/api/status',{})
-        assert status['active_template_id']==ids[0]
-        self.report['native_navigation']={'template_count':len(ids),'visited':navigation,'forward_reverse_and_original_return':True}
+            assert status['active_template_id']==ids[-1] and status['active_context_id']==last
+            for expected in reversed(ids[:-1]):
+                self.input(0x11,0x14);status=frame(1,'/api/status',{})
+                assert status['active_template_id']==expected and status['applied_seq']==0
+                navigation.append(expected)
+            self.input(0x11,0x14);self.input(0x11,0x13);status=frame(1,'/api/status',{})
+            assert status['active_template_id']==ids[0]
+            self.report['native_navigation']={'template_count':len(ids),'visited':navigation,'forward_reverse_and_original_return':True}
+        if bundle_replace_probe:
+            import copy
+            self.report['native_application_stage']='bundle-page-restore'
+            checks=[]
+            def replace(order,initial,job):
+                replacement=copy.deepcopy(bundle);replacement['job_id']=job
+                replacement['profile']={'template_ids':order,'initial_active_id':initial}
+                replacement['templates']=[next(t for t in bundle['templates'] if t['key']['template_id']==id) for id in order]
+                raw=json.dumps(replacement,ensure_ascii=False,separators=(',',':')).encode()
+                request={'bridge_id':principal,'device_mac':identity,'session_nonce':nonce,
+                    'request_id':job,'length':len(raw),'content_crc':f'{zlib.crc32(raw):08x}'}
+                frame(10,'/api/bundle/begin',request)
+                for at in range(0,len(raw),3072):
+                    frame(11,f'/api/bundle/chunk?request_id={job}&session_nonce={nonce}&offset={at}',raw[at:at+3072])
+                ack=frame(12,'/api/bundle/commit',request)
+                assert ack['result']=='applied' and ack['display_state']=='pending'
+                return ack
+            def drawn(id):
+                until=time.monotonic()+30
+                while time.monotonic()<until:
+                    state=frame(1,'/api/status',{})
+                    assert state['active_template_id']==id
+                    if state['display_state']=='displayed':return state
+                    time.sleep(.1)
+                raise TimeoutError('replacement template did not draw automatically')
+            # Current template is first; move it to the last position, declaring
+            # a different initial page. Identity, focus and real LVGL draw win.
+            old_context=status['active_context_id']
+            ack=replace(list(reversed(ids)),ids[-1],'replace-reorder')
+            assert ack['active_template_id']==ids[0]
+            status=drawn(ids[0]);assert status['active_context_id']!=old_context
+            assert self.action(observe=True)['focused']
+            checks.append('focused_reorder_preserves_id_and_draws')
+            self.snapshot('replace-reorder')
+            # Deleting the displayed page uses the new initial page and also
+            # proves the 1-page group returns without a rotary event.
+            replace([ids[-1]],ids[-1],'replace-remove')
+            status=drawn(ids[-1]);assert self.action(observe=True)['focused']
+            checks.append('removed_page_uses_initial_single_page_draws')
+            replace([ids[-1]],ids[-1],'replace-single');status=drawn(ids[-1])
+            checks.append('single_page_update_draws')
+            self.input(0x11,0x13);before=self.action(observe=True)
+            assert not before['focused']
+            ack=replace(ids,ids[0],'replace-stock')
+            for _ in range(3):
+                time.sleep(.1);status=frame(1,'/api/status',{})
+                state=self.action(observe=True)
+                assert not state['focused'] and state['page']==before['page']
+                assert status['display_state']=='pending' and status['display_reason']=='waiting_for_template_page'
+            assert ack['display_reason']=='waiting_for_template_page'
+            checks.append('stock_page_preserved_with_explicit_feedback')
+            self.input(0x11,0x14);status=drawn(ids[-1])
+            checks.append('reentry_confirms_only_current_template')
+            for _ in ids[:-1]:self.input(0x11,0x14)
+            status=drawn(ids[0]);assert status['template_ids']==ids
+            self.report['native_bundle_replace']={'passed':True,'checks':checks,'status':{
+                k:status[k] for k in ('active_template_id','display_state','display_reason','template_ids')}}
         if transition_probe:
-            self.transition_probe(len(ids));status=frame(1,'/api/status',{})
+            (self.screen_host_transition_probe if manifest.get('screen_host') else self.transition_probe)(len(ids));status=frame(1,'/api/status',{})
         activation={'bridge_id':principal,'device_mac':identity,'session_nonce':nonce,
                     'request_id':'native-activate-'+Path(sys.argv[sys.argv.index('--output')+1]).stem,
                     'template_id':ids[1],'expected_active_context_id':status['active_context_id']}
@@ -760,7 +1036,10 @@ class NativeProvider(OriginalProvider):
                 self.report['native_discovery_matches']=discovered['mac']==info['device_mac'] and discovered['http_port']==18081 and discovered['maintenance_port']==18080
                 if input_model:
                     try:self.application_probe(info)
-                    except Exception as error:self.report['native_application_error']=type(error).__name__+': '+str(error)
+                    except Exception as error:
+                        import traceback
+                        self.report['native_application_error']=type(error).__name__+': '+str(error)
+                        self.report['native_application_traceback']=traceback.format_exc()
                     self.report['native_probe_finished']=True
                 return
             except (ConnectionError,OSError,ValueError) as error:
@@ -822,12 +1101,15 @@ if __name__=='__main__':
                           (functional if input_model else report['cpu_safety_passed']) and (report.get('native_firmware_protocol_passed') if firmware_probe else True) and
                           (report.get('native_slot_switch_passed') if slot_probe else True) and
                           (report.get('native_transition_passed') if transition_probe else True))
+    if bundle_replace_probe:report['passed']=bool(report['passed'] and report.get('native_bundle_replace',{}).get('passed'))
+    if host_lifecycle_probe:report['passed']=bool(report['passed'] and (host_rebuild_only or report.get('native_coexistence',{}).get('passed')) and report.get('native_ui_rebuild',{}).get('passed') and report.get('native_application_stage')=='complete')
     if trial_cut:report['passed']=bool(report.get('native_boot_trial_cut') and report['native_execution_clean'] and len(report['native_ff13_calls'])==1)
     report['full_application_verified']=bool(report['native_application_smoke_passed'] and all(report.get(key) for key in
         ('native_binding_recovered','native_bundle_recovered','native_activation_recovered','native_firmware_receipt_recovered')))
     report['limitations']=['Socket provider/MAC/LVGL input/fbdev readiness are explicit API fixtures, not physical hardware',
                           'Actual original LVGL framebuffer is captured; LCD/SPI completion remains unverified',
                           'Full persistence/update/resource release acceptance is tracked separately']
+    report['host_rebuild_only']=host_rebuild_only
     report['native_runner_sha256']=NATIVE_RUNNER_SHA
     report['runner_variant_sha256']=runner_variant_sha
     report['native_startup_snapshots']=debug_snapshots

@@ -11,6 +11,7 @@ struct Ap01BusinessPort {
     // the content page. Only the UI executor acknowledges actual presentation.
     bool (*present)(void *, uint8_t *, uint32_t);
     bool (*retire)(void *) = nullptr;
+    const char *(*displayReason)(void *) = nullptr;
 };
 
 class Ap01Business {
@@ -34,6 +35,7 @@ class Ap01Business {
     void newContext(char (&out)[BS_CTX_LEN]);
     bool loadActive(uint64_t now);
     bool render();
+    void displayFeedback(JsonDocument &out, const char *state);
     static bool beforeReplace(void *);
 public:
     TemplateRenderer renderer;
@@ -41,10 +43,12 @@ public:
     Ap01Business(BundleFilesystem &filesystem, const Ap01BusinessPort &port, uint64_t bootId);
     bool begin(uint64_t now);
     void clock(const char *hhmm);
+    bool redraw() { return configured && render(); }
     void displayed(uint32_t value) { displayedGeneration.store(value, std::memory_order_release); }
     void displayFailed(uint32_t value) {failedGeneration.store(value,std::memory_order_release);}
     uint8_t count() const { return configured ? profile.count : 0; }
     uint8_t active() const { return profile.initial; }
+    const char *screenId(unsigned index) const { return configured && index < profile.count ? profile.ids[index] : ""; }
     const char *context() const { return profile.contextId; }
     bool localActivate(uint8_t index, uint64_t now);
     void status(JsonDocument &out);

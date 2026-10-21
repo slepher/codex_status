@@ -4,17 +4,24 @@ Run elevated: precreates its private state directory and compiler temp files.
 from pathlib import Path
 import hashlib, json, struct, subprocess, zlib, time, argparse
 repo=Path(__file__).resolve().parents[1]
-platform=repo.parent/"cuktech-ap01-firmware/tooling/firmware-modules"
 out=repo/'artifacts/ap01-platform-integration/device'
-parser=argparse.ArgumentParser();parser.add_argument('--image',type=Path,default=out/'ap01-native-0041-candidate-13.bin');parser.add_argument('--bundle',type=Path);args=parser.parse_args()
-state=out/('t'+str(time.time_ns()%1000000))
+parser=argparse.ArgumentParser();parser.add_argument('--image',type=Path,default=out/'ap01-native-0041-candidate-13.bin');parser.add_argument('--bundle',type=Path);parser.add_argument('--out',type=Path,default=out);parser.add_argument('--linux-state',action='store_true');args=parser.parse_args();out=args.out.resolve()
 assert out.is_dir()
-state.mkdir(exist_ok=True)
-assert not any(state.iterdir()), 'Use a fresh private test directory; never delete runtime data'
-for i in range(21):(state/('f'+str(i))).mkdir()
-(state/'f6/bundle').mkdir()
+if args.linux_state:
+    create="import tempfile,pathlib; p=pathlib.Path(tempfile.mkdtemp(prefix='ap01-host-')); [(p/('f'+str(i))).mkdir() for i in range(21)]; (p/'f6/bundle').mkdir(); print(p)"
+    state=subprocess.check_output(['wsl','-d','Ubuntu-24.04','--','python3','-c',create],text=True).strip()
+    assert state.startswith('/tmp/ap01-host-')
+else:
+    state=out/('t'+str(time.time_ns()%1000000))
+    state.mkdir(exist_ok=True)
+    assert not any(state.iterdir()), 'Use a fresh private test directory; never delete runtime data'
+    for i in range(21):(state/('f'+str(i))).mkdir()
+    (state/'f6/bundle').mkdir()
+
 def linux(p):
+    if isinstance(p,str) and p.startswith('/tmp/ap01-host-'):return p
     p=p.resolve(); return '/mnt/'+p.drive[0].lower()+p.as_posix()[2:]
+
 prior=repo/'artifacts/ap01-platform-integration/run-20261018-195827/device'
 meta=json.loads((prior/'littlefs-2f62756e646c652f73746174652e62696e').read_bytes()[12:])
 content=(prior/'littlefs-2f62756e646c652f636f6e74656e742e62696e').read_bytes()
@@ -43,12 +50,12 @@ cmd=['wsl','-d','Ubuntu-24.04','--','g++','-std=c++17','-O0','-g','-fno-omit-fra
      '-DARDUINOJSON_ENABLE_STD_STREAM=0','-Wno-deprecated-declarations']
 for folder in ('ports/ap01','bridge/crates/render/shim','src','.pio/libdeps/esp32-s3-epaper-154g/ArduinoJson/src'):
     cmd+=['-I',linux(repo/folder)]
+source_paths=[repo/'src'/s for s in sources]+[repo/'ports/ap01'/s for s in ('business.cpp','application.cpp','http.cpp','native_smoke.cpp')]
+platform=repo.parent/'cuktech-ap01-firmware/tooling/firmware-modules'
+source_paths += [platform/'native_wifi_profiles_0041.cpp',platform/'native_diagnostic_0041.cpp',platform/'native_calendar_0041.cpp',platform/'native_firmware_0041.cpp',platform/'native_ota_image_0041.c']
 cmd+=['-I',linux(platform)]
-source_paths=[repo/'src'/s for s in sources]+[repo/'ports/ap01'/s for s in ('business.cpp','application.cpp','http.cpp','calendar.cpp','native_smoke.cpp')]
-source_paths += [repo/'ports/ap01/firmware.cpp',repo/'ports/ap01/ota_image.c']
-source_paths += [platform/'native_wifi_profiles_0041.cpp',platform/'native_diagnostic_0041.cpp']
 objects=[]
-headers=list((repo/'ports/ap01').glob('*.h'))+list((repo/'src').glob('*.h'))
+headers=list(platform.glob('*.h'))+list((repo/'ports/ap01').glob('*.h'))+list((repo/'src').glob('*.h'))
 newest=max(p.stat().st_mtime_ns for p in headers)
 for source in source_paths:
     obj=out/('native-host-'+source.stem+'.o');objects.append(obj)
@@ -57,14 +64,14 @@ for source in source_paths:
         subprocess.run(compile_cmd+['-c',linux(source),'-o',linux(obj)],check=True)
 subprocess.run(cmd+[linux(p) for p in objects]+['-o',linux(binary)],check=True)
 result=subprocess.run(['wsl','-d','Ubuntu-24.04','--',linux(binary),linux(state),linux(bundle_file),
-                       linux(out/'native-app-activation.json')],capture_output=True,text=True)
+                       linux(out/'native-app-activation.json')],capture_output=True,text=True,timeout=180)
 (out/'native-app-tests.log').write_text(result.stdout+result.stderr,encoding='utf-8')
 assert not result.returncode,result.stderr
 firmware_source=repo/'ports/ap01/firmware_smoke.cpp';firmware_object=out/'native-host-firmware_smoke.o'
 subprocess.run(cmd+['-c',linux(firmware_source),'-o',linux(firmware_object)],check=True)
 firmware_binary=out/'native-firmware-smoke'
 subprocess.run(cmd+[linux(p) for p in objects if p.stem!='native-host-native_smoke']+[linux(firmware_object),'-o',linux(firmware_binary)],check=True)
-firmware_result=subprocess.run(['wsl','-d','Ubuntu-24.04','--',linux(firmware_binary),linux(state),linux(args.image)],capture_output=True,text=True)
+firmware_result=subprocess.run(['wsl','-d','Ubuntu-24.04','--',linux(firmware_binary),linux(state),linux(args.image)],capture_output=True,text=True,timeout=180)
 (out/'native-firmware-host-tests.log').write_text(firmware_result.stdout+firmware_result.stderr,encoding='utf-8')
 assert not firmware_result.returncode,firmware_result.stderr
 (out/'native-firmware-host-report.json').write_text(json.dumps({'passed':True,

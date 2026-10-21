@@ -1,0 +1,9 @@
+# Review
+
+The first real teardown caught a serious binding error: a00d7806 only invokes class destructors; the shared obj_delete now uses a00ded6c, which sends DELETE, recursively deletes, unlinks and frees. The stock Power1/other cleanup then passed optional NULL timers. A small XIP trampoline makes only NULL deletion a no-op and replays the exact original 8-byte prologue for non-NULL calls before returning to a008ae60. Packaging now explicitly permits and reconstructs that 8-byte hook in addition to the existing UI hook and unsigned-OTA branch; all resources remain preserved and the recovery tail is moved/rechecksummed as before.
+
+Stock callback registration deduplicates by function without updating context. DELETE detaches/frees only the four entries matching the retiring window; tests require 4 -> 0 -> 4 ownership counts. The retained timer keeps the lifetime anchor; no new writable global or service executor. UI epoch, monotonic transition and app revision reject stale frames/requests. Reattachment redraws the existing active business context.
+
+Final probe run10 and ordinary run03 both passed with native_execution_clean=true. Run09 separately passed full recreation. Pixel checks passed for four ordinary scenes and both rebuilt scenes. The second application is an opt-in fixture, not an added product service. System modal is explicitly modeled; no hardware claim.
+
+Failed runs are preserved: draw starvation in the old fbdev fixture, overlong test transaction ID, wrong delete binding, stock NULL-timer fault, and signed-coordinate/animation sampling test assumptions. No assertions were waived; the final deletion happens in the UI timer while phase2 and 0<abs(target_x)<320. Exact native OTA/reboot, physical DMA/LCD and real allocator/stack high-water are not established. No deployment or commit.

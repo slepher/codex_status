@@ -460,7 +460,8 @@ bool BundleStore::bsStartReceive(uint32_t length, String &err, const char *owner
 }
 
 bool BundleStore::bsInstall(File &f, uint32_t length, uint32_t crc, const char *fw,
-               const char *rt, const char *context, String &err, void (*beforeReplace)()) {
+               const char *rt, const char *context, String &err, void (*beforeReplace)(),
+               const char *preferredActiveId) {
     if (!f || f.size() != length || fileSize(INCOMING) != length) { err = "receive"; return false; }
     uint32_t actual;
     if (!crcRange(f, 0, length, actual) || actual != crc) { err = "crc"; return false; }
@@ -492,6 +493,10 @@ bool BundleStore::bsInstall(File &f, uint32_t length, uint32_t crc, const char *
         if (!strcmp(initial, next.ids[i])) { next.initial = i; activeFound = true; }
     }
     if (!activeFound) { err = "initial"; return false; }
+    // Preserve AP01's current page by identity within the same commit marker.
+    // A removed page falls back to the explicitly declared initial template.
+    if (preferredActiveId) for (uint8_t i = 0; i < next.count; ++i)
+        if (!strcmp(preferredActiveId, next.ids[i])) { next.initial = i; break; }
     doc.clear();
     Ranges entries;
     // Template includes a fixed compiled hex cache plus a bounded source.

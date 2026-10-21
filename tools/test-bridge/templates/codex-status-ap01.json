@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "id": "codex-status-a",
-  "version": 5,
+  "version": 9,
   "min_fw": "1.0.2_0041",
   "render_target": "lcd-jd9853-320x240-palette4",
   "canvas": {
@@ -22,42 +22,67 @@
     },
     {
       "type": "text",
-      "text": "CODEX STATUS",
+      "bind": "account.plan",
       "x": 16,
-      "y": 11,
-      "font": "ntthin18",
+      "y": 10,
+      "font": "nt16",
       "color": "white",
-      "bg": "black"
+      "bg": "black",
+      "region": [
+        16,
+        10,
+        52,
+        26
+      ]
+    },
+    {
+      "type": "text",
+      "bind": "bridge.label",
+      "x": 76,
+      "y": 10,
+      "font": "nt16",
+      "color": "muted",
+      "bg": "black",
+      "region": [
+        76,
+        10,
+        163,
+        26
+      ],
+      "when": {
+        "bind": "bridge.label",
+        "exists": true
+      }
     },
     {
       "type": "text",
       "bind": "device.now",
-      "x": 250,
-      "y": 13,
-      "font": "ntthin18",
-      "color": "muted",
+      "x": 244,
+      "y": 10,
+      "font": "nt16",
+      "color": "white",
       "bg": "black",
       "region": [
-        246,
-        11,
-        58,
-        18
+        244,
+        10,
+        60,
+        26
       ],
       "align": "right"
     },
     {
       "type": "line",
       "x1": 16,
-      "y1": 35,
+      "y1": 39,
       "x2": 303,
-      "y2": 35,
+      "y2": 39,
       "color": "track"
     },
     {
       "type": "ring",
       "x": 160,
-      "y": 104,
-      "radius": 61,
+      "y": 124,
+      "radius": 77,
       "thickness": 4,
       "bind": "buckets[codex].weekly.remaining",
       "fg": "cyan",
@@ -70,29 +95,36 @@
     {
       "type": "text",
       "text": "周额度剩余",
-      "x": 130,
-      "y": 62,
+      "x": 100,
+      "y": 64,
       "font": "ntthin18",
       "color": "cyan",
       "bg": "black",
       "when": {
         "bind": "buckets[codex].weekly.remaining",
         "exists": true
-      }
+      },
+      "region": [
+        100,
+        64,
+        120,
+        26
+      ],
+      "align": "center"
     },
     {
       "type": "text",
       "bind": "buckets[codex].weekly.remaining",
-      "x": 111,
-      "y": 78,
+      "x": 100,
+      "y": 90,
       "font": "ntreg64",
       "color": "white",
       "bg": "black",
       "region": [
-        111,
-        78,
-        98,
-        64
+        100,
+        90,
+        120,
+        76
       ],
       "align": "center",
       "when": {
@@ -103,28 +135,29 @@
     {
       "type": "text",
       "text": "%",
-      "x": 195,
-      "y": 109,
-      "font": "ntthin18",
+      "x": 150,
+      "y": 143,
+      "font": "nt16",
       "color": "white",
       "bg": "black",
       "when": {
         "bind": "buckets[codex].weekly.remaining",
         "exists": true
       },
-      "digit_bind": "buckets[codex].weekly.remaining",
-      "digit_x": [
-        181,
-        195,
-        208
-      ]
+      "region": [
+        150,
+        143,
+        20,
+        22
+      ],
+      "align": "center"
     },
     {
       "type": "text",
       "bind": "buckets[codex].weekly.resetsAt",
-      "x": 106,
-      "y": 128,
-      "font": "ntthin18",
+      "x": 102,
+      "y": 154,
+      "font": "nt16",
       "color": "muted",
       "bg": "black",
       "when": {
@@ -132,20 +165,20 @@
         "exists": true
       },
       "region": [
-        106,
-        126,
-        108,
-        18
+        102,
+        154,
+        116,
+        24
       ],
       "align": "center"
     },
     {
       "type": "rect",
       "rect": [
-        16,
-        43,
-        288,
-        126
+        0,
+        42,
+        320,
+        162
       ],
       "fill": true,
       "color": "black",
@@ -157,8 +190,8 @@
     {
       "type": "ring",
       "x": 160,
-      "y": 104,
-      "radius": 61,
+      "y": 124,
+      "radius": 77,
       "thickness": 4,
       "bind": "buckets[codex].monthly.remaining",
       "fg": "cyan",
@@ -171,29 +204,36 @@
     {
       "type": "text",
       "text": "月额度剩余",
-      "x": 130,
-      "y": 62,
+      "x": 100,
+      "y": 64,
       "font": "ntthin18",
       "color": "cyan",
       "bg": "black",
       "when": {
         "bind": "buckets[codex].monthly.remaining",
         "exists": true
-      }
+      },
+      "region": [
+        100,
+        64,
+        120,
+        26
+      ],
+      "align": "center"
     },
     {
       "type": "text",
       "bind": "buckets[codex].monthly.remaining",
-      "x": 111,
-      "y": 78,
+      "x": 100,
+      "y": 90,
       "font": "ntreg64",
       "color": "white",
       "bg": "black",
       "region": [
-        111,
-        78,
-        98,
-        64
+        100,
+        90,
+        120,
+        76
       ],
       "align": "center",
       "when": {
@@ -204,28 +244,29 @@
     {
       "type": "text",
       "text": "%",
-      "x": 195,
-      "y": 109,
-      "font": "ntthin18",
+      "x": 150,
+      "y": 143,
+      "font": "nt16",
       "color": "white",
       "bg": "black",
       "when": {
         "bind": "buckets[codex].monthly.remaining",
         "exists": true
       },
-      "digit_bind": "buckets[codex].monthly.remaining",
-      "digit_x": [
-        181,
-        195,
-        208
-      ]
+      "region": [
+        150,
+        143,
+        20,
+        22
+      ],
+      "align": "center"
     },
     {
       "type": "text",
       "bind": "buckets[codex].monthly.resetsAt",
-      "x": 106,
-      "y": 128,
-      "font": "ntthin18",
+      "x": 102,
+      "y": 154,
+      "font": "nt16",
       "color": "muted",
       "bg": "black",
       "when": {
@@ -233,20 +274,20 @@
         "exists": true
       },
       "region": [
-        106,
-        126,
-        108,
-        18
+        102,
+        154,
+        116,
+        24
       ],
       "align": "center"
     },
     {
       "type": "rect",
       "rect": [
-        16,
-        43,
-        288,
-        126
+        0,
+        42,
+        320,
+        162
       ],
       "fill": true,
       "color": "black",
@@ -257,9 +298,9 @@
     },
     {
       "type": "ring",
-      "x": 73,
-      "y": 104,
-      "radius": 54,
+      "x": 78,
+      "y": 124,
+      "radius": 77,
       "thickness": 4,
       "bind": "buckets[codex].weekly.remaining",
       "fg": "cyan",
@@ -272,29 +313,36 @@
     {
       "type": "text",
       "text": "周额度剩余",
-      "x": 43,
-      "y": 65,
+      "x": 18,
+      "y": 64,
       "font": "ntthin18",
       "color": "cyan",
       "bg": "black",
       "when": {
         "bind": "buckets[codex].5h.remaining",
         "exists": true
-      }
+      },
+      "region": [
+        18,
+        64,
+        120,
+        26
+      ],
+      "align": "center"
     },
     {
       "type": "text",
       "bind": "buckets[codex].weekly.remaining",
-      "x": 24,
-      "y": 78,
+      "x": 18,
+      "y": 90,
       "font": "ntreg64",
       "color": "white",
       "bg": "black",
       "region": [
-        24,
-        78,
-        98,
-        64
+        18,
+        90,
+        120,
+        76
       ],
       "align": "center",
       "when": {
@@ -305,41 +353,49 @@
     {
       "type": "text",
       "text": "%",
-      "x": 108,
-      "y": 109,
-      "font": "ntthin18",
+      "x": 68,
+      "y": 143,
+      "font": "nt16",
       "color": "white",
       "bg": "black",
       "when": {
         "bind": "buckets[codex].5h.remaining",
         "exists": true
       },
-      "digit_bind": "buckets[codex].weekly.remaining",
-      "digit_x": [
-        94,
-        108,
-        121
-      ]
+      "region": [
+        68,
+        143,
+        20,
+        22
+      ],
+      "align": "center"
     },
     {
       "type": "text",
       "text": "7 天窗口",
-      "x": 47,
-      "y": 128,
+      "x": 20,
+      "y": 166,
       "font": "ntthin18",
       "color": "muted",
       "bg": "black",
       "when": {
         "bind": "buckets[codex].5h.remaining",
         "exists": true
-      }
+      },
+      "region": [
+        20,
+        166,
+        116,
+        24
+      ],
+      "align": "center"
     },
     {
       "type": "line",
-      "x1": 145,
-      "y1": 53,
-      "x2": 145,
-      "y2": 164,
+      "x1": 159,
+      "y1": 55,
+      "x2": 159,
+      "y2": 196,
       "color": "track",
       "when": {
         "bind": "buckets[codex].5h.remaining",
@@ -349,35 +405,65 @@
     {
       "type": "text",
       "text": "5 小时剩余",
-      "x": 160,
-      "y": 52,
+      "x": 166,
+      "y": 57,
       "font": "ntthin18",
       "color": "orange",
       "bg": "black",
       "when": {
         "bind": "buckets[codex].5h.remaining",
         "exists": true
-      }
+      },
+      "region": [
+        166,
+        57,
+        138,
+        26
+      ]
     },
     {
       "type": "text",
       "bind": "buckets[codex].5h.remaining",
-      "x": 157,
-      "y": 74,
+      "x": 166,
+      "y": 80,
       "font": "nt30",
       "color": "white",
       "bg": "black",
-      "suffix": "%",
       "when": {
         "bind": "buckets[codex].5h.remaining",
         "exists": true
-      }
+      },
+      "region": [
+        166,
+        80,
+        110,
+        68
+      ]
+    },
+    {
+      "type": "text",
+      "text": "%",
+      "x": 203,
+      "y": 116,
+      "font": "nt16",
+      "color": "white",
+      "bg": "black",
+      "when": {
+        "bind": "buckets[codex].5h.remaining",
+        "exists": true
+      },
+      "digit_bind": "buckets[codex].5h.remaining",
+      "digit_x": [
+        203,
+        237,
+        271
+      ]
     },
     {
       "type": "text",
       "bind": "buckets[codex].5h.resetsAt",
-      "x": 160,
-      "y": 108,
+      "x": 166,
+      "y": 128,
       "font": "ntthin18",
       "color": "muted",
       "bg": "black",
@@ -386,27 +472,39 @@
       "when": {
         "bind": "buckets[codex].5h.remaining",
         "exists": true
-      }
+      },
+      "region": [
+        166,
+        128,
+        138,
+        26
+      ]
     },
     {
       "type": "text",
       "text": "周额度重置",
-      "x": 160,
-      "y": 130,
+      "x": 166,
+      "y": 154,
       "font": "ntthin18",
       "color": "cyan",
       "bg": "black",
       "when": {
         "bind": "buckets[codex].5h.remaining",
         "exists": true
-      }
+      },
+      "region": [
+        166,
+        154,
+        138,
+        24
+      ]
     },
     {
       "type": "text",
       "bind": "buckets[codex].weekly.resetsAt",
-      "x": 153,
-      "y": 150,
-      "font": "ntthin18",
+      "x": 166,
+      "y": 178,
+      "font": "nt16",
       "color": "white",
       "bg": "black",
       "when": {
@@ -414,55 +512,67 @@
         "exists": true
       },
       "region": [
-        153,
-        149,
-        151,
-        18
-      ],
-      "align": "center"
+        166,
+        178,
+        138,
+        24
+      ]
     },
     {
       "type": "line",
       "x1": 16,
-      "y1": 176,
+      "y1": 204,
       "x2": 303,
-      "y2": 176,
+      "y2": 204,
       "color": "track"
     },
     {
       "type": "text",
-      "bind": "account.plan",
+      "bind": "device.sync_hhmm",
       "x": 16,
-      "y": 184,
-      "font": "ntthin18",
-      "color": "white",
-      "bg": "black"
+      "y": 214,
+      "font": "nt16",
+      "color": "muted",
+      "bg": "black",
+      "prefix": "SYNC ",
+      "when": {
+        "bind": "device.offline_mins",
+        "exists": false
+      },
+      "region": [
+        16,
+        214,
+        180,
+        26
+      ]
     },
     {
       "type": "text",
-      "bind": "bridge.label",
-      "x": 65,
-      "y": 186,
-      "font": "ntthin18",
-      "color": "muted",
+      "bind": "device.offline_mins",
+      "x": 16,
+      "y": 214,
+      "font": "nt16",
+      "color": "orange",
       "bg": "black",
-      "region": [
-        65,
-        184,
-        174,
-        20
-      ],
+      "prefix": "OFF ",
+      "suffix": "m",
       "when": {
-        "bind": "bridge.label",
+        "bind": "device.offline_mins",
         "exists": true
-      }
+      },
+      "region": [
+        16,
+        214,
+        180,
+        26
+      ]
     },
     {
       "type": "text",
       "bind": "resetCredits.availableCount",
-      "x": 257,
-      "y": 186,
-      "font": "ntthin18",
+      "x": 240,
+      "y": 214,
+      "font": "nt16",
       "color": "orange",
       "bg": "black",
       "prefix": "RC ",
@@ -471,58 +581,12 @@
         "exists": true
       },
       "region": [
-        249,
-        184,
-        54,
-        20
+        240,
+        214,
+        64,
+        26
       ],
       "align": "right"
-    },
-    {
-      "type": "line",
-      "x1": 16,
-      "y1": 211,
-      "x2": 303,
-      "y2": 211,
-      "color": "track"
-    },
-    {
-      "type": "text",
-      "bind": "device.sync_hhmm",
-      "x": 16,
-      "y": 220,
-      "font": "ntthin18",
-      "color": "muted",
-      "bg": "black",
-      "prefix": "SYNC ",
-      "when": {
-        "bind": "device.offline_mins",
-        "exists": false
-      }
-    },
-    {
-      "type": "text",
-      "bind": "device.offline_mins",
-      "x": 16,
-      "y": 220,
-      "font": "ntthin18",
-      "color": "orange",
-      "bg": "black",
-      "prefix": "OFF ",
-      "suffix": "m",
-      "when": {
-        "bind": "device.offline_mins",
-        "exists": true
-      }
-    },
-    {
-      "type": "text",
-      "text": "额度看板",
-      "x": 260,
-      "y": 219,
-      "font": "ntthin18",
-      "color": "muted",
-      "bg": "black"
     }
   ]
 }

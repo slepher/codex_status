@@ -1,13 +1,19 @@
 # Codex Status 当前交接
 
-更新时间：2026-10-20 14:21 香港时间
+更新时间：2026-10-21 香港时间
+
+## AP01共享宿主离线重构（2026-10-20）
+
+- 两仓库重构及第二应用/窗口热重建离线验收完成：八模板+独立两页共存，跨应用发布保持焦点锁，两次原厂九页删除/重建（含动画x=-279），复用Runtime/原三条payload线程/UI定时器，旧帧/revision拒绝，维护/发现不断。修正完整对象删除绑定、原厂NULL定时器和旧窗口订阅；最终原生run10/普通run03、核心ASan/UBSan及六场景像素通过。
+- 普通候选03（未部署）：`artifacts/ap01-screen-lifecycle-production-20261020/ap01-screen-host-runtime-reuse-03.bin`，7,003,496 B，SHA256 `8b56c53bc86f255196d2a39cd43faa7b373e82c6b86ae43449bf2ac917e4cde4`；ELF `015de1182c2a99b9a0dd40df276934aff13a693fbae066e67318f31153615ad1`。Runtime2240B，不含探针。屏幕宿主重构未部署，后续诊断版以34精确源码另行构建并部署槽1，Bridge未部署；C9精确候选OTA/重启、物理LCD/SPI/高水位等仍开放。[专项](project-workflow/ap01-screen-host/status.md)。
 
 ## 部署与工作区
 
-- AP01 `34F01557210B`/DID2232184842：**33运行槽1**，build `967049b5f6a589b717e03d4abe312ed1`。本轮先认证回切0031槽0及头尾，再单次OTA槽1；**救援槽0保留，实机回切已验**。事务 `artifacts/ap01-app-rollout-20261020/navigation33-rollout-task.json`。
+- AP01 `34F01557210B`/DID2232184842：**独立诊断0041已部署应用槽1**，build `8083f67405c4c7fe9122a826f9a69e7e`；原版0031救援已恢复槽0并认证启动。首次误刷槽0后已按用户要求恢复，不能沿用“救援从未写入”的说法。已从应用槽1完整读回救援槽0，6822344 B逐字节及SHA256完全匹配原版（含PEC）；槽1头尾/build/业务在线及独立文件、Flash导出均已验证。固定角色：槽0原版救援保留、槽1应用，后续应用升级先启动救援再写槽1。物理屏幕/旋钮本轮未获目视确认。恢复事务和认证证据：`../cuktech-ap01-firmware/evidence/diagnostic-0041-20261021/correct-slot-recovery.json`。
 - **导航问题已修复并实机通过**：原厂Pet7→菜单6及菜单→主界面被页号递减误判为环回、重复插入应用；现仅在进入Pet的边/反向边插入全部模板。退出动画key0x13→2、0x14→1。用户本轮明确回复“页序和动画均正常”。
-- v5完整Bundle `b097bacb`保留，commit_seq5；真实Data seq12已应用，最终读取display_state=pending，不冒充本次Data已取得显示回执。原先已确认的时间修复沿用。
+- AP01保留单页v9布局/字体，验证后当前Bundle **`6a8d702a`/CRC4831c60d**，commit_seq13/source_crc3ce26768；Data23/displayed/current_template_drawn。原厂页发布不抢焦点及模板页发布自动恢复已实机通过，用户确认“自动返回，额度正常”；所有设备Profile不变。[部署与验收](project-workflow/ap01-template-integration/bundle-page-restore.md)。
 - 发现默认Bridge未监听，已按指定计划任务脚本启动既有EXE；force=false恢复既有占用并投递快照。该次启动未重建Bridge或刷Note4。
+- **AP01 34验收边界**：原生136页面恢复与137–139 OTA/同NOR/无稳定记录回切、12组像素零差异及匹配34宿主ASan/UBSan通过；单页实机与协议反馈已验，多页仍为原生/8页宿主证据。Bridge未部署，原生WK受WSL缺swiftc限制。[证据](artifacts/ap01-app-rollout-20261020/physical-verification-page-restore34.json)。
 
 ## Note4 / Mac Bridge（2026-10-20）
 
@@ -20,14 +26,18 @@
 - **A9 Plan同轮激活/图标实机已验**：用户已允许定位/蓝牙，14:20:08原Plan5904 BLE ACK明确network_activation=plan；3.304秒后同Plan ready报告，随后同MAC认证HTTP确认Wi-Fi连接、BLE关闭、Plan5904/剩余量递减，14:20:32本轮complete。14:21 Data876 ACK applied/displayed；用户确认Wi-Fi图标已显示。周期同值Sleep软件对照通过，自然余量变化完整时延未验。旧ROM维护兼容保留；[实机证据](artifacts/bridge-macos/plan-activation-physical-proof.json)。
 
 - **AP01字体核查已确认恢复遗漏**：原厂ROM有完整ASCII **Montserrat14**（`0xa0262f60`，含Y）；67套fmt_txt字库中原清单漏12套。全部字形/映射/字距与LVGL标准资源一致。页面子集确有裁剪；不再把“55套缺Y”推广为ROM缺Y。[核查及像素证据](project-workflow/ap01-template-integration/font-rom-audit.md)。核查仅读归档，未访问设备。
-- AP01布局完成**Montserrat14离线预览，未部署**：首栏订阅/账号/时间，底部SYNC/RC合栏；英文/账号/时间统一原ROM完整Montserrat14原尺寸（行高16），中文混排整段微软雅黑UI20px，大数字保留。四场景覆盖/边界检查及目视通过；LVGL9宿主RGB565，非实机验收。[预览与复现](project-workflow/ap01-template-integration/layout-preview.md)，生产Bundle/ROM未改。
+- AP01 v9：完整Montserrat14/CJK20、额度64/60px；完整像素/九场景通过，沿用I4渲染。后续34修复焦点恢复，用户确认自动返回/额度正常；多页物理与长期边界保留，其他设备Profile不变。[布局证据](project-workflow/ap01-template-integration/bundle-refresh.md)。
 - 本次导航项可结案；C9整体仍开放，物理掉电/Boot2前回退、真实调用链高水位等既有边界不变。反向完整导航为原生模拟证据，用户本轮确认来自顺时针实测请求。
 - 130/133/134原生完整OTA、同NOR升级/回切/原事务回执恢复通过；12组原厂活动LVGL像素与共享引擎差异0，匹配33宿主ASan/UBSan通过。128旧32对照失败；126/127/129及131/132的测试路径/离线引导门控/漏传回执参数记录保留，未放宽放行。
 - [部署与边界](project-workflow/ap01-template-integration/release-0041-20261020.md)；实机证据 `artifacts/ap01-app-rollout-20261020/physical-verification-navigation33.json`；[待办C9](docs/roadmap/backlog.md)。
 
 ## 精确ROM
 
+- **已部署独立诊断0041／槽1**：`../cuktech-ap01-firmware/evidence/diagnostic-0041-20261021/ap01-0041-independent-diagnostic.bin`，7000056 B，SHA256 `29352943f2301cc7bcb5fac60a504803d3b3488afe11d56c5dc27c23bc6f176c`。构建自34的265项核验隔离树，只增加独立只读诊断；不含当前工作区尚未部署的屏幕宿主重构。[部署说明](../cuktech-ap01-firmware/reverse/reports/ap01/independent-diagnostic-0041-20261021.md)。
+
+- **34归档（槽1已由独立诊断版替换）**：`artifacts/ap01-platform-integration/device/ap01-0041-page-restore-20261020.bin`，6995768 B，SHA256 `6ef5f3fd831e2f4faca5d50e2ea92cd620844080d33afb1873dc25a0fcfa42aa`；匹配ELF SHA256 `671adea921e1259dd87848fa901dd830489d19e6038b95512466ec794bf90426`。匹配发布包/上传完成及认证运行已验，未声称全Flash实读SHA。
+
 - Note4已部署：`artifacts/bridge-macos/note4-0.18.106-plan-activation.bin`，1,865,680 B，SHA256 `36ca4c3aacdc7b27c9c7cebe4cb18df0bee4048461e189f51050b6332b24ceb4`；匹配ELF SHA256 `40cbc05fcaccdd9f144132f2ffb40db61d956119e636df69be7591073e8fe21a`。
 
-- **已部署33**：`artifacts/ap01-platform-integration/device/ap01-0041-pet-navigation-20261020.bin`，6994872 B，SHA256 `a4a34b872815711094c68f4a5c6c1ded8c2316475520bff95e1d8ec25011c535`；匹配ELF SHA256 `5696ba3e8193d9b2458936edbc2394cf2372930ff1b3dd41d52bc4d4a149ecbd`。
-- 救援槽0：`artifacts/ap01-base0031-20261019/ap01-base0031-v2-rom.bin`，6822344 B，SHA256 `d843aae4e097c31ce06a315c62e1a66f4fb3bf9299db289b6f31562d0ef2231b`。本轮未写槽0，认证运行/头尾及回切前原生CRC检查通过；未声称全片实读哈希。
+- 上版33归档（槽1已由34替换）：`artifacts/ap01-platform-integration/device/ap01-0041-pet-navigation-20261020.bin`，6994872 B，SHA256 `a4a34b872815711094c68f4a5c6c1ded8c2316475520bff95e1d8ec25011c535`；匹配ELF SHA256 `5696ba3e8193d9b2458936edbc2394cf2372930ff1b3dd41d52bc4d4a149ecbd`。
+- 救援槽0：`artifacts/ap01-base0031-20261019/ap01-base0031-v2-rom.bin`，6822344 B，SHA256 `d843aae4e097c31ce06a315c62e1a66f4fb3bf9299db289b6f31562d0ef2231b`。2026-10-21误刷后已恢复此原版，认证启动槽0；非活动槽全镜像6822344 B实读SHA256与此归档完全匹配（含PEC）。

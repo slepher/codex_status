@@ -26,7 +26,7 @@ command = ['wsl', '-d', 'Ubuntu-24.04', '--', 'g++', '-std=c++17', '-O2',
 for directory in ['ports/ap01', 'bridge/crates/render/shim', 'src',
                   '.pio/libdeps/esp32-s3-epaper-154g/ArduinoJson/src']:
     command += ['-I', linux(repo / directory)]
-command += [linux(repo / 'ports/ap01/render_smoke.cpp'), linux(repo / 'ports/ap01/calendar.cpp')]
+command += [linux(repo / 'ports/ap01/render_smoke.cpp'), linux(repo.parent / 'cuktech-ap01-firmware/tooling/firmware-modules/native_calendar_0041.cpp')]
 command += [linux(repo / 'src' / source) for source in sources]
 command += ['-o', linux(binary)]
 subprocess.run(command, check=True)

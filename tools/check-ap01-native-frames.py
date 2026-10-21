@@ -20,9 +20,9 @@ def png(path,pixels):
                      chunk(b'IDAT',zlib.compress(b''.join(rows)))+chunk(b'IEND',b''))
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--run',required=True);p.add_argument('--scene',default='codex');a=p.parse_args()
-    assert a.run.isdigit() and a.scene.replace('-','').isalnum()
-    prefix=OUT/f'native-qemu-{a.run}.{a.scene}'
+    p=argparse.ArgumentParser();group=p.add_mutually_exclusive_group(required=True);group.add_argument('--run');group.add_argument('--prefix',type=Path);p.add_argument('--scene',default='codex');a=p.parse_args()
+    assert (a.run is None or a.run.isdigit()) and a.scene.replace('-','').isalnum()
+    base=a.prefix if a.prefix else OUT/f'native-qemu-{a.run}';prefix=Path(str(base)+'.'+a.scene)
     raw=prefix.with_suffix(prefix.suffix+'.palette4').read_bytes();assert len(raw)==38400
     expected=b''.join(struct.pack('<H',PALETTE[i]) for byte in raw for i in (byte>>4,byte&15))
     differences=[]
