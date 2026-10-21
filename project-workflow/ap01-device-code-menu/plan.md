@@ -1,0 +1,3 @@
+# Plan
+
+Use the exact deployed f52b12 native0041 source and actual ROM/QEMU, never a separately rebuilt SIM UI. Recover original Settings list/events/style with REA, prove one added native entry can be navigated, then implement a three-row device-code submenu: persistent eight decimal digits, explicit regeneration, return to parent Settings. Initialize only confirmed missing storage; normal navigation/restart keeps the value. No OTA/debug authentication changes, no Wi-Fi edits. Validate native pixels/events, faults and restart; preserve rescue0 and use only application1 for any authorized deployment.
