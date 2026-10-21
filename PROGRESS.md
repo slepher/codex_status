@@ -1,6 +1,6 @@
 # Codex Status 当前交接
 
-更新时间：2026-10-21 香港时间
+更新时间：2026-10-22 香港时间
 
 ## AP01共享宿主离线重构（2026-10-20）
 
@@ -9,8 +9,9 @@
 
 ## 部署与工作区
 
-- **原厂0041设备码菜单候选04模拟通过，未部署**：主菜单首尾循环；子菜单只在重新生成/返回间双向循环，数字栏不可选、默认选生成。原厂完整20px数字字体及前两行无箭头保持。原生navigation01/02导航轨迹/完整点击/生成/返回/重建/同Flash重启通过，原厂帧已审阅。交互http://127.0.0.1:18992/，模拟码99552520保留。应用槽1仍f52b12，救援0未动，未接OTA/调试鉴权。[专项](project-workflow/ap01-device-code-menu/status.md)。
-- AP01 `34F01557210B`/DID2232184842：**配网列表后端已部署应用槽1**，build `f52b12b55b8aaa9b8d891b7f23e98097`。原版0031救援槽0未刷写；部署前后6822344 B全镜像（含PEC）SHA均与原版一致。通过原救援只上传一次槽1，列表实机保存/uniq、软重启revision1/密文保持均通过；测试项已清理至revision2。11份原网络/身份文件不变；用户确认原厂界面/旋钮正常。**新增Wi-Fi菜单只有独立SIM实现，实机未接入；原网络安全写入/切网回退未验。** [专项](project-workflow/ap01-wifi-profiles/status.md)。历史误刷及已完成的0031恢复保留原记录，不能描述为历史上从未写槽0。
+- **应用OTA/切槽八位码06已部署槽1并实机通过**：build`5757fdd677800d1412d8795c1cb2dbe0`，经原0031救援0单次上传应用1；菜单码/原Bridge密钥维护兼容，缺失/错码401、原业务C2正常、Wi-Fi列表未变。八位码实际切槽/重启→救援0→独立入口回06通过，无二次上传；设备码跨重启保持，用户确认界面正常。救援0未写，完整非活动6822344B（含PEC）SHA与保留档一致。零绑定完整OTA为原生模拟证据，物理保留既有绑定；掉电/栈高水位未验。[实机证据](artifacts/ap01-menu-ota06-rollout-20261022/physical-validation.json)。实现及验证脚本已纳入本轮提交；配套固件仓库`57f18aa`。
+- 设备码菜单/手动鉴权05已由06替换；原物理菜单、生成后旧码失效及字体/选择行为验收保留。[05归档](artifacts/ap01-device-code-auth-20261021/physical-validation.json)。
+- AP01 `34F01557210B`/DID2232184842：**配网列表后端验收归档**，原build`f52b12`已由上述05替换，后端保留。该次救援0前后6822344B（含PEC）SHA均匹配原版；列表保存/uniq、软重启revision1/密文保持通过，清理至revision2；11份原网络/身份文件不变，用户确认原厂界面/旋钮正常。**Wi-Fi菜单只有独立SIM实现，实机未接入；原网络安全写入/切网回退未验。** [专项](project-workflow/ap01-wifi-profiles/status.md)。历史误刷及0031恢复记录保留。
 - **导航问题已修复并实机通过**：原厂Pet7→菜单6及菜单→主界面被页号递减误判为环回、重复插入应用；现仅在进入Pet的边/反向边插入全部模板。退出动画key0x13→2、0x14→1。用户本轮明确回复“页序和动画均正常”。
 - AP01保留单页v9布局/字体，验证后当前Bundle **`6a8d702a`/CRC4831c60d**，commit_seq13/source_crc3ce26768；Data23/displayed/current_template_drawn。原厂页发布不抢焦点及模板页发布自动恢复已实机通过，用户确认“自动返回，额度正常”；所有设备Profile不变。[部署与验收](project-workflow/ap01-template-integration/bundle-page-restore.md)。
 - 发现默认Bridge未监听，已按指定计划任务脚本启动既有EXE；force=false恢复既有占用并投递快照。该次启动未重建Bridge或刷Note4。
@@ -34,7 +35,11 @@
 
 ## 精确ROM
 
-- **已部署配网列表后端0041／槽1**：`../cuktech-ap01-firmware/evidence/wifi-profiles-20261021/ap01-0041-wifi-profiles.bin`，7006536 B，SHA256 `1ce657386b8deff11887428a30340bdaf91701981c2f82d9bd1d56aeb9df33bf`。基于已部署诊断34隔离基线，保留独立诊断，不含屏幕宿主重构；非活动槽1全镜像已实读匹配（含PEC）。[部署/边界](../cuktech-ap01-firmware/reverse/reports/ap01/wifi-profiles-0041-20261021.md)。
+- **已部署应用菜单码OTA06／槽1**：`artifacts/ap01-device-code-ota-20261021/ap01-0041-menu-ota-candidate06.bin`，7019304B，build`5757fdd677800d1412d8795c1cb2dbe0`，SHA256`82d33c493f7625a2b22588210d6492897af93b4f7eba05d3559abd9f15197e18`；ELF`76cbab6897edb5652a72a6553d749f0be799d7c9aa698fad1e7678749003be86`。[离线验收](artifacts/ap01-device-code-ota-20261021/offline-acceptance.json)。
+
+- **设备码/手动鉴权05归档（已由06替换）**：`artifacts/ap01-device-code-auth-20261021/ap01-0041-device-code-auth-candidate05.bin`，7019080B，SHA256`ccfa3c7dee00f81b4c2a9b60add89944eef82857bddff710f73443d0f4a26e7d`；ELF`386adefc11615650eb16b4a35a93d060fbedfdfa24762099f537dfec0615e8fd`。单次OTA成功及同MAC/build/槽位已认证，实体菜单/鉴权通过；未声称新活动槽全Flash哈希读回。
+
+- **配网列表后端0041归档（槽1已由05替换）**：`../cuktech-ap01-firmware/evidence/wifi-profiles-20261021/ap01-0041-wifi-profiles.bin`，7006536 B，SHA256 `1ce657386b8deff11887428a30340bdaf91701981c2f82d9bd1d56aeb9df33bf`。基于诊断34隔离基线；该次非活动槽1全镜像实读匹配（含PEC）。[部署/边界](../cuktech-ap01-firmware/reverse/reports/ap01/wifi-profiles-0041-20261021.md)。
 
 - **独立诊断0041归档（槽1已由列表版替换）**：`../cuktech-ap01-firmware/evidence/diagnostic-0041-20261021/ap01-0041-independent-diagnostic.bin`，7000056 B，SHA256 `29352943f2301cc7bcb5fac60a504803d3b3488afe11d56c5dc27c23bc6f176c`。
 

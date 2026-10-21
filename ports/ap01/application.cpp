@@ -130,12 +130,50 @@ Ap01Application::Session *Ap01Application::session(const char *principal) {
     strcpy(value->principal, principal); value->next = std::move(sessions);
     sessions = std::move(value); return sessions.get();
 }
+bool Ap01Application::manualAuth(const Ap01HttpRequest &request, uint64_t now, Ap01HttpReply &reply) {
+    // Maintenance has one executor. No code is cached across requests/rotation.
+    if (now < manualRetryAt) {
+        reply.status = 429;
+        reply.bytes = "{\"result\":\"rejected\",\"error\":\"device_code_rate_limited\",\"stage\":\"manual_auth\",\"action\":\"wait_30_seconds\"}";
+        return false;
+    }
+    char code[9] = {};
+    if (!port.deviceCode || port.deviceCode(port.context, code)) {
+        reply.status = 503;
+        reply.bytes = "{\"result\":\"rejected\",\"error\":\"device_code_unavailable\",\"stage\":\"manual_auth\",\"action\":\"open_device_code_menu\"}";
+        return false;
+    }
+    unsigned mismatch = 0;
+    if (!request.token || strlen(request.token) != 8) mismatch = 1;
+    else for (unsigned i = 0; i < 8; ++i) mismatch |= unsigned(uint8_t(code[i]) ^ uint8_t(request.token[i]));
+    memset(code, 0, sizeof(code));
+    if (mismatch) {
+        if (++manualFailures >= 5) { manualFailures = 0; manualRetryAt = now + 30000; }
+        reply.status = 401;
+        reply.bytes = "{\"result\":\"rejected\",\"error\":\"device_code\",\"stage\":\"manual_auth\",\"action\":\"enter_current_menu_code\"}";
+        return false;
+    }
+    manualFailures = 0; manualRetryAt = 0;
+    return true;
+}
 Ap01HttpReply Ap01Application::maintenanceHttp(const Ap01HttpRequest &request, uint64_t now) {
     Ap01HttpReply reply;
     maintenanceTick(now);
+    const bool wifi = !strncmp(request.path,"/api/wifi/",10);
+    const bool diagnostic = !strncmp(request.path,"/api/diagnostic/",16);
+    if (wifi || diagnostic) {
+        if (!ready) { error(reply, 503, "maintenance_busy", "lifecycle"); return reply; }
+        if (!manualAuth(request, now, reply)) return reply;
+        return wifi ? ap01WifiProfilesHttp0041(port.wifiProfiles,request,mac) :
+                      ap01DiagnosticHttp0041(port.diagnostic,request,mac,boot);
+    }
+    const bool localMaintenance = (!strncmp(request.path,"/api/firmware/",14) ||
+        !strcmp(request.path,"/health") || !strcmp(request.path,"/api/maintenance/status")) &&
+        (!request.token || strlen(request.token) != 32);
+    if (localMaintenance && !manualAuth(request, now, reply)) return reply;
     BindingGuard guard(port);
-    if (!ready || !guard) { error(reply, 503, "maintenance_busy", "bindings"); return reply; }
-    bindings.maintenance=maintenanceGate.load(std::memory_order_acquire);
+    if (!ready || (!localMaintenance && !guard)) { error(reply, 503, "maintenance_busy", "bindings"); return reply; }
+    if (guard) bindings.maintenance=maintenanceGate.load(std::memory_order_acquire);
     if (!strncmp(request.path, "/api/pairing", 12)) {
         if (request.length > 4096 || (request.length && memchr(request.body, 0, request.length))) {
             error(reply, 400, "body", "pairing"); return reply;
@@ -154,22 +192,17 @@ Ap01HttpReply Ap01Application::maintenanceHttp(const Ap01HttpRequest &request, u
         else reply.bytes = output.get();
         return reply;
     }
-    const char *bound=ap01BindingPrincipal(&bindings, request.token);
+    // A local maintenance credential never creates a Bridge binding or owner.
+    // The namespace survives code rotation so the current physical owner can
+    // query/resume the original maintenance transaction instead of resending it.
+    const char *bound=localMaintenance ? "ap01-menu-maintenance" : ap01BindingPrincipal(&bindings, request.token);
     if (!bound) { error(reply, 401, "unauthorized", "maintenance_auth"); return reply; }
-    if(!strncmp(request.path,"/api/wifi/",10)) {
-        guard.release();
-        return ap01WifiProfilesHttp0041(port.wifiProfiles,request,mac);
-    }
-    if(!strncmp(request.path,"/api/diagnostic/",16)) {
-        guard.release();
-        return ap01DiagnosticHttp0041(port.diagnostic,request,mac,boot);
-    }
     if(!strncmp(request.path,"/api/firmware/",14)) {
         if(!firmware){error(reply,port.firmware.open?503:501,"firmware_port_unavailable","maintenance_router");return reply;}
         char principal[65];strcpy(principal,bound);
         bool start=(!strcmp(request.path,"/api/firmware/begin")||!strcmp(request.path,"/api/firmware/switch"))&&!strcmp(request.method,"POST");
         if(start) {
-            maintenanceGate.store(true,std::memory_order_release);bindings.maintenance=true;
+            maintenanceGate.store(true,std::memory_order_release);if (guard) bindings.maintenance=true;
         }
         guard.release();reply=firmware->handle(request,principal,now);
         maintenanceGate.store(firmware->blocksBusiness(),std::memory_order_release);

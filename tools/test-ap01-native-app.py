@@ -8,14 +8,14 @@ out=repo/'artifacts/ap01-platform-integration/device'
 parser=argparse.ArgumentParser();parser.add_argument('--image',type=Path,default=out/'ap01-native-0041-candidate-13.bin');parser.add_argument('--bundle',type=Path);parser.add_argument('--out',type=Path,default=out);parser.add_argument('--linux-state',action='store_true');args=parser.parse_args();out=args.out.resolve()
 assert out.is_dir()
 if args.linux_state:
-    create="import tempfile,pathlib; p=pathlib.Path(tempfile.mkdtemp(prefix='ap01-host-')); [(p/('f'+str(i))).mkdir() for i in range(21)]; (p/'f6/bundle').mkdir(); print(p)"
+    create="import tempfile,pathlib; p=pathlib.Path(tempfile.mkdtemp(prefix='ap01-host-')); [(p/('f'+str(i))).mkdir() for i in range(22)]; (p/'f6/bundle').mkdir(); print(p)"
     state=subprocess.check_output(['wsl','-d','Ubuntu-24.04','--','python3','-c',create],text=True).strip()
     assert state.startswith('/tmp/ap01-host-')
 else:
     state=out/('t'+str(time.time_ns()%1000000))
     state.mkdir(exist_ok=True)
     assert not any(state.iterdir()), 'Use a fresh private test directory; never delete runtime data'
-    for i in range(21):(state/('f'+str(i))).mkdir()
+    for i in range(22):(state/('f'+str(i))).mkdir()
     (state/'f6/bundle').mkdir()
 
 def linux(p):

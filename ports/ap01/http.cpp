@@ -107,8 +107,15 @@ bool ap01ServeHttp(Ap01Application &app, bool maintenance, const Ap01Stream &io,
             for (char *p = value; *p; ++p) { if (*p < '0' || *p > '9') return fail(io, 400, "content_length", deadline); length = length*10+*p-'0'; }
             if (length > bodyLimit) return fail(io, 413, "body_limit", deadline);
         } else if (same(line, "authorization")) {
-            if (authSeen || strncmp(value, "Bearer ", 7) || strlen(value+7) != 32) return fail(io, 401, "authorization", deadline);
-            authSeen = true; request.token = value+7;
+            if (authSeen || strncmp(value, "Bearer ", 7)) return fail(io, 401, "authorization", deadline);
+            const char *token = value+7;
+            bool manual = maintenance && (!strncmp(request.path,"/api/wifi/",10) || !strncmp(request.path,"/api/diagnostic/",16) ||
+                !strncmp(request.path,"/api/firmware/",14) || !strcmp(request.path,"/health") || !strcmp(request.path,"/api/maintenance/status"));
+            if (manual) {
+                // Let the common guard count invalid credentials, including missing ones.
+                if (strlen(token) > 32) return fail(io, 401, "authorization", deadline);
+            } else if (strlen(token) != 32) return fail(io, 401, "authorization", deadline);
+            authSeen = true; request.token = token;
         } else if (same(line, "x-device-token")) {
             if (tokenSeen || strlen(value) != 32) return fail(io, 401, "device_token", deadline);
             tokenSeen = true; request.deviceToken = value;

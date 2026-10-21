@@ -13,7 +13,7 @@
 #include <fstream>
 #include <iterator>
 
-struct Disk {bool locked=false,loseRename=false,failSave=false;unsigned random=0;};
+struct Disk {bool locked=false,loseRename=false,failSave=false,denyLock=false;unsigned random=0;char code[9]="01234567";};
 void put32(uint8_t *p,uint32_t n){for(unsigned i=0;i<4;++i)p[i]=uint8_t(n>>(8*i));}
 int prepare(void *,const char *p){struct stat s;return stat(p,&s)||!S_ISDIR(s.st_mode)?-1:0;}
 int openFile(void *,const char *p,unsigned m){return open(p,m?O_WRONLY|O_CREAT|(m==1?O_TRUNC:O_APPEND):O_RDONLY,0600);}
@@ -28,7 +28,7 @@ int removeFile(void *,const char *p){return unlink(p);}
 int renameFile(void *p,const char *a,const char *b){int r=rename(a,b);if(!r&&((Disk *)p)->loseRename){((Disk *)p)->loseRename=false;return -1;}return r;}
 int capacity(void *,const char *,uint64_t *t,uint64_t *u){*t=0x140000;*u=8192;return 0;}
 bool randomBytes(void *p,uint8_t *out,size_t n){for(size_t i=0;i<n;++i)out[i]=++((Disk *)p)->random;return true;}
-bool lock(void *p){auto &d=*(Disk *)p;assert(!d.locked);d.locked=true;return true;}
+bool lock(void *p){auto &d=*(Disk *)p;if(d.denyLock)return false;assert(!d.locked);d.locked=true;return true;}
 void unlock(void *p){auto &d=*(Disk *)p;assert(d.locked);d.locked=false;}
 bool present(void *,uint8_t *p,uint32_t){delete[] p;return true;}
 struct Flash {
@@ -62,17 +62,76 @@ void upload(Ap01Firmware &fw,const std::string &image,size_t first=0){
 struct Stream {std::string input,output;size_t at=0;};
 int receive(void *p,uint8_t *out,size_t n,uint64_t){auto &s=*(Stream *)p;n=std::min(n,std::min<size_t>(2048,s.input.size()-s.at));memcpy(out,s.input.data()+s.at,n);s.at+=n;return n;}
 int send(void *p,const uint8_t *out,size_t n,uint64_t){((Stream *)p)->output.append((const char *)out,n);return n;}
+void unboundMaintenance(const std::string &folder,const std::string &image,Disk &disk,const Ap01VfsOps &ops) {
+    struct Slots:Flash {
+        int running=0,selected=0;unsigned selections=0;Ap01SlotImage identity;
+        static int current(void *p){return ((Slots *)p)->running;}
+        static bool inspect(void *p,unsigned,Ap01SlotImage &out){out=((Slots *)p)->identity;return true;}
+        static int select(void *p,unsigned slot){auto &s=*(Slots *)p;++s.selections;s.selected=slot;return 1;}
+        Ap01FirmwarePort callbacks(){auto result=port();result.runningSlot=current;result.inspectSlot=inspect;result.selectSlot=select;return result;}
+    } fake;
+    fake.expected=image;fake.identity.length=image.size();fake.identity.crc=1234;
+    LittleFSClass fs(ops,folder.c_str());assert(fs.inspect("/bindings.bin")==0);
+    auto callbacks=Ap01ApplicationPort{&disk,randomBytes,lock,unlock,fake.callbacks()};
+    callbacks.deviceCode=[](void *p,char out[9]){memcpy(out,((Disk *)p)->code,9);return 0;};
+    {
+        Ap01Business business(fs,{nullptr,present},30); // Deliberately never started.
+        Ap01Application app(fs,business,callbacks,"AABBCCDDEEFF",30);assert(app.begin());
+        disk.denyLock=true;
+        assert(app.maintenanceHttp(request("GET","/health",{},disk.code),1).status==200);
+        disk.denyLock=false;
+        assert(app.maintenanceHttp(request("GET","/api/firmware/slots",{},disk.code),1).status==200);
+        assert(app.maintenanceHttp(request("POST","/api/firmware/begin",beginBody(image),"99999999"),1).status==401&&!fake.opens);
+        assert(app.maintenanceHttp(request("POST","/api/firmware/begin",beginBody(image),disk.code),1).status==200&&fake.opens==1);
+        auto first=image.substr(0,32768);
+        Stream wire;wire.input="POST /api/firmware/chunk?request_id=fw-test&offset=0 HTTP/1.1\r\nAuthorization: Bearer 01234567\r\nContent-Type: application/octet-stream\r\nContent-Length: 32768\r\n\r\n"+first;
+        assert(ap01ServeHttp(app,true,{&wire,receive,send},2,5000)&&wire.output.rfind("HTTP/1.1 200 ",0)==0);
+        strcpy(disk.code,"76543210");
+        auto chunk=request("POST","/api/firmware/chunk",first,"01234567");chunk.contentType="application/octet-stream";chunk.requestId="fw-test";chunk.offset="0";
+        assert(app.maintenanceHttp(chunk,3).status==401&&fake.writes==1);
+        chunk.token=disk.code;assert(app.maintenanceHttp(chunk,3).status==200&&fake.writes==1);
+        for(size_t at=32768;at<image.size();at+=32768){
+            auto offset=std::to_string(at),body=image.substr(at,32768);auto r=request("POST","/api/firmware/chunk",body,disk.code);
+            r.contentType="application/octet-stream";r.requestId="fw-test";r.offset=offset.c_str();assert(app.maintenanceHttp(r,4).status==200);
+        }
+        assert(app.maintenanceHttp(request("POST","/api/firmware/commit",commitBody,disk.code),5).status==200);
+        assert(app.maintenanceHttp(request("POST","/api/firmware/commit",commitBody,disk.code),6).status==200&&fake.commits==1);
+        auto receipt=app.maintenanceHttp(request("GET","/api/firmware/fw-test",{},disk.code),6);
+        assert(receipt.status==200&&!strstr(receipt.bytes.c_str(),"01234567")&&!strstr(receipt.bytes.c_str(),"76543210"));
+        assert(app.maintenanceHttp(request("GET","/api/firmware/fw-test",{},"0123456789abcdef0123456789abcdef"),6).status==401);
+        assert(app.maintenanceHttp(request("POST","/api/firmware/reboot",commitBody,disk.code),7).status==200);
+        app.maintenanceResponse(true);assert(fake.reboots==1&&fs.inspect("/bindings.bin")==0);
+    }
+    const char *hex="0123456789abcdef";
+    for(unsigned i=0;i<16;++i){uint8_t b=image[0x675000+36+i];fake.build[2*i]=hex[b>>4];fake.build[2*i+1]=hex[b&15];}
+    fake.running=1;
+    {
+        Ap01Business business(fs,{nullptr,present},31);
+        Ap01Application app(fs,business,callbacks,"AABBCCDDEEFF",31);assert(app.begin());
+        assert(app.maintenanceHttp(request("GET","/api/firmware/fw-test",{},disk.code),10).status==200);
+        auto change=std::string("{\"device_mac\":\"AABBCCDDEEFF\",\"request_id\":\"local-switch\",\"target_slot\":0,\"expected_revision\":1,\"expected_image_crc\":1234}");
+        assert(app.maintenanceHttp(request("POST","/api/firmware/switch",change,"01234567"),11).status==401&&!fake.selections);
+        assert(app.maintenanceHttp(request("POST","/api/firmware/switch",change,disk.code),12).status==200&&fake.selected==0&&fake.selections==1);
+        assert(app.maintenanceHttp(request("POST","/api/firmware/switch",change,disk.code),13).status==200&&fake.selections==1);
+        assert(fs.inspect("/bindings.bin")==0);
+    }
+    puts("unbound maintenance: menu-code HTTP OTA, rotation/replay, reboot receipt/restart and no-stable slot switch passed; no binding created");
+}
 
 int main(int argc,char **argv){
     assert(argc==3);std::string root=argv[1],image=readAll(argv[2]);assert(image.size()>=6769704);
     Disk disk;Ap01VfsOps ops{&disk,prepare,openFile,closeFile,readFile,writeFile,seekFile,sizeFile,exists,mkdirFile,removeFile,renameFile,capacity};
     // The preceding application smoke test created this controlled binding.
     Flash flash;flash.expected=image;
+    unboundMaintenance(root+"/f21",image,disk,ops);
     {
         LittleFSClass fs(ops,root.c_str());Ap01Business business(fs,{nullptr,present},9);assert(business.begin(0));
         Ap01Application app(fs,business,{&disk,randomBytes,lock,unlock,flash.port()},"AABBCCDDEEFF",9);assert(app.begin());app.businessOnline(true);
         auto start=beginBody(image);
-        assert(app.maintenanceHttp(request("POST","/api/firmware/begin",start,""),1).status==401);assert(!flash.opens);
+        assert(app.maintenanceHttp(request("POST","/api/firmware/begin",start,""),1).status==503);assert(!flash.opens);
+        // No menu-code loader: diagnostics fails closed; firmware remains usable.
+        assert(app.maintenanceHttp(request("GET","/api/diagnostic/status",{},""),1).status==503);
+        assert(app.maintenanceHttp(request("GET","/api/diagnostic/status",{}),1).status==503);
         auto bad=start;bad.replace(bad.find("AABBCCDDEEFF"),12,"112233445566");assert(app.maintenanceHttp(request("POST","/api/firmware/begin",bad),1).status==400);assert(!flash.opens);
         flash.busy=true;assert(app.maintenanceHttp(request("POST","/api/firmware/begin",start),1).status==409);flash.busy=false;
         disk.loseRename=true;auto begin=app.maintenanceHttp(request("POST","/api/firmware/begin",start),1);assert(begin.status==200&&flash.opens==1);
@@ -165,7 +224,7 @@ int main(int argc,char **argv){
             // Business never starts: maintenance still authenticates and works.
             Ap01Business business(fs,{nullptr,present},20);
             Ap01Application app(fs,business,{&disk,randomBytes,lock,unlock,fake.callbacks()},"AABBCCDDEEFF",20);assert(app.begin());
-            assert(app.maintenanceHttp(request("POST","/api/firmware/switch",change,""),1).status==401);
+            assert(app.maintenanceHttp(request("POST","/api/firmware/switch",change,""),1).status==503);
             assert(app.maintenanceHttp(request("POST","/api/firmware/stable",mark),1).status==200);
             assert(app.maintenanceHttp(request("POST","/api/firmware/stable",mark),2).status==200);
             assert(app.maintenanceHttp(request("POST","/api/firmware/switch",change),2).status==409&&!fake.selections);

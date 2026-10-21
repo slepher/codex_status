@@ -6,6 +6,7 @@
 #include "vfs_0041.h"
 #include "native_wifi_profiles_port_0041.h"
 #include "native_diagnostic_0041.h"
+#include "native_device_code_0041.h"
 #include "ap01_template_display.h"
 #include "local_json_allocator.h"
 #include <atomic>
@@ -455,6 +456,7 @@ void *Runtime::bootstrap(void *p) {
         {&r,firmwareBusy,firmwareOpen,firmwareWrite,firmwareVerify,firmwareCommit,firmwareClose,r.firmwareBuild,firmwareReboot,runningSlot,inspectSlot,selectSlot,bootHealthy}};
     callbacks.wifiProfiles=ap01WifiProfilesNativePort0041(&r,diagnosticBusy);
     callbacks.diagnostic={&r,ap01DiagnosticFile0041,ap01DiagnosticFlash0041,diagnosticBusy};
+    callbacks.deviceCode=[](void *,char out[9]) {return ap01DeviceCodeLoad0041(ap01RomVfs(),out);};
     r.app.reset(new(std::nothrow) Ap01Application(r.fs,r.business,callbacks,mac,r.bootId));
     if(!r.app||!r.app->begin(nowMs()))return nullptr;
     r.initialized.store(true,std::memory_order_release);

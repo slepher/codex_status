@@ -14,6 +14,9 @@
 #include <iterator>
 
 struct Host {
+    char menuCode[9] = "01234567";
+    int codeError = 0;
+    unsigned codeReads = 0;
     bool locked = false, lostRename = false, corruptReadback = false,failPresent=false;
     unsigned randomCounter = 1, displays = 0;
     std::vector<uint8_t> frame, wifiList;
@@ -108,6 +111,47 @@ void binaryHttp(Ap01Application &app) {
 int wifiCurrent(void *p,char *ssid,unsigned,char *password,unsigned) {assert(!((Host*)p)->locked);strcpy(ssid,"Home");strcpy(password,"synthetic-current");return 0;}
 int wifiLoad(void *p,uint8_t *out,unsigned cap) {auto &h=*(Host*)p;assert(!h.locked);if(h.wifiList.empty())return -2;assert(h.wifiList.size()<=cap);memcpy(out,h.wifiList.data(),h.wifiList.size());return h.wifiList.size();}
 int wifiStore(void *p,const uint8_t *bytes,unsigned n) {auto &h=*(Host*)p;assert(!h.locked);h.wifiList.assign(bytes,bytes+n);return 0;}
+int menuCode(void *p,char out[9]) {
+    auto &h=*(Host*)p; assert(!h.locked); ++h.codeReads;
+    if(h.codeError)return h.codeError;
+    memcpy(out,h.menuCode,9); return 0;
+}
+void manualAuthTests(Ap01Application &app,Host &host) {
+    auto call=[&](const char *token,uint64_t now) {
+        return app.maintenanceHttp(req("GET","/api/diagnostic/status",token,{}),now);
+    };
+    assert(call("01234567",1).status==200); // Manual access needs no Bridge binding.
+    for(int failure:{-2,-5,-22,-115}) {
+        host.codeError=failure;auto r=call("01234567",2);
+        assert(r.status==503&&strstr(r.bytes.c_str(),"open_device_code_menu"));
+    }
+    host.codeError=0;
+    for(const char *token:{"","99999999","0123456","012345678","0123456789abcdef0123456789abcdef"}) {
+        auto r=call(token,10);assert(r.status==401&&!strstr(r.bytes.c_str(),host.menuCode));
+    }
+    unsigned reads=host.codeReads;
+    assert(call("01234567",11).status==429&&host.codeReads==reads);
+    assert(call("01234567",30009).status==429);
+    assert(call("01234567",30010).status==200);
+    strcpy(host.menuCode,"76543210");
+    assert(call("01234567",30011).status==401); // No cached authorization after rotation.
+    assert(call("76543210",30012).status==200);
+    for(auto example:{std::pair<const char *,unsigned>{"",401},
+            {"Authorization: Bearer 76543210\r\n",200},
+            {"Authorization: Bearer 76543210\r\nAuthorization: Bearer 76543210\r\n",401},
+            {"Authorization: Bearer 7654321x\r\n",401}}) {
+        MemoryStream stream{std::string("GET /api/diagnostic/status HTTP/1.1\r\n")+example.first+"\r\n"};
+        Ap01Stream io{&stream,streamRead,streamWrite};assert(ap01ServeHttp(app,true,io,30020,35000));
+        assert(stream.output.rfind("HTTP/1.1 "+std::to_string(example.second)+" ",0)==0);
+    }
+    assert(call("76543210",30021).status==200);
+    strcpy(host.menuCode,"01234567");
+    assert(call("76543210",30022).status==401);
+    assert(call("01234567",30023).status==200);
+    // Menu credentials authorize maintenance, but this fixture has no Flash port.
+    assert(app.maintenanceHttp(req("GET","/api/firmware/slots","01234567",{}),30024).status==501);
+    assert(app.maintenanceHttp(req("GET","/health","01234567",{}),30024).status==200);
+}
 int main(int argc,char **argv) {
     assert(argc==4); Host host;
     Ap01VfsOps io{&host,prepare,openFile,closeFile,readFile,writeFile,seekFile,sizeFile,exists,mkdirFile,removeFile,renameFile,statFs};
@@ -115,9 +159,10 @@ int main(int argc,char **argv) {
     std::string recoveredContext;
     {
         Ap01Business content(fs,{&host,present},1); assert(content.begin(0));
-        Ap01ApplicationPort callbacks{&host,randomBytes,lock,unlock};callbacks.wifiProfiles={&host,wifiCurrent,wifiLoad,wifiStore,nullptr};
+        Ap01ApplicationPort callbacks{&host,randomBytes,lock,unlock};callbacks.wifiProfiles={&host,wifiCurrent,wifiLoad,wifiStore,nullptr};callbacks.deviceCode=menuCode;
         Ap01Application app(fs,content,callbacks,"AABBCCDDEEFF",1); assert(app.begin()); app.businessOnline(true);
         http(app);
+        manualAuthTests(app,host);
         const std::string pairing="{\"device_mac\":\"AABBCCDDEEFF\",\"bridge_id\":\"bridge-test\",\"name\":\"native-test\",\"display_code\":\"1234\",\"binding_token\":\"0123456789abcdef0123456789abcdef\",\"request_id\":\"pair-test\",\"boot_id\":1,\"pairing_revision\":0}";
         auto reply=app.maintenanceHttp(req("POST","/api/pairing","",pairing),1); assert(reply.status==202);
         assert(app.button(false,1,2)); // A held old release cannot approve.
@@ -128,12 +173,12 @@ int main(int argc,char **argv) {
         assert(app.button(true,4,5)); assert(app.button(false,5,6));
         assert(app.maintenanceHttp(req("GET","/api/wifi/profiles","bad",{}),7).status==401);
         app.businessOnline(false);
-        auto list=app.maintenanceHttp(req("GET","/api/wifi/profiles","0123456789abcdef0123456789abcdef",{}),8);
+        auto list=app.maintenanceHttp(req("GET","/api/wifi/profiles","01234567",{}),8);
         assert(list.status==200&&strstr(list.bytes.c_str(),"Home")&&!strstr(list.bytes.c_str(),"synthetic-current"));
         const std::string profiles=R"({"device_mac":"AABBCCDDEEFF","expected_revision":0,"profiles":[{"ssid":"Office","password":"synthetic-candidate"}]})";
-        auto saved=app.maintenanceHttp(req("PUT","/api/wifi/profiles","0123456789abcdef0123456789abcdef",profiles),9);
+        auto saved=app.maintenanceHttp(req("PUT","/api/wifi/profiles","01234567",profiles),9);
         assert(saved.status==200&&strstr(saved.bytes.c_str(),"Office")&&strstr(saved.bytes.c_str(),"Home")&&!strstr(saved.bytes.c_str(),"synthetic-"));
-        assert(app.maintenanceHttp(req("POST","/api/wifi/activate","0123456789abcdef0123456789abcdef",{}),10).status==404);
+        assert(app.maintenanceHttp(req("POST","/api/wifi/activate","01234567",{}),10).status==404);
         app.businessOnline(true);
         binaryHttp(app);
         Client client{app}; client.status(); client.claim();

@@ -75,7 +75,7 @@ sources = [platform/'native_io_0041.cpp', platform/'screen_host_0041.c', platfor
 
 sources += [platform/'native_vfs_0041.cpp', repo/'ports/ap01/business.cpp', repo/'ports/ap01/application.cpp', repo/'ports/ap01/http.cpp', platform/'native_calendar_0041.cpp', platform/'native_runtime_0041.cpp', repo/'ports/ap01/native_0041.cpp', repo/'ports/ap01/manifest_0041.cpp']
 
-sources += [platform/'native_wifi_profiles_0041.cpp',platform/'native_wifi_profiles_port_0041.cpp',platform/'native_diagnostic_0041.cpp',platform/'native_firmware_0041.cpp',platform/'native_ota_image_0041.c',platform/'native_slot_0041.cpp']
+sources += [platform/'native_device_code_0041.cpp',platform/'native_wifi_profiles_0041.cpp',platform/'native_wifi_profiles_port_0041.cpp',platform/'native_diagnostic_0041.cpp',platform/'native_firmware_0041.cpp',platform/'native_ota_image_0041.c',platform/'native_slot_0041.cpp']
 
 sources += [repo/'src'/name for name in ['template_engine.cpp', 'GUI_Paint.cpp', 'font_asset.cpp',
 

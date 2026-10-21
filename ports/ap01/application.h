@@ -14,6 +14,8 @@ struct Ap01ApplicationPort {
     Ap01FirmwarePort firmware{};
     Ap01WifiProfilesPort wifiProfiles{};
     Ap01DiagnosticPort diagnostic{};
+    // Reads the committed menu code; never creates/rotates it from HTTP.
+    int (*deviceCode)(void *, char out[9]) = nullptr;
 };
 #include "native_http_0041.h"
 
@@ -30,6 +32,9 @@ class Ap01Application {
     char mac[13], nonce[33] = {};
     uint64_t boot;
     bool ready = false;
+    unsigned manualFailures = 0;
+    uint64_t manualRetryAt = 0;
+    bool manualAuth(const Ap01HttpRequest &, uint64_t, Ap01HttpReply &);
     std::atomic<bool> online{false};
     std::atomic<bool> maintenanceGate{false};
     static int save(void *, const uint8_t *, size_t);
