@@ -1028,7 +1028,10 @@ class NativeProvider(OriginalProvider):
                     time.sleep(.05);continue
                 code,info=self.http(self.port,'GET','/api/pairing/info')
                 self.report['native_pairing_info']={'status':code,'mac':info.get('device_mac'),'method':info.get('binding_method')}
-                code,_=self.http(self.port,'GET','/health');self.report['native_unauthorized_health']=code
+                code,denied=self.http(self.port,'GET','/health');self.report['native_unauthorized_health']=code
+                # Menu-code maintenance deliberately returns 503 until a code
+                # exists. It must not mint a credential while serving HTTP.
+                self.report['native_unauthorized_health_error']={key:denied.get(key) for key in ('error','stage','action')}
                 request=json.dumps({'magic':'codex-status','kind':'discover','discovery_v':1,'nonce':'0123456789abcdef0123456789abcdef'}).encode()
                 with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as udp:
                     udp.bind(('127.0.0.1',0));udp.settimeout(5);udp.sendto(request,('127.0.0.1',self.port+2));reply,_=udp.recvfrom(1024)
@@ -1086,7 +1089,10 @@ if __name__=='__main__':
     base.runner.QMP=CaptureQMP
     result=base.main()
     path=Path(sys.argv[sys.argv.index('--output')+1]);report=json.loads(path.read_text())
-    report['native_service_probe_passed']=bool(report.get('native_pairing_info',{}).get('status')==200 and report.get('native_unauthorized_health')==401 and report.get('native_discovery_matches'))
+    denial=report.get('native_unauthorized_health_error',{})
+    denied=report.get('native_unauthorized_health')==401 or (report.get('native_unauthorized_health')==503 and
+        denial=={'error':'device_code_unavailable','stage':'manual_auth','action':'open_device_code_menu'})
+    report['native_service_probe_passed']=bool(report.get('native_pairing_info',{}).get('status')==200 and denied and report.get('native_discovery_matches'))
     report['cpu_safety_passed']=report['passed']
     # The frozen runner's UART marker may be interleaved by other task logs.
     # A matching-ELF UI timer breakpoint gives direct execution evidence even

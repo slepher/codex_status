@@ -188,7 +188,7 @@ def main():
         report = read(filename); assert report['passed'], filename
         if 'image_sha256' in report: assert report['image_sha256'] == image_hash
         if args.trial_cut and filename == 'native-firmware-host-report.json':
-            assert digest(ROOT/'ports/ap01/firmware_smoke.cpp') == report['test_source_sha256']
+            assert digest(ROOT.parent/'cuktech-ap01-firmware/tooling/firmware-modules/test_native_maintenance_0041.cpp') == report['test_source_sha256']
         binary = OUT/('native-firmware-smoke' if 'firmware' in filename else 'native-app-smoke')
         assert digest(binary) == report['binary_sha256'], filename
         record(OUT/filename)

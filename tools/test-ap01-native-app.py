@@ -52,7 +52,7 @@ for folder in ('ports/ap01','bridge/crates/render/shim','src','.pio/libdeps/esp3
     cmd+=['-I',linux(repo/folder)]
 source_paths=[repo/'src'/s for s in sources]+[repo/'ports/ap01'/s for s in ('business.cpp','application.cpp','http.cpp','native_smoke.cpp')]
 platform=repo.parent/'cuktech-ap01-firmware/tooling/firmware-modules'
-source_paths += [platform/'native_wifi_profiles_0041.cpp',platform/'native_diagnostic_0041.cpp',platform/'native_calendar_0041.cpp',platform/'native_firmware_0041.cpp',platform/'native_ota_image_0041.c']
+source_paths += [platform/'native_maintenance_0041.cpp',platform/'native_http_transport_0041.cpp',platform/'native_wifi_profiles_0041.cpp',platform/'native_diagnostic_0041.cpp',platform/'native_calendar_0041.cpp',platform/'native_firmware_0041.cpp',platform/'native_ota_image_0041.c']
 cmd+=['-I',linux(platform)]
 objects=[]
 headers=list(platform.glob('*.h'))+list((repo/'ports/ap01').glob('*.h'))+list((repo/'src').glob('*.h'))
@@ -67,13 +67,33 @@ result=subprocess.run(['wsl','-d','Ubuntu-24.04','--',linux(binary),linux(state)
                        linux(out/'native-app-activation.json')],capture_output=True,text=True,timeout=180)
 (out/'native-app-tests.log').write_text(result.stdout+result.stderr,encoding='utf-8')
 assert not result.returncode,result.stderr
-firmware_source=repo/'ports/ap01/firmware_smoke.cpp';firmware_object=out/'native-host-firmware_smoke.o'
+firmware_source=platform/'test_native_maintenance_0041.cpp';firmware_object=out/'native-host-firmware_smoke.o'
 subprocess.run(cmd+['-c',linux(firmware_source),'-o',linux(firmware_object)],check=True)
 firmware_binary=out/'native-firmware-smoke'
 subprocess.run(cmd+[linux(p) for p in objects if p.stem!='native-host-native_smoke']+[linux(firmware_object),'-o',linux(firmware_binary)],check=True)
 firmware_result=subprocess.run(['wsl','-d','Ubuntu-24.04','--',linux(firmware_binary),linux(state),linux(args.image)],capture_output=True,text=True,timeout=180)
 (out/'native-firmware-host-tests.log').write_text(firmware_result.stdout+firmware_result.stderr,encoding='utf-8')
 assert not firmware_result.returncode,firmware_result.stderr
+# Compile the same menu-code OTA/restart/switch scenarios without App or
+# business/render objects: firmware maintenance must not link the application.
+independent_object=out/'native-host-maintenance-only.o'
+subprocess.run(cmd+['-DAP01_MAINTENANCE_ONLY_TEST=1','-c',linux(firmware_source),'-o',linux(independent_object)],check=True)
+independent_binary=out/'native-maintenance-independent'
+independent_names={'native_maintenance_0041','native_http_transport_0041','native_wifi_profiles_0041',
+                   'native_diagnostic_0041','native_firmware_0041','native_ota_image_0041','sha256'}
+independent_objects=[obj for source,obj in zip(source_paths,objects) if source.stem in independent_names]
+assert len(independent_objects)==len(independent_names)
+subprocess.run(cmd+[linux(p) for p in independent_objects]+[linux(independent_object),'-o',linux(independent_binary)],check=True)
+symbols=subprocess.check_output(['wsl','-d','Ubuntu-24.04','--','nm','-C',linux(independent_binary)],text=True)
+assert 'Ap01Application' not in symbols and 'Ap01Business' not in symbols
+create="import tempfile,pathlib; p=pathlib.Path(tempfile.mkdtemp(prefix='ap01-independent-')); (p/'f21').mkdir(); print(p)"
+independent_state=subprocess.check_output(['wsl','-d','Ubuntu-24.04','--','python3','-c',create],text=True).strip()
+independent_result=subprocess.run(['wsl','-d','Ubuntu-24.04','--',linux(independent_binary),independent_state,linux(args.image)],capture_output=True,text=True,timeout=180)
+(out/'native-maintenance-independent.log').write_text(independent_result.stdout+independent_result.stderr,encoding='utf-8')
+assert not independent_result.returncode,independent_result.stderr
+(out/'native-maintenance-independent.json').write_text(json.dumps({'passed':True,'application_linked':False,
+    'binary_sha256':hashlib.sha256(independent_binary.read_bytes()).hexdigest(),
+    'checks':independent_result.stdout.strip(),'physical_verified':False},indent=2),encoding='utf-8')
 (out/'native-firmware-host-report.json').write_text(json.dumps({'passed':True,
     'scope':'host ASan/UBSan exact native firmware service; fake flash callbacks, no ROM ABI proof',
     'image_sha256':hashlib.sha256(args.image.read_bytes()).hexdigest(),

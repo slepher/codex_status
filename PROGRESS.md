@@ -9,6 +9,8 @@
 
 ## 部署与工作区
 
+- **2026-10-22 AP01源码边界已调整并纳入本轮提交，未部署**：OTA/切槽/维护鉴权与HTTP策略、系统菜单及切网执行归固件仓库；本仓库保留Bridge通信App/模板和平台回调连接；配套固件提交`41541a2`。宿主App/维护及无App独立OTA/回执/切槽、切网核心ASan、RV32审计/链接、原生App/维护烟测通过；Wi-Fi菜单仍为C9待办，未新增实机验收。[交接/资源/证据](project-workflow/ap01-firmware-boundary/status.md)。
+
 - **应用OTA/切槽八位码06已部署槽1并实机通过**：build`5757fdd677800d1412d8795c1cb2dbe0`，经原0031救援0单次上传应用1；菜单码/原Bridge密钥维护兼容，缺失/错码401、原业务C2正常、Wi-Fi列表未变。八位码实际切槽/重启→救援0→独立入口回06通过，无二次上传；设备码跨重启保持，用户确认界面正常。救援0未写，完整非活动6822344B（含PEC）SHA与保留档一致。零绑定完整OTA为原生模拟证据，物理保留既有绑定；掉电/栈高水位未验。[实机证据](artifacts/ap01-menu-ota06-rollout-20261022/physical-validation.json)。实现及验证脚本已纳入本轮提交；配套固件仓库`57f18aa`。
 - 设备码菜单/手动鉴权05已由06替换；原物理菜单、生成后旧码失效及字体/选择行为验收保留。[05归档](artifacts/ap01-device-code-auth-20261021/physical-validation.json)。
 - AP01 `34F01557210B`/DID2232184842：**配网列表后端验收归档**，原build`f52b12`已由上述05替换，后端保留。该次救援0前后6822344B（含PEC）SHA均匹配原版；列表保存/uniq、软重启revision1/密文保持通过，清理至revision2；11份原网络/身份文件不变，用户确认原厂界面/旋钮正常。**Wi-Fi菜单只有独立SIM实现，实机未接入；原网络安全写入/切网回退未验。** [专项](project-workflow/ap01-wifi-profiles/status.md)。历史误刷及0031恢复记录保留。
@@ -36,6 +38,8 @@
 - [部署与边界](project-workflow/ap01-template-integration/release-0041-20261020.md)；实机证据 `artifacts/ap01-app-rollout-20261020/physical-verification-navigation33.json`；[待办C9](docs/roadmap/backlog.md)。
 
 ## 精确ROM
+
+- **边界迁移候选03（未部署）**：`artifacts/ap01-firmware-boundary-20261022/ap01-boundary-candidate03.bin`，7043304B，build`39a3d969e2e7f2e49956054feebec8fe`，SHA256`a0053614fba6c9d3e2443a71a61d843f4aec85ea0c934b25fa04503bdbde1fbf`；ELF`76a291bb2e8c7bfe0dc48a197f08dddc5a81783f7049d3e231171601fd888587`。原生执行02，与03 ELF/可执行payload逐字节相同；[验收边界](artifacts/ap01-firmware-boundary-20261022/acceptance.json)。
 
 - **已部署应用菜单码OTA06／槽1**：`artifacts/ap01-device-code-ota-20261021/ap01-0041-menu-ota-candidate06.bin`，7019304B，build`5757fdd677800d1412d8795c1cb2dbe0`，SHA256`82d33c493f7625a2b22588210d6492897af93b4f7eba05d3559abd9f15197e18`；ELF`76cbab6897edb5652a72a6553d749f0be799d7c9aa698fad1e7678749003be86`。[离线验收](artifacts/ap01-device-code-ota-20261021/offline-acceptance.json)。
 

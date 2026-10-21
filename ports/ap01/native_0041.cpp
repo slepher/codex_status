@@ -1,13 +1,9 @@
 #include "application.h"
-#include "native_wifi_switch_0041.h"
+#include "native_services_0041.h"
 #include "http.h"
-#include "slot_0041.h"
 #include "screen_port_0041.h"
 #include "native_io_0041.h"
 #include "vfs_0041.h"
-#include "native_wifi_profiles_port_0041.h"
-#include "native_diagnostic_0041.h"
-#include "native_device_code_0041.h"
 #include "ap01_template_display.h"
 #include "local_json_allocator.h"
 #include <atomic>
@@ -27,19 +23,15 @@ struct Frame {uint8_t *pixels;uint32_t generation,transition,epoch;uint8_t count
 struct Activation {unsigned index;uint32_t transition;};
 
 struct Runtime {
-    Flash updateFlash;
-    char firmwareBuild[33]={};
-    int bootSlot=-1;
     LittleFSClass fs;
     Ap01Business business;
     std::unique_ptr<Ap01Application> app;
-    Ap01WifiSwitch0041 wifi{ap01WifiSwitchNativePort0041(this,wifiBlocked)};
+    Ap01NativeServices0041 services;
     std::atomic<bool> initialized{false};
     std::atomic<uint32_t> uiEpoch{1};
     uint32_t renderingEpoch=1; // Captured by the business executor before each operation.
     std::atomic<uint32_t> ready{0}; // 0 initializing, 1 live, 2 root retired.
     std::atomic<uint32_t> uiHeartbeat{0};
-    std::atomic<bool> maintenanceListening{false};
     std::atomic<bool> stop{false};
     std::atomic_flag bindingsLock=ATOMIC_FLAG_INIT,businessLock=ATOMIC_FLAG_INIT;
     std::atomic<Frame *> pending{nullptr};
@@ -111,45 +103,10 @@ struct Runtime {
     }
     static bool lockBindings(void *p) {return !((Runtime *)p)->bindingsLock.test_and_set(std::memory_order_acquire);}
     static void unlockBindings(void *p) {((Runtime *)p)->bindingsLock.clear(std::memory_order_release);}
-    static bool wifiBlocked(void *p) {auto &r=*(Runtime *)p;return (ap01_native0041::firmwareBusy()) || (r.app&&r.app->maintenanceActive());}
-    static bool firmwareBusy(void *p) {return (ap01_native0041::firmwareBusy()) || ((Runtime *)p)->wifi.busy();}
-    static bool diagnosticBusy(void *p) {
-        return firmwareBusy(p) || ((Runtime *)p)->app->maintenanceActive();
-    }
-    static void firmwareClose(void *p) {
-        Flash &f=((Runtime *)p)->updateFlash;
-        if(f.fd>=0){flashClose(&f);f.fd=-1;}
-    }
-    static bool firmwareOpen(void *p,uint32_t length) {
-        Flash &f=((Runtime *)p)->updateFlash;if(f.fd>=0)return false;
-        const char *slot=updateSlot();
-        if(!slot||(strcmp(slot,"/dev/fw1")&&strcmp(slot,"/dev/fw2")))return false;
-        Runtime &r=*(Runtime *)p;
-        if(r.bootSlot<0||ap01SelectedSlot0041()!=r.bootSlot||strcmp(slot,r.bootSlot?"/dev/fw1":"/dev/fw2"))return false;
-        f.flip=0;
-        int result=flashOpen(&f,length);
-        if(result||f.fd<=0){firmwareClose(p);return false;}return true;
-    }
-    static bool firmwareWrite(void *p,uint32_t offset,const uint8_t *bytes,size_t length) {
-        Flash &f=((Runtime *)p)->updateFlash;if(f.fd<0||!length||length>32768)return false;
-        uint8_t scratch[1024];
-        while(length){unsigned n=length>sizeof(scratch)?sizeof(scratch):length;memcpy(scratch,bytes,n);
-            if(flashWrite(&f,offset,scratch,n))return false;
-            offset+=n;bytes+=n;length-=n;
-        }return true;
-    }
-    static bool firmwareVerify(void *p,uint32_t length) {
-        Flash &f=((Runtime *)p)->updateFlash;
-        return f.fd>=0&&!flashVerify(&f,length);
-    }
-    static int firmwareCommit(void *p) {int slot=((Runtime *)p)->bootSlot;return slot<0?-1:ap01SelectSlot0041(unsigned(slot)^1);}
-    static void firmwareReboot(void *) {reboot();}
-    static int runningSlot(void *p) {return ((Runtime *)p)->bootSlot;}
-    static bool inspectSlot(void *p,unsigned slot,Ap01SlotImage &out) {return ap01InspectSlot0041(slot,int(slot)==((Runtime *)p)->bootSlot,out);}
-    static int selectSlot(void *,unsigned slot) {return ap01SelectSlot0041(slot);}
-    static bool bootHealthy(void *p) {
+    static bool systemBusy(void *p) {return ((Runtime *)p)->services.busy();}
+    static bool healthy(void *p) {
         auto &r=*(Runtime *)p;uint32_t beat=r.uiHeartbeat.load(std::memory_order_acquire);
-        return r.ready.load(std::memory_order_acquire)==1&&r.maintenanceListening.load(std::memory_order_acquire)&&beat&&uint32_t(nowMs())-beat<=1000;
+        return r.ready.load(std::memory_order_acquire)==1&&beat&&uint32_t(nowMs())-beat<=1000;
     }
     bool mainRootVisible() const {return ap01_window_visible(const_cast<ap01_window_0041 *>(&window));}
     bool mainRootActive() const {return mainRootVisible()&&ap01_window_idle(const_cast<ap01_window_0041 *>(&window));}
@@ -205,7 +162,7 @@ struct Runtime {
     }
     bool initUi() {
         ready.store(0,std::memory_order_release);
-        window.win=root;window.stock=original;window.context=this;window.event=eventCallback;window.poll=timer;
+        window.win=root;window.stock=original;window.context=this;window.event=eventCallback;window.poll=timer;window.services=&services;
         uint32_t token=host.transition;
         uint32_t revisions[sizeof(apps)/sizeof(apps[0])];
         for(unsigned i=0;i<sizeof(apps)/sizeof(apps[0]);++i)revisions[i]=apps[i].revision;
@@ -259,9 +216,8 @@ struct Runtime {
     void tick();
     void key(void *);
     static void *bootstrap(void *);
-    static void *maintenance(void *);
     static void *udp(void *);
-    void serve(bool maintenance);
+    void serve();
 };
 extern "C" {
 __attribute__((section(".ap01_abi"),used))
@@ -400,14 +356,12 @@ void Runtime::key(void *e) {
     if(!consumed)original(e);
 }
 
-void Runtime::serve(bool maintenancePort) {
-    int fd=listener(maintenancePort?18080:18081);if(fd<0)return;
-    if(maintenancePort)maintenanceListening.store(true,std::memory_order_release);
-    if(!maintenancePort)app->businessOnline(true);
+void Runtime::serve() {
+    int fd=listener(18081);if(fd<0)return;
+    app->businessOnline(true);
     while(!stop.load(std::memory_order_acquire)) {
-        if(!maintenancePort)processActivation();
-        if(maintenancePort){app->maintenanceTick(nowMs());wifi.tick(nowMs());}
-        else if(!app->maintenanceActive()&&!businessLock.test_and_set(std::memory_order_acquire)) {
+        processActivation();
+        if(!app->maintenanceActive()&&!businessLock.test_and_set(std::memory_order_acquire)) {
             renderingEpoch=uiEpoch.load(std::memory_order_acquire);
             time_t epoch=time(nullptr);struct tm local{};char hhmm[6]="--:--";
             if(epoch>1600000000&&ap01Calendar(epoch,local)&&local.tm_hour>=0&&local.tm_hour<24&&local.tm_min>=0&&local.tm_min<60)
@@ -417,11 +371,9 @@ void Runtime::serve(bool maintenancePort) {
         if(!waitFd(fd,1,nowMs()+1000))continue;
         int client=ap01_native0041::accept(fd);if(client<0)continue;
         Ap01Stream io{&client,receive,send};uint64_t now=nowMs();
-        bool maintenanceSent=false;
-        if(maintenancePort)maintenanceSent=ap01ServeHttp(*app,true,io,now,now+5000);
-        else if(!businessLock.test_and_set(std::memory_order_acquire)) {
+        if(!businessLock.test_and_set(std::memory_order_acquire)) {
             renderingEpoch=uiEpoch.load(std::memory_order_acquire);
-            ap01ServeHttp(*app,false,io,now,now+5000);businessLock.clear(std::memory_order_release);
+            ap01ServeHttp(*app,io,now,now+5000);businessLock.clear(std::memory_order_release);
         } else {
             const char body[]="{\"result\":\"rejected\",\"error\":\"busy\",\"stage\":\"admission\",\"action\":\"read_status\"}";
             char headers[192];int length=snprintf(headers,sizeof(headers),"HTTP/1.1 503 Busy\r\nContent-Length: %u\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n",unsigned(sizeof(body)-1));
@@ -430,12 +382,9 @@ void Runtime::serve(bool maintenancePort) {
             }
         }
         closeFd(client);
-        if(maintenancePort)app->maintenanceResponse(maintenanceSent);
     }
-    if(maintenancePort)maintenanceListening.store(false,std::memory_order_release);
-    if(!maintenancePort)app->businessOnline(false);closeFd(fd);
+    app->businessOnline(false);closeFd(fd);
 }
-void *Runtime::maintenance(void *p) {((Runtime *)p)->serve(true);return nullptr;}
 void *Runtime::udp(void *p) {
     Runtime &r=*(Runtime *)p;int fd=listener(8767,true);if(fd<0)return nullptr;
     uint64_t nextReply=0;
@@ -452,28 +401,26 @@ void *Runtime::udp(void *p) {
 void *Runtime::bootstrap(void *p) {
     Runtime &r=*(Runtime *)p;char mac[13];
     if(!wifiMac(mac)||!r.fs.begin(false,"/resource",10,"resource"))return nullptr;
-    r.bootSlot=ap01SelectedSlot0041();
-    const char *hex="0123456789abcdef";
-    for(unsigned i=0;i<16;++i){uint8_t v=ap01_native_manifest[36+i];r.firmwareBuild[2*i]=hex[v>>4];r.firmwareBuild[2*i+1]=hex[v&15];}
-    Ap01ApplicationPort callbacks{&r,randomBytes,lockBindings,unlockBindings,
-        {&r,firmwareBusy,firmwareOpen,firmwareWrite,firmwareVerify,firmwareCommit,firmwareClose,r.firmwareBuild,firmwareReboot,runningSlot,inspectSlot,selectSlot,bootHealthy}};
-    callbacks.wifiProfiles=ap01WifiProfilesNativePort0041(&r,diagnosticBusy);
-    callbacks.diagnostic={&r,ap01DiagnosticFile0041,ap01DiagnosticFlash0041,diagnosticBusy};
-    callbacks.deviceCode=[](void *,char out[9]) {return ap01DeviceCodeLoad0041(ap01RomVfs(),out);};
+    Ap01ApplicationPort callbacks{&r,randomBytes,lockBindings,unlockBindings,systemBusy};
     r.app.reset(new(std::nothrow) Ap01Application(r.fs,r.business,callbacks,mac,r.bootId));
-    if(!r.app||!r.app->begin(nowMs()))return nullptr;
-    r.wifi.begin(nowMs());
+    if(!r.app)return nullptr;
+    bool appReady=r.app->begin(nowMs());
+    Ap01MaintenanceBridge0041 bridge{r.app.get(),
+        [](void *p,const char *token,char out[65]){return ((Ap01Application *)p)->bindingPrincipal(token,out);},
+        [](void *p,const Ap01HttpRequest &q,uint64_t now){return ((Ap01Application *)p)->pairingHttp(q,now);},
+        [](void *p){return ((Ap01Application *)p)->businessAvailable();}};
+    if(!r.services.start(bridge,r.bootId,&r,healthy))return nullptr;
+    if(!appReady)return nullptr; // System maintenance already has an independent executor.
     r.initialized.store(true,std::memory_order_release);
     uint32_t initializing=0;
     r.ready.compare_exchange_strong(initializing,1,std::memory_order_acq_rel);
     uint32_t thread=0;
-    ap01_native0041::thread(&thread,"ap01-maint",maintenance,16384,&r);
     ap01_native0041::thread(&thread,"ap01-discover",udp,8192,&r);
     // Maintenance/discovery are already running; a failed business restore
     // must not take their listeners or pairing lifecycle down with it.
     // A damaged Bundle must remain repairable through an authenticated full
     // publish. The service exposes recovery state and the native UI remains.
-    r.renderingEpoch=r.uiEpoch.load(std::memory_order_acquire);r.business.begin(nowMs());r.serve(false);
+    r.renderingEpoch=r.uiEpoch.load(std::memory_order_acquire);r.business.begin(nowMs());r.serve();
     return nullptr;
 }
 }
@@ -571,14 +518,3 @@ unsigned ap01HostProbe0041(void *context,unsigned operation) {
     }
 }
 #endif
-
-namespace {
-Runtime *wifiRuntime() {
-    return (Runtime *)ap01_window_find(Runtime::timer);
-}
-}
-extern "C" int ap01WifiSelect0041(const char *ssid){
-    auto r=wifiRuntime();if(!r||r->ready.load(std::memory_order_acquire)!=1||Runtime::wifiBlocked(r))return -16;
-    return r->wifi.request(ssid,uint32_t(nowMs()));
-}
-extern "C" int ap01WifiSelectionState0041(){auto r=wifiRuntime();return r?int(r->wifi.feedback(uint32_t(nowMs()))):int(Ap01WifiSwitch0041::Unavailable);}

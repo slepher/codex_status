@@ -10,6 +10,8 @@ ESP32-S3 本地渲染墨水屏；Rust/Tauri Bridge 经 `codex app-server` 取数
 
 目录：`src/` 固件（`main.cpp` 入口）；`bridge/crates/core|ble|render|mcp|app` 分别负责数据/设备客户端、BLE、同源预览、MCP、托盘应用。MCP 在 `127.0.0.1:8766/mcp`，平台工具与 UI 共用 app application service；`tools/` 为工具与测试桥；`project-workflow/` 为未结专项，结项在 `docs/history/workflow/`；`artifacts/` 为不入库的本地证据。
 
+AP01 源码边界：本仓库 `ports/ap01/` 只拥有 Bridge 配对/通信 App、Bundle 与模板显示；OTA、切槽、维护鉴权/HTTP 策略、原厂系统菜单及 Wi-Fi 切网/恢复由兄弟仓库 `cuktech-ap01-firmware/tooling/firmware-modules/` 拥有。App 只提供配对、绑定 principal、健康回调并读取系统忙门；本仓库可保留构建/集成测试入口，不复制维护实现或 ROM 补丁。改边界运行 `python tools/test-ap01-firmware-boundary.py`；现存 Note4/1.54 源码职责不受此 AP01 约定影响。
+
 ## 交接与工作流
 
 - `PROGRESS.md` 目标约 2 KB：更新时间、部署/工作区、活跃事项与下一步、风险、验收边界、backlog 编号和证据链接；无证据写未知。每个里程碑更新卡片，详细进度按日期归档；日志/私有原文留在 `artifacts/`。不重复待办/设计，不追加过程流水账；单次调查写对应专项或 backlog。

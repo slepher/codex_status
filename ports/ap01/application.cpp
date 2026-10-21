@@ -113,11 +113,6 @@ bool Ap01Application::begin(uint64_t now) {
     if (length && (!bytes || file.read(bytes.get(), length) != length)) return false;
     Ap01BindingIo io{this, malloc, free, save};
     ready = ap01BindingsInit(&bindings, &io, boot, bytes.get(), length);
-    if(ready&&port.firmware.open) {
-        firmware.reset(new(std::nothrow) Ap01Firmware(fs,port.firmware,mac));
-        if(firmware)firmware->begin(now);
-        maintenanceGate.store(!firmware||firmware->blocksBusiness(),std::memory_order_release);
-    }
     return ready;
 }
 Ap01Application::Session *Ap01Application::session(const char *principal) {
@@ -130,98 +125,34 @@ Ap01Application::Session *Ap01Application::session(const char *principal) {
     strcpy(value->principal, principal); value->next = std::move(sessions);
     sessions = std::move(value); return sessions.get();
 }
-bool Ap01Application::manualAuth(const Ap01HttpRequest &request, uint64_t now, Ap01HttpReply &reply) {
-    // Maintenance has one executor. No code is cached across requests/rotation.
-    if (now < manualRetryAt) {
-        reply.status = 429;
-        reply.bytes = "{\"result\":\"rejected\",\"error\":\"device_code_rate_limited\",\"stage\":\"manual_auth\",\"action\":\"wait_30_seconds\"}";
-        return false;
-    }
-    char code[9] = {};
-    if (!port.deviceCode || port.deviceCode(port.context, code)) {
-        reply.status = 503;
-        reply.bytes = "{\"result\":\"rejected\",\"error\":\"device_code_unavailable\",\"stage\":\"manual_auth\",\"action\":\"open_device_code_menu\"}";
-        return false;
-    }
-    unsigned mismatch = 0;
-    if (!request.token || strlen(request.token) != 8) mismatch = 1;
-    else for (unsigned i = 0; i < 8; ++i) mismatch |= unsigned(uint8_t(code[i]) ^ uint8_t(request.token[i]));
-    memset(code, 0, sizeof(code));
-    if (mismatch) {
-        if (++manualFailures >= 5) { manualFailures = 0; manualRetryAt = now + 30000; }
-        reply.status = 401;
-        reply.bytes = "{\"result\":\"rejected\",\"error\":\"device_code\",\"stage\":\"manual_auth\",\"action\":\"enter_current_menu_code\"}";
-        return false;
-    }
-    manualFailures = 0; manualRetryAt = 0;
-    return true;
-}
-Ap01HttpReply Ap01Application::maintenanceHttp(const Ap01HttpRequest &request, uint64_t now) {
+Ap01HttpReply Ap01Application::pairingHttp(const Ap01HttpRequest &request, uint64_t now) {
     Ap01HttpReply reply;
-    maintenanceTick(now);
-    const bool wifi = !strncmp(request.path,"/api/wifi/",10);
-    const bool diagnostic = !strncmp(request.path,"/api/diagnostic/",16);
-    if (wifi || diagnostic) {
-        if (!ready) { error(reply, 503, "maintenance_busy", "lifecycle"); return reply; }
-        if (!manualAuth(request, now, reply)) return reply;
-        return wifi ? ap01WifiProfilesHttp0041(port.wifiProfiles,request,mac) :
-                      ap01DiagnosticHttp0041(port.diagnostic,request,mac,boot);
-    }
-    const bool localMaintenance = (!strncmp(request.path,"/api/firmware/",14) ||
-        !strcmp(request.path,"/health") || !strcmp(request.path,"/api/maintenance/status")) &&
-        (!request.token || strlen(request.token) != 32);
-    if (localMaintenance && !manualAuth(request, now, reply)) return reply;
     BindingGuard guard(port);
-    if (!ready || (!localMaintenance && !guard)) { error(reply, 503, "maintenance_busy", "bindings"); return reply; }
-    if (guard) bindings.maintenance=maintenanceGate.load(std::memory_order_acquire);
-    if (!strncmp(request.path, "/api/pairing", 12)) {
-        if (request.length > 4096 || (request.length && memchr(request.body, 0, request.length))) {
-            error(reply, 400, "body", "pairing"); return reply;
-        }
-        String input((const char *)request.body, request.length);
-        std::unique_ptr<char[]> output(new (std::nothrow) char[4096]);
-        if (!output || input.length() != request.length) { error(reply, 503, "oom", "pairing"); return reply; }
-        if (bindings.storage_unknown) {
-            File file = fs.open("/bindings.bin", "r"); size_t n = file ? file.size() : 0;
-            std::unique_ptr<uint8_t[]> bytes(n && n <= 2136 ? new (std::nothrow) uint8_t[n] : nullptr);
-            if (bytes && file.read(bytes.get(), n) == n) ap01BindingsResolve(&bindings, bytes.get(), n);
-        }
-        reply.status = ap01PairingHttp(&bindings, mac, request.method, request.path,
-            request.token, input.c_str(), now, output.get(), 4096);
-        if (reply.status < 0) error(reply, 503, "reply_limit", "pairing");
-        else reply.bytes = output.get();
-        return reply;
+    if (!ready || !guard) { error(reply, 503, "maintenance_busy", "bindings"); return reply; }
+    bindings.maintenance=maintenanceActive();
+    if (request.length > 4096 || (request.length && memchr(request.body, 0, request.length))) {
+        error(reply, 400, "body", "pairing"); return reply;
     }
-    // A local maintenance credential never creates a Bridge binding or owner.
-    // The namespace survives code rotation so the current physical owner can
-    // query/resume the original maintenance transaction instead of resending it.
-    const char *bound=localMaintenance ? "ap01-menu-maintenance" : ap01BindingPrincipal(&bindings, request.token);
-    if (!bound) { error(reply, 401, "unauthorized", "maintenance_auth"); return reply; }
-    if(!strncmp(request.path,"/api/firmware/",14)) {
-        if(!firmware){error(reply,port.firmware.open?503:501,"firmware_port_unavailable","maintenance_router");return reply;}
-        char principal[65];strcpy(principal,bound);
-        bool start=(!strcmp(request.path,"/api/firmware/begin")||!strcmp(request.path,"/api/firmware/switch"))&&!strcmp(request.method,"POST");
-        if(start) {
-            maintenanceGate.store(true,std::memory_order_release);if (guard) bindings.maintenance=true;
-        }
-        guard.release();reply=firmware->handle(request,principal,now);
-        maintenanceGate.store(firmware->blocksBusiness(),std::memory_order_release);
-        return reply;
+    String input((const char *)request.body, request.length);
+    std::unique_ptr<char[]> output(new (std::nothrow) char[4096]);
+    if (!output || input.length() != request.length) { error(reply, 503, "oom", "pairing"); return reply; }
+    if (bindings.storage_unknown) {
+        File file = fs.open("/bindings.bin", "r"); size_t n = file ? file.size() : 0;
+        std::unique_ptr<uint8_t[]> bytes(n && n <= 2136 ? new (std::nothrow) uint8_t[n] : nullptr);
+        if (bytes && file.read(bytes.get(), n) == n) ap01BindingsResolve(&bindings, bytes.get(), n);
     }
-    if (!strcmp(request.method, "GET") && (!strcmp(request.path, "/health") || !strcmp(request.path, "/api/maintenance/status"))) {
-        LocalJsonAllocator allocator; JsonDocument out(&allocator);
-        out["device_mac"] = mac; out["fw_target"] = FW_TARGET_ID; out["boot_id"] = boot;
-        imageIdentity(out);
-        out["service"] = "ap01-maintenance"; out["http_port"] = 18080;
-        out["business_online"] = online.load(std::memory_order_acquire)&&!maintenanceGate.load(std::memory_order_acquire);
-        out["firmware_ota"] = firmware&&firmware->available()?"chunked-v1":"unavailable";
-        out["firmware_update_policy"]="sequential_with_traditional_ota";
-        reply.status = 200; encode(out, reply); return reply;
-    }
-    error(reply, 404, "unsupported_endpoint", "maintenance_router"); return reply;
+    reply.status = ap01PairingHttp(&bindings, mac, request.method, request.path,
+        request.token, input.c_str(), now, output.get(), 4096);
+    if (reply.status < 0) error(reply, 503, "reply_limit", "pairing");
+    else reply.bytes = output.get();
+    return reply;
 }
-void Ap01Application::maintenanceTick(uint64_t now) {
-    if(firmware){firmware->tick(now);maintenanceGate.store(firmware->blocksBusiness(),std::memory_order_release);}
+int Ap01Application::bindingPrincipal(const char *token, char out[65]) {
+    BindingGuard guard(port);
+    if (!ready || !guard) return 503;
+    const char *principal=ap01BindingPrincipal(&bindings,token);
+    if (!principal) return 401;
+    strcpy(out,principal); return 200;
 }
 void Ap01Application::dispatch(const Ap01HttpRequest &request, const char *principal,
                                uint16_t op, uint64_t now, Ap01HttpReply &reply) {
@@ -252,7 +183,7 @@ void Ap01Application::dispatch(const Ap01HttpRequest &request, const char *princ
     {
         BindingGuard guard(port);
         if (!guard) { error(reply, 503, "bindings_busy", "owner"); return; }
-        bindings.maintenance=maintenanceGate.load(std::memory_order_acquire);
+        bindings.maintenance=maintenanceActive();
         if (op == 4) {
             if (strcmp(request.deviceToken, request.token)) { error(reply, 401, "device_token", "claim"); return; }
             if (doc["force"] == true || doc["release"] == true) { error(reply, 409, "unsupported", "claim"); return; }
@@ -279,7 +210,7 @@ void Ap01Application::dispatch(const Ap01HttpRequest &request, const char *princ
 }
 Ap01HttpReply Ap01Application::businessHttp(const Ap01HttpRequest &request, uint64_t now) {
     Ap01HttpReply reply;
-    if (!ready || !online.load(std::memory_order_acquire)||maintenanceGate.load(std::memory_order_acquire)) { error(reply, 503, "business_offline", "lifecycle"); return reply; }
+    if (!ready || !online.load(std::memory_order_acquire)||maintenanceActive()) { error(reply, 503, "business_offline", "lifecycle"); return reply; }
     uint16_t op = operation(request.path);
     if (!op) { error(reply, 404, "unsupported_endpoint", "business_router"); return reply; }
     if (strcmp(request.method, "POST") || strcmp(request.contentType, FRAME_TYPE)) {
@@ -370,7 +301,7 @@ bool Ap01Application::discovery(const uint8_t *bytes, size_t length, String &rep
 }
 bool Ap01Application::pairingUi(uint64_t now, String &reply) {
     BindingGuard guard(port); if (!ready || !guard) return false;
-    bindings.maintenance=maintenanceGate.load(std::memory_order_acquire);
+    bindings.maintenance=maintenanceActive();
     // After confirmation, the UI only needs to hide the prompt. Avoid a JSON
     // document allocation while holding the shared binding lock on every tick.
     if (bindings.state != 1 && bindings.state != 2) {
@@ -384,7 +315,7 @@ bool Ap01Application::pairingDisplayed(const char *request, uint32_t revision, u
 }
 bool Ap01Application::button(bool pressed, uint64_t event, uint64_t now) {
     BindingGuard guard(port); if (!ready || !guard) return false;
-    bindings.maintenance=maintenanceGate.load(std::memory_order_acquire);
+    bindings.maintenance=maintenanceActive();
     bool pending = bindings.state == 1 || bindings.state == 2;
     if (pending) ap01PairButton(&bindings, pressed, event, now);
     return pending;

@@ -61,7 +61,7 @@ header_inputs=set()
 
 for directory in (platform,repo/'src',repo/'ports/ap01',repo/'bridge/crates/render/shim',json_header):
 
-    header_inputs.update(p for p in directory.rglob('*') if p.is_file() and p.suffix in ('.h','.hpp'))
+    header_inputs.update(p for p in directory.rglob('*') if p.is_file() and p.suffix in ('.h','.hpp','.inc'))
 
 report['input_headers']=[{'path':str(p),'sha256':hashlib.sha256(p.read_bytes()).hexdigest()} for p in sorted(header_inputs)]
 
@@ -83,7 +83,9 @@ sources += [repo/'src'/name for name in ['template_engine.cpp', 'GUI_Paint.cpp',
 
 if args.screen_host_probe:sources += [platform/'test_screen_peer_0041.cpp']
 
-sources += [platform/name for name in ['native_wifi_switch_0041.cpp','native_wifi_switch_port_0041.cpp']]
+sources += [platform/name for name in ['native_wifi_switch_0041.cpp','native_wifi_switch_port_0041.cpp',
+    'native_maintenance_0041.cpp','native_services_0041.cpp','native_http_transport_0041.cpp',
+    'native_device_code_font_0041.cpp','native_device_code_menu_0041.cpp','native_device_code_hooks_0041.cpp']]
 for source in sources:
 
     output = args.out/(source.stem+'.o')
@@ -183,6 +185,13 @@ report['budget']['firmware']={'service_bytes':firmware,'transaction_bytes':trans
     'max_persistent_record_bytes':receipt,'max_pending_plus_record_bytes':receipt*2,
 
     'native_write_scratch_stack_bytes':scratch}
+
+subprocess.run([str(tool)+'-objcopy.exe','-O','binary','--only-section=.ap01_platform_budget',
+                str(args.out/'native_services_0041.o'),str(budget_file)],check=True)
+service_state,maintenance,service_handle,wifi_switch,filesystem=struct.unpack('<5I',budget_file.read_bytes())
+report['budget']['platform_services']={'state_bytes':service_state,'maintenance_bytes':maintenance,
+    'app_handle_bytes':service_handle,'wifi_switch_bytes':wifi_switch,'filesystem_bytes':filesystem,
+    'additional_threads':0,'maintenance_stack_bytes':16384,'persistent_format_changes':False}
 
 # This is an ET_REL core, not a linked executable or a ROM. Merge objects to
 

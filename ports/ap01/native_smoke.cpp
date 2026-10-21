@@ -1,6 +1,7 @@
 // Host-only integration of the exact native application/VFS surface. Never
 // linked into a ROM. Tests the protocol and persistence, not the recovered ABI.
 #include "http.h"
+#include "test_maintenance_app_0041.h"
 #include "local_json_allocator.h"
 #include "v2_command_envelope.h"
 #include "v2_sync.h"
@@ -85,14 +86,14 @@ struct Client {
 struct MemoryStream { std::string input, output; size_t offset=0, fragment=17; };
 int streamRead(void *p, uint8_t *out, size_t n, uint64_t) { auto &s=*(MemoryStream *)p; n=std::min(n,std::min(s.fragment,s.input.size()-s.offset)); memcpy(out,s.input.data()+s.offset,n); s.offset+=n; return n; }
 int streamWrite(void *p,const uint8_t *out,size_t n,uint64_t) { auto &s=*(MemoryStream *)p; n=std::min(n,s.fragment); s.output.append((const char *)out,n); return n; }
-void http(Ap01Application &app) {
+void http(Ap01Maintenance0041 &maintenance) {
     struct Example {const char *request;unsigned status;};
     for (auto example : {
         Example{"GET /api/pairing/info HTTP/1.1\r\nHost: ap01\r\n\r\n",200},
         Example{"POST /api/pairing HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\n{",400},
         Example{"POST /api/pairing HTTP/1.1\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n{",400},
         Example{"POST /api/pairing HTTP/1.1\r\nContent-Length: 4097\r\n\r\n",413}}) {
-        MemoryStream s{example.request}; Ap01Stream io{&s,streamRead,streamWrite}; assert(ap01ServeHttp(app,true,io,1,5000));
+        MemoryStream s{example.request}; Ap01Stream io{&s,streamRead,streamWrite}; assert(ap01ServeMaintenanceHttp0041(maintenance,io,1,5000));
         assert(s.output.rfind("HTTP/1.1 "+std::to_string(example.status)+" ",0)==0);
     }
 }
@@ -102,7 +103,7 @@ void binaryHttp(Ap01Application &app) {
     MemoryStream stream;stream.fragment=8192;
     stream.input="POST /api/status HTTP/1.1\r\nContent-Length: 50\r\nContent-Type: application/vnd.codex-status.frame\r\nAuthorization: Bearer 0123456789abcdef0123456789abcdef\r\n\r\n";
     stream.input.append((const char *)raw,48);stream.input+="{}";
-    Ap01Stream io{&stream,streamRead,streamWrite};assert(ap01ServeHttp(app,false,io,10,5000));
+    Ap01Stream io{&stream,streamRead,streamWrite};assert(ap01ServeHttp(app,io,10,5000));
     assert(stream.output.rfind("HTTP/1.1 200 ",0)==0);
     size_t body=stream.output.find("\r\n\r\n");assert(body!=std::string::npos);
     CompactFrameHeader response;assert(compactFrameDecode((const uint8_t *)stream.output.data()+body+4,stream.output.size()-body-4,response,4096));
@@ -116,9 +117,9 @@ int menuCode(void *p,char out[9]) {
     if(h.codeError)return h.codeError;
     memcpy(out,h.menuCode,9); return 0;
 }
-void manualAuthTests(Ap01Application &app,Host &host) {
+void manualAuthTests(Ap01Maintenance0041 &maintenance,Host &host) {
     auto call=[&](const char *token,uint64_t now) {
-        return app.maintenanceHttp(req("GET","/api/diagnostic/status",token,{}),now);
+        return maintenance.handle(req("GET","/api/diagnostic/status",token,{}),now);
     };
     assert(call("01234567",1).status==200); // Manual access needs no Bridge binding.
     for(int failure:{-2,-5,-22,-115}) {
@@ -141,7 +142,7 @@ void manualAuthTests(Ap01Application &app,Host &host) {
             {"Authorization: Bearer 76543210\r\nAuthorization: Bearer 76543210\r\n",401},
             {"Authorization: Bearer 7654321x\r\n",401}}) {
         MemoryStream stream{std::string("GET /api/diagnostic/status HTTP/1.1\r\n")+example.first+"\r\n"};
-        Ap01Stream io{&stream,streamRead,streamWrite};assert(ap01ServeHttp(app,true,io,30020,35000));
+        Ap01Stream io{&stream,streamRead,streamWrite};assert(ap01ServeMaintenanceHttp0041(maintenance,io,30020,35000));
         assert(stream.output.rfind("HTTP/1.1 "+std::to_string(example.second)+" ",0)==0);
     }
     assert(call("76543210",30021).status==200);
@@ -149,8 +150,8 @@ void manualAuthTests(Ap01Application &app,Host &host) {
     assert(call("76543210",30022).status==401);
     assert(call("01234567",30023).status==200);
     // Menu credentials authorize maintenance, but this fixture has no Flash port.
-    assert(app.maintenanceHttp(req("GET","/api/firmware/slots","01234567",{}),30024).status==501);
-    assert(app.maintenanceHttp(req("GET","/health","01234567",{}),30024).status==200);
+    assert(maintenance.handle(req("GET","/api/firmware/slots","01234567",{}),30024).status==501);
+    assert(maintenance.handle(req("GET","/health","01234567",{}),30024).status==200);
 }
 int main(int argc,char **argv) {
     assert(argc==4); Host host;
@@ -159,26 +160,29 @@ int main(int argc,char **argv) {
     std::string recoveredContext;
     {
         Ap01Business content(fs,{&host,present},1); assert(content.begin(0));
-        Ap01ApplicationPort callbacks{&host,randomBytes,lock,unlock};callbacks.wifiProfiles={&host,wifiCurrent,wifiLoad,wifiStore,nullptr};callbacks.deviceCode=menuCode;
+        Ap01ApplicationPort callbacks{&host,randomBytes,lock,unlock};
         Ap01Application app(fs,content,callbacks,"AABBCCDDEEFF",1); assert(app.begin()); app.businessOnline(true);
-        http(app);
-        manualAuthTests(app,host);
+        Ap01MaintenancePort0041 servicePort{};servicePort.context=&host;
+        servicePort.wifiProfiles={&host,wifiCurrent,wifiLoad,wifiStore,nullptr};servicePort.deviceCode=menuCode;
+        Ap01Maintenance0041 maintenance(fs,servicePort,testMaintenanceBridge0041(app),"AABBCCDDEEFF",1);assert(maintenance.begin());
+        http(maintenance);
+        manualAuthTests(maintenance,host);
         const std::string pairing="{\"device_mac\":\"AABBCCDDEEFF\",\"bridge_id\":\"bridge-test\",\"name\":\"native-test\",\"display_code\":\"1234\",\"binding_token\":\"0123456789abcdef0123456789abcdef\",\"request_id\":\"pair-test\",\"boot_id\":1,\"pairing_revision\":0}";
-        auto reply=app.maintenanceHttp(req("POST","/api/pairing","",pairing),1); assert(reply.status==202);
+        auto reply=maintenance.handle(req("POST","/api/pairing","",pairing),1); assert(reply.status==202);
         assert(app.button(false,1,2)); // A held old release cannot approve.
         assert(app.pairingDisplayed("pair-test",0,2));
         assert(app.button(false,3,3));
-        auto result=app.maintenanceHttp(req("GET","/api/pairing/pair-test","0123456789abcdef0123456789abcdef",{}),4);
+        auto result=maintenance.handle(req("GET","/api/pairing/pair-test","0123456789abcdef0123456789abcdef",{}),4);
         assert(text(result.bytes).find("approved")==std::string::npos);
         assert(app.button(true,4,5)); assert(app.button(false,5,6));
-        assert(app.maintenanceHttp(req("GET","/api/wifi/profiles","bad",{}),7).status==401);
+        assert(maintenance.handle(req("GET","/api/wifi/profiles","bad",{}),7).status==401);
         app.businessOnline(false);
-        auto list=app.maintenanceHttp(req("GET","/api/wifi/profiles","01234567",{}),8);
+        auto list=maintenance.handle(req("GET","/api/wifi/profiles","01234567",{}),8);
         assert(list.status==200&&strstr(list.bytes.c_str(),"Home")&&!strstr(list.bytes.c_str(),"synthetic-current"));
         const std::string profiles=R"({"device_mac":"AABBCCDDEEFF","expected_revision":0,"profiles":[{"ssid":"Office","password":"synthetic-candidate"}]})";
-        auto saved=app.maintenanceHttp(req("PUT","/api/wifi/profiles","01234567",profiles),9);
+        auto saved=maintenance.handle(req("PUT","/api/wifi/profiles","01234567",profiles),9);
         assert(saved.status==200&&strstr(saved.bytes.c_str(),"Office")&&strstr(saved.bytes.c_str(),"Home")&&!strstr(saved.bytes.c_str(),"synthetic-"));
-        assert(app.maintenanceHttp(req("POST","/api/wifi/activate","01234567",{}),10).status==404);
+        assert(maintenance.handle(req("POST","/api/wifi/activate","01234567",{}),10).status==404);
         app.businessOnline(true);
         binaryHttp(app);
         Client client{app}; client.status(); client.claim();
@@ -210,7 +214,7 @@ int main(int argc,char **argv) {
         host.failPresent=false;assert(content.localActivate(content.active(),2001));content.status(status);content.displayed(status["frame_generation"]|0u);content.status(status);assert(!strcmp(status["display_state"]|"","displayed"));
         std::ofstream output(argv[3],std::ios::binary); output<<activate;
         app.businessOnline(false);
-        auto health=app.maintenanceHttp(req("GET","/health",client.token.c_str(),{}),4000); assert(health.status==200);
+        auto health=maintenance.handle(req("GET","/health",client.token.c_str(),{}),4000); assert(health.status==200);
         assert(text(health.bytes).find("\"business_online\":false")!=std::string::npos);
         assert(app.businessHttp(req("POST","/api/status",client.token.c_str(),{}),4000).status==503);
     }
