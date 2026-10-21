@@ -9,7 +9,7 @@
 
 ## 部署与工作区
 
-- AP01 `34F01557210B`/DID2232184842：**独立诊断0041已部署应用槽1**，build `8083f67405c4c7fe9122a826f9a69e7e`；原版0031救援已恢复槽0并认证启动。首次误刷槽0后已按用户要求恢复，不能沿用“救援从未写入”的说法。已从应用槽1完整读回救援槽0，6822344 B逐字节及SHA256完全匹配原版（含PEC）；槽1头尾/build/业务在线及独立文件、Flash导出均已验证。固定角色：槽0原版救援保留、槽1应用，后续应用升级先启动救援再写槽1。物理屏幕/旋钮本轮未获目视确认。恢复事务和认证证据：`../cuktech-ap01-firmware/evidence/diagnostic-0041-20261021/correct-slot-recovery.json`。
+- AP01 `34F01557210B`/DID2232184842：**配网列表后端已部署应用槽1**，build `f52b12b55b8aaa9b8d891b7f23e98097`。原版0031救援槽0未刷写；部署前后6822344 B全镜像（含PEC）SHA均与原版一致。通过原救援只上传一次槽1，列表实机保存/uniq、软重启revision1/密文保持均通过；测试项已清理至revision2。11份原网络/身份文件不变；用户确认原厂界面/旋钮正常。**新增Wi-Fi菜单只有独立SIM实现，实机未接入；原网络安全写入/切网回退未验。** [专项](project-workflow/ap01-wifi-profiles/status.md)。历史误刷及已完成的0031恢复保留原记录，不能描述为历史上从未写槽0。
 - **导航问题已修复并实机通过**：原厂Pet7→菜单6及菜单→主界面被页号递减误判为环回、重复插入应用；现仅在进入Pet的边/反向边插入全部模板。退出动画key0x13→2、0x14→1。用户本轮明确回复“页序和动画均正常”。
 - AP01保留单页v9布局/字体，验证后当前Bundle **`6a8d702a`/CRC4831c60d**，commit_seq13/source_crc3ce26768；Data23/displayed/current_template_drawn。原厂页发布不抢焦点及模板页发布自动恢复已实机通过，用户确认“自动返回，额度正常”；所有设备Profile不变。[部署与验收](project-workflow/ap01-template-integration/bundle-page-restore.md)。
 - 发现默认Bridge未监听，已按指定计划任务脚本启动既有EXE；force=false恢复既有占用并投递快照。该次启动未重建Bridge或刷Note4。
@@ -33,7 +33,9 @@
 
 ## 精确ROM
 
-- **已部署独立诊断0041／槽1**：`../cuktech-ap01-firmware/evidence/diagnostic-0041-20261021/ap01-0041-independent-diagnostic.bin`，7000056 B，SHA256 `29352943f2301cc7bcb5fac60a504803d3b3488afe11d56c5dc27c23bc6f176c`。构建自34的265项核验隔离树，只增加独立只读诊断；不含当前工作区尚未部署的屏幕宿主重构。[部署说明](../cuktech-ap01-firmware/reverse/reports/ap01/independent-diagnostic-0041-20261021.md)。
+- **已部署配网列表后端0041／槽1**：`../cuktech-ap01-firmware/evidence/wifi-profiles-20261021/ap01-0041-wifi-profiles.bin`，7006536 B，SHA256 `1ce657386b8deff11887428a30340bdaf91701981c2f82d9bd1d56aeb9df33bf`。基于已部署诊断34隔离基线，保留独立诊断，不含屏幕宿主重构；非活动槽1全镜像已实读匹配（含PEC）。[部署/边界](../cuktech-ap01-firmware/reverse/reports/ap01/wifi-profiles-0041-20261021.md)。
+
+- **独立诊断0041归档（槽1已由列表版替换）**：`../cuktech-ap01-firmware/evidence/diagnostic-0041-20261021/ap01-0041-independent-diagnostic.bin`，7000056 B，SHA256 `29352943f2301cc7bcb5fac60a504803d3b3488afe11d56c5dc27c23bc6f176c`。
 
 - **34归档（槽1已由独立诊断版替换）**：`artifacts/ap01-platform-integration/device/ap01-0041-page-restore-20261020.bin`，6995768 B，SHA256 `6ef5f3fd831e2f4faca5d50e2ea92cd620844080d33afb1873dc25a0fcfa42aa`；匹配ELF SHA256 `671adea921e1259dd87848fa901dd830489d19e6038b95512466ec794bf90426`。匹配发布包/上传完成及认证运行已验，未声称全Flash实读SHA。
 
