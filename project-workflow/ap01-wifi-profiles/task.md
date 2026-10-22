@@ -8,9 +8,9 @@
 - [x] Package candidate and verify native QEMU list API, restart persistence and offline NOR preservation.
 - [x] Deploy only application1 and verify physical list save/uniq/restart persistence; clean test candidates.
 - [x] Verify full rescue0 before/after image including PEC matches unchanged original.
-- [ ] Integrate menu/events into original0041 ROM; separate SIM GUI is not acceptance.
+- [x] Integrate menu/events into original0041 ROM; separate SIM GUI is not acceptance.
 - [ ] Verify safe original network-field writes, actual RF switching, failure recovery and cloud binding.
 
-- [ ] Add native Settings Wi-Fi entry, saved/current list, stock checkmarks and full wrap/return navigation on deployed06 baseline.
-- [ ] Implement network-only worker, confirmed success/failure rollback/restart recovery and OTA exclusion.
-- [ ] Build exact candidate and validate host/native menu/network recovery; present preview without device writes.
+- [x] Add native Settings Wi-Fi entry, saved/current list and stock checkmarks on the current shared Runtime/firmware boundary.
+- [x] Implement network-only worker, confirmed success/failure rollback/restart recovery and OTA exclusion.
+- [x] Build exact candidate and validate host/native menu/network recovery plus same-NOR restart; inspect original framebuffer previews without device writes.

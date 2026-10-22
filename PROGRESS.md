@@ -9,11 +9,11 @@
 
 ## 部署与工作区
 
-- **2026-10-22 AP01源码边界已调整并纳入本轮提交，未部署**：OTA/切槽/维护鉴权与HTTP策略、系统菜单及切网执行归固件仓库；本仓库保留Bridge通信App/模板和平台回调连接；配套固件提交`41541a2`。宿主App/维护及无App独立OTA/回执/切槽、切网核心ASan、RV32审计/链接、原生App/维护烟测通过；Wi-Fi菜单仍为C9待办，未新增实机验收。[交接/资源/证据](project-workflow/ap01-firmware-boundary/status.md)。
+- **2026-10-22 AP01源码边界已调整并纳入本轮提交，未部署**：OTA/切槽/维护鉴权与HTTP策略、系统菜单及切网执行归固件仓库；本仓库保留Bridge通信App/模板和平台回调连接；配套固件提交`41541a2`。宿主App/维护及无App独立OTA/回执/切槽、切网核心ASan、RV32审计/链接、原生App/维护烟测通过；Wi-Fi菜单后续已完成离线验收（见下），未新增实机验收。用户已确认保留切网暂停App、App绑定初始化失败仍启维护、维护启动失败阻止App三项行为；四场景像素一致，本次仅更新核查记录、不刷机。[交接/资源/证据](project-workflow/ap01-firmware-boundary/status.md)。
 
 - **应用OTA/切槽八位码06已部署槽1并实机通过**：build`5757fdd677800d1412d8795c1cb2dbe0`，经原0031救援0单次上传应用1；菜单码/原Bridge密钥维护兼容，缺失/错码401、原业务C2正常、Wi-Fi列表未变。八位码实际切槽/重启→救援0→独立入口回06通过，无二次上传；设备码跨重启保持，用户确认界面正常。救援0未写，完整非活动6822344B（含PEC）SHA与保留档一致。零绑定完整OTA为原生模拟证据，物理保留既有绑定；掉电/栈高水位未验。[实机证据](artifacts/ap01-menu-ota06-rollout-20261022/physical-validation.json)。实现及验证脚本已纳入本轮提交；配套固件仓库`57f18aa`。
 - 设备码菜单/手动鉴权05已由06替换；原物理菜单、生成后旧码失效及字体/选择行为验收保留。[05归档](artifacts/ap01-device-code-auth-20261021/physical-validation.json)。
-- AP01 `34F01557210B`/DID2232184842：**配网列表后端验收归档**，原build`f52b12`已由上述05替换，后端保留。该次救援0前后6822344B（含PEC）SHA均匹配原版；列表保存/uniq、软重启revision1/密文保持通过，清理至revision2；11份原网络/身份文件不变，用户确认原厂界面/旋钮正常。**Wi-Fi菜单只有独立SIM实现，实机未接入；原网络安全写入/切网回退未验。** [专项](project-workflow/ap01-wifi-profiles/status.md)。历史误刷及0031恢复记录保留。
+- AP01 `34F01557210B`/DID2232184842：**配网列表后端验收归档**，原build`f52b12`已由上述05替换，后端保留。该次救援0前后6822344B（含PEC）SHA均匹配原版；列表保存/uniq、软重启revision1/密文保持通过，清理至revision2；11份原网络/身份文件不变，用户确认原厂界面/旋钮正常。**该次物理验收仅列表后端；后续原生菜单/切网已完成离线验证，实机切网仍未验。** [专项](project-workflow/ap01-wifi-profiles/status.md)。历史误刷及0031恢复记录保留。
 - **导航问题已修复并实机通过**：原厂Pet7→菜单6及菜单→主界面被页号递减误判为环回、重复插入应用；现仅在进入Pet的边/反向边插入全部模板。退出动画key0x13→2、0x14→1。用户本轮明确回复“页序和动画均正常”。
 - AP01保留单页v9布局/字体，验证后当前Bundle **`6a8d702a`/CRC4831c60d**，commit_seq13/source_crc3ce26768；Data23/displayed/current_template_drawn。原厂页发布不抢焦点及模板页发布自动恢复已实机通过，用户确认“自动返回，额度正常”；所有设备Profile不变。[部署与验收](project-workflow/ap01-template-integration/bundle-page-restore.md)。
 - 发现默认Bridge未监听，已按指定计划任务脚本启动既有EXE；force=false恢复既有占用并投递快照。该次启动未重建Bridge或刷Note4。
@@ -26,7 +26,7 @@
 
 ## 下一步与验收边界
 
-- **AP01 Wi-Fi选择菜单已按用户要求转待办（C9）**：现有原生菜单/异步切网/恢复代码作为阶段性实现保存；宿主核心ASan/UBSan通过，原生模拟12后段导航断言失败，尚未完成菜单、切网和预览验收。候选12未部署，设备仍应用06／救援0，Bridge未变。[续接状态](project-workflow/ap01-wifi-profiles/status.md)。
+- **AP01 Wi-Fi菜单/切网离线完成（C9，未部署）**：REA合约直接落实固件模块；修复原厂布局枚举推断和退出设置定时器地址，统一SSID字体/长名裁剪。原生04导航/返回/重建、合成RF切网成功/重复点击/失败回退，原生07同NOR重启保持列表/当前勾号/设备码/身份；生产适配层ASan故障/掉电恢复、App/维护回归及精确ROM重建通过。候选03为7043512B，SHA256`da2143188172abce693f6ca5b6718e97c0628000772071ddddf65ccd8e472731`；ELF`29c53fb041f9a3ce07e64a14d95496a9ae1e2b1bb6bfffce2d53435300dcf3d6`。文件`artifacts/ap01-wifi-completion-20261022/ap01-wifi-complete-candidate03.bin`；[证据/资源/物理边界](project-workflow/ap01-wifi-profiles/status.md)。未访问设备或Bridge，应用06/救援0不变；RF/LCD/物理掉电与调用链高水位仍开放。
 
 - A9软件/Mac部署已修；本轮Data是启动重确认，真实新余量变化通知/屏幕时延、Windows部署未验。B6/C8合盖苏醒、长期RF/目视仍未验，BOOT旧网回退未改。上游跨会话通知未到达原因仍未知，现有60秒采集兜底。[原调查](project-workflow/bridge-macos/wifi-usage-latency-20261020.md)。
 - **A9 Plan同轮激活/图标实机已验**：用户已允许定位/蓝牙，14:20:08原Plan5904 BLE ACK明确network_activation=plan；3.304秒后同Plan ready报告，随后同MAC认证HTTP确认Wi-Fi连接、BLE关闭、Plan5904/剩余量递减，14:20:32本轮complete。14:21 Data876 ACK applied/displayed；用户确认Wi-Fi图标已显示。周期同值Sleep软件对照通过，自然余量变化完整时延未验。旧ROM维护兼容保留；[实机证据](artifacts/bridge-macos/plan-activation-physical-proof.json)。

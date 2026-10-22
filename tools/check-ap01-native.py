@@ -192,6 +192,18 @@ service_state,maintenance,service_handle,wifi_switch,filesystem=struct.unpack('<
 report['budget']['platform_services']={'state_bytes':service_state,'maintenance_bytes':maintenance,
     'app_handle_bytes':service_handle,'wifi_switch_bytes':wifi_switch,'filesystem_bytes':filesystem,
     'additional_threads':0,'maintenance_stack_bytes':16384,'persistent_format_changes':False}
+subprocess.run([str(tool)+'-objcopy.exe','-O','binary','--only-section=.ap01_menu_budget',
+                str(args.out/'native_device_code_menu_0041.o'),str(budget_file)],check=True)
+menu_context,ssid_row,list_snapshot,max_rows=struct.unpack('<4I',budget_file.read_bytes())
+subprocess.run([str(tool)+'-objcopy.exe','-O','binary','--only-section=.ap01_wifi_switch_budget',
+                str(args.out/'native_wifi_switch_0041.o'),str(budget_file)],check=True)
+switch_owner,switch_attempt=struct.unpack('<2I',budget_file.read_bytes())
+report['budget']['wifi_menu']={'context_bytes':menu_context,'ssid_row_bytes':ssid_row,
+    'rows_empty_single_typical_max_bytes':[0,ssid_row,3*ssid_row,max_rows*ssid_row],
+    'temporary_list_snapshot_bytes':list_snapshot,'switch_owner_bytes':switch_owner,
+    'switch_attempt_bytes':switch_attempt,'max_rollback_plain_bytes':106,
+    'max_encrypted_journal_bytes':112,'max_pending_plus_journal_bytes':224,
+    'added_threads':0,'limits':'allocator/widget/font-cache overhead and original ROM call-chain stack require separate accounting'}
 
 # This is an ET_REL core, not a linked executable or a ROM. Merge objects to
 
