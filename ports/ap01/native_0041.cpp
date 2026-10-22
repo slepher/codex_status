@@ -136,13 +136,27 @@ struct Runtime {
     }
     static int prepare(void *p,ap01_screen_slot *slot,uint32_t token) {
         auto &r=*(Runtime *)p;
-        if(r.pageIndex(slot)<0||r.replacing)return AP01_ENTER_FAILED;
+        int index=r.pageIndex(slot);
+        if(index<0||r.replacing)return AP01_ENTER_FAILED;
+        auto &surface=r.pages[index].surface;
+        // The current front buffer is already rendered. Re-enter it without
+        // blocking on the business executor or rendering the same data again.
+        if(index==r.lastFrameIndex&&surface.image&&surface.bytes&&surface.generation==r.shownGeneration&&
+           r.business.canReuseFrame(surface.generation)&&r.rollbackIndex<0&&
+           !r.pending.load(std::memory_order_acquire)&&!r.activation.load(std::memory_order_acquire))
+            return AP01_ENTER_READY;
         r.prepareToken=token;r.prepareSlot=slot;r.rollbackIndex=-1;
         r.uiToken.store(token,std::memory_order_release);
         if(r.requestActivation(slot->order,token))return AP01_ENTER_PENDING;
         r.uiToken.store(0,std::memory_order_release);r.prepareSlot=nullptr;return AP01_ENTER_FAILED;
     }
     static void leave(void *p,ap01_screen_slot *s) {
+        auto &r=*(Runtime *)p;int i=r.pageIndex(s);
+        // Retain only the latest front buffer while visiting stock pages.
+        // Switching to another app template still releases the outgoing one.
+        if(i>=0&&i!=r.lastFrameIndex)ap01_lvgl_0041.i4_retire(&r.pages[i].surface);
+    }
+    static void unbind(void *p,ap01_screen_slot *s) {
         auto &r=*(Runtime *)p;int i=r.pageIndex(s);
         if(i>=0)ap01_lvgl_0041.i4_retire(&r.pages[i].surface);
     }
@@ -255,7 +269,7 @@ void Runtime::processFrames() {
         if(changed) {
             ap01_screen_desc descriptions[8]{};
             for(unsigned i=0;i<frame->count;++i)
-                descriptions[i]={AP01_SCREEN_ABI_0041,sizeof(ap01_screen_desc),frame->ids[i],this,prepare,nullptr,leave,leave,nullptr,1};
+                descriptions[i]={AP01_SCREEN_ABI_0041,sizeof(ap01_screen_desc),frame->ids[i],this,prepare,nullptr,leave,unbind,nullptr,1};
             int result=ap01_host_api.replace_screen_set(&apps[0],apps[0].revision,descriptions,frame->count);
             if(result==AP01_HOST_BUSY)defer();
             else if(result!=AP01_HOST_OK){business.displayFailed(frame->generation);delete[] frame->pixels;delete frame;return;}

@@ -210,8 +210,8 @@ int main(int argc,char **argv) {
         std::string activate="{"+client.command("activate-test")+",\"template_id\":\""+second+"\",\"expected_active_context_id\":\""+content.context()+"\"}";
         host.lostRename=true;
         auto switched=client.send(13,"/api/activate",activate); assert(switched.status==200); assert(content.active()==1);
-        host.failPresent=true;assert(!content.localActivate(content.active(),2000));content.status(status);assert(!strcmp(status["display_state"]|"","failed"));
-        host.failPresent=false;assert(content.localActivate(content.active(),2001));content.status(status);content.displayed(status["frame_generation"]|0u);content.status(status);assert(!strcmp(status["display_state"]|"","displayed"));
+        host.failPresent=true;assert(!content.localActivate(content.active(),2000));content.status(status);assert(!strcmp(status["display_state"]|"","failed"));assert(!content.canReuseFrame(status["frame_generation"]|0u));assert(!content.canReuseFrame(0));
+        host.failPresent=false;assert(content.localActivate(content.active(),2001));content.status(status);content.displayed(status["frame_generation"]|0u);content.status(status);assert(!strcmp(status["display_state"]|"","displayed"));assert(content.canReuseFrame(status["frame_generation"]|0u));
         std::ofstream output(argv[3],std::ios::binary); output<<activate;
         app.businessOnline(false);
         auto health=maintenance.handle(req("GET","/health",client.token.c_str(),{}),4000); assert(health.status==200);
@@ -273,7 +273,7 @@ int main(int argc,char **argv) {
         assert(status["display_state"]=="displayed"&&status["display_reason"]=="current_template_drawn");
         host.failPresent=true;
         reply=client.publish(variant(2,false,"pages2"),"replacefail");assert(reply.status==409);
-        host.failPresent=false;content.status(status);assert(status["display_state"]=="failed");
+        host.failPresent=false;content.status(status);assert(status["display_state"]=="failed");assert(!content.canReuseFrame(generation));
         fprintf(stdout,"Bundle page identity: 8-page reorder, all-page activation, removed-page initial fallback, 1-page replacement, stale draw receipt and render failure passed\n");
     }
     fprintf(stdout,"native application: physical confirmation, full Bundle chunks/commit replay, durable activation/lost rename ACK, restart, independent maintenance, discovery and HTTP parsing passed\n");
