@@ -70,6 +70,14 @@ pub(crate) fn recover_ble(pending: &mut Option<BleRecovery>, failure: Option<&st
     }
 }
 
+/// All critical children are owned here. Any exit reaches the existing process
+/// supervisor; dropping the set also cancels siblings, including on parent abort.
+pub(crate) async fn wait_services(mut services: tokio::task::JoinSet<()>) {
+    if let Some(Err(_)) = services.join_next().await {
+        tracing::error!("Critical background service failed");
+    }
+}
+
 /// Supervision never waits on the BLE worker or its delivery permits.
 async fn monitor_services<F: std::future::Future<Output=()>+Send+'static>(
     services:F, native_failed:impl Fn()->bool,
@@ -354,5 +362,34 @@ mod tests {
         assert!(!text.contains("abnormal"));
         assert!(text.contains("exited normally"));
         fs::remove_file(marker).unwrap(); fs::remove_file(log).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod service_group_tests {
+    use super::*;
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    struct Dropped(Arc<AtomicBool>);
+    impl Drop for Dropped { fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); } }
+    #[tokio::test]
+    async fn child_exit_or_panic_finishes_group_and_cancels_siblings() {
+        for panic in [false, true] {
+            let dropped=Arc::new(AtomicBool::new(false));
+            let guard=Dropped(dropped.clone());
+            let mut tasks=tokio::task::JoinSet::new();
+            tasks.spawn(async move { let _guard=guard; std::future::pending::<()>().await; });
+            tasks.spawn(async move { assert!(!panic,"injected child failure"); });
+            tokio::time::timeout(std::time::Duration::from_secs(1),wait_services(tasks)).await.unwrap();
+            tokio::task::yield_now().await;
+            assert!(dropped.load(Ordering::SeqCst));
+        }
+    }
+    #[tokio::test]
+    async fn parent_cancellation_aborts_children() {
+        let dropped=Arc::new(AtomicBool::new(false));let guard=Dropped(dropped.clone());
+        let mut tasks=tokio::task::JoinSet::new();
+        tasks.spawn(async move { let _guard=guard; std::future::pending::<()>().await; });
+        let parent=tokio::spawn(wait_services(tasks));parent.abort();let _=parent.await;
+        tokio::task::yield_now().await;assert!(dropped.load(Ordering::SeqCst));
     }
 }

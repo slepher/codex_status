@@ -1,9 +1,35 @@
 """Compatibility entry for firmware-owned AP01 ROM packaging.
-Application build/test orchestration may import assemble/validate_candidate.
-All ROM layout, menu patching and OTA/recovery image policy live in firmware.
+
+The App supplies build paths; the firmware packager owns image policy.
 """
 from pathlib import Path
-import runpy
-_builder=Path(__file__).resolve().parents[1].parent/'cuktech-ap01-firmware/tooling/scripts/build-native-app-rom-0041.py'
-globals().update({k:v for k,v in runpy.run_path(str(_builder)).items() if not k.startswith('__')})
-if __name__ == '__main__':main()
+from importlib.util import module_from_spec, spec_from_file_location
+import os
+import shutil
+import sys
+
+repo = Path(__file__).resolve().parents[1]
+spec = spec_from_file_location('ap01_rom_packager', repo.parent / 'cuktech-ap01-firmware/tooling/scripts/build-native-app-rom-0041.py')
+_builder = module_from_spec(spec)
+spec.loader.exec_module(_builder)
+# Existing acceptance/QEMU callers import only this small, explicit surface.
+assemble = _builder.assemble
+validate_candidate = _builder.validate_candidate
+sha = _builder.sha
+FORMAT = _builder.FORMAT
+ORIGINAL_SHA = _builder.ORIGINAL_SHA
+main = _builder.main
+
+if __name__ == '__main__':
+    if not any(x == '--source-dir' or x.startswith('--source-dir=') for x in sys.argv):
+        sys.argv += ['--source-dir', str(repo / 'artifacts/ap01-platform-integration/device')]
+    if not any(x == '--tool-prefix' or x.startswith('--tool-prefix=') for x in sys.argv) and not any(x in sys.argv for x in ('-h', '--help')):
+        nm = shutil.which('riscv32-esp-elf-nm')
+        if nm:
+            prefix = nm[:-2]
+        elif os.environ.get('USERPROFILE'):
+            prefix = str(Path(os.environ['USERPROFILE']) / '.platformio/packages/toolchain-riscv32-esp/bin/riscv32-esp-elf-')
+        else:
+            raise SystemExit('Supply --tool-prefix /path/to/riscv32-esp-elf-')
+        sys.argv += ['--tool-prefix', prefix]
+    main()

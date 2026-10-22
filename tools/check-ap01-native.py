@@ -24,14 +24,19 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--out', type=Path, default=repo/'artifacts/ap01-platform-integration/device')
 
 parser.add_argument('--screen-host-probe',action='store_true')
+parser.add_argument('--tool-prefix', help='Cross compiler prefix, e.g. /opt/bin/riscv32-esp-elf-')
+parser.add_argument('--json-header', type=Path, help='ArduinoJson src directory')
 
 args = parser.parse_args()
 
 assert args.out.is_dir(), 'Precreate the output directory with elevation'
 
-tool = Path(os.environ['USERPROFILE'])/'.platformio/packages/toolchain-riscv32-esp/bin/riscv32-esp-elf'
+tool = args.tool_prefix or str(Path(os.environ['USERPROFILE'])/'.platformio/packages/toolchain-riscv32-esp/bin/riscv32-esp-elf-')
+def executable(name):
+    path = tool + name
+    return path + '.exe' if Path(path + '.exe').is_file() else path
 
-json_header = repo/'.pio/libdeps/esp32-s3-epaper-154g/ArduinoJson/src'
+json_header = args.json_header or repo/'.pio/libdeps/esp32-s3-epaper-154g/ArduinoJson/src'
 
 assert json_header.joinpath('ArduinoJson.h').is_file()
 
@@ -51,7 +56,7 @@ report = {'scope':'owned binding/render/Bundle/HTTP and recovered 0041 UI/VFS ru
 
           'firmware_target':'cuktech-ap01-0041', 'flashable':False, 'hardware_verified':False,
 
-          'compiler':subprocess.check_output([str(tool)+'-g++.exe','--version'],text=True).splitlines()[0],
+          'compiler':subprocess.check_output([executable('g++'),'--version'],text=True).splitlines()[0],
 
           'flags':flags, 'objects':[]}
 
@@ -102,13 +107,13 @@ for source in sources:
 
                          '-I'+str(repo/'ports/ap01'), '-I'+str(repo/'bridge/crates/render/shim')]
 
-    compiler='-gcc.exe' if source.suffix=='.c' else '-g++.exe'
+    compiler='gcc' if source.suffix=='.c' else 'g++'
 
     if source.suffix=='.c':source_flags=[f.replace('gnu++17','gnu11').replace('c++17','c11') for f in source_flags if f not in ('-fno-exceptions','-fno-rtti')]
 
-    subprocess.run([str(tool)+compiler,*source_flags,'-c',str(source),'-o',str(output)],check=True)
+    subprocess.run([executable(compiler),*source_flags,'-c',str(source),'-o',str(output)],check=True)
 
-    sizes = subprocess.check_output([str(tool)+'-size.exe','-A',str(output)],text=True)
+    sizes = subprocess.check_output([executable('size'),'-A',str(output)],text=True)
 
     sections = []
 
@@ -126,7 +131,7 @@ for source in sources:
 
             assert not size or not name.startswith(forbidden), 'XIP writable state or implicit initializer: '+name
 
-    imports = subprocess.check_output([str(tool)+'-nm.exe','-u',str(output)],text=True).splitlines()
+    imports = subprocess.check_output([executable('nm'),'-u',str(output)],text=True).splitlines()
 
     stack = output.with_suffix('.su').read_text(encoding='utf-8').splitlines()
 
@@ -140,7 +145,7 @@ for source in sources:
 
 budget_file=args.out/'abi-budget.bin'
 
-subprocess.run([str(tool)+'-objcopy.exe','-O','binary','--only-section=.ap01_budget',
+subprocess.run([executable('objcopy'),'-O','binary','--only-section=.ap01_budget',
 
                 str(args.out/'abi_budget.o'),str(budget_file)],check=True)
 
@@ -162,7 +167,7 @@ report['budget']={'state_heap_bytes':state,'record_heap_bytes':record,'bindings_
 
                   'limitations':'allocator overhead, JSON/UI/Bundle allocations and native calling chains require separate audit'}
 
-subprocess.run([str(tool)+'-objcopy.exe','-O','binary','--only-section=.ap01_render_budget',
+subprocess.run([executable('objcopy'),'-O','binary','--only-section=.ap01_render_budget',
 
                 str(args.out/'abi_budget.o'),str(budget_file)],check=True)
 
@@ -172,7 +177,7 @@ report['budget'].update({'paint_state_bytes':paint,'renderer_state_bytes':render
 
                         'compiled_template_bytes':compiled})
 
-subprocess.run([str(tool)+'-objcopy.exe','-O','binary','--only-section=.ap01_firmware_budget',
+subprocess.run([executable('objcopy'),'-O','binary','--only-section=.ap01_firmware_budget',
 
                 str(args.out/'native_firmware_0041.o'),str(budget_file)],check=True)
 
@@ -186,16 +191,16 @@ report['budget']['firmware']={'service_bytes':firmware,'transaction_bytes':trans
 
     'native_write_scratch_stack_bytes':scratch}
 
-subprocess.run([str(tool)+'-objcopy.exe','-O','binary','--only-section=.ap01_platform_budget',
+subprocess.run([executable('objcopy'),'-O','binary','--only-section=.ap01_platform_budget',
                 str(args.out/'native_services_0041.o'),str(budget_file)],check=True)
 service_state,maintenance,service_handle,wifi_switch,filesystem=struct.unpack('<5I',budget_file.read_bytes())
 report['budget']['platform_services']={'state_bytes':service_state,'maintenance_bytes':maintenance,
     'app_handle_bytes':service_handle,'wifi_switch_bytes':wifi_switch,'filesystem_bytes':filesystem,
     'additional_threads':0,'maintenance_stack_bytes':16384,'persistent_format_changes':False}
-subprocess.run([str(tool)+'-objcopy.exe','-O','binary','--only-section=.ap01_menu_budget',
+subprocess.run([executable('objcopy'),'-O','binary','--only-section=.ap01_menu_budget',
                 str(args.out/'native_device_code_menu_0041.o'),str(budget_file)],check=True)
 menu_context,ssid_row,list_snapshot,max_rows=struct.unpack('<4I',budget_file.read_bytes())
-subprocess.run([str(tool)+'-objcopy.exe','-O','binary','--only-section=.ap01_wifi_switch_budget',
+subprocess.run([executable('objcopy'),'-O','binary','--only-section=.ap01_wifi_switch_budget',
                 str(args.out/'native_wifi_switch_0041.o'),str(budget_file)],check=True)
 switch_owner,switch_attempt=struct.unpack('<2I',budget_file.read_bytes())
 report['budget']['wifi_menu']={'context_bytes':menu_context,'ssid_row_bytes':ssid_row,
@@ -211,7 +216,7 @@ report['budget']['wifi_menu']={'context_bytes':menu_context,'ssid_row_bytes':ssi
 
 partial = args.out/'ap01-shared-core.o'
 
-subprocess.run([str(tool)+'-ld.exe','-r',*[str(args.out/(s.stem+'.o')) for s in sources],
+subprocess.run([executable('ld'),'-r',*[str(args.out/(s.stem+'.o')) for s in sources],
 
                 '-o',str(partial)],check=True)
 
@@ -219,7 +224,7 @@ report['combined'] = {'path':str(partial),'sha256':hashlib.sha256(partial.read_b
 
                       'bytes':partial.stat().st_size,
 
-                      'undefined_imports':subprocess.check_output([str(tool)+'-nm.exe','-u',str(partial)],text=True).splitlines()}
+                      'undefined_imports':subprocess.check_output([executable('nm'),'-u',str(partial)],text=True).splitlines()}
 
 report['passed'] = True
 

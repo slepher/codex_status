@@ -86,7 +86,7 @@ assert len(independent_objects)==len(independent_names)
 subprocess.run(cmd+[linux(p) for p in independent_objects]+[linux(independent_object),'-o',linux(independent_binary)],check=True)
 symbols=subprocess.check_output(['wsl','-d','Ubuntu-24.04','--','nm','-C',linux(independent_binary)],text=True)
 assert 'Ap01Application' not in symbols and 'Ap01Business' not in symbols
-create="import tempfile,pathlib; p=pathlib.Path(tempfile.mkdtemp(prefix='ap01-independent-')); (p/'f21').mkdir(); print(p)"
+create="import tempfile,pathlib; p=pathlib.Path(tempfile.mkdtemp(prefix='ap01-independent-')); (p/'f21').mkdir(); [(p/('maintenance-'+str(i))).mkdir() for i in range(6)]; print(p)"
 independent_state=subprocess.check_output(['wsl','-d','Ubuntu-24.04','--','python3','-c',create],text=True).strip()
 independent_result=subprocess.run(['wsl','-d','Ubuntu-24.04','--',linux(independent_binary),independent_state,linux(args.image)],capture_output=True,text=True,timeout=180)
 (out/'native-maintenance-independent.log').write_text(independent_result.stdout+independent_result.stderr,encoding='utf-8')
@@ -94,6 +94,17 @@ assert not independent_result.returncode,independent_result.stderr
 (out/'native-maintenance-independent.json').write_text(json.dumps({'passed':True,'application_linked':False,
     'binary_sha256':hashlib.sha256(independent_binary.read_bytes()).hexdigest(),
     'checks':independent_result.stdout.strip(),'physical_verified':False},indent=2),encoding='utf-8')
+# Current review regressions use the same production objects and private disk.
+for name, extra, argv in (
+    ('test_native_maintenance_recovery_0041', independent_objects, [independent_state]),
+    ('test_native_menu_order_0041', [], []),
+):
+    target=out/name
+    subprocess.run(cmd+[linux(platform/(name+'.cpp'))]+[linux(p) for p in extra]+['-o',linux(target)],check=True)
+    checked=subprocess.run(['wsl','-d','Ubuntu-24.04','--','env','UBSAN_OPTIONS=halt_on_error=1',linux(target)]+argv,
+                           capture_output=True,text=True,timeout=180)
+    (out/(name+'.log')).write_text(checked.stdout+checked.stderr,encoding='utf-8')
+    assert not checked.returncode,checked.stdout+checked.stderr
 (out/'native-firmware-host-report.json').write_text(json.dumps({'passed':True,
     'scope':'host ASan/UBSan exact native firmware service; fake flash callbacks, no ROM ABI proof',
     'image_sha256':hashlib.sha256(args.image.read_bytes()).hexdigest(),

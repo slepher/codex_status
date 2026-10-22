@@ -272,10 +272,14 @@ class NativeRSP(OriginalRSP):
                         elif action.get('wall_time'):
                             changes={1:timer_va,2:temporary,10:0,32:int(manifest['native_abi']['wall_time'],16)}
                         elif action.get('native_page') is not None:
+                            self.ui_state()
+                            assert native_ui_root, 'native page requested before UI root exists'
                             changes={1:timer_va,2:temporary,10:native_ui_root,11:action['native_page'],12:action.get('direction',1),32:0xa00b3106}
                         elif 'framebuffer_ready' in action:
                             changes={1:timer_va,2:temporary,10:action['framebuffer_ready'],11:0,12:2,32:0xa00806d0}
                         else:
+                            self.ui_state()
+                            assert native_ui_root, 'native input requested before UI root exists'
                             changes={1:timer_va,2:temporary,10:native_ui_root,11:action['event'],12:param if action['event']==0x11 else 0,32:send_event_va}
                         updated=list(regs)
                         for register,value in changes.items():

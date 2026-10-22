@@ -3415,8 +3415,13 @@ async fn platform_sync_loop(ctx: Arc<AppCtx>, snapshot_ready: Arc<Notify>) {
     // One coalescing mailbox per device: slow HTTP cannot hold up source
     // ingestion, another MAC, or create an unbounded queue of delivery tasks.
     let mut workers = HashMap::<String, tokio::sync::watch::Sender<u64>>::new();
+    let mut deliveries = tokio::task::JoinSet::new();
     loop {
         let maintenance = tokio::select! {
+            result = deliveries.join_next(), if !deliveries.is_empty() => {
+                if result.is_some_and(|r| r.is_err()) { return; }
+                continue; // Removed devices close their mailbox normally.
+            }
             _ = timer.tick() => { tick += 1; true },
             _ = snapshot_ready.notified() => false,
         };
@@ -3442,7 +3447,7 @@ async fn platform_sync_loop(ctx: Arc<AppCtx>, snapshot_ready: Arc<Notify>) {
             let (sender, mut work) = tokio::sync::watch::channel(tick);
             workers.insert(mac.clone(), sender);
             let ctx = ctx.clone();
-            tokio::spawn(async move {
+            deliveries.spawn(async move {
                 let mut last_tick = None;
                 let mut last_delivery_tick = tick;
                 let mut attempted_activation = None;
@@ -3479,6 +3484,7 @@ async fn platform_sync_loop(ctx: Arc<AppCtx>, snapshot_ready: Arc<Notify>) {
 }
 
 async fn run_services(ctx: Arc<AppCtx>) {
+    let mut services = tokio::task::JoinSet::new();
     // A missing codex.exe must not block HTTP/MCP/BLE: the poller re-discovers
     // the CLI itself (Codex auto-upgrades move the binary).
     let exe = match locate_codex(ctx.config.codex_path.as_deref()) {
@@ -3500,7 +3506,7 @@ async fn run_services(ctx: Arc<AppCtx>) {
         .expect("addr");
     {
         let ctx = ctx.clone();
-        tokio::spawn(async move {
+        services.spawn(async move {
             if let Err(e) = serve_with_router(addr, axum::Router::new()
                 .route("/api/device/presence",axum::routing::post(presence_hint))
                 .route("/api/device/session",axum::routing::post(report_session))
@@ -3515,6 +3521,7 @@ async fn run_services(ctx: Arc<AppCtx>) {
     }
 
     if std::env::var("CODEX_STATUS_SIM_COOPERATIVE").as_deref() == Ok("1") {
+        watchdog::wait_services(services).await;
         return;
     }
 
@@ -3531,19 +3538,25 @@ async fn run_services(ctx: Arc<AppCtx>) {
         activity: ctx.activity.clone(),
         snapshot_ready: Some(snapshot_ready.clone()),
     };
-    tokio::spawn(run_poller(poller, ctx.envelope.clone()));
+    let envelope = ctx.envelope.clone();
+    services.spawn(async move { let _ = run_poller(poller, envelope).await; });
 
     let udp_ctx = ctx.clone();
-    tokio::spawn(async move { udp_listen(udp_ctx).await });
+    services.spawn(async move { udp_listen(udp_ctx).await });
     let cache_ctx = ctx.clone();
-    tokio::spawn(async move { device_cache_loop(cache_ctx).await });
+    services.spawn(async move { device_cache_loop(cache_ctx).await });
     if std::env::var("CODEX_STATUS_PLATFORM_STATUS_POLL").as_deref() != Ok("0") {
         let status_ctx = ctx.clone();
-        tokio::spawn(async move { device_status_poll_loop(status_ctx).await });
+        services.spawn(async move { device_status_poll_loop(status_ctx).await });
     }
 
-    tokio::spawn(platform_sync_loop(ctx.clone(), snapshot_ready));
+    services.spawn(platform_sync_loop(ctx.clone(), snapshot_ready));
 
+    services.spawn(run_ble_services(ctx));
+    watchdog::wait_services(services).await;
+}
+
+async fn run_ble_services(ctx: Arc<AppCtx>) {
     // Only registered MACs enter the current rendezvous protocol. UDP hints
     // do not authorize writes; an unknown advertisement never triggers a fallback
     // endpoint write or implicit registration.
