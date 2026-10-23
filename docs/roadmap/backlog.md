@@ -469,6 +469,8 @@
 
 ### C8. 设备同步与诊断协议（device-sync-diagnostics）
 
+- **2026-10-23 新设备默认数据投递已部署**：首次登记默认开启，已有关闭设置及重注册/重启持久值保留；AP01回执返回真实同步设置。338测试通过/5忽略，Mac Bridge重建/重启，AP01 seq8/Note4 seq1011设备ACK已应用显示；不关闭C8其他验收。[记录](../../project-workflow/default-data-sync/status.md)
+
 - 2026-10-19 R1–R5源码/软件验收完成，C2四端改动及删除清单见B6本日收敛条目；Windows/Note4随后已部署C2，1.54/AP01未部署；不将单次上线或短时观察记作长期RF验收。
 
 - **2026-10-16隔夜断连/自动恢复修复已部署，授权后自然恢复通过**：昨晚服务发现未完成与11:40系统加密失败719都经4s超时进入隔离，休眠不是必要触发。11:58部署supervisor退避重建、持久化UI/MCP错误提示及发现失败回执，保留未知隔离；App107/BLE28/回放3/Node/WK68和supervisor红→绿通过。两项权限allowed后14:03自然wake2104完成Plan4050/认证HTTP/sync，独立认证MAC/.104/Bridge可达；正式Sleep4051后14:05自然wake2106再次会合。9旧Wi-Fi作业哈希不变，无BOOT/刷机/手动重启。真实隔离后自动child重建尚未现场触发，最初原生失败深层原因与长期矩阵仍开放。[证据/部署/边界](../../project-workflow/bridge-macos/sleep-resume-disconnect-20261016.md)。

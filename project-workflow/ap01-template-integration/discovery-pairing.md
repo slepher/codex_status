@@ -6,7 +6,7 @@
 
 沿用 `binding_method=screen_confirm_v1`：米家先完成Wi-Fi配网；Bridge点击绑定，双方显示Bridge固定四位数字与身份提示，用户在AP01按旋钮确认。最多一个待确认请求、120秒截止；原设计中的owner/维护闸门、候选token、原事务查询与持久提交规则不变。不增加输入数字步骤，不要求预先在设备设置打开窗口。
 
-数字是人眼核对提示而非密码，首次采用原定局域网HTTP/token方案，不承诺密码学身份认证或防同网段窃听。完整MAC、boot_id、pairing_revision由GET /api/pairing/info读回；确认绑定后使用该关系凭据认证/api/status。广播本身不构成认证。原设计绑定成功后显式claim，不自动发布Bundle或启用数据同步。
+数字是人眼核对提示而非密码，首次采用原定局域网HTTP/token方案，不承诺密码学身份认证或防同网段窃听。完整MAC、boot_id、pairing_revision由GET /api/pairing/info读回；确认绑定后使用该关系凭据认证/api/status。广播本身不构成认证。绑定成功后通过显式 claim 请求取得占用，不自动发布 Bundle；2026-10-23 修订：新登记设备默认开启数据同步，已有设备保留保存的同步设置，数据需求仍以设备认证契约为准。
 
 ## 产品目标与入口
 

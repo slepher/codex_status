@@ -2328,7 +2328,7 @@ impl PlatformService {
             last_authenticated_contact_at: existing.as_ref().and_then(|d| d.last_authenticated_contact_at),
             last_authenticated_transport: existing.as_ref().and_then(|d| d.last_authenticated_transport.clone()),
             last_status_attempt: existing.as_ref().and_then(|d| d.last_status_attempt.clone()),
-            sync_enabled: existing.as_ref().map(|d| d.sync_enabled).unwrap_or(false),
+            sync_enabled: existing.as_ref().map(|d| d.sync_enabled).unwrap_or(true),
             data_contract: existing.as_ref().and_then(|d| d.data_contract.clone()),
         };
         inner.devices.insert(mac.clone(), record);
@@ -4087,7 +4087,8 @@ mod tests {
                 "requirements":[{"index":4,"field":"account.plan","kind":"text",
                     "missing":"hide","local":false}]}});
         svc.note_device_status_at(mac, &status, "http", 100).unwrap();
-        svc.set_data_sync(mac, true).unwrap();
+        assert!(svc.inner.lock().unwrap().coordinators[mac].sync_enabled);
+        assert!(svc.inner.lock().unwrap().coordinators[mac].data.push_dirty);
         let before = svc.device_get(mac).unwrap()["data_contract"].clone();
         svc.template_save("quad", crate::platform::model::RENDER_TARGET_154G,
             &quad_source(), 101).unwrap();
@@ -4237,6 +4238,30 @@ mod tests {
         assert_eq!(second["groups"]["radio"], first["groups"]["radio"]);
         assert_ne!(second["groups"]["firmware"], first["groups"]["firmware"]);
         crate::device_clock::clear(mac);
+    }
+
+    #[test]
+    fn new_device_sync_defaults_on_and_preserves_saved_choice() {
+        let dir = tempfile::tempdir().unwrap();
+        let mac = "0200000000F4";
+        let svc = PlatformService::open(dir.path()).unwrap();
+        let register = |svc: &PlatformService| {
+            svc.device_upsert(DeviceIdentity::new(mac, "Fake").unwrap(),
+                DeviceCapabilities::ap01()).unwrap();
+        };
+        register(&svc);
+        assert_eq!(svc.device_get(mac).unwrap()["sync_enabled"], true);
+        assert!(svc.device_get(mac).unwrap()["profile"].is_null());
+        svc.set_data_sync(mac, false).unwrap();
+        register(&svc);
+        assert_eq!(svc.device_get(mac).unwrap()["sync_enabled"], false);
+        drop(svc);
+        let resumed = PlatformService::open(dir.path()).unwrap();
+        register(&resumed);
+        assert_eq!(resumed.device_get(mac).unwrap()["sync_enabled"], false);
+        resumed.set_data_sync(mac, true).unwrap();
+        register(&resumed);
+        assert_eq!(resumed.device_get(mac).unwrap()["sync_enabled"], true);
     }
 
     #[test]

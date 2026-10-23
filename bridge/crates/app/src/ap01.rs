@@ -226,7 +226,8 @@ async fn execute(ctx:&AppCtx,op:&str,args:&Value)->Result<Value,String> {
         let status=verify_endpoint(ctx,&mac,&pending.candidate.endpoint).await?;
         register(ctx,&mac,&pending.candidate.endpoint,&pending.candidate.name,&status)?;
         std::fs::remove_file(path).map_err(|_|"pairing_cleanup_failed")?;
-        return Ok(json!({"result":"paired","mac":mac,"display_code":pending.display_code,"published":false,"sync_enabled":false}));
+        return Ok(json!({"result":"paired","mac":mac,"display_code":pending.display_code,"published":false,
+            "sync_enabled":platform::service(ctx).device_get(&mac).ok_or("device_missing_after_pairing")?["sync_enabled"]}));
     }
     if matches!(reply["state"].as_str(),Some("cancelled"|"expired"|"rejected")) {
         std::fs::remove_file(path).map_err(|_|"pairing_cleanup_failed")?;

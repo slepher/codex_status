@@ -701,7 +701,7 @@ fn tool_definitions() -> Value {
         {
             "name": "ap01_devices",
             "title": "发现与配对 AP01",
-            "description": "局域网主动发现，无需输入IP；pair显示双屏四位码，必须设备旋钮确认；pair_status查询原事务，cancel_pair取消。绑定不发布模板或启用同步。",
+            "description": "局域网主动发现，无需输入IP；pair显示双屏四位码，必须设备旋钮确认；pair_status查询原事务，cancel_pair取消。绑定不发布模板；新设备默认启用数据同步，已有设备保留同步设置。",
             "annotations": {"readOnlyHint": false,"destructiveHint": false},
             "inputSchema": {"type":"object","properties":{"op":{"enum":["search","cancel_search","pair","pair_status","cancel_pair"]},"mac":{"type":"string"}},"required":["op"],"additionalProperties":false}
         },
