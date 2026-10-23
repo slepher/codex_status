@@ -1,19 +1,20 @@
 # Codex Status 当前交接
 
-更新时间：2026-10-23 10:14，Asia/Shanghai。
+更新时间：2026-10-23，Asia/Shanghai。
 
 ## 当前部署
 
-- Mac Bridge 已从当前工作区重建/重启：`artifacts/bridge-macos/Codex Status Bridge.app`，exe 79336800 B，SHA256 `d0f0948cafbe3c7a5fd70b9d49b3b0e4809115098e972bed38266119681d35b9`。LaunchAgent supervisor/child 正常，8765/8766 监听。新设备默认同步，旧设备保存值保留；AP01/Note4 成功投递 ACK 分别 seq8/1011，均已显示。[验收](project-workflow/default-data-sync/status.md)
-- AP01 `34F01557210B`：本轮认证 `1.0.2_0041`、build `ec0a58f71f65c2830c08c9bfd7c155db`、Bundle `6a8d702a`，与前卡应用06不同；本轮未刷机，匹配ROM/槽位未重新核验，不沿用旧哈希冒充当前。救援0031槽0为前次记录。
-- Note4 `.106-note4` 认证通过；ROM `artifacts/bridge-macos/note4-0.18.106-plan-activation.bin`，1865680 B，SHA256 `36ca4c3aacdc7b27c9c7cebe4cb18df0bee4048461e189f51050b6332b24ceb4`。本轮未刷机。
+- Mac Bridge 已重建/重启：`artifacts/bridge-macos/Codex Status Bridge.app`，exe 79336800 B，SHA256 `d0f0948cafbe3c7a5fd70b9d49b3b0e4809115098e972bed38266119681d35b9`。supervisor/child 正常，8765/8766 监听。新设备默认同步，旧设置保留；AP01/Note4 ACK seq8/1011均已显示。[验收](project-workflow/default-data-sync/status.md)
+- AP01 `34F01557210B`：首尾动画修复ROM应用槽1，版本`1.0.2_0041`、build`ec0a58f71f65c2830c08c9bfd7c155db`、Bundle`6a8d702a`。ROM `artifacts/ap01-wifi-animation-20261022/ap01-wifi-animation-candidate01.bin`，7045480 B，SHA256 `5a49f78b550fabbafcc3cde75aa1f6e9986fb9dd88320cd029cd6655d61e0cee`。10-22认证槽1，用户确认原厂界面/旋钮/App及双向快转首尾正常；10-23再次认证同build，未刷机、未复核槽位。
+- 救援0031/槽0保留：10-22先认证build`53574b55382d55a514ef5b7767db66d9`及槽0，再单次写应用1；按用户要求未整槽读回/导出，停止标记保留。
+- Note4 `.106-note4`认证通过；ROM `artifacts/bridge-macos/note4-0.18.106-plan-activation.bin`，1865680 B，SHA256 `36ca4c3aacdc7b27c9c7cebe4cb18df0bee4048461e189f51050b6332b24ceb4`。10-23未刷机。
 
 ## 活跃事项与下一步
 
-- 默认同步改动纳入本次提交，core/app/mcp 合计338通过/5忽略；应用及完整运行data已私有备份，重建期间数据哈希一致。此前已提交Bridge监督修复随本次重建部署；AP01固件修复仍仅候选。
-- 四日审查AP01候选 `artifacts/review-fixes-20261022/james-native/review-candidate.bin`，7043256 B，SHA256 `8ee11c4204c2b5df01aa42f3bf97a17eeb2230df705386dfbb0c3729a3f8a5d7`，未刷；RV32/原生菜单/切网夹具/重启恢复已验，物理RF/LCD/掉电/栈高水位未验。[审查](project-workflow/review-fixes-20261022/status.md)
-- C9 Wi-Fi菜单与边界迁移固件尚未部署；A9/B6/C8 实际新余量完整时延、跨会话通知原因、Windows及长期合盖恢复仍开放，60秒采集兜底保留。[待办唯一入口](docs/roadmap/backlog.md)
+- 默认同步已提交，core/app/mcp 338通过/5忽略；应用及完整data已私有备份，重建期间data哈希一致。Bridge监督修复已随重建部署。
+- C9：共享宿主有效帧、Wi-Fi菜单及首尾循环动画修复已部署；原生红绿/宿主消毒器/菜单回归及用户视觉验收通过，不扩大为全部GPIO或逐帧保证。10-22末轮未切网/改列表，临时UU清理未执行；此前失联后按键重连原因未定。[调查与实机](project-workflow/ap01-wifi-profiles/animation-20261022.md)
+- 较早四日审查候选已由上述部署记录接续，不再代表当前ROM；历史候选/资源证据见[审查](project-workflow/review-fixes-20261022/status.md)。物理RF/掉电/完整栈高水位、A9/B6/C8新余量时延/跨会话通知/Windows及长期合盖恢复仍开放，60秒兜底保留。[唯一待办](docs/roadmap/backlog.md)
 
-## 历史与证据
+## 证据
 
-[本次前卡](docs/history/progress-archive-2026-10-23-before-default-data-sync.md)保留既有未提交清理记录。[完整历史](docs/history/progress-archive-2026-10-22-before-review-fixes.md)；旧产物已释放27.69GiB，部分链接可能失效。证据/私有备份在 `artifacts/default-data-sync-20261023/`。
+[默认同步前卡](docs/history/progress-archive-2026-10-23-before-default-data-sync.md)、[完整历史](docs/history/progress-archive-2026-10-22-before-review-fixes.md)。旧产物释放27.69GiB，部分历史链接可能失效。实机证据在`artifacts/ap01-entry-rollout-20261022/`、`artifacts/ap01-wifi-animation-rollout-20261022/`；同步备份/证据在`artifacts/default-data-sync-20261023/`。日志/SSID/绑定原文仅留私有artifacts。

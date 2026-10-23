@@ -76,3 +76,18 @@ QEMU10.1.0官方发行归档SHA256 `e0517349b50ca73ebec2fa85b06050d5c463ca65c738
 最终`menu-restart4.json`在加入有界等待后passed=true，native_execution_clean=true、服务与恢复检查通过；本次ready_polls=1。最终判定读取报告JSON，runner stdout早先的passed/full_application是通用业务阶段输出，不能代替专项最终结果。
 
 取回后重新核对315项当前源文件/头文件哈希、候选SHA及两份原生报告的runner SHA均匹配；最终归档`james-native/native-evidence.tar.gz`，结构化结论`james-native/final-verification.json`。重启后的中文SSID原厂RGB565截图亦已审阅。两仓库diff检查和AP01边界检查通过。本次修复分别提交两仓库，测试产物不入库。
+
+
+## 2026-10-22 授权实机续验（当前）
+
+用户授权更新AP01并保留救援0；候选01暴露共享宿主每次切入强制重绘回归，App侧保留当前有效帧后，候选02已部署应用1。用户确认设置/GIF两侧单格切入和App内容正常；原生红/绿测与匹配构建见[共享宿主状态](../ap01-screen-host/status.md)。首次测试目标SSID大小写不匹配，失败后认证核对原网；用户纠正大小写后，单次列表修正，实机连接目标/勾号及回切原网均获确认。临时列表已清理，11身份/绑定/设备码/系统文件比对通过。间歇跳过SSID仍开放；字体按用户要求暂缓，原厂运行日志缺此次明确失败原因。救援0完整6822344B读回SHA256与保留镜像匹配，从未为写目标。用户后续要求的异地网络已保存并读回确认，当前网络不变；Bridge未重启。本节覆盖历史“未部署”描述，未追加提交/推送。
+
+## 2026-10-22 香港本机同步续验（完成，未部署）
+
+主仓库快进至f8342fb、固件至da7a5b5；本机Windows GCC8.4重新审计/链接/打包，所有编译源/头哈希和完整ROM重建通过。候选`artifacts/ap01-synced-20261022/ap01-synced-candidate01.bin`，7043256B，build`82d294d3f52d953d57ce779de459268d`，SHA256`eaabe3681861ff5a08828dcd0ba1168a80e56adaedc1f7fd201c801944c46155`；ELF SHA256`3e33681d7db828820fb11dcd3872afbd8eb6d141af1697eb9607c259f43e562e`。本机完整镜像哈希与james产物分别登记，不以相同build ID冒充同一文件。
+
+本机Wi-Fi核心/生产适配、App/维护/无App OTA切槽、旧metadata恢复、菜单适配器ASan/UBSan均通过。原生menu01完整菜单/切网fixture/退出重建通过；精确快照restart02恢复中文SSID/当前勾号/菜单码/绑定及身份，未注入缓存，首轮GET即200。原厂RGB565已审阅，两个虚拟固件槽、boot/partition/reserved区域字节不变。实际菜单顺序是六项原厂项、设备码6、Wi-Fi7、返回8，保留原厂flex；旧“屏保后Wi-Fi/绝对位置映射”说明不再描述当前源码。
+
+restart01 guest无异常，但测试在GET503时直接断言，未保留响应体，不能据此断言503的深层原因。现将既有30秒轮询扩展为仅重试结构化`wifi_profiles/read_unavailable`503，记录status/stage/error；其他错误立即失败。提取实际轮询代码的HTTP/时钟夹具四项通过：已知503→200、其他503拒绝、401拒绝、持续503期限退出。restart02本身未重现503，不能记为真实503恢复验收。该改动只在离线验证脚本，候选ROM未重编。
+
+[本机结构化验收](../../artifacts/ap01-synced-20261022/local-acceptance.json)。无实机访问/刷写、无Bridge启停或运行data变更；设备仍应用06/槽1、救援0031/槽0。真实RF/LCD/掉电/完整调用链高水位仍为C9。此处及对应报告/脚本为同步后的本机续验改动，尚未提交。

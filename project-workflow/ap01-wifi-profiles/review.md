@@ -10,3 +10,21 @@ Physical backend save/restart checks passed with11 original network/identity fil
 
 
 2026-10-22 checkpoint review: the new native UI/switch source is unfinished and deferred by user request (C9). The original list endpoint remains passive; only explicit menu selection queues network changes. Host switch-core sanitizer scenarios passed, including timeout/rollback, partial two-key commit, restart/corrupt journal and ambiguous cleanup; native candidate12 is NOT accepted because a later menu-navigation assertion failed. Stock Version badge requires logical row3; the checkpoint preserves logical indices and translates visual positions. Long SSID display/font coverage, complete original-menu navigation/pixels, driver-level fault/restart verification, resource budgets and current main Runtime/build reproducibility remain open. No device access/flash; deployed06 and rescue0 unchanged. Prior physical backend acceptance does not cover these new modules.
+
+
+## 2026-10-22 intermittent focus / diagnostic review (offline complete)
+
+The production navigation algorithm, wrap indices, wake-consumption semantics and group behavior are not changed. Logging records input decisions, not physical LCD completion. Worker logs preserve actual profile/current errors and stage boundaries; timeout logs do not assert a driver-specific association cause. Sixteen numeric records are retained outside ramlog; bounded try-lock/drop-count snapshots are safe between UI/maintenance producers and the diagnostic reader. Existing manual-auth/rate-limit routing is unchanged, and the optional diagnostic callback keeps standalone/no-App maintenance functional. No persistent schema, SSID, password or token is added to trace.
+
+Host diagnostic tests verify empty/16-event bounded order and structured503 when the snapshot callback reports busy; switch tests verify exact successful stage sequence and silent waiting polls plus explicit timeout errno. App/maintenance/independent fallback/menu host regressions pass. Native failed controls are retained: absence of an optional custom callback and App-only peripheral fixture exclusion of original LVGL callers are test-boundary findings, not a product root cause. Physical GPIO/edge timing and the reported intermittent failure remain open until actual evidence supports them. No debounce or global wake-gate bypass is added on speculation. Device and rescue0 remain untouched this follow-up.
+
+
+Final native rotary06 and menu01 passed with clean guest execution. Encoder setup includes native press/release and sample reading, not direct group Enter. The narrowly scoped original-caller peripheral fixture is explicit and fingerprinted. Thirty-one focus assertions include wake/resume and batched steps; no physical GPIO equivalence is claimed. Initial harness controls and unsigned metadata error are preserved separately. Original focus/checkmark/connection/rollback framebuffer review passed. Physical intermittent cause remains open; navigation is not patched without evidence. Exact acceptance: artifacts/ap01-wifi-focus-20261022/offline-acceptance.json.
+
+
+## 2026-10-22 fast-wrap correction review
+
+Simulation now supports a viewport cause for the fast boundary symptom: old animated wrap selects an offscreen destination, which the next100ms step replaces before complete visibility. The smallest correction changes only the original scroll animation argument on selectable first/last wraps; indices, ordinary adjacent animation, wake consumption and input delivery stay intact. Host red/green and native guest-time coordinate red/green pass. Native RGB565 snapshots reveal independent virtual readiness lag and are NOT counted as immediate physical display proof. Physical input/LCD acceptance remains open. Full native menu/driver regression passed with clean execution; see animation-20261022.md.
+
+
+2026-10-22 physical acceptance: exact animation candidate is authenticated on application1 after independent rescue0 startup and one upload; version/slot-only checks per explicit user scope, no slot/file exports. User confirms native UI/knob/App and both fast boundary directions normal. Rescue0 never written. Specific animation symptom passes; retained trace is partial, and GPIO/all-frame/network-loss claims remain excluded. Evidence: artifacts/ap01-wifi-animation-rollout-20261022/physical-verification.json.

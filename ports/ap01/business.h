@@ -46,6 +46,10 @@ public:
     bool redraw() { return configured && render(); }
     void displayed(uint32_t value) { displayedGeneration.store(value, std::memory_order_release); }
     void displayFailed(uint32_t value) {failedGeneration.store(value,std::memory_order_release);}
+    bool canReuseFrame(uint32_t value) const {
+        uint32_t failed=failedGeneration.load(std::memory_order_acquire);
+        return value&&value!=failed&&(failed==UINT32_MAX||value>failed);
+    }
     uint8_t count() const { return configured ? profile.count : 0; }
     uint8_t active() const { return profile.initial; }
     const char *screenId(unsigned index) const { return configured && index < profile.count ? profile.ids[index] : ""; }
