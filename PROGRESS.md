@@ -13,7 +13,7 @@
 
 ## 活跃事项与下一步
 
-- Wi-Fi族Windows已部署，旧网络已合并3族（2双SSID+1仅2.4G），密码保留；Note4选3族/BW保留原1族，AP01手选不变。共享族库/有线指定、Note/BW现有字段传族名。Rust337/定向56、Node/Edge12通过；macOS原生/部署及实机切网归B6。[状态](project-workflow/wifi-families/status.md)。
+- Wi-Fi族Windows已部署，旧网络已合并3族（2异名双频+1同名双频；3设备均只连2.4G），密码保留；Note4选3族/BW保留原1族，AP01手选不变。共享族库/有线指定、Note/BW现有字段传族名。Rust337/定向56、Node/Edge12通过；macOS原生/部署及实机切网归B6。[状态](project-workflow/wifi-families/status.md)。
 
 - 书桌屏 `70041DD7A340`：USB部署`.38-bw`/`ota_0`，ROM `artifacts/desk-ota-20261026/desk-0.18.38-bw.bin`，1837008 B，SHA256 `2b002a21e2673a96a4c519fb746219737911a82f577a2b5597cb2a89fba6580e`，认证运行镜像SHA已匹配。原`.37`槽1/模板保留；154g构建、200/400宿主布局、匹配ELF栈通过，Note4未构建/部署。用户授权后经USB JTAG将原通用凭据转换为119B共享active WFS4，仅写NVS的0xC000扇区，完整NVS读回一致且原记录保留；实机加载1条/format4，HTTP确认connected/IP192.168.3.163。
 - 旧quad v12含退役device.state；兼容v15+mini完整Bundle `99dc6326` 已用原事务续传，COMMIT显示displayed，认证commit_seq4097/context `ffaf4e43e43639c1`、quad active、content ready/error空；Bridge对账succeeded。用户随后确认模板已显示；按最新要求已开启sync_enabled并持久解除书桌屏暂停，HTTP数据seq288 ACK displayed且认证applied_seq288/content_error空。此前实体BOOT169ms内响应。Windows JTAG接口已安装签名官方驱动oem88.inf，诊断临时Bridge配置仍保持还原。调试/恢复期间记录RTC WDT重启，根因未定；最后两次HTTP同wake/uptime160→175，不能扩大为长期稳定验收。B6证据：[状态](project-workflow/builtin-radio-status/status.md)、`artifacts/desk-ota-20261026/`。

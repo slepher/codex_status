@@ -35,3 +35,5 @@ HTTP health204、MCP44工具、library_select可见；生产MCP读取Wi-Fi族sch
 在私有副本先执行现有PlatformService校验与原子保存，再按规定停watchdog/任务、备份并校验286文件data，在停机状态应用同一合并，最后脚本启动默认Bridge（PID8916）。原程序/设备ROM未改。库revision1，Note4=3族/BW=原1族，AP01无旧Bridge网络快照，未新增订阅或修改手选列表。MCP分别读取三设备均可见3族，主机当前族正确解析；HTTP204、3设备身份/Profile/许可、Bridge设置及原事务冻结范围保留。设备端投递/真实切网不作为此次合并已验结果。
 
 详细网络名、私有快照和备份位置仅存`artifacts/wifi-families/merge-result.json`、`merge-verification.json`及对应merge-backup目录；一次性助手及构建日志也仅在私有artifacts。未把密码/SSID原文加入版本库。
+
+2026-10-27后续用户确认：第三族实际为同名双频，已通过原有应用服务更新ssid_5g与同SSID凭据，库revision2。三个设备均只支持2.4G，5G仅作为Bridge族识别信息；核验所有设备目标仍等于族内2.4G SSID，目标local_revision、订阅及Bridge设置未变，AP01继续手选。更新前完整备份/逐文件校验，按规定重启（PID17200），HTTP204/MCP实际族读取通过。私有证据dual-band-result.json、dual-band-verification.json位于artifacts/wifi-families/，未改设备ROM或切网。
