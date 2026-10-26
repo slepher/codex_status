@@ -15,6 +15,10 @@ pio run -e zectrix-note4-b -t upload  # USB 烧录（用网页 OTA 后先擦 ota
 pio device monitor
 ```
 
+### AP01 可选 App 构建
+
+AP01 编译、RV32 审计、链接和打包统一由兄弟固件仓库执行；源码配置为 `ports/ap01/build-0041.json`，命令及兼容入口见 [构建说明](../ports/ap01/BUILD.md)。这不改变下述 Note4/1.54 构建目标约定。
+
 ### 固件目标：默认只构建 Note4；本次双 ROM 实机测试例外
 
 - **默认唯一目标：`zectrix-note4-b`。** 2026-09-26 用户明确授权依次发布 Note4 与 1.54 两份 ROM 并实机测试；本次允许为 1.54 构建且仅构建 `esp32-s3-epaper-154g`，使用 `tools/pio-target.ps1 -Target 154g` 的隔离包目录与完整 sdkconfig 快照。两个目标不得并行构建；不得构建 `-gray4`/`-btpm` 等变体。构建前核对目标，发布前核对 ROM marker、大小、SHA256、登记 MAC 与设备自报身份。该例外不代表以后默认可以构建其他 env。

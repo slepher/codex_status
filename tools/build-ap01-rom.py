@@ -4,8 +4,6 @@ The App supplies build paths; the firmware packager owns image policy.
 """
 from pathlib import Path
 from importlib.util import module_from_spec, spec_from_file_location
-import os
-import shutil
 import sys
 
 repo = Path(__file__).resolve().parents[1]
@@ -24,12 +22,6 @@ if __name__ == '__main__':
     if not any(x == '--source-dir' or x.startswith('--source-dir=') for x in sys.argv):
         sys.argv += ['--source-dir', str(repo / 'artifacts/ap01-platform-integration/device')]
     if not any(x == '--tool-prefix' or x.startswith('--tool-prefix=') for x in sys.argv) and not any(x in sys.argv for x in ('-h', '--help')):
-        nm = shutil.which('riscv32-esp-elf-nm')
-        if nm:
-            prefix = nm[:-2]
-        elif os.environ.get('USERPROFILE'):
-            prefix = str(Path(os.environ['USERPROFILE']) / '.platformio/packages/toolchain-riscv32-esp/bin/riscv32-esp-elf-')
-        else:
-            raise SystemExit('Supply --tool-prefix /path/to/riscv32-esp-elf-')
+        prefix = _builder._native.tool_prefix()
         sys.argv += ['--tool-prefix', prefix]
     main()

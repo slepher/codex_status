@@ -1,0 +1,41 @@
+{
+  "format": 1,
+  "root": "../..",
+  "include_dirs": [
+    "src",
+    "ports/ap01",
+    "bridge/crates/render/shim"
+  ],
+  "defines": [
+    "CODEX_AP01_NATIVE=1",
+    "CODEX_RENDER_NOTE4_FONTS=1"
+  ],
+  "plain_sources": [
+    "src/ap01_binding.cpp",
+    "src/ap01_pairing.cpp"
+  ],
+  "sources": [
+    "ports/ap01/abi_budget.cpp",
+    "ports/ap01/business.cpp",
+    "ports/ap01/application.cpp",
+    "ports/ap01/http.cpp",
+    "ports/ap01/native_0041.cpp",
+    "ports/ap01/manifest_0041.cpp",
+    "src/template_engine.cpp",
+    "src/GUI_Paint.cpp",
+    "src/font_asset.cpp",
+    "src/v2_runtime.cpp",
+    "src/v2_data_command.cpp",
+    "src/v2_bundle_command.cpp",
+    "src/v2_activate_command.cpp",
+    "src/v2_command_envelope.cpp",
+    "src/v2_status_snapshot.cpp",
+    "src/bundle_store.cpp",
+    "src/bundle_payload.cpp",
+    "src/font8.cpp",
+    "src/font12.cpp",
+    "src/font16.cpp",
+    "src/font20.cpp",
+    "src/font24.cpp"
+  ]
+}

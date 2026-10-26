@@ -1,6 +1,6 @@
 # Codex Status 当前交接
 
-更新时间：2026-10-23，Asia/Shanghai。
+更新时间：2026-10-27，Asia/Hong_Kong。
 
 ## 当前部署
 
@@ -10,6 +10,10 @@
 - Note4 `.106-note4`认证通过；ROM `artifacts/bridge-macos/note4-0.18.106-plan-activation.bin`，1865680 B，SHA256 `36ca4c3aacdc7b27c9c7cebe4cb18df0bee4048461e189f51050b6332b24ceb4`。10-23未刷机。
 
 ## 活跃事项与下一步
+
+- AP01 构建已统一到兄弟固件仓库，App 仅源码/配置及兼容入口；独立版/App版、隔离构建和旧命令验证通过，均未部署。[记录](project-workflow/ap01-unified-build/status.md)
+- 未部署 platform ROM：`D:\Documents\PlatformIO\Projects\cuktech-ap01-firmware\build\unified-0041\platform.bin`，6875656 B，SHA256 `d77900bf5ce60ac9d1139a37d7a7314e75f2a6ac1f021eb7f04bfd9b440e2859`。
+- 未部署 codex-status ROM：`D:\Documents\PlatformIO\Projects\cuktech-ap01-firmware\build\unified-0041\codex-status-commit.bin`，7044408 B，SHA256 `7cf24650ed8b24323e42b1b4a5400f5b05aa0d0f52c81127c2271c2c7d4e4183`。
 
 - 默认同步已提交，core/app/mcp 338通过/5忽略；应用及完整data已私有备份，重建期间data哈希一致。Bridge监督修复已随重建部署。
 - C9：共享宿主有效帧、Wi-Fi菜单及首尾循环动画修复已部署；原生红绿/宿主消毒器/菜单回归及用户视觉验收通过，不扩大为全部GPIO或逐帧保证。10-22末轮未切网/改列表，临时UU清理未执行；此前失联后按键重连原因未定。[调查与实机](project-workflow/ap01-wifi-profiles/animation-20261022.md)

@@ -17,6 +17,8 @@ A portable e-paper companion for local Codex usage, supporting **Waveshare 1.54"
 
 两款设备共用模板引擎与显示平台，使用各自的固件和分辨率适配模板。200×200 提供 `quad`、`mini` 等布局；400×300 提供 `codex-status-a`。ROM 必须与设备 target 匹配，不能混刷。桌面桥支持 Windows 与 macOS，构建、签名及验收边界见下方安装指南。
 
+AP01 的可选 App 构建使用兄弟固件仓库的统一入口；本仓库仅提供源码与配置，见 [AP01 构建说明](ports/ap01/BUILD.md)。
+
 ### 主要功能
 
 - **Codex 余量显示**：通过本机 `codex app-server` JSON-RPC 获取配额与重置时间，设备本地渲染。

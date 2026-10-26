@@ -33,6 +33,17 @@ if args.audit:
     for name in owned:
         assert '/cuktech-ap01-firmware/tooling/firmware-modules/' in paths[name],name
 
+# App-side build entries may forward arguments, never compile/link platform code.
+for name in ('check-ap01-native.py','link-ap01-native.py','ap01_firmware_build.py'):
+    text=(repo/'tools'/name).read_text(encoding='utf-8')
+    for token in ('subprocess','-march=','--gc-sections','native_services_0041.cpp'):
+        assert token not in text,(name,token)
+config=json.loads((repo/'ports/ap01/build-0041.json').read_text(encoding='utf-8'))
+assert config['format']==1
+for relative in config['sources']+config['plain_sources']+config['include_dirs']:
+    assert (repo/relative).resolve().is_relative_to(repo),relative
+    assert (repo/relative).exists(),relative
+
 builder=runpy.run_path(str(repo/'tools/build-ap01-rom.py'))
 assert Path(builder['main'].__code__.co_filename).resolve().is_relative_to(platform.parent/'scripts')
 print('AP01 boundary passed: App protocol/display only; OTA/slots/Wi-Fi/menu/HTTP policies and ROM packaging owned by firmware')
