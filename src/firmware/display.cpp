@@ -144,7 +144,6 @@ static WinInfo findWindow(JsonDocument &doc, bool fiveHour) {
 static void screenStatus() {
     std::vector<String> lines;
     lines.push_back("CODEX STATUS");
-    lines.push_back(String("WIFI ") + wifiPhaseText(radio::wifiPhase()));
     lines.push_back(String("BATT ") + power::displayBatteryPercent() + "%");
     lines.push_back(String("IP ") + radio::ipText());
     lines.push_back(String("SYNC ") + clock::fmtEpoch((long long)radio::retained.rtcLastSyncEpoch, "%H:%M"));
@@ -152,8 +151,29 @@ static void screenStatus() {
     screen(lines);
 }
 
+static bool builtinBleOn() {
+    return radio::state.bleOn &&
+        !(power::retained.rtcMode == MODE_DEEP && !radio::state.v2InRendezvous);
+}
+
+// This module serves the sleep-capable ESP32 EPDs, not the AP01 system UI.
+static void drawBuiltinRadioStatus(int x, int y) {
+    const bool sleeping = power::retained.rtcMode == MODE_DEEP && !radio::state.v2InRendezvous;
+    const char *wifi = "WIFI idle";
+    if (sleeping) wifi = "WIFI sleep";
+    else switch (radio::wifiPhase()) {
+        case WifiPhase::Connecting: wifi = "WIFI joining"; break;
+        case WifiPhase::Connected: wifi = "WIFI online"; break;
+        case WifiPhase::Off: wifi = "WIFI off"; break;
+        default: break;
+    }
+    Paint_DrawString_EN(x, y, wifi, &Font12, WHITE, BLACK);
+    Paint_DrawString_EN(x, y + 14, builtinBleOn() ? "BLE on" : "BLE off", &Font12, WHITE, BLACK);
+}
+
 void screen(const std::vector<String> &lines, UBYTE color) {
     if (!state.frame) return;
+    state.builtinScreen = true;
     Paint_SelectImage(state.frame);
     Paint_Clear(WHITE);
     Paint_DrawRectangle(0, 0, EPD_W - 1, EPD_H - 1, BLACK, DOT_PIXEL_1X1, DRAW_FILL_EMPTY);
@@ -161,12 +181,13 @@ void screen(const std::vector<String> &lines, UBYTE color) {
     bool full = false;
     for (const auto &line : lines) {
         for (const auto &part : wrapText(line)) {
-            if (y > EPD_H - 24) { full = true; break; }
+            if (y > EPD_H - 48) { full = true; break; }
             Paint_DrawString_EN(8, y, part.c_str(), &Font16, WHITE, color);
             y += 20;
         }
         if (full) break;
     }
+    drawBuiltinRadioStatus(8, EPD_H - 32);
     epdFlush();
 }
 
@@ -873,6 +894,8 @@ static void renderUsage(const String &json, const char *channel) {
 
     for (int i = 0; i < (int)tr.size(); i++)
         drawSmallRight(tr[i], Q_TR_RIGHT, Q_TR_Y0 + i * Q_LINE_H);
+    state.builtinScreen = true;
+    drawBuiltinRadioStatus(Q_TR_RIGHT - 12 * Font12.Width, Q_TR_Y0 + 4 * Q_LINE_H);
     int first = 4 - (int)bl.size();
     for (int i = 0; i < (int)bl.size(); i++)
         drawSmallLeft(bl[i], Q_BL_X, Q_BL_SLOTS[first + i]);
@@ -923,6 +946,7 @@ void renderActiveUsage(const String &json, const char *channel) {
     bool drawn = platform::state.v2CtValid ? tplDrawCt(platform::state.v2Ct, json, env)
                            : tplDraw(platform::state.activeTplJson, json, env);
     if (drawn) {
+        state.builtinScreen = false;
         epdFlush(false);
         if (state.epdBaselineTrusted && state.lastDisplayedFrame &&
             memcmp(state.lastDisplayedFrame, state.frame, EPD_FB_BYTES) == 0) {
@@ -951,7 +975,8 @@ void renderCurrent() {
     else screenStatus();
     state.networkGlyph.observe(radio::state.wifiUp, currentBridgeOfflineMinutes(), radio::wifiPhase(),
                                radio::state.wifiConnActive ? (radio::state.wifiBlinkOn ? 1 : 0) : -1,
-                               power::state.bleRecovery.active(clock::v2NowMs()));
+                               power::state.bleRecovery.active(clock::v2NowMs()),
+                               state.builtinScreen && builtinBleOn());
     const bool confirmed = state.epdBaselineTrusted && state.lastDisplayedFrame && state.frame &&
         memcmp(state.lastDisplayedFrame, state.frame, EPD_FB_BYTES) == 0;
     state.networkGlyph.rendered(confirmed, clock::v2NowMs());
@@ -963,8 +988,10 @@ void serviceNetworkGlyph() {
     const bool manual = power::state.bleRecovery.active(clock::v2NowMs());
     const bool blinkOnly = state.networkGlyph.known && phase == WifiPhase::Connecting &&
         state.networkGlyph.wifiPhase == phase && state.networkGlyph.wifiBlink != blink &&
-        state.networkGlyph.bridgeOffline == currentBridgeOfflineMinutes() && state.networkGlyph.bleManual == manual;
-    state.networkGlyph.observe(radio::state.wifiUp, currentBridgeOfflineMinutes(), phase, blink, manual);
+        state.networkGlyph.bridgeOffline == currentBridgeOfflineMinutes() && state.networkGlyph.bleManual == manual &&
+        state.networkGlyph.bleRadio == (state.builtinScreen && builtinBleOn());
+    state.networkGlyph.observe(radio::state.wifiUp, currentBridgeOfflineMinutes(), phase, blink, manual,
+                               state.builtinScreen && builtinBleOn());
     if (!state.networkGlyph.due(clock::v2NowMs()) || transport::state.otaInProgress) return;
     state.rfnBlink = blinkOnly;
     if (state.networkGlyph.attempts) state.forceCleanRefresh = true;

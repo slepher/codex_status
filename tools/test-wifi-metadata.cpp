@@ -32,4 +32,14 @@ int main() {
     display.rendered(true,6001);
     display.observe(true,-1,WifiPhase::Connected,-1,false);
     assert(display.pending); // recovery redraws Bridge without Wi-Fi transition
+    display.rendered(true,6002);
+    display.observe(true,-1,WifiPhase::Connected,-1,false,true);
+    assert(display.due(6003) && display.bleRadio); // automatic BLE also redraws builtin pages
+    display.rendered(true,6003);
+    display.observe(true,-1,WifiPhase::Connected,-1,false,false);
+    assert(display.due(6004) && !display.bleRadio);
+    display.rendered(false,6004);
+    display.rendered(false,11004);
+    display.rendered(false,16004);
+    assert(!display.due(21004)); // preserve bounded retries
 }

@@ -20,6 +20,7 @@ struct ClkRegion {
 
 struct State {
     NetworkDisplayState networkGlyph;
+    bool builtinScreen = false;
 
     // NVS `pm/panel_pwr`: 1 keeps the Note4 logic rail on in deep sleep; 0
     // powers it off. Both modes turn the controller's internal HV supply off.

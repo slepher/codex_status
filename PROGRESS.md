@@ -15,6 +15,9 @@
 
 - Wi-Fi族Windows已部署：共享族库/逐设备订阅/有线指定、Note/BW现有字段传族名、AP01列表同步与手选。Rust337/定向56、Node/Edge12通过；macOS原生/部署及实机切网归B6。[状态](project-workflow/wifi-families/status.md)。
 
+- 书桌屏 `70041DD7A340`：USB部署`.38-bw`/`ota_0`，ROM `artifacts/desk-ota-20261026/desk-0.18.38-bw.bin`，1837008 B，SHA256 `2b002a21e2673a96a4c519fb746219737911a82f577a2b5597cb2a89fba6580e`，认证运行镜像SHA已匹配。原`.37`槽1/模板保留；154g构建、200/400宿主布局、匹配ELF栈通过，Note4未构建/部署。用户授权后经USB JTAG将原通用凭据转换为119B共享active WFS4，仅写NVS的0xC000扇区，完整NVS读回一致且原记录保留；实机加载1条/format4，HTTP确认connected/IP192.168.3.163。
+- 旧quad v12含退役device.state；兼容v15+mini完整Bundle `99dc6326` 已用原事务续传，COMMIT显示displayed，认证commit_seq4097/context `ffaf4e43e43639c1`、quad active、content ready/error空；Bridge对账succeeded。用户随后确认模板已显示；按最新要求已开启sync_enabled并持久解除书桌屏暂停，HTTP数据seq288 ACK displayed且认证applied_seq288/content_error空。此前实体BOOT169ms内响应。Windows JTAG接口已安装签名官方驱动oem88.inf，诊断临时Bridge配置仍保持还原。调试/恢复期间记录RTC WDT重启，根因未定；最后两次HTTP同wake/uptime160→175，不能扩大为长期稳定验收。B6证据：[状态](project-workflow/builtin-radio-status/status.md)、`artifacts/desk-ota-20261026/`。
+
 - AP01 构建已统一到兄弟固件仓库，App 仅源码/配置及兼容入口；独立版/App版、隔离构建和旧命令验证通过，均未部署。[记录](project-workflow/ap01-unified-build/status.md)
 - 未部署 platform ROM：`D:\Documents\PlatformIO\Projects\cuktech-ap01-firmware\build\unified-0041\platform.bin`，6875656 B，SHA256 `d77900bf5ce60ac9d1139a37d7a7314e75f2a6ac1f021eb7f04bfd9b440e2859`。
 - 未部署 codex-status ROM：`D:\Documents\PlatformIO\Projects\cuktech-ap01-firmware\build\unified-0041\codex-status-commit.bin`，7044408 B，SHA256 `7cf24650ed8b24323e42b1b4a5400f5b05aa0d0f52c81127c2271c2c7d4e4183`。
