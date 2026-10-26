@@ -37,3 +37,13 @@ HTTP health204、MCP44工具、library_select可见；生产MCP读取Wi-Fi族sch
 详细网络名、私有快照和备份位置仅存`artifacts/wifi-families/merge-result.json`、`merge-verification.json`及对应merge-backup目录；一次性助手及构建日志也仅在私有artifacts。未把密码/SSID原文加入版本库。
 
 2026-10-27后续用户确认：第三族实际为同名双频，已通过原有应用服务更新ssid_5g与同SSID凭据，库revision2。三个设备均只支持2.4G，5G仅作为Bridge族识别信息；核验所有设备目标仍等于族内2.4G SSID，目标local_revision、订阅及Bridge设置未变，AP01继续手选。更新前完整备份/逐文件校验，按规定重启（PID17200），HTTP204/MCP实际族读取通过。私有证据dual-band-result.json、dual-band-verification.json位于artifacts/wifi-families/，未改设备ROM或切网。
+
+## 页面重整（2026-10-27）
+
+已按用户粘贴方案完成：Bridge页只有共享族订阅列表与唯一族编辑器；设备配置导入归比较页，未关联记录必须明确选择族；概览工具直接可见，在线胶囊与AP01设备码横幅收拢。旧本地目标编辑/复制/删除入口及草稿状态移除；恢复工具选择已保存订阅网络，未知密码明拒。
+
+- Node回归通过，Edge复用原生脚本的40场景×560/1000两种宽度共80通过；包含共享族编辑/删除保护/失败保留、当前族快捷入口、缓存导入及当前/其他绑定的同步回环。截图已审阅窄宽编辑器、概览、比较、AP01横幅。证据 `artifacts/wifi-families/edge-results.json`、`{560,1000}-*.png`、`workspace-node-tests.log`。
+- `bash tools/test-wifi-ui.sh`已通过Git Bash实际运行，因缺少`swiftc`失败；macOS原生WKWebView及真实Rust/RF矩阵仍归B6，不以Edge合成IPC代替。
+- 最终隔离构建`cargo build -p bridge-app --target-dir target-note4-sync`通过，只有既有btleplug生命周期警告。**未部署候选** `bridge/target-note4-sync/debug/bridge-app.exe`，39005184 B，SHA256 `621386772286dd20d581c0000bd76182c02772b31a992c75f46b62f879a085ab`。
+- 已核对默认exe路径、任务及8765/8766同PID2728/watchdog32096。自动审批拒绝执行`artifacts/wifi-families/deploy-workspace.ps1`：停止共享运行实例、替换exe和重启需用户明确授权。脚本未运行，未停服务/备份/替换exe，真实data、设备网络及ROM未修改。当前部署仍为本页前述9077bb8c版本。
+- 部署脚本已准备完整data逐文件哈希校验、旧exe备份、watchdog→任务停止顺序、启动/health/MCP验证；待授权后执行。未提交。

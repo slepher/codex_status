@@ -5,9 +5,12 @@ import vm from 'node:vm';
 const html = readFileSync(new URL('../bridge/crates/app/ui/index.html', import.meta.url), 'utf8');
 assert(!html.includes('id="ring-week"'));
 assert(!html.includes('加入 / 更新草稿'));
-assert(!html.includes('onclick="wifiSaveLocal()"'));
-assert(html.includes('onsubmit="event.preventDefault();wifiSaveLocal()"'));
-assert.match(html,/<button id="wifi-submit"[^>]+>保存到 Bridge<\/button>/);
+assert(!html.includes('id="wifi-editor"'));
+assert(!html.includes('id="wifi-local"'));
+assert(!html.includes('id="wifi-family-selection"'));
+assert(html.includes('onsubmit="event.preventDefault();wifiFamilySave()"'));
+assert(html.indexOf('id="wifi-panel-bridge"')<html.indexOf('id="wifi-family-library"'));
+assert(html.indexOf('id="wifi-panel-compare"')<html.indexOf('id="wifi-family-import"'));
 assert(!html.includes('id="pt-profile"'));
 assert(!html.includes('id="pt-fonts"'));
 assert(!html.includes('屏幕内容与发布'));
@@ -189,20 +192,10 @@ assert.match(element('wifi-result').textContent,/完成.*设备方案已读取/)
 wifi.jobs[0]={...wifi.jobs[0],state:'failed',error_code:'unsupported'};
 await run('wifiRefreshView()');
 assert.match(element('wifi-result').textContent,/已终止.*不支持/);
-run("wifiLocalResult('Bridge 配置已保存。')");
+run("wifiSetResult('Bridge 配置已保存。')");
 await run('wifiRefreshView()');
 assert.equal(element('wifi-result').textContent,'Bridge 配置已保存。');
 wifi.jobs=[];
-run('wifiDraft[0].password="fixture-pass";wifiEdit(0)');assert.equal(element('wifi-password').value,'fixture-pass');
-assert.equal(element('wifi-password').type,'password');run('wifiTogglePassword()');assert.equal(element('wifi-password').type,'text');
-assert.equal(element('wifi-password-toggle').getAttribute('aria-label'),'隐藏密码');
-run('wifiTogglePassword()');assert.equal(element('wifi-password').type,'password');
-run('wifiTogglePassword();wifiEdit(0)');assert.equal(element('wifi-password').type,'password');
-element('wifi-ssid').value='Local edit';run('wifiSubmit()');
-const beforeRefresh=run('wifiDraft[0].ssid');await run('wifiRefreshView()');assert.equal(run('wifiDraft[0].ssid'),beforeRefresh);
-await run('wifiSaveLocal()');assert(calls.some(c=>c.name==='platform_wifi'&&c.args.op==='save'));
-assert.equal(calls.findLast(c=>c.name==='platform_wifi'&&c.args.op==='save').args.body.targets[0].password,'fixture-pass');
-assert(!calls.some(c=>c.name==='platform_wifi'&&c.args.op==='setup'));
 run("wifiHostNetwork={state:'connected',networks:[{ssid:'Host 5G'}]}");
 element('wifi-direction').value='sync';run("wifiChoose(0,true);wifiPreviewSync()");
 assert.match(element('wifi-preview').textContent,/整条覆盖/);assert.equal(element('wifi-sync-submit').disabled,false);
@@ -210,7 +203,7 @@ await run('wifiCommitPreview()');
 const sync=calls.findLast(c=>c.name==='platform_wifi'&&c.args.op==='sync');assert(!('fields' in sync.args.body));assert.deepEqual(Array.from(sync.args.body.selected),['home']);
 assert.match(element('wifi-result').textContent,/等待设备可用通道/);
 assert(!element('wifi-compare').innerHTML.includes('字段选择'));assert(!element('wifi-compare').innerHTML.includes('密码不回读'));
-element('wifi-direction').value='import';run("wifiChoose(0,true);wifiPreviewSync()");
+run("wifiLibrary.families=[{id:'home',name:'Home',ssid_2g:'Device'}]");element('wifi-direction').value='import';run("wifiChoose(0,true);wifiPreviewSync()");
 const importStart=calls.length;await run('wifiCommitPreview()');
 const imported=calls.slice(importStart).find(c=>c.name==='platform_wifi'&&c.args.op==='import');
 assert(!('fields' in imported.args.body));assert.deepEqual(Array.from(imported.args.body.selected),['home']);assert.equal(imported.args.body.snapshot_id,'full-1');
@@ -218,8 +211,6 @@ assert.equal(imported.args.body.local_revision,run('wifiState.local_revision'));
 assert(!calls.slice(importStart).some(c=>c.name==='platform_wifi'&&['get','read_import','authorize'].includes(c.args.op)));
 assert.match(element('wifi-result').textContent,/选中的设备快照方案整条保存到 Bridge/);
 assert(!source.includes('wifiRefreshImport()'));element('wifi-direction').value='sync';
-element('wifi-password').value=Array.from({length:12},(_,i)=>String.fromCharCode(97+i)).join('');
-await run('wifiTrial()');assert.equal(element('wifi-password').value,'');assert.match(element('wifi-result').textContent,/恢复原链路/);
 run(`wifiDifferences=[{network_id:'readonly',state:'device_only',writable:false,bridge:null,device:[{bond:'other',writable:false,network:{ssid:'Other'}}],fields:[{field:'ssid',bridge:null,device:'Other'}]},
  {network_id:'delete',state:'explicit_delete',writable:true,bridge:{deleted:true,credential:'keep'},device:[],fields:[]},
  {network_id:'unknown',state:'no_baseline',writable:true,bridge:{credential:'keep'},device:[],fields:[]}];wifiSelectDifferences()`);
@@ -232,10 +223,10 @@ run("wifiState.jobs.push({job_id:'done',kind:'read',state:'completed',device_mac
 assert.match(element('wifi-jobs').innerHTML,/创建时间 时间未记录/);assert.match(element('wifi-jobs').innerHTML,/完成/);assert(!element('wifi-current-jobs').innerHTML.includes('done'));assert.equal(element('wifi-job-history').open,false);
 let finishWifi;handlers.platform_wifi=({op})=>op==='get'?new Promise(resolve=>{finishWifi=resolve}):{wifi,differences:[difference]};
 const oldRead=run('wifiReadScheme()');select(macB);finishWifi({job_id:'old',device_mac:macA,state:'completed'});await oldRead;
-assert.equal(element('wifi-result').textContent,'操作结果将在此显示');assert.equal(element('wifi-password').value,'');
+assert.equal(element('wifi-result').textContent,'操作结果将在此显示');
 assert(!calls.some(c=>c.name==='platform_publish'));
 const tabCalls=calls.length;
-element('wifi-id').value='unsaved-editor';
+element('wifi-family-name').value='unsaved-editor';
 run("wifiSelections.set('home',true);wifiPreview={scope:'keep'}");
 for(const tab of ['device','compare','bridge']) {
  run("wifiShowTab('"+tab+"')");
@@ -243,7 +234,7 @@ for(const tab of ['device','compare','bridge']) {
   assert.equal(element('wifi-panel-'+other).hidden,other!==tab);
  assert.equal(element('wifi-tab-'+tab).getAttribute('aria-selected'),'true');
 }
-assert.equal(element('wifi-id').value,'unsaved-editor');
+assert.equal(element('wifi-family-name').value,'unsaved-editor');
 assert.equal(run("wifiSelections.get('home')"),true);
 assert.equal(run('wifiPreview.scope'),'keep');
 assert.equal(calls.length,tabCalls);
@@ -310,56 +301,6 @@ assert(startup.includes('wifiInitPermissions()'));
 run("wifiPermissionGuideShown=false;wifiShowPermissions({platform:'macos',location:'not_determined',bluetooth:'allowed'});wifiGuidePermissionsOnce()");
 assert.equal(run('wifiPermissionGuideShown'),true);
 const guidedCalls=calls.length;run('wifiGuidePermissionsOnce()');assert.equal(calls.length,guidedCalls);
-
-// Exercise the real edit/delete/save chain through production HTML and IPC.
-let persistedWifi;
-handlers.platform_wifi=({op,body})=>{
-  if(op==='view')return {wifi:persistedWifi,differences:[],host:{state:'permission_required'}};
-  if(op==='save'){persistedWifi={...persistedWifi,local_revision:persistedWifi.local_revision+1,targets:structuredClone(body.targets)};return persistedWifi;}
-  throw new Error('Unexpected edit operation '+op);
-};
-const editFailures=[];
-for(const scenario of ['delete-open-editor','rename-original']) {
-  persistedWifi={...structuredClone(wifi),targets:[{...network,ssid:'Device-2G',password:'fixture-pass',version:7}]};
-  run('wifiDrafts.clear()');select(macA);await run('wifiRefreshView()');run('wifiEdit(0)');
-  if(scenario==='delete-open-editor')run('wifiDelete(0)');
-  else {element('wifi-id').value='renamed-id';element('wifi-label').value='Renamed network';element('wifi-ssid').value='Renamed-2G';}
-  await run('wifiSaveLocal()');
-  try {
-    assert.equal(persistedWifi.targets.length,1,'Editing must update the original row, not insert');
-    assert.equal(persistedWifi.targets[0].network_id,'home','Stable identity must be preserved');
-    assert.equal(persistedWifi.targets[0].password,'fixture-pass');
-    if(scenario==='delete-open-editor')assert.equal(persistedWifi.targets[0].deleted,true,'Open editor must not resurrect a deletion');
-    else assert.equal(persistedWifi.targets[0].label,'Renamed network');
-    assert.equal(persistedWifi.targets[0].version,7,'Editing must preserve the observed version');
-  }catch(e){editFailures.push(scenario+': '+e.message);}
-}
-assert.deepEqual(editFailures,[],'Wi-Fi edit regressions');
-// Undo, cancelled confirmation and duplicate identifiers must preserve the row.
-assert.equal(element('wifi-id').readOnly,true);
-run('wifiDelete(0)');assert.equal(run('wifiDraft[0].deleted'),true);
-run('wifiDelete(0)');await run('wifiSaveLocal()');assert.equal(persistedWifi.targets[0].deleted,false);
-context.window.confirm=()=>false;run('wifiDelete(0)');assert.equal(run('wifiDraft[0].deleted'),false);context.window.confirm=()=>true;
-run('wifiCancelEdit();wifiNew()');assert.equal(element('wifi-id').readOnly,false);
-element('wifi-id').value='home';element('wifi-host-ssid').value='Host 5G';element('wifi-ssid').value='Device';
-assert.equal(run('wifiSubmit()'),false);assert.match(element('wifi-result').textContent,/标识已存在/);
-assert.equal(run('wifiDraft.length'),1);
-// The user's real cache shape: imported from a different binding, hence read-only.
-persistedWifi={...structuredClone(wifi),targets:[{...network,origin:'other-bond',credential:'device',password:undefined,version:7}]};
-run('wifiDrafts.clear()');select(macA);await run('wifiRefreshView()');
-run('wifiEdit(0)');
-element('wifi-label').value='Edited imported network';element('wifi-password').value='fixture-new-pass';
-await run('wifiSaveLocal()');
-assert.equal(persistedWifi.targets.length,1);
-assert.equal(persistedWifi.targets[0].network_id,network.network_id);
-assert.equal(persistedWifi.targets[0].origin,'local');
-assert.equal(persistedWifi.targets[0].version,7);
-assert.equal(persistedWifi.targets[0].label,'Edited imported network');
-assert.equal(persistedWifi.targets[0].password,'fixture-new-pass');
-assert.match(element('wifi-save-result').textContent,/已保存/);
-console.log('Imported Bridge target: direct edit saved under original identity, nearby feedback OK');
-
-console.log('Wi-Fi edits: stable identity, rename, delete/save, undo, cancelled delete, duplicate protection and version/password retention OK');
 
 console.log('permission UI: combined first-start request, bounded follow-up, denied/settings, duplicate guard, real-grant visibility OK');
 console.log('device page: passive cache, full bond/legacy groups, offline drafts, queued reads, whole-network preview, stale-MAC isolation and secret cleanup OK');
@@ -504,7 +445,7 @@ handlers.platform_wifi=({op,body})=>{
 await run('wifiRefreshView()');
 assert.equal(run('wifiNetworkKey()'),'Home-5');
 assert.match(element('wifi-host').textContent,/Home-2.*Home-5/);
-assert.match(element('wifi-family-selection').innerHTML,/home/);
+assert.match(element('wifi-family-list').innerHTML,/home/);
 run('wifiFamilyEdit(0)');assert.equal(element('wifi-family-pass2').value,'fixture-password');
 run('wifiFamilyTogglePassword(2)');assert.equal(element('wifi-family-pass2').type,'text');
 element('wifi-family-name').value='My home';
@@ -525,8 +466,8 @@ assert.equal(familyImport.args.body.snapshot_id,'family-snapshot');assert.equal(
 assert(!calls.slice(familyImportStart).some(c=>c.args?.op==='get'));
 // Background refresh preserves a wired choice and unfinished subscription choices.
 element('wifi-wired-family').value='';run('wifiWiredDirty=true;wifiFamilySelectionDirty=true');
-element('wifi-family-selection').innerHTML='unfinished checkbox draft';await run('wifiRefreshView()');
-assert.equal(element('wifi-wired-family').value,'');assert.equal(element('wifi-family-selection').innerHTML,'unfinished checkbox draft');
+context.document.querySelectorAll=selector=>selector==='[data-wifi-family]:checked'?[{dataset:{wifiFamily:'home'}}]:[];await run('wifiRefreshView()');
+assert.equal(element('wifi-wired-family').value,'');assert.match(element('wifi-family-list').innerHTML,/checked/);context.document.querySelectorAll=()=>[];
 manualWifi=true;run('wifiFamilySelectionDirty=false;wifiWiredDirty=false');await run('wifiRefreshView()');
 assert.equal(element('wifi-ap01-auth').hidden,false);assert.equal(element('wifi-current-action').hidden,true);
 assert.equal(element('wifi-note-recovery').hidden,true);assert(!element('wifi-networks').innerHTML.includes('wifiSelect('));
@@ -535,3 +476,36 @@ const ap01Read=calls.filter(c=>c.name==='platform_wifi'&&c.args.op==='get').at(-
 assert.equal(run("wifiManualNetworkGuard(['home'])"),null);
 select(macB);assert.equal(element('wifi-ap01-code').value,'');assert.equal(run('wifiFamilySelectionDirty'),false);
 console.log('Wi-Fi families: shared edits, independent selections, family-name wire key, wired draft, cached import, password cleanup and AP01 manual selection OK');
+
+// Shared editor is the only edit path, including current host shortcuts.
+manualWifi=false;select(macA);await run('wifiRefreshView()');
+run('wifiEditCurrent()');assert.equal(run('wifiFamilyEditing'),'home');
+assert.equal(element('wifi-family-editor').open,true);
+const editCalls=calls.length;
+element('wifi-family-name').value='draft retained';await run('wifiRefreshView()');
+assert.equal(element('wifi-family-name').value,'draft retained');
+assert(!calls.slice(editCalls).some(c=>['save','sync','get'].includes(c.args?.op)));
+handlers.platform_wifi=()=>{throw 'wifi_library_revision_conflict'};
+await run('wifiFamilySave()');
+assert.equal(element('wifi-family-name').value,'draft retained');
+assert.equal(element('wifi-family-editor').open,true);
+assert.match(element('wifi-family-result').textContent,/已变化/);
+run('wifiFamilyCancel()');assert.equal(element('wifi-family-editor').open,false);
+assert.equal(element('wifi-family-pass2').value,'');
+element('wifi-direction').value='import';run('wifiRenderComparison()');assert.equal(element('wifi-family-import').hidden,false);
+element('wifi-direction').value='sync';run('wifiRenderComparison()');assert.equal(element('wifi-family-import').hidden,true);
+// Recovery uses a saved subscription; unknown credentials must not become empty passwords.
+run("wifiLibrary.devices[selectedTarget()]=['home'];wifiState.targets=[{network_id:'home',ssid:'Home-2',host_ssid:'Home-5',password:null}]");
+element('wifi-recovery-family').value='home';const recoveryCalls=calls.length;
+await run('wifiTrial()');assert.equal(calls.length,recoveryCalls);assert.match(element('wifi-result').textContent,/补充/);
+run("wifiState.targets[0].password='fixture-recovery'");
+handlers.platform_wifi=({op})=>op==='trial'?{stage:'trial_complete'}:{wifi:run('wifiState'),library:run('wifiLibrary')};
+await run('wifiTrial()');assert(calls.slice(recoveryCalls).some(c=>c.args?.op==='trial'));
+assert.match(element('wifi-result').textContent,/恢复原链路/);
+console.log('Unified Wi-Fi workspace: one editor, current-family shortcut, draft/conflict retention, direction import and bounded recovery OK');
+
+element('wifi-import-family').value='';const noDestinationCalls=calls.length;
+run("wifiSelections.clear();wifiSelections.set('unknown',true);wifiScheme={complete:true}");
+await run('wifiFamilyImport()');assert.equal(calls.length,noDestinationCalls);assert.match(element('wifi-result').textContent,/明确选择/);
+run("wifiDifferences=[{network_id:'unknown',device:[{writable:true,network:{}}]}]");
+element('wifi-direction').value='import';run('wifiPreviewSync()');assert.equal(element('wifi-sync-submit').disabled,true);assert.match(element('wifi-preview').textContent,/选择目标族/);

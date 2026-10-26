@@ -58,7 +58,7 @@ final class Runner: NSObject, WKNavigationDelegate {
                         let bitmap = NSBitmapImageRep(data:image.tiffRepresentation!)!
                         try bitmap.representation(using:.png,properties:[:])!.write(to:output.appendingPathComponent("\(width)-\(scenario).png"))
                         if scenario == "bridge" {
-                            _ = try await web.evaluateJavaScript("document.getElementById('wifi-editor').scrollIntoView({block:'start'});true;")
+                            _ = try await web.evaluateJavaScript("document.getElementById('wifi-family-editor').scrollIntoView({block:'start'});true;")
                             try await Task.sleep(nanoseconds:100_000_000)
                             let editor = try await web.takeSnapshot(configuration:config)
                             let editorBitmap=NSBitmapImageRep(data:editor.tiffRepresentation!)!

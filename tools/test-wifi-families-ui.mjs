@@ -12,7 +12,9 @@ const edge='C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
 assert(existsSync(edge),'Installed Edge required');
 let html=readFileSync(resolve(root,'bridge/crates/app/ui/index.html'),'utf8');
 const script=html.match(/<script>([\s\S]*?)<\/script>/)[1];
-const bootstrap="window.__uiCalls=[];window.__uiErrors=[];window.addEventListener('error',e=>window.__uiErrors.push(e.message));window.__TAURI__={core:{invoke:async(name,args)=>{window.__uiCalls.push({name,args});return {devices:[],profiles:[],templates:[],sources:[],jobs:[],plans:[],contexts:[]};}}};";
+const nativeHarness=readFileSync(resolve(root,'tools/test-wifi-ui.swift'),'utf8');
+const bootstrap=nativeHarness.match(/let bootstrap = """([\s\S]*?)"""/)[1];
+const scenarios=JSON.parse(nativeHarness.match(/for scenario in (\[[^\n]+\])/)[1]);
 const production=script.slice(0,script.lastIndexOf('\n  renderFamilyMenu();'));
 html=html.replace(script,bootstrap+production+'\n'+readFileSync(resolve(root,'tools/wifi-ui-scenarios.js'),'utf8'));
 const fixture=resolve(output,'fixture.html');writeFileSync(fixture,html);
@@ -39,7 +41,7 @@ try {
   await call('Page.enable');const results=[];
   for(const width of [560,1000]) {
     await call('Emulation.setDeviceMetricsOverride',{width,height:800,deviceScaleFactor:1,mobile:false});
-    for(const scenario of ['bridge','device','compare','wifi-family-edit','wifi-family-wired','wifi-family-ap01']) {
+    for(const scenario of scenarios) {
       await call('Page.navigate',{url:pathToFileURL(fixture).href});
       for(let n=0;n<50;n++){if(await evaluate('typeof window.__wifiUiScenario==="function"'))break;await new Promise(r=>setTimeout(r,100));}
       const result=await evaluate(`window.__wifiUiScenario(${JSON.stringify(scenario)})`);

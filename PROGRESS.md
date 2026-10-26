@@ -13,6 +13,8 @@
 
 ## 活跃事项与下一步
 
+- Wi-Fi页面已按单一共享族工作台重整：唯一列表/编辑器、比较页明确导入、有线回退/概览/恢复工具归位。Node/Edge80/窄宽审阅及隔离构建通过；macOS缺swiftc，B6实机未验。未部署候选`bridge/target-note4-sync/debug/bridge-app.exe`，39005184 B，SHA256 `621386772286dd20d581c0000bd76182c02772b31a992c75f46b62f879a085ab`。自动审批拒绝停桥/替换/重启，待用户明确授权；当前exe/data未改。[状态与部署脚本](project-workflow/wifi-families/status.md)。
+
 - Wi-Fi族Windows已部署，旧网络已合并3族（2异名双频+1同名双频；3设备均只连2.4G），密码保留；Note4选3族/BW保留原1族，AP01手选不变。共享族库/有线指定、Note/BW现有字段传族名。Rust337/定向56、Node/Edge12通过；macOS原生/部署及实机切网归B6。[状态](project-workflow/wifi-families/status.md)。
 
 - 书桌屏 `70041DD7A340`：USB部署`.38-bw`/`ota_0`，ROM `artifacts/desk-ota-20261026/desk-0.18.38-bw.bin`，1837008 B，SHA256 `2b002a21e2673a96a4c519fb746219737911a82f577a2b5597cb2a89fba6580e`，认证运行镜像SHA已匹配。原`.37`槽1/模板保留；154g构建、200/400宿主布局、匹配ELF栈通过，Note4未构建/部署。用户授权后经USB JTAG将原通用凭据转换为119B共享active WFS4，仅写NVS的0xC000扇区，完整NVS读回一致且原记录保留；实机加载1条/format4，HTTP确认connected/IP192.168.3.163。
