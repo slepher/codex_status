@@ -21,7 +21,8 @@ fn control_projection(job: &bridge_core::platform::wifi::Job) -> Value {
 pub async fn action(ctx: &AppCtx, mac: &str, op: &str, body: Value) -> Result<Value, String> {
     if op == "host" || op == "host_permission" {
         let request = op == "host_permission";
-        return tokio::task::spawn_blocking(move || host_wifi::read(request)).await.map_err(|_| "host_network_unavailable".into());
+        let host=tokio::task::spawn_blocking(move || host_wifi::read(request)).await.map_err(|_| "host_network_unavailable")?;
+        return Ok(resolve_host(ctx,host));
     }
     if matches!(op, "permissions" | "permission_location" | "permission_bluetooth" | "permission_all") {
         let request = match op { "permission_location" => 1, "permission_bluetooth" => 2, "permission_all" => 3, _ => 0 };
@@ -41,12 +42,44 @@ pub async fn action(ctx: &AppCtx, mac: &str, op: &str, body: Value) -> Result<Va
     let mac = DeviceIdentity::normalized_mac(mac).ok_or("invalid_device_mac")?;
     let svc = platform::service(ctx);
     let now = crate::device_now_secs(&mac).max(0) as u64;
+    if op=="library_import" {
+        return svc.wifi_library_import(&mac,body["library_revision"].as_u64().ok_or("wifi_library_revision_required")?,
+            body["local_revision"].as_u64().ok_or("local_revision_required")?,body["snapshot_id"].as_str().ok_or("snapshot_id_required")?,
+            body["network_id"].as_str().ok_or("invalid_wifi_selection")?,body["family_id"].as_str().ok_or("wifi_family_not_found")?,now)
+            .and_then(|v|Ok(serde_json::to_value(v)?)).map_err(|e|e.to_string());
+    }
+    if matches!(op,"library_save"|"library_select"|"library_wired") {
+        let expected=body["library_revision"].as_u64().ok_or("wifi_library_revision_required")?;
+        let mut library=svc.wifi_library();
+        if op=="library_save" {
+            let mut families:Vec<bridge_core::platform::wifi_families::Family>=serde_json::from_value(body["families"].clone()).map_err(|_|"invalid_wifi_family")?;
+            for (family,input) in families.iter_mut().zip(body["families"].as_array().ok_or("invalid_wifi_family")?) {
+                if let Some(old)=library.families.iter().find(|f|f.id==family.id) {
+                    if input.get("password_2g").is_none(){family.password_2g=old.password_2g.clone();}
+                    if input.get("password_5g").is_none(){family.password_5g=old.password_5g.clone();}
+                }
+            }
+            library.families=families;
+        } else if op=="library_select" {
+            let selected=serde_json::from_value(body["selected"].clone()).map_err(|_|"invalid_wifi_selection")?;
+            library.devices.insert(mac.clone(),selected);
+        } else {
+            library.wired_family=serde_json::from_value(body["family_id"].clone()).map_err(|_|"invalid_wifi_selection")?;
+        }
+        return svc.wifi_library_save(expected,library,now).and_then(|v|Ok(serde_json::to_value(v)?)).map_err(|e|e.to_string());
+    }
+    if crate::ap01::is_ap01(ctx,&mac) && matches!(op,"get"|"sync"|"sync_cached"|"ap01_reconcile"|"ap01_accept_observed") {
+        return ap01_action(ctx,&mac,op,&body).await;
+    }
+    if crate::ap01::is_ap01(ctx,&mac) && matches!(op,"use_current"|"trial"|"activate"|"recover_save"|"authorize") {
+        return Err("ap01_manual_network_selection".into());
+    }
     match op {
         "use_current" => {
             let host=current_host(ctx).await;
             let state=svc.wifi_state(&mac);
             if body["local_revision"].as_u64()!=Some(state.local_revision){return Err("local_revision_conflict".into());}
-            let target=current_target(&state,&host).ok_or("network_not_configured")?;
+            let target=current_device_target(ctx,&mac,&state,&host).ok_or("network_not_configured")?;
             if body["network_id"]!=target.network_id {return Err("host_network_changed".into());}
             let credentials: BTreeMap<String,String>=serde_json::from_value(body.get("credentials").cloned().unwrap_or(json!({}))).map_err(|_|"invalid_credentials")?;
             if credentials.keys().any(|id|id!=&target.network_id){return Err("invalid_credentials".into());}
@@ -91,7 +124,7 @@ pub async fn action(ctx: &AppCtx, mac: &str, op: &str, body: Value) -> Result<Va
             let expected = if op == "get" { None } else { Some(body["local_revision"].as_u64().ok_or("local_revision_required")?) };
             let job = if op == "sync" {
                 let host = current_host(ctx).await;
-                let ssid = host_wifi::current_ssid(&host).ok_or("host_network_unknown")?;
+                let ssid = host_wifi::network_key(&host).ok_or("host_network_unknown")?;
                 if body["host_ssid"].as_str() != Some(ssid) { return Err("host_network_changed".into()); }
                 if !fields.is_empty() { return Err("whole_network_required".into()); }
                 svc.wifi_queue_manual_sync(&mac, &ctx.bridge_id, selected, expected.unwrap(),
@@ -199,6 +232,109 @@ pub async fn action(ctx: &AppCtx, mac: &str, op: &str, body: Value) -> Result<Va
     add_device(ctx, &mac).await
 }
 
+// AP01 retains the original maintenance list API and physical manual selection.
+fn ap01_snapshot(reply:&Value,mac:&str,library:&bridge_core::platform::wifi_families::Library,now:u64)
+    -> Result<bridge_core::platform::wifi::Snapshot,String> {
+    if reply["result"]!="ok" || reply["device_mac"].as_str().and_then(DeviceIdentity::normalized_mac).as_deref()!=Some(mac) {
+        return Err("http_identity_mismatch".into());
+    }
+    let revision=reply["revision"].as_u64().filter(|r|*r<=u32::MAX as u64).ok_or("invalid_wifi_snapshot")?;
+    let rows=reply["profiles"].as_array().filter(|r|r.len()<=9).ok_or("invalid_wifi_snapshot")?;
+    let mut networks=Vec::new();
+    for row in rows {
+        let ssid=row["ssid"].as_str().ok_or("invalid_wifi_snapshot")?;
+        let family=library.families.iter().find(|f|f.ssid_2g==ssid);
+        let id=family.map(|f|f.id.clone()).unwrap_or_else(||format!("ap01_{}",&format!("{:x}",Sha256::digest(ssid.as_bytes()))[..16]));
+        let n=Network {network_id:id,host_ssid:family.map_or(ssid,|f|&f.name).into(),ssid:ssid.into(),
+            label:family.map_or(ssid,|f|&f.name).into(),credential:"device".into(),password:None,origin:"device".into(),version:revision,deleted:false};
+        networks.push(bridge_core::platform::wifi::ObservedNetwork{bond:"ap01".into(),writable:row["source"]=="saved",network:n});
+    }
+    let snapshot=bridge_core::platform::wifi::Snapshot {schema:2,device_mac:mac.into(),revision,
+        snapshot_id:uuid::Uuid::new_v4().simple().to_string(),complete:true,observed_at:now,networks,active:Value::Null,capacity:json!({"total":8})};
+    snapshot.validate(mac).map_err(|_|"invalid_wifi_snapshot")?;Ok(snapshot)
+}
+async fn ap01_action(ctx:&AppCtx,mac:&str,op:&str,body:&Value)->Result<Value,String> {
+    let svc=platform::service(ctx);
+    let row=svc.device_get(mac).ok_or("device_not_found")?;
+    let address=row["ip"].as_str().ok_or("device_ip_required")?;
+    let ip=address.split(':').next().ok_or("device_ip_required")?.parse::<std::net::Ipv4Addr>().map_err(|_|"device_ip_required")?;
+    let endpoint=format!("{ip}:{}",bridge_core::ap01::MAINTENANCE_HTTP_PORT);
+    ap01_action_at(ctx,mac,op,body,&endpoint).await
+}
+async fn ap01_action_at(ctx:&AppCtx,mac:&str,op:&str,body:&Value,endpoint:&str)->Result<Value,String> {
+    let svc=platform::service(ctx);
+    let code=body["device_code"].as_str().filter(|s|s.len()==8&&s.bytes().all(|b|b.is_ascii_digit())).ok_or("ap01_device_code_required")?;
+    let lock=platform::delivery_lock(ctx,mac);
+    let _guard=lock.try_lock().map_err(|_|"device_channel_busy")?;
+    let now=crate::device_now_secs(mac).max(0) as u64;
+    let read=match bridge_core::device_client::ap01_wifi_profiles(endpoint,"GET",code,None).await {
+        Ok(read)=>read,
+        Err(error)=>return Ok(json!({"state":"failed","stage":error.downcast_ref::<bridge_core::rendezvous::CommandFailure>().map_or("wifi_profiles_read",|e|e.stage),
+            "error":"ap01_wifi_read_failed","action":"check_device_network_and_code"})),
+    };
+    if read.0!=200 {return Ok(json!({"state":"failed","stage":"wifi_profiles_read","error":read.1["error"],"http_status":read.0}));}
+    let library=svc.wifi_library();let snapshot=ap01_snapshot(&read.1,mac,&library,now)?;
+    let state=svc.wifi_state(mac);
+    if op=="ap01_accept_observed" {
+        let cached=state.snapshot.as_ref().filter(|s|s.complete&&s.revision==snapshot.revision).ok_or("snapshot_conflict")?;
+        if serde_json::to_value(&cached.networks).ok()!=serde_json::to_value(&snapshot.networks).ok(){return Err("snapshot_conflict".into());}
+        let mut pending=state.ap01_pending.clone().ok_or("ap01_no_unknown_operation")?;
+        pending["state"]=json!("acknowledged_unknown");
+        svc.wifi_ap01_cache(mac,Some(snapshot),Some(pending)).map_err(|_|"wifi_job_persistence")?;
+        return Ok(json!({"state":"completed","stage":"observed_list_accepted","outcome":"original_result_unknown","manual_selection":true}));
+    }
+    let blocked=state.ap01_pending.as_ref().is_some_and(|p|p["state"]!="acknowledged_unknown");
+    if op=="get" || op=="ap01_reconcile" {
+        svc.wifi_ap01_cache(mac,Some(snapshot),state.ap01_pending.clone()).map_err(|_|"wifi_job_persistence")?;
+        return Ok(if blocked {
+            json!({"state":"needs_attention","stage":"wifi_profiles_readback","error":"ap01_wifi_result_unknown","action":"inspect_saved_list_and_credentials","pending":state.ap01_pending})
+        } else {json!({"state":"completed","stage":"complete_snapshot"})});
+    }
+    if blocked{return Err("ap01_wifi_result_unknown".into());}
+    if body["local_revision"].as_u64()!=Some(state.local_revision){return Err("local_revision_conflict".into());}
+    let cached=state.snapshot.as_ref().filter(|s|s.complete&&Some(s.snapshot_id.as_str())==body["snapshot_id"].as_str()).ok_or("snapshot_conflict")?;
+    if cached.revision!=snapshot.revision {return Err("revision_conflict".into());}
+    let selected:Vec<String>=serde_json::from_value(body["selected"].clone()).map_err(|_|"invalid_wifi_selection")?;
+    if selected.is_empty() || selected.iter().collect::<std::collections::BTreeSet<_>>().len()!=selected.len(){return Err("invalid_wifi_selection".into());}
+    let credentials:BTreeMap<String,String>=serde_json::from_value(body.get("credentials").cloned().unwrap_or(json!({}))).map_err(|_|"invalid_credentials")?;
+    if credentials.keys().any(|id|!selected.contains(id)){return Err("invalid_credentials".into());}
+    let mut profiles:Vec<Value>=read.1["profiles"].as_array().unwrap().iter().filter(|r|r["source"]=="saved").map(|r|json!({"ssid":r["ssid"]})).collect();
+    for id in &selected {
+        let mut n=state.targets.iter().find(|n|&n.network_id==id).ok_or("invalid_wifi_selection")?.clone();
+        if let Some(password)=credentials.get(id){n.password=Some(password.clone());n.validate().map_err(|_|"invalid_wifi_password")?;}
+        if n.deleted {profiles.retain(|r|r["ssid"]!=n.ssid);continue;}
+        let exists=profiles.iter().any(|r|r["ssid"]==n.ssid);
+        if n.password.is_none()&&!exists{return Err("credentials_required".into());}
+        profiles.retain(|r|r["ssid"]!=n.ssid);
+        let mut profile=json!({"ssid":n.ssid});
+        if let Some(password)=&n.password {profile["password"]=json!(password);}
+        profiles.push(profile);
+    }
+    if profiles.len()>8{return Err("capacity".into());}
+    let pending=json!({"expected_revision":snapshot.revision,"selected":selected,"state":"result_unknown","stage":"wifi_profiles_put"});
+    // Persist BEFORE PUT. A lost ACK/restart may only read back, never resubmit.
+    svc.wifi_ap01_cache(mac,None,Some(pending)).map_err(|_|"wifi_job_persistence")?;
+    let payload=json!({"device_mac":mac,"expected_revision":snapshot.revision,"profiles":profiles});
+    match bridge_core::device_client::ap01_wifi_profiles(endpoint,"PUT",code,Some(&payload)).await {
+        Ok((200,reply))=>{
+            let confirmed=ap01_snapshot(&reply,mac,&library,now)?;
+            if confirmed.revision!=snapshot.revision+1{return Err("ap01_wifi_result_unknown".into());}
+            svc.wifi_ap01_cache(mac,Some(confirmed),None).map_err(|_|"wifi_job_persistence")?;
+            Ok(json!({"state":"completed","stage":"saved","manual_selection":true}))
+        },
+        Ok((status,reply)) if reply["result"]=="rejected" || matches!(status,401|429)=>{
+            svc.wifi_ap01_cache(mac,None,None).map_err(|_|"wifi_job_persistence")?;
+            Ok(json!({"state":"failed","stage":"wifi_profiles_put","error":reply["error"],"http_status":status}))
+        },
+        Err(error) if error.downcast_ref::<bridge_core::rendezvous::CommandFailure>().is_some_and(|e|e.outcome==bridge_core::rendezvous::DispatchOutcome::NotSent)=>{
+            svc.wifi_ap01_cache(mac,None,None).map_err(|_|"wifi_job_persistence")?;
+            let failure=error.downcast_ref::<bridge_core::rendezvous::CommandFailure>().unwrap();
+            Ok(json!({"state":"failed","outcome":"not_sent","stage":failure.stage,"error":failure.reason,"action":"check_device_network","manual_selection":true}))
+        },
+        _=>Ok(json!({"state":"needs_attention","stage":"wifi_profiles_put","error":"ap01_wifi_result_unknown","action":"read_original_operation"})),
+    }
+}
+
 async fn add_device(ctx: &AppCtx, mac: &str) -> Result<Value, String> {
     host_wifi::require_device_bluetooth()?;
     let lock = platform::delivery_lock(ctx, mac);
@@ -230,18 +366,20 @@ async fn add_device(ctx: &AppCtx, mac: &str) -> Result<Value, String> {
 pub async fn view(ctx: &AppCtx, mac: &str, refresh: bool) -> Result<Value, String> {
     let mac = DeviceIdentity::normalized_mac(mac).ok_or("invalid_device_mac")?;
     let queued = if refresh { Some(action(ctx, &mac, "get", json!({})).await?) } else { None };
-    let (host, permissions) = tokio::task::spawn_blocking(|| (host_wifi::read(false), host_wifi::permissions(0))).await.map_err(|_| "host_network_unavailable")?;
+    let host=current_host(ctx).await;
+    let permissions=host_wifi::permissions(0);
     let _ = platform::service(ctx).wifi_expire(&mac, crate::device_now_secs(&mac).max(0) as u64);
     let mut state = platform::service(ctx).wifi_state(&mac);
     let history=platform::service(ctx).wifi_archived_jobs(&mac).map_err(|_|"wifi_history_unavailable")?;
     let result=state.jobs.iter().rev().find(|j|matches!(j.kind.as_str(),"trial"|"activate"))
         .map(control_projection).unwrap_or_else(||json!({"stage":"idle"}));
-    let target=current_target(&state,&host).cloned();
+    let target=current_device_target(ctx,&mac,&state,&host).cloned();
     let matched=target.as_ref().map(|n|n.network_id.as_str());
-    let connection=host_wifi::current_ssid(&host).and_then(|ssid|state.matching_connection(ssid))
+    let connection=host_wifi::network_key(&host).and_then(|ssid|state.matching_connection(ssid))
         .map(|c|c.view(crate::device_now_secs(&mac).max(0) as u64,&state.jobs));
     let result_pending=state.jobs.iter().any(|j|j.blocks_mutations());
-    let auto_state=if host["state"]!="connected" {host["state"].as_str().unwrap_or("unknown")}
+    let auto_state=if crate::ap01::is_ap01(ctx,&mac) {"manual_selection"}
+        else if host_wifi::network_key(&host).is_none() {host["state"].as_str().unwrap_or("unknown")}
         else if target.is_none(){"no_mapping"} else if let Some(c)=&connection {
             if result_pending&&c.automatic_state()=="retry_exhausted" {"awaiting_confirmation"} else {c.automatic_state()}
         } else {"waiting_for_window"};
@@ -249,10 +387,10 @@ pub async fn view(ctx: &AppCtx, mac: &str, refresh: bool) -> Result<Value, Strin
     // Terminal history is display-only; it never re-enters execution admission.
     state.jobs.splice(0..0,history.into_iter().rev());
     Ok(json!({"device_mac":mac,"online":platform::service(ctx).device_get(&mac).map(|d|json!({"presence":d["last_authenticated"]["body"]["presence"],"transports":d["last_authenticated"]["body"]["transports"],"wifi_control":d["last_authenticated"]["body"]["wifi_control"],"observed_at":d["last_authenticated"]["observed_at"],"boot_id":d["last_authenticated"]["body"]["boot_id"],"status_seq":d["last_authenticated"]["body"]["status_seq"]})),"host":host,"permissions":permissions,"result":result,"automatic_state":auto_state,
-        "matched_network_id":matched,"matched_target":target,"connection":connection,"differences":state.differences(),"wifi":state,"queued":queued}))
+        "matched_network_id":matched,"matched_target":target,"connection":connection,"differences":state.differences(),"wifi":state,"queued":queued,"library":platform::service(ctx).wifi_library(),"manual_selection":crate::ap01::is_ap01(ctx,&mac)}))
 }
 
-async fn current_host(ctx:&AppCtx) -> Value {
+async fn raw_host(ctx:&AppCtx) -> Value {
     #[cfg(test)]
     if let Ok(host)=std::env::var("CODEX_STATUS_TEST_HOST_WIFI") {
         return serde_json::from_str(&host).expect("synthetic test host network");
@@ -261,8 +399,23 @@ async fn current_host(ctx:&AppCtx) -> Value {
     if ctx.app_handle.get().is_none(){return json!({"state":"unavailable","networks":[]});}
     tokio::task::spawn_blocking(||host_wifi::read(false)).await.unwrap_or(Value::Null)
 }
+fn resolve_host(ctx:&AppCtx, mut host:Value) -> Value {
+    let library=platform::service(ctx).wifi_library();
+    // Empty library preserves existing installations until explicitly configured.
+    if !library.families.is_empty() {
+        host["family_name"]=json!(library.current_name(&host));
+    }
+    host
+}
+async fn current_host(ctx:&AppCtx) -> Value { resolve_host(ctx,raw_host(ctx).await) }
 fn current_target<'a>(state: &'a WifiState, host: &Value) -> Option<&'a Network> {
-    state.matching_target(host_wifi::current_ssid(host)?)
+    state.matching_target(host_wifi::network_key(host)?)
+}
+fn current_device_target<'a>(ctx:&AppCtx,mac:&str,state:&'a WifiState,host:&Value)->Option<&'a Network> {
+    let target=current_target(state,host)?;
+    let library=platform::service(ctx).wifi_library();
+    if !library.families.is_empty() && !library.devices.get(mac).is_some_and(|ids|ids.contains(&target.network_id)) {return None;}
+    Some(target)
 }
 fn target_query(target: &Network) -> Value {
     let mut fingerprint=Sha256::new();
@@ -275,7 +428,7 @@ fn target_query(target: &Network) -> Value {
 pub(crate) async fn plan_network(ctx: &AppCtx, mac: &str, address: std::net::Ipv4Addr, budget: Budget) -> Result<Value, String> {
     let host=tokio::time::timeout(budget.remaining(),current_host(ctx)).await.map_err(|_|"host_wifi_timeout")?;
     let state=platform::service(ctx).wifi_state(mac);
-    let target=current_target(&state,&host).ok_or("network_mapping_required")?;
+    let target=current_device_target(ctx,&mac,&state,&host).ok_or("network_mapping_required")?;
     let network=json!({"v":bridge_core::template::PLAN_ACTIVATION_VERSION,
         "bridge_addr":address.to_string(),"bridge_port":ctx.config.port,"target":target_query(target)});
     bridge_core::template::validate_plan_activation(&network).map_err(|_|"plan_network_shape")?;
@@ -355,7 +508,7 @@ pub async fn prepare_connection(ctx:&AppCtx,mac:&str,link:&mut bridge_ble::Devic
     let host=tokio::time::timeout(budget.remaining(),current_host(ctx)).await
         .map_err(|_|"host_network_timeout".to_owned())?;
     let state=platform::service(ctx).wifi_state(mac);
-    let Some(target)=current_target(&state,&host) else{let _=platform::service(ctx).wifi_clear_connection(mac);return Ok(());};
+    let Some(target)=current_device_target(ctx,&mac,&state,&host) else{let _=platform::service(ctx).wifi_clear_connection(mac);return Ok(());};
     let reply=link.command_budget("wifi_match",target_query(target),budget.remaining()).await
         .map_err(|error|bridge_core::rendezvous::wifi_error(&error).1.to_owned())?;
     if reply["ok"]!=true {return Err(reply["error"].as_str().unwrap_or("protocol_rejected").to_owned());}
@@ -429,7 +582,7 @@ pub async fn automatic_on_link(ctx: &AppCtx,mac:&str,link:&mut bridge_ble::Devic
         let host=tokio::time::timeout(budget.remaining(), current_host(ctx)).await.map_err(|_| "host_network_timeout".to_owned())?;
         host_wifi::require_same_network(&contact_host,&host)?;
         let state=platform::service(ctx).wifi_state(mac);
-        let Some(target)=current_target(&state,&host).cloned() else{
+        let Some(target)=current_device_target(ctx,&mac,&state,&host).cloned() else{
             return if selection_only { Ok(()) } else { Err("network_mapping_required".into()) };
         };
         let now=crate::device_now_secs(mac).max(0) as u64;
@@ -579,6 +732,16 @@ async fn acknowledge_receipts_http(ctx:&AppCtx,mac:&str) {
 pub async fn opportunity_admitted(ctx: &AppCtx, mac: &str, job_id: &str, budget: bridge_core::rendezvous::Budget) {
     let svc = platform::service(ctx).clone(); let now = crate::device_now_secs(mac).max(0) as u64;
     let Some(job) = svc.wifi_state(mac).jobs.into_iter().find(|j| j.job_id == job_id && bridge_core::rendezvous::admit_wifi(j, now)) else { return; };
+    if !job.sent {
+        if let Some(expected)=job.host_ssid.as_deref() {
+            let host=match tokio::time::timeout(budget.remaining(),current_host(ctx)).await {
+                Ok(host)=>host,Err(_)=>{defer_job(ctx,mac,job_id,"host_network_timeout");return;}
+            };
+            if host_wifi::network_key(&host)!=Some(expected) {
+                let _=svc.wifi_finish(mac,job_id,"failed",Some("host_network_changed"),now);return;
+            }
+        }
+    }
     if work_blocked(ctx, mac) {defer_job(ctx,mac,job_id,"device_delivery_pending");return;}
     let Some(link) = platform::device_link_for_mac(ctx, mac) else {defer_job(ctx,mac,job_id,"device_endpoint_unavailable");return;};
     tracing::info!(event="wifi_attempt",device_mac=%mac,job_id,kind=%job.kind,"Wi-Fi task checking HTTP connection");
@@ -717,7 +880,7 @@ async fn unified_on_link(ctx:&AppCtx,mac:&str,link:&mut bridge_ble::DeviceConnec
                 Ok(host)=>host,
                 Err(_)=>{defer_job(ctx,mac,&job.job_id,"host_network_timeout");return;}
             };
-            if host_wifi::current_ssid(&host) != Some(expected) {
+            if host_wifi::network_key(&host) != Some(expected) {
                 let _ = svc.wifi_finish(mac, &job.job_id, "failed", Some("host_network_changed"), now);
                 return;
             }
@@ -821,6 +984,101 @@ pub async fn recover_on_link_budget(ctx: &AppCtx, mac: &str, link: &mut bridge_b
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn wifi_family_application_paths_and_mcp_secret_boundary() {
+        let root=tempfile::tempdir().unwrap();let mac="AABBCCDDEEFF";let other="AABBCCDDEE01";
+        let ctx=platform::ble_close_lock_tests::test_ctx(root.path(),&[mac,other]);
+        action(&ctx,mac,"library_save",json!({"library_revision":0,"families":[{"id":"home","ssid_2g":"House-2","ssid_5g":"House-5","password_2g":"synthetic-password","password_5g":"synthetic-password"}]})).await.unwrap();
+        action(&ctx,mac,"library_select",json!({"library_revision":1,"selected":["home"]})).await.unwrap();
+        action(&ctx,mac,"library_wired",json!({"library_revision":2,"family_id":"home"})).await.unwrap();
+        let svc=platform::service(&ctx);let state=svc.wifi_state(mac);
+        for raw in [json!({"state":"connected","networks":[{"ssid":"House-2"}]}),json!({"state":"connected","networks":[{"ssid":"House-5"}]}),json!({"state":"no_wifi"})] {
+            let host=resolve_host(&ctx,raw);let target=current_device_target(&ctx,mac,&state,&host).unwrap();
+            assert_eq!(target.host_ssid,"House-5");assert_eq!(target.ssid,"House-2");
+            assert!(current_device_target(&ctx,other,&state,&host).is_none());
+        }
+        let unknown=resolve_host(&ctx,json!({"state":"connected","networks":[{"ssid":"Unknown"}]}));
+        assert!(current_device_target(&ctx,mac,&state,&unknown).is_none());
+        let view=platform::tool(&ctx,"platform_wifi_view",&json!({"mac":mac})).await.unwrap();
+        assert!(!view.contains("synthetic-password"));assert!(!view.contains("password_2g"));
+        assert!(platform::tool(&ctx,"platform_wifi_action",&json!({"mac":mac,"op":"library_save","body":{
+            "library_revision":3,"families":[{"id":"home","ssid_2g":"House-2","password_2g":"forbidden"}]}})).await.is_err());
+        // Non-secret MCP edits preserve passwords omitted by its redacted view.
+        platform::tool(&ctx,"platform_wifi_action",&json!({"mac":mac,"op":"library_save","body":{
+            "library_revision":3,"families":[{"id":"home","name":"Renamed","ssid_2g":"House-2","ssid_5g":"House-5"}]}})).await.unwrap();
+        assert_eq!(svc.wifi_library().families[0].password_2g.as_deref(),Some("synthetic-password"));
+        assert_eq!(svc.wifi_state(mac).targets[0].host_ssid,"Renamed");
+    }
+
+    #[tokio::test]
+    async fn wifi_ap01_list_roundtrip_manual_auth_and_lost_ack_never_reposts() {
+        use axum::{extract::State,http::{Method,HeaderMap,StatusCode},body::Bytes,response::IntoResponse,routing::any,Json,Router};
+        use std::sync::{Arc,Mutex};
+        #[derive(Default)] struct Fake {revision:u64,puts:usize,rows:Vec<Value>,lose_ack:bool,wrong_mac:bool}
+        async fn route(State(fake):State<Arc<Mutex<Fake>>>,method:Method,headers:HeaderMap,body:Bytes)->axum::response::Response {
+            if headers.get("authorization").and_then(|h|h.to_str().ok())!=Some("Bearer 01234567") {
+                return (StatusCode::UNAUTHORIZED,Json(json!({"error":"manual_auth","result":"rejected"}))).into_response();
+            }
+            let mut f=fake.lock().unwrap();
+            if method==Method::PUT {
+                let request:Value=serde_json::from_slice(&body).unwrap();
+                assert_eq!(request["device_mac"],"AABBCCDDEEFF");assert_eq!(request["expected_revision"],f.revision);
+                f.puts+=1;f.revision+=1;
+                f.rows=request["profiles"].as_array().unwrap().iter().map(|r|json!({"ssid":r["ssid"],"has_password":true,"source":"saved","current":false})).collect();
+                if f.lose_ack {return (StatusCode::SERVICE_UNAVAILABLE,Json(json!({"result":"unknown","error":"readback_unavailable"}))).into_response();}
+            }
+            Json(json!({"result":"ok","device_mac":if f.wrong_mac {"AABBCCDDEE00"}else{"AABBCCDDEEFF"},"revision":f.revision,"profiles":f.rows})).into_response()
+        }
+        let fake=Arc::new(Mutex::new(Fake{rows:vec![json!({"ssid":"Keep","has_password":true,"source":"saved","current":true})],..Default::default()}));
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let endpoint=listener.local_addr().unwrap().to_string();
+        let router=Router::new().route("/api/wifi/profiles",any(route)).with_state(fake.clone());
+        let server=tokio::spawn(async move {axum::serve(listener,router).await.unwrap();});
+        let root=tempfile::tempdir().unwrap();let mac="AABBCCDDEEFF";let ctx=platform::ble_close_lock_tests::test_ctx(root.path(),&[mac]);
+        let svc=platform::service(&ctx);
+        let state=svc.wifi_save(mac,0,serde_json::from_value(json!([{"network_id":"home","host_ssid":"House-5","ssid":"House-2","password":"synthetic-password","credential":"replace"}])).unwrap(),1).unwrap();
+        let code=json!({"device_code":"01234567"});
+        assert_eq!(ap01_action_at(&ctx,mac,"get",&json!({}),&endpoint).await.unwrap_err(),"ap01_device_code_required");
+        assert_eq!(ap01_action_at(&ctx,mac,"get",&json!({"device_code":"00000000"}),&endpoint).await.unwrap()["error"],"manual_auth");
+        ap01_action_at(&ctx,mac,"get",&code,&endpoint).await.unwrap();
+        assert!(svc.wifi_state(mac).snapshot.unwrap().networks[0].network.password.is_none());
+        fake.lock().unwrap().wrong_mac=true;
+        assert_eq!(ap01_action_at(&ctx,mac,"get",&code,&endpoint).await.unwrap_err(),"http_identity_mismatch");
+        fake.lock().unwrap().wrong_mac=false;
+        let snapshot=svc.wifi_state(mac).snapshot.unwrap();
+        let mut request=json!({"device_code":"01234567","local_revision":state.local_revision,"snapshot_id":snapshot.snapshot_id,"selected":["home"]});
+        let reply=ap01_action_at(&ctx,mac,"sync",&request,&endpoint).await.unwrap();
+        assert_eq!(reply["state"],"completed");assert_eq!(reply["manual_selection"],true);
+        assert_eq!(fake.lock().unwrap().rows.len(),2);assert_eq!(fake.lock().unwrap().puts,1);
+        assert!(svc.wifi_state(mac).ap01_pending.is_none());
+        // A committed write whose response was lost stays unknown; query only.
+        request["snapshot_id"]=json!(svc.wifi_state(mac).snapshot.unwrap().snapshot_id);
+        fake.lock().unwrap().lose_ack=true;
+        assert_eq!(ap01_action_at(&ctx,mac,"sync",&request,&endpoint).await.unwrap()["state"],"needs_attention");
+        assert_eq!(ap01_action_at(&ctx,mac,"sync",&request,&endpoint).await.unwrap_err(),"ap01_wifi_result_unknown");
+        assert_eq!(ap01_action_at(&ctx,mac,"ap01_reconcile",&code,&endpoint).await.unwrap()["state"],"needs_attention");
+        assert_eq!(fake.lock().unwrap().puts,2);
+        let persisted=std::fs::read_to_string(root.path().join("platform/state.json")).unwrap();assert!(!persisted.contains("01234567"));
+        let accepted=ap01_action_at(&ctx,mac,"ap01_accept_observed",&code,&endpoint).await.unwrap();
+        assert_eq!(accepted["outcome"],"original_result_unknown");assert_eq!(fake.lock().unwrap().puts,2);
+        server.abort();
+        // Drop the listening socket before replying to GET: PUT is definitively
+        // not sent, so it must clear the uncertainty fence and permit retry.
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let offline_endpoint=listener.local_addr().unwrap().to_string();
+        let reply={let f=fake.lock().unwrap();json!({"result":"ok","device_mac":mac,"revision":f.revision,"profiles":f.rows})};
+        let server=tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt,AsyncWriteExt};
+            let (mut connection,_)=listener.accept().await.unwrap();drop(listener);
+            let mut buffer=[0u8;4096];let _=connection.read(&mut buffer).await.unwrap();
+            let body=serde_json::to_string(&reply).unwrap();
+            connection.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).as_bytes()).await.unwrap();
+        });
+        request["snapshot_id"]=json!(svc.wifi_state(mac).snapshot.unwrap().snapshot_id);
+        let failed=ap01_action_at(&ctx,mac,"sync",&request,&offline_endpoint).await.unwrap();
+        assert_eq!(failed["outcome"],"not_sent");assert_eq!(failed["stage"],"http_connect");
+        assert!(svc.wifi_state(mac).ap01_pending.is_none());server.await.unwrap();
+    }
+
     #[test]
     fn pending_credentials_are_isolated_by_application_instance() {
         let first=tempfile::tempdir().unwrap();let second=tempfile::tempdir().unwrap();

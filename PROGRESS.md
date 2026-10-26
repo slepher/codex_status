@@ -4,12 +4,16 @@
 
 ## 当前部署
 
+- Windows默认Bridge已部署Wi-Fi族并重启：`bridge/target/debug/bridge-app.exe`，39009280 B，SHA256 `9077bb8cb338034291612fff5280c95ad6c5be456a2f7f0b4507c12280311cf1`。health204/MCP44及族schema1读取通过；旧exe及286文件data完整备份校验，3设备Profile/许可及Bridge设置保留。[验收](project-workflow/wifi-families/status.md)
+
 - Mac Bridge 已重建/重启：`artifacts/bridge-macos/Codex Status Bridge.app`，exe 79336800 B，SHA256 `d0f0948cafbe3c7a5fd70b9d49b3b0e4809115098e972bed38266119681d35b9`。supervisor/child 正常，8765/8766 监听。新设备默认同步，旧设置保留；AP01/Note4 ACK seq8/1011均已显示。[验收](project-workflow/default-data-sync/status.md)
 - AP01 `34F01557210B`：首尾动画修复ROM应用槽1，版本`1.0.2_0041`、build`ec0a58f71f65c2830c08c9bfd7c155db`、Bundle`6a8d702a`。ROM `artifacts/ap01-wifi-animation-20261022/ap01-wifi-animation-candidate01.bin`，7045480 B，SHA256 `5a49f78b550fabbafcc3cde75aa1f6e9986fb9dd88320cd029cd6655d61e0cee`。10-22认证槽1，用户确认原厂界面/旋钮/App及双向快转首尾正常；10-23再次认证同build，未刷机、未复核槽位。
 - 救援0031/槽0保留：10-22先认证build`53574b55382d55a514ef5b7767db66d9`及槽0，再单次写应用1；按用户要求未整槽读回/导出，停止标记保留。
 - Note4 `.106-note4`认证通过；ROM `artifacts/bridge-macos/note4-0.18.106-plan-activation.bin`，1865680 B，SHA256 `36ca4c3aacdc7b27c9c7cebe4cb18df0bee4048461e189f51050b6332b24ceb4`。10-23未刷机。
 
 ## 活跃事项与下一步
+
+- Wi-Fi族Windows已部署：共享族库/逐设备订阅/有线指定、Note/BW现有字段传族名、AP01列表同步与手选。Rust337/定向56、Node/Edge12通过；macOS原生/部署及实机切网归B6。[状态](project-workflow/wifi-families/status.md)。
 
 - AP01 构建已统一到兄弟固件仓库，App 仅源码/配置及兼容入口；独立版/App版、隔离构建和旧命令验证通过，均未部署。[记录](project-workflow/ap01-unified-build/status.md)
 - 未部署 platform ROM：`D:\Documents\PlatformIO\Projects\cuktech-ap01-firmware\build\unified-0041\platform.bin`，6875656 B，SHA256 `d77900bf5ce60ac9d1139a37d7a7314e75f2a6ac1f021eb7f04bfd9b440e2859`。

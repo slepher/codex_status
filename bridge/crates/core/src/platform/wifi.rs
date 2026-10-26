@@ -291,6 +291,9 @@ fn connection_from_disk<'de,D:serde::Deserializer<'de>>(d:D)->std::result::Resul
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WifiState {
+    /// AP01 list-write uncertainty fence. Metadata only, never passwords or menu codes.
+    #[serde(default)]
+    pub ap01_pending: Option<Value>,
     #[serde(default)]
     pub next_job_seq: u64,
     pub local_revision: u64,

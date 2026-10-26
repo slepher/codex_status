@@ -143,6 +143,8 @@ impl AssetJob {
 #[serde(deny_unknown_fields)]
 pub struct PersistedState {
     #[serde(default)]
+    pub wifi_library: super::wifi_families::Library,
+    #[serde(default)]
     pub wifi: BTreeMap<String, WifiState>,
     #[serde(default)]
     pub sources: Vec<DataSource>,
@@ -183,6 +185,7 @@ pub struct PlatformService {
 }
 
 struct Inner {
+    wifi_library: super::wifi_families::Library,
     wifi: BTreeMap<String, WifiState>,
     sources: BTreeMap<String, DataSource>,
     snapshots: BTreeMap<String, SourceSnapshot>,
@@ -213,6 +216,7 @@ impl PlatformService {
         let persisted: PersistedState =
             store::read_json(&dir.join("state.json"))?.unwrap_or_default();
         let PersistedState {
+            mut wifi_library,
             mut wifi,
             sources: persisted_sources,
             templates: persisted_templates,
@@ -229,6 +233,7 @@ impl PlatformService {
             contexts,
             plans,
         } = persisted;
+        wifi_library.validate()?;
         for state in wifi.values_mut() { state.recover(); }
         for job in persisted_ota_jobs.values_mut() {
             if job.state == "transferring" { job.state = "awaiting_confirmation".into(); }
@@ -340,6 +345,7 @@ impl PlatformService {
         let service = Self {
             dir,
             inner: Mutex::new(Inner {
+                wifi_library,
                 wifi,
                 sources,
                 snapshots: BTreeMap::new(),
@@ -422,6 +428,7 @@ impl PlatformService {
         // Keep frozen in-flight Bundles across Bridge restarts. The device's
         // authenticated status and idempotent BEGIN decide whether to resume.
         let state = PersistedState {
+            wifi_library: inner.wifi_library.clone(),
             wifi: inner.wifi.clone(),
             sources: inner.sources.values().cloned().collect(),
             templates: inner.templates.values().cloned().collect(),
@@ -551,6 +558,76 @@ impl PlatformService {
         }
         Ok(())
     }
+    pub fn wifi_library(&self) -> super::wifi_families::Library { self.inner.lock().unwrap().wifi_library.clone() }
+
+    /// Library and per-device projections commit together. Saving never performs I/O to devices.
+    pub fn wifi_library_save(&self, expected:u64, mut next:super::wifi_families::Library, now:u64) -> Result<super::wifi_families::Library> {
+        let mut inner=self.inner.lock().unwrap();
+        self.wifi_library_commit(&mut inner,expected,&mut next,now)
+    }
+    fn wifi_library_commit(&self, inner:&mut Inner, expected:u64, next:&mut super::wifi_families::Library, now:u64) -> Result<super::wifi_families::Library> {
+        anyhow::ensure!(inner.wifi_library.revision==expected,"wifi_library_revision_conflict");
+        next.validate()?;
+        let mut wifi=inner.wifi.clone();
+        let macs:BTreeSet<_>=inner.wifi_library.devices.keys().chain(next.devices.keys()).cloned().collect();
+        for mac in macs {
+            let record=inner.devices.get(&mac).context("device_not_found")?;
+            let state=wifi.entry(mac.clone()).or_default();
+            let old_ids=inner.wifi_library.devices.get(&mac).cloned().unwrap_or_default();
+            let selected=next.devices.get(&mac).cloned().unwrap_or_default();
+            let capacity=if record.capabilities.firmware_target==crate::platform::model::FIRMWARE_TARGET_AP01 {8}else{12};
+            anyhow::ensure!(selected.len()<=capacity,"capacity");
+            // Unsubscribing is local-only. Preserve device bytes until an explicit
+            // delete is approved through the existing comparison/sync flow.
+            let mut targets:Vec<_>=state.targets.iter().filter(|n|!old_ids.contains(&n.network_id)).cloned().collect();
+            for id in selected {
+                let mut n=next.get(&id)?.network(&record.capabilities.firmware_target)?;
+                if let Some(old)=state.targets.iter().find(|n|n.network_id==id) {
+                    if old.host_ssid==n.host_ssid && old.ssid==n.ssid && old.label==n.label && old.password==n.password && !old.deleted {
+                        n=old.clone();
+                    }
+                }
+                // Explicitly subscribing may adopt an identical legacy mapping.
+                targets.retain(|old| !((old.deleted && old.network_id==id) ||
+                    (old.host_ssid==n.host_ssid && old.ssid==n.ssid && (old.password==n.password || old.password.is_none()) && !old.deleted)));
+                anyhow::ensure!(!targets.iter().any(|old|old.network_id==id),"wifi_family_network_id_conflict");
+                targets.push(n);
+            }
+            if serde_json::to_value(&targets)?!=serde_json::to_value(&state.targets)? {state.save(state.local_revision,targets,now)?;}
+        }
+        next.revision=expected.checked_add(1).context("revision_exhausted")?;
+        let old_library=std::mem::replace(&mut inner.wifi_library,next.clone());
+        let old_wifi=std::mem::replace(&mut inner.wifi,wifi);
+        if let Err(e)=Self::persist(inner,&self.state_path()) {inner.wifi_library=old_library;inner.wifi=old_wifi;return Err(e);}
+        Ok(next.clone())
+    }
+
+    /// Import a cached row into an explicitly chosen family; never infer an unknown grouping.
+    pub fn wifi_library_import(&self,mac:&str,expected:u64,local_revision:u64,snapshot_id:&str,network_id:&str,family_id:&str,now:u64)->Result<super::wifi_families::Library> {
+        let mut inner=self.inner.lock().unwrap();
+        let state=inner.wifi.get(mac).context("snapshot_required")?;
+        anyhow::ensure!(state.local_revision==local_revision,"local_revision_conflict");
+        let snapshot=state.snapshot.as_ref().filter(|s|s.complete && s.snapshot_id==snapshot_id).context("snapshot_conflict")?;
+        let rows:Vec<_>=snapshot.networks.iter().filter(|r|r.network.network_id==network_id).collect();
+        anyhow::ensure!(rows.len()==1,"ambiguous_network_id");
+        let n=&rows[0].network;
+        let mut next=inner.wifi_library.clone();
+        let family=next.families.iter_mut().find(|f|f.id==family_id).context("wifi_family_not_found")?;
+        // AP01 reads deliberately omit passwords: retain a known password only
+        // for the same SSID. Never replace credentials with an invented blank.
+        if n.password.is_none() && family.ssid_2g!=n.ssid {family.password_2g=None;}
+        family.ssid_2g=n.ssid.clone();
+        if n.password.is_some(){family.password_2g=n.password.clone();if family.ssid_5g==n.ssid {family.password_5g=n.password.clone();}}
+        self.wifi_library_commit(&mut inner,expected,&mut next,now)
+    }
+
+    pub fn wifi_ap01_cache(&self,mac:&str,snapshot:Option<WifiSnapshot>,pending:Option<Value>)->Result<()> {
+        self.wifi_mutate(mac,|s| {
+            if let Some(snapshot)=snapshot {snapshot.validate(mac)?;s.snapshot=Some(snapshot);}
+            s.ap01_pending=pending;Ok(())
+        })
+    }
+
     pub fn wifi_state(&self, mac: &str) -> WifiState {
         DeviceIdentity::normalized_mac(mac).and_then(|mac| self.inner.lock().unwrap().wifi.get(&mac).cloned()).unwrap_or_default()
     }
@@ -586,7 +663,21 @@ impl PlatformService {
         self.wifi_set_connection(mac,facts)
     }
     pub fn wifi_save(&self, mac: &str, expected: u64, targets: Vec<WifiNetwork>, now: u64) -> Result<WifiState> {
-        self.wifi_mutate(mac, |s| { s.save(expected, targets, now)?; Ok(s.clone()) })
+        let mac=DeviceIdentity::normalized_mac(mac).context("invalid_device_mac")?;
+        let mut inner=self.inner.lock().unwrap();
+        let old=inner.wifi.get(&mac).cloned();
+        let mut next=old.clone().unwrap_or_default();
+        for id in inner.wifi_library.devices.get(&mac).into_iter().flatten() {
+            let before=next.targets.iter().find(|n|&n.network_id==id).context("wifi_family_not_found")?;
+            let after=targets.iter().find(|n|&n.network_id==id).context("wifi_shared_edit_library")?;
+            anyhow::ensure!(before==after,"wifi_shared_edit_library");
+        }
+        next.save(expected,targets,now)?;
+        inner.wifi.insert(mac.clone(),next.clone());
+        if let Err(e)=Self::persist(&inner,&self.state_path()) {
+            if let Some(old)=old {inner.wifi.insert(mac,old);}else{inner.wifi.remove(&mac);}return Err(e);
+        }
+        Ok(next)
     }
     pub fn wifi_queue(&self, mac: &str, bridge: &str, kind: &str, selected: Vec<String>, now: u64) -> Result<WifiJob> {
         self.wifi_queue_fields(mac, bridge, kind, selected, BTreeMap::new(), now)
@@ -789,12 +880,29 @@ impl PlatformService {
         self.wifi_import_fields_checked(mac, selected, fields, expected, None, now)
     }
     pub fn wifi_import_fields_checked(&self, mac: &str, selected: &[String], fields: &BTreeMap<String, Vec<String>>, expected: u64, snapshot_id: Option<&str>, now: u64) -> Result<WifiState> {
-        self.wifi_mutate(mac, |s| {
-            if snapshot_id.is_some_and(|id| s.snapshot.as_ref().map(|v| v.snapshot_id.as_str()) != Some(id)) {
-                bail!("snapshot_conflict");
+        let mac=DeviceIdentity::normalized_mac(mac).context("invalid_device_mac")?;
+        let mut inner=self.inner.lock().unwrap();
+        let mut next=inner.wifi.get(&mac).cloned().unwrap_or_default();
+        if snapshot_id.is_some_and(|id|next.snapshot.as_ref().map(|s|s.snapshot_id.as_str())!=Some(id)) {bail!("snapshot_conflict");}
+        next.import_fields(selected,fields,expected,now)?;
+        let mut library=inner.wifi_library.clone();
+        let mut shared=false;
+        for id in selected {
+            if !library.devices.get(&mac).is_some_and(|ids|ids.contains(id)){continue;}
+            if let Some(f)=library.families.iter_mut().find(|f|&f.id==id) {
+                let n=next.targets.iter().find(|n|&n.network_id==id).context("invalid_wifi_selection")?;
+                if n.password.is_none() && f.ssid_2g!=n.ssid {f.password_2g=None;}
+                f.name=n.host_ssid.clone();f.ssid_2g=n.ssid.clone();
+                if n.password.is_some(){f.password_2g=n.password.clone();if f.ssid_5g==n.ssid {f.password_5g=n.password.clone();}}
+                shared=true;
             }
-            s.import_fields(selected, fields, expected, now)?; Ok(s.clone())
-        })
+        }
+        let old_wifi=inner.wifi.clone();
+        inner.wifi.insert(mac.clone(),next);
+        let result=if shared {let revision=library.revision;self.wifi_library_commit(&mut inner,revision,&mut library,now).map(|_|())}
+            else {Self::persist(&inner,&self.state_path())};
+        if let Err(e)=result {inner.wifi=old_wifi;return Err(e);}
+        Ok(inner.wifi[&mac].clone())
     }
     pub fn wifi_expire(&self, mac: &str, now: u64) -> Result<()> {
         if self.wifi_state(mac).jobs.iter().any(|j| !j.terminal() && now >= j.expires_at) {
@@ -3478,6 +3586,74 @@ mod tests {
         )
         .unwrap();
         svc
+    }
+
+    #[test]
+    fn wifi_family_projection_import_restart_and_atomic_failure() {
+        let root=tempfile::tempdir().unwrap();let svc=PlatformService::open(root.path()).unwrap();
+        let a="AABBCCDDEEFF";let b="AABBCCDDEE01";let ap="AABBCCDDEE02";
+        svc.device_upsert(DeviceIdentity::new(a,"BW").unwrap(),DeviceCapabilities::ssd1681_154g()).unwrap();
+        let mut note=DeviceCapabilities::ssd1681_154g();
+        note.firmware_target=crate::platform::model::FIRMWARE_TARGET_NOTE4.into();
+        note.render_target=crate::platform::model::RENDER_TARGET_NOTE4.into();note.width=400;note.height=300;
+        svc.device_upsert(DeviceIdentity::new(b,"Note").unwrap(),note).unwrap();
+        svc.device_upsert(DeviceIdentity::new(ap,"AP01").unwrap(),DeviceCapabilities::ap01()).unwrap();
+        // Identical legacy mapping is adopted on an explicit subscription.
+        svc.wifi_save(a,0,serde_json::from_value(json!([{"network_id":"old","host_ssid":"Home-5","ssid":"Home-2","password":"password-home","credential":"replace"}])).unwrap(),1).unwrap();
+        let mut lib:super::super::wifi_families::Library=serde_json::from_value(json!({"revision":0,"families":[
+            {"id":"home","ssid_2g":"Home-2","ssid_5g":"Home-5","password_2g":"password-home"},
+            {"id":"office","ssid_2g":"Office","password_2g":"password-office"}],
+            "devices":{(a):["home"],(b):["home","office"],(ap):["office"]},"wired_family":"home"})).unwrap();
+        for mac in lib.devices.keys() {assert!(svc.device_get(mac).is_some(),"missing test device {mac}");}
+        lib=svc.wifi_library_save(0,lib,2).unwrap();
+        assert_eq!(svc.wifi_state(a).targets.len(),1);
+        assert_eq!(svc.wifi_state(a).targets[0].host_ssid,"Home-5");
+        assert_eq!(svc.wifi_state(b).targets.len(),2);assert_eq!(svc.wifi_state(ap).targets.len(),1);
+        let job=svc.wifi_queue(a,"bridge","recovery_save",vec!["home".into()],3).unwrap();
+        lib.families[0].name="Home family".into();lib=svc.wifi_library_save(1,lib,4).unwrap();
+        assert_eq!(svc.wifi_state(a).targets[0].host_ssid,"Home family");
+        assert_eq!(svc.wifi_state(b).targets[0].host_ssid,"Home family");
+        assert_eq!(svc.wifi_state(a).jobs[0].frozen,job.frozen);
+        let mut divergent=svc.wifi_state(a).targets.clone();divergent[0].ssid="Separate".into();
+        assert_eq!(svc.wifi_save(a,svc.wifi_state(a).local_revision,divergent,5).unwrap_err().to_string(),"wifi_shared_edit_library");
+        let before=serde_json::to_value(svc.wifi_state(a)).unwrap();
+        assert!(svc.wifi_library_save(0,lib.clone(),5).is_err());
+        let mut unsupported=lib.clone();unsupported.families[0].ssid_2g.clear();
+        assert_eq!(svc.wifi_library_save(2,unsupported,5).unwrap_err().to_string(),"wifi_family_no_compatible_network");
+        assert_eq!(serde_json::to_value(svc.wifi_state(a)).unwrap(),before);
+        // A filesystem failure restores both projections and library in RAM/disk.
+        std::fs::create_dir(root.path().join("platform/state.json.tmp")).unwrap();
+        let mut failing=lib.clone();failing.families[0].name="Should not commit".into();
+        assert!(svc.wifi_library_save(2,failing,5).is_err());
+        std::fs::remove_dir(root.path().join("platform/state.json.tmp")).unwrap();
+        assert_eq!(svc.wifi_library().families[0].name,"Home family");
+        assert_eq!(serde_json::to_value(svc.wifi_state(a)).unwrap(),before);
+        // Existing device -> Bridge import updates the shared family and all subscribers.
+        svc.wifi_mutate(a,|state|{state.snapshot=Some(serde_json::from_value(json!({"schema":2,"device_mac":a,"revision":3,
+            "snapshot_id":"family-cache","complete":true,"observed_at":6,"active":null,"capacity":{"total":12},"networks":[
+            {"bond":"own","writable":true,"network":{"network_id":"home","host_ssid":"Home family","ssid":"New-2","label":"Home family","password":"new-password","version":3}}]}))?);Ok(())}).unwrap();
+        let revision=svc.wifi_state(a).local_revision;
+        svc.wifi_import_fields_checked(a,&["home".into()],&BTreeMap::new(),revision,Some("family-cache"),7).unwrap();
+        assert_eq!(svc.wifi_state(b).targets[0].ssid,"New-2");
+        assert_eq!(svc.wifi_library().families[0].password_2g.as_deref(),Some("new-password"));
+        drop(svc);let svc=PlatformService::open(root.path()).unwrap();
+        assert_eq!(svc.wifi_state(b).targets.len(),2);assert_eq!(svc.wifi_state(b).targets[0].ssid,"New-2");
+        lib=svc.wifi_library();lib.devices.insert(a.into(),vec![]);
+        svc.wifi_library_save(lib.revision,lib,8).unwrap();
+        assert!(svc.wifi_state(a).targets.is_empty());assert_eq!(svc.wifi_state(b).targets.len(),2);
+        // A legacy row whose ID happens to equal an unsubscribed family must
+        // not change that family's other devices during ordinary import.
+        svc.wifi_mutate(a,|state|{let snapshot=state.snapshot.as_mut().unwrap();snapshot.snapshot_id="unrelated-cache".into();
+            let row=&mut snapshot.networks[0].network;row.network_id="office".into();row.host_ssid="Local".into();row.ssid="Local".into();Ok(())}).unwrap();
+        let revision=svc.wifi_library().revision;
+        svc.wifi_import_fields_checked(a,&["office".into()],&BTreeMap::new(),svc.wifi_state(a).local_revision,Some("unrelated-cache"),9).unwrap();
+        assert_eq!(svc.wifi_library().revision,revision);assert_eq!(svc.wifi_state(ap).targets[0].ssid,"Office");
+        // Secret-free AP01 imports can later adopt the shared known credential.
+        let target:WifiNetwork=serde_json::from_value(json!({"network_id":"office","host_ssid":"Office","ssid":"Office","credential":"device"})).unwrap();
+        svc.wifi_save(a,svc.wifi_state(a).local_revision,vec![target],10).unwrap();
+        lib=svc.wifi_library();lib.devices.insert(a.into(),vec!["office".into()]);
+        svc.wifi_library_save(lib.revision,lib,11).unwrap();
+        assert_eq!(svc.wifi_state(a).targets[0].password.as_deref(),Some("password-office"));
     }
 
     #[test]

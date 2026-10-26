@@ -2401,11 +2401,11 @@ fn json_arg(args: &Value) -> Result<Value, String> {
 
 /// MCP-tool adapter: same service calls as the UI commands.
 pub async fn tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, String> {
-    let value = match name {
+    let mut value = match name {
         "platform_device_register" => register_device(ctx, args).await?,
         "platform_wifi_action" => {
             let body=args.get("body").cloned().unwrap_or(json!({}));
-            if ["credentials","password","token"].iter().any(|key| body.get(*key).is_some()) { return Err("credentials_use_device_ui".into()); }
+            if wifi_contains_secret(&body) { return Err("credentials_use_device_ui".into()); }
             let op=args["op"].as_str().ok_or("missing op")?;
             // The current-environment post-state guard belongs to the page's
             // manual preview, not programmatic or automatic configuration.
@@ -2616,7 +2616,18 @@ pub async fn tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, Stri
         }
         other => return Err(format!("unknown platform tool: {other}")),
     };
+    if matches!(name,"platform_wifi_view"|"platform_wifi_action") {wifi_strip_secrets(&mut value);}
     serde_json::to_string_pretty(&value).map_err(err_text)
+}
+
+fn wifi_secret_key(key:&str)->bool {matches!(key,"password"|"password_2g"|"password_5g"|"credentials"|"token"|"device_code")}
+fn wifi_contains_secret(value:&Value)->bool {
+    match value {Value::Object(map)=>map.iter().any(|(key,v)|wifi_secret_key(key)||wifi_contains_secret(v)),
+        Value::Array(rows)=>rows.iter().any(wifi_contains_secret),_=>false}
+}
+fn wifi_strip_secrets(value:&mut Value) {
+    match value {Value::Object(map)=>{map.retain(|key,_|!wifi_secret_key(key));for v in map.values_mut(){wifi_strip_secrets(v);}},
+        Value::Array(rows)=>for row in rows {wifi_strip_secrets(row);},_=>{}}
 }
 
 fn requested_mac(args: &Value) -> Result<Option<String>, String> {

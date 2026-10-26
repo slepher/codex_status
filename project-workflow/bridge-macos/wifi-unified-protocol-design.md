@@ -1,5 +1,7 @@
 # 设备在线状态与统一控制协议：HTTP 直接交互与 BLE 回退
 
+> 2026-10-27 Wi-Fi族修订：Bridge共享族库及逐设备订阅，Note/BW既有`host_ssid`字段现在承载族名（默认5G SSID），主机SSID由Bridge解析到族；无Wi-Fi可指定族。设备wire/WFS4/WTX1不变。AP01沿用独立列表格式和菜单八位码鉴权，继续旋钮手选。实现与未部署/平台验收边界见[Wi-Fi族状态](../wifi-families/status.md)。
+
 > 2026-10-06 用户修订：设备 Wi-Fi 配置全局共享，有效 session + 当前 claim/lease owner 可修改、删除、试连及启用任何来源记录。bond 只保留来源及已有内部引用，事务回执/重放围栏仍按 principal/namespace 隔离；总容量12，不再按创建者限4条/3组。同ID旧记录不自动合并，明确 ambiguous_network_id；保留内容及凭据。实现、验证和部署边界见 [shared-wifi-20261006-plan.md](shared-wifi-20261006-plan.md)，本修订覆盖下文历史绑定只读/配置写隔离规则。
 
 

@@ -110,12 +110,16 @@ pub fn current_ssid(value: &Value) -> Option<&str> {
     (value["state"] == "connected").then(|| value["networks"][0]["ssid"].as_str()).flatten()
 }
 
+pub fn network_key(value: &Value) -> Option<&str> {
+    match value.get("family_name") { Some(name)=>name.as_str(), None=>current_ssid(value) }
+}
+
 // Freeze the actual environment across save→activate. Saved configuration is
 // never evidence of which network the host currently uses.
 pub fn require_same_network(expected: &Value, actual: &Value) -> Result<(), String> {
-    let expected = current_ssid(expected).filter(|s| !s.is_empty()).ok_or("host_network_unknown")?;
-    let actual = current_ssid(actual).filter(|s| !s.is_empty()).ok_or("host_network_unknown")?;
-    if expected != actual { return Err("host_network_changed".into()); }
+    let expected_key = network_key(expected).filter(|s| !s.is_empty()).ok_or("host_network_unknown")?;
+    let actual_key = network_key(actual).filter(|s| !s.is_empty()).ok_or("host_network_unknown")?;
+    if expected_key != actual_key || current_ssid(expected)!=current_ssid(actual) { return Err("host_network_changed".into()); }
     Ok(())
 }
 

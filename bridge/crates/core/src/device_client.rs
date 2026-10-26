@@ -331,6 +331,21 @@ pub async fn pairing_request(endpoint: &str, method: &str, path: &str, token: &s
     Ok((status,reply))
 }
 
+/// AP01's existing menu-code authenticated list API. No activation endpoint.
+pub async fn ap01_wifi_profiles(endpoint:&str, method:&str, code:&str, body:Option<&Value>) -> Result<(u16,Value)> {
+    anyhow::ensure!(matches!(method,"GET"|"PUT") && code.len()==8 && code.bytes().all(|b|b.is_ascii_digit()),"ap01_device_code_required");
+    let payload=body.map(serde_json::to_vec).transpose()?;
+    anyhow::ensure!(payload.as_ref().is_none_or(|b|b.len()<=4096),"wifi_request_too_large");
+    let mut progress=HttpProgress{outcome:DispatchOutcome::NotSent,stage:"wifi_profiles_prepare"};
+    let (status,bytes)=transport_request(endpoint,method,"/api/wifi/profiles",code,payload.as_deref(),&[],
+        "application/json",Duration::from_secs(3),&mut progress).await
+        .map_err(|error| {let reason=crate::rendezvous::wifi_error(&error).1;
+            error.context(CommandFailure{outcome:progress.outcome,stage:progress.stage,reason})})?;
+    let reply=serde_json::from_slice(&bytes).map_err(|error|anyhow!(error).context(
+        CommandFailure{outcome:DispatchOutcome::AckUnknown,stage:"wifi_profiles_response",reason:"invalid_response"}))?;
+    Ok((status,reply))
+}
+
 async fn post_json(ip: &str, path: &str, token: &str, body: &Value, timeout: Duration) -> Result<Value> {
     let started = Instant::now();
     let mut payload=body.clone();

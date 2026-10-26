@@ -8,6 +8,7 @@ window.__wifiUiScenario = async function(scenario) {
   document.querySelectorAll('.panel').forEach(p => p.classList.toggle('on', p.id === 'tab-device'));
   selectedDeviceMac = mac; deviceSelectionGeneration++;
   clearDeviceView();
+  wifiLibrary={revision:0,families:[],devices:{},wired_family:null};wifiManualSelection=false;$('wifi-family-library').open=false;wifiFamilyRender();
   const network = {network_id:'home', label:'书桌网络', host_ssid:'Home-5G', ssid:'Home-2G',
     password:'fixture-pass',credential:'keep', origin:'local', version:2, deleted:false};
   const long = 'Long-Network-Name-'.repeat(6);
@@ -150,7 +151,7 @@ window.__wifiUiScenario = async function(scenario) {
   $('wifi-password-toggle').click();check($('wifi-password').type==='text','Eye failed to reveal password');
   check($('wifi-password-toggle').getAttribute('aria-label')==='隐藏密码','Eye missing accessible hide action');
   $('wifi-password-toggle').click();check($('wifi-password').type==='password','Eye failed to hide password');
-  const fields = [...document.querySelectorAll('.wifi-field')];
+  const fields = [...document.querySelectorAll('#wifi-editor .wifi-field')];
   check(fields.length === 6,'Editor needs six separate field groups');
   for (const group of fields) {
     const label = group.querySelector('label').getBoundingClientRect();
@@ -358,7 +359,7 @@ window.__wifiUiScenario = async function(scenario) {
     const kind=scenario.slice(8),state={missing:'no_mapping',connecting:'connecting',error:'connection_failed',ready:'connected',unreachable:'bridge_unreachable'}[kind];
     wifiRenderCurrent({automatic_state:state,matched_target:kind==='missing'?null:network,
       connection:{state,error:kind==='error'?'authentication_failed':kind==='unreachable'?'http_unavailable':null,http_ready:kind==='ready'}});
-    check($('wifi-auto').textContent.includes({missing:'没有该网络',connecting:'正在连接',error:'认证失败',ready:'Bridge HTTP 已确认',unreachable:'无法访问设备 HTTP'}[kind]),'Incorrect current-network guidance');
+    check($('wifi-auto').textContent.includes({missing:'选择对应族',connecting:'正在连接',error:'认证失败',ready:'Bridge HTTP 已确认',unreachable:'无法访问设备 HTTP'}[kind]),'Incorrect current-network guidance');
     if(kind==='missing') {
       wifiEditCurrent();
       check($('wifi-host-ssid').value==='Home-5G','Current host was not prefilled');
@@ -380,6 +381,25 @@ window.__wifiUiScenario = async function(scenario) {
     check($('wifi-online').textContent.includes(scenario==='online-usb'?'USB 常驻在线':'BOOT 在线'),'Missing presence reason');
   }
   await wait();
+  if(scenario.startsWith('wifi-family-')) {
+    wifiLibrary={revision:3,families:[{id:'home',name:'Home-5G',ssid_2g:'Home-2G',ssid_5g:'Home-5G',password_2g:'fixture-pass',password_5g:'fixture-pass'},
+      {id:'office',name:'Office',ssid_2g:'Office',ssid_5g:'Office',password_2g:'',password_5g:''}],devices:{[mac]:['home','office']},wired_family:'office'};
+    wifiManualSelection=scenario==='wifi-family-ap01';wifiFamilyRender();$('wifi-family-library').open=true;
+    wifiShowHost({state:scenario==='wifi-family-wired'?'no_wifi':'connected',family_name:scenario==='wifi-family-wired'?'Office':'Home-5G',networks:scenario==='wifi-family-wired'?[]:[{ssid:'Home-2G'}]});
+    wifiRenderCurrent({automatic_state:wifiManualSelection?'manual_selection':'waiting_for_window',matched_target:network});
+    wifiRenderScheme();
+    check($('wifi-family-selection').querySelectorAll('input:checked').length===2,'Family selections missing');
+    check($('wifi-wired-family').value==='office','Wired family missing');
+    const familyBounds=$('wifi-family-library').getBoundingClientRect();
+    for(const control of $('wifi-family-library').querySelectorAll('input,select,button')){const r=control.getBoundingClientRect();check(r.left>=familyBounds.left-1&&r.right<=familyBounds.right+1,'Family control exceeds library: '+control.id);}
+    if(wifiManualSelection) {
+      check(!$('wifi-ap01-auth').hidden&&$('wifi-note-recovery').hidden&&$('wifi-current-action').hidden,'AP01 automatic network controls exposed');
+      check(!$('wifi-networks').innerHTML.includes('wifiSelect('),'AP01 must select network on device');
+    } else {
+      wifiFamilyEdit(0);check($('wifi-family-name').value==='Home-5G','Family editor missing');
+      check($('wifi-family-pass2').type==='password','Family password exposed');
+    }
+  }
   const card = $('wifi-card'), bounds=card.getBoundingClientRect();
   check(card.scrollWidth <= card.clientWidth+1,'Wi-Fi card overflows horizontally');
   for (const node of card.querySelectorAll('input:not([type=checkbox]),select,button,.pmeta')) {

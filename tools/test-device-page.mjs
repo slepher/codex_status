@@ -488,3 +488,50 @@ await run("selectFamily('lcd-jd9853-320x240-palette4')");
 assert.equal(run('selectedRenderTarget'), 'lcd-jd9853-320x240-palette4');
 assert.match(element('menu-family').innerHTML, /AP01/);
 console.log('AP01 template family is selectable in the same configuration menu');
+
+// Shared Wi-Fi library: per-device selection, family keys on the existing wire,
+// explicit credential treatment, cached reverse import and AP01 manual controls.
+select(macA);
+let sharedWifiLibrary={revision:9,families:[{id:'home',name:'Home-5',ssid_2g:'Home-2',ssid_5g:'Home-5',password_2g:'fixture-password',password_5g:'fixture-password'}],devices:{[macA]:['home'],[macB]:[]},wired_family:'home'};
+let manualWifi=false;
+const familyTarget={network_id:'home',host_ssid:'Home-5',ssid:'Home-2',credential:'keep',password:'fixture-password',origin:'local',version:2};
+handlers.platform_wifi=({op,body})=>{
+  if(op==='view')return {library:sharedWifiLibrary,manual_selection:manualWifi,host:{state:'connected',family_name:'Home-5',networks:[{ssid:'Home-2'}]},
+    wifi:{local_revision:4,targets:[familyTarget],jobs:[],snapshot:{schema:2,complete:true,snapshot_id:'family-snapshot',revision:2,capacity:{total:12},networks:[{bond:'own',writable:true,network:familyTarget}]}},differences:[],automatic_state:manualWifi?'manual_selection':'connected',matched_target:familyTarget};
+  if(op==='library_save'){sharedWifiLibrary={...sharedWifiLibrary,families:body.families,revision:sharedWifiLibrary.revision+1};return sharedWifiLibrary;}
+  return {state:'completed'};
+};
+await run('wifiRefreshView()');
+assert.equal(run('wifiNetworkKey()'),'Home-5');
+assert.match(element('wifi-host').textContent,/Home-2.*Home-5/);
+assert.match(element('wifi-family-selection').innerHTML,/home/);
+run('wifiFamilyEdit(0)');assert.equal(element('wifi-family-pass2').value,'fixture-password');
+run('wifiFamilyTogglePassword(2)');assert.equal(element('wifi-family-pass2').type,'text');
+element('wifi-family-name').value='My home';
+await run('wifiFamilySave()');
+const familySave=calls.filter(c=>c.name==='platform_wifi'&&c.args.op==='library_save').at(-1);
+assert.equal(familySave.args.body.library_revision,9);assert.equal(familySave.args.body.families[0].id,'home');
+assert.equal(familySave.args.body.families[0].password_2g,'fixture-password');
+assert.equal(element('wifi-family-pass2').value,'');assert.equal(element('wifi-family-pass2').type,'password');
+context.document.querySelectorAll=selector=>selector==='[data-wifi-family]:checked'?[{dataset:{wifiFamily:'home'}}]:[];
+await run('wifiFamilySelect()');
+const familySelection=calls.filter(c=>c.name==='platform_wifi'&&c.args.op==='library_select').at(-1);
+assert.deepEqual(Array.from(familySelection.args.body.selected),['home']);assert.equal(familySelection.args.mac,macA);
+context.document.querySelectorAll=()=>[];
+run("wifiSelections.clear();wifiSelections.set('home',true)");element('wifi-import-family').value='home';
+const familyImportStart=calls.length;await run('wifiFamilyImport()');
+const familyImport=calls.slice(familyImportStart).find(c=>c.args?.op==='library_import');
+assert.equal(familyImport.args.body.snapshot_id,'family-snapshot');assert.equal(familyImport.args.body.network_id,'home');
+assert(!calls.slice(familyImportStart).some(c=>c.args?.op==='get'));
+// Background refresh preserves a wired choice and unfinished subscription choices.
+element('wifi-wired-family').value='';run('wifiWiredDirty=true;wifiFamilySelectionDirty=true');
+element('wifi-family-selection').innerHTML='unfinished checkbox draft';await run('wifiRefreshView()');
+assert.equal(element('wifi-wired-family').value,'');assert.equal(element('wifi-family-selection').innerHTML,'unfinished checkbox draft');
+manualWifi=true;run('wifiFamilySelectionDirty=false;wifiWiredDirty=false');await run('wifiRefreshView()');
+assert.equal(element('wifi-ap01-auth').hidden,false);assert.equal(element('wifi-current-action').hidden,true);
+assert.equal(element('wifi-note-recovery').hidden,true);assert(!element('wifi-networks').innerHTML.includes('wifiSelect('));
+element('wifi-ap01-code').value='01234567';await run('wifiReadScheme()');assert.equal(element('wifi-ap01-code').value,'');
+const ap01Read=calls.filter(c=>c.name==='platform_wifi'&&c.args.op==='get').at(-1);assert.equal(ap01Read.args.body.device_code,'');
+assert.equal(run("wifiManualNetworkGuard(['home'])"),null);
+select(macB);assert.equal(element('wifi-ap01-code').value,'');assert.equal(run('wifiFamilySelectionDirty'),false);
+console.log('Wi-Fi families: shared edits, independent selections, family-name wire key, wired draft, cached import, password cleanup and AP01 manual selection OK');

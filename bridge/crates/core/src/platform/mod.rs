@@ -11,3 +11,4 @@ pub use crate::coordinator;
 pub use crate::datasource;
 
 pub mod wifi;
+pub mod wifi_families;
