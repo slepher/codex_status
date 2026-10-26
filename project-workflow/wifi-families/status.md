@@ -55,3 +55,7 @@ HTTP health204、MCP44工具、library_select可见；生产MCP读取Wi-Fi族sch
 - 第二次部署01:41完成：旧exe和294文件完整data备份位于`artifacts/wifi-families/workspace-deployment-20261027-014122/`，逐文件SHA256一致；最终exe39005184 B、SHA256`621386772286dd20d581c0000bd76182c02772b31a992c75f46b62f879a085ab`，与候选一致。
 - 标准计划任务启动主PID20624/watchdog31928；任务Running，8765/8766归同主PID，health204、MCP44。共享库3族、3设备identity/capabilities/data_contract/profile/sync_enabled、sources/templates/family_profiles/发布目录以及4份设置/凭据文件均与备份一致；运行observed/认证联系时间/读取尝试按正常调度变化，不要求运行state整文件不变。不打印敏感值。证据`verification.json`和`data-preservation.json`位于上述备份目录。
 - Node末轮复跑和git diff --check通过；Edge80及截图沿用最终构建前验证。未推送远端，未刷ROM、未手动切网，macOS与B6实体矩阵仍开放。
+
+### 01:44 有线回退保存提示更正
+
+用户指出有线回退只属Bridge行为，且无需额外写“无需同步设备”。`library_wired`成功提示改为“有线回退已保存，在 Bridge 未连接 Wi-Fi 时生效。”，其他保存提示保留。Node与隔离构建通过，默认Windows已备份/重启部署：39005184 B，SHA256`14c519e07efaa9e13f5ce5d08a9985c0ae627993578c38abf43608735a6575d4`，health204/MCP44。旧exe与295文件data备份逐一校验一致，证据`artifacts/wifi-families/workspace-deployment-20261027-014434/verification.json`。仅调整提示，无手动切网或ROM修改。

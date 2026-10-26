@@ -4,7 +4,7 @@
 
 ## 当前部署
 
-- Windows默认Bridge已部署单一共享族网络工作台并重启：`bridge/target/debug/bridge-app.exe`，39005184 B，SHA256 `621386772286dd20d581c0000bd76182c02772b31a992c75f46b62f879a085ab`。health204/MCP44、主进程/watchdog/端口核验通过；旧exe及294文件data完整备份校验，3族/3设备配置、模板/Profile/设置及凭据保留。[验收](project-workflow/wifi-families/status.md)
+- Windows默认Bridge已部署单一共享族网络工作台（含有线回退提示更正）并重启：`bridge/target/debug/bridge-app.exe`，39005184 B，SHA256 `14c519e07efaa9e13f5ce5d08a9985c0ae627993578c38abf43608735a6575d4`。health204/MCP44、主进程/watchdog/端口核验通过；旧exe及295文件data完整备份校验，3族/3设备配置、模板/Profile/设置及凭据保留。[验收](project-workflow/wifi-families/status.md)
 
 - Mac Bridge 已重建/重启：`artifacts/bridge-macos/Codex Status Bridge.app`，exe 79336800 B，SHA256 `d0f0948cafbe3c7a5fd70b9d49b3b0e4809115098e972bed38266119681d35b9`。supervisor/child 正常，8765/8766 监听。新设备默认同步，旧设置保留；AP01/Note4 ACK seq8/1011均已显示。[验收](project-workflow/default-data-sync/status.md)
 - AP01 `34F01557210B`：首尾动画修复ROM应用槽1，版本`1.0.2_0041`、build`ec0a58f71f65c2830c08c9bfd7c155db`、Bundle`6a8d702a`。ROM `artifacts/ap01-wifi-animation-20261022/ap01-wifi-animation-candidate01.bin`，7045480 B，SHA256 `5a49f78b550fabbafcc3cde75aa1f6e9986fb9dd88320cd029cd6655d61e0cee`。10-22认证槽1，用户确认原厂界面/旋钮/App及双向快转首尾正常；10-23再次认证同build，未刷机、未复核槽位。

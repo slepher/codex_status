@@ -1117,7 +1117,7 @@
   }
   async function wifiFamilyAction(op,body){const mac=selectedTarget(),generation=deviceSelectionGeneration;
     try{await invoke('platform_wifi',{mac,op,body:{...body,library_revision:wifiLibrary.revision}});
-      if(!isCurrentDevice(mac,generation))return false;wifiPreview=null;if(op==='library_select')wifiFamilySelectionDirty=false;if(op==='library_wired')wifiWiredDirty=false;await wifiRefreshView();$('wifi-family-result').textContent='已保存到 Bridge；在比较页预览后同步到设备。';wifiSetResult($('wifi-family-result').textContent);return true;
+      if(!isCurrentDevice(mac,generation))return false;wifiPreview=null;if(op==='library_select')wifiFamilySelectionDirty=false;if(op==='library_wired')wifiWiredDirty=false;await wifiRefreshView();$('wifi-family-result').textContent=op==='library_wired'?'有线回退已保存，在 Bridge 未连接 Wi-Fi 时生效。':'已保存到 Bridge；在比较页预览后同步到设备。';wifiSetResult($('wifi-family-result').textContent);return true;
     }catch(e){if(isCurrentDevice(mac,generation)){ $('wifi-family-result').textContent=wifiError(e);wifiSetResult(wifiError(e)); }return false;}}
   async function wifiFamilySave(){const f={id:wifiFamilyEditing||'wf_'+Date.now().toString(36),name:$('wifi-family-name').value,
     ssid_2g:$('wifi-family-2g').value,ssid_5g:$('wifi-family-5g').value};
