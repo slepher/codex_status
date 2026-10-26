@@ -4,7 +4,7 @@
 
 ## 当前部署
 
-- Windows默认Bridge已部署Wi-Fi族并重启：`bridge/target/debug/bridge-app.exe`，39009280 B，SHA256 `9077bb8cb338034291612fff5280c95ad6c5be456a2f7f0b4507c12280311cf1`。health204/MCP44及族schema1读取通过；旧exe及286文件data完整备份校验，3设备Profile/许可及Bridge设置保留。[验收](project-workflow/wifi-families/status.md)
+- Windows默认Bridge已部署单一共享族网络工作台并重启：`bridge/target/debug/bridge-app.exe`，39005184 B，SHA256 `621386772286dd20d581c0000bd76182c02772b31a992c75f46b62f879a085ab`。health204/MCP44、主进程/watchdog/端口核验通过；旧exe及294文件data完整备份校验，3族/3设备配置、模板/Profile/设置及凭据保留。[验收](project-workflow/wifi-families/status.md)
 
 - Mac Bridge 已重建/重启：`artifacts/bridge-macos/Codex Status Bridge.app`，exe 79336800 B，SHA256 `d0f0948cafbe3c7a5fd70b9d49b3b0e4809115098e972bed38266119681d35b9`。supervisor/child 正常，8765/8766 监听。新设备默认同步，旧设置保留；AP01/Note4 ACK seq8/1011均已显示。[验收](project-workflow/default-data-sync/status.md)
 - AP01 `34F01557210B`：首尾动画修复ROM应用槽1，版本`1.0.2_0041`、build`ec0a58f71f65c2830c08c9bfd7c155db`、Bundle`6a8d702a`。ROM `artifacts/ap01-wifi-animation-20261022/ap01-wifi-animation-candidate01.bin`，7045480 B，SHA256 `5a49f78b550fabbafcc3cde75aa1f6e9986fb9dd88320cd029cd6655d61e0cee`。10-22认证槽1，用户确认原厂界面/旋钮/App及双向快转首尾正常；10-23再次认证同build，未刷机、未复核槽位。
@@ -13,7 +13,7 @@
 
 ## 活跃事项与下一步
 
-- Wi-Fi页面已按单一共享族工作台重整：唯一列表/编辑器、比较页明确导入、有线回退/概览/恢复工具归位。Node/Edge80/窄宽审阅及隔离构建通过；macOS缺swiftc，B6实机未验。未部署候选`bridge/target-note4-sync/debug/bridge-app.exe`，39005184 B，SHA256 `621386772286dd20d581c0000bd76182c02772b31a992c75f46b62f879a085ab`。自动审批拒绝停桥/替换/重启，待用户明确授权；当前exe/data未改。[状态与部署脚本](project-workflow/wifi-families/status.md)。
+- Wi-Fi页面重整已提交`53a1fdd`并部署Windows默认实例：唯一共享族列表/编辑器、比较页明确导入、有线回退/概览/恢复工具归位。Node/Edge80/窄宽审阅及隔离构建通过；macOS缺swiftc，B6实机未验。01:41部署备份与数据核验见[状态](project-workflow/wifi-families/status.md)，未刷ROM或手动切网。
 
 - Wi-Fi族Windows已部署，旧网络已合并3族（2异名双频+1同名双频；3设备均只连2.4G），密码保留；Note4选3族/BW保留原1族，AP01手选不变。共享族库/有线指定、Note/BW现有字段传族名。Rust337/定向56、Node/Edge12通过；macOS原生/部署及实机切网归B6。[状态](project-workflow/wifi-families/status.md)。
 

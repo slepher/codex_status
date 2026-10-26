@@ -47,3 +47,11 @@ HTTP health204、MCP44工具、library_select可见；生产MCP读取Wi-Fi族sch
 - 最终隔离构建`cargo build -p bridge-app --target-dir target-note4-sync`通过，只有既有btleplug生命周期警告。**未部署候选** `bridge/target-note4-sync/debug/bridge-app.exe`，39005184 B，SHA256 `621386772286dd20d581c0000bd76182c02772b31a992c75f46b62f879a085ab`。
 - 已核对默认exe路径、任务及8765/8766同PID2728/watchdog32096。自动审批拒绝执行`artifacts/wifi-families/deploy-workspace.ps1`：停止共享运行实例、替换exe和重启需用户明确授权。脚本未运行，未停服务/备份/替换exe，真实data、设备网络及ROM未修改。当前部署仍为本页前述9077bb8c版本。
 - 部署脚本已准备完整data逐文件哈希校验、旧exe备份、watchdog→任务停止顺序、启动/health/MCP验证；待授权后执行。未提交。
+
+### 2026-10-27 01:41 用户授权提交并部署
+
+- 实现提交`53a1fdd`（Unify Wi-Fi management around shared families and subscriptions）。用户明确授权后部署默认Windows实例；前述审批阻挡已解除。
+- 首次脚本停止旧实例后读到已退出PID的过期监听记录，身份安全检查中止，未备份或替换程序；先经标准启动脚本恢复旧实例，再增加最多6秒的退出等待后重新执行。仅确认同exe残留进程可停止，未知身份仍拒绝。
+- 第二次部署01:41完成：旧exe和294文件完整data备份位于`artifacts/wifi-families/workspace-deployment-20261027-014122/`，逐文件SHA256一致；最终exe39005184 B、SHA256`621386772286dd20d581c0000bd76182c02772b31a992c75f46b62f879a085ab`，与候选一致。
+- 标准计划任务启动主PID20624/watchdog31928；任务Running，8765/8766归同主PID，health204、MCP44。共享库3族、3设备identity/capabilities/data_contract/profile/sync_enabled、sources/templates/family_profiles/发布目录以及4份设置/凭据文件均与备份一致；运行observed/认证联系时间/读取尝试按正常调度变化，不要求运行state整文件不变。不打印敏感值。证据`verification.json`和`data-preservation.json`位于上述备份目录。
+- Node末轮复跑和git diff --check通过；Edge80及截图沿用最终构建前验证。未推送远端，未刷ROM、未手动切网，macOS与B6实体矩阵仍开放。
