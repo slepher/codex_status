@@ -1335,7 +1335,7 @@ async fn status_impl(state: SimState, request: Request<Body>, gate: bool) -> Res
                     sync["config_owner"].as_str() == Some(owner.id.as_str())));
             sync.as_object_mut().map(|object| object.remove("config_owner"));
             let mut wifi=state.wifi.lock().unwrap();let continuous=power.plugged && !power.deep_on_usb;
-            status["wifi_management"] = json!(3);
+            status["wifi_management"] = json!(3);status["wifi_connection"]=json!(2);
             status["wifi_storage"]=match wifi.engine.storage_status() {Ok(value)=>value,Err(_)=>return (StatusCode::INTERNAL_SERVER_ERROR,Json(json!({"ok":false,"error":"wifi_storage_status_unavailable","stage":"status"}))).into_response()};
             let radio=match wifi.engine.observe() {Ok(value)=>value,Err(_)=>return (StatusCode::INTERNAL_SERVER_ERROR,Json(json!({"ok":false,"error":"wifi_radio_unavailable","stage":"status"}))).into_response()};
             let radio_ready=radio["connected"]==true && radio["has_ip"]==true;
@@ -2382,7 +2382,7 @@ async fn sim_ble_info(State(state): State<SimState>, request: Request<Body>) -> 
     let bytes = match bridge_render::simulator_ble_wire("info", &json!({
         "mac":state.mac,"ip":"127.0.0.1","fw":fw,"peerBonded":true,"peerEncrypted":true,
         "wake_generation":generation,"wake_seq":power.wake_count,"bundle_configured":power.configured,
-        "wifi_setup_protocol":1,"wifi_management":3,"wifi_connection":1,"plan_activation":1,"rf_remaining_ms":power.ble_window_until_ms.map(|until| until.saturating_sub(clock.monotonic_ms))})) {
+        "wifi_setup_protocol":1,"wifi_management":3,"wifi_connection":2,"plan_activation":1,"rf_remaining_ms":power.ble_window_until_ms.map(|until| until.saturating_sub(clock.monotonic_ms))})) {
         Ok(bytes) => bytes, Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     let connect = request.uri().query().is_some_and(|q| q == "connect=1");
@@ -2992,8 +2992,13 @@ async fn sim_ble_command(State(state): State<SimState>, request: Request<Body>) 
             let response=status_impl(state.clone(),authenticated,false).await;
             let Ok(bytes)=to_bytes(response.into_body(),16384).await else{return StatusCode::INTERNAL_SERVER_ERROR.into_response();};
             let Ok(text)=std::str::from_utf8(&bytes) else{return StatusCode::INTERNAL_SERVER_ERROR.into_response();};
-            let mut wifi=state.wifi.lock().unwrap();let peer=wifi.peer.clone();
-            let Ok(mut reply)=wifi.engine.read_page(&message,&peer,generation,text) else{return StatusCode::INTERNAL_SERVER_ERROR.into_response();};drop(wifi);
+            let mut reply=if message["control_only"]==true {
+                let mut status:Value=serde_json::from_str(text).unwrap();status["ack"]=json!("wifi");status["ok"]=json!(true);
+                status["control_only"]=json!(true);status["request_id"]=message["request_id"].clone();status
+            }else{
+                let mut wifi=state.wifi.lock().unwrap();let peer=wifi.peer.clone();
+                let Ok(reply)=wifi.engine.read_page(&message,&peer,generation,text) else{return StatusCode::INTERNAL_SERVER_ERROR.into_response();};reply
+            };
             reply["wake_generation"]=json!(session_snapshot(&state).boot_id);reply["wake_seq"]=json!(power.wake_count);
             let _ = ble_frame_reply(&state,frame,op,&reply,&bytes,clock.monotonic_ms);
             return Json(json!({"result":"accepted"})).into_response();

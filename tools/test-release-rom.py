@@ -10,7 +10,14 @@ for env, (target, partitions, _) in stage.TARGETS.items():
     suffix = "note4" if env == "zectrix-note4-b" else "bw-rtc1"
     marker = f"codex-status-ota-v1|{target}|0.18.84-{suffix}\0".encode()
     table = (root / partitions).read_text()
-    assert stage.inspect_rom(marker, env, table)["firmware_target"] == target
+    assert stage.inspect_rom(marker, env, table, "0.18.84")["firmware_target"] == target
+    assert stage.inspect_rom(marker, env, table)["release_version"] == "0.18.84"
+    try:
+        stage.inspect_rom(marker, env, table, "0.18.85")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("stale ROM release accepted for a newer source")
     for data, changed_table in [(b"missing", table), (marker + marker.replace(b"0.18.84", b"0.18.85"), table),
                                 (marker, "ota_0,app,ota_0,0x10000,1\nota_1,app,ota_1,0x20000,1")]:
         try:
@@ -26,4 +33,4 @@ for env, (target, partitions, _) in stage.TARGETS.items():
         pass
     else:
         raise AssertionError("wrong target accepted")
-print("release ROM: both target identities, ambiguous marker and slot budgets passed")
+print("release ROM: shared release, stale-artifact rejection, both target identities and slot budgets passed")

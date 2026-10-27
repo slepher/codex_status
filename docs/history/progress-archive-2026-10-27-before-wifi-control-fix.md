@@ -1,0 +1,35 @@
+# Codex Status 当前交接
+
+更新时间：2026-10-27，Asia/Hong_Kong。
+
+## 当前部署
+
+- Windows默认Bridge已部署单一共享族网络工作台（含有线回退提示更正）并重启：`bridge/target/debug/bridge-app.exe`，39005184 B，SHA256 `14c519e07efaa9e13f5ce5d08a9985c0ae627993578c38abf43608735a6575d4`。health204/MCP44、主进程/watchdog/端口核验通过；旧exe及295文件data完整备份校验，3族/3设备配置、模板/Profile/设置及凭据保留。[验收](project-workflow/wifi-families/status.md)
+
+- Mac Bridge 已重建/重启：`artifacts/bridge-macos/Codex Status Bridge.app`，exe 79336800 B，SHA256 `d0f0948cafbe3c7a5fd70b9d49b3b0e4809115098e972bed38266119681d35b9`。supervisor/child 正常，8765/8766 监听。新设备默认同步，旧设置保留；AP01/Note4 ACK seq8/1011均已显示。[验收](project-workflow/default-data-sync/status.md)
+- AP01 `34F01557210B`：首尾动画修复ROM应用槽1，版本`1.0.2_0041`、build`ec0a58f71f65c2830c08c9bfd7c155db`、Bundle`6a8d702a`。ROM `artifacts/ap01-wifi-animation-20261022/ap01-wifi-animation-candidate01.bin`，7045480 B，SHA256 `5a49f78b550fabbafcc3cde75aa1f6e9986fb9dd88320cd029cd6655d61e0cee`。10-22认证槽1，用户确认原厂界面/旋钮/App及双向快转首尾正常；10-23再次认证同build，未刷机、未复核槽位。
+- 救援0031/槽0保留：10-22先认证build`53574b55382d55a514ef5b7767db66d9`及槽0，再单次写应用1；按用户要求未整槽读回/导出，停止标记保留。
+- Note4 `.106-note4`认证通过；ROM `artifacts/bridge-macos/note4-0.18.106-plan-activation.bin`，1865680 B，SHA256 `36ca4c3aacdc7b27c9c7cebe4cb18df0bee4048461e189f51050b6332b24ceb4`。10-23未刷机。
+
+## 活跃事项与下一步
+
+- Note4 19:30联网调查：共享族label变化参与目标摘要，设备报`plan_network_target_mismatch`；分页读取挤占RF，原恢复保存曾ACK未知，现已原回执确认r344。既有Bridge自动启用后，同MAC认证`.106-note4`/HTTP ready/error空，未刷机或重发；启用任务最终结算仍待观察，BLE缓存版本新鲜度及分页延迟归B6。[调查](project-workflow/wifi-families/note4-connection-20261027.md)。
+
+- Wi-Fi页面重整已提交`53a1fdd`并部署Windows默认实例：唯一共享族列表/编辑器、比较页明确导入、有线回退/概览/恢复工具归位。Node/Edge80/窄宽审阅及隔离构建通过；macOS缺swiftc，B6实机未验。01:41部署备份与数据核验见[状态](project-workflow/wifi-families/status.md)，未刷ROM或手动切网。
+
+- Wi-Fi族Windows已部署，旧网络已合并3族（2异名双频+1同名双频；3设备均只连2.4G），密码保留；Note4选3族/BW保留原1族，AP01手选不变。共享族库/有线指定、Note/BW现有字段传族名。Rust337/定向56、Node/Edge12通过；macOS原生/部署及实机切网归B6。[状态](project-workflow/wifi-families/status.md)。
+
+- 书桌屏 `70041DD7A340`：USB部署`.38-bw`/`ota_0`，ROM `artifacts/desk-ota-20261026/desk-0.18.38-bw.bin`，1837008 B，SHA256 `2b002a21e2673a96a4c519fb746219737911a82f577a2b5597cb2a89fba6580e`，认证运行镜像SHA已匹配。原`.37`槽1/模板保留；154g构建、200/400宿主布局、匹配ELF栈通过，Note4未构建/部署。用户授权后经USB JTAG将原通用凭据转换为119B共享active WFS4，仅写NVS的0xC000扇区，完整NVS读回一致且原记录保留；实机加载1条/format4，HTTP确认connected/IP192.168.3.163。
+- 旧quad v12含退役device.state；兼容v15+mini完整Bundle `99dc6326` 已用原事务续传，COMMIT显示displayed，认证commit_seq4097/context `ffaf4e43e43639c1`、quad active、content ready/error空；Bridge对账succeeded。用户随后确认模板已显示；按最新要求已开启sync_enabled并持久解除书桌屏暂停，HTTP数据seq288 ACK displayed且认证applied_seq288/content_error空。此前实体BOOT169ms内响应。Windows JTAG接口已安装签名官方驱动oem88.inf，诊断临时Bridge配置仍保持还原。调试/恢复期间记录RTC WDT重启，根因未定；最后两次HTTP同wake/uptime160→175，不能扩大为长期稳定验收。B6证据：[状态](project-workflow/builtin-radio-status/status.md)、`artifacts/desk-ota-20261026/`。
+
+- AP01 构建已统一到兄弟固件仓库，App 仅源码/配置及兼容入口；独立版/App版、隔离构建和旧命令验证通过，均未部署。[记录](project-workflow/ap01-unified-build/status.md)
+- 未部署 platform ROM：`D:\Documents\PlatformIO\Projects\cuktech-ap01-firmware\build\unified-0041\platform.bin`，6875656 B，SHA256 `d77900bf5ce60ac9d1139a37d7a7314e75f2a6ac1f021eb7f04bfd9b440e2859`。
+- 未部署 codex-status ROM：`D:\Documents\PlatformIO\Projects\cuktech-ap01-firmware\build\unified-0041\codex-status-commit.bin`，7044408 B，SHA256 `7cf24650ed8b24323e42b1b4a5400f5b05aa0d0f52c81127c2271c2c7d4e4183`。
+
+- 默认同步已提交，core/app/mcp 338通过/5忽略；应用及完整data已私有备份，重建期间data哈希一致。Bridge监督修复已随重建部署。
+- C9：共享宿主有效帧、Wi-Fi菜单及首尾循环动画修复已部署；原生红绿/宿主消毒器/菜单回归及用户视觉验收通过，不扩大为全部GPIO或逐帧保证。10-22末轮未切网/改列表，临时UU清理未执行；此前失联后按键重连原因未定。[调查与实机](project-workflow/ap01-wifi-profiles/animation-20261022.md)
+- 较早四日审查候选已由上述部署记录接续，不再代表当前ROM；历史候选/资源证据见[审查](project-workflow/review-fixes-20261022/status.md)。物理RF/掉电/完整栈高水位、A9/B6/C8新余量时延/跨会话通知/Windows及长期合盖恢复仍开放，60秒兜底保留。[唯一待办](docs/roadmap/backlog.md)
+
+## 证据
+
+[默认同步前卡](docs/history/progress-archive-2026-10-23-before-default-data-sync.md)、[完整历史](docs/history/progress-archive-2026-10-22-before-review-fixes.md)。旧产物释放27.69GiB，部分历史链接可能失效。实机证据在`artifacts/ap01-entry-rollout-20261022/`、`artifacts/ap01-wifi-animation-rollout-20261022/`；同步备份/证据在`artifacts/default-data-sync-20261023/`。日志/SSID/绑定原文仅留私有artifacts。

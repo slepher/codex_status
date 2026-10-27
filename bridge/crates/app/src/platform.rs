@@ -2800,7 +2800,7 @@ pub(crate) mod ble_close_lock_tests {
                 "wifi_management": 3,
                 "plan_activation":fake.status_extra.lock().unwrap()["_plan_activation"],
                 "rf_remaining_ms": if initial > 0 {json!(remaining)} else {Value::Null},
-                "wc":u8::from(fake.protocol.load(Ordering::SeqCst)),
+                "wc":if fake.status_extra.lock().unwrap()["_compact_control"]==true {2}else{u8::from(fake.protocol.load(Ordering::SeqCst))},
                 "ble_claim":u8::from(fake.ble_claim.load(Ordering::SeqCst)),
                 "wake_generation":if fake.protocol.load(Ordering::SeqCst) {json!(2)} else {Value::Null},
                 "wake_seq":if fake.protocol.load(Ordering::SeqCst) {json!(9)} else {Value::Null}})),
@@ -2906,6 +2906,12 @@ pub(crate) mod ble_close_lock_tests {
                     reply["matches"]=json!(true);reply["connected"]=json!(true);
                     for (key,value) in fake.wifi_match_reply.lock().unwrap().as_object().unwrap() {reply[key]=value.clone();}},
                 "wifi_status" => {
+                    if command["control_only"]==true && fake.status_extra.lock().unwrap()["_compact_control"]==true {
+                        reply["ack"]=json!("wifi");reply["control_only"]=json!(true);reply["fw"]=json!("control-test");
+                        reply["boot_id"]=json!("00112233445566778899aabbccddeeff");
+                        reply["wifi_control"]=json!({"remaining_ms":3000,"read_allowed":true,"write_allowed":true,"principal":"bridge-lock-repro","namespace":"own","transaction_high_watermark":0,"reason":null});
+                        reply["wifi_storage"]=json!({"revision":1});
+                    }else{
                     // A paged status read can outlive the original short exchange.
                     if fake.rf_initial_ms.load(Ordering::SeqCst) > 0 {tokio::time::sleep(Duration::from_millis(450)).await;}
                     let mut status=json!({"device_mac":fake.mac,
@@ -2914,11 +2920,13 @@ pub(crate) mod ble_close_lock_tests {
                     if fake.status_extra.lock().unwrap()["_wifi_status_continuous"]==true {
                         status["wifi_management"]=json!(3);status["wifi_control"]["mode"]=json!("continuous");
                     }
+                    if let Some(padding)=fake.status_extra.lock().unwrap().get("_control_padding"){status["padding"]=padding.clone();}
                     let text=serde_json::to_vec(&status).unwrap();
                     let offset=command["offset"].as_u64().unwrap_or(0) as usize;
                     let end=(offset+100).min(text.len());
                     reply["snapshot"]=json!(1);reply["total"]=json!(text.len());reply["next_offset"]=json!(end);
                     reply["chunk"]=json!(text[offset..end].iter().map(|b|format!("{b:02x}")).collect::<String>());
+                    }
                 },
                 "wifi_snapshot" if fake.rf_initial_ms.load(Ordering::SeqCst) > 0 => {
                     let text=serde_json::to_string(&json!({"schema":2,"device_mac":fake.mac,
@@ -2970,7 +2978,8 @@ pub(crate) mod ble_close_lock_tests {
                 wire["device_mac"]=json!(fake.mac.as_bytes().chunks(2)
                     .map(|part|std::str::from_utf8(part).unwrap()).collect::<Vec<_>>().join(":"));
                 bridge_render::simulator_ble_wire("status", &wire).unwrap()
-            } else { serde_json::to_vec(&reply).unwrap() };
+            } else if reply["control_only"]==true {bridge_render::simulator_ble_wire("reply",&reply).unwrap()}
+            else { serde_json::to_vec(&reply).unwrap() };
             let response=bridge_core::compact_frame::Header{kind:1,op:frame.op,
                 result:if reply["result"]=="accepted" {1} else if reply["result"]=="rejected" {2}else{0},
                 payload_len:payload.len() as u16,
@@ -3128,6 +3137,26 @@ pub(crate) mod ble_close_lock_tests {
             mcp_tx,
             platform,
         }
+    }
+
+    #[tokio::test(flavor="multi_thread",worker_threads=4)]
+    async fn compact_wifi_control_is_one_frame_and_legacy_read_keeps_transaction_reserve() {
+        let _serial=SIM_ENV.lock().unwrap_or_else(|p|p.into_inner());
+        let (fake,url)=start_fake_ble(HUNG_MAC,false).await;fake.protocol.store(true,Ordering::SeqCst);
+        fake.status_extra.lock().unwrap()["_compact_control"]=json!(true);
+        std::env::set_var("CODEX_STATUS_SIM_BLE_ENDPOINTS",json!({HUNG_MAC:url}).to_string());
+        let mut link=bridge_ble::DeviceConnection::connect(HUNG_MAC,TOKEN,"bridge-lock-repro").await.unwrap().unwrap();
+        assert_eq!(link.info["wc"],2);
+        let status=link.wifi_read_budget("wifi_status",bridge_core::rendezvous::Budget::new(Duration::from_millis(1800))).await.unwrap();
+        assert_eq!(status["wifi_control"]["namespace"],"own");assert_eq!(status["wifi_storage"]["revision"],1);assert_eq!(status["fw"],"control-test");
+        assert_eq!(command_ops(&fake).iter().filter(|op|*op=="wifi_status").count(),1);
+        fake.status_extra.lock().unwrap()["_compact_control"]=json!(false);
+        fake.status_extra.lock().unwrap()["_control_padding"]=json!("x".repeat(2000));
+        let budget=bridge_core::rendezvous::Budget::new(Duration::from_millis(700));
+        let error=link.wifi_read_budget("wifi_status",budget).await.unwrap_err();
+        assert!(bridge_core::rendezvous::not_dispatched(&error));assert!(budget.remaining()>Duration::from_millis(200));
+        assert_eq!(command_ops(&fake).iter().filter(|op|*op=="wifi_status").count(),2);
+        link.close().await;std::env::remove_var("CODEX_STATUS_SIM_BLE_ENDPOINTS");
     }
 
     #[tokio::test(flavor="multi_thread",worker_threads=4)]
@@ -5235,7 +5264,7 @@ pub(crate) mod ble_close_lock_tests {
         std::env::set_var("CODEX_STATUS_SIM_BLE_ENDPOINTS",json!({HUNG_MAC:url}).to_string());
         std::env::set_var("CODEX_STATUS_TEST_HOST_WIFI",json!({"state":"connected","networks":[{"ssid":"FakeHost"}]}).to_string());
         let mut link=bridge_ble::DeviceConnection::connect(HUNG_MAC,TOKEN,&ctx.bridge_id).await.unwrap().unwrap();
-        assert_eq!(link.info["wifi_management"],3);assert_eq!(link.info["wc"],1);
+        assert_eq!(link.info["wifi_management"],3);assert_eq!(link.info["wc"],2);
         link.command("status",json!({})).await.unwrap();
         let owner=link.command("wifi_owner",json!({})).await.unwrap();
         assert_eq!(owner["ok"],true,"{owner:?}");

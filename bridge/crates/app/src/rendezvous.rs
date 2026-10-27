@@ -265,7 +265,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
         if plan_activation && needs_http && !reachable {
             let target=device_link_for_mac(ctx,&mac).ok_or("report_device_address_missing")?;
             let route=report_route(&target.ip)?;
-            plan_body["network"]=crate::wifi::plan_network(ctx,&mac,route,round.command_budget).await?;
+            plan_body["network"]=crate::wifi::plan_network(ctx,&mac,route,round.command_budget,link.info["wc"].as_u64().unwrap_or(0)).await?;
             round.activation_in_plan=true;
         }
         if let Some(data) = &pending_data {
@@ -436,15 +436,8 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
                 return Err("ble_info_refresh_failed".into());
             }
             // These optional commands consume a short shared tail.
-            if !round.admitted_wifi.is_empty() && !read_only {
-                // Cancelling a fragmented write leaves a partial JSON frame.
-                // Use the shared deadline; on timeout never reuse this link.
-                let noted=crate::wifi::note_link_budget(ctx,&mac,&mut link,shared_tail).await;
-                if noted["ok"]!=true {
-                    super::close_device_ble(link,_device_delivery,_delivery).await;
-                    return Err(noted["error"].as_str().unwrap_or("status_unavailable").to_owned());
-                }
-            }
+            // unified_on_link reads its own authenticated control summary.
+            // Do not spend the same RF tail reading a second full status first.
             // An unknown plan may query an already sent transaction, but
             // does not authorize a fresh write before HTTP proves the plan.
             let confirmation_only = service(ctx).wifi_state(&mac).jobs.iter()

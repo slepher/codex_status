@@ -108,6 +108,7 @@ void pollWifi();
 bool automaticContactNeeded();
 uint64_t wifiControlUntil(uint64_t now);
 WifiControlContext wifiControlContext(const EndpointRec &endpoint);
+void wifiDeviceControlStatus(JsonDocument &doc,const EndpointRec &endpoint);
 void wifiDeviceStatus(JsonDocument &doc,const EndpointRec *endpoint=nullptr);
 void handleWifiManagement(const char *op);
 void v2RendezvousBegin(bool deep = false);

@@ -105,6 +105,12 @@ fn id(s: &str, max: usize) -> bool {
     !s.is_empty() && s.len() <= max && s.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
 }
 impl Network {
+    /// Names may change while a frozen transaction is being confirmed.
+    /// Only the same radio/credential intent can consume its receipt.
+    pub fn same_connection_intent(&self,other:&Self)->bool {
+        self.network_id==other.network_id && self.ssid==other.ssid && self.password==other.password &&
+        self.credential==other.credential && self.origin==other.origin && self.version==other.version && self.deleted==other.deleted
+    }
     pub fn validate(&self) -> Result<()> {
         if !id(&self.network_id, 32) || self.host_ssid.is_empty() || self.ssid.is_empty()
             || self.host_ssid.len() > 32 || self.ssid.len() > 32 || self.label.len() > 64
@@ -703,10 +709,10 @@ impl WifiState {
         }
         // A fulfilled whole-row intent must not cause another password write on
         // every rendezvous. Never consume newer local edits or partial jobs.
-        if self.local_revision==j.local_revision {
+        {
             for frozen in &j.frozen {
                 if j.fields.contains_key(&frozen.network_id)||frozen.deleted {continue;}
-                if let Some(target)=self.targets.iter_mut().find(|n|n.network_id==frozen.network_id&&n.metadata()==frozen.metadata()&&n.credential==frozen.credential) {
+                if let Some(target)=self.targets.iter_mut().find(|n|n.same_connection_intent(frozen)) {
                     if let Some(row)=snapshot.networks.iter().find(|n|n.writable&&n.network.network_id==frozen.network_id) {
                         target.version=row.network.version;
                         if matches!(target.credential.as_str(),"replace"|"open")&&receipt {target.credential="keep".into();}
@@ -771,10 +777,8 @@ impl WifiState {
         }
         for frozen in &job.frozen {
             self.baseline.insert(frozen.network_id.clone(), frozen.metadata());
-            if self.local_revision == job.local_revision {
-                if let Some(target) = self.targets.iter_mut().find(|n| n == &frozen) {
-                    target.version = revision; target.credential = "keep".into();
-                }
+            if let Some(target) = self.targets.iter_mut().find(|n| n.same_connection_intent(frozen)) {
+                target.version = revision; target.credential = "keep".into();
             }
         }
         let j = self.jobs.iter_mut().find(|j| j.job_id == job_id).unwrap();

@@ -192,6 +192,10 @@ BEGIN/COMMIT载荷关联同一业务request及length/content_crc；完整正文�
 
 ### 5.3 Wi-Fi载荷差异与错误
 
+2026-10-27修复合同（候选，部署以PROGRESS为准）：INFO `wc=2`及HTTP `wifi_connection=2`支持连接匹配v2。`wifi_match`和Plan的target可带`match_v:2`；其`metadata_key=SHA256(SSID UTF-8 + NUL + open单字节)`，密码仍单独`credential_key=SHA256(password)`。network_id仍必须一致。label及host_ssid（族显示名）不参与v2，改名不强制替换已确认凭据；无match_v保留旧摘要，其他显式版本拒绝。Bridge按当前载体认证能力选择，旧ROM不发送v2，SSID/open/密码变化继续失配。
+
+BLE `wifi_status`加`control_only:true`请求单帧控制摘要；旧请求仍用冻结分页。应答`c=[1,boot_id,base64(fw),remaining_ms,read_allowed,write_allowed,principal,namespace,transaction_high_watermark,reason,revision]`，其device_mac、rid及wake/session仍由原48B封帧及认证围栏核验。remaining_ms=null表示continuous，0为unavailable；最大字段完整帧≤512B。只携带控制事实，不能冒充完整设备快照、联网成功或续期。Bridge校验数组长度/类型/版本后展开为原内部合同；旧ROM忽略control_only时仍可分页，但预留后续命令预算、预计无法完成时发送前明拒。会合去除重复全状态读取，apply/activate/trial剩余预算不足750ms不发送，不把最后几十毫秒的写入赌作成功；已发未知保持原ID查询。
+
 HTTP/BLE都以具体frame opcode进入同一Wi-Fi处理器；apply使用wifi_apply，删除wifi_command包装及wifi_save别名。两端拒绝JSON op/command/session_nonce/protocol/rv，原持久事务ID、principal/namespace和回执高水位保留。
 
 401/403的发送前失败或明确拒绝进入确定失败；查询历史未知事务遇拒绝不能抹掉原sent/unknown。409保留revision_conflict/context等真实error/stage，不统一伪装occupied。格式/content-type/鉴权错误可能是未封帧的载体错误，不能因收到HTTP200或非frame错误页就当业务成功。

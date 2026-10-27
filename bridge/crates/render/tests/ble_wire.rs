@@ -130,3 +130,13 @@ fn invalid_identity_is_not_echoed_and_oversize_is_unknown_after_execution() {
     let reply: Value = serde_json::from_slice(&wire("reply", &doc).unwrap()).unwrap();
     assert_eq!(reply["more"], true); assert!(reply["records"].as_array().unwrap().len() < 2);
 }
+
+#[test]
+fn wifi_control_summary_fits_one_frame_at_field_limits() {
+    let input=json!({"device_mac":"AA:BB:CC:DD:EE:FF","request_id":"rffffffffffffffff","wake_generation":u32::MAX,"wake_seq":u32::MAX,
+        "ack":"wifi","ok":true,"control_only":true,"boot_id":"f".repeat(32),"fw":"\u{1}".repeat(64),
+        "wifi_control":{"remaining_ms":u64::MAX,"read_allowed":true,"write_allowed":false,"principal":"f".repeat(32),"namespace":"f".repeat(21),"transaction_high_watermark":u64::MAX,"reason":"r".repeat(32)},"wifi_storage":{"revision":u64::MAX}});
+    let raw=wire("reply",&input).unwrap();let doc:Value=serde_json::from_slice(&raw).unwrap();
+    assert!(raw.len()+48<=512,"{} bytes",raw.len()+48);assert_eq!(doc["c"][0],1);assert_eq!(doc["c"][10],u64::MAX);
+    println!("max Wi-Fi control frame={} bytes, one command",raw.len()+48);
+}

@@ -583,8 +583,9 @@ impl PlatformService {
             for id in selected {
                 let mut n=next.get(&id)?.network(&record.capabilities.firmware_target)?;
                 if let Some(old)=state.targets.iter().find(|n|n.network_id==id) {
-                    if old.host_ssid==n.host_ssid && old.ssid==n.ssid && old.label==n.label && old.password==n.password && !old.deleted {
-                        n=old.clone();
+                    if old.ssid==n.ssid && old.password==n.password && !old.deleted {
+                        // Display/family names do not create a new credential intent.
+                        n.version=old.version;n.credential=old.credential.clone();
                     }
                 }
                 // Explicitly subscribing may adopt an identical legacy mapping.
@@ -758,9 +759,7 @@ impl PlatformService {
             anyhow::ensure!(versions.len()==job.selected.len() && job.selected.iter().all(|id|versions.contains_key(id)),"target_unconfirmed");
             for frozen in &job.frozen {
                 s.baseline.insert(frozen.network_id.clone(),frozen.metadata());
-                if s.local_revision==job.local_revision {
-                    if let Some(target)=s.targets.iter_mut().find(|n|*n==frozen){target.version=versions[&frozen.network_id];target.credential="keep".into();}
-                }
+                if let Some(target)=s.targets.iter_mut().find(|n|n.same_connection_intent(frozen)){target.version=versions[&frozen.network_id];target.credential="keep".into();}
             }
             // Do not promote a stale full snapshot using a subset of digests.
             if let Some(snapshot)=s.snapshot.as_mut(){snapshot.complete=false;}
@@ -2515,7 +2514,7 @@ impl PlatformService {
         let groups: [(&str, &[&str]); 7] = [
             ("identity", &["device_mac", "configured"]),
             ("firmware", &["fw", "firmware_target", "running_slot", "reset_reason",
-                "image_identity", "sync_v1", "diag_format", "diag_capacity", "wifi_management"]),
+                "image_identity", "sync_v1", "diag_format", "diag_capacity", "wifi_management", "wifi_connection"]),
             ("radio", &["radio", "presence", "transports", "wifi_control", "status_seq", "network"]),
             ("runtime", &["heap_free", "heap_min", "uptime_ms"]),
             ("display", &["display", "active_context_id", "active_template_id",
@@ -3588,6 +3587,18 @@ mod tests {
         svc
     }
 
+    #[test]
+    fn wifi_family_rename_preserves_confirmed_credentials_and_version() {
+        let root=tempfile::tempdir().unwrap();let svc=PlatformService::open(root.path()).unwrap();let mac="AABBCCDDEEFF";
+        svc.device_upsert(DeviceIdentity::new(mac,"BW").unwrap(),DeviceCapabilities::ssd1681_154g()).unwrap();
+        let lib=serde_json::from_value(json!({"revision":0,"families":[{"id":"home","name":"Home","ssid_2g":"Device","password_2g":"password1"}],"devices":{mac:["home"]},"wired_family":null})).unwrap();
+        let mut lib=svc.wifi_library_save(0,lib,100).unwrap();
+        svc.wifi_mutate(mac,|w|{w.targets[0].credential="keep".into();w.targets[0].version=7;Ok(())}).unwrap();
+        lib.families[0].name="Renamed".into();let mut lib=svc.wifi_library_save(1,lib,101).unwrap();
+        let n=svc.wifi_state(mac).targets.remove(0);assert_eq!(n.host_ssid,"Renamed");assert_eq!(n.label,"Renamed");assert_eq!(n.credential,"keep");assert_eq!(n.version,7);
+        lib.families[0].password_2g=Some("password2".into());svc.wifi_library_save(2,lib,102).unwrap();
+        let n=svc.wifi_state(mac).targets.remove(0);assert_eq!(n.credential,"replace");assert_eq!(n.version,0);
+    }
     #[test]
     fn wifi_family_projection_import_restart_and_atomic_failure() {
         let root=tempfile::tempdir().unwrap();let svc=PlatformService::open(root.path()).unwrap();
@@ -5907,7 +5918,8 @@ mod tests {
 
     #[test]
     fn wifi_recovery_consumes_confirmed_credentials_but_preserves_new_local_edits() {
-        for edit in [false,true] {
+        for case in ["unchanged","radio","display"] {
+            let edit=case=="radio";
             let dir=tempfile::tempdir().unwrap();let svc=service_with_device(dir.path());let mac="AABBCCDDEEFF";
             let target:WifiNetwork=serde_json::from_value(json!({"network_id":"home","host_ssid":"Host","ssid":"Device","credential":"replace"})).unwrap();
             svc.wifi_save(mac,0,vec![target.clone()],100).unwrap();
@@ -5916,6 +5928,7 @@ mod tests {
             svc.wifi_mark_sent(mac,&job.job_id,102).unwrap();
             svc.wifi_finish(mac,&job.job_id,"awaiting_confirmation",None,102).unwrap();
             if edit {let mut changed=target.clone();changed.ssid="New intent".into();svc.wifi_save(mac,1,vec![changed],103).unwrap();}
+            if case=="display" {let mut changed=target.clone();changed.label="New label".into();changed.host_ssid="New family".into();svc.wifi_save(mac,1,vec![changed],103).unwrap();}
             ready(svc.wifi_attempt_async(mac,&job.job_id,"bridge","own",false,&BTreeMap::new(),200,&mut |op: &str, body: Value| {
                 assert_eq!(op,"result");assert_eq!(body["query_id"],job.request_id);
                 Ok(json!({"ok":true,"outcome":"committed","revision":7,"bond":"own"}))
@@ -5924,6 +5937,7 @@ mod tests {
             assert_eq!(state.targets[0].credential,if edit{"replace"}else{"keep"});
             assert_eq!(state.targets[0].version,if edit{0}else{7});
             assert_eq!(state.targets[0].ssid,if edit{"New intent"}else{"Device"});
+            if case=="display" {assert_eq!(state.targets[0].label,"New label");assert_eq!(state.targets[0].host_ssid,"New family");}
             assert!(state.snapshot.is_none()); // no prerequisite full-device read
         }
     }

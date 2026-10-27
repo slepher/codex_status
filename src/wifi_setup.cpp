@@ -325,12 +325,22 @@ static String wifiMetadataKey(const WifiNetwork &network, const char *label, boo
     for(size_t i=0;i<32;++i){text[2*i]=hex[hash[i]>>4];text[2*i+1]=hex[hash[i]&15];}text[64]=0;
     return String(text);
 }
+static String wifiConnectionKey(const WifiNetwork &network, bool open) {
+    uint8_t payload[34],hash[32];const size_t length=strlen(network.ssid.c_str());
+    memcpy(payload,network.ssid.c_str(),length+1);payload[length+1]=open?1:0;
+    mbedtls_sha256(payload,length+2,hash,0);
+    static const char digits[]="0123456789abcdef";char hex[65];
+    for(size_t i=0;i<32;++i){hex[2*i]=digits[hash[i]>>4];hex[2*i+1]=digits[hash[i]&15];}hex[64]=0;
+    return String(hex);
+}
 static bool wifiTargetMatches(const WifiNetwork &network, JsonVariantConst target) {
     if (!target["open"].is<bool>()) return false;
     const bool open=target["open"].as<bool>();
+    const bool v2=target["match_v"]==2;
+    if (!target["match_v"].isNull() && !v2) return false;
     bool matches=String(network.id.c_str())==(target["network_id"]|"") &&
-        wifiMetadataKey(network,network.label.c_str(),open)==(target["metadata_key"]|"") &&
-        (!open || !*network.password);
+        (v2?wifiConnectionKey(network,open):wifiMetadataKey(network,network.label.c_str(),open))==(target["metadata_key"]|"") &&
+        (open==!*network.password);
     if (!target["credential_key"].isNull()) {
         uint8_t digest[32]; char hex[65]; const char *password=network.password;
         mbedtls_sha256((const uint8_t *)password,strlen(password),digest,0);
@@ -367,6 +377,7 @@ String wifiSetupCommand(JsonDocument &doc, const String &peer, uint32_t generati
         out["ack"] = "wifi"; out["op"] = "wifi"; out["request_id"] = id;
         out["device_mac"] = doc["device_mac"]; out["ok"] = true; out["network_id"] = networkId;
         out["version"] = slot < 0 ? 0 : schemes.networks[slot].version;
+        if (!doc["match_v"].isNull() && (!doc["match_v"].is<uint8_t>() || doc["match_v"]!=2)) return reply(doc,"shape");
         if (!doc["open"].is<bool>() || String(doc["metadata_key"] | "").length()!=64) return reply(doc,"shape");
         if (!doc["credential_key"].isNull() && String(doc["credential_key"]|"").length()!=64) return reply(doc,"shape");
         bool matches=slot>=0 && wifiTargetMatches(schemes.networks[slot],doc.as<JsonVariantConst>());

@@ -3,12 +3,15 @@
 #include "platform_target.h"
 #include "firmware/application.h"
 
+// Shared release sequence; hardware suffixes do not advance independently.
+#define FW_RELEASE_VERSION "0.18.107"
+
 #if defined(CODEX_CLK_WINDOW_TEST)
 #define FW_VERSION    "0.13.9-clkwin"
 #elif defined(CODEX_TARGET_NOTE4)
-#define FW_VERSION    "0.18.106-note4"
+#define FW_VERSION    FW_RELEASE_VERSION "-note4"
 #else
-#define FW_VERSION    "0.18.38-bw"
+#define FW_VERSION    FW_RELEASE_VERSION "-bw"
 #endif
 
 // Keep version and OTA marker together: Bridge validates this exact identity.

@@ -37,7 +37,8 @@ public:
         if (!id || !network.is<JsonObjectConst>() || network.size()!=4 || !network["v"].is<uint8_t>() || network["v"]!=1 ||
             !planNetworkText(network["bridge_addr"],15) || !planNetworkAddress(network["bridge_addr"]) ||
             !network["bridge_port"].is<uint16_t>() || network["bridge_port"]==0 ||
-            !t.is<JsonObjectConst>() || t.size()!=(t["credential_key"].isNull()?3u:4u) ||
+            !t.is<JsonObjectConst>() || t.size()!=3u+(!t["credential_key"].isNull())+(!t["match_v"].isNull()) ||
+            (!t["match_v"].isNull() && (!t["match_v"].is<uint8_t>() || t["match_v"]!=2)) ||
             !planNetworkText(t["network_id"],32) || !t["open"].is<bool>() ||
             !planNetworkHex(t["metadata_key"]) || (!t["credential_key"].isNull() && !planNetworkHex(t["credential_key"])))
             return "plan_network_shape";
@@ -46,6 +47,7 @@ public:
         canonical["bridge_port"]=network["bridge_port"];
         canonical["target"]["network_id"]=t["network_id"];
         canonical["target"]["open"]=t["open"];
+        if (!t["match_v"].isNull()) canonical["target"]["match_v"]=t["match_v"];
         canonical["target"]["metadata_key"]=t["metadata_key"];
         if (!t["credential_key"].isNull()) canonical["target"]["credential_key"]=t["credential_key"];
         const size_t length=measureJson(canonical);

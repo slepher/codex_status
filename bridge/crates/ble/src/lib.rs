@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use bridge_core::rendezvous::CLOSE_BUDGET;
 use btleplug::api::{
     Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter, ValueNotification, WriteType,
@@ -940,6 +940,10 @@ pub fn decode_wire(raw: &[u8]) -> Result<serde_json::Value> {
     }
     if value.get("er").is_some() { value["endpoint_registration"] = value["er"].clone(); }
     if value.get("f").is_some() { value["fw"] = json!(text(&value["f"], 64)?); }
+    if let Some(c)=value.get("c") {
+        ensure!(c.as_array().is_some_and(|a|a.len()==11),"Wi-Fi control shape");
+        value["c"][2]=json!(text(&value["c"][2],64)?);
+    }
     if value.get("rid").is_some() {
         let request = text(&value["rid"], 64)?;
         if request.is_empty() { bail!("empty BLE request identity"); }
@@ -979,6 +983,18 @@ pub fn decode_wire(raw: &[u8]) -> Result<serde_json::Value> {
             "due":a[12],"retry_skip":a[13],"pending":a[14]}); }
     }
     Ok(value)
+}
+
+fn decode_wifi_control_status(reply:&serde_json::Value)->Result<serde_json::Value>{
+    let c=reply["c"].as_array().context("Wi-Fi control shape")?;
+    let text=|i:usize,max:usize|c.get(i).and_then(|v|v.as_str()).is_some_and(|v|!v.is_empty()&&v.len()<=max&&!v.contains('\0'));
+    ensure!(c.len()==11 && c[0]==1 && text(1,32) && text(2,64) && (c[3].is_null()||c[3].as_u64().is_some()) &&
+        c[4].is_boolean() && c[5].is_boolean() && text(6,32) && text(7,21) && c[8].as_u64().is_some() &&
+        (c[9].is_null()||text(9,32)) && c[10].as_u64().is_some(),"Wi-Fi control shape");
+    Ok(json!({"device_mac":reply["device_mac"],"boot_id":c[1],"fw":c[2],"wifi_management":3,"wifi_connection":2,
+        "wifi_storage":{"revision":c[10]},"wifi_control":{"mode":if c[3].is_null(){"continuous"}else if c[3]==0{"unavailable"}else{"window"},
+            "remaining_ms":c[3],"read_allowed":c[4],"write_allowed":c[5],"principal":c[6],"namespace":c[7],
+            "transaction_high_watermark":c[8],"reason":c[9]}}))
 }
 
 impl DeviceConnection {
@@ -1231,6 +1247,15 @@ impl DeviceConnection {
         let normal = tokio::time::Instant::now() + Duration::from_secs(5);
         let deadline = self.rf_deadline.map_or(normal, |rf| rf.min(normal));
         self.command_budget_deadline.map_or(deadline, |phase| phase.min(deadline))
+    }
+
+    /// A whole Wi-Fi exchange must reserve time inside the actual radio phase,
+    /// even when its caller has a longer end-to-end budget.
+    pub fn wifi_work_budget(&self,budget:bridge_core::rendezvous::Budget)->bridge_core::rendezvous::Budget {
+        match self.rf_deadline.into_iter().chain(self.command_budget_deadline).min() {
+            Some(deadline)=>budget.capped(deadline.saturating_duration_since(tokio::time::Instant::now())),
+            None=>budget,
+        }
     }
 
     /// A shared phase deadline belongs inside the carrier: an application
@@ -1693,12 +1718,22 @@ impl DeviceConnection {
 
     pub async fn wifi_read_budget(&mut self, op: &str, budget: bridge_core::rendezvous::Budget) -> Result<serde_json::Value> {
         if !matches!(op, "wifi_scheme_get" | "wifi_capabilities" | "wifi_status") { bail!("invalid Wi-Fi read"); }
+        let budget=self.wifi_work_budget(budget);
+        let reserve=budget.remaining().min(Duration::from_millis(1600))/2;
         let mut body = json!({"offset":0});
+        if op=="wifi_status" {body["control_only"]=json!(true);}
         let mut bytes = Vec::new();
         let mut snapshot = None;
         loop {
-            let reply = self.command_budget(op, body, budget.remaining()).await?;
+            let remaining=budget.remaining().saturating_sub(reserve);
+            if remaining.is_zero(){return Err(bridge_core::rendezvous::CommandFailure{
+                outcome:bridge_core::rendezvous::DispatchOutcome::NotSent,stage:"summary_preflight",reason:"summary_budget_exhausted"}.into());}
+            let reply = self.command_budget(op, body, remaining).await?;
             if reply["ok"] != true { bail!("Wi-Fi summary read rejected"); }
+            if reply.get("c").is_some() {
+                ensure!(op=="wifi_status" && bytes.is_empty(),"unexpected compact Wi-Fi status");
+                return decode_wifi_control_status(&reply);
+            }
             let total = reply["total"].as_u64().context("Wi-Fi summary total")? as usize;
             let next = reply["next_offset"].as_u64().context("Wi-Fi summary offset")? as usize;
             let id = reply["snapshot"].as_u64().context("Wi-Fi summary snapshot")?;
@@ -1711,7 +1746,13 @@ impl DeviceConnection {
             }
             if bytes.len() != next || next > total { bail!("Wi-Fi summary offset mismatch"); }
             if next == total { return serde_json::from_slice(&bytes).context("Wi-Fi summary JSON"); }
+            let pages=(total-next).div_ceil(chunk.len()/2);
+            if budget.remaining()<reserve+Duration::from_millis(pages as u64*150) {
+                return Err(bridge_core::rendezvous::CommandFailure{outcome:bridge_core::rendezvous::DispatchOutcome::NotSent,
+                    stage:"summary_preflight",reason:"summary_budget_exhausted"}.into());
+            }
             body = json!({"offset":next,"snapshot":id});
+            if op=="wifi_status" {body["control_only"]=json!(true);}
         }
     }
 
@@ -1860,6 +1901,16 @@ fn info_authorized_target(info: &serde_json::Value, target_macs: &[String]) -> O
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compact_control_status_is_validated_and_expanded() {
+        let mut r=serde_json::json!({"device_mac":"AABBCCDDEEFF","c":[1,"boot","0.18.107-note4",3000,true,true,"8c94","10:68:38:ab:23:df/0",378,null,344]});
+        let status=super::decode_wifi_control_status(&r).unwrap();
+        assert_eq!(status["wifi_control"]["namespace"],"10:68:38:ab:23:df/0");assert_eq!(status["wifi_storage"]["revision"],344);
+        assert_eq!(status["wifi_control"]["mode"],"window");
+        r["c"][0]=serde_json::json!(2);assert!(super::decode_wifi_control_status(&r).is_err());
+        r["c"][0]=serde_json::json!(1);r["c"][4]=serde_json::json!("true");assert!(super::decode_wifi_control_status(&r).is_err());
+    }
+
     #[test]
     fn discovery_candidate_requires_unique_suffix_and_full_info_identity() {
         let targets=vec!["001122334455".to_owned(),"AABBCC334455".to_owned()];
@@ -2354,6 +2405,19 @@ mod tests {
         assert!(link.command_deadline() < tokio::time::Instant::now());
         link.set_command_budget(None);
         assert!(link.command_deadline() > phase);
+    }
+
+    #[test]
+    fn wifi_work_budget_reserves_against_rf_and_shared_deadlines() {
+        let mut link=test_link();let caller=bridge_core::rendezvous::Budget::new(Duration::from_secs(30));
+        link.rf_deadline=Some(tokio::time::Instant::now()+Duration::from_millis(200));
+        assert!(link.wifi_work_budget(caller).remaining()<=Duration::from_millis(200));
+        link.command_budget_deadline=Some(tokio::time::Instant::now()+Duration::from_millis(100));
+        assert!(link.wifi_work_budget(caller).remaining()<=Duration::from_millis(100));
+        let shorter=bridge_core::rendezvous::Budget::new(Duration::from_millis(50));
+        assert!(link.wifi_work_budget(shorter).remaining()<=Duration::from_millis(50));
+        link.rf_deadline=Some(tokio::time::Instant::now()-Duration::from_millis(1));
+        assert!(link.wifi_work_budget(caller).remaining().is_zero());
     }
 
     #[test]

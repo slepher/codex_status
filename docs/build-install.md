@@ -71,4 +71,6 @@ python3 tools/bridge-macos-service.py start --app "$CODEX_STATUS_APP_OUTPUT"
 
 `.github/workflows/release.yml`：推送 `v*` 标签构建所有目标；手动 `workflow_dispatch` 只上传可下载产物。普通提交/PR 不触发这份发布流程。Windows x64、macOS arm64/x64 使用对应原生 runner；两个固件目标串行隔离构建。全部成功才生成 **draft Release**，由维护者检查后公开；失败目标在 Actions summary 明示，不静默跳过 1.54。
 
-发布标签代表源码快照，各 ROM 使用镜像内自身版本/target。产物须有大小、SHA256、匹配 ELF 哈希与原生 OTA 双槽容量检查。macOS 签名/公证、CI 首次实跑、1.54 最新 ROM 与真实 USB 全流程的证据尚未取得时，应保留为缺口。
+发布标签代表源码快照。Note4与1.54共用`src/main.cpp`的`FW_RELEASE_VERSION`，只在这一处递增；完整版本分别为`<基号>-note4`与`<基号>-bw`，target/env保持不变。两台不必同时构建、打包或升级；各自在某一源码快照打包时使用该快照的共同基号，不另开设备专属序号。AP01沿用兄弟仓库版本，不加入此序列。
+
+打包使用`tools/stage-release-rom.py`：核对ROM marker基号与当前源码，拒绝拿旧目标缓存冒充新版；manifest同时登记`release_version`、完整`version`、target/env、source_commit/source_dirty、ROM大小/SHA256及匹配ELF哈希。源码版本、已打包产物、实机运行版本分开记录：仅改共同基号不将未升级设备登记为新版本；现场确认仍以同MAC认证及运行镜像证明为准。当前部署见PROGRESS，历史差异从统一序列开始时保留，不改写旧版本。产物须有大小、SHA256、匹配 ELF 哈希与原生 OTA 双槽容量检查。macOS 签名/公证、CI 首次实跑、1.54 最新 ROM 与真实 USB 全流程的证据尚未取得时，应保留为缺口。

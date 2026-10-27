@@ -30,7 +30,11 @@ fn plan_network_contract_matches_rom_and_replay_is_immutable() {
         assert!(bridge_core::template::validate_plan_activation(&invalid).is_err(),"{pointer}");
         assert!(bridge_render::simulator_plan_network(43,None,&invalid).is_err(),"{pointer}");
     }
-    let mut maximum=network.clone();maximum["target"]["network_id"]=json!("x".repeat(32));
+    let mut modern=network.clone();modern["target"]["match_v"]=json!(2);
+    bridge_core::template::validate_plan_activation(&modern).unwrap();
+    let result=bridge_render::simulator_plan_network(43,None,&modern).unwrap();assert_eq!(result["target"]["match_v"],2);
+    modern["target"]["match_v"]=json!(3);assert!(bridge_core::template::validate_plan_activation(&modern).is_err());assert!(bridge_render::simulator_plan_network(43,None,&modern).is_err());
+    let mut maximum=network.clone();maximum["target"]["match_v"]=json!(2);maximum["target"]["network_id"]=json!("x".repeat(32));
     maximum["target"]["credential_key"]=json!("f".repeat(64));
     bridge_core::template::validate_plan_activation(&maximum).unwrap();
     assert!(bridge_render::simulator_plan_network(43,None,&maximum).unwrap().to_string().len()<=384);

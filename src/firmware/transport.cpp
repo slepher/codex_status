@@ -729,8 +729,12 @@ void serviceV2Ble() {
             } else {
                 auto context=radio::wifiControlContext(endpoint);context.generation=generation;
                 if(operation=="wifi_status"){
-                    JsonDocument status;radio::wifiDeviceStatus(status,&endpoint);status["session_nonce"]=v2Nonce();status["ok"]=true;
-                    String text;serializeJson(status,text);deserializeJson(out,wifiSetupReadPage(doc,endpoint.nameSpace,generation,text));
+                    if(doc["control_only"]==true){
+                        radio::wifiDeviceControlStatus(out,endpoint);out["control_only"]=true;out["ok"]=true;
+                    }else{
+                        JsonDocument status;radio::wifiDeviceStatus(status,&endpoint);status["session_nonce"]=v2Nonce();status["ok"]=true;
+                        String text;serializeJson(status,text);deserializeJson(out,wifiSetupReadPage(doc,endpoint.nameSpace,generation,text));
+                    }
                 }
                 else deserializeJson(out,wifiControlCommand(doc,context,now));
             }

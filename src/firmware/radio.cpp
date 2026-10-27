@@ -147,7 +147,7 @@ String ipText() {
 
 static String infoExtraJson() {
     String items = "\"mac\":\"" + macText() + "\",\"ip\":\"" + ipText() +
-                   "\",\"http_port\":80,\"rendezvous\":true,\"wifi_setup_protocol\":1,\"wifi_management\":3,\"wifi_connection\":1,\"ble_claim\":1,\"plan_activation\":1" +
+                   "\",\"http_port\":80,\"rendezvous\":true,\"wifi_setup_protocol\":1,\"wifi_management\":3,\"wifi_connection\":2,\"ble_claim\":1,\"plan_activation\":1" +
                    ",\"wake_generation\":" + String((unsigned long)diagnostics::retained.rtcWakeGeneration) +
                    ",\"wake_seq\":" + String((unsigned long)diagnostics::retained.rtcTraceCurrentSeq) +
                    ",\"wake_stage\":\"" +
@@ -438,8 +438,30 @@ WifiControlContext wifiControlContext(const EndpointRec &endpoint) {
     context.sessionValid=true;return context; // caller has admitted the authenticated frame session
 }
 
+void wifiDeviceControlStatus(JsonDocument &doc,const EndpointRec &endpointValue) {
+    const EndpointRec *endpoint=&endpointValue;
+    const uint64_t now=clock::v2NowMs(),controlUntil=wifiControlUntil(now);
+    OwnerRec owner;const bool owned=ownerGet(owner);
+    doc["device_mac"]=macText();doc["boot_id"]=transport::bootId();
+    doc["fw"]=application::state.firmwareVersion;doc["wifi_management"]=3;doc["wifi_connection"]=2;
+    if(doc["wifi_storage"].isNull())wifiSchemesStorageStatus(doc["wifi_storage"].to<JsonObject>());
+    if(endpoint){
+        auto control=doc["wifi_control"].to<JsonObject>();bool bound=endpoint->principal.length()&&endpoint->nameSpace.length();
+        bool claimed=owned && owner.id==endpoint->principal;
+        control["mode"]=controlUntil==UINT64_MAX?"continuous":controlUntil>now?"window":"unavailable";
+        control["read_allowed"]=bound && controlUntil>now;
+        control["write_allowed"]=bound && claimed && controlUntil>now && !wifiSetupBusy();
+        if(controlUntil==UINT64_MAX)control["remaining_ms"]=nullptr;else control["remaining_ms"]=controlUntil>now?controlUntil-now:0;
+        control["principal"]=endpoint->principal;
+        control["namespace"]=endpoint->nameSpace;
+        control["transaction_high_watermark"]=wifiManagementHighWater(endpoint->principal,endpoint->nameSpace);
+        const char *reason=!bound?"binding_required":transport::state.otaInProgress?"ota_busy":!controlUntil?"window_closed":!claimed?(owned?"occupied":"claim_required"):wifiSetupBusy()?"busy":nullptr;
+        if(reason)control["reason"]=reason;else control["reason"]=nullptr;
+    }
+}
+
 void wifiDeviceStatus(JsonDocument &doc,const EndpointRec *endpoint) {
-    doc["plan_activation"]=1;
+    doc["plan_activation"]=1;doc["wifi_connection"]=2;
     doc["power"]["plan_storage"] = power::state.planStore.status();
     doc["network"]["startup_contact"] = state.startupContact;
     const uint64_t now=clock::v2NowMs(),until=wifiPresenceUntil(now),controlUntil=wifiControlUntil(now);
@@ -469,19 +491,7 @@ void wifiDeviceStatus(JsonDocument &doc,const EndpointRec *endpoint) {
     if(power::state.v2Provisional)reasons.add("startup");if(power::state.v2Plan.lightActive(now))reasons.add("bridge");else if(!continuous && power::state.bleRecovery.until<=now)reasons.add("timer");
     auto http=doc["transports"]["http"].to<JsonObject>();http["ready"]=httpReady;http["ip"]=ipText();http["port"]=80;
     doc["transports"]["ble"]["ready"]=state.bleOn;
-    if(endpoint){
-        auto control=doc["wifi_control"].to<JsonObject>();bool bound=endpoint->principal.length()&&endpoint->nameSpace.length();
-        bool claimed=owned && owner.id==endpoint->principal;
-        control["mode"]=controlUntil==UINT64_MAX?"continuous":controlUntil>now?"window":"unavailable";
-        control["read_allowed"]=bound && controlUntil>now;
-        control["write_allowed"]=bound && claimed && controlUntil>now && !wifiSetupBusy();
-        if(controlUntil==UINT64_MAX)control["remaining_ms"]=nullptr;else control["remaining_ms"]=controlUntil>now?controlUntil-now:0;
-        control["principal"]=endpoint->principal;
-        control["namespace"]=endpoint->nameSpace;
-        control["transaction_high_watermark"]=wifiManagementHighWater(endpoint->principal,endpoint->nameSpace);
-        const char *reason=!bound?"binding_required":transport::state.otaInProgress?"ota_busy":!controlUntil?"window_closed":!claimed?(owned?"occupied":"claim_required"):wifiSetupBusy()?"busy":nullptr;
-        if(reason)control["reason"]=reason;else control["reason"]=nullptr;
-    }
+    if(endpoint)wifiDeviceControlStatus(doc,*endpoint);
 }
 
 static __attribute__((noinline)) void servicePresence() {

@@ -96,6 +96,16 @@ String bleBuildStatus(const BleStatusSnapshot &s) {
 String bleBuildReply(JsonDocument &doc, const String &request, uint32_t generation, uint32_t wakeSeq) {
     if (!bleWireText(request, 64, false)) return String();
     const bool wifi = doc["ack"] == "wifi";
+    if(wifi && doc["control_only"]==true){
+        // One bounded, authenticated control observation, never a device snapshot.
+        JsonDocument compact;compact["device_mac"]=doc["device_mac"];compact["ok"]=doc["ok"];
+        JsonArray c=compact["c"].to<JsonArray>();
+        c.add(1);c.add(doc["boot_id"]);c.add(encoded(doc["fw"].as<String>()));
+        c.add(doc["wifi_control"]["remaining_ms"]);c.add(doc["wifi_control"]["read_allowed"]);c.add(doc["wifi_control"]["write_allowed"]);
+        c.add(doc["wifi_control"]["principal"]);c.add(doc["wifi_control"]["namespace"]);
+        c.add(doc["wifi_control"]["transaction_high_watermark"]);c.add(doc["wifi_control"]["reason"]);c.add(doc["wifi_storage"]["revision"]);
+        doc=std::move(compact);
+    }
     doc["ack"] = wifi ? "wifi" : "command";
     doc["ble_wire"] = 1; doc["rid"] = encoded(request);
     doc.remove("request_id"); doc.remove("wake_generation"); doc.remove("wake_seq");

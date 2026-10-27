@@ -39,7 +39,8 @@ pub fn validate_plan_activation(network: &Value) -> Result<()> {
     anyhow::ensure!(object.len()==4 && network["v"]==PLAN_ACTIVATION_VERSION &&
         address.is_some_and(|ip|ip.octets()[0]>0 && ip.octets()[0]!=127 && ip.octets()[0]<224) &&
         network["bridge_port"].as_u64().is_some_and(|p|(1..=65535).contains(&p)) &&
-        target.len()==(if target.contains_key("credential_key"){4}else{3}) &&
+        target.len()==3+usize::from(target.contains_key("credential_key"))+usize::from(target.contains_key("match_v")) &&
+        (!target.contains_key("match_v") || network["target"]["match_v"]==2) &&
         network["target"]["network_id"].as_str().is_some_and(|s|!s.is_empty() && s.len()<=32 && !s.contains('\0')) &&
         network["target"]["open"].is_boolean() && hex(&network["target"]["metadata_key"]) &&
         (!target.contains_key("credential_key") || hex(&network["target"]["credential_key"])),"plan_network_shape");

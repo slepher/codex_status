@@ -1865,6 +1865,12 @@ fn physical_ble_hold_finishes_wifi_activation_without_starting_deferred_rf() {
     // SHA256 of Host\0Device\0\0 followed by the open-network byte 1.
     let mut target=serde_json::json!({"network_id":"home","open":true,"metadata_key":"b733bca5c43500f3fcfd520711c18f89d0e4ea05ab1ce7b4cf6c23be82b656e2"});
     assert!(sim.plan_matches(&target).unwrap(),"Plan matches the authorized deferred configuration before RF starts");
+    let mut v2=target.clone();v2["match_v"]=serde_json::json!(2);v2["metadata_key"]=serde_json::json!("103d00acaa32b929d09082da22860ab169bef9b5923c30cf2b790c9872306aac");
+    assert!(sim.plan_matches(&v2).unwrap(),"C++ ROM accepts the Python/Rust connection-only digest");
+    v2["credential_key"]=serde_json::json!("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");assert!(sim.plan_matches(&v2).unwrap());
+    v2["credential_key"]=serde_json::json!("0".repeat(64));assert!(!sim.plan_matches(&v2).unwrap());
+    v2["match_v"]=serde_json::json!(3);assert!(!sim.plan_matches(&v2).unwrap());
+
     target["metadata_key"]=serde_json::json!("0".repeat(64));
     assert!(!sim.plan_matches(&target).unwrap(),"Plan must not connect a different configuration");
     assert_eq!(sim.control(&serde_json::json!({"op":"result","bridge_id":"test","request_id":"query2","query_id":"deferred","device_mac":"AABBCCDDEEFF"}),"test","bond",1,1600,300000,0,true,true).unwrap()["outcome"],"accepted");

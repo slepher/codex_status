@@ -77,6 +77,8 @@ for prefix in ("pageStatus(", "StatusPages::"):
     required.extend(name for name in functions if name.startswith(prefix))
 for prefix in ("PlanStore::", "PlanActivation::", "applyV2Plan(", "v2RendezvousTick("):
     required.extend(name for name in functions if name.startswith(prefix))
+for prefix in ("wifiDeviceControlStatus(", "wifiConnectionKey(", "bleBuildReply("):
+    required.extend(name for name in functions if name.startswith(prefix))
 for name in required:
     if name is None:
         print("FAIL: missing required Wi-Fi Xtensa frame")
@@ -97,7 +99,7 @@ def local(name):
                         "(anonymous namespace)::recoverTail(", "(anonymous namespace)::prune(",
                         "(anonymous namespace)::readFloor(", "(anonymous namespace)::saveFloor(")):
         return True
-    if name.startswith(("PlanStore::", "PlanActivation::", "applyV2Plan(", "v2RendezvousTick(")):
+    if name.startswith(("PlanStore::", "PlanActivation::", "applyV2Plan(", "v2RendezvousTick(", "bleBuildReply(")):
         return True
     return name.startswith(("wifi", "Wifi", "readWifiStore(", "saveV2(", "save(Wifi", "Preferences::", "nvs_", "nvs::", "store", "load(Endpoints", "save(Endpoints", "legacyString(", "wifiDeviceStatus(", "handleWifiManagement(", "servicePresence(", "serviceReadyReport(", "v2Http", "v2Response(", "handleV2Status(", "pageStatus(", "StatusPages::", "buildPlatformStatus(", "handleClaim(", "serviceV2Ble(", "_ZL22handleBleWifiMigration", "handleBleWifiMigration(", "handleBleWifiCapabilities(", "v2BleNotify("))
 
