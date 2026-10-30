@@ -3008,6 +3008,9 @@ fn safe_device_error_category(error: &str) -> &'static str {
         "not_sent" => return "not_sent",
         "result_unknown" | "ble_write_result_unknown" => return "result_unknown",
         "network_not_found" => return "network_not_found",
+        "host_network_unknown" | "host_network_changed" | "host_network_timeout" |
+        "network_mapping_required" | "host_lan_unavailable" | "lan_interface_unavailable" |
+        "bridge_http_unavailable" => return "bridge_network_unavailable",
         "http_proof_budget_exhausted" | "wifi_window_timeout" => return "window_budget_exhausted",
         _ => {},
     }

@@ -68,7 +68,7 @@ fn report_route(target: &str) -> Result<std::net::Ipv4Addr, String> {
 
 // Explicit claim is required before BLE provisioning can create the HTTP path.
 // Reuses the HTTP claim permission/decision contract on capable firmware.
-pub(super) async fn claim_on_ble(ctx: &AppCtx, mac: &str, link: &mut bridge_ble::DeviceConnection) -> Result<(), String> {
+pub(super) async fn claim_on_ble(ctx: &AppCtx, mac: &str, link: &mut bridge_ble::DeviceConnection, budget:Budget) -> Result<(), String> {
     if link.info["ble_claim"] != 1 { return Ok(()); }
     if ctx.device_status_cache.lock().unwrap().get(mac).is_some_and(|s| s.yielded) {
         return Err("owner_yielded".into());
@@ -82,10 +82,15 @@ pub(super) async fn claim_on_ble(ctx: &AppCtx, mac: &str, link: &mut bridge_ble:
         _ => return Err("owner_check_unknown".into()),
     };
     if !id.is_empty() && id != ctx.bridge_id { return Err("occupied".into()); }
+    let address=crate::wifi::claim_network(ctx,mac,budget).await.map_err(|error| {
+        tracing::warn!(event="claim_not_sent",device_mac=%mac,stage="host_network",
+            error_code=%error,action="connect_bridge_network", "BLE claim blocked before lease creation or renewal");
+        error
+    })?;
     let token = bridge_mcp::load_device_token(&crate::mcp_config(ctx), mac).ok_or("device_token_required")?;
     let name = ctx.bridge_name.lock().unwrap().clone();
     let ack = link.command("claim", json!({"operation_token":token,"name":name,
-        "host":bridge_ble::lan_ip(),"port":ctx.config.port,"lease_s":300})).await
+        "host":address.to_string(),"port":ctx.config.port,"lease_s":300})).await
         .map_err(|_| "claim_result_unknown")?;
     if ack["result"] != "applied" || ack["owner_id"] != ctx.bridge_id {
         return Err(ack["error"].as_str().unwrap_or("claim_rejected").to_owned());
@@ -172,7 +177,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
         if round.observation["automatic_contact"] == false {
             return Ok(());
         }
-        claim_on_ble(ctx, &mac, &mut link).await?;
+        claim_on_ble(ctx, &mac, &mut link, round.command_budget).await?;
         let sync_capable = round.observation["sync"]["v"] == 1;
         let mut sync_enabled = round.observation["sync"]["enabled"] == true;
         if sync_capable && !sync_enabled {
@@ -203,8 +208,8 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
         // grant Light even when its small snapshot fits in joint BLE Data.
         let plan_activation=link.info["plan_activation"]==1;
         let early_plan=if plan_activation {
-            Some(service(ctx).plan_for_rendezvous_network_work(&mac,device_now(&mac),
-                if remaining>0 {"manual"}else{"rendezvous"},remaining,needs_http).map_err(err_text)?)
+            Some(service(ctx).plan_for_rendezvous(&mac,device_now(&mac),
+                if remaining>0 {"manual"}else{"rendezvous"},remaining).map_err(err_text)?)
         } else {None};
         needs_http |= !failure_report && early_plan.as_ref().is_some_and(|p|
             p.mode==bridge_core::platform::model::PlanMode::Light);
@@ -248,7 +253,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
         round.admitted_wifi = service(ctx).wifi_state(&mac).jobs.iter()
             .filter(|job| bridge_core::rendezvous::admit_wifi(job, device_now(&mac))).map(|j| j.job_id.clone()).collect();
         let plan = if let Some(plan)=early_plan {plan} else { service(ctx)
-            .plan_for_rendezvous_network_work(
+            .plan_for_rendezvous(
                 &mac,
                 device_now(&mac),
                 if remaining > 0 {
@@ -257,7 +262,6 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
                     "rendezvous"
                 },
                 remaining,
-                needs_http,
             )
             .map_err(err_text)? };
         let mut plan_body = serde_json::to_value(&plan).map_err(err_text)?;

@@ -9,7 +9,7 @@ fn main() {
             .status().unwrap().success());
         println!("cargo:rustc-link-search=native={}", out.display());
         println!("cargo:rustc-link-lib=static=host_wifi");
-        for framework in ["CoreWLAN", "CoreLocation", "CoreBluetooth", "AppKit", "Foundation"] {
+        for framework in ["CoreWLAN", "CoreLocation", "CoreBluetooth", "AppKit", "Foundation", "SystemConfiguration"] {
             println!("cargo:rustc-link-lib=framework={framework}");
         }
         println!("cargo:rerun-if-changed=src/host_wifi.m");

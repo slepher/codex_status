@@ -436,6 +436,36 @@ pub(crate) async fn plan_network(ctx: &AppCtx, mac: &str, address: std::net::Ipv
     bridge_core::template::validate_plan_activation(&network).map_err(|_|"plan_network_shape")?;
     Ok(network)
 }
+
+/// A saved mapping and BLE contact do not prove that this Bridge is on the LAN.
+/// Re-evaluate on every claim, including renewal after a host sleep/resume.
+pub(crate) async fn claim_network(ctx: &AppCtx, mac: &str, budget:Budget) -> Result<std::net::Ipv4Addr, String> {
+    let budget=budget.capped(Duration::from_secs(2));
+    let host=tokio::time::timeout(budget.remaining(),current_host(ctx)).await
+        .map_err(|_|"host_network_timeout")?;
+    host_wifi::require_same_network(&host,&host)?;
+    if current_device_target(ctx,mac,&platform::service(ctx).wifi_state(mac),&host).is_none() {
+        return Err("network_mapping_required".into());
+    }
+    let address=bridge_ble::lan_ip().parse::<std::net::Ipv4Addr>().map_err(|_|"host_lan_unavailable")?;
+    #[cfg(test)]
+    let address=std::env::var("CODEX_STATUS_TEST_LAN_ADDRESS").ok()
+        .map(|s|s.parse().expect("synthetic LAN address")).unwrap_or(address);
+    let interfaces=crate::ap01_lan::interfaces()?;
+    let present=interfaces.iter().any(|interface|interface.address==address);
+    #[cfg(test)]
+    let present=present || (address.is_loopback() && std::env::var_os("CODEX_STATUS_SIM_BLE_ENDPOINTS").is_some());
+    if !present {return Err("host_lan_unavailable".into());}
+    let client=reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none())
+        .build().map_err(|_|"bridge_http_unavailable")?;
+    let health=client.get(format!("http://{address}:{}/health",ctx.config.port))
+        .timeout(budget.remaining()).send().await.map_err(|_|"bridge_http_unavailable")?;
+    if health.status()!=reqwest::StatusCode::NO_CONTENT {return Err("bridge_http_unavailable".into());}
+    let fresh=tokio::time::timeout(budget.remaining(),current_host(ctx)).await
+        .map_err(|_|"host_network_timeout")?;
+    host_wifi::require_same_network(&host,&fresh)?;
+    Ok(address)
+}
 fn current_input_key(mac:&str,target:&Network,revision:u64)->String {
     format!("current:{mac}:{}:{revision}",target.network_id)
 }

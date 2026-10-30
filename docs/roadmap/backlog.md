@@ -226,6 +226,10 @@
 
 ### B6. 离线 BLE 配 Wi-Fi 与 BOOT 蓝牙恢复入口（2026-10-03 新开）
 
+- **2026-10-30 BLE占用网络准入，Windows已部署**：用户要求Bridge本身未联网不得经BLE创建/续租owner；共享claim前检查新鲜宿主网络/设备映射、活动LAN地址及HTTP监听，失败不发送claim/Plan/Data。现场Mac旧租约到期后Windows自动恢复；首次目标不匹配及Mac实际版本仍待核验。22:07 Windows新exe已部署，22:08 Note4自然BLE claim/Data1329/认证HTTP通过；Mac构建部署验收留到Mac。实现/回归/原生验收边界见[状态](../../project-workflow/wifi-families/ble-claim-network-status.md)，现场见[调查](../../project-workflow/wifi-families/connection-incident-20261030.md)。
+
+- **2026-10-27 周期诊断激活修复已部署Windows（关联A9）**：移除正式计划入口的HTTP需求参数，过期连接观察不再授予120秒Light；纯诊断复用有界SyncOpen。生产路径红绿/新旧Plan路径诊断完成、真实push同轮激活及Rust341通过/5条件忽略；21:40重建/重启默认Bridge，health204/MCP44，315文件data备份校验与配置/凭据保留通过。剩余为纯诊断实机自然周期、RF/功耗长期矩阵，未改ROM。[实施与证据](../../project-workflow/wifi-families/activation-fix-status.md)。
+
 - **2026-10-27 Wi-Fi族源码完成，Windows已部署**：Bridge共享2.4G/5G族库、默认5G SSID族名、逐设备多族选择、有线指定族、双向同步；Note/BW现有host_ssid字段发送族名，格式不变。AP01沿用菜单八位码列表接口及旋钮手选，未知写只读核对。Rust/Node/Edge窄宽验收见[专项](../../project-workflow/wifi-families/status.md)；Windows health204/MCP44/族schema1读取及3设备配置保留通过；macOS脚本因本机缺swiftc未运行完成，macOS原生/部署和实机切网RF仍待验。
 
 - **2026-10-26书桌屏恢复/内置页状态**：错误页/BOOT响应已验。旧通用凭据读取兼容缺口仍待源码修复：旧wifi/s0,p0,last有效，启动只读新版active，旧读取函数无调用点，不能归因于Bridge暂停。此设备已按用户授权USB JTAG转换为119B共享active WFS4，完整NVS读回一致、运行态读取/HTTP connected及`.38-bw`整镜像认证SHA通过；不可要求每桥重配。Windows BLE隔离、旧键兼容与显式清空边界仍开放。调试/恢复期间出现RTC WDT reset16与一次HTTP wake代际变化，原因未定；末轮同wake两次uptime递增仅短时通过，不能关闭重启/长期风险。兼容quad v15+mini Bundle `99dc6326` 已原事务续传，认证commit_seq4097/ready/displayed、content_error空，Bridge对账succeeded；用户随后确认模板已显示并要求启用同步，已开启设备许可/解除该MAC暂停，HTTP seq288 displayed且认证applied_seq288；无线状态变化仍待验。首份Data前renderCurrent因lastUsage空画默认页，需修正并避免将默认页刷新视为模板显示验收，本轮未改ROM。见[专项](../../project-workflow/builtin-radio-status/status.md)。

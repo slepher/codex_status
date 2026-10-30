@@ -2,9 +2,23 @@
 #import <CoreLocation/CoreLocation.h>
 #import <CoreBluetooth/CoreBluetooth.h>
 #import <AppKit/AppKit.h>
+#import <SystemConfiguration/SystemConfiguration.h>
 #include <string.h>
 
 static void requestAuthorization(int request);
+// Read actual link state, including Ethernet. A saved wired family is not
+// evidence that a cable is attached when a sleeping Mac briefly resumes.
+int codex_network_interface_active(const char *name) {
+    if (!name) return 0;
+    @autoreleasepool {
+        SCDynamicStoreRef store=SCDynamicStoreCreate(NULL,CFSTR("CodexStatusLinkCheck"),NULL,NULL);
+        if (!store) return 0;
+        NSString *key=[NSString stringWithFormat:@"State:/Network/Interface/%s/Link",name];
+        id state=CFBridgingRelease(SCDynamicStoreCopyValue(store,(__bridge CFStringRef)key));
+        CFRelease(store);
+        return [state isKindOfClass:[NSDictionary class]] && [state[@"Active"] isEqual:@YES];
+    }
+}
 @interface WifiAuthorization : NSObject <CLLocationManagerDelegate, CBCentralManagerDelegate>
 @property(nonatomic, strong) CLLocationManager *location;
 @property(nonatomic, strong) CBCentralManager *bluetooth;

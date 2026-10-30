@@ -2995,17 +2995,12 @@ impl PlatformService {
             .context("unknown device")?.capabilities.uses_power_plan())
     }
 
-    pub fn plan_for_rendezvous(&self,mac:&str,now:u64,wake_reason:&str,provisional_remaining_s:u32)->Result<PowerPlan> {
-        self.plan_for_rendezvous_network_work(mac,now,wake_reason,provisional_remaining_s,false)
-    }
-
-    pub fn plan_for_rendezvous_network_work(
+    pub fn plan_for_rendezvous(
         &self,
         mac: &str,
         now: u64,
         wake_reason: &str,
         provisional_remaining_s: u32,
-        network_work: bool,
     ) -> Result<PowerPlan> {
         anyhow::ensure!(self.uses_power_plan(mac)?, "power_plan_unsupported");
         let mac = mac.to_uppercase();
@@ -3042,16 +3037,18 @@ impl PlatformService {
         // real pending work. It is admitted into the window work set and gets a
         // *bounded* formal light plan, so a read no longer has to borrow somebody
         // else's window. The Wi-Fi job store is keyed by the normalized MAC.
+        // A saved/stale connection is not work: diagnostic HTTP uses SyncOpen's
+        // temporary window, not a formal Light grant. Only an explicit connection
+        // request may grant Light without a queued Wi-Fi job.
         let wifi_window_wanted = DeviceIdentity::normalized_mac(&mac).is_some_and(|wifi_mac| {
             inner
                 .wifi
                 .get(&wifi_mac)
                 .is_some_and(|state| state.jobs.iter().any(|job| wifi_job_wants_window(job, now)) || state.connection_at(now).as_ref().is_some_and(|c|
-                    (network_work || c.state=="requested") &&
+                    c.state=="requested" &&
                     c.local_revision==state.local_revision && state.matching_target(&c.host_ssid).is_some_and(|n|n.network_id==c.network_id) &&
-                    matches!(c.state.as_str(),"requested"|"waiting_for_window"|"connecting"|"awaiting_confirmation"|"connection_failed") &&
                     !matches!(c.error.as_deref(),Some("authentication_failed"|"security_mismatch")) &&
-                    c.attempts<3 && (c.state=="connecting" || now>=c.next_attempt_at)))
+                    c.attempts<3 && now>=c.next_attempt_at))
         });
         let other_work_want_light = contract_needed || inner
             .coordinators
@@ -5945,16 +5942,15 @@ mod tests {
     #[test]
     fn saved_network_connection_work_has_a_bounded_plan_and_stale_or_rejected_work_does_not() {
         let now=crate::now_secs();let mac="AA:BB:CC:DD:EE:FF";
-        for (kind,error,attempts,due,wanted) in [("waiting_for_window",None,0,true,true),("selected",None,0,true,false),
-            ("connection_failed",Some("network_not_found"),1,true,true),("connection_failed",Some("authentication_failed"),1,true,false),
-            ("connection_failed",Some("network_not_found"),3,true,false),("connection_failed",Some("network_not_found"),1,false,false)] {
+        for (kind,error,attempts,due,wanted) in [("requested",None,0,true,true),("waiting_for_window",None,0,true,false),("selected",None,0,true,false),
+            ("connection_failed",Some("network_not_found"),1,true,false),("connection_failed",Some("authentication_failed"),1,true,false),
+            ("requested",Some("network_not_found"),3,true,false),("requested",Some("network_not_found"),1,false,false)] {
             let dir=tempfile::tempdir().unwrap();let svc=service_with_device(dir.path());
             svc.wifi_save(mac,0,vec![serde_json::from_value(json!({"network_id":"home","host_ssid":"Host","ssid":"Device"})).unwrap()],now).unwrap();
             let c=super::super::wifi::Connection{host_ssid:"Host".into(),network_id:"home".into(),local_revision:1,version:1,
                 state:kind.into(),error:error.map(str::to_owned),reason:0,observed_at:now,attempts,next_attempt_at:if due{now}else{now+60},http_ready:false,bridge_error:None,actual_ssid:None,ip:None};
             svc.wifi_note_connection(mac,c.clone()).unwrap();
-            assert_eq!(svc.plan_for_rendezvous(mac,now,"rendezvous",0).unwrap().mode,PlanMode::Sleep);
-            let plan=svc.plan_for_rendezvous_network_work(mac,now,"rendezvous",0,true).unwrap();
+            let plan=svc.plan_for_rendezvous(mac,now,"rendezvous",0).unwrap();
             assert_eq!(plan.mode==PlanMode::Light,wanted,"{kind}/{error:?}/{attempts}/{due}");
             if wanted {assert!(plan.light_duration_s<=120);}
             let mut stale=c;stale.local_revision=0;assert!(svc.wifi_note_connection(mac,stale).is_err());
@@ -6228,7 +6224,7 @@ mod tests {
         let retry = svc.next_http_delivery(mac, true, periodic_at + 1);
         assert_eq!(retry["data_seq"], periodic["data_seq"]);
         assert_eq!(retry["temporary_data"], true);
-        assert_eq!(svc.plan_for_rendezvous_network_work(mac, periodic_at + 1, "rendezvous", 0, true).unwrap().mode, PlanMode::Sleep);
+        assert_eq!(svc.plan_for_rendezvous(mac, periodic_at + 1, "rendezvous", 0).unwrap().mode, PlanMode::Sleep);
         let resumed = PlatformService::open(dir.path()).unwrap();
         assert_eq!(resumed.plan_for_rendezvous(mac, periodic_at + 2, "rendezvous", 0).unwrap().mode, PlanMode::Sleep);
         // A stale ACK for the old content never confirms the new snapshot.
@@ -6396,7 +6392,7 @@ mod wifi_idle_admission_tests {
             for now in [100,280,460,640] {
                 assert_eq!(svc.plan_for_rendezvous(mac,now,"rendezvous",0).unwrap().mode,PlanMode::Sleep);
             }
-            assert_eq!(svc.plan_for_rendezvous_network_work(mac,641,"rendezvous",0,true).unwrap().mode,PlanMode::Light);
+            assert_eq!(svc.plan_for_rendezvous(mac,641,"rendezvous",0).unwrap().mode,PlanMode::Sleep);
         }
         let mut c=svc.wifi_state(mac).connection().unwrap();c.state="requested".into();svc.wifi_note_connection(mac,c).unwrap();
         assert_eq!(svc.plan_for_rendezvous(mac,700,"rendezvous",0).unwrap().mode,PlanMode::Light);

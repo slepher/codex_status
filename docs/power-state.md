@@ -410,6 +410,8 @@ Explicit HTTP `POST /claim` and capability `ble_claim=1`'s BLE `claim` share `ow
 
 ## 2026-10-11 临时 Light 同步窗口合同（.83源码候选）
 
+2026-10-27 Bridge判定修正：纯周期诊断的HTTP需求不构成正式Light意图；已保存或过期的连接观察也不构成待办。诊断使用原SyncOpen有界临时窗口，真实Wi-Fi任务/显式连接、push变化、OTA及物理窗口仍由正式计划规则决定。正式计划入口不接收HTTP需求布尔值，避免传输选择反过来授予120秒Light。软件回归与部署见[修复状态](../project-workflow/wifi-families/activation-fix-status.md)，不以宿主通过替代实机自然周期验收。
+
 自动全量Data同步允许在自然联系机会唤醒并进入**临时 Light 传输状态**，不创建、不续期600秒正式Light PowerPlan。真实push可见变化与用户显式Light仍按正式计划执行。full_sync_deadline、数据投递许可及设备认证合同不变；只有成功Data ACK推进确认指纹/全量同步期限。小Data在原BLE会合中完成并收尾，大Data通过既有sync_open开临时HTTP窗口；不能为周期快照、其in_flight或重试冒充真实push。
 
 临时窗口复用WIFI_SYNC_ONCE，从设备首次接受sync_open起最多90秒，保持单独的绝对截止。正式Light remaining归零不撤销该临时传输授权，也不允许无限延期：网络关联/ready报告、Bridge身份核对和分页工作受各自有限预算及临时总截止约束。两端采用有效正式Light截止与有效临时截止的较晚者，再受原交换/本轮工作预算限制；Bridge以认证采样时刻锚定并扣除1秒余量，不能重新授予或在每页重计90秒。USB/manual窗口与owner/低电规则仍独立。

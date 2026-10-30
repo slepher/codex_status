@@ -1,10 +1,10 @@
-//! OS interface addresses and existing neighbors; never guess a /24 or sweep it.
+//! Active OS LAN interface addresses; never guess a /24 or sweep it.
 use bridge_core::ap01::LanInterface;
 use std::net::Ipv4Addr;
 
 #[cfg(windows)]
 pub fn interfaces() -> Result<Vec<LanInterface>, String> {
-    use windows_sys::Win32::NetworkManagement::IpHelper::{GetAdaptersInfo, IP_ADAPTER_INFO};
+    use windows_sys::Win32::NetworkManagement::IpHelper::{GetAdaptersInfo, IP_ADAPTER_INFO, GetIfEntry, MIB_IFROW, IF_OPER_STATUS_OPERATIONAL};
     let mut size=0u32;
     unsafe { GetAdaptersInfo(std::ptr::null_mut(), &mut size); }
     if size==0 || size>1024*1024 { return Err("lan_interface_unavailable".into()); }
@@ -15,6 +15,12 @@ pub fn interfaces() -> Result<Vec<LanInterface>, String> {
     let mut result=Vec::new();let mut adapter=pointer;
     unsafe {
         while !adapter.is_null() {
+            let mut status: MIB_IFROW=std::mem::zeroed();
+            status.dwIndex=(*adapter).Index;
+            if GetIfEntry(&mut status)!=0 || status.dwOperStatus!=IF_OPER_STATUS_OPERATIONAL {
+                adapter=(*adapter).Next;
+                continue;
+            }
             let mut row: *const windows_sys::Win32::NetworkManagement::IpHelper::IP_ADDR_STRING=&(*adapter).IpAddressList;
             while !row.is_null() {
                 let ip=std::ffi::CStr::from_ptr((*row).IpAddress.String.as_ptr()).to_str().ok();
@@ -36,7 +42,15 @@ pub fn interfaces() -> Result<Vec<LanInterface>, String> {
     unsafe {
         while !row.is_null() {
             let iface=&*row;
-            if iface.ifa_flags & libc::IFF_UP as u32 !=0 && !iface.ifa_addr.is_null() &&
+            let required=(libc::IFF_UP|libc::IFF_RUNNING) as u32;
+            let active=iface.ifa_flags & required ==required && iface.ifa_flags & libc::IFF_POINTOPOINT as u32 ==0;
+            // IFF_RUNNING alone can survive an unplugged cable with a retained IP.
+            #[cfg(target_os="macos")]
+            let active=active && {
+                unsafe extern "C" {fn codex_network_interface_active(name:*const std::ffi::c_char)->i32;}
+                codex_network_interface_active(iface.ifa_name)!=0
+            };
+            if active && !iface.ifa_addr.is_null() &&
                 !iface.ifa_netmask.is_null() && (*iface.ifa_addr).sa_family as i32==libc::AF_INET {
                 let ip=&*iface.ifa_addr.cast::<libc::sockaddr_in>();
                 let mask=&*iface.ifa_netmask.cast::<libc::sockaddr_in>();
