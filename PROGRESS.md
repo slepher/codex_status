@@ -1,12 +1,12 @@
 # Codex Status 当前交接
 
-更新时间：2026-10-28，Asia/Shanghai。
+更新时间：2026-11-02，Asia/Shanghai。
 
 ## 当前部署
 
 - Windows默认Bridge已部署单一共享族网络工作台（含有线回退提示更正）并重启：`bridge/target/debug/bridge-app.exe`，39005184 B，SHA256 `14c519e07efaa9e13f5ce5d08a9985c0ae627993578c38abf43608735a6575d4`。health204/MCP44、主进程/watchdog/端口核验通过；旧exe及295文件data完整备份校验，3族/3设备配置、模板/Profile/设置及凭据保留。[验收](project-workflow/wifi-families/status.md)
 
-- Mac Bridge 已重建/重启：`artifacts/bridge-macos/Codex Status Bridge.app`，exe 79336800 B，SHA256 `d0f0948cafbe3c7a5fd70b9d49b3b0e4809115098e972bed38266119681d35b9`。supervisor/child 正常，8765/8766 监听。新设备默认同步，旧设置保留；AP01/Note4 ACK seq8/1011均已显示。[验收](project-workflow/default-data-sync/status.md)
+- 当前Mac（arm64）Bridge已首次构建/启动：`artifacts/bridge-macos/Codex Status Bridge.app`，exe 81375120 B，SHA256 `1a4592e9b6f1b522f6f3aae5ed8b1618a6a782d5a1907c273a7c54e248ad682c`。按需LaunchAgent supervisor38919/child38927，8765健康204、8766 MCP初始化通过，Codex app-server已启动。该机原无应用/运行数据，现为新建默认data，尚无设备登记，未验设备投递；此前Mac数据/设备ACK记录不能视为本机现场。Rust1.99.1、ArduinoJson7.0.4；[构建日志](artifacts/bridge-macos/build-20261102.log)。
 - AP01 `34F01557210B`：首尾动画修复ROM应用槽1，版本`1.0.2_0041`、build`ec0a58f71f65c2830c08c9bfd7c155db`、Bundle`6a8d702a`。ROM `artifacts/ap01-wifi-animation-20261022/ap01-wifi-animation-candidate01.bin`，7045480 B，SHA256 `5a49f78b550fabbafcc3cde75aa1f6e9986fb9dd88320cd029cd6655d61e0cee`。10-22认证槽1，用户确认原厂界面/旋钮/App及双向快转首尾正常；10-23再次认证同build，未刷机、未复核槽位。
 - 救援0031/槽0保留：10-22先认证build`53574b55382d55a514ef5b7767db66d9`及槽0，再单次写应用1；按用户要求未整槽读回/导出，停止标记保留。
 - Note4 `.106-note4`认证通过；ROM `artifacts/bridge-macos/note4-0.18.106-plan-activation.bin`，1865680 B，SHA256 `36ca4c3aacdc7b27c9c7cebe4cb18df0bee4048461e189f51050b6332b24ceb4`。10-23未刷机。
