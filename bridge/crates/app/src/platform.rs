@@ -3551,7 +3551,7 @@ pub(crate) mod ble_close_lock_tests {
         std::env::set_var("CODEX_STATUS_SIM_BLE_ENDPOINTS", json!({HUNG_MAC:url}).to_string());
         let result = tokio::time::timeout(Duration::from_secs(12), ble_cycle(&ctx, &[HUNG_MAC.to_owned()])).await;
         std::env::remove_var("CODEX_STATUS_SIM_BLE_ENDPOINTS");
-        assert!(result.is_ok_and(|r| r.is_ok()));
+        assert!(result.as_ref().is_ok_and(|r| r.is_ok()), "{result:?}");
         assert_eq!(http.status_calls.load(Ordering::SeqCst), 0);
         let plans:Vec<_> = ble.commands.lock().unwrap().iter().filter(|c| c["op"] == "plan")
             .map(|c| c["need_http"].clone()).collect();

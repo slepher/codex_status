@@ -5,7 +5,7 @@ mod sim_peripheral;
 use std::collections::HashSet;
 use std::future::Future;
 use std::net::UdpSocket;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -51,12 +51,24 @@ impl std::fmt::Display for EndpointFailure {
 }
 impl std::error::Error for EndpointFailure {}
 
-// 0: idle, 1: native operation/link reserved, 2: unknown; restart is required.
-static NATIVE_RADIO_STATE: AtomicU8 = AtomicU8::new(0);
-/// Unknown native operations can only be retired by ending their process.
-pub fn native_quarantined() -> bool { NATIVE_RADIO_STATE.load(Ordering::Acquire) == 2 }
-// Simulation uses the production reservation logic, isolated from the physical radio.
-static SIM_RADIO_STATE: AtomicU8 = AtomicU8::new(0);
+#[derive(Debug)]
+struct NativeRadio { inner: Mutex<RadioState> }
+#[derive(Debug)]
+struct RadioState { active: bool, retry_at: Option<Instant>, failures: u32 }
+impl NativeRadio {
+    const fn new(_: u8) -> Self { Self { inner: Mutex::new(RadioState {
+        active: false, retry_at: None, failures: 0,
+    }) } }
+    fn load(&self, _: Ordering) -> u8 {
+        let state = self.inner.lock().unwrap();
+        if state.active { 1 } else if state.retry_at.is_some() { 2 } else { 0 }
+    }
+}
+static NATIVE_RADIO_STATE: NativeRadio = NativeRadio::new(0);
+// A timed-out adapter is recoverable in-process; the service supervisor must
+// not terminate the entire Bridge for this condition.
+pub fn native_recovery_pending() -> bool { NATIVE_RADIO_STATE.load(Ordering::Acquire) == 2 }
+static SIM_RADIO_STATE: NativeRadio = NativeRadio::new(0);
 static EMPTY_SCAN_SUMMARY: OnceLock<Mutex<EmptyScanSummary>> = OnceLock::new();
 
 #[derive(Default)]
@@ -148,27 +160,38 @@ async fn trace_stage<T>(
 }
 
 #[derive(Debug)]
-struct NativeLease<'a> { state: &'a AtomicU8, stopped: bool }
+struct NativeLease<'a> { state: &'a NativeRadio, stopped: bool, reset_failures: bool }
 impl<'a> NativeLease<'a> {
-    fn acquire(state: &'a AtomicU8) -> Result<Self> {
-        state.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|value| anyhow!(if value == 2 { "ble_native_quarantined_restart_required" } else { "ble_native_busy" }))?;
-        Ok(Self { state, stopped: false })
+    fn acquire(state: &'a NativeRadio) -> Result<Self> {
+        let mut radio = state.inner.lock().unwrap();
+        anyhow::ensure!(!radio.active, "ble_native_busy");
+        if radio.retry_at.is_some_and(|at| Instant::now() < at) {
+            bail!(if radio.failures >= 3 { "ble_native_degraded" } else { "ble_native_cooldown" });
+        }
+        radio.active = true;
+        radio.retry_at = None;
+        Ok(Self { state, stopped: false, reset_failures: true })
     }
 }
 impl Drop for NativeLease<'_> {
     fn drop(&mut self) {
-        self.state.store(if self.stopped { 0 } else { 2 }, Ordering::Release);
-        if !self.stopped {
-            tracing::warn!(error = "ble_native_quarantined_restart_required",
-                action = "restart_bridge", "BLE native shutdown is unconfirmed; further BLE work blocked");
+        let mut radio = self.state.inner.lock().unwrap();
+        radio.active = false;
+        if self.stopped {
+            if self.reset_failures { radio.failures = 0; }
+            radio.retry_at = None;
+        } else {
+            radio.failures = radio.failures.saturating_add(1);
+            radio.retry_at = Some(Instant::now() + Duration::from_secs(3));
+            tracing::warn!(failures=radio.failures, error="ble_native_cooldown",
+                action="retry_with_fresh_adapter", "BLE operation timed out; cooling down");
         }
     }
 }
 
 /// The production scan and fault adapter share this entire start/work/stop path.
 /// Native cancellation is not proof that the platform watcher has stopped.
-async fn scan_with_cleanup<T, F>(state: &AtomicU8, limit: Duration, cleanup_budget: Duration,
+async fn scan_with_cleanup<T, F>(state: &NativeRadio, limit: Duration, cleanup_budget: Duration,
     start: impl Future<Output = Result<()>>,
     scan: impl FnOnce(tokio::time::Instant) -> F,
     stop: impl Future<Output = Result<()>>) -> Result<Option<T>>
@@ -176,6 +199,7 @@ where F: Future<Output = Result<Option<T>>>
 {
     anyhow::ensure!(limit > cleanup_budget, "ble_scan_budget_exhausted");
     let mut lease = NativeLease::acquire(state)?;
+    lease.reset_failures = false;
     let deadline = tokio::time::Instant::now() + limit;
     let work_deadline = deadline - cleanup_budget.min(limit);
     let started = tokio::time::timeout_at(work_deadline, start).await;
@@ -216,7 +240,7 @@ async fn disconnect_bounded(
     }
 }
 
-async fn open_link<'a, T, F>(state: &'a AtomicU8, scan_id: u64, limit: Duration,
+async fn open_link<'a, T, F>(state: &'a NativeRadio, scan_id: u64, limit: Duration,
     mut connect: impl FnMut() -> F,
     setup: impl Future<Output = Result<T>>,
     disconnect: impl Future<Output = btleplug::Result<()>>) -> Result<(T, NativeLease<'a>)>
@@ -333,6 +357,7 @@ impl Pusher {
     /// leak-free option here.
     pub async fn adapter() -> Result<Adapter> {
         let mut lease = NativeLease::acquire(&NATIVE_RADIO_STATE)?;
+        lease.reset_failures = false;
         let result = tokio::time::timeout(Duration::from_secs(5), async {
             let manager = Manager::new().await.context("bluetooth manager")?;
             let adapter = manager
@@ -345,7 +370,7 @@ impl Pusher {
             Ok::<_, anyhow::Error>(adapter)
         }).await;
         lease.stopped = result.is_ok();
-        let result = result.context("ble_adapter_timeout")?;
+        let result = result.context("ble_adapter_unresponsive")?;
         match &result {
             Ok(_) => tracing::debug!(result = "selected", "BLE adapter available"),
             Err(_) => tracing::warn!(
@@ -1541,6 +1566,12 @@ impl DeviceConnection {
             }
         };
         tracing::info!(device_mac = %self.device_mac, op, characteristic = "status", duration_ms = lookup_start.elapsed().as_millis(), "BLE ACK characteristic found");
+        let mut notifications = if let (Some(peripheral), Some(status)) = (&self.peripheral, &status) {
+            tokio::time::timeout_at(deadline, async {
+                peripheral.subscribe(status).await?;
+                peripheral.notifications().await
+            }).await.ok().and_then(Result::ok)
+        } else { None };
         let write_start = Instant::now();
         if tokio::time::Instant::now() >= deadline {
             return Err(self.command_failure(id, op, bridge_core::rendezvous::DispatchOutcome::NotSent,
@@ -1573,7 +1604,19 @@ impl DeviceConnection {
             "BLE command written"
         );
         let started = Instant::now();
+        let mut poll_delay = Duration::ZERO;
         loop {
+            let wake = (tokio::time::Instant::now() + poll_delay).min(deadline);
+            if let Some(stream) = notifications.as_mut() {
+                let signal = tokio::time::timeout_at(wake, async {
+                    while let Some(value) = stream.next().await {
+                        if value.uuid == Pusher::uuid(CHR_STATUS) { return true; }
+                    }
+                    false
+                }).await;
+                if matches!(signal, Ok(false)) { notifications = None; tokio::time::sleep_until(wake).await; }
+            } else { tokio::time::sleep_until(wake).await; }
+            poll_delay = if poll_delay.is_zero() { Duration::from_millis(150) } else { (poll_delay * 2).min(Duration::from_millis(500)) };
             if tokio::time::Instant::now() >= deadline {
                 return Err(self.command_failure(id, op, bridge_core::rendezvous::DispatchOutcome::AckUnknown,
                     "ack", "window_budget_exhausted", deadline, started.elapsed()).into());
@@ -1587,18 +1630,25 @@ impl DeviceConnection {
                     bridge_core::rendezvous::DispatchOutcome::AckUnknown, "ack", "window_budget_exhausted", deadline, started.elapsed()).into()),
             };
             if let Ok((reply_header, reply_payload)) = bridge_core::compact_frame::Header::decode(&raw, 512) {
+                if reply_header.kind == 1 && reply_header.result == 2 && reply_header.op == 0 && reply_header.request_no == 0 {
+                    return Err(self.command_failure(id, op, bridge_core::rendezvous::DispatchOutcome::AckUnknown,
+                        "reassembly", "uncorrelated_transport_rejection", deadline, started.elapsed()).into());
+                }
                 if reply_header.kind != 1 || reply_header.op != frame_op ||
                     reply_header.request_no != request_no ||
                     (op != "status" && reply_header.session != session) {
                     // A stale readable characteristic is not a fresh reply.
                     // Bound polling on both a real radio and the Fake transport.
-                    tokio::time::sleep_until((tokio::time::Instant::now() +
-                        Duration::from_millis(20)).min(deadline)).await;
                     continue;
                 }
+                if reply_header.result == 2 {
+                    if let Ok(reply) = serde_json::from_slice::<serde_json::Value>(reply_payload) {
+                        if reply["stage"].as_str().is_some_and(|s| matches!(s, "gatt_write" | "reassembly" | "queue")) {
+                            return Ok(reply);
+                        }
+                    }
+                }
                 let Ok(reply) = decode_wire(reply_payload) else {
-                    tokio::time::sleep_until((tokio::time::Instant::now() +
-                        Duration::from_millis(20)).min(deadline)).await;
                     continue;
                 };
                 if reply["ack"] == if op.starts_with("wifi_") { "wifi" } else { "command" } && reply["request_id"] == id {
@@ -1611,7 +1661,6 @@ impl DeviceConnection {
                     let operation_matches = reply["op"].as_str().map_or(true, |actual| actual == op || actual == "command" || (actual == "wifi" && op.starts_with("wifi_")));
                     let nonce_matches = op == "status" || !reply["session_nonce"].as_str().is_some_and(|n| n != self.nonce);
                     if !mac_matches || !wake_matches || !version_matches || !nonce_matches || !operation_matches {
-                        tokio::time::sleep_until((tokio::time::Instant::now() + Duration::from_millis(20)).min(deadline)).await;
                         continue;
                     }
                     if self.wake_identity.is_none() {
@@ -1654,8 +1703,6 @@ impl DeviceConnection {
                     return Ok(reply);
                 }
             }
-            tokio::time::sleep_until((tokio::time::Instant::now() +
-                Duration::from_millis(20)).min(deadline)).await;
             if tokio::time::Instant::now() >= deadline {
                 return Err(self.command_failure(id, op, bridge_core::rendezvous::DispatchOutcome::AckUnknown,
                     "ack", "window_budget_exhausted", deadline, started.elapsed()).into());
@@ -1787,9 +1834,8 @@ impl DeviceConnection {
     /// Bounded variant of [`Self::close`] for callers that must not be blocked
     /// by link cleanup. Our btleplug patch acknowledges a peripheral already
     /// removed by a native disconnect callback. An actual native timeout or
-    /// uncertain write still quarantines the shared
-    /// radio reservation; dropping the handle is not proof of shutdown.
-    /// The next native attempt returns a restart-required error.
+    /// uncertain write starts a bounded cooldown before the next fresh adapter.
+    /// Business outcomes remain unknown and are queried using their original ID.
     ///
     /// The future is cancelled in place rather than detached with
     /// `tokio::spawn`: a background disconnect would race the next rendezvous
@@ -1878,10 +1924,27 @@ mod tests {
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
 
+    #[test]
+    fn cooldown_expires_and_repeated_failures_allow_fresh_adapter_retry() {
+        use super::{NativeLease, NativeRadio};
+        let state = NativeRadio::new(0);
+        for failures in 1..=4 {
+            drop(NativeLease::acquire(&state).unwrap());
+            assert_eq!(state.inner.lock().unwrap().failures, failures);
+            let error = NativeLease::acquire(&state).unwrap_err().to_string();
+            assert_eq!(error, if failures >= 3 { "ble_native_degraded" } else { "ble_native_cooldown" });
+            state.inner.lock().unwrap().retry_at = Some(Instant::now() - Duration::from_secs(1));
+        }
+        let mut lease = NativeLease::acquire(&state).unwrap();
+        lease.stopped = true;
+        drop(lease);
+        assert_eq!(state.inner.lock().unwrap().failures, 0);
+    }
+
     #[tokio::test]
     async fn scan_failure_cleans_up_then_the_next_scan_can_run() {
-        use super::{scan_with_cleanup, AtomicU8, Ordering};
-        let state = AtomicU8::new(0);
+        use super::{scan_with_cleanup, NativeRadio, Ordering};
+        let state = NativeRadio::new(0);
         let stops = std::cell::Cell::new(0);
         let error = scan_with_cleanup::<(), _>(&state, Duration::from_millis(100), Duration::from_millis(20),
             async { anyhow::bail!("injected_start_failure") },
@@ -1897,9 +1960,9 @@ mod tests {
 
     #[tokio::test]
     async fn hanging_scan_stages_return_and_uncertain_stop_prevents_native_reentry() {
-        use super::{scan_with_cleanup, AtomicU8, Ordering};
+        use super::{scan_with_cleanup, NativeRadio, Ordering};
         for stage in ["start", "events", "stop"] {
-            let state = AtomicU8::new(0);
+            let state = NativeRadio::new(0);
             let started = Instant::now();
             let error = scan_with_cleanup::<(), _>(&state, Duration::from_millis(80), Duration::from_millis(20),
                 async { if stage == "start" { std::future::pending::<()>().await; } Ok(()) },
@@ -1915,20 +1978,20 @@ mod tests {
                     async { panic!("quarantine must not issue native requests") },
                     |_| async { panic!("quarantine must not scan") },
                     async { panic!("quarantine must not spawn cleanup") }).await.unwrap_err();
-                assert_eq!(error.to_string(), "ble_native_quarantined_restart_required");
+                assert_eq!(error.to_string(), "ble_native_cooldown");
             }
         }
     }
 
     #[tokio::test]
     async fn cancelled_scan_and_failed_stop_never_report_the_adapter_idle() {
-        use super::{scan_with_cleanup, AtomicU8, Ordering};
-        let state = AtomicU8::new(0);
+        use super::{scan_with_cleanup, NativeRadio, Ordering};
+        let state = NativeRadio::new(0);
         assert!(tokio::time::timeout(Duration::from_millis(10),
             scan_with_cleanup::<(), _>(&state, Duration::from_secs(1), Duration::from_millis(20), async { Ok(()) },
                 |_| std::future::pending(), async { Ok(()) })).await.is_err());
         assert_eq!(state.load(Ordering::Acquire), 2);
-        let state = AtomicU8::new(0);
+        let state = NativeRadio::new(0);
         let result = scan_with_cleanup(&state, Duration::from_millis(100), Duration::from_millis(20), async { Ok(()) },
             |_| async { Ok(Some(7)) }, async { anyhow::bail!("injected_stop_failure") }).await;
         assert!(result.is_err(), "a match is unusable until scan shutdown is confirmed");
@@ -1937,8 +2000,8 @@ mod tests {
 
     #[tokio::test]
     async fn scan_reservation_rejects_overlap_and_empty_budget_without_native_calls() {
-        use super::{scan_with_cleanup, AtomicU8, Ordering};
-        let state = AtomicU8::new(0);
+        use super::{scan_with_cleanup, NativeRadio, Ordering};
+        let state = NativeRadio::new(0);
         let mut active = Box::pin(scan_with_cleanup::<(), _>(&state, Duration::from_secs(1),
             Duration::from_millis(20), std::future::pending(),
             |_| async { Ok(None) }, async { Ok(()) }));
@@ -1949,7 +2012,7 @@ mod tests {
         assert_eq!(error.to_string(), "ble_native_busy");
         drop(active);
         assert_eq!(state.load(Ordering::Acquire), 2);
-        let state = AtomicU8::new(0);
+        let state = NativeRadio::new(0);
         assert!(scan_with_cleanup::<(), _>(&state, Duration::ZERO, Duration::ZERO,
             async { panic!("expired native start") }, |_| async { Ok(None) },
             async { panic!("expired native stop") }).await.is_err());
@@ -1964,10 +2027,10 @@ mod tests {
 
     #[tokio::test]
     async fn discovery_error_completes_native_future_without_timeout_quarantine() {
-        use super::{open_link, AtomicU8, Ordering, CLOSE_BUDGET};
+        use super::{open_link, NativeRadio, Ordering, CLOSE_BUDGET};
         use btleplug::connection_lifecycle::{self, future::BtlePlugFuture};
         for stage in ["services", "characteristics", "descriptors"] {
-            let state = AtomicU8::new(0);
+            let state = NativeRadio::new(0);
             let result = open_link::<(), _>(&state, 1, CLOSE_BUDGET + Duration::from_millis(300),
                 || async {
                     let future = BtlePlugFuture::default();
@@ -1984,8 +2047,8 @@ mod tests {
 
     #[tokio::test]
     async fn failed_connect_cleanup_releases_lock_and_allows_next_attempt() {
-        use super::{open_link, AtomicU8, Ordering, CLOSE_BUDGET};
-        let state = AtomicU8::new(0);
+        use super::{open_link, NativeRadio, Ordering, CLOSE_BUDGET};
+        let state = NativeRadio::new(0);
         let attempts = std::cell::Cell::new(0);
         let error = open_link::<(), _>(&state, 1, CLOSE_BUDGET + Duration::from_millis(300),
             || { attempts.set(attempts.get()+1); std::future::ready(Err(anyhow::anyhow!("injected connect failure"))) },
@@ -2003,9 +2066,9 @@ mod tests {
 
     #[tokio::test]
     async fn failed_native_open_and_unknown_cleanup_quarantine_without_retrying_native_work() {
-        use super::{open_link, AtomicU8, Ordering, CLOSE_BUDGET};
+        use super::{open_link, NativeRadio, Ordering, CLOSE_BUDGET};
         for stage in ["connect", "setup", "cleanup"] {
-            let state = AtomicU8::new(0);
+            let state = NativeRadio::new(0);
             let calls = std::cell::Cell::new(0);
             let result = tokio::time::timeout(Duration::from_secs(3), open_link::<(), _>(&state, 1,
                 CLOSE_BUDGET + Duration::from_millis(150), || async {
@@ -2030,9 +2093,9 @@ mod tests {
 
     #[tokio::test]
     async fn rejected_setup_cleans_once_and_cancelled_or_dropped_links_remain_reserved() {
-        use super::{open_link, AtomicU8, Ordering, CLOSE_BUDGET};
+        use super::{open_link, NativeRadio, Ordering, CLOSE_BUDGET};
         for stage in ["discover", "info", "mac", "bond", "rendezvous"] {
-            let state = AtomicU8::new(0);
+            let state = NativeRadio::new(0);
             let closes = std::cell::Cell::new(0);
             let error = open_link::<(), _>(&state, 1, CLOSE_BUDGET + Duration::from_millis(150),
                 || async { Ok(()) }, async { anyhow::bail!("injected {stage}") },
@@ -2041,12 +2104,12 @@ mod tests {
             assert_eq!(closes.get(), 1);
             assert_eq!(state.load(Ordering::Acquire), 0);
         }
-        let state = AtomicU8::new(0);
+        let state = NativeRadio::new(0);
         let mut open = Box::pin(open_link::<(), _>(&state, 1, Duration::from_secs(3),
             || async { Ok(()) }, std::future::pending(), async { Ok(()) }));
         assert!(futures::poll!(&mut open).is_pending()); drop(open);
         assert_eq!(state.load(Ordering::Acquire), 2);
-        let state = AtomicU8::new(0);
+        let state = NativeRadio::new(0);
         let (_, lease) = open_link(&state, 1, Duration::from_secs(3),
             || async { Ok(()) }, async { Ok(()) }, async { Ok(()) }).await.unwrap();
         drop(lease);

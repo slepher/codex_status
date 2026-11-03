@@ -3584,7 +3584,7 @@ async fn run_ble_services(ctx: Arc<AppCtx>) {
                 Ok(platform::BleOpportunity::NoDevice) => {}
                 Ok(platform::BleOpportunity::Connected { mac, result }) => {
                     last_device_attempt.insert(mac.clone(), device_now_secs(&mac));
-                    if !bridge_ble::native_quarantined() { watchdog::ble_recovered(); }
+                    if !bridge_ble::native_recovery_pending() { watchdog::ble_recovered(); }
                     match result {
                         Ok(()) => {
                             tracing::info!(event = "result", device_mac = %mac,

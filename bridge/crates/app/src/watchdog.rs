@@ -34,7 +34,7 @@ impl BleRecovery {
             .map_or(1, |p| p.attempt.saturating_add(1));
         let delay = match attempt { 1 => 5, 2 => 30, 3 => 120, _ => 300 };
         Self { state: if automatic { "recovering" } else { "restart_required" }.into(),
-            error: "ble_native_quarantined_restart_required".into(), stage: "native_shutdown".into(),
+            error: "service_task_failed".into(), stage: "service_task".into(),
             action: if automatic { "wait_for_automatic_recovery" } else { "restart_managed_bridge" }.into(),
             attempt, failed_at: now, retry_at: now.saturating_add(delay), recovered_at: None }
     }
@@ -56,7 +56,6 @@ pub(crate) fn recover_ble(pending: &mut Option<BleRecovery>, failure: Option<&st
     if pending.is_none() {
         let mut recovery = BleRecovery::next(ble_recovery().as_ref(), now_secs(), automatic);
         recovery.error=failure.into();
-        if failure!="ble_native_quarantined_restart_required" {recovery.stage="service_task".into();}
         if let Err(error) = save_recovery(&recovery) {
             tracing::error!(%error, "Cannot persist BLE recovery status");
         }
@@ -80,7 +79,7 @@ pub(crate) async fn wait_services(mut services: tokio::task::JoinSet<()>) {
 
 /// Supervision never waits on the BLE worker or its delivery permits.
 async fn monitor_services<F: std::future::Future<Output=()>+Send+'static>(
-    services:F, native_failed:impl Fn()->bool,
+    services:F,
     mut report:impl FnMut(Option<&'static str>), period:std::time::Duration,
 ) {
     let mut services=tokio::spawn(services);
@@ -96,13 +95,13 @@ async fn monitor_services<F: std::future::Future<Output=()>+Send+'static>(
             }
             _=interval.tick()=>{}
         }
-        report(task_failure.or_else(||native_failed().then_some("ble_native_quarantined_restart_required")));
+        report(task_failure);
     }
 }
 
 pub(crate) async fn supervise_services(services:impl std::future::Future<Output=()>+Send+'static) {
     let mut pending=None;
-    monitor_services(services,bridge_ble::native_quarantined,
+    monitor_services(services,
         |failure|recover_ble(&mut pending,failure),std::time::Duration::from_secs(1)).await;
 }
 
@@ -304,18 +303,10 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn review_supervisor_observes_quarantine_while_worker_is_stuck_and_task_panics() {
-        use std::sync::{Arc,atomic::{AtomicBool,Ordering}};
-        let native=Arc::new(AtomicBool::new(false));
-        let flag=native.clone();let (tx,mut rx)=tokio::sync::mpsc::unbounded_channel();
-        let monitor=tokio::spawn(monitor_services(std::future::pending(),move||flag.load(Ordering::SeqCst),
-            move|failure|{if let Some(failure)=failure{let _=tx.send(failure);}},std::time::Duration::from_millis(10)));
-        native.store(true,Ordering::SeqCst);
-        assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(1),rx.recv()).await.unwrap(),Some("ble_native_quarantined_restart_required"));
-        monitor.abort();
+    async fn supervisor_observes_service_exit_and_panics() {
         for panic in [false,true] {
             let (tx,mut rx)=tokio::sync::mpsc::unbounded_channel();
-            let monitor=tokio::spawn(monitor_services(async move{assert!(!panic,"injected service panic");},||false,
+            let monitor=tokio::spawn(monitor_services(async move{assert!(!panic,"injected service panic");},
                 move|failure|{if let Some(failure)=failure{let _=tx.send(failure);}},std::time::Duration::from_millis(10)));
             assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(1),rx.recv()).await.unwrap(),Some(if panic{"service_task_panicked"}else{"service_task_exited"}));
             monitor.abort();

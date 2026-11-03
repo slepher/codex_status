@@ -151,7 +151,7 @@ async fn transport_request(
 }
 
 #[derive(Default)]
-struct HttpFrameSession { id: [u8; 16], next_no: u64, context: [u8; 16] }
+struct HttpFrameSession { id: [u8; 16], next_no: u64, context: [u8; 16], identity: Option<Value> }
 static FRAME_SESSIONS: OnceLock<Mutex<HashMap<String, Arc<AsyncMutex<HttpFrameSession>>>>> = OnceLock::new();
 static STATUS_READS: OnceLock<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>> = OnceLock::new();
 static NEXT_OPEN_NONCE: AtomicU64 = AtomicU64::new(1);
@@ -210,10 +210,10 @@ async fn request(
     progress.stage = "http_session";
     let session = frame_session(ip, token);
     if op != 1 && op != 19 && lock_session_until(&session, deadline).await?.id == [0; 16] {
-        Box::pin(status(ip, token, deadline.saturating_duration_since(Instant::now()))).await.context("establish device HTTP session")?;
+        Box::pin(status_compact(ip, token, deadline.saturating_duration_since(Instant::now()))).await.context("establish device HTTP session")?;
     }
     let mut session = lock_session_until(&session, deadline).await?;
-    let opening = op == 1 || (op == 19 && session.id == [0; 16]);
+    let opening = (op == 1 || op == 19) && session.id == [0; 16];
     anyhow::ensure!(opening || session.id != [0; 16], "device HTTP session is not established");
     let number = session.next_no.checked_add(1).context("HTTP request number exhausted")?;
     session.next_no = number;
@@ -229,7 +229,7 @@ async fn request(
     let header = Header { kind: 0, op, result: 0,
         payload_len: payload.len().try_into().context("HTTP payload too large")?,
         session: if opening { new_open_nonce() } else { session.id },
-        request_no: number, context: if opening { [0; 16] } else { session.context } };
+        request_no: number, context: if opening || op == 1 { [0; 16] } else { session.context } };
     let mut frame = header.encode().map_err(anyhow::Error::msg)?.to_vec();
     frame.extend_from_slice(payload);
     let (status, response) = transport_request(ip, "POST", path, token, Some(&frame),
@@ -252,20 +252,22 @@ async fn request(
     }
     let (ack, bytes) = Header::decode(&response, MAX_HTTP_FRAME)
         .map_err(|e| anyhow!("device protocol mismatch: {e}; update Bridge and device software"))?;
-    if status == 409 && serde_json::from_slice::<Value>(bytes).ok()
-        .is_some_and(|reply|reply["error"]=="session") {
-        session.id = [0;16];
+    if status == 409 && ack.kind == 1 && ack.result == 2 && ack.op == op && ack.request_no == number && serde_json::from_slice::<Value>(bytes).ok()
+        .is_some_and(|reply| matches!(reply["error"].as_str(), Some("session" | "session_mismatch" | "session_expired"))) {
+        *session = HttpFrameSession::default();
         return Err(HttpSessionExpired.into());
     }
     anyhow::ensure!(ack.kind == 1 && ack.op == op && ack.request_no == number &&
-        (opening || ack.session == session.id), "device HTTP response identity mismatch");
-    if opening && status == 200 && ack.result == 0 {
+        (opening || op == 1 || ack.session == session.id), "device HTTP response identity mismatch");
+    if (opening || (op == 1 && ack.session != session.id)) && status == 200 && ack.result == 0 {
         anyhow::ensure!(ack.session != [0; 16], "device HTTP session missing");
         session.id = ack.session;
+        session.identity = None;
         session.context = [0; 16];
     }
     if status == 200 && ack.result == 0 {
         if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
+            if op == 1 && value["device_mac"].is_string() { session.identity = Some(json!({"device_mac":value["device_mac"], "boot_id":value["boot_id"], "session_nonce":value["session_nonce"]})); }
             if let Some(ctx) = value["active_context_id"].as_str() {
                 if ctx.len() == 16 && ctx.bytes().all(|b| b.is_ascii_hexdigit()) {
                     session.context.copy_from_slice(ctx.as_bytes());
@@ -367,6 +369,13 @@ async fn post_json(ip: &str, path: &str, token: &str, body: &Value, timeout: Dur
         "device HTTP request"
     );
     let response = request(ip, "POST", path, token, Some(&text), &[], timeout).await;
+    if response.as_ref().err().is_some_and(|e| e.downcast_ref::<HttpSessionExpired>().is_some()) {
+        // The frame was rejected before dispatch. Refresh identity once, but do
+        // not blindly replay a mutation whose durable transaction predates reboot.
+        if let Some(mac) = body["device_mac"].as_str() {
+            session_nonce(ip, token, mac, timeout.saturating_sub(started.elapsed())).await?;
+        }
+    }
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let (status, response_body) = match response {
         Ok(response) => response,
@@ -482,6 +491,11 @@ async fn status_mode(ip: &str, token: &str, timeout: Duration, compact: bool) ->
     tracing::info!(event = "send", operation = "/api/status", "device HTTP request");
     let projection = compact.then_some(br#"{"compact":true}"#.as_slice());
     let response = request(ip, "POST", "/api/status", token, projection, &[], deadline.saturating_duration_since(Instant::now())).await;
+    let response = match response {
+        Err(error) if error.downcast_ref::<HttpSessionExpired>().is_some() =>
+            request(ip, "POST", "/api/status", token, projection, &[], deadline.saturating_duration_since(Instant::now())).await,
+        result => result,
+    };
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let (status, body) = match response {
         Ok(response) => response,
@@ -539,6 +553,7 @@ async fn status_mode(ip: &str, token: &str, timeout: Duration, compact: bool) ->
         value=parse_status_body(std::str::from_utf8(&bytes)?)?;
         let session=frame_session(ip,token);
         let mut session=lock_session_until(&session,deadline).await?;
+        session.identity = Some(json!({"device_mac":value["device_mac"], "boot_id":value["boot_id"], "session_nonce":value["session_nonce"]}));
         if let Some(ctx)=value["active_context_id"].as_str().filter(|s|s.len()==16 && s.bytes().all(|c|c.is_ascii_hexdigit())) {session.context.copy_from_slice(ctx.as_bytes());}
         return Ok(value);
     }
@@ -631,12 +646,13 @@ pub async fn plan(ip: &str, token: &str, expected_mac: &str, plan: &Value, timeo
 }
 
 async fn session_post(ip: &str, path: &str, token: &str, expected_mac: &str, message: &Value, timeout: Duration) -> Result<Value> {
+    let started = Instant::now();
     let mut command = message.clone();
     let (_, device_mac) = session_nonce(ip, token, expected_mac, timeout).await?;
     command["device_mac"] = json!(device_mac);
     command["request_id"] = json!(format!("{}-{:08x}", path.rsplit('/').next().unwrap_or("command"),
         crc32fast::hash(&crate::template::canonical_bytes(message))));
-    post_json(ip, path, token, &command, timeout).await
+    post_json(ip, path, token, &command, timeout.saturating_sub(started.elapsed())).await
 }
 
 /// Explicit remote activation.
@@ -659,7 +675,13 @@ pub async fn activate(
 }
 
 async fn session_nonce(ip: &str, token: &str, expected_mac: &str, timeout: Duration) -> Result<(String, String)> {
-    let state = status(ip, token, timeout).await?;
+    let session = frame_session(ip, token);
+    let deadline = Instant::now() + timeout;
+    let cached = lock_session_until(&session, deadline).await?.identity.clone();
+    let state = match cached {
+        Some(state) => state,
+        None => status_compact(ip, token, deadline.saturating_duration_since(Instant::now())).await?,
+    };
     let mac = state["device_mac"].as_str()
         .with_context(|| format!("authenticated status is missing device MAC for target {expected_mac}"))?;
     let expected = DeviceIdentity::normalized_mac(expected_mac)

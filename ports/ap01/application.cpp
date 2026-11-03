@@ -265,7 +265,8 @@ Ap01HttpReply Ap01Application::businessHttp(const Ap01HttpRequest &request, uint
         if (reply.bytes.length()) {}
         else if (memcmp(frame.session, s->id, 16) && !(op == 1 && !memcmp(frame.session, s->open, 16)))
             error(reply, 409, "session", "frame");
-        else if (frame.requestNo <= s->highest) {
+        else if (frame.requestNo <= s->highest && !(frame.requestNo == s->highest &&
+            !memcmp(digest, s->digest, 32) && !s->response.length() && isIdempotentReadOp(op))) {
             if (frame.requestNo == s->highest && !memcmp(digest, s->digest, 32) && s->response.length()) {
                 reply.status = s->lastStatus; reply.frame = true; reply.bytes = s->response; return reply;
             }
@@ -279,7 +280,7 @@ Ap01HttpReply Ap01Application::businessHttp(const Ap01HttpRequest &request, uint
             dispatch(payload, principal, op, now, reply);
         }
     }
-    if (!reply.bytes.length() || reply.bytes.length() > 4048) error(reply, 503, "reply_limit", "response", true);
+    if (!reply.bytes.length() || reply.bytes.length() > (isIdempotentReadOp(op) ? 4048u : 464u)) error(reply, 503, "reply_limit", "response", true);
     CompactFrameHeader response = frame; response.kind = 1;
     response.result = reply.status < 400 ? 0 : reply.status == 503 ? 3 : 2;
     response.payloadLen = reply.bytes.length(); memcpy(response.session, s->id, 16);

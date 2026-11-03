@@ -111,6 +111,8 @@
 
 ### A9. PowerPlan 与 Data 同轮联合下发（2026-10-05）
 
+- **2026-11-02 协议整改 P0 源码/软件验收完成，未部署**：会话复用、只读重放/写回执守卫、BLE 错误和可恢复驱动；workspace522通过/5条件忽略、Note4构建/匹配ELF栈88项通过。设计差异、最后补充回归及同版本候选哈希见[专项状态](../../project-workflow/bridge-device-protocol-remediation/status.md)。真实驱动恢复/RF/资源高水位仍开放，不结A9/B6/C8。
+
 - **2026-10-20 Plan激活已修并配套实机验收**：原60→59 Data872/Plan5880获Light却下一周期才联网，是network_start拆分导致；新能力由Plan原事务冻结目标摘要/回报路由并在BLE结束建连。Note4 `.106` 原OTA job f7186b2f succeeded/image_verified，Mac12:09已部署；401回归/5条件忽略，最终协议8、栈88项通过，周期同值Sleep对照通过。用户允许蓝牙/定位后14:20原Plan5904 ACK network_activation=plan，3.304秒内同Plan ready，随后同MAC认证HTTP Wi-Fi连接/BLE关闭/原期限递减，本轮complete；14:21 Data876 applied/displayed，用户目视确认Wi-Fi图标已显示。自然新余量全链路时延未验，不结A9。[实施/部署/边界](../../project-workflow/bridge-macos/plan-activation-20261020.md)。
 
 - **2026-10-20 Wi-Fi余量快路径已修并部署Mac**：通知即时响应+源60秒兜底；新工作首次投递，只有待确认按设备每6轮重试，源消费/跨MAC独立，Data先于诊断。Core181/App122+集成26通过，最终定向3项通过；同MAC Data871 HTTP ACK applied/displayed及认证读回通过，源刷新实测61.49秒含RPC。仍缺真实新余量变化的通知/屏幕时延、Windows部署与长期RF；上游通知未到达原因未定。见[实施与部署](../../project-workflow/bridge-macos/wifi-usage-fast-path-20261020.md)、[原调查](../../project-workflow/bridge-macos/wifi-usage-latency-20261020.md)。

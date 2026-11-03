@@ -80,6 +80,7 @@ struct SimWifi {
 
 #[derive(Default)]
 struct SimHttpFrame {
+    reply_status: Option<StatusCode>,
     status_pages: Option<bridge_render::SimulatorStatusPages>,
     id: [u8; 16],
     open_nonce: [u8; 16],
@@ -3344,24 +3345,14 @@ where F: FnOnce(State<SimState>, Request<Body>) -> Fut,
         return (StatusCode::BAD_REQUEST, Json(json!({"error":"operation","stage":"frame"}))).into_response();
     }
     let mut session = state.http_frame.lock().await;
-    if op == 1 || (op == 19 && serde_json::from_slice::<Value>(payload).ok().is_some_and(|v|v["open"]==true)) {
+    if (op == 1 && (frame.session != session.id || digest != session.token_digest)) || (op == 19 && serde_json::from_slice::<Value>(payload).ok().is_some_and(|v|v["open"]==true)) {
         if frame.session == [0; 16] {
             return framed_http_response(StatusCode::CONFLICT,frame,session.id,2,
                 br#"{"result":"rejected","error":"session"}"#);
         }
         if frame.session == session.open_nonce && digest == session.token_digest {
-            return match session.fence.inspect(frame.request_no,&raw) {
-                Admission::Replay(reply) => (StatusCode::OK,
-                    [(header::CONTENT_TYPE,bridge_core::compact_frame::CONTENT_TYPE)],
-                    reply.to_vec()).into_response(),
-                admission => framed_http_response(StatusCode::CONFLICT,frame,session.id,2,
-                    if matches!(admission,Admission::Retired) {
-                        br#"{"result":"rejected","error":"retired","query":"original_business_id"}"#
-                    } else {
-                        br#"{"result":"rejected","error":"request_conflict","query":"original_business_id"}"#
-                    }),
-            };
-        }
+            // Common replay fence below also admits uncached read-only responses.
+        } else {
         session.opens += 1;
         let boot = session_snapshot(&state).boot_id;
         let seed = Sha256::digest(format!("http:{}:{boot}:{}",state.mac,session.opens));
@@ -3369,6 +3360,7 @@ where F: FnOnce(State<SimState>, Request<Body>) -> Fut,
         session.open_nonce = frame.session;
         session.token_digest = digest;
         session.fence = RequestFence::default();
+        }
     } else if frame.session != session.id || session.id == [0; 16] || digest != session.token_digest {
         return framed_http_response(StatusCode::CONFLICT,frame,session.id,2,
             br#"{"result":"rejected","error":"session"}"#);
@@ -3383,7 +3375,7 @@ where F: FnOnce(State<SimState>, Request<Body>) -> Fut,
     }
     match session.fence.inspect(frame.request_no, &raw) {
         Admission::Replay(reply) => {
-            return (StatusCode::OK, [(header::CONTENT_TYPE, bridge_core::compact_frame::CONTENT_TYPE)], reply.to_vec()).into_response();
+            return (session.reply_status.unwrap_or(StatusCode::OK), [(header::CONTENT_TYPE, bridge_core::compact_frame::CONTENT_TYPE)], reply.to_vec()).into_response();
         }
         Admission::Retired | Admission::Conflict => {
             let error = if matches!(session.fence.inspect(frame.request_no, &raw), Admission::Retired) {
@@ -3402,7 +3394,12 @@ where F: FnOnce(State<SimState>, Request<Body>) -> Fut,
                 pages.page(None,&token,&id,offset as usize,device_uptime_ms(&state,clock_snapshot(&state).unwrap())).ok())
                 .unwrap_or(json!({"result":"rejected","error":"status_read_expired","stage":"status_read"}));
             let rejected=reply["result"]=="rejected";
-            return framed_http_response(if rejected {StatusCode::CONFLICT}else{StatusCode::OK},frame,session.id,if rejected{2}else{0},&serde_json::to_vec(&reply).unwrap());
+            let code = if rejected {StatusCode::CONFLICT}else{StatusCode::OK};
+            let response = framed_http_response(code,frame,session.id,if rejected{2}else{0},&serde_json::to_vec(&reply).unwrap());
+            let bytes = to_bytes(response.into_body(),4096).await.unwrap();
+            session.fence.retain(frame.request_no,&raw,&bytes);
+            session.reply_status = Some(code);
+            return (code,[(header::CONTENT_TYPE,bridge_core::compact_frame::CONTENT_TYPE)],bytes).into_response();
         }
         session.status_pages = None;
     }
@@ -3431,13 +3428,27 @@ where F: FnOnce(State<SimState>, Request<Body>) -> Fut,
         let reply=session.status_pages.as_mut().unwrap().page(Some(std::str::from_utf8(&bytes).unwrap()),&token,&id,0,device_uptime_ms(&state,clock_snapshot(&state).unwrap())).unwrap();
         Some(serde_json::to_vec(&reply).unwrap())
     }else{None};
-    let payload = if let Some(page)=page.as_ref() {page.clone()} else if bytes.len() + HEADER_LEN <= 4096 { bytes.to_vec() } else {
+    let mut bytes = bytes.to_vec();
+    if frame.op == 6 && bytes.len()+HEADER_LEN>512 {
+        if let Ok(mut value) = serde_json::from_slice::<Value>(&bytes) {
+            if let Some(object) = value.as_object_mut() {
+                for key in ["reasons", "diag_generation", "from_seq", "through_seq"] { object.remove(key); }
+            }
+            bytes = serde_json::to_vec(&value).unwrap();
+        }
+    }
+    let write_limit = !bridge_core::compact_frame::is_idempotent_read_op(frame.op) && bytes.len()+HEADER_LEN>512;
+    let payload = if write_limit {
+        serde_json::to_vec(&json!({"result":if status.is_success(){"unknown"}else{"rejected"},
+            "error":"reply_limit","stage":"reply","query":"original_business_id"})).unwrap()
+    } else if let Some(page)=page.as_ref() {page.clone()} else if bytes.len() + HEADER_LEN <= 4096 { bytes.to_vec() } else {
         br#"{"result":"unknown","error":"reply_limit","stage":"frame","query":"original_business_id"}"#.to_vec()
     };
-    let result = if page.is_some(){0}else if bytes.len() + HEADER_LEN > 4096 {3} else {result};
+    let result = if write_limit {if status.is_success(){3}else{2}} else if page.is_some(){0}else if bytes.len() + HEADER_LEN > 4096 {3} else {result};
     let mut reply = Header {kind:1,op:frame.op,result,payload_len:payload.len() as u16,
         session:session.id,request_no:frame.request_no,context:frame.context}.encode().unwrap().to_vec();
     reply.extend_from_slice(&payload);
+    session.reply_status = Some(status);
     session.fence.retain(frame.request_no,&raw,&reply);
     (status, [(header::CONTENT_TYPE, bridge_core::compact_frame::CONTENT_TYPE)], reply).into_response()
 }

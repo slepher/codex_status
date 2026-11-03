@@ -65,6 +65,7 @@ static bool jsonComplete(const String &s) {
 }
 
 static void clearReceiveBuffers() {
+    std::lock_guard<std::recursive_mutex> lock(infoMutex);
     endpointBuf = "";
     tplCtrlBuf = "";
     tplCtrlStartedMs = 0;
@@ -148,38 +149,78 @@ static bool appendJson(String &buf, const std::string &value, size_t limit,
     return true;
 }
 
+void bleReplyTransportError(const uint8_t *prefix, size_t length, const char *code, const char *stage) {
+    CompactFrameHeader header;
+    header.kind = 1;
+    header.result = 2;
+    // Preserve correlation only if the header itself is valid. Never expose a
+    // current session to an unauthenticated or unidentifiable fragment.
+    if (prefix && length >= COMPACT_FRAME_HEADER && prefix[0] == COMPACT_FRAME_MARKER) {
+        header.op = (uint16_t(prefix[2]) << 8) | prefix[3];
+        memcpy(header.session, prefix + 8, 16);
+        for (size_t i = 0; i < 8; ++i) header.requestNo = (header.requestNo << 8) | prefix[24+i];
+        memcpy(header.context, prefix + 32, 16);
+        uint8_t check[COMPACT_FRAME_HEADER];
+        if (!compactFrameEncode(header, check)) {
+            header = CompactFrameHeader{}; header.kind = 1; header.result = 2;
+        }
+    }
+    String payload = String("{\"ok\":false,\"result\":\"rejected\",\"error\":\"") + code +
+        "\",\"stage\":\"" + stage + "\",\"action\":\"retry_after_transport_recovery\"}";
+    header.payloadLen = payload.length();
+    uint8_t bytes[COMPACT_FRAME_HEADER];
+    if (!compactFrameEncode(header, bytes)) return;
+    String response(reinterpret_cast<const char *>(bytes), sizeof(bytes));
+    response.concat(payload.c_str(), payload.length());
+    bleNotifyStatusQuiet(response);
+}
+
 static bool appendCommandFrame(String &buf, const std::string &value) {
+    std::lock_guard<std::recursive_mutex> lock(infoMutex);
     const uint32_t now = millis();
     if (buf.length() && (uint32_t)(now - tplCtrlStartedMs) > 2000) {
+        bleReplyTransportError(reinterpret_cast<const uint8_t *>(buf.c_str()), buf.length(), "frame_invalid", "reassembly");
         buf = "";
-        ++connectionGeneration;
+        tplCtrlStartedMs = 0;
     }
     if (!buf.length()) tplCtrlStartedMs = now;
     if (value.empty() || buf.length() + value.size() > 8192 ||
         !buf.concat(value.data(), value.size())) {
+        bleReplyTransportError(reinterpret_cast<const uint8_t *>(buf.c_str()), buf.length(), "frame_invalid", "reassembly");
         buf = "";
-        ++connectionGeneration;
+        tplCtrlStartedMs = 0;
         return false;
     }
     if (buf.length() < COMPACT_FRAME_HEADER) return false;
     const uint8_t *bytes = reinterpret_cast<const uint8_t *>(buf.c_str());
     const size_t expected = COMPACT_FRAME_HEADER + (size_t(bytes[6]) << 8 | bytes[7]);
     if (bytes[0] != COMPACT_FRAME_MARKER || expected > 8192 || buf.length() > expected) {
+        bleReplyTransportError(reinterpret_cast<const uint8_t *>(buf.c_str()), buf.length(), "frame_invalid", "reassembly");
         buf = "";
-        ++connectionGeneration;
+        tplCtrlStartedMs = 0;
         return false;
     }
     if (buf.length() < expected) return false;
     CompactFrameHeader header;
     if (!compactFrameDecode(bytes, buf.length(), header, 8192) || header.kind != 0) {
+        bleReplyTransportError(reinterpret_cast<const uint8_t *>(buf.c_str()), buf.length(), "frame_invalid", "reassembly");
         buf = "";
-        ++connectionGeneration;
+        tplCtrlStartedMs = 0;
         return false;
     }
-    String complete = buf;
+    String complete = std::move(buf);
     buf = "";
     dispatchTemplateCtrl(complete);
     return true;
+}
+
+void blePollCommandTimeout() {
+    std::lock_guard<std::recursive_mutex> lock(infoMutex);
+    if (tplCtrlBuf.length() && uint32_t(millis() - tplCtrlStartedMs) > 2000) {
+        bleReplyTransportError(reinterpret_cast<const uint8_t *>(tplCtrlBuf.c_str()), tplCtrlBuf.length(), "frame_invalid", "reassembly");
+        tplCtrlBuf = "";
+        tplCtrlStartedMs = 0;
+    }
 }
 
 // A shared last gate for ALL INFO/Status writes, including auth/endpoint.
@@ -321,6 +362,8 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         }
         refreshInfo();
         if (!peer.secure()) {
+            ++connectionGeneration;
+            clearReceiveBuffers();
             DevLog.println("[ble] authentication rejected: encryption and bond required");
             if (bleServer) {
                 disconnecting = true;
@@ -350,8 +393,11 @@ class UsageCallbacks : public NimBLECharacteristicCallbacks {
 
 class TplCtrlCallbacks : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic *c, PEER_ARG) override {
-        if (!writeAllowed(desc)) return;
         std::string v = c->getValue();
+        if (!writeAllowed(desc)) {
+            bleReplyTransportError(reinterpret_cast<const uint8_t *>(v.data()), v.size(), "ble_auth_required", "gatt_write");
+            return;
+        }
         appendCommandFrame(tplCtrlBuf, v);
     }
 };

@@ -286,7 +286,7 @@ void enterBleOn(bool userInitiated) {
     }
     // An unconfigured device must still advertise on a timer wake so the
     // bridge can issue a formal light plan and install its first Bundle.
-    if (!transport::state.v2BleQueue) transport::state.v2BleQueue = xQueueCreate(2, sizeof(transport::V2BleMessage *));
+    if (!transport::state.v2BleQueue) transport::state.v2BleQueue = xQueueCreate(4, sizeof(transport::V2BleMessage *));
     if (!bleInitialized()) {
         bleSetInfoProvider(infoExtraJson);
         bleBegin("CodexStatus-" + macSuffix(), application::state.firmwareVersion);

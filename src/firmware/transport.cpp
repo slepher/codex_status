@@ -8,6 +8,8 @@
 #include "radio_internal.h"
 #include "sync_internal.h"
 #include "data_activity_led.h"
+#include <new>
+#include <utility>
 
 namespace firmware::transport {
 
@@ -47,6 +49,7 @@ static uint64_t v2HttpHighestRequest = 0;
 static uint8_t v2HttpLastDigest[32] = {}, v2HttpCurrentDigest[32] = {};
 
 static bool v2HttpCacheReply = false;
+static int v2HttpLastStatus = 200;
 
 static void randomHex(char *out, size_t bytes);
 static void setOtaPassword(const char *value);
@@ -221,9 +224,17 @@ void handleBleAuth(const String &json) {
 }
 
 void handleBleV2Ctrl(const String &json) {
-    if (!state.v2BleQueue || json.length() > 8192 || !blePeerIsBonded() || !blePeerIsEncrypted()) return;
-    auto *message = new V2BleMessage{json, blePeerAddress(), blePeerIdentity(), bleConnectionGeneration()};
-    if (xQueueSend(state.v2BleQueue, &message, 0) != pdTRUE) delete message;
+    const auto reject = [&](const char *code, const char *stage) {
+        bleReplyTransportError(reinterpret_cast<const uint8_t *>(json.c_str()), json.length(), code, stage);
+    };
+    if (!blePeerIsBonded() || !blePeerIsEncrypted()) { reject("ble_auth_required", "gatt_write"); return; }
+    if (json.length() > 8192) { reject("frame_invalid", "reassembly"); return; }
+    if (!state.v2BleQueue || !uxQueueSpacesAvailable(state.v2BleQueue)) { reject("device_busy", "queue"); return; }
+    auto *message = new (std::nothrow) V2BleMessage{json, blePeerAddress(), blePeerIdentity(), bleConnectionGeneration()};
+    if (!message || message->body.length() != json.length() || xQueueSend(state.v2BleQueue, &message, 0) != pdTRUE) {
+        delete message;
+        reject("device_busy", "queue");
+    }
 }
 
 static void handleUpdatePage() {
@@ -315,6 +326,29 @@ void v2Response(int status, const String &body) {
     if (!state.v2ReplyOverBle) {
         if (!state.v2HttpFrameActive) { state.server.send(status, "application/json", body); return; }
         String payload = body;
+        if (state.v2HttpFrame.op == 6 && payload.length() > 512 - COMPACT_FRAME_HEADER) {
+            // These diagnostics remain in the frozen batch and status. The
+            // BEGIN receipt needs only identity, batch ID, length/hash and offset.
+            JsonDocument manifest;
+            if (!deserializeJson(manifest, payload)) {
+                for (const char *key : {"reasons", "diag_generation", "from_seq", "through_seq"}) manifest.remove(key);
+                payload = ""; serializeJson(manifest, payload);
+            }
+        }
+        if (!isIdempotentReadOp(state.v2HttpFrame.op) && payload.length() > 512 - COMPACT_FRAME_HEADER) {
+            // Never replay a fabricated success after executing a mutation.
+            payload = "{\"result\":\"unknown\",\"error\":\"reply_limit\",\"stage\":\"reply\",\"query\":\"original_business_id\"}";
+            if (status >= 400) {
+                JsonDocument original, compact;
+                deserializeJson(original, body);
+                String error = original["error"] | "reply_limit";
+                compact["result"] = "rejected";
+                compact["error"] = error.length() <= 64 ? error : String("reply_limit");
+                compact["stage"] = "reply";
+                compact["action"] = "read_device_status";
+                payload = ""; serializeJson(compact, payload);
+            }
+        }
         if (payload.length() > 4096 - COMPACT_FRAME_HEADER) {
             payload = "{\"result\":\"unknown\",\"error\":\"reply_limit\",\"stage\":\"frame\",\"query\":\"original_business_id\"}";
         }
@@ -335,6 +369,7 @@ void v2Response(int status, const String &body) {
         String bytes(reinterpret_cast<const char *>(header), COMPACT_FRAME_HEADER);
         bytes.concat(payload.c_str(), payload.length());
         if (v2HttpCacheReply) {
+            v2HttpLastStatus = status;
             v2HttpHighestRequest = state.v2HttpFrame.requestNo;
             memcpy(v2HttpLastDigest, v2HttpCurrentDigest, sizeof(v2HttpLastDigest));
             state.v2HttpLastFrame = bytes.length() <= 512 ? bytes : String();
@@ -454,38 +489,30 @@ static bool v2HttpBegin(uint16_t op) {
     compactDigest(state.v2HttpRaw, v2HttpCurrentDigest);
     state.v2HttpBody = op == 11 ? String() :
         String(state.v2HttpRaw.c_str() + COMPACT_FRAME_HEADER, request.payloadLen);
-    uint8_t zeroSession[16] = {};
     bool imageOpen = false;
     if (op == 19) {
         JsonDocument input;
         imageOpen = !deserializeJson(input, state.v2HttpBody) && input["open"] == true;
     }
-    if (op == 1 || imageOpen) {
+    if ((op == 1 && (state.v2HttpToken != token || memcmp(request.session, v2HttpSession, 16))) || imageOpen) {
         uint8_t zero[16] = {};
         if (!memcmp(request.session, zero, 16)) {
             v2Response(409, "{\"result\":\"rejected\",\"error\":\"session\"}"); return false;
         }
         if (v2HttpOpenValid && state.v2HttpToken == token &&
             !memcmp(request.session, v2HttpOpenNonce, 16)) {
-            if (request.requestNo == v2HttpHighestRequest && state.v2HttpLastFrame.length() &&
-                !memcmp(v2HttpCurrentDigest, v2HttpLastDigest, sizeof(v2HttpLastDigest))) {
-                state.server.send(200, "application/vnd.codex-status.frame", state.v2HttpLastFrame);
-            } else {
-                v2Response(409, request.requestNo == v2HttpHighestRequest ?
-                    "{\"result\":\"rejected\",\"error\":\"request_conflict\",\"query\":\"original_business_id\"}" :
-                    "{\"result\":\"rejected\",\"error\":\"retired\",\"query\":\"original_business_id\"}");
+            // Replayed opening request uses the same digest fence as ordinary reads.
+        } else {
+            memcpy(v2HttpOpenNonce, request.session, 16);
+            v2HttpOpenValid = true;
+            for (size_t i = 0; i < 16; i += 4) {
+                uint32_t random = esp_random();
+                memcpy(v2HttpSession + i, &random, 4);
             }
-            return false;
+            state.v2HttpToken = token;
+            v2HttpHighestRequest = 0;
+            state.v2HttpLastFrame = "";
         }
-        memcpy(v2HttpOpenNonce, request.session, 16);
-        v2HttpOpenValid = true;
-        for (size_t i = 0; i < 16; i += 4) {
-            uint32_t random = esp_random();
-            memcpy(v2HttpSession + i, &random, 4);
-        }
-        state.v2HttpToken = token;
-        v2HttpHighestRequest = 0;
-        state.v2HttpLastFrame = "";
     } else if (state.v2HttpToken != token || memcmp(request.session, v2HttpSession, 16)) {
         v2Response(409, "{\"result\":\"rejected\",\"error\":\"session\"}"); return false;
     }
@@ -495,15 +522,18 @@ static bool v2HttpBegin(uint16_t op) {
         v2Response(409, "{\"result\":\"rejected\",\"error\":\"context\"}"); return false;
     }
     if (request.requestNo <= v2HttpHighestRequest) {
-        if (request.requestNo == v2HttpHighestRequest && state.v2HttpLastFrame.length() &&
-            !memcmp(v2HttpCurrentDigest, v2HttpLastDigest, sizeof(v2HttpLastDigest))) {
-            state.server.send(200, "application/vnd.codex-status.frame", state.v2HttpLastFrame);
-        } else {
+        const bool same = request.requestNo == v2HttpHighestRequest &&
+            !memcmp(v2HttpCurrentDigest, v2HttpLastDigest, sizeof(v2HttpLastDigest));
+        if (same && state.v2HttpLastFrame.length()) {
+            state.server.send(v2HttpLastStatus, "application/vnd.codex-status.frame", state.v2HttpLastFrame);
+            return false;
+        }
+        if (!same || !isIdempotentReadOp(request.op)) {
             v2Response(409, request.requestNo == v2HttpHighestRequest ?
                 "{\"result\":\"rejected\",\"error\":\"request_conflict\",\"query\":\"original_business_id\"}" :
                 "{\"result\":\"rejected\",\"error\":\"retired\",\"query\":\"original_business_id\"}");
+            return false;
         }
-        return false;
     }
     if(op!=11) {
         JsonDocument command;
@@ -624,11 +654,12 @@ static void __attribute__((noinline)) handleBleWifiCapabilities(
 }
 
 void serviceV2Ble() {
+    blePollCommandTimeout();
     if (!state.v2BleQueue) return;
     V2BleMessage *message = nullptr;
     if (xQueueReceive(state.v2BleQueue, &message, 0) != pdTRUE) return;
-    String body = message->body, peer = message->peer;
-    String identity = message->identity;
+    String body = std::move(message->body), peer = std::move(message->peer);
+    String identity = std::move(message->identity);
     uint32_t generation = message->generation;
     delete message;
     if (!blePeerIsBonded() || !blePeerIsEncrypted() || peer != blePeerAddress() ||
