@@ -34,7 +34,10 @@ async fn http(endpoint:String,method:&str,path:String,token:String,body:Option<V
     let method=method.to_owned();
     device_client::pairing_request(&endpoint,&method,&path,&token,
         body.as_ref(),Duration::from_secs(3)).await
-        .map_err(|_|"pairing_transport_unknown".into())
+        .map_err(|error| {
+            tracing::warn!(error = %error, "AP01 pairing HTTP failed");
+            "pairing_transport_unknown".into()
+        })
 }
 
 pub async fn verify_endpoint(ctx:&AppCtx,mac:&str,endpoint:&str)->Result<Value,String> {

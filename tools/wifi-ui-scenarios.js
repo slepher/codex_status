@@ -67,10 +67,15 @@ window.__wifiUiScenario = async function(scenario) {
       if(scenario==='permission-request') {
         check(permissionCalls.filter(op=>op==='permission_all').length===1,'Startup must request once');
         check($('wifi-permissions').hidden,'Successful combined grant must hide setup');
+        permission={platform:'macos',location:'not_determined',bluetooth:'not_determined'};
+        permissionCalls.length=0;
+        $('wifi-host-read').click();await wait();
+        check(permissionCalls.filter(op=>op==='permission_all').length===1,'Read-network button did not request authorization');
+        check($('wifi-host').textContent==='Home-5G','Read-network button did not refresh after grant');
       } else {
         check(!permissionCalls.some(op=>op.startsWith('permission_')||op.startsWith('settings_')),'Startup repeated a denied prompt');
-        $('wifi-permission-action').click();await wait();
-        check(permissionCalls.filter(op=>op==='settings_permissions').length===1,'Combined settings button failed');
+        $('wifi-host-read').click();await wait();
+        check(permissionCalls.filter(op=>op==='settings_permissions').length===1,'Read-network button did not open settings');
       }
     } finally {window.__wifiRoundtripInvoke=null;}
     wifiShowPermissions({platform:'macos',location:scenario==='permission-request'?'not_determined':'disabled',bluetooth:scenario==='permission-request'?'not_determined':'denied'});

@@ -45,6 +45,9 @@ const context = vm.createContext({
 vm.runInContext(source, context);
 const run = code => vm.runInContext(code, context);
 const macA = '0200000000A1', macB = '0200000000B2';
+// No remembered device is normal on startup; it must not abort permission setup.
+run('selectedDeviceMac=null;clearDeviceView()');
+assert.match(element('wifi-family-list').innerHTML,/尚无共享族/);
 const select = mac => run("selectedDeviceMac = '" + mac + "'; deviceSelectionGeneration++; clearDeviceView()");
 const view = (mac, verdict, screen = '屏幕已显示') => ({
   device: {
@@ -266,6 +269,15 @@ assert.equal(element('wifi-permission-result').textContent,'两项权限已授�
 assert.equal(element('wifi-host').textContent,'Host-5G');
 const secondStart=calls.length;await run('wifiInitPermissions()');
 assert.equal(calls.length,secondStart);
+// Exercise the production read-network button, rather than only the permission helper.
+const hostReadHandler=html.match(/<button[^>]*onclick="([^"]+)"[^>]*>读取主机网络<\/button>/)?.[1];
+assert(hostReadHandler);
+permissionState={platform:'macos',location:'not_determined',bluetooth:'not_determined'};
+requested=false;authorizationPoll=0;
+const hostReadStart=calls.length;await run(hostReadHandler);
+assert.equal(calls.slice(hostReadStart).filter(c=>c.args.op==='permission_all').length,1);
+assert.equal(element('wifi-host').textContent,'Host-5G');
+
 for(const state of [{platform:'macos',location:'allowed',bluetooth:'allowed'},
  {platform:'macos',location:'denied',bluetooth:'restricted'}, {platform:'other'}]) {
  permissionState=state;requested=false;run('wifiPermissionStartupChecked=false');

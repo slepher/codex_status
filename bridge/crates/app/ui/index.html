@@ -342,7 +342,7 @@
         </div>
         <div class="wifi-summary">
           <div class="row"><span>主机当前 Wi-Fi</span><span id="wifi-host">尚未读取</span></div>
-          <p id="wifi-auto" role="status" aria-live="polite"></p><div class="action-strip"><button id="wifi-current-action" onclick="wifiEditCurrent()" hidden>配置当前网络</button><button id="wifi-current-retry" onclick="wifiRetryCurrent()" hidden>重新尝试连接</button></div><p id="wifi-times" class="muted"></p><div class="action-strip"><button onclick="wifiHost(false)">读取主机网络</button><button onclick="wifiRefreshView()">刷新本地缓存</button></div>
+          <p id="wifi-auto" role="status" aria-live="polite"></p><div class="action-strip"><button id="wifi-current-action" onclick="wifiEditCurrent()" hidden>配置当前网络</button><button id="wifi-current-retry" onclick="wifiRetryCurrent()" hidden>重新尝试连接</button></div><p id="wifi-times" class="muted"></p><div class="action-strip"><button id="wifi-host-read" onclick="wifiHost(true)">读取主机网络</button><button onclick="wifiRefreshView()">刷新本地缓存</button></div>
         </div>
         <div id="wifi-ap01-auth" hidden>
           <p class="section-note">AP01 保持旋钮手动选网。同步只更新保存列表；设备读取不提供密码。</p>
@@ -1093,7 +1093,7 @@
   let wifiLibrary={revision:0,families:[],devices:{},wired_family:null},wifiFamilyEditing=null,wifiManualSelection=false,wifiFamilySelectionDirty=false,wifiWiredDirty=false;
   function wifiNetworkKey(){return wifiHostNetwork&&Object.hasOwn(wifiHostNetwork,'family_name')?wifiHostNetwork.family_name:(wifiHostNetwork?.state==='connected'?wifiHostNetwork.networks?.[0]?.ssid:null);}
   function wifiFamilyRender(){
-    const families=wifiLibrary.families||[],selected=wifiLibrary.devices?.[selectedTarget()]||[];
+    const families=wifiLibrary.families||[],selected=wifiLibrary.devices?.[selectedDeviceMac]||[];
     const draft=wifiFamilySelectionDirty?[...document.querySelectorAll('[data-wifi-family]:checked')].map(e=>e.dataset.wifiFamily):selected;
     const credential=p=>p==null?'凭据待补充':p===''?'开放网络':'密码已存';
     $('wifi-family-list').innerHTML=families.map((f,i)=>`<div class="prow"><label class="wifi-family-check"><input type="checkbox" onchange="wifiFamilySelectionDirty=true;wifiFamilyCount()" data-wifi-family="${escapeHtml(f.id)}" ${draft.includes(f.id)?'checked':''}><span class="pmeta"><b>${escapeHtml(f.name)}</b><small>2.4G: ${escapeHtml(f.ssid_2g||'无')} · ${credential(f.password_2g)}<br>5G: ${escapeHtml(f.ssid_5g||'无')}${f.ssid_5g?' · '+credential(f.password_5g):''}</small></span></label><button onclick="wifiFamilyEdit(${i})">编辑族</button><button onclick="wifiFamilyDelete(${i})">删除族</button></div>`).join('')||'尚无共享族，点击“新增共享族”开始配置。';

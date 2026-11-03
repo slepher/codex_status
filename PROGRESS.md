@@ -1,21 +1,21 @@
 # Codex Status 当前交接
 
-更新时间：2026-11-02，Asia/Shanghai。
+更新时间：2026-11-03，Asia/Shanghai。
 
 ## 当前部署
 
 - Windows默认Bridge已部署单一共享族网络工作台（含有线回退提示更正）并重启：`bridge/target/debug/bridge-app.exe`，39005184 B，SHA256 `14c519e07efaa9e13f5ce5d08a9985c0ae627993578c38abf43608735a6575d4`。health204/MCP44、主进程/watchdog/端口核验通过；旧exe及295文件data完整备份校验，3族/3设备配置、模板/Profile/设置及凭据保留。[验收](project-workflow/wifi-families/status.md)
 
-- 当前Mac（arm64）Bridge已首次构建/启动：`artifacts/bridge-macos/Codex Status Bridge.app`，exe 81375120 B，SHA256 `1a4592e9b6f1b522f6f3aae5ed8b1618a6a782d5a1907c273a7c54e248ad682c`。按需LaunchAgent supervisor38919/child38927，8765健康204、8766 MCP初始化通过，Codex app-server已启动。该机原无应用/运行数据，现为新建默认data，尚无设备登记，未验设备投递；此前Mac数据/设备ACK记录不能视为本机现场。Rust1.99.1、ArduinoJson7.0.4；[构建日志](artifacts/bridge-macos/build-20261102.log)。
+- 当前Mac（arm64）Bridge已首次构建/启动：`artifacts/bridge-macos/Codex Status Bridge.app`，exe 81394752 B，SHA256 `de3e039fddefcfb8b45e37ddca86359f0f7af7f781035317eddcf767130578df`。按需LaunchAgent supervisor51790/child51794，8765健康204、8766 MCP初始化通过，Codex app-server已启动。该机原无应用/运行数据，当前data已导入恢复的3组Wi-Fi，AP01已重新配对并认证登记；Note4因不在身边待配对，未验设备投递；此前Mac数据/设备ACK记录不能视为本机现场。Rust1.99.1、ArduinoJson7.0.4；托盘左键打开面板、右键菜单：Mac取消自动菜单挂载，改为右键显式弹出，用户两键实测正常；Windows源码保持同逻辑、未部署；已修复未选设备时初始化异常及主机网络按钮漏授权，Node/WK80和窄宽截图通过，用户已确认真实权限弹窗允许；菜单栏刷新已改原子保留系统模板模式，透明底居中数字，已按用户要求移除全部额外状态标记；定向2测试通过，原应用/data已备份。仅数字版本重建/重启，health204/MCP ping通过。旧数据迁移包未含Bridge目录；从历史对话找回2台Mac设备登记与3组Wi-Fi/历史密码，私有恢复清单在`artifacts/bridge-macos/recovered-device-wifi-20261102.json`；3组2.4G密码已导入并逐项读回一致，已按用户要求将3组5G密码设为对应2.4G密码并读回一致（库revision2），未推送设备网络。仓库5模板已校验并导入平台库，建立3个屏幕族的“仓库默认”本地配置；未绑定/发布设备。[记录](project-workflow/bridge-macos/tray-contrast-20261102.md)。
 - AP01 `34F01557210B`：首尾动画修复ROM应用槽1，版本`1.0.2_0041`、build`ec0a58f71f65c2830c08c9bfd7c155db`、Bundle`6a8d702a`。ROM `artifacts/ap01-wifi-animation-20261022/ap01-wifi-animation-candidate01.bin`，7045480 B，SHA256 `5a49f78b550fabbafcc3cde75aa1f6e9986fb9dd88320cd029cd6655d61e0cee`。10-22认证槽1，用户确认原厂界面/旋钮/App及双向快转首尾正常；10-23再次认证同build，未刷机、未复核槽位。
 - 救援0031/槽0保留：10-22先认证build`53574b55382d55a514ef5b7767db66d9`及槽0，再单次写应用1；按用户要求未整槽读回/导出，停止标记保留。
 - Note4 `.106-note4`认证通过；ROM `artifacts/bridge-macos/note4-0.18.106-plan-activation.bin`，1865680 B，SHA256 `36ca4c3aacdc7b27c9c7cebe4cb18df0bee4048461e189f51050b6332b24ceb4`。10-23未刷机。
 
 ## 活跃事项与下一步
 
-- 协议整改 P0 源码/软件验收完成，已提交、未部署：HTTP 会话复用与重放、BLE 错误/四槽队列/Notify 退避/可恢复冷却；workspace522通过/5条件忽略，最终core+ble245通过/2忽略，Note4构建及匹配ELF栈88项通过。**未部署同版本候选** `artifacts/protocol-p0/note4-p0-0.18.106.bin`，1872736 B，SHA256 `1b93bf34f4139c21d322fb0a8a3c93d9333503fb056663c4771f8a07bfaeb864`；现场ROM不变。新工具链、资源预算及实机边界见[状态](project-workflow/bridge-device-protocol-remediation/status.md)。A9/B6/C8实机未结，P1/P2未实施。
-
 - C9 独立 App 的 D1 非实机验收完成，未部署：ABI 3.0 直接 C 表、真实包零导入、双基址/重复构建一致；最终 `../cuktech-ap01-firmware/build/app-install/d1-v3-11/app.apx2`，203696 B，SHA256 `581eafe33e3e524a3aefdb32e30905be75be304cfa202f14efcdbda113de1dcc`。平台独立维护/host/固定文件开机组合已接入，完整平台候选 `d1-platform-v3-02.bin`，6897352 B，SHA256 `53629b54908e6681c73dad6f256c299a9d0245a800e9301c4b5fb7d0e0ab141c`，镜像检查通过。james.local Docker QEMU 双基址执行真实三入口、业务/发现线程及 root 销毁/重建通过；ROM I/O、LVGL、维护监听/调度为模型替身。生产执行内存 backend 尚未准入、明确不可用，候选不可部署；D2–D4 集合更新仍待推进，现场部署未变。[D1 证据](../cuktech-ap01-firmware/project-workflow/ap01-app-update/d1-direct-app.md)
+
+- 协议整改 P0 源码/软件验收完成，已提交、未部署：HTTP 会话复用与重放、BLE 错误/四槽队列/Notify 退避/可恢复冷却；workspace522通过/5条件忽略，最终core+ble245通过/2忽略，Note4构建及匹配ELF栈88项通过。**未部署同版本候选** `artifacts/protocol-p0/note4-p0-0.18.106.bin`，1872736 B，SHA256 `1b93bf34f4139c21d322fb0a8a3c93d9333503fb056663c4771f8a07bfaeb864`；现场ROM不变。新工具链、资源预算及实机边界见[状态](project-workflow/bridge-device-protocol-remediation/status.md)。A9/B6/C8实机未结，P1/P2未实施。
 
 - Wi-Fi页面重整已提交`53a1fdd`并部署Windows默认实例：唯一共享族列表/编辑器、比较页明确导入、有线回退/概览/恢复工具归位。Node/Edge80/窄宽审阅及隔离构建通过；macOS缺swiftc，B6实机未验。01:41部署备份与数据核验见[状态](project-workflow/wifi-families/status.md)，未刷ROM或手动切网。
 

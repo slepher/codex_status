@@ -829,7 +829,11 @@ fn refresh_tray(app: &AppHandle, ctx: &Arc<AppCtx>) {
     let app = app.clone();
     let _ = app.clone().run_on_main_thread(move || {
         if let Some(tray) = app.tray_by_id("bridge-tray") {
-            let _ = tray.set_icon(Some(icon::render(percent, state, shape)));
+            // Replacing an NSImage resets its template flag; update both atomically.
+            let _ = tray.set_icon_with_as_template(
+                Some(icon::render(percent, state, shape)),
+                cfg!(target_os = "macos"),
+            );
             let _ = tray.set_tooltip(Some(tip.as_str()));
         }
     });
@@ -861,6 +865,8 @@ fn open_url(url: &str) {
 }
 
 fn show_panel(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    let _ = app.show();
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
@@ -3919,7 +3925,7 @@ fn main() {
                     Some(name) => format!("Codex Status 桥 [{name}]"),
                     None => "Codex Status 桥".into(),
                 })
-                .menu(&menu)
+                // macOS must not attach NSStatusItem.menu: AppKit can consume left clicks.
                 .show_menu_on_left_click(false)
                 .on_menu_event({
                     let app_handle = app.handle().clone();
@@ -3971,18 +3977,37 @@ fn main() {
                 })
                 .on_tray_icon_event({
                     let app_handle = app.handle().clone();
+                    #[cfg(target_os = "macos")]
+                    let right_click_menu = menu.clone();
                     move |_tray, event| {
                         if let TrayIconEvent::Click {
                             button: MouseButton::Left,
+                            button_state: MouseButtonState::Down,
+                            ..
+                        } = event
+                        {
+                            tracing::info!("tray left click: opening panel");
+                            show_panel(&app_handle);
+                        }
+                        #[cfg(target_os = "macos")]
+                        if let TrayIconEvent::Click {
+                            button: MouseButton::Right,
                             button_state: MouseButtonState::Up,
                             ..
                         } = event
                         {
-                            show_panel(&app_handle);
+                            if let Some(window) = app_handle.get_webview_window("main") {
+                                tracing::info!("tray right click: opening menu");
+                                if let Err(error) = window.popup_menu(&right_click_menu) {
+                                    tracing::warn!(%error, "tray menu failed");
+                                }
+                            }
                         }
                     }
-                })
-                .build(app)?;
+                });
+            #[cfg(not(target_os = "macos"))]
+            let tray = tray.menu(&menu);
+            let tray = tray.build(app)?;
             let _ = tray;
             spawn_tray_loop(app.handle().clone(), ctx_setup.clone());
             Ok(())
