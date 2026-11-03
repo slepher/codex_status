@@ -1,10 +1,13 @@
 #include "application.h"
+#ifdef AP01_FILE_APP_V3
+#include "app_runtime_v3.h"
+#endif
 #include "local_json_allocator.h"
 #include "v2_command_envelope.h"
 #include "v2_sync.h"
 #include "platform_target.h"
 #include <new>
-#if defined(__riscv)
+#if defined(__riscv) && !defined(AP01_FILE_APP_V3)
 extern "C" const uint8_t ap01_native_manifest[256];
 #endif
 
@@ -12,7 +15,13 @@ namespace {
 constexpr const char *FRAME_TYPE = "application/vnd.codex-status.frame";
 void imageIdentity(JsonDocument &out) {
     out["fw"] = "1.0.2_0041";
-#if defined(__riscv)
+#if defined(AP01_FILE_APP_V3)
+    const auto *api=ap01RuntimeApiV3();
+    // Keep the existing firmware identity field; report the independent App too.
+    out["app_build"] = api->platform_build;
+    out["app_package_digest"] = api->app_digest;
+    out["rom_bytes"] = api->rom_bytes;
+#elif defined(__riscv)
     char build[33]; const char *hex="0123456789abcdef";
     for (unsigned i=0;i<16;++i) {uint8_t v=ap01_native_manifest[36+i];build[2*i]=hex[v>>4];build[2*i+1]=hex[v&15];}
     build[32]=0;out["app_build"] = String(build);
@@ -89,6 +98,7 @@ Ap01Application::Ap01Application(BundleFilesystem &filesystem, Ap01Business &con
 Ap01Application::~Ap01Application() { ap01BindingsFree(&bindings); }
 int Ap01Application::save(void *context, const uint8_t *bytes, size_t length) {
     auto &self = *(Ap01Application *)context;
+    if (!self.business.writesAllowed()) return 0;
     File pending = self.fs.open("/bindings.pending", "w");
     if (!pending || pending.write(bytes, length) != length) return 0;
     pending.close(); pending = self.fs.open("/bindings.pending", "r");
@@ -129,7 +139,7 @@ Ap01HttpReply Ap01Application::pairingHttp(const Ap01HttpRequest &request, uint6
     Ap01HttpReply reply;
     BindingGuard guard(port);
     if (!ready || !guard) { error(reply, 503, "maintenance_busy", "bindings"); return reply; }
-    bindings.maintenance=maintenanceActive();
+    bindings.maintenance=maintenanceActive()||!business.writesAllowed();
     if (request.length > 4096 || (request.length && memchr(request.body, 0, request.length))) {
         error(reply, 400, "body", "pairing"); return reply;
     }
@@ -183,7 +193,7 @@ void Ap01Application::dispatch(const Ap01HttpRequest &request, const char *princ
     {
         BindingGuard guard(port);
         if (!guard) { error(reply, 503, "bindings_busy", "owner"); return; }
-        bindings.maintenance=maintenanceActive();
+        bindings.maintenance=maintenanceActive()||!business.writesAllowed();
         if (op == 4) {
             if (strcmp(request.deviceToken, request.token)) { error(reply, 401, "device_token", "claim"); return; }
             if (doc["force"] == true || doc["release"] == true) { error(reply, 409, "unsupported", "claim"); return; }
@@ -212,6 +222,7 @@ Ap01HttpReply Ap01Application::businessHttp(const Ap01HttpRequest &request, uint
     Ap01HttpReply reply;
     if (!ready || !online.load(std::memory_order_acquire)||maintenanceActive()) { error(reply, 503, "business_offline", "lifecycle"); return reply; }
     uint16_t op = operation(request.path);
+    if (op != 1 && !business.writesAllowed()) { error(reply, 503, "app_trial_readonly", "lifecycle"); return reply; }
     if (!op) { error(reply, 404, "unsupported_endpoint", "business_router"); return reply; }
     if (strcmp(request.method, "POST") || strcmp(request.contentType, FRAME_TYPE)) {
         error(reply, 415, "content_type_or_method", "frame"); return reply;
@@ -301,7 +312,7 @@ bool Ap01Application::discovery(const uint8_t *bytes, size_t length, String &rep
 }
 bool Ap01Application::pairingUi(uint64_t now, String &reply) {
     BindingGuard guard(port); if (!ready || !guard) return false;
-    bindings.maintenance=maintenanceActive();
+    bindings.maintenance=maintenanceActive()||!business.writesAllowed();
     // After confirmation, the UI only needs to hide the prompt. Avoid a JSON
     // document allocation while holding the shared binding lock on every tick.
     if (bindings.state != 1 && bindings.state != 2) {
@@ -315,7 +326,7 @@ bool Ap01Application::pairingDisplayed(const char *request, uint32_t revision, u
 }
 bool Ap01Application::button(bool pressed, uint64_t event, uint64_t now) {
     BindingGuard guard(port); if (!ready || !guard) return false;
-    bindings.maintenance=maintenanceActive();
+    bindings.maintenance=maintenanceActive()||!business.writesAllowed();
     bool pending = bindings.state == 1 || bindings.state == 2;
     if (pending) ap01PairButton(&bindings, pressed, event, now);
     return pending;

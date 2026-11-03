@@ -49,7 +49,8 @@ public:
     const char * bsReceivePath();
     uint32_t bsDecodedLimit();
     uint32_t bsCompressionProtocol();
-    bool bsBegin();
+    // readOnly restores an already mounted volume without mkdir/migration.
+    bool bsBegin(bool readOnly = false);
     size_t bsFreeBytes();
     size_t bsMaxBundleBytes();
     bool bsStartReceive(uint32_t length, String &err,

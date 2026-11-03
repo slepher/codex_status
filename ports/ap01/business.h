@@ -32,6 +32,7 @@ class Ap01Business {
     std::atomic<uint32_t> displayedGeneration{0};
     std::atomic<uint32_t> failedGeneration{UINT32_MAX};
     bool configured = false, storageUnknown = false, replacing = false;
+    std::atomic<bool> writesEnabled{true};
     void newContext(char (&out)[BS_CTX_LEN]);
     bool loadActive(uint64_t now);
     bool render();
@@ -41,7 +42,10 @@ public:
     TemplateRenderer renderer;
     BundleStore store;
     Ap01Business(BundleFilesystem &filesystem, const Ap01BusinessPort &port, uint64_t bootId);
-    bool begin(uint64_t now);
+    // Trial/rollback entry passes readOnly=true. After durable approval, the
+    // serialized executor calls begin(now,false) to establish a fresh context.
+    bool begin(uint64_t now, bool readOnly = false);
+    bool writesAllowed() const {return writesEnabled.load(std::memory_order_acquire);}
     void clock(const char *hhmm);
     bool redraw() { return configured && render(); }
     void displayed(uint32_t value) { displayedGeneration.store(value, std::memory_order_release); }

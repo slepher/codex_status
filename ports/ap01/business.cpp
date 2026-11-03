@@ -40,9 +40,11 @@ bool Ap01Business::loadActive(uint64_t now) {
     sequence.beginContext(now, 1); usage = "";
     return true;
 }
-bool Ap01Business::begin(uint64_t now) {
-    if (!store.bsBegin()) return !strcmp(store.bsLastError(), "unconfigured");
+bool Ap01Business::begin(uint64_t now, bool readOnly) {
+    writesEnabled.store(!readOnly,std::memory_order_release);
+    if (!store.bsBegin(readOnly)) return !strcmp(store.bsLastError(), "unconfigured");
     if (!store.bsProfile(profile)) return false;
+    if (readOnly) return loadActive(now) && render();
     char next[BS_CTX_LEN]; newContext(next); String error;
     // Retain uniqueness even when a synthetic entropy fixture repeats after
     // reboot. The durable context already carries this boot's counter.
@@ -84,7 +86,7 @@ void Ap01Business::clock(const char *hhmm) {
     }
 }
 bool Ap01Business::localActivate(uint8_t index, uint64_t now) {
-    if (storageUnknown || !configured || index >= profile.count) return false;
+    if (!writesAllowed() || storageUnknown || !configured || index >= profile.count) return false;
     char next[BS_CTX_LEN]; newContext(next); String error;
     return store.bsSetActive(index, next, error) && loadActive(now) && render();
 }
@@ -132,6 +134,11 @@ void Ap01Business::status(JsonDocument &out) {
 int Ap01Business::command(uint16_t op, JsonDocument &request, const char *nonce, uint64_t now,
                            const uint8_t *body, size_t bytes, const char *requestId,
                            const char *offset, String &reply) {
+    if (!writesAllowed()) {
+        reply = v2BuildAck("storage", "rejected", "unchanged", "lifecycle", "app_trial_readonly",
+                          -1, 0, nullptr, UINT32_MAX, FW_TARGET_ID);
+        return 503;
+    }
     const char *error = nullptr, *display = "unchanged", *result = "applied";
     int status = 200;
     const char *operation = op == 2 ? "data" : op == 13 ? "activate" : "bundle";

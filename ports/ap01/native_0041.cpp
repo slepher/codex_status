@@ -1,14 +1,26 @@
 #include "application.h"
+#ifndef AP01_FILE_APP_V3
 #include "native_services_0041.h"
+#include "app_tasks_0041.h"
+#include "app_services_0041.h"
+#include "app_vfs_client_v2.h"
+#include "app_network_client_v2.h"
+#else
+#include "app_runtime_v3.h"
+#include "app_network_client_v3.h"
+#endif
 #include "http.h"
 #include "screen_port_0041.h"
+#ifndef AP01_FILE_APP_V3
 #include "native_io_0041.h"
+#endif
 #include "vfs_0041.h"
 #include "ap01_template_display.h"
 #include "local_json_allocator.h"
 #include <atomic>
 #include <new>
 #include <stddef.h>
+#include <time.h>
 #ifdef AP01_SCREEN_HOST_PROBE
 #include "test_screen_peer_0041.h"
 #endif
@@ -16,17 +28,50 @@
 bool ap01Calendar(time_t epoch, struct tm &result);
 extern "C" const uint8_t ap01_native_manifest[256];
 
+#ifdef AP01_FILE_APP_V3
+#include "app_ui_client_v3.h"
+#endif
 namespace {
+#ifdef AP01_FILE_APP_V3
+using NetworkClient=Ap01AppNetworkClientV3;
+using NetworkPeer=Ap01PeerV3;
+uint64_t nowMs(){return ap01RuntimeApiV3()->now_ms(ap01RuntimeContextV3());}
+void pause(unsigned ms){ap01RuntimeApiV3()->pause_ms(ap01RuntimeContextV3(),ms);}
+#else
 using namespace ap01_native0041;
+using NetworkClient=Ap01AppNetworkClientV2;
+using NetworkPeer=ap01_app_peer_v2;
+#endif
 struct Frame {uint8_t *pixels;uint32_t generation,transition,epoch;uint8_t count,index,tries=0;char ids[8][BS_ID_LEN]={};};
 
 struct Activation {unsigned index;uint32_t transition;};
 
 struct Runtime {
+    #ifndef AP01_FILE_APP_V3
+    Ap01AppGeneration0041 callbackGate;
+    Ap01AppTasks0041 callbackTasks;
+    uint32_t callbackGeneration;
+    Ap01AppCore0041 core;
+    Ap01AppFiles0041 files;
+    Ap01AppNetwork0041 networkService;
+    Ap01AppServices0041 serviceRouter;
+    ap01_app_services_v2 appServices;
+    #endif
+    NetworkClient networkClient;
+    struct Connection {
+        NetworkClient *network;int handle;
+        static int read(void *p,uint8_t *out,size_t n,uint64_t deadline){auto &c=*(Connection *)p;return c.network->receive(c.handle,out,n,deadline);}
+        static int write(void *p,const uint8_t *in,size_t n,uint64_t deadline){auto &c=*(Connection *)p;return c.network->send(c.handle,in,n,deadline);}
+    };
+    #ifndef AP01_FILE_APP_V3
+    Ap01AppVfsClientV2 vfsClient;
+    #endif
     LittleFSClass fs;
     Ap01Business business;
     std::unique_ptr<Ap01Application> app;
+    #ifndef AP01_FILE_APP_V3
     Ap01NativeServices0041 services;
+    #endif
     std::atomic<bool> initialized{false};
     std::atomic<uint32_t> uiEpoch{1};
     uint32_t renderingEpoch=1; // Captured by the business executor before each operation.
@@ -57,6 +102,16 @@ struct Runtime {
     ap01_screen_slot *prepareSlot=nullptr;
     std::unique_ptr<ap01_screen_slot[]> slots;
     std::unique_ptr<ap01_page_0041[]> pages;
+    #ifdef AP01_FILE_APP_V3
+    ap01_screen_host &host;
+    ap01_screen_app *apps;
+    ap01_window_0041 &window;
+    explicit Runtime(const Ap01PlatformApiV3 &api)
+        :networkClient(api.network),fs(api.files,api.private_root),
+         business(fs,{this,present,retire,displayReason},api.boot_id),bootId(api.boot_id),
+         root(api.ui.window->win),original(api.ui.window->stock),
+         host(*api.ui.host),apps(api.ui.app),window(*api.ui.window) {}
+    #else
     ap01_screen_host host{};
     #ifdef AP01_SCREEN_HOST_PROBE
     ap01_screen_app apps[2]{};
@@ -72,7 +127,17 @@ struct Runtime {
 #endif
     ap01_window_0041 window{};
     explicit Runtime(void *window,void (*callback)(void *),uint64_t boot)
-        :fs(ap01RomVfs(),"/resource/codex-status"),business(fs,{this,present,retire,displayReason},boot),bootId(boot),root(window),original(callback) {}
+        :callbackTasks(callbackGate),callbackGeneration(callbackGate.begin()),core(callbackGate,ap01NativeAppCorePort0041()),files(callbackGate,ap01RomVfs(),"/resource/codex-status"),networkService(callbackGate,ap01NativeAppNetworkPort0041()),serviceRouter(core,files,&networkService),appServices(serviceRouter.table(callbackGeneration)),networkClient(appServices),vfsClient(appServices,"/resource/codex-status"),fs(vfsClient.ops(),"/resource/codex-status"),business(fs,{this,present,retire,displayReason},boot),bootId(boot),root(window),original(callback) {}
+    #endif
+    static bool appRandom(void *p,uint8_t *out,size_t length) {
+        if(!out||!length||length>256)return false;
+#ifdef AP01_FILE_APP_V3
+        (void)p;return ap01RuntimeApiV3()->random(ap01RuntimeContextV3(),out,uint32_t(length))==0;
+#else
+        auto &r=*(Runtime *)p;
+        return ap01_app_core_call(&r.appServices,AP01_CORE_RANDOM,out,uint32_t(length))==AP01_SERVICE_OK;
+#endif
+    }
     static const char *displayReason(void *p) {
         switch(((Runtime *)p)->displayWait.load(std::memory_order_acquire)) {
             case 1:return "waiting_for_draw";
@@ -103,7 +168,13 @@ struct Runtime {
     }
     static bool lockBindings(void *p) {return !((Runtime *)p)->bindingsLock.test_and_set(std::memory_order_acquire);}
     static void unlockBindings(void *p) {((Runtime *)p)->bindingsLock.clear(std::memory_order_release);}
-    static bool systemBusy(void *p) {return ((Runtime *)p)->services.busy();}
+    static bool systemBusy(void *p) {
+#ifdef AP01_FILE_APP_V3
+        (void)p;return ap01RuntimeApiV3()->busy(ap01RuntimeContextV3())!=0;
+#else
+        return ((Runtime *)p)->services.busy();
+#endif
+    }
     static bool healthy(void *p) {
         auto &r=*(Runtime *)p;uint32_t beat=r.uiHeartbeat.load(std::memory_order_acquire);
         return r.ready.load(std::memory_order_acquire)==1&&beat&&uint32_t(nowMs())-beat<=1000;
@@ -176,6 +247,16 @@ struct Runtime {
     }
     bool initUi() {
         ready.store(0,std::memory_order_release);
+#ifdef AP01_FILE_APP_V3
+        slots.reset(new(std::nothrow) ap01_screen_slot[8]{});
+        pages.reset(new(std::nothrow) ap01_page_0041[8]{});
+        uiMounted=slots&&pages&&ap01RuntimeApiV3()->ui.attach(ap01RuntimeContextV3(),this,
+            slots.get(),pages.get(),8,pollApp,timer,eventCallback)==0;
+        if(uiMounted&&initialized.load(std::memory_order_acquire)) {
+            ready.store(1,std::memory_order_release);app->businessOnline(true);requestActivation(~0u,0);
+        }
+        return uiMounted;
+#else
         window.win=root;window.stock=original;window.context=this;window.event=eventCallback;window.poll=timer;window.services=&services;
         uint32_t token=host.transition;
         uint32_t revisions[sizeof(apps)/sizeof(apps[0])];
@@ -204,6 +285,7 @@ struct Runtime {
         }
         if(uiMounted)ap01_window_unmount(slots.get(),pages.get(),8);
         return false;
+#endif
     }
     static void timer(void *p) {auto &r=*(Runtime *)p;r.tick();r.uiHeartbeat.store(uint32_t(nowMs()),std::memory_order_release);}
     static void eventCallback(void *p,void *e) {
@@ -214,14 +296,22 @@ struct Runtime {
 #endif
             r.ready.store(2,std::memory_order_release);r.uiEpoch.fetch_add(1,std::memory_order_acq_rel);
             if(r.app)r.app->businessOnline(false);
-            ap01_host_destroy(&r.host);r.retired.store(true,std::memory_order_release);
+#ifdef AP01_FILE_APP_V3
+            ap01_host_retire(&r.apps[0]);
+#else
+            ap01_host_destroy(&r.host);
+#endif
+            r.retired.store(true,std::memory_order_release);
             r.uiToken.store(0,std::memory_order_release);r.failedToken.store(0,std::memory_order_release);
             delete r.activation.exchange(nullptr,std::memory_order_acq_rel);
             Frame *pending=r.pending.exchange(nullptr,std::memory_order_acq_rel);
             if(pending){delete[] pending->pixels;delete pending;}
             r.prepareSlot=nullptr;r.rollbackIndex=-1;r.uiMounted=false;r.resumeContent=false;r.replacing=false;
             r.content=r.image=r.dialog=nullptr;r.dialogPage=255;r.pairRevision=0;r.pairRequest[0]=0;r.focused=false;
-            ap01_window_detach(&r.window);r.root=nullptr;return;
+#ifndef AP01_FILE_APP_V3
+            ap01_window_detach(&r.window);
+#endif
+            r.root=nullptr;return;
         }
         r.key(e);
     }
@@ -233,6 +323,7 @@ struct Runtime {
     static void *udp(void *);
     void serve();
 };
+#ifndef AP01_FILE_APP_V3
 extern "C" {
 __attribute__((section(".ap01_abi"),used))
 extern const uint32_t ap01_runtime_abi[] = {
@@ -243,6 +334,7 @@ extern const uint32_t ap01_runtime_abi[] = {
     offsetof(Runtime,host),offsetof(ap01_screen_host,phase),sizeof(ap01_screen_slot),offsetof(ap01_screen_slot,root),offsetof(ap01_screen_slot,child),offsetof(Runtime,slots),
 };
 }
+#endif
 void Runtime::processFrames() {
     if(ready.load(std::memory_order_acquire)!=1)return;
     Frame *frame=pending.exchange(nullptr,std::memory_order_acq_rel);if(!frame)return;
@@ -371,7 +463,10 @@ void Runtime::key(void *e) {
 }
 
 void Runtime::serve() {
-    int fd=listener(18081);if(fd<0)return;
+    int fd=networkClient.listen(18081);if(fd<0){ready.store(3,std::memory_order_release);return;}
+#ifdef AP01_FILE_APP_V3
+    uint32_t starting=0;ready.compare_exchange_strong(starting,1,std::memory_order_acq_rel);
+#endif
     app->businessOnline(true);
     while(!stop.load(std::memory_order_acquire)) {
         processActivation();
@@ -382,9 +477,9 @@ void Runtime::serve() {
                 snprintf(hhmm,sizeof(hhmm),"%02u:%02u",unsigned(local.tm_hour),unsigned(local.tm_min));
             business.clock(hhmm);businessLock.clear(std::memory_order_release);
         }
-        if(!waitFd(fd,1,nowMs()+1000))continue;
-        int client=ap01_native0041::accept(fd);if(client<0)continue;
-        Ap01Stream io{&client,receive,send};uint64_t now=nowMs();
+        if(!networkClient.wait(fd,1,nowMs()+1000))continue;
+        int client=networkClient.accept(fd);if(client<0)continue;
+        Connection connection{&networkClient,client};Ap01Stream io{&connection,Connection::read,Connection::write};uint64_t now=nowMs();
         if(!businessLock.test_and_set(std::memory_order_acquire)) {
             renderingEpoch=uiEpoch.load(std::memory_order_acquire);
             ap01ServeHttp(*app,io,now,now+5000);businessLock.clear(std::memory_order_release);
@@ -392,51 +487,132 @@ void Runtime::serve() {
             const char body[]="{\"result\":\"rejected\",\"error\":\"busy\",\"stage\":\"admission\",\"action\":\"read_status\"}";
             char headers[192];int length=snprintf(headers,sizeof(headers),"HTTP/1.1 503 Busy\r\nContent-Length: %u\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n",unsigned(sizeof(body)-1));
             for(auto part:{String(headers,length),String(body)}) {
-                size_t at=0;while(at<part.length()){int n=send(&client,(const uint8_t *)part.c_str()+at,part.length()-at,now+5000);if(n<=0)break;at+=n;}
+                size_t at=0;while(at<part.length()){int n=networkClient.send(client,(const uint8_t *)part.c_str()+at,part.length()-at,now+5000);if(n<=0)break;at+=n;}
             }
         }
-        closeFd(client);
+        networkClient.close(client);
     }
-    app->businessOnline(false);closeFd(fd);
+    app->businessOnline(false);networkClient.close(fd);
 }
 void *Runtime::udp(void *p) {
-    Runtime &r=*(Runtime *)p;int fd=listener(8767,true);if(fd<0)return nullptr;
+    Runtime &r=*(Runtime *)p;int fd=r.networkClient.listen(8767,true);if(fd<0){r.ready.store(3,std::memory_order_release);return nullptr;}
     uint64_t nextReply=0;
     while(!r.stop.load(std::memory_order_acquire)) {
-        if(!waitFd(fd,1,nowMs()+1000))continue;
-        uint8_t bytes[257];Address source{};unsigned length=sizeof(source);
-        int n=receiveFrom(fd,bytes,sizeof(bytes),&source,&length);
-        uint64_t now=nowMs();if(n<=0||n>256||length!=sizeof(source)||now<nextReply)continue;
+        if(!r.networkClient.wait(fd,1,nowMs()+1000))continue;
+        uint8_t bytes[257];NetworkPeer source{};
+        int n=r.networkClient.receiveFrom(fd,bytes,sizeof(bytes),source);
+        uint64_t now=nowMs();if(n<=0||n>256||now<nextReply)continue;
         String reply;if(!r.app->discovery(bytes,n,reply))continue;
-        sendTo(fd,reply.c_str(),reply.length(),&source,sizeof(source));
+        r.networkClient.sendTo(fd,reply.c_str(),reply.length(),source);
         nextReply=now+200;
-    }closeFd(fd);return nullptr;
+    }r.networkClient.close(fd);return nullptr;
 }
 void *Runtime::bootstrap(void *p) {
     Runtime &r=*(Runtime *)p;char mac[13];
-    if(!wifiMac(mac)||!r.fs.begin(false,"/resource",10,"resource"))return nullptr;
-    Ap01ApplicationPort callbacks{&r,randomBytes,lockBindings,unlockBindings,systemBusy};
+#ifdef AP01_FILE_APP_V3
+    struct WorkerExit {Runtime &r;~WorkerExit(){r.ready.store(3,std::memory_order_release);}} exit{r};
+#endif
+    // Resident XIP startup prepares the private root. File-App startup will
+    // receive a prepared root and permission from the permanent installer.
+#ifdef AP01_FILE_APP_V3
+    const auto *api=ap01RuntimeApiV3();void *context=ap01RuntimeContextV3();
+    if(api->mac(context,mac)||!r.fs.begin(false,"/resource",10,"resource"))return nullptr;
+#else
+    auto nativeVfs=ap01RomVfs();
+    if(nativeVfs.prepare(nativeVfs.context,"/resource/codex-status")||
+       !r.files.writes(r.callbackGeneration,true))return nullptr;
+    if(ap01_app_core_call(&r.appServices,AP01_CORE_MAC,mac,sizeof(mac))!=AP01_SERVICE_OK||!r.fs.begin(false,"/resource",10,"resource"))return nullptr;
+    #endif
+    Ap01ApplicationPort callbacks{&r,appRandom,lockBindings,unlockBindings,systemBusy};
     r.app.reset(new(std::nothrow) Ap01Application(r.fs,r.business,callbacks,mac,r.bootId));
     if(!r.app)return nullptr;
     bool appReady=r.app->begin(nowMs());
+#ifdef AP01_FILE_APP_V3
+    // Set readonly policy before exposing pairing callbacks to maintenance.
+    r.business.begin(nowMs(),api->writes_allowed(context)!=1);
+    Ap01AppBindingV3 binding{r.app.get(),
+        [](void *p,const char *token,char out[65])->int32_t{return ((Ap01Application *)p)->bindingPrincipal(token,out);},
+        [](void *p,const Ap01HttpRequestV3 *q,uint64_t now,Ap01ReplyV3 emit,void *out)->int32_t {
+            if(!q||!emit)return -1;
+            Ap01HttpRequest request{};
+            request.method=q->method;request.path=q->path;request.token=q->token;
+            request.deviceToken=q->device_token;request.contentType=q->content_type;
+            request.requestId=q->request_id;request.offset=q->offset;request.nonce=q->nonce;
+            request.body=q->body;request.length=q->length;request.chunkSha256=q->chunk_sha256;request.deviceMac=q->device_mac;
+            auto reply=((Ap01Application *)p)->pairingHttp(request,now);
+            return emit(out,uint32_t(reply.status),(const uint8_t *)reply.bytes.c_str(),uint32_t(reply.bytes.length()));
+        },[](void *p)->int32_t{return ((Ap01Application *)p)->businessAvailable();}};
+    if(api->bind(context,&binding))return nullptr;
+#else
     Ap01MaintenanceBridge0041 bridge{r.app.get(),
         [](void *p,const char *token,char out[65]){return ((Ap01Application *)p)->bindingPrincipal(token,out);},
         [](void *p,const Ap01HttpRequest &q,uint64_t now){return ((Ap01Application *)p)->pairingHttp(q,now);},
-        [](void *p){return ((Ap01Application *)p)->businessAvailable();}};
+        [](void *p){return ((Ap01Application *)p)->businessAvailable();},&r.callbackGate,r.callbackGeneration};
     if(!r.services.start(bridge,r.bootId,&r,healthy))return nullptr;
+#endif
     if(!appReady)return nullptr; // System maintenance already has an independent executor.
     r.initialized.store(true,std::memory_order_release);
+#ifndef AP01_FILE_APP_V3
     uint32_t initializing=0;
     r.ready.compare_exchange_strong(initializing,1,std::memory_order_acq_rel);
+#endif
+#ifdef AP01_FILE_APP_V3
+    if(api->task_start(context,"ap01-discover",udp,8192,&r))return nullptr;
+#else
     uint32_t thread=0;
-    ap01_native0041::thread(&thread,"ap01-discover",udp,8192,&r);
+    r.callbackTasks.start(ap01_native0041::thread,&thread,"ap01-discover",udp,8192,&r,r.callbackGeneration);
+#endif
     // Maintenance/discovery are already running; a failed business restore
     // must not take their listeners or pairing lifecycle down with it.
     // A damaged Bundle must remain repairable through an authenticated full
     // publish. The service exposes recovery state and the native UI remains.
-    r.renderingEpoch=r.uiEpoch.load(std::memory_order_acquire);r.business.begin(nowMs());r.serve();
+    r.renderingEpoch=r.uiEpoch.load(std::memory_order_acquire);
+#ifndef AP01_FILE_APP_V3
+    r.business.begin(nowMs());
+#endif
+    r.serve();
     return nullptr;
 }
+}
+
+#ifdef AP01_FILE_APP_V3
+extern "C" __attribute__((used)) int32_t ap01_app_start_v3(const Ap01PlatformApiV3 *api,void *context,void **out) {
+    if(!out)return AP01_APP_V3_INVALID;
+    *out=nullptr;
+    if(ap01BindRuntimeV3(api,context))return AP01_APP_V3_UNSUPPORTED;
+    auto *r=new(std::nothrow) Runtime(*api);if(!r)return AP01_APP_V3_RESOURCE;
+    *out=r; // Even a failed start can publish UI callbacks; retained until reboot.
+    if(!r->initUi())return AP01_APP_V3_FAILED;
+    return api->task_start(context,"ap01-business",Runtime::bootstrap,32768,r)?AP01_APP_V3_FAILED:AP01_APP_V3_OK;
+}
+extern "C" __attribute__((used)) int32_t ap01_app_event_v3(void *instance,uint32_t event,const void *payload,uint32_t bytes) {
+    if(!instance)return AP01_APP_V3_INVALID;
+    if(event==1&&!payload&&!bytes){Runtime::timer(instance);return AP01_APP_V3_OK;}
+    if(event==2&&payload&&!bytes){Runtime::eventCallback(instance,const_cast<void *>(payload));return AP01_APP_V3_OK;}
+    if(event==3&&!payload&&!bytes){
+        auto &r=*(Runtime *)instance;if(r.root)return AP01_APP_V3_INVALID;
+        r.root=r.window.win;r.original=r.window.stock;
+        if(r.initUi())return AP01_APP_V3_OK;
+        r.root=nullptr;r.ready.store(2,std::memory_order_release);return AP01_APP_V3_FAILED;
+    }
+    return AP01_APP_V3_UNSUPPORTED;
+}
+extern "C" __attribute__((used)) int32_t ap01_app_health_v3(void *instance) {
+    if(!instance)return AP01_APP_V3_INVALID;
+    if(((Runtime *)instance)->ready.load(std::memory_order_acquire)==3)return AP01_APP_V3_FAILED;
+    return Runtime::healthy(instance)?AP01_APP_V3_OK:AP01_APP_V3_PENDING;
+}
+#else
+// Internal lifecycle hooks. Task drain alone does not permit unloading: the
+// UI bindings and resident maintenance ownership must also be separated first.
+extern "C" void ap01RequestAppTasksStop0041(void *context) {
+    auto &r=*(Runtime *)context;
+    r.stop.store(true,std::memory_order_release);
+    r.callbackGate.close();
+}
+extern "C" int ap01AppTasksDrained0041(void *context) {
+    auto &r=*(Runtime *)context;
+    return r.callbackTasks.drained()&&r.callbackGate.drained()&&r.networkService.drain()&&r.files.drain();
 }
 
 extern "C" __attribute__((used))
@@ -466,9 +642,11 @@ void ap01Register0041(void *root,void (*callback)(void *),unsigned filter,void *
         ap01_native0041::registerStock(root,callback,filter,user);return;
     }
     uint32_t thread=0;
-    ap01_native0041::thread
-        (&thread,"ap01-business",Runtime::bootstrap,32768,runtime);
+    runtime->callbackTasks.start(ap01_native0041::thread,
+        &thread,"ap01-business",Runtime::bootstrap,32768,runtime,runtime->callbackGeneration);
 }
+
+#endif // AP01_FILE_APP_V3
 
 #ifdef AP01_SCREEN_HOST_PROBE
 // Invoked only by the offline runner, on the original UI executor.
