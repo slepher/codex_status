@@ -26,6 +26,53 @@ fn packages(args:&Value,m:&Manifest)->Result<Vec<Vec<u8>>> {
 }
 fn receipt_path(root:&Path,mac:&str)->PathBuf {root.join(format!("ap01-app-set-{mac}.json"))}
 
+// Called under the shared AP01 operation lock. Only our exact cache namespace
+// is eligible; original selected paths never enter cleanup.
+fn cache_name(name:&str)->bool {
+    let name=name.strip_suffix(".tmp").unwrap_or(name);
+    name.strip_prefix("ap01-artifact-").is_some_and(|hash|hash.len()==64 && hash.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+}
+fn stage_artifact(root:&Path,bytes:&[u8],limit:u64)->Result<(PathBuf,String)> {
+    use sha2::Digest;
+    let digest=format!("{:x}",sha2::Sha256::digest(bytes));
+    let path=root.join(format!("ap01-artifact-{digest}"));
+    let tmp=path.with_file_name(format!("ap01-artifact-{digest}.tmp"));
+    // Do not follow links (including broken ones), directories or special files.
+    for candidate in [&path,&tmp] {
+        match std::fs::symlink_metadata(candidate) {
+            Ok(meta)=>ensure!(meta.is_file(),"app_set_cache_regular_file_required"),
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},
+            Err(e)=>return Err(e.into()),
+        }
+    }
+    let exists=path.exists();
+    if exists {ensure!(read(path.to_str().context("app_set_artifact_path")?,bytes.len())?==bytes,"app_set_artifact_conflict");}
+    // ponytail: any active receipt pins the whole cache; per-package references
+    // are only needed if concurrent device updates routinely exhaust this cap.
+    let mut pinned=false;
+    for entry in std::fs::read_dir(root)? {
+        let entry=entry?;let name=entry.file_name();let name=name.to_string_lossy();
+        if name.strip_prefix("ap01-app-set-").and_then(|s|s.strip_suffix(".json"))
+            .is_some_and(|mac|mac.len()==12 && mac.bytes().all(|b|b.is_ascii_hexdigit())) {pinned=true;break;}
+    }
+    let now=std::time::SystemTime::now();let mut used=0u64;
+    for entry in std::fs::read_dir(root)? {
+        let entry=entry?;
+        if !cache_name(&entry.file_name().to_string_lossy()){continue;}
+        let meta=std::fs::symlink_metadata(entry.path())?;
+        ensure!(meta.is_file(),"app_set_cache_regular_file_required");
+        if !pinned && entry.path()!=path && now.duration_since(meta.modified()?).is_ok_and(|age|age>=Duration::from_secs(24*3600)) {
+            std::fs::remove_file(entry.path())?;
+        }else{used=used.checked_add(meta.len()).context("app_set_cache_full")?;}
+    }
+    ensure!(used.checked_add(if exists{0}else{bytes.len() as u64}).is_some_and(|n|n<=limit),"app_set_cache_full");
+    if exists {
+        // A user selecting an old cached package starts a new retention window.
+        std::fs::File::open(&path)?.set_modified(now)?;
+    }else{bridge_core::platform::store::atomic_write(&path,bytes)?;}
+    Ok((path,digest))
+}
+
 pub async fn action(root:&Path,mac:&str,endpoint:&str,args:&Value)->Value {
     match execute(root,mac,endpoint,args).await {
         Ok(value)=>value,
@@ -43,16 +90,14 @@ async fn execute(root:&Path,mac:&str,endpoint:&str,args:&Value)->Result<Value> {
     let op=args["op"].as_str().context("app_set_operation")?;
     ensure!(matches!(op,"prepare"|"inspect"|"query"|"advance"|"cancel"|"archive"|"reconnect"|"stage"),"app_set_operation");
     if op=="stage" {
-        use base64::Engine;use sha2::Digest;
+        use base64::Engine;
         let kind=args["kind"].as_str().context("app_set_artifact_kind")?;
         let limit=match kind {"manifest"=>3584,"package"=>16*1024*1024,_=>anyhow::bail!("app_set_artifact_kind")};
         let text=args["data_base64"].as_str().context("app_set_artifact_bytes")?;
         ensure!(text.len()<=((limit+2)/3)*4,"app_set_artifact_too_large");
         let bytes=base64::engine::general_purpose::STANDARD.decode(text)?;ensure!(bytes.len()<=limit,"app_set_artifact_too_large");
         if kind=="manifest" {Manifest::parse(&bytes)?;}else{ensure!(bytes.len()>=256 && bytes.starts_with(b"APX2"),"app_set_package_header");}
-        let digest=format!("{:x}",sha2::Sha256::digest(&bytes));let path=root.join(format!("ap01-artifact-{digest}"));
-        if path.exists(){ensure!(read(path.to_str().context("app_set_artifact_path")?,limit)?==bytes,"app_set_artifact_conflict");}
-        else {bridge_core::platform::store::atomic_write(&path,&bytes)?;}
+        let (path,digest)=stage_artifact(root,&bytes,128*1024*1024)?;
         return Ok(json!({"result":"staged","path":path,"bytes":bytes.len(),"sha256":digest}));
     }
     let path=receipt_path(root,mac);
@@ -211,6 +256,39 @@ async fn run_worker(ctx:&std::sync::Arc<crate::AppCtx>,mut receipt:Receipt,path:
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn staged_cache_bounds_retention_and_protects_recovery() {
+        let dir=tempfile::tempdir().unwrap();let root=dir.path();
+        let (first,_)=stage_artifact(root,b"first",10).unwrap();
+        let old=std::time::SystemTime::now()-Duration::from_secs(25*3600);
+        std::fs::File::open(&first).unwrap().set_modified(old).unwrap();
+        let receipt=receipt_path(root,"AABBCCDDEEFF");std::fs::write(&receipt,b"corrupt receipt still pins cache").unwrap();
+        assert!(stage_artifact(root,b"second",10).unwrap_err().to_string().contains("cache_full"));assert!(first.exists());
+        std::fs::rename(&receipt,root.join("archived.completed")).unwrap();
+        let original=root.join("selected.apx2");std::fs::write(&original,b"original").unwrap();
+        std::fs::File::open(&original).unwrap().set_modified(old).unwrap();
+        let temp=root.join(format!("ap01-artifact-{}.tmp","a".repeat(64)));std::fs::write(&temp,b"partial").unwrap();
+        std::fs::File::open(&temp).unwrap().set_modified(old).unwrap();
+        let (second,_)=stage_artifact(root,b"second",10).unwrap();
+        assert!(!first.exists());assert!(!temp.exists());assert_eq!(std::fs::read(&original).unwrap(),b"original");
+        std::fs::File::open(&second).unwrap().set_modified(old).unwrap();
+        assert_eq!(stage_artifact(root,b"second",10).unwrap().0,second);
+        assert!(second.metadata().unwrap().modified().unwrap()>old);
+        assert!(stage_artifact(root,b"12345",10).is_err());assert!(second.exists());
+        std::fs::File::open(&second).unwrap().set_modified(std::time::SystemTime::now()+Duration::from_secs(3600)).unwrap();
+        assert!(stage_artifact(root,b"12345",10).is_err());assert!(second.exists());
+        std::fs::write(&second,b"broken").unwrap();assert!(stage_artifact(root,b"second",10).unwrap_err().to_string().contains("conflict"));
+        #[cfg(unix)] {
+            std::fs::remove_file(&second).unwrap();std::os::unix::fs::symlink(&original,&second).unwrap();
+            assert!(stage_artifact(root,b"second",100).is_err());assert_eq!(std::fs::read(&original).unwrap(),b"original");
+            std::fs::remove_file(&second).unwrap();
+            let temp=second.with_file_name(format!("{}.tmp",second.file_name().unwrap().to_str().unwrap()));
+            std::os::unix::fs::symlink(root.join("missing"),&temp).unwrap();
+            assert!(stage_artifact(root,b"second",100).is_err());assert!(!root.join("missing").exists());
+            std::fs::remove_file(temp).unwrap();
+        }
+    }
+
     use super::*;
     #[tokio::test]
     async fn rejects_unregistered_input_and_preserves_existing_receipt_without_network() {
