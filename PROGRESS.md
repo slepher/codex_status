@@ -13,7 +13,7 @@
 
 ## 活跃事项与下一步
 
-- C9 独立 App：D1 已验收，D2 已接真实双包、Manifest 文件启动、集合监督；本仓 ABI 3 增加业务/发现心跳与 worker 写许可恢复，分别停滞或恢复失败时报告失败；恢复失败保持只读且不重试。james.local Docker 两基址真实三线程逐个冻结/恢复通过，平台故障仍锁存。当前 App `../cuktech-ap01-firmware/build/app-install/d2-business-resume-01/app.apx2`，204080 B，SHA256 `c3bf0c7d4a01d6788532cf178c7f8e969862af5088c42062b522df5eec5e9913`；零导入、双链接归一化及重复构建一致。平台候选 `d2-platform-11.bin`，6907160 B，SHA256 `a042af91eec958a601c0f9986270530d25fcc5bbd8f1b7c445a3988c0667b2cf`，未部署且硬件 backend 不可用。ROM I/O/LVGL/调度仍为模型，线程观察阈值不是硬件耗时上界；D2 写集/许可、D3/D4 仍待推进。现场部署未变。[状态与证据](../cuktech-ap01-firmware/project-workflow/ap01-app-update/status.md)
+- C9 独立 App：固件 D3/D4 已有集合日志、重启选择/清理、HTTP 与 Python CLI；首装/单更/批更/整集回退通过 C++ 服务及回环 TCP 交叉模型。Bridge core 已有 v3 维护传输与 AMF3/APX2 校验，12 项客户端回归、真实双包/能力匹配及回执恢复校验通过；core 单步协调及丢 commit 回复恢复测试通过；application worker/service/UI、Rust/C++ 交叉验收、孤儿回收与 RV32 整链仍待完成。未启停/部署 Bridge，现场不变；模型不替代硬件准入。[Bridge 接入](project-workflow/ap01-app-set-v3/status.md) · [固件证据](../cuktech-ap01-firmware/project-workflow/ap01-app-update/status.md)
 
 - 协议整改 P0 源码/软件验收完成，已提交、未部署：HTTP 会话复用与重放、BLE 错误/四槽队列/Notify 退避/可恢复冷却；workspace522通过/5条件忽略，最终core+ble245通过/2忽略，Note4构建及匹配ELF栈88项通过。**未部署同版本候选** `artifacts/protocol-p0/note4-p0-0.18.106.bin`，1872736 B，SHA256 `1b93bf34f4139c21d322fb0a8a3c93d9333503fb056663c4771f8a07bfaeb864`；现场ROM不变。新工具链、资源预算及实机边界见[状态](project-workflow/bridge-device-protocol-remediation/status.md)。A9/B6/C8实机未结，P1/P2未实施。
 
