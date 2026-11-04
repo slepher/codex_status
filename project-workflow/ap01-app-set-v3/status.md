@@ -1,5 +1,8 @@
 # 状态
 
+2026-11-04 暂存清理：stage 新增 128 MiB 逻辑容量限制；无活动回执时清理超过 24 小时的精确命名缓存/.tmp，复用刷新时间。有活动或损坏回执则保留全部缓存；超限拒绝新增，不触碰原始选择文件。5 项应用测试、职责边界检查及 UI→Rust→C++ 真实双包四链复验通过（首装/单更/批更/整集回退，测试 IPC、模型健康/重启）。原生 IPC、自动网络变化及固件资源/孤儿回收/RV32 全链仍开放，未部署或操作实机。
+
+
 2026-11-04：core 复用 bounded transport 新增 AP01 v3 请求适配，校验菜单码、MAC/事务、块摘要/边界和成功响应身份；未知保留 dispatch 分类，不重发。隔离 target 下 cargo test --offline -p bridge-core device_client:: --lib，12 测试通过（含路由与真实回环 TCP 的身份错误/截断响应）。application service、AMF3/APX2 校验、持久回执协调和 UI 未接。未启停/部署 Bridge，未连接实机。
 
 2026-11-04 产物校验：`core::ap01_app_set` 解析 AMF3 与资源汇总、规范 ABI 3 APX2 和 BASE32，按变更位图选择已校验包；使用真实业务包/peer 执行 2 项测试（含全部 AMF3 截断、缺包/重复、重算摘要后的非法结构）通过。命令：设置 AP01_MANIFEST/AP01_PACKAGE/AP01_PEER 到固件仓库实际产物后，cargo test --offline -p bridge-core ap01_app_set:: --lib -- --include-ignored。未接持久协调/application service/UI；总资源能力匹配仍待实现。

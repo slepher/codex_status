@@ -17,4 +17,4 @@
 - [ ] Native Tauri IPC validation
 - [ ] Automatic network-change discovery validation
 
-- [ ] Desktop staged artifact retention/cleanup policy
+- [x] Desktop staged artifact retention/cleanup policy (128 MiB, 24-hour retention, active receipts pin cache)
