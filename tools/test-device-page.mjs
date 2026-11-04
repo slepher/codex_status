@@ -40,7 +40,7 @@ const context = vm.createContext({
   document: { getElementById: element, querySelectorAll: () => [],
     querySelector: () => ({ classList: { contains: () => deviceTabOn } }), addEventListener() {} },
   localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
-  setInterval() {}, clearInterval() {}, setTimeout(callback) {callback();}, structuredClone,
+  setInterval() {}, clearInterval() {}, setTimeout(callback) {callback();}, structuredClone, btoa,
 });
 vm.runInContext(source, context);
 const run = code => vm.runInContext(code, context);
@@ -521,3 +521,34 @@ run("wifiSelections.clear();wifiSelections.set('unknown',true);wifiScheme={compl
 await run('wifiFamilyImport()');assert.equal(calls.length,noDestinationCalls);assert.match(element('wifi-result').textContent,/明确选择/);
 run("wifiDifferences=[{network_id:'unknown',device:[{writable:true,network:{}}]}]");
 element('wifi-direction').value='import';run('wifiPreviewSync()');assert.equal(element('wifi-sync-submit').disabled,true);assert.match(element('wifi-preview').textContent,/选择目标族/);
+
+// App updates use the same application service; passive polling never starts a job.
+select(macA);element('app-update-card').hidden=false;
+const appManifest={apps:[{id:'business',version:'v2',package_bytes:1024},{id:'peer',version:'v1',package_bytes:256}]};
+let appWorker={result:'absent',active:false};
+handlers.platform_ap01_app_update=({body})=>{
+  if(body.op==='stage')return {result:'staged',path:'/fixture/'+body.kind};
+  if(body.op==='prepare')return {result:'prepared',operation_id:'original-op',manifest:appManifest};
+  if(body.op==='run'){appWorker={operation_id:'original-op',active:true,manifest:appManifest,status:{result:'pending',progress:{phase:'receiving',changed_mask:1,ready_mask:0,received:[512,0]}}};return {result:'running',operation_id:'original-op',active:true};}
+  if(body.op==='worker_status')return appWorker;
+  if(body.op==='cancel')return {result:'cancelling',operation_id:'original-op'};
+  if(body.op==='archive')return {result:'archived',operation_id:'original-op'};
+  return {result:'absent'};
+};
+const file={size:4,arrayBuffer:async()=>new Uint8Array([1,2,3,4]).buffer};
+element('app-update-manifest').files=[file];element('app-update-packages').files=[file,file];element('app-update-code').value='01234567';
+const appStart=calls.length;await run('appUpdatePrepare()');
+assert.equal(run('appUpdate.operation'),'original-op');assert.equal(element('app-update-run').disabled,false);
+assert.deepEqual(calls.slice(appStart).map(c=>c.args.body.op),['stage','stage','stage','prepare']);
+assert(!calls.slice(appStart).some(c=>c.args.body.op==='run'));
+await run("appUpdateAction('run')");assert.equal(element('app-update-code').value,'');assert.equal(run('appUpdate.active'),true);
+await run('appUpdatePoll()');assert.match(element('app-update-progress').innerHTML,/512 \/ 1024/);assert.match(element('app-update-progress').innerHTML,/复用已有包/);
+await run("appUpdateAction('cancel')");assert.match(element('app-update-result').textContent,/取消请求已保存/);
+appWorker={...appWorker,active:false,status:{result:'unknown',error:'budget_exhausted'}};await run('appUpdatePoll()');assert.match(element('app-update-result').textContent,/结果未知/);assert.equal(run('appUpdate.operation'),'original-op');
+appWorker.status={result:'terminal',reply:{phase:'failed_rolled_back'}};await run('appUpdatePoll()');assert.match(element('app-update-result').textContent,/整体回退/);assert(!element('app-update-result').textContent.includes('更新成功'));
+element('app-update-code').value='01234567';await run("appUpdateAction('archive')");assert.equal(run('appUpdate.operation'),null);
+await run('appUpdatePoll()');assert.equal(run('appUpdate.operation'),null,'finished worker must not resurrect archived receipt');
+let deliver;handlers.platform_ap01_app_update=()=>new Promise(resolve=>{deliver=resolve;});
+const late=run('appUpdatePoll()');select(macB);deliver({operation_id:'wrong-device-op',active:true,status:{result:'running'}});await late;
+assert.equal(run('appUpdate.operation'),null);assert.equal(element('app-update-code').value,'');
+console.log('AP01 App UI: multi-file prepare, explicit run, progress/reuse, cancel, unknown/rollback, archive and stale-device isolation OK');
