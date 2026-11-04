@@ -348,6 +348,65 @@ pub async fn ap01_wifi_profiles(endpoint:&str, method:&str, code:&str, body:Opti
     Ok((status,reply))
 }
 
+/// Versioned collection maintenance routes. Caller owns the durable operation
+/// receipt and retries by querying it; this transport never replays a mutation.
+#[derive(Clone, Copy, Debug)]
+pub enum Ap01AppSetAction {
+    Status, Result, Begin, Chunk { index: u8, offset: u32 }, Ready { index: u8 }, Commit, Cancel,
+}
+
+fn app_set_request_parts(action: Ap01AppSetAction, operation: &str, mac: &str, body: &[u8]) -> Result<(&'static str, String)> {
+    use sha2::{Digest, Sha256};
+    anyhow::ensure!(mac.len()==12 && mac.bytes().all(|b|b.is_ascii_hexdigit()),"app_set_mac_required");
+    let (method,path)=match action {
+        Ap01AppSetAction::Status => ("GET","status".to_owned()),
+        Ap01AppSetAction::Result => ("GET","update/result".to_owned()),
+        Ap01AppSetAction::Begin => ("POST","update/begin".to_owned()),
+        Ap01AppSetAction::Chunk{index,..} => {anyhow::ensure!(index<8,"app_set_index");("PUT",format!("package/{index}/chunk"))},
+        Ap01AppSetAction::Ready{index} => {anyhow::ensure!(index<8,"app_set_index");("POST",format!("package/{index}/ready"))},
+        Ap01AppSetAction::Commit => ("POST","update/commit".to_owned()),
+        Ap01AppSetAction::Cancel => ("POST","update/cancel".to_owned()),
+    };
+    match action {
+        Ap01AppSetAction::Begin => anyhow::ensure!((128..=3648).contains(&body.len()) && body.starts_with(b"ASB3\x01\x00\x40\x00"),"app_set_begin_body"),
+        Ap01AppSetAction::Chunk{offset,..} => anyhow::ensure!((1..=1024).contains(&body.len()) && offset.checked_add(body.len() as u32).is_some(),"app_set_chunk_bounds"),
+        _ => anyhow::ensure!(body.is_empty(),"app_set_empty_body_required"),
+    }
+    let mut path=format!("/api/app/v3/{path}");
+    if !matches!(action,Ap01AppSetAction::Status) {
+        anyhow::ensure!(operation.len()==32 && operation.bytes().all(|b|b.is_ascii_hexdigit()) && operation.bytes().any(|b|b!=b'0'),"app_set_operation_required");
+        path.push_str(&format!("?operation_id={}&device_mac={}",operation.to_ascii_lowercase(),mac.to_ascii_uppercase()));
+    }
+    if let Ap01AppSetAction::Chunk{offset,..}=action {path.push_str(&format!("&offset={offset}&sha256={:x}",Sha256::digest(body)));}
+    Ok((method,path))
+}
+
+pub async fn ap01_app_set_request(endpoint:&str, mac:&str, code:&str, operation:&str,
+    action:Ap01AppSetAction, body:&[u8], timeout:Duration) -> Result<(u16,Value)> {
+    anyhow::ensure!(code.len()==8 && code.bytes().all(|b|b.is_ascii_digit()),"ap01_device_code_required");
+    let (method,path)=app_set_request_parts(action,operation,mac,body)?;
+    let mut progress=HttpProgress{outcome:DispatchOutcome::NotSent,stage:"app_set_prepare"};
+    let (status,bytes)=transport_request(endpoint,method,&path,code,Some(body),&[],"application/octet-stream",
+        timeout.min(Duration::from_secs(15)),&mut progress).await.map_err(|error| {
+            let reason=crate::rendezvous::wifi_error(&error).1;
+            error.context(CommandFailure{outcome:progress.outcome,stage:progress.stage,reason})
+        })?;
+    let validate=|| -> Result<Value> {
+        anyhow::ensure!(bytes.len()<=8192,"app_set_response_too_large");
+        let value:Value=serde_json::from_slice(&bytes)?;
+        anyhow::ensure!(value.is_object(),"app_set_response_object");
+        if matches!(status,200|202) {
+            anyhow::ensure!(value["protocol"].as_u64()==Some(3) && value["device_mac"].as_str()==Some(mac.to_ascii_uppercase().as_str()),"app_set_response_identity");
+            if !matches!(action,Ap01AppSetAction::Status) {
+                anyhow::ensure!(value["operation_id"].as_str()==Some(operation.to_ascii_lowercase().as_str()),"app_set_response_operation");
+            }
+        }
+        Ok(value)
+    };
+    let value=validate().map_err(|error|error.context(CommandFailure{outcome:DispatchOutcome::AckUnknown,stage:"app_set_response",reason:"invalid_response"}))?;
+    Ok((status,value))
+}
+
 async fn post_json(ip: &str, path: &str, token: &str, body: &Value, timeout: Duration) -> Result<Value> {
     let started = Instant::now();
     let mut payload=body.clone();
@@ -1175,5 +1234,57 @@ pub async fn wifi_snapshot(ip: &str, token: &str, mac: &str, bridge: &str,
             return Ok(parsed);
         }
         if offset == size { bail!("wifi_snapshot_incomplete"); }
+    }
+}
+
+#[cfg(test)]
+mod app_set_v3_tests {
+    use super::*;
+    const MAC:&str="AABBCCDDEEFF";
+    const OP:&str="01000000000000000000000000000000";
+
+    #[test]
+    fn routes_and_bounds() {
+        let (method,path)=app_set_request_parts(Ap01AppSetAction::Chunk{index:7,offset:9},OP,MAC,b"abc").unwrap();
+        assert_eq!(method,"PUT");
+        assert!(path.starts_with("/api/app/v3/package/7/chunk?operation_id="));
+        assert!(path.ends_with("&offset=9&sha256=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+        for action in [Ap01AppSetAction::Result,Ap01AppSetAction::Ready{index:0},Ap01AppSetAction::Commit,Ap01AppSetAction::Cancel] {
+            assert!(app_set_request_parts(action,OP,MAC,b"").is_ok());
+            assert!(app_set_request_parts(action,"",MAC,b"").is_err());
+            assert!(app_set_request_parts(action,OP,MAC,b"x").is_err());
+        }
+        assert!(app_set_request_parts(Ap01AppSetAction::Chunk{index:8,offset:0},OP,MAC,b"a").is_err());
+        assert!(app_set_request_parts(Ap01AppSetAction::Chunk{index:0,offset:u32::MAX},OP,MAC,b"a").is_err());
+        assert!(app_set_request_parts(Ap01AppSetAction::Commit,OP,"bad\r\n",b"").is_err());
+        let mut body=vec![0;128];body[..8].copy_from_slice(b"ASB3\x01\x00\x40\x00");
+        assert!(app_set_request_parts(Ap01AppSetAction::Begin,OP,MAC,&body).is_ok());
+        body.resize(3649,0);assert!(app_set_request_parts(Ap01AppSetAction::Begin,OP,MAC,&body).is_err());
+    }
+
+    #[tokio::test]
+    async fn real_tcp_identity_rejection_and_unknown() {
+        for fault in 0..4 {
+            let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address=listener.local_addr().unwrap().to_string();
+            let server=tokio::spawn(async move {
+                let (mut stream,_)=listener.accept().await.unwrap();let mut raw=Vec::new();
+                loop {let mut bytes=[0;1024];let n=stream.read(&mut bytes).await.unwrap();assert!(n>0);raw.extend_from_slice(&bytes[..n]);
+                    if let Some(at)=raw.windows(4).position(|w|w==b"\r\n\r\n") {if raw.len()>=at+4+3 {break;}}
+                }
+                let value=if fault==3 {json!({"error":"device_code"})} else {
+                    json!({"protocol":3,"device_mac":if fault==1 {"000000000000"} else {MAC},"operation_id":OP})};
+                let body=serde_json::to_vec(&value).unwrap();
+                let head=format!("HTTP/1.1 {} Reply\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",if fault==3 {401} else {200},body.len());
+                stream.write_all(head.as_bytes()).await.unwrap();
+                stream.write_all(if fault==2 {&body[..body.len()-3]} else {&body}).await.unwrap();
+                String::from_utf8(raw).unwrap()
+            });
+            let result=ap01_app_set_request(&address,MAC,"01234567",OP,Ap01AppSetAction::Chunk{index:0,offset:0},b"abc",Duration::from_secs(2)).await;
+            if fault==0 {assert_eq!(result.unwrap().0,200);}
+            else if fault==3 {assert_eq!(result.unwrap().0,401);}
+            else {let error=result.unwrap_err();assert!(matches!(error.downcast_ref::<CommandFailure>().unwrap().outcome,DispatchOutcome::AckUnknown));}
+            let request=server.await.unwrap();assert!(request.contains("Authorization: Bearer 01234567\r\n"));assert!(request.ends_with("\r\n\r\nabc"));
+        }
     }
 }
