@@ -8,7 +8,7 @@ use crate::{ap01_app_set::Manifest,ap01_app_set_receipt::{Receipt,Phase},device_
 
 #[derive(Debug,PartialEq,Eq,Serialize)]
 #[serde(rename_all="snake_case")]
-pub enum State {Pending,Unknown,Confirmed,Terminal}
+pub enum State {Pending,Unknown,Confirmed,Terminal,Abandoned}
 #[derive(Debug,Serialize)]
 pub struct Step {pub state:State,pub reply:Value}
 fn hex(bytes:&[u8])->String {bytes.iter().map(|b|format!("{b:02x}")).collect()}
@@ -48,26 +48,63 @@ fn next(r:&Receipt,packages:&[Vec<u8>],cancel:bool,chunk_max:u64)->Result<Option
     }
 }
 fn received(r:&mut Receipt,path:&Path,status:u16,value:Value)->Result<Step> {
+    received_at(r,path,&r.endpoint.clone(),status,value)
+}
+fn received_at(r:&mut Receipt,path:&Path,endpoint:&str,status:u16,value:Value)->Result<Step> {
     if status==503 {return Ok(Step{state:State::Unknown,reply:value});}
     if status==409 && (value["error_code"]=="write_drain_pending" || value["error"]=="maintenance_busy") {return Ok(Step{state:State::Pending,reply:value});}
     ensure!(matches!(status,200|202),"app_set_http_rejected: {status}");
-    r.acknowledge(path,&value).map_err(|error|error.context(crate::rendezvous::CommandFailure{outcome:crate::rendezvous::DispatchOutcome::AckUnknown,stage:"app_set_receipt",reason:"receipt_unconfirmed"}))?;
+    r.acknowledge_at(path,endpoint,&value).map_err(|error|error.context(crate::rendezvous::CommandFailure{outcome:crate::rendezvous::DispatchOutcome::AckUnknown,stage:"app_set_receipt",reason:"receipt_unconfirmed"}))?;
     let phase=r.progress.as_ref().unwrap().phase;
     let state=if phase==Phase::Succeeded {if confirmed(r,&r.manifest()?,&value)? {State::Confirmed}else{State::Pending}}
         else if phase.terminal(){State::Terminal}else{State::Pending};
     Ok(Step{state,reply:value})
 }
 
+fn reload(r:&mut Receipt,path:&Path)->Result<()> {
+    let stored=Receipt::load(path,&r.endpoint,&r.device_mac)?;
+    ensure!(stored.operation_id==r.operation_id && stored.begin_body()?==r.begin_body()?,"app_set_receipt_replaced");*r=stored;Ok(())
+}
+/// Observe the original operation only. Unlike advance, 404 never starts begin.
+pub async fn query(r:&mut Receipt,path:&Path,code:&str,budget:Duration)->Result<Step> {
+    reload(r,path)?;
+    let (status,value)=ap01_app_set_request(&r.endpoint,&r.device_mac,code,&r.operation_id,Action::Result,&[],budget).await?;
+    received(r,path,status,value)
+}
+
+/// Query only at an explicitly rediscovered endpoint. No begin/commit is sent;
+/// wrong identity, stale progress or storage errors leave the old fence intact.
+pub async fn reconnect(r:&mut Receipt,path:&Path,endpoint:&str,code:&str,budget:Duration)->Result<Step> {
+    reload(r,path)?;let started=Instant::now();
+    let (status,value)=ap01_app_set_request(endpoint,&r.device_mac,code,&r.operation_id,Action::Result,&[],budget).await?;
+    if status==404 && r.progress.is_none() {
+        let (status,value)=ap01_app_set_request(endpoint,&r.device_mac,code,&r.operation_id,Action::Status,&[],budget.saturating_sub(started.elapsed())).await?;
+        if status==503{return Ok(Step{state:State::Unknown,reply:value});}
+        ensure!(status==200,"app_set_status_rejected: {status}");
+        r.relocate_unstarted(path,endpoint,&value)?;
+        return Ok(Step{state:State::Pending,reply:serde_json::json!({"operation_id":r.operation_id,"device_mac":r.device_mac,"local_only":true,"reason":"unacknowledged_operation_absent"})});
+    }
+    received_at(r,path,endpoint,status,value)
+}
+
 /// Always query first, including after a transport/persistence error. Never
 /// generate an operation ID here. Credentials are request-local, not persisted.
 pub async fn advance(r:&mut Receipt,path:&Path,code:&str,packages:&[Vec<u8>],cancel:bool,budget:Duration)->Result<Step> {
-    let stored=Receipt::load(path,&r.endpoint,&r.device_mac)?;
-    ensure!(stored.operation_id==r.operation_id && stored.begin_body()?==r.begin_body()?,"app_set_receipt_replaced");*r=stored;
+    reload(r,path)?;
     let started=Instant::now();
     let (status,value)=ap01_app_set_request(&r.endpoint,&r.device_mac,code,&r.operation_id,Action::Result,&[],budget).await?;
     let planned=if status==404 {
         ensure!(r.progress.is_none(),"app_set_acknowledged_receipt_expired");
-        ensure!(!cancel,"app_set_no_transaction_to_cancel");
+        if cancel {
+            // A bare 404 is not identity proof. Authenticate this MAC before
+            // releasing an unacknowledged local receipt; never fabricate progress.
+            let remaining=budget.saturating_sub(started.elapsed());
+            let (status,value)=ap01_app_set_request(&r.endpoint,&r.device_mac,code,&r.operation_id,Action::Status,&[],remaining).await?;
+            if status==503{return Ok(Step{state:State::Unknown,reply:value});}
+            ensure!(status==200,"app_set_status_rejected: {status}");
+            r.archive_unstarted(path)?;
+            return Ok(Step{state:State::Abandoned,reply:serde_json::json!({"operation_id":r.operation_id,"device_mac":r.device_mac,"local_only":true,"reason":"unacknowledged_operation_absent"})});
+        }
         Some((Action::Begin,r.begin_body()?))
     }else{
         let step=received(r,path,status,value)?;
@@ -143,6 +180,87 @@ mod tests {
         assert!(confirmed(&r,&m,&value).unwrap());value["boot_id"]=11.into();assert!(!confirmed(&r,&m,&value).unwrap());value["boot_id"]=12.into();
         value["runtime"]["running"][1]["health"]=Value::Null;assert!(!confirmed(&r,&m,&value).unwrap());value["runtime"]["running"][1]["health"]=0.into();
         value["runtime"]["running"][1]["digest"]="bad".into();assert!(confirmed(&r,&m,&value).is_err());
+    }
+
+    /// Invoked by the firmware cross-language harness; endpoint is loopback only.
+    #[tokio::test]
+    #[ignore="requires AP01_HTTP_ENDPOINT, AP01_MANIFEST, AP01_PACKAGE, AP01_RECEIPT and AP01_RESULT"]
+    async fn production_cpp_http_collection() {
+        let endpoint=std::env::var("AP01_HTTP_ENDPOINT").unwrap();
+        let address:std::net::SocketAddr=endpoint.parse().unwrap();assert!(address.ip().is_loopback());
+        let bytes=std::fs::read(std::env::var("AP01_MANIFEST").unwrap()).unwrap();
+        let mut packages=vec![std::fs::read(std::env::var("AP01_PACKAGE").unwrap()).unwrap()];
+        if let Ok(path)=std::env::var("AP01_PEER"){packages.push(std::fs::read(path).unwrap());}
+        let path=std::path::PathBuf::from(std::env::var("AP01_RECEIPT").unwrap());
+        let operation=format!("{:032x}",Manifest::parse(&bytes).unwrap().sequence);
+        let mac="010203040506";let budget=Duration::from_secs(5);
+        let (status,initial)=ap01_app_set_request(&endpoint,mac,"01234567",&operation,Action::Status,&[],budget).await.unwrap();assert_eq!(status,200);
+        let mut receipt=Receipt::prepare(&endpoint,mac,&operation,&bytes,&initial).unwrap();receipt.create(&path).unwrap();
+        let deadline=Instant::now()+Duration::from_secs(120);let mut unknown=0;
+        loop {
+            assert!(Instant::now()<deadline,"cross-language transaction exceeded deadline");
+            match advance(&mut receipt,&path,"01234567",&packages,false,budget).await {
+                Ok(step) if matches!(step.state,State::Confirmed|State::Terminal) => {
+                    let expected=std::env::var("AP01_EXPECT_PHASE").unwrap();assert_eq!(step.reply["phase"],expected);
+                    assert_eq!(step.state,if expected=="succeeded" {State::Confirmed}else{State::Terminal});
+                    assert_eq!(unknown,1,"expected exactly one injected lost response");
+                    std::fs::write(std::env::var("AP01_RESULT").unwrap(),serde_json::to_vec_pretty(&step.reply).unwrap()).unwrap();break;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    assert!(matches!(error.downcast_ref::<CommandFailure>().map(|e|&e.outcome),Some(DispatchOutcome::AckUnknown)),"{error:#}");
+                    unknown+=1;assert!(unknown<=1,"unexpected repeated transport failure: {error:#}");
+                    receipt=Receipt::load(&path,&endpoint,mac).unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rediscovery_and_unstarted_cancel_only_query_authenticated_identity() {
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let endpoint=listener.local_addr().unwrap().to_string();
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("active.json");
+        let mut r=Receipt::prepare("127.0.0.1:1","AABBCCDDEEFF","01000000000000000000000000000000",&manifest(),&status()).unwrap();r.create(&path).unwrap();
+        let original=std::fs::read(&path).unwrap();
+        let good=serde_json::json!({"protocol":3,"device_mac":r.device_mac,"operation_id":r.operation_id,
+            "candidate_manifest":hex(&r.manifest().unwrap().digest),"candidate_version":1,"old_manifest":r.expected_manifest,"old_version":0,
+            "phase":"receiving","sequence":1,"boot_id":12,"changed_mask":0,"ready_mask":0,"received":[0,0,0,0,0,0,0,0],"chunk_max":1024});
+        let mut wrong_mac=good.clone();wrong_mac["device_mac"]="000000000000".into();
+        let mut wrong_manifest=good.clone();wrong_manifest["candidate_manifest"]="00".repeat(32).into();
+        let mut identity=status();identity["boot_id"]=22.into();let mut other=identity.clone();other["device_mac"]="000000000000".into();
+        let missing=serde_json::json!({"error":"receipt_not_found"});
+        let responses=vec![(200,wrong_mac),(200,wrong_manifest),(200,good),(404,missing.clone()),
+            (404,missing.clone()),(200,other),(404,missing.clone()),(200,identity.clone()),
+            (404,missing.clone()),(503,serde_json::json!({"error":"busy"})),(404,missing),(200,identity)];
+        let server=tokio::spawn(async move {
+            let mut requests=Vec::new();
+            for (status,value) in responses {
+                let (mut stream,_)=listener.accept().await.unwrap();let mut bytes=Vec::new();
+                while !bytes.windows(4).any(|w|w==b"\r\n\r\n") {
+                    let mut buffer=[0;1024];let n=stream.read(&mut buffer).await.unwrap();assert!(n>0);bytes.extend_from_slice(&buffer[..n]);assert!(bytes.len()<8192);
+                }
+                let line=String::from_utf8_lossy(&bytes).lines().next().unwrap().to_owned();assert!(line.starts_with("GET "));requests.push(line);
+                let body=serde_json::to_vec(&value).unwrap();let header=format!("HTTP/1.1 {status} Reply\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len());
+                stream.write_all(header.as_bytes()).await.unwrap();stream.write_all(&body).await.unwrap();
+            }
+            requests
+        });
+        let budget=Duration::from_secs(2);
+        for _ in 0..2 {assert!(reconnect(&mut r,&path,&endpoint,"01234567",budget).await.is_err());assert_eq!(std::fs::read(&path).unwrap(),original);}
+        assert_eq!(reconnect(&mut r,&path,&endpoint,"01234567",budget).await.unwrap().state,State::Pending);
+        assert_eq!(r.endpoint,endpoint);assert_eq!(Receipt::load(&path,&endpoint,&r.device_mac).unwrap().operation_id,r.operation_id);
+        // A previously acknowledged receipt cannot be discarded on 404.
+        assert!(advance(&mut r,&path,"01234567",&[],true,budget).await.is_err());assert!(path.exists());
+        let second=dir.path().join("prepared.json");let mut prepared=Receipt::prepare("127.0.0.1:1","AABBCCDDEEFF","02000000000000000000000000000000",&manifest(),&status()).unwrap();prepared.create(&second).unwrap();
+        let saved=std::fs::read(&second).unwrap();
+        assert!(reconnect(&mut prepared,&second,&endpoint,"01234567",budget).await.is_err());assert_eq!(std::fs::read(&second).unwrap(),saved);
+        assert_eq!(reconnect(&mut prepared,&second,&endpoint,"01234567",budget).await.unwrap().state,State::Pending);
+        assert_eq!(prepared.endpoint,endpoint);assert_eq!(prepared.original_boot,11);assert!(prepared.progress.is_none());
+        assert_eq!(advance(&mut prepared,&second,"01234567",&[],true,budget).await.unwrap().state,State::Unknown);assert!(second.exists());
+        let result=advance(&mut prepared,&second,"01234567",&[],true,budget).await.unwrap();assert_eq!(result.state,State::Abandoned);assert_eq!(result.reply["local_only"],true);assert!(!second.exists());
+        let archived=second.with_file_name(format!("prepared.json.{}.abandoned",prepared.operation_id));
+        assert!(Receipt::load_local(&archived,&prepared.device_mac).unwrap().progress.is_none());
+        let requests=server.await.unwrap();assert_eq!(requests.len(),12);assert!(requests.iter().all(|r|r.contains("/update/result?")||r.contains("/api/app/v3/status ")));
     }
 
 }

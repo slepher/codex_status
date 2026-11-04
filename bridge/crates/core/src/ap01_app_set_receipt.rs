@@ -67,10 +67,50 @@ impl Receipt {
         let mut file=options.open(path)?;file.write_all(&bytes)?;file.sync_all()?;drop(file);
         #[cfg(unix)] if let Some(parent)=path.parent(){File::open(parent)?.sync_all()?;}Ok(())
     }
-    pub fn load(path:&Path,endpoint:&str,mac:&str)->Result<Self> {
+    pub fn load_local(path:&Path,mac:&str)->Result<Self> {
         let mut bytes=Vec::new();File::open(path)?.take((MAX_RECEIPT+1) as u64).read_to_end(&mut bytes)?;ensure!(bytes.len()<=MAX_RECEIPT,"app_receipt_size");
         let out:Self=serde_json::from_slice(&bytes)?;out.validate()?;
-        ensure!(out.endpoint==endpoint && out.device_mac==mac.to_ascii_uppercase(),"app_receipt_target_changed");Ok(out)
+        ensure!(out.device_mac==mac.to_ascii_uppercase(),"app_receipt_target_changed");Ok(out)
+    }
+    pub fn load(path:&Path,endpoint:&str,mac:&str)->Result<Self> {
+        let out=Self::load_local(path,mac)?;
+        ensure!(out.endpoint==endpoint,"app_receipt_target_changed");Ok(out)
+    }
+    /// Caller must freshly confirm terminal cleanup (and running identity on
+    /// success). Keep an exclusive, synced copy before releasing the active slot.
+    pub fn archive(&self,path:&Path)->Result<std::path::PathBuf> {
+        ensure!(self.progress.as_ref().is_some_and(|p|matches!(p.phase,Phase::Succeeded|Phase::FailedRolledBack|Phase::Cancelled)),"app_receipt_not_terminal");
+        self.archive_copy(path,"completed")
+    }
+    /// Only after a fresh authenticated query says the unacknowledged operation
+    /// does not exist. This records a local abandonment, not a device Cancelled.
+    pub fn archive_unstarted(&self,path:&Path)->Result<std::path::PathBuf> {
+        ensure!(self.progress.is_none(),"app_receipt_already_acknowledged");
+        self.archive_copy(path,"abandoned")
+    }
+    fn archive_copy(&self,path:&Path,suffix:&str)->Result<std::path::PathBuf> {
+        let current=Self::load(path,&self.endpoint,&self.device_mac)?;
+        ensure!(current.bytes()?==self.bytes()?,"app_receipt_file_changed");
+        let name=path.file_name().and_then(|n|n.to_str()).context("app_receipt_filename")?;
+        let archived=path.with_file_name(format!("{name}.{}.{suffix}",self.operation_id));
+        if archived.exists(){
+            ensure!(Self::load(&archived,&self.endpoint,&self.device_mac)?.bytes()?==self.bytes()?,"app_receipt_archive_conflict");
+            File::open(&archived)?.sync_all()?;
+            #[cfg(unix)] if let Some(parent)=archived.parent(){File::open(parent)?.sync_all()?;}
+        }else{self.create(&archived)?;}
+        ensure!(Self::load(path,&self.endpoint,&self.device_mac)?.bytes()?==self.bytes()?,"app_receipt_file_changed");
+        std::fs::remove_file(path)?;
+        #[cfg(unix)] if let Some(parent)=path.parent(){File::open(parent)?.sync_all()?;}
+        Ok(archived)
+    }
+    /// A never-acknowledged receipt can follow a verified device even before
+    /// begin exists. Preserve every operation/Manifest/boot fence verbatim.
+    pub fn relocate_unstarted(&mut self,path:&Path,endpoint:&str,status:&Value)->Result<()> {
+        ensure!(self.progress.is_none(),"app_receipt_already_acknowledged");
+        ensure!(status["protocol"]==3 && status["device_mac"].as_str()==Some(self.device_mac.as_str()) && status["boot_id"].as_u64().is_some_and(|n|n>0),"app_receipt_identity");
+        ensure!(Self::load(path,&self.endpoint,&self.device_mac)?.bytes()?==self.bytes()?,"app_receipt_file_changed");
+        let mut next=self.clone();next.endpoint=endpoint.to_owned();
+        crate::platform::store::atomic_write(path,&next.bytes()?)?;*self=next;Ok(())
     }
     pub fn begin_body(&self)->Result<Vec<u8>> {
         self.validate()?;let manifest=STANDARD.decode(&self.manifest_base64)?;let mut body=vec![0;64];body[..8].copy_from_slice(b"ASB3\x01\x00\x40\x00");
@@ -78,6 +118,11 @@ impl Receipt {
     }
     /// Persist only typed progress, never arbitrary response fields/credentials.
     pub fn acknowledge(&mut self,path:&Path,value:&Value)->Result<()> {
+        self.acknowledge_at(path,&self.endpoint.clone(),value)
+    }
+    /// Persist a newly discovered address only with an authenticated response
+    /// matching the original MAC, transaction, Manifests and monotonic progress.
+    pub fn acknowledge_at(&mut self,path:&Path,endpoint:&str,value:&Value)->Result<()> {
         let manifest=self.manifest()?;
         ensure!(value["protocol"]==3 && value["device_mac"].as_str()==Some(self.device_mac.as_str()) && value["operation_id"].as_str()==Some(self.operation_id.as_str()),"app_receipt_identity");
         ensure!(value["candidate_manifest"].as_str()==Some(digest_string(&manifest.digest).as_str()) && value["candidate_version"].as_u64()==Some(manifest.sequence) && value["old_manifest"].as_str()==Some(self.expected_manifest.as_str()) && value["old_version"].as_u64()==Some(self.expected_version),"app_receipt_manifest_mismatch");
@@ -91,7 +136,7 @@ impl Receipt {
         }
         let stored=Self::load(path,&self.endpoint,&self.device_mac)?;
         ensure!(stored.bytes()?==self.bytes()?,"app_receipt_file_changed");
-        let mut next=self.clone();next.progress=Some(p);crate::platform::store::atomic_write(path,&next.bytes()?)?;*self=next;Ok(())
+        let mut next=self.clone();next.endpoint=endpoint.to_owned();next.progress=Some(p);crate::platform::store::atomic_write(path,&next.bytes()?)?;*self=next;Ok(())
     }
 }
 
@@ -151,6 +196,33 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(),stable);
         let mut other=r.clone();other.operation_id="02000000000000000000000000000000".to_owned();std::fs::write(&path,other.bytes().unwrap()).unwrap();
         v["received"][7]=0.into();assert!(r.acknowledge(&path,&v).is_err());
+    }
+
+    #[test]
+    fn archive_preserves_source_on_conflict_and_recovers_after_copy() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("active.json");let mut r=prepare();r.create(&path).unwrap();
+        assert!(r.archive(&path).is_err());assert!(path.exists());
+        r.acknowledge(&path,&reply(&r,"cancelled",2)).unwrap();
+        let archive=dir.path().join(format!("active.json.{}.completed",r.operation_id));
+        std::fs::write(&archive,b"conflicting archive").unwrap();
+        assert!(r.archive(&path).is_err());assert!(path.exists());
+        assert_eq!(std::fs::read(&archive).unwrap(),b"conflicting archive");std::fs::remove_file(&archive).unwrap();
+        // Crash after durable copy but before deleting active: resume idempotently.
+        r.create(&archive).unwrap();assert_eq!(r.archive(&path).unwrap(),archive);assert!(!path.exists());
+        let saved=Receipt::load_local(&archive,&r.device_mac).unwrap();assert_eq!(saved.operation_id,r.operation_id);
+        assert_eq!(saved.progress.unwrap().phase,Phase::Cancelled);
+    }
+
+    #[test]
+    fn rediscovery_storage_failure_keeps_original_address() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("receipt.json");let mut r=prepare();r.create(&path).unwrap();
+        let bytes=std::fs::read(&path).unwrap();let endpoint="127.0.0.1:18081";
+        let mut wrong=status();wrong["device_mac"]="000000000000".into();
+        assert!(r.relocate_unstarted(&path,endpoint,&wrong).is_err());assert_eq!(std::fs::read(&path).unwrap(),bytes);
+        std::fs::create_dir(dir.path().join("receipt.json.tmp")).unwrap();
+        assert!(r.relocate_unstarted(&path,endpoint,&status()).is_err());
+        assert!(r.acknowledge_at(&path,endpoint,&reply(&r,"receiving",1)).is_err());
+        assert_eq!(r.endpoint,"127.0.0.1:18080");assert!(r.progress.is_none());assert_eq!(std::fs::read(&path).unwrap(),bytes);
     }
 
 }
