@@ -7,6 +7,7 @@ mod autostart;
 mod autostart;
 mod config;
 mod ap01;
+mod ap01_app_update;
 mod ap01_lan;
 mod device_runtime;
 mod discovery;
@@ -1000,6 +1001,7 @@ async fn mcp_handler(
             "device_rename"
                 | "device_discover"
                 | "ap01_devices"
+                | "ap01_app_update"
                 | "device_owner"
                 | "device_claim"
                 | "device_release"
@@ -1993,7 +1995,7 @@ async fn discover_device(
 }
 
 /// MCP device tools, handled in the app because they mutate live state.
-async fn device_tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, String> {
+async fn device_tool(ctx: &Arc<AppCtx>, name: &str, args: &Value) -> Result<String, String> {
     match name {
         "device_rename" => {
             let raw = args
@@ -2029,6 +2031,7 @@ async fn device_tool(ctx: &AppCtx, name: &str, args: &Value) -> Result<String, S
         "device_owner" => Ok(device_identity_json(ctx)
             .unwrap_or(Value::Null)
             .to_string()),
+        "ap01_app_update" => Ok(ap01::update_action(ctx,args).await.to_string()),
         "ap01_devices" => Ok(ap01::action(ctx,args["op"].as_str().unwrap_or("search"),args).await.to_string()),
         "device_discover" => {
             let via = args.get("via").and_then(|v| v.as_str()).unwrap_or("auto");
@@ -2167,6 +2170,11 @@ async fn platform_device_detail(state: State<'_, Arc<AppCtx>>, mac: String, sect
 async fn platform_wifi(state: State<'_, Arc<AppCtx>>, mac: String, op: String, body: Value) -> Result<Value, String> {
     if op == "view" { wifi::view(&state, &mac, false).await }
     else { wifi::action(&state, &mac, &op, body).await }
+}
+
+#[tauri::command]
+async fn platform_ap01_app_update(state: State<'_, Arc<AppCtx>>, body: Value) -> Result<Value,String> {
+    Ok(ap01::update_action(&state,&body).await)
 }
 
 #[tauri::command]
@@ -3858,6 +3866,7 @@ fn main() {
             platform_device_detail,
             platform_wifi,
             platform_ap01,
+            platform_ap01_app_update,
             platform_template_get,
             platform_template_validate,
             platform_template_preview,

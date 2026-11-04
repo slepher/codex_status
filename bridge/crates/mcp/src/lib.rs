@@ -699,6 +699,17 @@ fn tool_definitions() -> Value {
             }
         },
         {
+            "name":"ap01_app_update",
+            "title":"更新 AP01 独立 App 集合",
+            "description":"prepare 校验完整 Manifest 和提供的单个/多个包，认证维护能力后仅保存本地回执；advance 查询原事务并最多推进一次上传/提交，cancel 请求取消原事务，inspect 离线只读本地进度，query 仅查询原事务，archive 重新确认终态和清理后归档回执以允许下一次更新。reconnect 在已登记的新地址查询原事务，身份核验后保存地址；abandoned 仅表示设备确认事务不存在后关闭未确认的本地回执。confirmed 才表示新启动的完整集合已核验。run 有界后台推进原回执，worker_status 查询进度；活动任务 cancel 先保存取消意图。设备菜单八位码仅当前任务内存使用；不要覆盖未完成回执。",
+            "annotations":{"readOnlyHint":false,"destructiveHint":false},
+            "inputSchema":{"type":"object","properties":{
+                "op":{"enum":["prepare","inspect","query","advance","cancel","archive","reconnect","run","worker_status"]},"mac":{"type":"string"},
+                "code":{"type":"string","pattern":"^[0-9]{8}$"},"operation_id":{"type":"string"},"budget_secs":{"type":"integer","minimum":1,"maximum":3600},
+                "manifest_path":{"type":"string"},"package_paths":{"type":"array","maxItems":8,"items":{"type":"string"}}
+            },"required":["op","mac"],"additionalProperties":false}
+        },
+        {
             "name": "ap01_devices",
             "title": "发现与配对 AP01",
             "description": "局域网主动发现，无需输入IP；pair显示双屏四位码，必须设备旋钮确认；pair_status查询原事务，cancel_pair取消。绑定不发布模板；新设备默认启用数据同步，已有设备保留同步设置。",
@@ -1157,7 +1168,7 @@ async fn call_tool(cfg: &McpConfig, name: &str, args: &Value) -> Result<Vec<Valu
             .map_err(|e| e.to_string())?;
             Ok(vec![text_block(text)])
         }
-        "ap01_devices" | "device_rename" | "device_discover" | "device_owner" | "device_claim"
+        "ap01_app_update" | "ap01_devices" | "device_rename" | "device_discover" | "device_owner" | "device_claim"
         | "device_release" => {
             // Implemented in bridge-app (live identity/occupancy state); this
             // library copy has no running app to mutate.
