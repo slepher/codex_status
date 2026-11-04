@@ -41,8 +41,9 @@ bool Ap01Business::loadActive(uint64_t now) {
     return true;
 }
 bool Ap01Business::begin(uint64_t now, bool readOnly) {
-    writesEnabled.store(!readOnly,std::memory_order_release);
-    if (!store.bsBegin(readOnly)) return !strcmp(store.bsLastError(), "unconfigured");
+    writesEnabled.store(false,std::memory_order_release);
+    auto finish=[&](bool okay){writesEnabled.store(okay&&!readOnly,std::memory_order_release);return okay;};
+    if (!store.bsBegin(readOnly)) return finish(!strcmp(store.bsLastError(), "unconfigured"));
     if (!store.bsProfile(profile)) return false;
     if (readOnly) return loadActive(now) && render();
     char next[BS_CTX_LEN]; newContext(next); String error;
@@ -61,7 +62,14 @@ bool Ap01Business::begin(uint64_t now, bool readOnly) {
             contextCounter = previous; newContext(next);
         }
     }
-    return store.bsSetActive(profile.initial, next, error) && loadActive(now) && render();
+    return finish(store.bsSetActive(profile.initial, next, error) && loadActive(now) && render());
+}
+bool Ap01Business::syncWritePermission(uint64_t now,bool allow) {
+    if(!allow){writesEnabled.store(false,std::memory_order_release);return true;}
+    if(writeResumeFailed)return false;
+    if(writesAllowed())return true;
+    if(begin(now,false))return true;
+    writeResumeFailed=true;return false;
 }
 bool Ap01Business::render() {
     auto failed=[this](){displayFailed(generation);return false;};

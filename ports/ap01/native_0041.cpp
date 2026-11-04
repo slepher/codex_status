@@ -77,6 +77,20 @@ struct Runtime {
     uint32_t renderingEpoch=1; // Captured by the business executor before each operation.
     std::atomic<uint32_t> ready{0}; // 0 initializing, 1 live, 2 root retired.
     std::atomic<uint32_t> uiHeartbeat{0};
+#ifdef AP01_FILE_APP_V3
+    std::atomic<uint32_t> businessHeartbeat{0},discoveryHeartbeat{0},workersStarted{0};
+    bool workersFresh() const {
+        uint32_t businessBeat=businessHeartbeat.load(std::memory_order_acquire);
+        uint32_t discoveryBeat=discoveryHeartbeat.load(std::memory_order_acquire);
+        uint32_t now=uint32_t(nowMs());
+        // Sample beats before the clock so a concurrent update cannot look like wraparound.
+        // HTTP has a 5 s deadline plus the 1 s listener wait. These are
+        // observation limits, not proof of bounded ROM/VFS/render execution.
+        return workersStarted.load(std::memory_order_acquire)==3&&
+            uint32_t(now-businessBeat)<=15000&&
+            uint32_t(now-discoveryBeat)<=5000;
+    }
+#endif
     std::atomic<bool> stop{false};
     std::atomic_flag bindingsLock=ATOMIC_FLAG_INIT,businessLock=ATOMIC_FLAG_INIT;
     std::atomic<Frame *> pending{nullptr};
@@ -469,6 +483,16 @@ void Runtime::serve() {
 #endif
     app->businessOnline(true);
     while(!stop.load(std::memory_order_acquire)) {
+#ifdef AP01_FILE_APP_V3
+        businessHeartbeat.store(uint32_t(nowMs()),std::memory_order_release);
+        workersStarted.fetch_or(1,std::memory_order_release);
+        if(!businessLock.test_and_set(std::memory_order_acquire)) {
+            auto *api=ap01RuntimeApiV3();void *context=ap01RuntimeContextV3();
+            if(!business.syncWritePermission(nowMs(),api->writes_allowed(context)==1))
+                ready.store(3,std::memory_order_release);
+            businessLock.clear(std::memory_order_release);
+        }
+#endif
         processActivation();
         if(!app->maintenanceActive()&&!businessLock.test_and_set(std::memory_order_acquire)) {
             renderingEpoch=uiEpoch.load(std::memory_order_acquire);
@@ -495,9 +519,17 @@ void Runtime::serve() {
     app->businessOnline(false);networkClient.close(fd);
 }
 void *Runtime::udp(void *p) {
-    Runtime &r=*(Runtime *)p;int fd=r.networkClient.listen(8767,true);if(fd<0){r.ready.store(3,std::memory_order_release);return nullptr;}
+    Runtime &r=*(Runtime *)p;
+#ifdef AP01_FILE_APP_V3
+    struct WorkerExit {Runtime &r;~WorkerExit(){r.ready.store(3,std::memory_order_release);}} exit{r};
+#endif
+    int fd=r.networkClient.listen(8767,true);if(fd<0){r.ready.store(3,std::memory_order_release);return nullptr;}
     uint64_t nextReply=0;
     while(!r.stop.load(std::memory_order_acquire)) {
+#ifdef AP01_FILE_APP_V3
+        r.discoveryHeartbeat.store(uint32_t(nowMs()),std::memory_order_release);
+        r.workersStarted.fetch_or(2,std::memory_order_release);
+#endif
         if(!r.networkClient.wait(fd,1,nowMs()+1000))continue;
         uint8_t bytes[257];NetworkPeer source{};
         int n=r.networkClient.receiveFrom(fd,bytes,sizeof(bytes),source);
@@ -599,7 +631,10 @@ extern "C" __attribute__((used)) int32_t ap01_app_event_v3(void *instance,uint32
 }
 extern "C" __attribute__((used)) int32_t ap01_app_health_v3(void *instance) {
     if(!instance)return AP01_APP_V3_INVALID;
-    if(((Runtime *)instance)->ready.load(std::memory_order_acquire)==3)return AP01_APP_V3_FAILED;
+    auto &r=*(Runtime *)instance;
+    if(r.ready.load(std::memory_order_acquire)==3)return AP01_APP_V3_FAILED;
+    if(r.workersStarted.load(std::memory_order_acquire)!=3)return AP01_APP_V3_PENDING;
+    if(!r.workersFresh())return AP01_APP_V3_FAILED;
     return Runtime::healthy(instance)?AP01_APP_V3_OK:AP01_APP_V3_PENDING;
 }
 #else

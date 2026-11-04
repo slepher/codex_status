@@ -1,6 +1,6 @@
 # Codex Status 当前交接
 
-更新时间：2026-11-03，Asia/Shanghai。
+更新时间：2026-11-04，Asia/Shanghai。
 
 ## 当前部署
 
@@ -13,7 +13,7 @@
 
 ## 活跃事项与下一步
 
-- C9 独立 App 的 D1 非实机验收完成，未部署：ABI 3.0 直接 C 表、真实包零导入、双基址/重复构建一致；最终 `../cuktech-ap01-firmware/build/app-install/d1-v3-11/app.apx2`，203696 B，SHA256 `581eafe33e3e524a3aefdb32e30905be75be304cfa202f14efcdbda113de1dcc`。平台独立维护/host/固定文件开机组合已接入，完整平台候选 `d1-platform-v3-02.bin`，6897352 B，SHA256 `53629b54908e6681c73dad6f256c299a9d0245a800e9301c4b5fb7d0e0ab141c`，镜像检查通过。james.local Docker QEMU 双基址执行真实三入口、业务/发现线程及 root 销毁/重建通过；ROM I/O、LVGL、维护监听/调度为模型替身。生产执行内存 backend 尚未准入、明确不可用，候选不可部署；D2–D4 集合更新仍待推进，现场部署未变。[D1 证据](../cuktech-ap01-firmware/project-workflow/ap01-app-update/d1-direct-app.md)
+- C9 独立 App：D1 已验收，D2 已接真实双包、Manifest 文件启动、集合监督；本仓 ABI 3 增加业务/发现心跳与 worker 写许可恢复，分别停滞或恢复失败时报告失败；恢复失败保持只读且不重试。james.local Docker 两基址真实三线程逐个冻结/恢复通过，平台故障仍锁存。当前 App `../cuktech-ap01-firmware/build/app-install/d2-business-resume-01/app.apx2`，204080 B，SHA256 `c3bf0c7d4a01d6788532cf178c7f8e969862af5088c42062b522df5eec5e9913`；零导入、双链接归一化及重复构建一致。平台候选 `d2-platform-11.bin`，6907160 B，SHA256 `a042af91eec958a601c0f9986270530d25fcc5bbd8f1b7c445a3988c0667b2cf`，未部署且硬件 backend 不可用。ROM I/O/LVGL/调度仍为模型，线程观察阈值不是硬件耗时上界；D2 写集/许可、D3/D4 仍待推进。现场部署未变。[状态与证据](../cuktech-ap01-firmware/project-workflow/ap01-app-update/status.md)
 
 - 协议整改 P0 源码/软件验收完成，已提交、未部署：HTTP 会话复用与重放、BLE 错误/四槽队列/Notify 退避/可恢复冷却；workspace522通过/5条件忽略，最终core+ble245通过/2忽略，Note4构建及匹配ELF栈88项通过。**未部署同版本候选** `artifacts/protocol-p0/note4-p0-0.18.106.bin`，1872736 B，SHA256 `1b93bf34f4139c21d322fb0a8a3c93d9333503fb056663c4771f8a07bfaeb864`；现场ROM不变。新工具链、资源预算及实机边界见[状态](project-workflow/bridge-device-protocol-remediation/status.md)。A9/B6/C8实机未结，P1/P2未实施。
 
