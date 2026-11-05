@@ -9,6 +9,26 @@ window.__wifiUiScenario = async function(scenario) {
   selectedDeviceMac = mac; deviceSelectionGeneration++;
   clearDeviceView();
   wifiLibrary={revision:0,families:[],devices:{},wired_family:null};wifiManualSelection=false;$('wifi-family-editor').open=false;wifiFamilyRender();
+  if(scenario==='device-add'){
+    platformDevices=[{device_mac:mac,name:'CUKTECH AP01',model:'AP01 320×240',status:'最近已认证'}];
+    renderRegisteredDevices(mac);renderBridgeBle({state:'recovering',attempt:2});
+    window.__wifiRoundtripInvoke=async(name,args)=>{
+      if(name==='platform_ap01')return {result:'complete',candidates:[{name:'CUKTECH AP01',device_mac:mac},{name:'新 AP01',device_mac:'0200000000B2'}]};
+      throw new Error('ble_connect_timeout');
+    };
+    try{
+      await ap01Search();
+      check($('ap01-stop-search').hidden,'Completed scan still offers stop');
+      check(!$('ap01-candidates').children[0].querySelector('button'),'Registered device offered unnecessary pairing');
+      check($('ap01-candidates').children[1].querySelectorAll('button')[1].disabled,'Missing transaction query enabled');
+      ap01Close();check($('ap01-add').hidden,'Close did not dismiss search');
+      await ap01Search();await wifiAddDevice();
+      check($('ble-add-result').textContent.includes('添加蓝牙设备失败'),'BLE error missing at add entry');
+      $('registered-devices').closest('.card').scrollIntoView({block:'start'});await wait();await wait();
+      return {scenario,width:innerWidth};
+    }finally{window.__wifiRoundtripInvoke=null;}
+  }
+  ap01Close();$('ble-add-result').hidden=true;renderBridgeBle(null);
   const network = {network_id:'home', label:'书桌网络', host_ssid:'Home-5G', ssid:'Home-2G',
     password:'fixture-pass',credential:'keep', origin:'local', version:2, deleted:false};
   const long = 'Long-Network-Name-'.repeat(6);
@@ -67,10 +87,15 @@ window.__wifiUiScenario = async function(scenario) {
       if(scenario==='permission-request') {
         check(permissionCalls.filter(op=>op==='permission_all').length===1,'Startup must request once');
         check($('wifi-permissions').hidden,'Successful combined grant must hide setup');
+        permission={platform:'macos',location:'not_determined',bluetooth:'not_determined'};
+        permissionCalls.length=0;
+        $('wifi-host-read').click();await wait();
+        check(permissionCalls.filter(op=>op==='permission_all').length===1,'Read-network button did not request authorization');
+        check($('wifi-host').textContent==='Home-5G','Read-network button did not refresh after grant');
       } else {
         check(!permissionCalls.some(op=>op.startsWith('permission_')||op.startsWith('settings_')),'Startup repeated a denied prompt');
-        $('wifi-permission-action').click();await wait();
-        check(permissionCalls.filter(op=>op==='settings_permissions').length===1,'Combined settings button failed');
+        $('wifi-host-read').click();await wait();
+        check(permissionCalls.filter(op=>op==='settings_permissions').length===1,'Read-network button did not open settings');
       }
     } finally {window.__wifiRoundtripInvoke=null;}
     wifiShowPermissions({platform:'macos',location:scenario==='permission-request'?'not_determined':'disabled',bluetooth:scenario==='permission-request'?'not_determined':'denied'});
@@ -106,8 +131,8 @@ window.__wifiUiScenario = async function(scenario) {
     } finally {window.__wifiRoundtripInvoke=null;}
   }
   if (scenario === 'ble-recovery') {
-    const fixture = {device:{device_mac:'7C4FADB93408',identity:{name:'Note4'},
-      contact:{label:'蓝牙异常，正在自动恢复',ble_recovery:{state:'recovering',attempt:2},wifi_sampled_at:Math.floor(Date.now()/1000)-60},
+    const fixture = {ble_recovery:{state:'recovering',attempt:2},device:{device_mac:'7C4FADB93408',identity:{name:'Note4'},
+      contact:{label:'最近已认证',wifi_sampled_at:Math.floor(Date.now()/1000)-60},
       firmware:{current:{value:'0.18.104-note4'},latest:{},label:'运行版本高于登记版本'},
       display:{installed:{value:1},active_template:{value:true},data_applied:{value:true},screen_state:{value:'displayed'},label:'屏幕已显示'},
       battery:{value:73},delivery:{enabled:true,required_fields:7},occupancy:{label:'上次观察为已占用'}}};
@@ -116,9 +141,9 @@ window.__wifiUiScenario = async function(scenario) {
       check(name==='platform_device_view','Recovery view must stay passive');return fixture;
     };
     try { await refreshDevice(); } finally {window.__wifiRoundtripInvoke=null;}
-    check($('device-state').textContent.includes('正在自动恢复'),'Missing recovery status');
-    check($('dev-sample-note').textContent.includes('第 2 次'),'Missing recovery attempt');
-    $('device-state').closest('.card').scrollIntoView({block:'start'});
+    check($('device-state').textContent==='最近已认证','Global recovery replaced device contact');
+    check($('bridge-ble-status').textContent.includes('第 2 次'),'Missing global recovery attempt');
+    $('bridge-ble-status').closest('.card').scrollIntoView({block:'start'});
     await wait();await wait();
     return {scenario,width:innerWidth};
   }

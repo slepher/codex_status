@@ -282,6 +282,12 @@ impl Coordinator {
         self.active_template_id = Some(active_template_id.to_string());
         self.requirements = requirements.into_iter().filter(|r| !r.local).collect();
         self.triggers = triggers;
+        self.data.acked_push_fp = None;
+        self.data.acked_full_fp = None;
+        if let Some(context) = self.context.as_mut() {
+            context.acked_push_fp = None;
+            context.acked_full_fp = None;
+        }
         self.data.push_dirty = self.sync_enabled;
         self.recompute_fingerprints();
     }
@@ -306,6 +312,8 @@ impl Coordinator {
             last_content_crc: None,
         });
         self.data.in_flight = None;
+        self.data.acked_push_fp = None;
+        self.data.acked_full_fp = None;
         self.data.push_dirty = self.sync_enabled;
         self.recompute_fingerprints();
         self.last_sequence_reason = Some(reason.into());
@@ -326,22 +334,18 @@ impl Coordinator {
 
     /// Recompute bounded fingerprints and decide whether a push is pending.
     pub fn recompute_fingerprints(&mut self) {
-        let Some(context) = self.context.clone() else {
+        if self.context.is_none() {
             return;
-        };
+        }
         let merged = merge_sources(&self.sources);
         let closure = |f: &str| self.trigger_of(f);
         let push_fp = fingerprint(&merged.fields, &self.requirements, true, &closure);
         let full_fp = fingerprint(&merged.fields, &self.requirements, false, &closure);
-        let push_changed = self.data.push_fp != Some(push_fp);
         self.data.push_fp = Some(push_fp);
         self.data.full_fp = Some(full_fp);
         // Only push-field visible changes trigger delivery; pull-only changes
         // merely update the cache (and piggyback later).
-        if push_changed && self.data.acked_push_fp != Some(push_fp) && self.sync_enabled {
-            self.data.push_dirty = true;
-        }
-        let _ = context;
+        self.data.push_dirty = self.sync_enabled && self.data.acked_push_fp != Some(push_fp);
     }
 
     /// Recompute the complete snapshot from the merged sources.

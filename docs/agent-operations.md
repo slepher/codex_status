@@ -94,7 +94,7 @@ git diff --check                   # 提交前必查
 
 - Wi-Fi元数据（2026-10-11源码候选）：`device.wifi_state=idle/connecting/connected/off`；`device.wifi_blink=0/1`仅connecting存在。固件不决定图形；quad v13、Note4 codex-status-a v3由when实现等待隐藏、连接交替闪烁、成功常亮、终态OFF。Bridge图标仍仅依联系新鲜度，不从Wi-Fi阶段推断。新模板需对应支持新绑定的固件，保存不等于发布；.75部署状态见交接卡。
 
-- 显示规则：配额/账号缺失的表现是**模板属性**，由各变体自己的 `when` 分支决定，不用全局规则统一。200×200 `quad` v15按weekly/monthly真实字段显示余额和重置，月度覆盖周度；PLAN/用户名/长期窗口重置/RC固定在y28/46/64/82，缺用户名/RC隐藏该行；5h不存在时仍显示静态`100`并隐藏其重置时间；400×300 `codex-status-a` v7 与320×240 AP01彩色候选v3按实际窗口绘制：仅weekly恢复历史周额度主位（含prolite），仅monthly显示月度，存在5h时原双栏优先；通过额度区域条件清除与顺序覆盖消除分支重叠，不假设付费必有5h。部署状态看PROGRESS。共享数据侧：`resetCredits.availableCount<=0` 时不下发该字段，模板按 `exists` 隐藏 RC；`bridge.label` 取不到用户名时不绘制。新增变体同步更新本行。
+- 显示规则：配额/账号缺失的表现是**模板属性**，由各变体自己的 `when` 分支决定，不用全局规则统一。200×200 `quad` v15按weekly/monthly真实字段显示余额和重置，月度覆盖周度；PLAN/用户名/长期窗口重置/RC固定在y28/46/64/82，缺用户名/RC隐藏该行；5h不存在时仍显示静态`100`并隐藏其重置时间；400×300 `codex-status-a` v8（电池满电保留四周间隙）与320×240 AP01彩色候选v3按实际窗口绘制：仅weekly恢复历史周额度主位（含prolite），仅monthly显示月度，存在5h时原双栏优先；通过额度区域条件清除与顺序覆盖消除分支重叠，不假设付费必有5h。部署状态看PROGRESS。共享数据侧：`resetCredits.availableCount<=0` 时不下发该字段，模板按 `exists` 隐藏 RC；`bridge.label` 取不到用户名时不绘制。新增变体同步更新本行。
 
 ## 硬件与串口诊断
 

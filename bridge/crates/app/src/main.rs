@@ -108,15 +108,18 @@ fn update_device_status_cache(
     };
     let previous = cache.get(&mac);
     let previous_status = previous.and_then(|entry| entry.status.clone());
-    let owner = if online {
-        status
-            .as_ref()
-            .and_then(|status| status.get("owner"))
-            .filter(|owner| !owner.is_null())
-            .cloned()
-    } else {
-        previous.and_then(|entry| entry.owner.clone())
+    let observed_owner = online.then(|| status.as_ref()?.get("owner")).flatten();
+    let same_boot = status.as_ref().and_then(|s| s["boot_id"].as_str())
+        .zip(previous_status.as_ref().and_then(|s| s["boot_id"].as_str()))
+        .is_some_and(|(current, previous)| current == previous && !current.is_empty());
+    // Missing owner is not an observation of vacancy. Retain only within the
+    // same authenticated boot; the original observation time bounds its lease.
+    let owner = match observed_owner {
+        Some(owner) => (!owner.is_null()).then(|| owner.clone()),
+        None if !online || same_boot => previous.and_then(|entry| entry.owner.clone()),
+        None => None,
     };
+    let owner_observed = observed_owner.is_some();
     cache.insert(
         mac.clone(),
         CachedDeviceStatus {
@@ -125,7 +128,7 @@ fn update_device_status_cache(
             online,
             status: if online { status } else { previous_status },
             owner,
-            owner_observed_at: if online {
+            owner_observed_at: if owner_observed {
                 Some(fetched_at)
             } else {
                 previous.and_then(|entry| entry.owner_observed_at)
@@ -220,6 +223,34 @@ fn device_status_fresh(mac: &str, status: &CachedDeviceStatus, now: i64, ttl_s: 
     status.fetched_at <= now && now.saturating_sub(status.fetched_at) <= ttl_s as i64
 }
 
+/// Only a fresh device observation of the already accepted, unchanged plan
+/// can suppress HTTP. This is a status confirmation, never a fabricated ACK.
+fn confirmed_plan_remaining(
+    mac: &str, cached: &CachedDeviceStatus,
+    plan: &bridge_core::platform::model::PowerPlan, accepted_id: u64, now: i64,
+) -> Option<u32> {
+    use bridge_core::platform::model::PlanMode;
+    if !cached.online || !device_status_fresh(mac, cached, now, 30)
+        || plan.plan_id == 0 || accepted_id != plan.plan_id { return None; }
+    let status = cached.status.as_ref()?;
+    if status["boot_id"].as_str().is_none_or(str::is_empty) { return None; }
+    let power = &status["power"];
+    let mode = match plan.mode { PlanMode::Sleep => "sleep", PlanMode::Light => "light" };
+    if power["plan_id"].as_u64() != Some(plan.plan_id)
+        || power["mode"].as_str() != Some(mode)
+        || power["provisional"].as_bool() != Some(false)
+        || power["rendezvous_period_s"].as_u64() != Some(plan.rendezvous_period_s as u64)
+        || power["granted_s"].as_u64() != Some(plan.light_duration_s as u64) { return None; }
+    let age = match bridge_core::device_clock::monotonic_ms(mac) {
+        Some(now_ms) => now_ms.checked_sub(cached.fetched_mono_ms?)? / 1000,
+        None => now.checked_sub(cached.fetched_at)? as u64,
+    };
+    let remaining = power["remaining_s"].as_u64()?.saturating_sub(age)
+        .min(plan.light_duration_s as u64) as u32;
+    if plan.mode == PlanMode::Light && remaining == 0 { return None; }
+    Some(remaining)
+}
+
 fn device_claim_renew_due(mac: &str, status: &CachedDeviceStatus, now: i64) -> bool {
     if let Some(monotonic) = bridge_core::device_clock::monotonic_ms(mac) {
         return status.last_claim_mono_ms.is_none_or(|at|
@@ -250,7 +281,12 @@ fn device_occupancy_decision(
     if status.yielded {
         return DeviceOccupancyDecision::Yielded;
     }
-    if let Some(owner) = status.owner.as_ref().filter(|owner| owner_valid(owner)) {
+    if let Some(owner) = status.owner.as_ref().filter(|owner| {
+        let lease = owner["expires_in_s"].as_i64()
+            .or_else(|| owner["lease_s"].as_i64()).unwrap_or(60);
+        owner_valid(owner) && status.owner_observed_at.is_some_and(|at|
+            now >= at && now.saturating_sub(at) < lease)
+    }) {
         if owner_id(owner) != Some(bridge_id) {
             return DeviceOccupancyDecision::Other(owner.clone());
         }
@@ -829,7 +865,11 @@ fn refresh_tray(app: &AppHandle, ctx: &Arc<AppCtx>) {
     let app = app.clone();
     let _ = app.clone().run_on_main_thread(move || {
         if let Some(tray) = app.tray_by_id("bridge-tray") {
-            let _ = tray.set_icon(Some(icon::render(percent, state, shape)));
+            // Replacing an NSImage resets its template flag; update both atomically.
+            let _ = tray.set_icon_with_as_template(
+                Some(icon::render(percent, state, shape)),
+                cfg!(target_os = "macos"),
+            );
             let _ = tray.set_tooltip(Some(tip.as_str()));
         }
     });
@@ -861,6 +901,8 @@ fn open_url(url: &str) {
 }
 
 fn show_panel(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    let _ = app.show();
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
@@ -1530,7 +1572,7 @@ async fn post_claim_once(
 ) -> Result<(reqwest::StatusCode, String), ClaimError> {
     let bridge_id = ctx.bridge_id.clone();
     let name = ctx.bridge_name.lock().unwrap().clone();
-    let host = lan_ip();
+    let host = wifi::bridge_address(ctx).await.map_err(ClaimError::Other)?;
     let port = ctx.config.port;
     if ap01::is_ap01(ctx,target_mac) {
         if force || release {return Err(ClaimError::Other("AP01 不支持 force/release；请等待占用租约到期".into()));}
@@ -3587,7 +3629,7 @@ async fn run_ble_services(ctx: Arc<AppCtx>) {
                 Ok(platform::BleOpportunity::NoDevice) => {}
                 Ok(platform::BleOpportunity::Connected { mac, result }) => {
                     last_device_attempt.insert(mac.clone(), device_now_secs(&mac));
-                    if !bridge_ble::native_quarantined() { watchdog::ble_recovered(); }
+                    if !bridge_ble::native_recovery_pending() { watchdog::ble_recovered(); }
                     match result {
                         Ok(()) => {
                             tracing::info!(event = "result", device_mac = %mac,
@@ -3922,7 +3964,7 @@ fn main() {
                     Some(name) => format!("Codex Status 桥 [{name}]"),
                     None => "Codex Status 桥".into(),
                 })
-                .menu(&menu)
+                // macOS must not attach NSStatusItem.menu: AppKit can consume left clicks.
                 .show_menu_on_left_click(false)
                 .on_menu_event({
                     let app_handle = app.handle().clone();
@@ -3974,18 +4016,37 @@ fn main() {
                 })
                 .on_tray_icon_event({
                     let app_handle = app.handle().clone();
+                    #[cfg(target_os = "macos")]
+                    let right_click_menu = menu.clone();
                     move |_tray, event| {
                         if let TrayIconEvent::Click {
                             button: MouseButton::Left,
+                            button_state: MouseButtonState::Down,
+                            ..
+                        } = event
+                        {
+                            tracing::info!("tray left click: opening panel");
+                            show_panel(&app_handle);
+                        }
+                        #[cfg(target_os = "macos")]
+                        if let TrayIconEvent::Click {
+                            button: MouseButton::Right,
                             button_state: MouseButtonState::Up,
                             ..
                         } = event
                         {
-                            show_panel(&app_handle);
+                            if let Some(window) = app_handle.get_webview_window("main") {
+                                tracing::info!("tray right click: opening menu");
+                                if let Err(error) = window.popup_menu(&right_click_menu) {
+                                    tracing::warn!(%error, "tray menu failed");
+                                }
+                            }
                         }
                     }
-                })
-                .build(app)?;
+                });
+            #[cfg(not(target_os = "macos"))]
+            let tray = tray.menu(&menu);
+            let tray = tray.build(app)?;
             let _ = tray;
             spawn_tray_loop(app.handle().clone(), ctx_setup.clone());
             Ok(())
@@ -4233,6 +4294,63 @@ mod device_status_cache_tests {
     };
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn missing_owner_preserves_claim_without_extending_lease_or_crossing_boot() {
+        let mac = "AABBCCDDEE91";
+        let mut cache = HashMap::new();
+        let status = json!({"device_mac":mac,"boot_id":"boot-a"});
+        update_device_status_cache(&mut cache, mac, true, Some(status.clone()), 100);
+        update_device_claim_cache(&mut cache, mac,
+            Some(json!({"id":"ours","expires_in_s":300})), 100, false);
+        update_device_status_cache(&mut cache, mac, true, Some(status.clone()), 130);
+        assert!(matches!(device_occupancy_decision(mac,cache.get(mac),"ours",130),
+            DeviceOccupancyDecision::Owned { renew:false }));
+        assert_eq!(cache[mac].owner_observed_at,Some(100));
+        update_device_status_cache(&mut cache, mac, true, Some(status.clone()), 160);
+        assert!(matches!(device_occupancy_decision(mac,cache.get(mac),"ours",160),
+            DeviceOccupancyDecision::Owned { renew:true }));
+        update_device_status_cache(&mut cache, mac, true, Some(status.clone()), 400);
+        assert!(matches!(device_occupancy_decision(mac,cache.get(mac),"ours",400),
+            DeviceOccupancyDecision::Claim));
+        update_device_claim_cache(&mut cache,mac,Some(json!({"id":"ours","expires_in_s":300})),400,false);
+        update_device_status_cache(&mut cache,mac,true,Some(json!({"boot_id":"boot-b"})),410);
+        assert!(matches!(device_occupancy_decision(mac,cache.get(mac),"ours",410),DeviceOccupancyDecision::Claim));
+        update_device_claim_cache(&mut cache,mac,Some(json!({"id":"ours","expires_in_s":300})),410,false);
+        update_device_status_cache(&mut cache,mac,true,Some(json!({"boot_id":"boot-b","owner":null})),420);
+        assert!(matches!(device_occupancy_decision(mac,cache.get(mac),"ours",420),DeviceOccupancyDecision::Claim));
+        update_device_owner_cache(&mut cache,mac,json!({"id":"other","expires_in_s":30}),420);
+        update_device_status_cache(&mut cache,mac,true,Some(json!({"boot_id":"boot-b"})),430);
+        assert!(matches!(device_occupancy_decision(mac,cache.get(mac),"ours",430),DeviceOccupancyDecision::Other(_)));
+        update_device_status_cache(&mut cache,mac,true,Some(json!({"boot_id":"boot-b"})),451);
+        assert!(matches!(device_occupancy_decision(mac,cache.get(mac),"ours",451),DeviceOccupancyDecision::Claim));
+    }
+
+    #[test]
+    fn confirmed_plan_requires_fresh_matching_device_evidence_and_ack() {
+        use bridge_core::platform::model::PowerPlan;
+        let mac = "AABBCCDDEE92";
+        let plan = PowerPlan::light(7,600,60,"rendezvous");
+        let mut cache = HashMap::new();
+        let status = json!({"boot_id":"boot-a","power":{"plan_id":7,"mode":"light",
+            "provisional":false,"rendezvous_period_s":60,"granted_s":600,"remaining_s":80}});
+        update_device_status_cache(&mut cache,mac,true,Some(status.clone()),100);
+        let check = |cached: &CachedDeviceStatus, ack, now|
+            super::confirmed_plan_remaining(mac,cached,&plan,ack,now);
+        assert_eq!(check(&cache[mac],7,120),Some(60));
+        assert_eq!(check(&cache[mac],0,120),None); // Unknown ACK must not be suppressed.
+        assert_eq!(check(&cache[mac],7,131),None);
+        for (field,value) in [("plan_id",json!(8)),("mode",json!("sleep")),
+            ("provisional",json!(true)),("granted_s",json!(300)),
+            ("rendezvous_period_s",json!(120)),("remaining_s",json!(0))] {
+            let mut changed=status.clone();changed["power"][field]=value;
+            update_device_status_cache(&mut cache,mac,true,Some(changed),100);
+            assert_eq!(check(&cache[mac],7,100),None,"{field}");
+        }
+        update_device_status_cache(&mut cache,mac,true,Some(status),100);
+        update_device_status_cache(&mut cache,mac,false,None,101);
+        assert_eq!(check(&cache[mac],7,101),None);
+    }
 
     #[test]
     fn new_work_bypasses_retry_gate_but_unconfirmed_data_does_not() {

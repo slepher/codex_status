@@ -442,6 +442,7 @@ extern "C" {
     fn codex_sim_wifi_poll(now: u64, peer: *const c_char, generation: u32, encrypted: c_int, outcome: c_int, start_allowed: c_int) -> c_int;
     fn codex_sim_wifi_storage_failure(fail: c_int);
     fn codex_sim_wifi_constrain(now:u64,until:u64,owner_allowed:c_int);
+    fn codex_sim_wifi_high_water(principal:*const c_char,namespace:*const c_char)->u64;
     fn codex_sim_wifi_storage_status(out:*mut c_char,cap:c_int)->c_int;
     fn codex_sim_wifi_observe(out:*mut c_char,cap:c_int)->c_int;
     fn codex_sim_wifi_plan_matches(target:*const c_char)->c_int;
@@ -1604,6 +1605,10 @@ impl SimulatorWifi {
     pub fn poll_with_start_allowed(&mut self, now: u64, peer: &str, generation: u32, encrypted: bool, outcome: i32, start_allowed: bool) -> anyhow::Result<bool> {
         let peer = CString::new(peer)?;
         Ok(unsafe { codex_sim_wifi_poll(now, peer.as_ptr(), generation, encrypted as c_int, outcome,start_allowed as c_int) } == 1)
+    }
+    pub fn high_water(&mut self,principal:&str,namespace:&str)->anyhow::Result<u64> {
+        let principal=CString::new(principal)?;let namespace=CString::new(namespace)?;
+        Ok(unsafe{codex_sim_wifi_high_water(principal.as_ptr(),namespace.as_ptr())})
     }
     pub fn storage_status(&mut self)->anyhow::Result<serde_json::Value> {
         let mut out=vec![0i8;2048];let rc=unsafe{codex_sim_wifi_storage_status(out.as_mut_ptr(),out.len() as c_int)};

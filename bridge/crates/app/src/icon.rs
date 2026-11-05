@@ -119,18 +119,16 @@ fn draw_text(px: &mut [u8], text: &str, x: i32, y: i32, scale: i32, c: [u8; 4]) 
     }
 }
 
-/// Draw the tray icon: status-colored plate with the percent value as digits.
+/// macOS uses a template alpha mask; other platforms use a status-colored plate.
 pub fn render(percent: Option<i32>, state: State, shape: Shape) -> Image<'static> {
     let mut px = vec![0u8; (SIZE * SIZE * 4) as usize];
-    let plate = if cfg!(target_os = "macos") {
-        [0, 0, 0, 255]
-    } else {
-        state.color()
-    };
-    for y in 0..SIZE as i32 {
-        for x in 0..SIZE as i32 {
-            if shape.contains(x, y) {
-                set_pixel(&mut px, x, y, plate);
+    let macos = cfg!(target_os = "macos");
+    if !macos {
+        for y in 0..SIZE as i32 {
+            for x in 0..SIZE as i32 {
+                if shape.contains(x, y) {
+                    set_pixel(&mut px, x, y, state.color());
+                }
             }
         }
     }
@@ -142,9 +140,9 @@ pub fn render(percent: Option<i32>, state: State, shape: Shape) -> Image<'static
     let w = text_width(&text, scale);
     let x = (SIZE as i32 - w) / 2;
     let y = (SIZE as i32 - 5 * scale) / 2;
-    // Template images use alpha; opaque white would hide the digits on macOS.
+    // Template foreground must be opaque; macOS supplies the visible color.
     let ink = if cfg!(target_os = "macos") {
-        [0, 0, 0, 0]
+        [0, 0, 0, 255]
     } else {
         [255, 255, 255, 255]
     };
@@ -155,6 +153,28 @@ pub fn render(percent: Option<i32>, state: State, shape: Shape) -> Image<'static
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn template_masks_show_only_centered_digits() {
+        for shape in [Shape::Square, Shape::Circle, Shape::Diamond] {
+            for percent in [None, Some(0), Some(50), Some(100)] {
+                let ok = render(percent, State::Ok, shape);
+                let stale = render(percent, State::Stale, shape);
+                let error = render(percent, State::Error, shape);
+                let no_data = render(percent, State::NoData, shape);
+                assert_eq!(&ok.rgba()[..4], &[0, 0, 0, 0]);
+                assert!(ok.rgba().chunks_exact(4).any(|p| p[3] == 255));
+                assert!(ok.rgba().chunks_exact(4).all(|p| p[..3] == [0, 0, 0]));
+                assert_eq!(ok.rgba(), stale.rgba());
+                assert_eq!(ok.rgba(), error.rgba());
+                assert_eq!(ok.rgba(), no_data.rgba());
+                // No status marks below the centered digits.
+                let numeric_end = (23 * SIZE * 4) as usize;
+                assert!(ok.rgba()[numeric_end..].iter().all(|b| *b == 0));
+            }
+        }
+    }
 
     #[test]
     fn backgrounds_are_visibly_distinct() {

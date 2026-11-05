@@ -1,0 +1,42 @@
+# Codex Status 当前交接
+
+更新时间：2026-11-05，Asia/Shanghai。
+
+## 当前部署
+
+- Windows默认Bridge已部署单一共享族网络工作台（含有线回退提示更正）并重启：`bridge/target/debug/bridge-app.exe`，39005184 B，SHA256 `14c519e07efaa9e13f5ce5d08a9985c0ae627993578c38abf43608735a6575d4`。health204/MCP44、主进程/watchdog/端口核验通过；旧exe及295文件data完整备份校验，3族/3设备配置、模板/Profile/设置及凭据保留。[验收](project-workflow/wifi-families/status.md)
+
+- 当前Mac（arm64）Bridge已首次构建/启动：`artifacts/bridge-macos/Codex Status Bridge.app`，exe 81394752 B，SHA256 `de3e039fddefcfb8b45e37ddca86359f0f7af7f781035317eddcf767130578df`。按需LaunchAgent supervisor51790/child51794，8765健康204、8766 MCP初始化通过，Codex app-server已启动。该机原无应用/运行数据，当前data已导入恢复的3组Wi-Fi，AP01已重新配对并认证登记；Note4因不在身边待配对，未验设备投递；此前Mac数据/设备ACK记录不能视为本机现场。Rust1.99.1、ArduinoJson7.0.4；托盘左键打开面板、右键菜单：Mac取消自动菜单挂载，改为右键显式弹出，用户两键实测正常；Windows源码保持同逻辑、未部署；已修复未选设备时初始化异常及主机网络按钮漏授权，Node/WK80和窄宽截图通过，用户已确认真实权限弹窗允许；菜单栏刷新已改原子保留系统模板模式，透明底居中数字，已按用户要求移除全部额外状态标记；定向2测试通过，原应用/data已备份。仅数字版本重建/重启，health204/MCP ping通过。旧数据迁移包未含Bridge目录；从历史对话找回2台Mac设备登记与3组Wi-Fi/历史密码，私有恢复清单在`artifacts/bridge-macos/recovered-device-wifi-20261102.json`；3组2.4G密码已导入并逐项读回一致，已按用户要求将3组5G密码设为对应2.4G密码并读回一致（库revision2），未推送设备网络。仓库5模板已校验并导入平台库，建立3个屏幕族的“仓库默认”本地配置；未绑定/发布设备。[记录](project-workflow/bridge-macos/tray-contrast-20261102.md)。
+- AP01 `34F01557210B`：11-05当前槽1，CUKTECH ROM `0.1.0-cuktech`（基于0041），build `677bc30246d7ae8f7cd73698fe4086d6`；独立App `0.18.108-ap01`已安装，集合2 succeeded/healthy、清理完成。版本诊断与运行列表一致。App版本由本仓 `ports/ap01/build-0041.json` 声明，基座独立发版。[产物哈希与验收](project-workflow/ap01-app-set-v3/status.md)。
+- AP01槽0现为 `0.1.0-cuktech` 无载入器救援基座；槽1升级未写槽0，头/构建标识/尾抽样一致。两槽Wi-Fi 3项/revision7/当前网络一致；未改配置、未重新目视验界面。旧0031槽0记录已被本次授权部署取代。
+- Note4 `7C4FADB93408`：11-05按用户明确授权USB部署基于.106的`.108-note4`到`ota_0`，串口同MAC/版本/槽已确认；原`.107`保留`ota_1`，NVS/Bundle未写。ROM `artifacts/bridge-macos/note4-0.18.108-bond-reconnect.bin`，1873040B，SHA256 `13019165228c888a25f40e8c9f8566673419a5a57d25fcf4b591a44b06b467fa`，全镜像读回逐字节一致。自然窗口外原绑定重连/认证HTTP通过；Xiaomi_1EBB@192.168.31.90，Data seq5 applied/displayed。[记录](project-workflow/bridge-macos/device-add-20261105-status.md)
+
+## 活跃事项与下一步
+
+- 11-05 Note4电池图标已修复并发布：codex-status-a v8，满电左右1px/上下2px白边；0/50/99/100%同源渲染及像素断言通过。Bridge库同步，完整Bundle34329d8f/事务24725a35 succeeded；独立认证同MAC、合同5ad7964c、commit_seq1149、ready/error空，Data9 displayed；ROM仍.108。用户已确认效果正常；认证时电量93%，满电边距由宿主像素验收。[记录与预览](project-workflow/bridge-macos/note4-battery-icon-20261105.md)。
+
+- 11-05 Mac添加设备/Note4现场修复已部署：AP01搜索可关闭、迟到响应围栏、全局BLE错误不污染设备卡、设备码只限AP01；首次配对使用显式绑定入口；首次无IP联网解除循环依赖，TUN下登记/Plan/claim及续租使用实际Wi-Fi接口。Bridge exe81482064B，SHA256 `ddff5b57a7470de3088de0b35f6e2359db6112e7ca99f4fdfdf58d5d9af90a43`。Node/WK82/窄宽图、Rust无IP/准入及claim9测试通过。Note4部署.108后自然窗口外原绑定加密重连通过、联网Xiaomi_1EBB、HTTP认证及Data seq5 displayed；owner host实测192.168.31.66。首次联网会合预算超时后独立认证报告成功；长Flash备份中断，实际保全引导/NVS及将覆盖区域分块备份，原.107槽未写。B6/C8完整矩阵仍未结。[状态](project-workflow/bridge-macos/device-add-20261105-status.md)
+
+- C9 独立 App：按用户边界，App 可执行包 OTA（单更/批更、回执、重启切换、回退及客户端）归兄弟 firmware 仓库；本仓撤出 App OTA Rust/UI/MCP 接线，保留业务 Bundle/C2/配对协议、只读恢复和 ABI 3.1 App 适配。原 Bridge OTA 实现留存于 firmware 的 docs/history/app-ota-bridge，维护入口为 tooling/scripts/app-set-client-v3.py。未启停 Bridge、未动运行数据、未部署；当前迁移验收见[状态](project-workflow/ap01-app-set-v3/status.md)。业务协议整改独立继续。
+
+- 协议整改 P0 源码/软件验收完成，已提交、未部署：HTTP 会话复用与重放、BLE 错误/四槽队列/Notify 退避/可恢复冷却；workspace522通过/5条件忽略，最终core+ble245通过/2忽略，Note4构建及匹配ELF栈88项通过。**未部署同版本候选** `artifacts/protocol-p0/note4-p0-0.18.106.bin`，1872736 B，SHA256 `1b93bf34f4139c21d322fb0a8a3c93d9333503fb056663c4771f8a07bfaeb864`；现场ROM不变。新工具链、资源预算及实机边界见[状态](project-workflow/bridge-device-protocol-remediation/status.md)。A9/B6/C8实机未结，P1/P2未实施。
+
+- Wi-Fi页面重整已提交`53a1fdd`并部署Windows默认实例：唯一共享族列表/编辑器、比较页明确导入、有线回退/概览/恢复工具归位。Node/Edge80/窄宽审阅及隔离构建通过；macOS缺swiftc，B6实机未验。01:41部署备份与数据核验见[状态](project-workflow/wifi-families/status.md)，未刷ROM或手动切网。
+
+- Wi-Fi族Windows已部署，旧网络已合并3族（2异名双频+1同名双频；3设备均只连2.4G），密码保留；Note4选3族/BW保留原1族，AP01手选不变。共享族库/有线指定、Note/BW现有字段传族名。Rust337/定向56、Node/Edge12通过；macOS原生/部署及实机切网归B6。[状态](project-workflow/wifi-families/status.md)。
+
+- 书桌屏 `70041DD7A340`：USB部署`.38-bw`/`ota_0`，ROM `artifacts/desk-ota-20261026/desk-0.18.38-bw.bin`，1837008 B，SHA256 `2b002a21e2673a96a4c519fb746219737911a82f577a2b5597cb2a89fba6580e`，认证运行镜像SHA已匹配。原`.37`槽1/模板保留；154g构建、200/400宿主布局、匹配ELF栈通过，Note4未构建/部署。用户授权后经USB JTAG将原通用凭据转换为119B共享active WFS4，仅写NVS的0xC000扇区，完整NVS读回一致且原记录保留；实机加载1条/format4，HTTP确认connected/IP192.168.3.163。
+- 旧quad v12含退役device.state；兼容v15+mini完整Bundle `99dc6326` 已用原事务续传，COMMIT显示displayed，认证commit_seq4097/context `ffaf4e43e43639c1`、quad active、content ready/error空；Bridge对账succeeded。用户随后确认模板已显示；按最新要求已开启sync_enabled并持久解除书桌屏暂停，HTTP数据seq288 ACK displayed且认证applied_seq288/content_error空。此前实体BOOT169ms内响应。Windows JTAG接口已安装签名官方驱动oem88.inf，诊断临时Bridge配置仍保持还原。调试/恢复期间记录RTC WDT重启，根因未定；最后两次HTTP同wake/uptime160→175，不能扩大为长期稳定验收。B6证据：[状态](project-workflow/builtin-radio-status/status.md)、`artifacts/desk-ota-20261026/`。
+
+- AP01 构建已统一到兄弟固件仓库，App 仅源码/配置及兼容入口；独立版/App版、隔离构建和旧命令验证通过，均未部署。[记录](project-workflow/ap01-unified-build/status.md)
+- 未部署 platform ROM：`D:\Documents\PlatformIO\Projects\cuktech-ap01-firmware\build\unified-0041\platform.bin`，6875656 B，SHA256 `d77900bf5ce60ac9d1139a37d7a7314e75f2a6ac1f021eb7f04bfd9b440e2859`。
+- 未部署 codex-status ROM：`D:\Documents\PlatformIO\Projects\cuktech-ap01-firmware\build\unified-0041\codex-status-commit.bin`，7044408 B，SHA256 `7cf24650ed8b24323e42b1b4a5400f5b05aa0d0f52c81127c2271c2c7d4e4183`。
+
+- C9：AP01用量80多时画面/旋钮无响应，用户拔电后恢复；同部署build、认证displayed。用量重置关联未证，旧栈/死机前日志缺失，根因未知；未刷机。[调查](project-workflow/ap01-template-integration/freeze-20261028.md)
+- 默认同步已提交，core/app/mcp 338通过/5忽略；应用及完整data已私有备份，重建期间data哈希一致。Bridge监督修复已随重建部署。
+- C9：共享宿主有效帧、Wi-Fi菜单及首尾循环动画修复已部署；原生红绿/宿主消毒器/菜单回归及用户视觉验收通过，不扩大为全部GPIO或逐帧保证。10-22末轮未切网/改列表，临时UU清理未执行；此前失联后按键重连原因未定。[调查与实机](project-workflow/ap01-wifi-profiles/animation-20261022.md)
+- 较早四日审查候选已由上述部署记录接续，不再代表当前ROM；历史候选/资源证据见[审查](project-workflow/review-fixes-20261022/status.md)。物理RF/掉电/完整栈高水位、A9/B6/C8新余量时延/跨会话通知/Windows及长期合盖恢复仍开放，60秒兜底保留。[唯一待办](docs/roadmap/backlog.md)
+
+## 证据
+
+[默认同步前卡](docs/history/progress-archive-2026-10-23-before-default-data-sync.md)、[完整历史](docs/history/progress-archive-2026-10-22-before-review-fixes.md)。旧产物释放27.69GiB，部分历史链接可能失效。实机证据在`artifacts/ap01-entry-rollout-20261022/`、`artifacts/ap01-wifi-animation-rollout-20261022/`；同步备份/证据在`artifacts/default-data-sync-20261023/`。日志/SSID/绑定原文仅留私有artifacts。

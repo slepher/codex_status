@@ -61,6 +61,10 @@ extern "C" int codex_sim_wifi_read_page(const char *input,const char *peer,uint3
     if(response.length()>=(size_t)cap)return -2;memcpy(out,response.c_str(),response.length()+1);return response.length();
 }
 
+extern "C" uint64_t codex_sim_wifi_high_water(const char *principal,const char *nameSpace) {
+    return wifiManagementHighWater(principal,nameSpace);
+}
+
 extern "C" int codex_sim_wifi_storage_status(char *out,int cap) {
     JsonDocument doc;wifiSchemesStorageStatus(doc.to<JsonObject>());
     String response;serializeJson(doc,response);if(response.length()>=(size_t)cap)return -2;

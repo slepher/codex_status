@@ -12,6 +12,9 @@ struct Ap01BusinessPort {
     bool (*present)(void *, uint8_t *, uint32_t);
     bool (*retire)(void *) = nullptr;
     const char *(*displayReason)(void *) = nullptr;
+    // Optional resident write admission: 1 means no callback (retry later),
+    // 0 means callback ran with its result in out; negative means unavailable.
+    int32_t (*writeScope)(void *,int32_t (*)(void *),void *,int32_t *) = nullptr;
 };
 
 class Ap01Business {
@@ -32,6 +35,8 @@ class Ap01Business {
     std::atomic<uint32_t> displayedGeneration{0};
     std::atomic<uint32_t> failedGeneration{UINT32_MAX};
     bool configured = false, storageUnknown = false, replacing = false;
+    std::atomic<bool> writesEnabled{true};
+    bool writeResumeFailed=false; // Serialized business worker; no repeated migration after failure.
     void newContext(char (&out)[BS_CTX_LEN]);
     bool loadActive(uint64_t now);
     bool render();
@@ -41,7 +46,11 @@ public:
     TemplateRenderer renderer;
     BundleStore store;
     Ap01Business(BundleFilesystem &filesystem, const Ap01BusinessPort &port, uint64_t bootId);
-    bool begin(uint64_t now);
+    // Trial/rollback entry passes readOnly=true. After durable approval, the
+    // serialized executor calls begin(now,false) to establish a fresh context.
+    bool begin(uint64_t now, bool readOnly = false);
+    bool syncWritePermission(uint64_t now,bool allow);
+    bool writesAllowed() const {return writesEnabled.load(std::memory_order_acquire);}
     void clock(const char *hhmm);
     bool redraw() { return configured && render(); }
     void displayed(uint32_t value) { displayedGeneration.store(value, std::memory_order_release); }
@@ -54,7 +63,8 @@ public:
     uint8_t active() const { return profile.initial; }
     const char *screenId(unsigned index) const { return configured && index < profile.count ? profile.ids[index] : ""; }
     const char *context() const { return profile.contextId; }
-    bool localActivate(uint8_t index, uint64_t now);
+    // Retry is true only when write admission declined before any mutation.
+    bool localActivate(uint8_t index, uint64_t now, bool *retry = nullptr);
     void status(JsonDocument &out);
     int command(uint16_t op, JsonDocument &request, const char *nonce, uint64_t now,
                 const uint8_t *body, size_t bytes, const char *requestId,

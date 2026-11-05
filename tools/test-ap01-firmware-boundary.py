@@ -16,6 +16,20 @@ for name in ('application.cpp','application.h','native_0041.cpp','http.cpp','htt
 for name in ('firmware.h','firmware_smoke.cpp','ota_image.h','slot_0041.h','native_wifi_switch_0041.h'):
     assert not (repo/'ports/ap01'/name).exists(),name
 
+# App executable OTA is firmware-owned, including its client and UI.
+for relative in ('bridge/crates/core/src/ap01_app_set.rs',
+                 'bridge/crates/core/src/ap01_app_set_install.rs',
+                 'bridge/crates/core/src/ap01_app_set_receipt.rs',
+                 'bridge/crates/app/src/ap01_app_update.rs'):
+    assert not (repo/relative).exists(),relative
+for relative in ('bridge/crates/app/src/main.rs','bridge/crates/app/src/ap01.rs',
+                 'bridge/crates/core/src/device_client.rs','bridge/crates/core/src/lib.rs',
+                 'bridge/crates/mcp/src/lib.rs','bridge/crates/app/ui/index.html'):
+    source=(repo/relative).read_text(encoding='utf-8')
+    for token in ('ap01_app_update','ap01_app_set','/api/app/v3/','app-update-card'):
+        assert token not in source,(relative,token)
+assert (platform.parent/'scripts/app-set-client-v3.py').is_file()
+
 owned=('native_firmware_0041.cpp','native_slot_0041.cpp','native_wifi_switch_0041.cpp',
        'native_wifi_switch_port_0041.cpp','native_device_code_menu_0041.cpp',
        'native_maintenance_0041.cpp','native_services_0041.cpp','native_http_transport_0041.cpp')

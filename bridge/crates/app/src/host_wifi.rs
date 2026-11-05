@@ -14,12 +14,13 @@ pub fn read(request_permission: bool) -> Value {
 }
 
 /// 0: passive check, 1: location, 2: Bluetooth, 3: sequential combined request.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(test)))]
 pub fn permissions(request: i32) -> Value {
     unsafe extern "C" { fn codex_permissions_read(request: i32) -> *mut std::ffi::c_char; }
     unsafe { native_json(codex_permissions_read(request), json!({"platform":"macos","location":"unavailable","bluetooth":"unavailable"})) }
 }
-#[cfg(not(target_os = "macos"))]
+#[cfg(any(not(target_os = "macos"), test))]
+// Unit tests have no Cocoa main loop and must not request real permissions.
 pub fn permissions(_request: i32) -> Value { json!({"platform":"other"}) }
 
 #[cfg(any(target_os = "macos", test))]

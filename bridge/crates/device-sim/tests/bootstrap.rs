@@ -430,9 +430,11 @@ fn fixed_frame_http_rejects_malformed_identity_and_retired_requests() {
     assert_ne!(opened.session,[0;16]);
     assert_eq!(serde_json::from_slice::<Value>(body).unwrap()["status_projection"],"compact");
     let (replay_code,replay)=wire_frame_request(sim.address(),"/api/status",&opening,true);
-    assert_eq!(replay_code,409);
-    assert_eq!(json_body(&replay)["error"],"retired",
-        "a reply over the 512-byte retention budget must not reopen the session");
+    assert!(reply.len()>512, "exercise uncached status response");
+    assert_eq!(replay_code,200);
+    assert_eq!(Header::decode(&replay,4096).unwrap().0.session,opened.session,
+        "uncached read replay must not reopen the session");
+    assert_eq!(json_body(&replay)["status_projection"],"compact");
     status.op=3;status.request_no=2;status.session=opened.session;
     let invalid=br#"{"request_id":"synthetic-invalid"}"#;
     status.payload_len=invalid.len() as u16;
@@ -440,7 +442,7 @@ fn fixed_frame_http_rejects_malformed_identity_and_retired_requests() {
     let (first_code,first)=wire_frame_request(sim.address(),"/api/plan",&frame,true);
     assert!(matches!(first_code,200|400|409));
     let (replay_code,replay)=wire_frame_request(sim.address(),"/api/plan",&frame,true);
-    assert_eq!(replay_code,200);
+    assert_eq!(replay_code,first_code,"replay must preserve the original HTTP error status");
     assert_eq!(replay,first,"the retained identical result must be returned verbatim");
     let (old_open_code,old_open)=wire_frame_request(sim.address(),"/api/status",&opening,true);
     assert_eq!(old_open_code,409);
@@ -3511,7 +3513,8 @@ fn unified_usb_http_without_ble_survives_bridge_restart_lost_ack_and_receipt_ret
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let mut link=bridge_ble::DeviceConnection::connect(mac,ENDPOINT,"bridge-test").await.unwrap().unwrap();assert_eq!(link.info["wifi_management"],3);
             link.write_endpoint("127.0.0.1",8765,ENDPOINT).await.unwrap();
-            let full=link.wifi_read("wifi_status").await.unwrap();assert_eq!(full["presence"]["mode"],"continuous");
+            let control=link.wifi_read("wifi_status").await.unwrap();assert_eq!(control["wifi_control"]["mode"],"continuous");
+            assert_eq!(control["wifi_control"]["transaction_high_watermark"],u64::from_str_radix(job.request_id.strip_prefix("w3_").unwrap(),16).unwrap());
             assert_eq!(link.command("wifi_result",serde_json::json!({"query_id":job.request_id})).await.unwrap()["outcome"],"committed");
             let snapshot=link.wifi_snapshot().await.unwrap();assert_eq!(snapshot["revision"],1);assert_eq!(snapshot["networks"].as_array().unwrap().len(),1);
             link.close().await;
@@ -4018,9 +4021,12 @@ fn fake_ble_device_remote_close_reconnect_and_unknown_quarantine() {
         link.close_bounded(Duration::from_millis(100)).await;
         let before=json_body(&request(sim.address(),"GET","/sim/ble/device",Some(CONTROL),b"").1);
         let error=bridge_ble::DeviceConnection::connect("0200000000C4",ENDPOINT,"bridge-test").await.err().expect("unknown close must block reconnect");
-        assert!(error.to_string().contains("ble_native_quarantined_restart_required"),"{error:#}");
+        assert!(error.to_string().contains("ble_native_cooldown"),"{error:#}");
         let after=json_body(&request(sim.address(),"GET","/sim/ble/device",Some(CONTROL),b"").1);
-        assert_eq!(before,after,"quarantined reconnect must not touch peripheral");
+        assert_eq!(before,after,"cooldown reconnect must not touch peripheral");
+        tokio::time::sleep(Duration::from_millis(3050)).await;
+        let link=bridge_ble::DeviceConnection::connect("0200000000C4",ENDPOINT,"bridge-test").await.unwrap().unwrap();
+        link.close_bounded(Duration::from_millis(300)).await;
         eprintln!("Fake BLE lifecycle: 3 StaticJson frames verified; remote-first and stale-generation close recovered; missing callback blocks reconnect.");
     });
 }

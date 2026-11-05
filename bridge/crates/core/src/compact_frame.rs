@@ -16,6 +16,10 @@ pub fn operation_name(op: u16) -> Option<&'static str> {
     OPERATIONS.get(usize::from(op)).copied().filter(|n|!n.is_empty())
 }
 
+pub fn is_idempotent_read_op(op: u16) -> bool {
+    matches!(op, 1 | 7 | 14 | 16 | 21 | 25 | 26 | 27 | 28 | 31 | 33 | 34 | 35)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
     pub kind: u8,
@@ -29,8 +33,9 @@ pub struct Header {
 
 impl Header {
     fn valid(&self) -> Result<(), &'static str> {
-        if self.kind > 2 || self.op == 0 || self.op > MAX_OP || self.result > 3
-            || (self.kind != 1 && self.result != 0) || self.request_no == 0
+        let transport_error = self.kind == 1 && self.result == 2 && self.op == 0 && self.request_no == 0;
+        if !transport_error && (self.kind > 2 || self.op == 0 || self.op > MAX_OP || self.result > 3
+            || (self.kind != 1 && self.result != 0) || self.request_no == 0)
         {
             return Err("invalid frame header");
         }
@@ -99,15 +104,21 @@ impl RequestFence {
         use sha2::{Digest, Sha256};
         if number == 0 { return Admission::Retired; }
         if number > self.highest { return Admission::New; }
-        if number < self.highest || self.response.is_empty() { return Admission::Retired; }
+        if number < self.highest { return Admission::Retired; }
         let digest: [u8; 32] = Sha256::digest(frame).into();
         if digest != self.digest { return Admission::Conflict; }
+        if self.response.is_empty() {
+            return if Header::decode(frame, MAX_HTTP_FRAME).ok()
+                .is_some_and(|(h, _)| h.kind == 0 && is_idempotent_read_op(h.op)) {
+                Admission::New
+            } else { Admission::Retired };
+        }
         Admission::Replay(&self.response)
     }
 
     pub fn retain(&mut self, number: u64, frame: &[u8], response: &[u8]) {
         use sha2::{Digest, Sha256};
-        assert!(number > self.highest && number != 0);
+        assert!(number != 0 && (number > self.highest || matches!(self.inspect(number, frame), Admission::New)));
         self.highest = number;
         self.digest = Sha256::digest(frame).into();
         self.response.clear();
@@ -120,6 +131,32 @@ impl RequestFence {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uncached_read_reexecutes_but_changed_payload_and_writes_do_not() {
+        for op in 1..=MAX_OP {
+            let h = Header { kind: 0, op, result: 0, payload_len: 2,
+                session: [1;16], request_no: 1, context: [0;16] };
+            let mut frame = h.encode().unwrap().to_vec(); frame.extend_from_slice(b"{}");
+            let mut fence = RequestFence::default();
+            fence.retain(1, &frame, &vec![0;513]);
+            assert_eq!(fence.inspect(1, &frame), if is_idempotent_read_op(op) { Admission::New } else { Admission::Retired });
+            let mut changed = frame.clone(); *changed.last_mut().unwrap() = b' ';
+            assert_eq!(fence.inspect(1, &changed), Admission::Conflict);
+            if is_idempotent_read_op(op) {
+                fence.retain(1, &frame, b"new snapshot");
+                assert_eq!(fence.inspect(1, &frame), Admission::Replay(b"new snapshot"));
+            }
+        }
+    }
+
+    #[test]
+    fn uncorrelated_error_header_is_response_only() {
+        let mut h = Header {kind:1,op:0,result:2,payload_len:0,session:[0;16],request_no:0,context:[0;16]};
+        assert!(Header::decode(&h.encode().unwrap(), 512).is_ok());
+        h.kind=0; assert!(h.encode().is_err());
+        h.kind=1; h.result=0; assert!(h.encode().is_err());
+    }
 
     #[test]
     fn every_operation_matches_firmware_without_alias_or_wildcard() {

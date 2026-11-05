@@ -48,3 +48,7 @@ String bleRecoveryTrialJson(char variant, uint32_t runId);
 #define BLE_CHR_TPLCTL "e7f1a005-4b2a-4c9e-9a11-3c0d5e9a0000"
 #define BLE_CHR_TPLDAT "e7f1a006-4b2a-4c9e-9a11-3c0d5e9a0000"
 #define BLE_CHR_AUTH   "e7f1a007-4b2a-4c9e-9a11-3c0d5e9a0000"
+
+void bleReplyTransportError(const uint8_t *prefix, size_t length, const char *code, const char *stage);
+
+void blePollCommandTimeout();

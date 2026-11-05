@@ -321,12 +321,14 @@
       <div class="card">
         <h2>当前屏幕</h2>
         <div id="registered-devices" class="plist muted">加载中…</div>
-        <div class="action-strip"><button onclick="ap01Search()">添加 AP01 · 局域网</button><button onclick="wifiAddDevice()">通过蓝牙添加设备</button></div>
+        <div class="action-strip"><button onclick="ap01Search()">添加 AP01 · 局域网</button><button id="ble-add-button" onclick="wifiAddDevice()">通过蓝牙添加设备</button></div>
+        <p id="bridge-ble-status" role="status" hidden></p>
+        <p id="ble-add-result" role="status" aria-live="polite" hidden></p>
         <div id="ap01-add" hidden>
           <p id="ap01-code" class="ap01-code" hidden aria-label="设备配对码"></p>
           <p id="ap01-result" role="status" aria-live="polite"></p>
           <div id="ap01-candidates" class="plist"></div>
-          <div class="action-strip"><button onclick="ap01CancelSearch()">停止搜索</button></div>
+          <div class="action-strip"><button id="ap01-stop-search" onclick="ap01CancelSearch()" hidden>停止搜索</button><button onclick="ap01Close()">关闭</button></div>
         </div>
       </div>
       <div class="card wifi-card" id="wifi-card">
@@ -342,11 +344,11 @@
         </div>
         <div class="wifi-summary">
           <div class="row"><span>主机当前 Wi-Fi</span><span id="wifi-host">尚未读取</span></div>
-          <p id="wifi-auto" role="status" aria-live="polite"></p><div class="action-strip"><button id="wifi-current-action" onclick="wifiEditCurrent()" hidden>配置当前网络</button><button id="wifi-current-retry" onclick="wifiRetryCurrent()" hidden>重新尝试连接</button></div><p id="wifi-times" class="muted"></p><div class="action-strip"><button onclick="wifiHost(false)">读取主机网络</button><button onclick="wifiRefreshView()">刷新本地缓存</button></div>
+          <p id="wifi-auto" role="status" aria-live="polite"></p><div class="action-strip"><button id="wifi-current-action" onclick="wifiEditCurrent()" hidden>配置当前网络</button><button id="wifi-current-retry" onclick="wifiRetryCurrent()" hidden>重新尝试连接</button></div><p id="wifi-times" class="muted"></p><div class="action-strip"><button id="wifi-host-read" onclick="wifiHost(true)">读取主机网络</button><button onclick="wifiRefreshView()">刷新本地缓存</button></div>
         </div>
         <div id="wifi-ap01-auth" hidden>
           <p class="section-note">AP01 保持旋钮手动选网。同步只更新保存列表；设备读取不提供密码。</p>
-          <div class="wifi-field"><label for="wifi-ap01-code">设置 → 设备码（八位）</label><input id="wifi-ap01-code" type="password" inputmode="numeric" maxlength="8" autocomplete="off"><small>只用于本次维护请求，不保存。</small></div>
+          <div class="wifi-field"><label for="wifi-ap01-code">设置 → 设备码（八位）</label><input id="wifi-ap01-code" type="password" inputmode="numeric" maxlength="8" autocomplete="off"><small>验证成功后按设备保存；留空使用已保存的设备码。</small></div>
           <button onclick="wifiQueue('ap01_reconcile')">只读核对上次列表操作</button>
           <button onclick="wifiAp01Accept()">接受读回列表并解除未知结果阻挡</button>
         </div>
@@ -1093,7 +1095,7 @@
   let wifiLibrary={revision:0,families:[],devices:{},wired_family:null},wifiFamilyEditing=null,wifiManualSelection=false,wifiFamilySelectionDirty=false,wifiWiredDirty=false;
   function wifiNetworkKey(){return wifiHostNetwork&&Object.hasOwn(wifiHostNetwork,'family_name')?wifiHostNetwork.family_name:(wifiHostNetwork?.state==='connected'?wifiHostNetwork.networks?.[0]?.ssid:null);}
   function wifiFamilyRender(){
-    const families=wifiLibrary.families||[],selected=wifiLibrary.devices?.[selectedTarget()]||[];
+    const families=wifiLibrary.families||[],selected=wifiLibrary.devices?.[selectedDeviceMac]||[];
     const draft=wifiFamilySelectionDirty?[...document.querySelectorAll('[data-wifi-family]:checked')].map(e=>e.dataset.wifiFamily):selected;
     const credential=p=>p==null?'凭据待补充':p===''?'开放网络':'密码已存';
     $('wifi-family-list').innerHTML=families.map((f,i)=>`<div class="prow"><label class="wifi-family-check"><input type="checkbox" onchange="wifiFamilySelectionDirty=true;wifiFamilyCount()" data-wifi-family="${escapeHtml(f.id)}" ${draft.includes(f.id)?'checked':''}><span class="pmeta"><b>${escapeHtml(f.name)}</b><small>2.4G: ${escapeHtml(f.ssid_2g||'无')} · ${credential(f.password_2g)}<br>5G: ${escapeHtml(f.ssid_5g||'无')}${f.ssid_5g?' · '+credential(f.password_5g):''}</small></span></label><button onclick="wifiFamilyEdit(${i})">编辑族</button><button onclick="wifiFamilyDelete(${i})">删除族</button></div>`).join('')||'尚无共享族，点击“新增共享族”开始配置。';
@@ -1140,7 +1142,7 @@
   let wifiViewMac=null, wifiRequestSeq=0, wifiResultJobId=null;
   let wifiPermissions=null, wifiPermissionBusy=false, wifiPermissionGuideShown=false, wifiPermissionStartupChecked=false;
   const wifiSelections=new Map();
-  const wifiError=e=>({wifi_shared_edit_library:'此网络来自共享族，请在共享族库编辑；取消订阅请修改设备的族选择。',wifi_library_revision_conflict:'共享族库已变化，请刷新后再保存。',wifi_family_no_compatible_network:'选中的族没有此设备支持的 2.4G 网络，原配置已保留。',wifi_family_ssid_conflict:'同一 SSID 不能属于多个族。',wifi_family_credential_conflict:'同名双频 SSID 的密码必须一致。',wifi_family_network_id_conflict:'族标识与旧配置冲突，请核对后再选择。',wifi_family_conflict:'族名或标识重复，请修改。',ap01_wifi_read_failed:'未能读取 AP01 网络列表，请检查设备在线状态、地址和设备码。',capacity:'设备网络配置数量超过上限，请减少选择后重试。',ap01_device_code_required:'请填写 AP01 设置菜单中的八位设备码。',ap01_wifi_result_unknown:'上次列表保存结果未知；只能先读回核对，不会自动重发。',ap01_manual_network_selection:'请在 AP01 菜单中手动选择网络。',manual_auth:'设备码不正确，请核对 AP01 菜单。',ambiguous_network_id:'设备存在同名配置，无法确定目标。配置已保留，请核对冲突记录。',revision_conflict:'设备方案已变化，缓存已过期，请重新读取设备后再同步。Bridge 配置已保留。',physical_required:'请单击 BOOT 开启维护窗口',unsupported:'此固件尚不支持完整方案，请等待升级',
+  const wifiError=e=>({wifi_shared_edit_library:'此网络来自共享族，请在共享族库编辑；取消订阅请修改设备的族选择。',wifi_library_revision_conflict:'共享族库已变化，请刷新后再保存。',wifi_family_no_compatible_network:'选中的族没有此设备支持的 2.4G 网络，原配置已保留。',wifi_family_ssid_conflict:'同一 SSID 不能属于多个族。',wifi_family_credential_conflict:'同名双频 SSID 的密码必须一致。',wifi_family_network_id_conflict:'族标识与旧配置冲突，请核对后再选择。',wifi_family_conflict:'族名或标识重复，请修改。',ap01_wifi_read_failed:'未能读取 AP01 网络列表，请检查设备在线状态、地址和设备码。',capacity:'设备网络配置数量超过上限，请减少选择后重试。',ap01_device_code_required:'尚无可用设备码，请填写 AP01 设置菜单中的八位设备码。',ap01_device_code_save_failed:'设备码验证成功，但本机保存失败，请检查数据目录权限。',ap01_wifi_result_unknown:'上次列表保存结果未知；只能先读回核对，不会自动重发。',ap01_manual_network_selection:'请在 AP01 菜单中手动选择网络。',manual_auth:'设备码不正确，请核对 AP01 菜单。',ambiguous_network_id:'设备存在同名配置，无法确定目标。配置已保留，请核对冲突记录。',revision_conflict:'设备方案已变化，缓存已过期，请重新读取设备后再同步。Bridge 配置已保留。',physical_required:'请单击 BOOT 开启维护窗口',unsupported:'此固件尚不支持完整方案，请等待升级',
     local_revision_conflict:'Bridge 保存版本已改变，保留修改，请重新比较',target_revision_conflict:'方案已改变，请处理冲突',host_network_changed:'主机网络已改变，请重新选择当前网络',network_not_configured:'Bridge 尚无当前网络配置，请先保存方案',current_network_required:'请保留或加入当前网络后再同步。',host_network_unknown:'无法识别当前网络，请先授权读取主机 Wi-Fi。',snapshot_conflict:'设备快照已变化，请重新预览。',
     http_session_mismatch:'HTTP 会话与本次设备会合不一致，已停止执行。',http_wake_mismatch:'HTTP 响应属于其他醒次，已停止执行。',rendezvous_failed:'本轮设备会合失败，任务与本地配置已保留。',
     transaction_identity_unknown:'缺少原事务身份，无法自动确认，已停止自动重试。',transaction_principal_changed:'Bridge 身份已变化，已停止自动重试。',transaction_namespace_changed:'设备绑定身份已变化，已停止自动重试。',transaction_namespace_invalid:'设备事务身份无效，已停止自动重试。',
@@ -1433,7 +1435,21 @@
   async function wifiSelect(i){const n=wifiScheme?.networks?.[i];if(wifiManualSelection){wifiSetResult('请在 AP01 设备菜单中手动选择网络。');return;}if(n?.writable&&window.confirm(`启用 ${n.network.network_id} 的 v${n.network.version}？将尝试切换网络。`))await wifiRun('activate',{network_id:n.network.network_id,version:n.network.version});}
   async function wifiCancel(){if(wifiBusyMac)await invoke('platform_wifi',{mac:wifiBusyMac,op:'cancel',body:{}}); }
   let ap01Poll = 0;
-  async function ap01CancelSearch(){ await invoke('platform_ap01',{op:'cancel_search',body:{}}); }
+  let ap01SearchGeneration = 0;
+  let ap01Searching = false;
+  async function ap01CancelSearch(){
+    if(!ap01Searching)return;
+    ++ap01SearchGeneration;ap01Searching=false;$('ap01-stop-search').hidden=true;
+    $('ap01-result').textContent='搜索已停止';
+    try{await invoke('platform_ap01',{op:'cancel_search',body:{}});}
+    catch(e){if(!$('ap01-add').hidden)$('ap01-result').textContent='停止搜索失败：'+String(e);}
+  }
+  function ap01Close(){
+    ap01CancelSearch();++ap01SearchGeneration;++ap01Poll;
+    $('ap01-add').hidden=true;$('ap01-code').hidden=true;
+    $('ap01-candidates').replaceChildren();
+    // Closing the view never cancels an already-sent pairing transaction.
+  }
   function ap01Message(value){
     const reply=value.reply||{};
     const state=['paired','cancelled','expired','rejected','error','unknown'].includes(value.result)
@@ -1450,42 +1466,80 @@
     const generation=++ap01Poll;
     try{
       let result=await invoke('platform_ap01',{op,body:{mac}});
+      if(generation!==ap01Poll)return;
       let state=ap01Message(result);
       const deadline=Date.now()+125000;
       while(generation===ap01Poll && Date.now()<deadline &&
         !['paired','cancelled','expired','rejected','error'].includes(state)){
         await new Promise(resolve=>setTimeout(resolve,1200));
         if(generation!==ap01Poll)return;
-        result=await invoke('platform_ap01',{op:'pair_status',body:{mac}});state=ap01Message(result);
+        result=await invoke('platform_ap01',{op:'pair_status',body:{mac}});
+        if(generation!==ap01Poll)return;state=ap01Message(result);
       }
       if(state==='paired'){selectedDeviceMac=mac;deviceSelectionGeneration++;clearDeviceView();await refreshPlatformDevice();}
       else if(Date.now()>=deadline)$('ap01-result').textContent+=' · 已停止自动查询，可查询原事务';
-    }catch(e){$('ap01-result').textContent=String(e);}
+    }catch(e){if(generation===ap01Poll)$('ap01-result').textContent=String(e);}
   }
   async function ap01Search(){
+    if(ap01Searching)return;
+    const generation=++ap01SearchGeneration;++ap01Poll;ap01Searching=true;
+    $('ap01-stop-search').hidden=false;$('ap01-code').hidden=true;
     $('ap01-add').hidden=false;$('ap01-result').textContent='正在搜索局域网中的 AP01…';
     $('ap01-candidates').replaceChildren();
     try{
       const result=await invoke('platform_ap01',{op:'search',body:{}});
+      if(generation!==ap01SearchGeneration)return;
       if(result.result==='error'){ap01Message(result);return;}
       $('ap01-result').textContent=result.candidates?.length?'选择设备，核对两端四位码后按下设备旋钮':
         `未发现 AP01。请确认电脑与设备位于同一局域网，并允许本地网络通信。${(result.errors||[]).join(' · ')}`;
       for(const candidate of result.candidates||[]){
         const row=document.createElement('div');row.className='action-strip';
         const label=document.createElement('span');label.textContent=`${candidate.name} · ${candidate.device_mac}`;row.append(label);
-        for(const [text,op] of [['配对','pair'],['查询原事务','pair_status'],['取消配对','cancel_pair']]){
-          const button=document.createElement('button');button.textContent=text;button.onclick=()=>ap01Pair(candidate.device_mac,op);row.append(button);
+        const registered=platformDevices.some(d=>d.device_mac===candidate.device_mac);
+        if(registered)label.textContent+=' · 已登记';
+        const actions=candidate.pairing_pending ? [['查询原事务','pair_status'],['取消配对','cancel_pair']] : registered ? [] : [['配对','pair'],['查询原事务','pair_status'],['取消配对','cancel_pair']];
+        for(const [text,op] of actions){
+          const button=document.createElement('button');button.textContent=text;
+          button.disabled=op!=='pair'&&!candidate.pairing_pending;
+          button.onclick=()=>{if(op==='pair')for(const control of row.querySelectorAll('button'))control.disabled=false;ap01Pair(candidate.device_mac,op);};row.append(button);
         }
         $('ap01-candidates').append(row);
       }
-    }catch(e){$('ap01-result').textContent=String(e);}
+    }catch(e){if(generation===ap01SearchGeneration)$('ap01-result').textContent=String(e);}
+    finally{if(generation===ap01SearchGeneration){ap01Searching=false;$('ap01-stop-search').hidden=true;}}
   }
   async function wifiAddDevice(){
-    wifiSetResult('扫描目标，请单击 BOOT 开启维护窗口');
+    if($('ble-add-button').disabled)return;
+    $('ble-add-button').disabled=true;$('ble-add-result').hidden=false;
+    $('ble-add-result').textContent='正在搜索蓝牙设备，请开启设备的 120 秒配对窗口…';
     try{const candidate=await invoke('platform_wifi',{mac:'',op:'scan',body:{}});const mac=candidate.mac;
-      if(!mac||!window.confirm(`绑定并登记目标 ${mac}？`))return;
-      await invoke('platform_wifi',{mac,op:'add',body:{}});selectedDeviceMac=mac;deviceSelectionGeneration++;clearDeviceView();await refreshPlatformDevice();
-      wifiSetResult('设备已登记；可离线准备目标。');}catch(e){wifiSetResult(wifiError(e));}
+      if(!mac){$('ble-add-result').textContent='未发现可添加的设备，请开启配对窗口后重试。';return;}
+      openModal(`<h3>添加蓝牙设备</h3><p>已发现设备 <b>${escapeHtml(mac)}</b>。请确认与 Note4 身份一致，并保持配对窗口开启。</p>
+        <div class="foot"><button onclick="closeModal();$('ble-add-result').textContent='已取消添加'">取消</button>
+        <button class="primary" onclick="wifiConfirmAdd('${escapeAttr(mac)}')">绑定并登记</button></div>`);
+    }catch(e){$('ble-add-result').textContent='添加蓝牙设备失败：'+wifiError(e);}
+    finally{$('ble-add-button').disabled=false;}
+  }
+  async function wifiConfirmAdd(mac){
+    if($('ble-add-button').disabled)return;
+    closeModal();$('ble-add-button').disabled=true;
+    $('ble-add-result').textContent=`正在绑定并登记 ${mac}…`;
+    try{
+      const result=await invoke('platform_wifi',{mac,op:'add',body:{}});
+      if(result.registered!==true){
+        $('ble-add-result').textContent=`设备 ${mac} 登记未完成：${wifiError(result.error||result.outcome)} · 阶段 ${result.stage||'登记'} · ${result.action||'请先确认原操作结果'}`;return;
+      }
+      selectedDeviceMac=result.device_mac;deviceSelectionGeneration++;clearDeviceView();await refreshPlatformDevice();
+      $('ble-add-result').textContent=`设备 ${mac} 已登记；可配置网络。`;
+    }catch(e){$('ble-add-result').textContent=`设备 ${mac} 绑定失败：`+wifiError(e);}
+    finally{$('ble-add-button').disabled=false;}
+  }
+
+  function renderBridgeBle(recovery){
+    const active=recovery && ['recovering','restart_required'].includes(recovery.state);
+    $('bridge-ble-status').hidden=!active;
+    $('bridge-ble-status').textContent=active ? 'Bridge 蓝牙服务异常；蓝牙添加暂不可用，设备的 Wi-Fi 状态独立显示。'+
+      (recovery.state==='restart_required'?'请重新启动 Bridge。':`正在恢复（第 ${recovery.attempt} 次）。`) : '';
   }
 
   let platformDeviceRequest = 0;
@@ -1656,12 +1710,7 @@
       $('dev-sample-note').textContent = d.contact.wifi_sampled_at
         ? `上次完整状态回报：${eventTime(d.contact.wifi_sampled_at)} · Wi-Fi`
         : '尚无完整 Wi-Fi 状态回报；普通缓存读取不会联系设备。';
-      const recovery = d.contact.ble_recovery;
-      if (recovery && recovery.state !== 'recovered') {
-        $('dev-sample-note').textContent += recovery.state === 'restart_required'
-          ? '\n蓝牙操作未确认结束；请从托管入口重新启动 Bridge。'
-          : `\n蓝牙操作未确认结束，正在自动恢复（第 ${recovery.attempt} 次）；恢复后等待设备下次联系，无需按 BOOT。`;
-      }
+      renderBridgeBle(result.ble_recovery);
       $('dev-fw').textContent = showReading(d.firmware.current);
       $('dev-latest').textContent = d.firmware.latest?.value
         ? `${d.firmware.latest.value} · 登记于 ${eventTime(d.firmware.latest.published_at)}`
@@ -1989,6 +2038,7 @@
     try {
       const view = await invoke('platform_device_view', {});
       if (!isCurrentDevice(mac, generation) || request !== platformDeviceRequest) return;
+      renderBridgeBle(view.ble_recovery);
       platformDevices = view.devices || [];
       const selected = resolveSelectedDevice();
       if (selected !== mac) {

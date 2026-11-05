@@ -72,10 +72,13 @@ fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
 }
 
 fn respond(stream: &mut TcpStream, status: u16, body: &Value) {
+    respond_session(stream, status, body, [9;16]);
+}
+fn respond_session(stream: &mut TcpStream, status: u16, body: &Value, session: [u8;16]) {
     let payload = body.to_string();
     let request=REQUEST_FRAME.get().unwrap();
     let ack=Header{kind:1,op:request.op,result:if status>=400 || body["result"]=="rejected" {2}else{0},
-        payload_len:payload.len() as u16,session:[9;16],request_no:request.request_no,context:request.context};
+        payload_len:payload.len() as u16,session,request_no:request.request_no,context:request.context};
     let mut bytes=ack.encode().unwrap().to_vec();bytes.extend_from_slice(payload.as_bytes());
     let head = format!(
         "HTTP/1.1 {status} OK\r\nContent-Type: {CONTENT_TYPE}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -141,6 +144,9 @@ fn spawn_fake() -> (String, FakeDevice) {
             let Ok(mut stream) = stream else { break };
             let (line, path, head, body) = read_request(&mut stream);
             let method = line.split_whitespace().next().unwrap_or("");
+            if !calls.lock().unwrap().is_empty() {
+                assert_eq!(REQUEST_FRAME.get().unwrap().session, [9;16], "ordinary reads/writes must not reopen a live session");
+            }
             calls.lock().unwrap().push(format!("{method} {path}"));
             if path == "/api/status" {
                 respond(
@@ -275,9 +281,55 @@ fn status_data_plan_activate_round_trip() {
     let ack = http(device_client::activate(&addr, token, "70:04:1D:D7:A3:40", "bridge-1", "mini", "0000000000000001", timeout)).unwrap();
     assert_eq!(ack["active_context_id"], "0000000000000002");
     let calls = fake.calls.lock().unwrap().clone();
-    assert_eq!(calls[0], "POST /api/status");
+    assert_eq!(calls.iter().filter(|p| *p == "POST /api/status").count(), 1, "writes must reuse authenticated identity");
     let writes: Vec<_> = calls.iter().filter(|p| *p != "POST /api/status").cloned().collect();
     assert_eq!(writes, vec!["POST /api/data", "POST /api/plan", "POST /api/activate"]);
+}
+
+#[test]
+fn status_after_reboot_adopts_new_authenticated_session_before_writing() {
+    let listener=TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr=listener.local_addr().unwrap().to_string();
+    let server=std::thread::spawn(move || {
+        for i in 0..3 {
+            let (mut stream,_)=listener.accept().unwrap();
+            let (_,path,_,_)=read_request(&mut stream);
+            if i<2 {
+                assert_eq!(path,"/api/status");
+                respond_session(&mut stream,200,&json!({"device_mac":"70041DD7A340",
+                    "boot_id":format!("boot-{i}"),"session_nonce":"0123456789abcdef0123456789abcdef"}),[9+i;16]);
+            } else {
+                assert_eq!(path,"/api/data");
+                assert_eq!(REQUEST_FRAME.get().unwrap().session,[10;16]);
+                respond_session(&mut stream,200,&json!({"result":"applied"}),[10;16]);
+            }
+        }
+    });
+    http(async {
+        let timeout=Duration::from_secs(2);
+        device_client::status(&addr,"tok",timeout).await.unwrap();
+        assert_eq!(device_client::status(&addr,"tok",timeout).await.unwrap()["boot_id"],"boot-1");
+        assert_eq!(device_client::data(&addr,"tok","70041DD7A340",&json!({"seq":1}),timeout).await.unwrap()["result"],"applied");
+    });
+    server.join().unwrap();
+}
+
+#[test]
+fn concurrent_status_and_writes_share_the_authenticated_session() {
+    let (addr, fake) = spawn_fake();
+    http(async {
+        let timeout = Duration::from_secs(2);
+        device_client::status(&addr, "tok", timeout).await.unwrap();
+        let data = json!({"context_id":"0000000000000001","seq":5,"fields":[]});
+        let plan = json!({"plan_id":8,"light_duration_s":300});
+        let (read, data, plan) = tokio::join!(
+            device_client::status(&addr, "tok", timeout),
+            device_client::data(&addr, "tok", "70041DD7A340", &data, timeout),
+            device_client::plan(&addr, "tok", "70041DD7A340", &plan, timeout));
+        assert!(read.is_ok()); assert_eq!(data.unwrap()["result"], "applied");
+        assert_eq!(plan.unwrap()["result"], "applied");
+    });
+    assert_eq!(fake.calls.lock().unwrap().len(), 4);
 }
 
 #[test]
@@ -342,7 +394,7 @@ fn wrong_target_mac_stops_all_writes_after_status_read() {
 
     assert_eq!(
         fake.calls.lock().unwrap().as_slice(),
-        ["POST /api/status", "POST /api/status", "POST /api/status", "POST /api/status"],
+        ["POST /api/status"],
         "MAC mismatch must perform only authenticated POST /api/status, with no write POST"
     );
 }

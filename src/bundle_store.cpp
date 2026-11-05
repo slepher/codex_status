@@ -406,14 +406,14 @@ uint32_t BundleStore::bsCompressionProtocol() {
 #endif
 }
 
-bool BundleStore::bsBegin() {
+bool BundleStore::bsBegin(bool readOnly) {
     activation.reset();
     clearFonts(); configured = false; profile = BsProfile{};
     receipt = BsReceipt{}; incomingReceipt = BsReceipt{}; sequence = 0;
-    if (!mounted) mounted = fs.begin(false, "/littlefs", 10, "storage");
+    if (!mounted) mounted = readOnly ? fs.totalBytes() != 0 : fs.begin(false, "/littlefs", 10, "storage");
     if (!mounted) { lastError = "fs"; return false; }
-    if (!fs.exists("/bundle") && !fs.mkdir("/bundle")) { lastError = "mkdir"; return false; }
-    if (!fs.exists(CONTENT)) migrateLegacy();
+    if (!readOnly && !fs.exists("/bundle") && !fs.mkdir("/bundle")) { lastError = "mkdir"; return false; }
+    if (!readOnly && !fs.exists(CONTENT)) migrateLegacy();
     JsonBudget docBudget(8192); JsonDocument doc(&docBudget);
     configured = readMeta(META, doc) && loadMeta(doc);
     if (!configured) {

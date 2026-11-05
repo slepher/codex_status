@@ -1,12 +1,27 @@
 name: release
 on:
   workflow_dispatch:
+    inputs:
+      scope:
+        description: Build scope (manual runs never publish)
+        type: choice
+        default: windows
+        options: [windows, windows-cross, bridge, all]
+      s3_roms:
+        description: Also build Note4 and 1.54 S3 ROMs (serial Windows jobs)
+        type: boolean
+        default: true
+      ap01_roms:
+        description: Also build AP01 0031 base and 0041 with App
+        type: boolean
+        default: true
   push:
     tags: ["v*"]
 permissions:
   contents: read
 jobs:
   firmware:
+    if: github.event_name == 'push' || inputs.scope == 'all' || inputs.s3_roms
     runs-on: windows-2022
     strategy:
       fail-fast: false
@@ -25,11 +40,9 @@ jobs:
       - run: python -m pip install platformio
       - name: Bootstrap only this target's packages
         run: pio pkg install -e ${{ matrix.env }}
-      - name: Build isolated target
+      - name: Build, verify and stage isolated S3 ROM
         shell: pwsh
-        run: ./tools/pio-target.ps1 -Target ${{ matrix.target }}
-      - name: Verify marker, slot budget, and stage ROM
-        run: python tools/stage-release-rom.py --env ${{ matrix.env }} --out dist
+        run: ./tools/build-release-rom.ps1 -Target ${{ matrix.target }} -OutputDir "$env:GITHUB_WORKSPACE/dist"
       - uses: actions/upload-artifact@v4
         with:
           name: firmware-${{ matrix.target }}
@@ -40,16 +53,11 @@ jobs:
         shell: pwsh
         run: '"ROM release gap: ${{ matrix.env }} failed. Do not substitute another target or publish a complete release. See backlog C6." >> $env:GITHUB_STEP_SUMMARY'
   bridge:
+    if: inputs.scope != 'windows-cross'
+    timeout-minutes: 90
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: windows-2022
-            platform: windows-x64
-          - os: macos-15
-            platform: macos-arm64
-          - os: macos-15-intel
-            platform: macos-x64
+      matrix: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.scope == 'windows' && '{"include":[{"os":"windows-2022","platform":"windows-x64"}]}' || '{"include":[{"os":"windows-2022","platform":"windows-x64"},{"os":"macos-15","platform":"macos-arm64"},{"os":"macos-15-intel","platform":"macos-x64"}]}') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -61,33 +69,28 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: bridge
+          workspaces: |
+            bridge -> ../artifacts/release-ci/target
+            bridge -> ../artifacts/bridge-macos/target
       - name: Use host-only ArduinoJson headers
         shell: bash
         run: echo "CODEX_STATUS_ARDUINOJSON=$GITHUB_WORKSPACE/dependencies/ArduinoJson/src" >> "$GITHUB_ENV"
       - name: Check font generator and ROM staging guards
+        if: runner.os == 'macOS'
         run: |
           python tools/test-unicode-font.py
           python tools/test-release-rom.py
       - name: Test shared core, renderer and app
+        if: runner.os == 'macOS'
         working-directory: bridge
-        run: cargo test --locked -p bridge-core -p bridge-render -p bridge-app
-      - name: Build Windows release
-        if: runner.os == 'Windows'
-        working-directory: bridge
-        run: cargo build --locked -p bridge-app --release
-      - name: Package Windows portable app
+        run: cargo test --locked --target-dir ../artifacts/bridge-macos/target -p bridge-core -p bridge-ble -p bridge-render -p bridge-app
+      - name: Test, build and verify Windows portable app
         if: runner.os == 'Windows'
         shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force dist/bundle/seed | Out-Null
-          Copy-Item bridge/target/release/bridge-app.exe dist/bundle/
-          Copy-Item tools/test-bridge/templates dist/bundle/seed/templates -Recurse
-          Copy-Item LICENSE, README.md dist/bundle/
-          Compress-Archive -Path dist/bundle/* -DestinationPath dist/codex-status-bridge-windows-x64.zip
-          Get-FileHash dist/*.zip -Algorithm SHA256 | Format-Table -AutoSize
+        run: ./tools/build-bridge-windows.ps1 -OutputDir "$env:GITHUB_WORKSPACE/dist"
       - name: Build and package macOS app (ad-hoc signed, not notarized)
         if: runner.os == 'macOS'
         shell: bash
@@ -104,10 +107,123 @@ jobs:
           name: bridge-${{ matrix.platform }}
           path: dist/*.zip
           if-no-files-found: error
+  windows-cross:
+    # Experimental cross build is opt-in; never substitutes the native release gate.
+    if: github.event_name == 'workflow_dispatch' && inputs.scope == 'windows-cross'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch public ArduinoJson headers (no token required)
+        shell: bash
+        run: |
+          git init dependencies/ArduinoJson
+          git -C dependencies/ArduinoJson fetch --depth=1 https://github.com/bblanchon/ArduinoJson.git refs/tags/v7.4.3
+          git -C dependencies/ArduinoJson checkout --detach FETCH_HEAD
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Cross compile Windows MSVC and verify portable ZIP
+        env:
+          CODEX_STATUS_ARDUINOJSON: ${{ github.workspace }}/dependencies/ArduinoJson/src
+        run: bash tools/build-bridge-windows-cross.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bridge-windows-x64-cross
+          path: artifacts/release-ci/cross-dist/*
+          if-no-files-found: error
+  ap01-0031:
+    if: github.event_name == 'push' || inputs.scope == 'all' || inputs.ap01_roms
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: codex_status
+          persist-credentials: false
+      - name: Fetch pinned public firmware sources
+        shell: bash
+        run: |
+          git init cuktech-ap01-firmware
+          git -C cuktech-ap01-firmware fetch --depth=1 https://github.com/slepher/cuktech-ap01-firmware.git 69015e7713394449ee40e7e6f1b17246516d82fe
+          git -C cuktech-ap01-firmware checkout --detach FETCH_HEAD
+          test "$(git -C cuktech-ap01-firmware rev-parse HEAD)" = 69015e7713394449ee40e7e6f1b17246516d82fe
+      - name: Prepare historical builder toolchain layout
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-riscv64-unknown-elf binutils-riscv64-unknown-elf python3-pil build-essential
+          mkdir -p cuktech-ap01-firmware-tools/tools/docker/toolchain/bin dist
+          for tool in gcc as ld nm objcopy; do
+            ln -s "$(command -v riscv64-unknown-elf-$tool)" "cuktech-ap01-firmware-tools/tools/docker/toolchain/bin/riscv64-unknown-elf-$tool"
+          done
+      - name: Build and validate expanded OTA/menu ROM preserving stock GIF
+        run: bash codex_status/tools/build-ap01-0031.sh cuktech-ap01-firmware dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ap01-0031-candidate
+          path: |
+            dist/*.bin
+            dist/*.json
+            dist/ap01-0031-SHA256SUMS
+          if-no-files-found: error
+  ap01-0041:
+    if: github.event_name == 'push' || inputs.scope == 'all' || inputs.ap01_roms
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: codex_status
+          persist-credentials: false
+      - name: Fetch pinned public firmware sources
+        shell: pwsh
+        run: |
+          git init cuktech-ap01-firmware
+          if ($LASTEXITCODE -ne 0) { throw 'Firmware checkout initialization failed' }
+          git -C cuktech-ap01-firmware fetch --depth=1 https://github.com/slepher/cuktech-ap01-firmware.git 69015e7713394449ee40e7e6f1b17246516d82fe
+          if ($LASTEXITCODE -ne 0) { throw 'Firmware dependency fetch failed' }
+          git -C cuktech-ap01-firmware checkout --detach FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Firmware dependency checkout failed' }
+          if ((git -C cuktech-ap01-firmware rev-parse HEAD) -ne '69015e7713394449ee40e7e6f1b17246516d82fe') { throw 'Firmware revision mismatch' }
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install the validated RV32 toolchain
+        shell: pwsh
+        run: |
+          python -m pip install platformio
+          if ($LASTEXITCODE -ne 0) { throw 'PlatformIO installation failed' }
+          pio pkg install --global --tool 'espressif/toolchain-riscv32-esp@8.4.0+2021r2-patch5'
+          if ($LASTEXITCODE -ne 0) { throw 'RV32 toolchain installation failed' }
+      - name: Build and validate the app ROM through the firmware repository
+        shell: pwsh
+        run: |
+          $output = "$env:GITHUB_WORKSPACE/dist/ap01-codex-status-0041.bin"
+          $tool = "$env:USERPROFILE/.platformio/packages/toolchain-riscv32-esp/bin/riscv32-esp-elf-"
+          python -B cuktech-ap01-firmware/tooling/scripts/build-firmware-0041.py --app-config codex_status/ports/ap01/build-0041.json --tool-prefix $tool --build-dir "$env:GITHUB_WORKSPACE/build/ap01" --output $output
+          if ($LASTEXITCODE -ne 0) { throw 'AP01 audit/link/package failed' }
+          python -B cuktech-ap01-firmware/tooling/scripts/test-firmware-0041.py --manifest "$env:GITHUB_WORKSPACE/dist/ap01-codex-status-0041.manifest.json"
+          if ($LASTEXITCODE -ne 0) { throw 'AP01 ROM validation failed' }
+          $provenance = [ordered]@{
+            app_commit = (git -C codex_status rev-parse HEAD)
+            firmware_commit = (git -C cuktech-ap01-firmware rev-parse HEAD)
+            toolchain = 'espressif/toolchain-riscv32-esp@8.4.0+2021r2-patch5'
+            original_sha256 = (Get-FileHash cuktech-ap01-firmware/roms/0041/ap01-1.0.2_0041.bin).Hash.ToLowerInvariant()
+            rom_sha256 = (Get-FileHash $output).Hash.ToLowerInvariant()
+            hardware_verified = $false
+          }
+          $provenance | ConvertTo-Json | Set-Content dist/ap01-0041-provenance.json -Encoding utf8
+          Get-ChildItem dist -File | Where-Object Name -ne 'SHA256SUMS' | ForEach-Object { "$((Get-FileHash $_.FullName).Hash.ToLowerInvariant())  $($_.Name)" } | Set-Content dist/ap01-0041-SHA256SUMS -Encoding utf8NoBOM
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ap01-0041-candidate
+          path: dist/*
+          if-no-files-found: error
   release:
     # Manual runs produce artifacts only. Every platform/ROM must succeed.
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [firmware, bridge]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [firmware, bridge, ap01-0031, ap01-0041]
     runs-on: ubuntu-latest
     permissions:
       contents: write

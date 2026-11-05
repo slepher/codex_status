@@ -40,9 +40,12 @@ bool Ap01Business::loadActive(uint64_t now) {
     sequence.beginContext(now, 1); usage = "";
     return true;
 }
-bool Ap01Business::begin(uint64_t now) {
-    if (!store.bsBegin()) return !strcmp(store.bsLastError(), "unconfigured");
+bool Ap01Business::begin(uint64_t now, bool readOnly) {
+    writesEnabled.store(false,std::memory_order_release);
+    auto finish=[&](bool okay){writesEnabled.store(okay&&!readOnly,std::memory_order_release);return okay;};
+    if (!store.bsBegin(readOnly)) return finish(!strcmp(store.bsLastError(), "unconfigured"));
     if (!store.bsProfile(profile)) return false;
+    if (readOnly) return loadActive(now) && render();
     char next[BS_CTX_LEN]; newContext(next); String error;
     // Retain uniqueness even when a synthetic entropy fixture repeats after
     // reboot. The durable context already carries this boot's counter.
@@ -59,7 +62,22 @@ bool Ap01Business::begin(uint64_t now) {
             contextCounter = previous; newContext(next);
         }
     }
-    return store.bsSetActive(profile.initial, next, error) && loadActive(now) && render();
+    return finish(store.bsSetActive(profile.initial, next, error) && loadActive(now) && render());
+}
+bool Ap01Business::syncWritePermission(uint64_t now,bool allow) {
+    if(!allow){writesEnabled.store(false,std::memory_order_release);return true;}
+    if(writeResumeFailed)return false;
+    if(writesAllowed())return true;
+    if(ui.writeScope){
+        struct Resume {Ap01Business *self;uint64_t now;} resume{this,now};
+        int32_t result=-1;
+        int32_t admitted=ui.writeScope(ui.context,[](void *p)->int32_t{
+            auto &r=*(Resume *)p;return r.self->begin(r.now,false)?0:-1;
+        },&resume,&result);
+        if(admitted==1)return true; // Busy: no begin, no migration or failure latch.
+        if(admitted==0&&result==0)return true;
+    }else if(begin(now,false))return true;
+    writeResumeFailed=true;return false;
 }
 bool Ap01Business::render() {
     auto failed=[this](){displayFailed(generation);return false;};
@@ -83,10 +101,20 @@ void Ap01Business::clock(const char *hhmm) {
         if(!strcmp(path,"device.now")||!strcmp(path,"device.date")){render();break;}
     }
 }
-bool Ap01Business::localActivate(uint8_t index, uint64_t now) {
-    if (storageUnknown || !configured || index >= profile.count) return false;
-    char next[BS_CTX_LEN]; newContext(next); String error;
-    return store.bsSetActive(index, next, error) && loadActive(now) && render();
+bool Ap01Business::localActivate(uint8_t index, uint64_t now, bool *retry) {
+    if(retry)*retry=false;
+    if (!writesAllowed() || storageUnknown || !configured || index >= profile.count) return false;
+    struct Call {Ap01Business *self;uint8_t index;uint64_t now;} call{this,index,now};
+    auto activate=[](void *p)->int32_t{
+        auto &c=*(Call *)p;auto &s=*c.self;
+        char next[BS_CTX_LEN];s.newContext(next);String error;
+        return s.store.bsSetActive(c.index,next,error)&&s.loadActive(c.now)&&s.render()?0:-1;
+    };
+    if(!ui.writeScope)return activate(&call)==0;
+    int32_t result=-1;
+    int32_t admitted=ui.writeScope(ui.context,activate,&call,&result);
+    if(retry)*retry=admitted==1;
+    return admitted==0&&result==0;
 }
 void Ap01Business::displayFeedback(JsonDocument &out, const char *state) {
     out["active_template_id"] = configured ? profile.ids[profile.initial] : "";
@@ -132,6 +160,11 @@ void Ap01Business::status(JsonDocument &out) {
 int Ap01Business::command(uint16_t op, JsonDocument &request, const char *nonce, uint64_t now,
                            const uint8_t *body, size_t bytes, const char *requestId,
                            const char *offset, String &reply) {
+    if (!writesAllowed()) {
+        reply = v2BuildAck("storage", "rejected", "unchanged", "lifecycle", "app_trial_readonly",
+                          -1, 0, nullptr, UINT32_MAX, FW_TARGET_ID);
+        return 503;
+    }
     const char *error = nullptr, *display = "unchanged", *result = "applied";
     int status = 200;
     const char *operation = op == 2 ? "data" : op == 13 ? "activate" : "bundle";

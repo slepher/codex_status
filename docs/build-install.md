@@ -69,7 +69,79 @@ python3 tools/bridge-macos-service.py start --app "$CODEX_STATUS_APP_OUTPUT"
 
 ## GitHub 构建与发布
 
-`.github/workflows/release.yml`：推送 `v*` 标签构建所有目标；手动 `workflow_dispatch` 只上传可下载产物。普通提交/PR 不触发这份发布流程。Windows x64、macOS arm64/x64 使用对应原生 runner；两个固件目标串行隔离构建。全部成功才生成 **draft Release**，由维护者检查后公开；失败目标在 Actions summary 明示，不静默跳过 1.54。
+`.github/workflows/release.yml`：推送 `v*` 标签构建所有目标；手动 `workflow_dispatch` 只上传可下载产物，`scope=windows`（默认）只测 Windows，`bridge` 测三个原生 Bridge 平台，`all` 包含固件，`windows-cross` 单独尝试 Linux → Windows。普通提交/PR 不触发。Windows x64、macOS arm64/x64 使用对应原生 runner；两个固件目标串行隔离构建。全部成功才生成 **draft Release**，由维护者检查后公开；交叉编译实验不替代标签的原生门禁。
+
+手动运行新增 `s3_roms=true`（默认）：为选定 Bridge 范围同时生成 Note4/1.54 两份 S3 ROM。仅测试 Bridge 时取消该选项；`scope=all` 和 tag 发布始终包含两份 ROM。固件使用 Windows runner、matrix `max-parallel: 1`，与 Linux windows-cross 是独立 job；`act -j windows-cross` 不冒充已执行固件 job。两份 ROM 的本机构建通过同一 `tools/build-release-rom.ps1 -Target note4|154g` 入口，只有编译、Wi-Fi ELF 栈门禁、ROM marker/源码版本/双槽容量校验通过才打包。每目标上传 OTA `.bin`、manifest `.json` 和含 bootloader/分区/boot_app0/匹配 ELF 的 USB `.zip`。
+
+AP01 独立双仓库工作流、凭据与已验证生成命令见 [AP01 release CI](ap01-release-ci.md)；其维护实现仍归兄弟固件库。
+
+### 本地复现 release CI
+
+Windows PowerShell 7（VS C++ Build Tools、Rust、Python 已安装）：
+
+```powershell
+$env:CODEX_STATUS_ARDUINOJSON = '<ArduinoJson 7.4.3 的绝对路径>/src'
+pwsh -File tools/build-bridge-windows.ps1
+```
+
+此入口与 Windows job 相同：字体/ROM staging 校验、core/BLE/render/app 测试、release 编译、便携 ZIP 文件列表校验和 SHA256。默认写 `artifacts/release-ci/target` 与 `artifacts/release-ci/dist`，不启动程序、不访问设备、不使用开发实例 data。Agent 执行时按 AGENTS 要求提权创建构建子目录。首次全量编译较慢；重跑复用 target。测试失败立即退出，旧 ZIP 不代表本轮成功，须看命令退出状态。
+
+Linux/WSL + Docker 可运行同一交叉构建入口：
+
+```bash
+export CODEX_STATUS_ARDUINOJSON=/absolute/path/ArduinoJson/src
+bash tools/build-bridge-windows-cross.sh
+```
+
+脚本用 cargo-xwin 容器构建 `x86_64-pc-windows-msvc`，编译本项目 C++ 引擎，检查 x64 PE 头、ZIP CRC 并计算哈希。输出在 `artifacts/release-ci/cross-dist`，target 与原生构建隔离。容器需要下载 Rust/MSVC SDK/CRT 与依赖；使用 cargo-xwin 包含接受其文档所列 Microsoft SDK/CRT 许可。`CODEX_STATUS_XWIN_IMAGE` 可固定镜像 digest。交叉编译不能证明 WebView2、Wi-Fi、BLE 或托盘在 Windows 正常，运行验收仍在 Windows。
+
+本机已有 act 可先验证工作流计划（不执行构建/上传）：
+
+```bash
+act workflow_dispatch -W .github/workflows/release.yml --input scope=windows-cross -j windows-cross -P ubuntu-24.04=node:20-bookworm-slim --dryrun --no-skip-checkout
+```
+
+完整 act 实跑（Linux/WSL + Docker，在包含待测修改的独立 clone/源码副本根目录执行）：
+
+```bash
+mkdir -p ../act-uploads
+timeout 5400s act workflow_dispatch \
+  -W .github/workflows/release.yml --input scope=windows-cross -j windows-cross \
+  -P ubuntu-24.04=catthehacker/ubuntu:act-24.04 \
+  --bind --action-offline-mode \
+  --artifact-server-path "$(cd ../act-uploads && pwd)" --artifact-server-port 34569 \
+  --env-file /dev/null --secret-file /dev/null
+```
+
+这里没有 `--dryrun`。`--bind` 让 act runner 与 Docker daemon 使用相同绝对源码路径，内层 cargo-xwin 容器才能读到 checkout 后的文件；不要改为 act 默认复制目录后仍假设宿主存在同一路径。Ubuntu runner 包含 Docker CLI；轻量 Node 镜像只适合前面的 dry-run。首次需下载 Python/SDK/依赖。本地 server 接收真正执行的 `upload-artifact@v4` 上传；端口须可供 runner 访问且未占用。
+
+Windows Docker Desktop + WSL 若出现 runner 无法访问 WSL artifact server，使用下面的同网络版本；不需要开放防火墙。在专用 `act-run/source` 副本内执行，父目录只放本次测试文件：
+
+```bash
+run_root=$(cd .. && pwd)
+cp "$(command -v act)" "$run_root/act"
+mkdir -p "$run_root/uploads"
+timeout 5400s docker run --rm --network host \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v "$run_root:$run_root" -w "$PWD" \
+  --entrypoint "$run_root/act" catthehacker/ubuntu:act-24.04 \
+  workflow_dispatch -W .github/workflows/release.yml \
+  --input scope=windows-cross -j windows-cross \
+  -P ubuntu-24.04=catthehacker/ubuntu:act-24.04 --bind --action-offline-mode \
+  --artifact-server-addr 127.0.0.1 --artifact-server-port 34569 \
+  --artifact-server-path "$run_root/uploads" \
+  --env-file /dev/null --secret-file /dev/null
+```
+
+act 控制进程和 runner 都使用 Docker host 网络；上传走同一网络命名空间的 loopback，绕开 WSL→Docker Desktop 的不可达宿主地址。此处是实际完整 job，未关闭 artifact 上传。
+
+act 默认用本地源码替代当前仓库 checkout，保留待测修改；windows-cross 的 ArduinoJson 步骤通过匿名 Git fetch/checkout 实际从 GitHub 获取 v7.4.3，无需个人 token（第二个 actions/checkout 在无 token 环境会直接失败）。不要加 `--no-skip-checkout` 把待测源码覆盖为远端旧版。测试源码仅复制 tracked/非忽略源码和必要 Git 元数据，不复制 `.pio`、运行 data、旧 target 或原 artifacts。Agent 创建目录/运行构建仍按 AGENTS 提权规则。验证服务器收到的 artifact 外层 ZIP 中确有 release ZIP 与 `.sha256`，检查内层包哈希、CRC、x64 PE，并与本轮输出逐字节比较；不能只看 job success。
+
+这验证本地真实执行及上传，GitHub 云端 cache/权限/draft 行为仍须单独验收。Windows 宿主映射 `-P windows-2022=-self-hosted` 只能在 Windows 上执行，不能让 WSL 模拟 Windows。act 不完整模拟 permissions/timeout/environment。
+
+Mac 端：按前文安装依赖，先在 `bridge/` 执行 `cargo test --locked --target-dir ../artifacts/bridge-macos/target -p bridge-core -p bridge-ble -p bridge-render -p bridge-app`，再用 `CODEX_STATUS_BUILD_PROFILE=release bash tools/build-bridge-macos.sh` 与 `codesign --verify --deep --strict` 验证包。Linux → macOS 可以研究 osxcross，但当前 `app/build.rs` 写死原生 clang/ar，且依赖 Apple SDK/CoreWLAN 等框架；现成脚本不能直接交叉构建。Mach-O 构建、.app 打包、签名、公证与 Mac 实机测试须分别验收，本任务保留 Mac 原生路径。
+
+方案依据：[cargo-xwin](https://github.com/rust-cross/cargo-xwin)、[Tauri Windows 交叉编译](https://v2.tauri.app/distribute/windows-installer/)、[osxcross](https://github.com/tpoechtrager/osxcross)、[act runner](https://nektosact.com/usage/runners.html)。Astranaut 使用的是 Erlang `rebar3_docker_ci` 容器矩阵，不是通用 Actions/跨系统打包模拟器。
 
 发布标签代表源码快照。Note4与1.54共用`src/main.cpp`的`FW_RELEASE_VERSION`，只在这一处递增；完整版本分别为`<基号>-note4`与`<基号>-bw`，target/env保持不变。两台不必同时构建、打包或升级；各自在某一源码快照打包时使用该快照的共同基号，不另开设备专属序号。AP01沿用兄弟仓库版本，不加入此序列。
 

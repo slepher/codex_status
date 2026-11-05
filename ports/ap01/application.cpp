@@ -1,10 +1,13 @@
 #include "application.h"
+#ifdef AP01_FILE_APP_V3
+#include "app_runtime_v3.h"
+#endif
 #include "local_json_allocator.h"
 #include "v2_command_envelope.h"
 #include "v2_sync.h"
 #include "platform_target.h"
 #include <new>
-#if defined(__riscv)
+#if defined(__riscv) && !defined(AP01_FILE_APP_V3)
 extern "C" const uint8_t ap01_native_manifest[256];
 #endif
 
@@ -12,7 +15,13 @@ namespace {
 constexpr const char *FRAME_TYPE = "application/vnd.codex-status.frame";
 void imageIdentity(JsonDocument &out) {
     out["fw"] = "1.0.2_0041";
-#if defined(__riscv)
+#if defined(AP01_FILE_APP_V3)
+    const auto *api=ap01RuntimeApiV3();
+    // Keep the existing firmware identity field; report the independent App too.
+    out["app_build"] = api->platform_build;
+    out["app_package_digest"] = api->app_digest;
+    out["rom_bytes"] = api->rom_bytes;
+#elif defined(__riscv)
     char build[33]; const char *hex="0123456789abcdef";
     for (unsigned i=0;i<16;++i) {uint8_t v=ap01_native_manifest[36+i];build[2*i]=hex[v>>4];build[2*i+1]=hex[v&15];}
     build[32]=0;out["app_build"] = String(build);
@@ -89,6 +98,7 @@ Ap01Application::Ap01Application(BundleFilesystem &filesystem, Ap01Business &con
 Ap01Application::~Ap01Application() { ap01BindingsFree(&bindings); }
 int Ap01Application::save(void *context, const uint8_t *bytes, size_t length) {
     auto &self = *(Ap01Application *)context;
+    if (!self.business.writesAllowed()) return 0;
     File pending = self.fs.open("/bindings.pending", "w");
     if (!pending || pending.write(bytes, length) != length) return 0;
     pending.close(); pending = self.fs.open("/bindings.pending", "r");
@@ -129,7 +139,7 @@ Ap01HttpReply Ap01Application::pairingHttp(const Ap01HttpRequest &request, uint6
     Ap01HttpReply reply;
     BindingGuard guard(port);
     if (!ready || !guard) { error(reply, 503, "maintenance_busy", "bindings"); return reply; }
-    bindings.maintenance=maintenanceActive();
+    bindings.maintenance=maintenanceActive()||!business.writesAllowed();
     if (request.length > 4096 || (request.length && memchr(request.body, 0, request.length))) {
         error(reply, 400, "body", "pairing"); return reply;
     }
@@ -183,7 +193,7 @@ void Ap01Application::dispatch(const Ap01HttpRequest &request, const char *princ
     {
         BindingGuard guard(port);
         if (!guard) { error(reply, 503, "bindings_busy", "owner"); return; }
-        bindings.maintenance=maintenanceActive();
+        bindings.maintenance=maintenanceActive()||!business.writesAllowed();
         if (op == 4) {
             if (strcmp(request.deviceToken, request.token)) { error(reply, 401, "device_token", "claim"); return; }
             if (doc["force"] == true || doc["release"] == true) { error(reply, 409, "unsupported", "claim"); return; }
@@ -209,9 +219,23 @@ void Ap01Application::dispatch(const Ap01HttpRequest &request, const char *princ
     }
 }
 Ap01HttpReply Ap01Application::businessHttp(const Ap01HttpRequest &request, uint64_t now) {
+    uint16_t op=operation(request.path);
+    if(!port.writeScope||!op||op==1||!business.writesAllowed())return businessHttpOwned(request,now);
+    struct Call {Ap01Application *app;const Ap01HttpRequest *request;uint64_t now;Ap01HttpReply reply;} call{this,&request,now,{}};
+    int32_t result=-1;
+    int32_t admitted=port.writeScope(port.context,[](void *p)->int32_t{
+        auto &c=*(Call *)p;c.reply=c.app->businessHttpOwned(*c.request,c.now);return 0;
+    },&call,&result);
+    if(admitted==0&&result==0)return std::move(call.reply);
+    // Admission precedes session/replay updates: Busy never retires a request.
+    error(call.reply,503,admitted==1?"maintenance_busy":"write_scope_unavailable","write_admission");
+    return std::move(call.reply);
+}
+Ap01HttpReply Ap01Application::businessHttpOwned(const Ap01HttpRequest &request, uint64_t now) {
     Ap01HttpReply reply;
     if (!ready || !online.load(std::memory_order_acquire)||maintenanceActive()) { error(reply, 503, "business_offline", "lifecycle"); return reply; }
     uint16_t op = operation(request.path);
+    if (op != 1 && !business.writesAllowed()) { error(reply, 503, "app_trial_readonly", "lifecycle"); return reply; }
     if (!op) { error(reply, 404, "unsupported_endpoint", "business_router"); return reply; }
     if (strcmp(request.method, "POST") || strcmp(request.contentType, FRAME_TYPE)) {
         error(reply, 415, "content_type_or_method", "frame"); return reply;
@@ -254,7 +278,8 @@ Ap01HttpReply Ap01Application::businessHttp(const Ap01HttpRequest &request, uint
         if (reply.bytes.length()) {}
         else if (memcmp(frame.session, s->id, 16) && !(op == 1 && !memcmp(frame.session, s->open, 16)))
             error(reply, 409, "session", "frame");
-        else if (frame.requestNo <= s->highest) {
+        else if (frame.requestNo <= s->highest && !(frame.requestNo == s->highest &&
+            !memcmp(digest, s->digest, 32) && !s->response.length() && isIdempotentReadOp(op))) {
             if (frame.requestNo == s->highest && !memcmp(digest, s->digest, 32) && s->response.length()) {
                 reply.status = s->lastStatus; reply.frame = true; reply.bytes = s->response; return reply;
             }
@@ -268,7 +293,7 @@ Ap01HttpReply Ap01Application::businessHttp(const Ap01HttpRequest &request, uint
             dispatch(payload, principal, op, now, reply);
         }
     }
-    if (!reply.bytes.length() || reply.bytes.length() > 4048) error(reply, 503, "reply_limit", "response", true);
+    if (!reply.bytes.length() || reply.bytes.length() > (isIdempotentReadOp(op) ? 4048u : 464u)) error(reply, 503, "reply_limit", "response", true);
     CompactFrameHeader response = frame; response.kind = 1;
     response.result = reply.status < 400 ? 0 : reply.status == 503 ? 3 : 2;
     response.payloadLen = reply.bytes.length(); memcpy(response.session, s->id, 16);
@@ -301,7 +326,7 @@ bool Ap01Application::discovery(const uint8_t *bytes, size_t length, String &rep
 }
 bool Ap01Application::pairingUi(uint64_t now, String &reply) {
     BindingGuard guard(port); if (!ready || !guard) return false;
-    bindings.maintenance=maintenanceActive();
+    bindings.maintenance=maintenanceActive()||!business.writesAllowed();
     // After confirmation, the UI only needs to hide the prompt. Avoid a JSON
     // document allocation while holding the shared binding lock on every tick.
     if (bindings.state != 1 && bindings.state != 2) {
@@ -315,8 +340,33 @@ bool Ap01Application::pairingDisplayed(const char *request, uint32_t revision, u
 }
 bool Ap01Application::button(bool pressed, uint64_t event, uint64_t now) {
     BindingGuard guard(port); if (!ready || !guard) return false;
-    bindings.maintenance=maintenanceActive();
+    bindings.maintenance=maintenanceActive()||!business.writesAllowed();
     bool pending = bindings.state == 1 || bindings.state == 2;
+    if(pending&&port.writeScope){
+        if(confirmationEvent&&confirmationRevision==bindings.revision)return true;
+        confirmationEvent=0;
+        if(!pressed&&bindings.state==2&&bindings.pressed_event&&
+           event>bindings.pressed_event&&event>bindings.displayed_event){
+            confirmationEvent=event;confirmationRevision=bindings.revision;
+            return true;
+        }
+    }
     if (pending) ap01PairButton(&bindings, pressed, event, now);
     return pending;
+}
+void Ap01Application::processConfirmation(uint64_t now) {
+    BindingGuard guard(port);if(!ready||!guard||!confirmationEvent)return;
+    // Poll expiry using worker time, never the old UI event timestamp.
+    ap01PairResult(&bindings,bindings.pending.request,bindings.pending.token,now);
+    if(bindings.state!=2||confirmationRevision!=bindings.revision){confirmationEvent=0;return;}
+    if(maintenanceActive()||!business.writesAllowed())return;
+    struct Call {Ap01Application *app;uint64_t now;} call{this,now};
+    int32_t result=-1;
+    int32_t admitted=port.writeScope(port.context,[](void *p)->int32_t{
+        auto &c=*(Call *)p;auto &s=*c.app;
+        s.bindings.maintenance=s.maintenanceActive()||!s.business.writesAllowed();
+        ap01PairButton(&s.bindings,false,s.confirmationEvent,c.now);
+        return 0;
+    },&call,&result);
+    if(admitted!=1)confirmationEvent=0; // Busy alone retains the physical approval.
 }

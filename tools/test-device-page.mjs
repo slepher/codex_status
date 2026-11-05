@@ -25,6 +25,7 @@ const element = id => {
   if (!elements.has(id)) elements.set(id, {
     textContent: '', innerHTML: '', value: '', checked: false, disabled: false, hidden: false,
     classList: { add() {}, remove() {}, contains() { return false; } },
+    children: [], replaceChildren(...nodes) { this.children=nodes; }, append(node) { this.children.push(node); }, querySelectorAll() { return this.children.filter(n=>n.tag==='button'); },
     focus() {}, scrollIntoView() {}, attributes: {}, setAttribute(name,value) { this.attributes[name]=value; }, getAttribute(name) { return this.attributes[name] || ''; },
   });
   return elements.get(id);
@@ -37,7 +38,7 @@ const context = vm.createContext({
     calls.push({ name, args });
     return Promise.resolve(handlers[name]?.(args) ?? {});
   } } } },
-  document: { getElementById: element, querySelectorAll: () => [],
+  document: { createElement: tag => ({tag,children:[],append(node){this.children.push(node);},querySelectorAll(){return this.children.filter(n=>n.tag==='button');}}), getElementById: element, querySelectorAll: () => [],
     querySelector: () => ({ classList: { contains: () => deviceTabOn } }), addEventListener() {} },
   localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
   setInterval() {}, clearInterval() {}, setTimeout(callback) {callback();}, structuredClone,
@@ -45,6 +46,9 @@ const context = vm.createContext({
 vm.runInContext(source, context);
 const run = code => vm.runInContext(code, context);
 const macA = '0200000000A1', macB = '0200000000B2';
+// No remembered device is normal on startup; it must not abort permission setup.
+run('selectedDeviceMac=null;clearDeviceView()');
+assert.match(element('wifi-family-list').innerHTML,/尚无共享族/);
 const select = mac => run("selectedDeviceMac = '" + mac + "'; deviceSelectionGeneration++; clearDeviceView()");
 const view = (mac, verdict, screen = '屏幕已显示') => ({
   device: {
@@ -106,12 +110,13 @@ sameWifi.device.delivery.required_fields = 0;
 await run('refreshDevice()');
 assert.equal(element('dev-contact-row').hidden, true);
 assert.match(element('dev-data-needs').textContent, /0 个数据字段/);
-sameWifi.device.contact.ble_recovery = { state: 'recovering', attempt: 2, retry_at: 130 };
-sameWifi.device.contact.label = '蓝牙异常，正在自动恢复';
+sameWifi.ble_recovery = { state: 'recovering', attempt: 2, retry_at: 130 };
+sameWifi.device.contact.label = '最近已认证';
 await run('refreshDevice()');
-assert.match(element('device-state').textContent, /蓝牙异常/);
-assert.match(element('dev-sample-note').textContent, /第 2 次.*无需按 BOOT/);
-sameWifi.device.contact.ble_recovery.state = 'recovered';
+assert.equal(element('device-state').textContent, '最近已认证');
+assert.match(element('bridge-ble-status').textContent, /Bridge 蓝牙.*第 2 次/);
+assert.doesNotMatch(element('dev-sample-note').textContent, /蓝牙/);
+sameWifi.ble_recovery.state = 'recovered';
 await run('refreshDevice()');
 assert.doesNotMatch(element('dev-sample-note').textContent, /蓝牙操作未确认/);
 deviceTabOn = true;
@@ -266,6 +271,15 @@ assert.equal(element('wifi-permission-result').textContent,'两项权限已授�
 assert.equal(element('wifi-host').textContent,'Host-5G');
 const secondStart=calls.length;await run('wifiInitPermissions()');
 assert.equal(calls.length,secondStart);
+// Exercise the production read-network button, rather than only the permission helper.
+const hostReadHandler=html.match(/<button[^>]*onclick="([^"]+)"[^>]*>读取主机网络<\/button>/)?.[1];
+assert(hostReadHandler);
+permissionState={platform:'macos',location:'not_determined',bluetooth:'not_determined'};
+requested=false;authorizationPoll=0;
+const hostReadStart=calls.length;await run(hostReadHandler);
+assert.equal(calls.slice(hostReadStart).filter(c=>c.args.op==='permission_all').length,1);
+assert.equal(element('wifi-host').textContent,'Host-5G');
+
 for(const state of [{platform:'macos',location:'allowed',bluetooth:'allowed'},
  {platform:'macos',location:'denied',bluetooth:'restricted'}, {platform:'other'}]) {
  permissionState=state;requested=false;run('wifiPermissionStartupChecked=false');
@@ -474,7 +488,7 @@ assert.equal(element('wifi-note-recovery').hidden,true);assert(!element('wifi-ne
 element('wifi-ap01-code').value='01234567';await run('wifiReadScheme()');assert.equal(element('wifi-ap01-code').value,'');
 const ap01Read=calls.filter(c=>c.name==='platform_wifi'&&c.args.op==='get').at(-1);assert.equal(ap01Read.args.body.device_code,'');
 assert.equal(run("wifiManualNetworkGuard(['home'])"),null);
-select(macB);assert.equal(element('wifi-ap01-code').value,'');assert.equal(run('wifiFamilySelectionDirty'),false);
+select(macB);assert.equal(element('wifi-ap01-auth').hidden,true);assert.equal(element('wifi-ap01-code').value,'');assert.equal(run('wifiFamilySelectionDirty'),false);
 console.log('Wi-Fi families: shared edits, independent selections, family-name wire key, wired draft, cached import, password cleanup and AP01 manual selection OK');
 
 // Shared editor is the only edit path, including current host shortcuts.
@@ -509,3 +523,42 @@ run("wifiSelections.clear();wifiSelections.set('unknown',true);wifiScheme={compl
 await run('wifiFamilyImport()');assert.equal(calls.length,noDestinationCalls);assert.match(element('wifi-result').textContent,/明确选择/);
 run("wifiDifferences=[{network_id:'unknown',device:[{writable:true,network:{}}]}]");
 element('wifi-direction').value='import';run('wifiPreviewSync()');assert.equal(element('wifi-sync-submit').disabled,true);assert.match(element('wifi-preview').textContent,/选择目标族/);
+
+// Close wins over an in-flight search or pairing reply; closing is not remote cancellation.
+let finishSearch;
+handlers.platform_ap01 = ({op}) => op==='search' ? new Promise(resolve=>{finishSearch=resolve;}) : {result:'cancelling'};
+const searching=run('ap01Search()');
+assert.equal(element('ap01-add').hidden,false);
+run('ap01Close()');
+assert.equal(element('ap01-add').hidden,true);
+finishSearch({result:'complete',candidates:[{name:'late',device_mac:macA}]});await searching;
+assert.equal(element('ap01-candidates').children.length,0);
+handlers.platform_ap01=()=>({result:'complete',candidates:[{name:'new',device_mac:'AABBCCDDEEFF',pairing_pending:false}]});
+await run('ap01Search()');
+assert.equal(element('ap01-stop-search').hidden,true);
+assert.deepEqual(element('ap01-candidates').children[0].children.filter(n=>n.tag==='button').map(n=>!!n.disabled),[false,true,true]);
+let finishPair;
+handlers.platform_ap01=()=>new Promise(resolve=>{finishPair=resolve;});
+const pairing=run('ap01Pair("AABBCCDDEEFF")');run('ap01Close()');
+const beforeClosed=element('ap01-result').textContent;
+finishPair({result:'paired'});await pairing;
+assert.equal(element('ap01-result').textContent,beforeClosed);
+assert.equal(element('ap01-add').hidden,true);
+const beforeWifi=element('wifi-result').textContent;
+handlers.platform_wifi=()=>{throw new Error('ble_connect_timeout');};
+await run('wifiAddDevice()');
+assert.match(element('ble-add-result').textContent,/添加蓝牙设备失败/);
+assert.equal(element('ble-add-button').disabled,false);
+assert.equal(element('wifi-result').textContent,beforeWifi);
+handlers.platform_wifi=({op})=>op==='scan'?{mac:'AABBCCDDEEFF'}:{state:'failed',outcome:'unknown',error:'endpoint_timeout'};
+await run('wifiAddDevice()');
+assert.match(element('modal').innerHTML,/绑定并登记/);
+await run('wifiConfirmAdd("AABBCCDDEEFF")');
+assert.match(element('ble-add-result').textContent,/登记未完成/);
+console.log('Device add: close races, pending controls and local BLE feedback passed');
+
+handlers.platform_wifi=()=>({registered:true,device_mac:'7C4FADB93408'});
+handlers.platform_device_view=()=>({devices:[{device_mac:'7C4FADB93408',name:'Note4'}]});
+await run('wifiConfirmAdd("7C:4F:AD:B9:34:08")');
+assert.equal(run('selectedDeviceMac'),'7C4FADB93408');
+console.log('New device selection uses persisted canonical MAC');

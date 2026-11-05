@@ -15,6 +15,7 @@ static bool compactContextValid(const uint8_t context[16]) {
 }
 
 static bool compactHeaderValid(const CompactFrameHeader &h) {
+    if (h.kind == 1 && h.result == 2 && h.op == 0 && h.requestNo == 0) return compactContextValid(h.context);
     return h.kind <= 2 && h.op > 0 && h.op <= COMPACT_FRAME_MAX_OP &&
            h.result <= 3 && (h.kind == 1 || h.result == 0) &&
            h.requestNo != 0 && compactContextValid(h.context);

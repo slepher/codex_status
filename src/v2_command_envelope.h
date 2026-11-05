@@ -37,3 +37,12 @@ String v2BuildAck(const char *op, const char *result, const char *display,
                   const char *retention, const char *error, int64_t seq,
                   uint64_t planId, const char *context,
                   uint32_t acceptedRemainingS, const char *fwTarget, bool fullSeq = false);
+
+// Read-only replay may regenerate a snapshot; mutations must retain their ACK.
+inline bool isIdempotentReadOp(uint16_t op) {
+    switch (op) {
+        case 1: case 7: case 14: case 16: case 21: case 25: case 26:
+        case 27: case 28: case 31: case 33: case 34: case 35: return true;
+        default: return false;
+    }
+}

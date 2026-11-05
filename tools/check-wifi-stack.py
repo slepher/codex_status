@@ -15,10 +15,12 @@ args = parser.parse_args()
 assembly = subprocess.check_output([str(args.objdump), "-d", "-C", str(args.elf)], text=True)
 # Some toolchain .xt.prop ranges mark entire C++ functions as literal data.
 # Decode a disposable copy as a fallback, preserving the original ELF/ROM.
-with tempfile.NamedTemporaryFile(suffix=".elf") as decoded:
+with tempfile.TemporaryDirectory() as temp_dir:
+    # objcopy must open the output itself; an open NamedTemporaryFile is locked on Windows.
+    decoded = Path(temp_dir) / "decoded.elf"
     objcopy=args.objdump.with_name(args.objdump.name.replace("objdump","objcopy"))
-    subprocess.run([str(objcopy),"--remove-section=.xt.prop",str(args.elf),decoded.name],check=True,capture_output=True)
-    assembly += subprocess.check_output([str(args.objdump),"-d","-C",decoded.name],text=True)
+    subprocess.run([str(objcopy),"--remove-section=.xt.prop",str(args.elf),str(decoded)],check=True)
+    assembly += subprocess.check_output([str(args.objdump),"-d","-C",str(decoded)],text=True)
 functions = {}
 def adapter_name(name):
     if name.startswith("_Z") and "handleBleWifiMigration" in name:

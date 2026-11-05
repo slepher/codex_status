@@ -23,6 +23,10 @@ def patched_source(text):
     cleanup = text.split('\nvoid\nble_hs_deinit(void)\n', 1)
     if len(cleanup) != 2 or '    ble_npl_callout_deinit(&ble_hs_timer);' not in cleanup[1]:
         raise RuntimeError('NimBLE host final timer cleanup changed; review the fix')
+    # Newer upstream already leaves callout destruction to ble_hs_deinit.
+    upstream = OLD.replace('        ble_npl_callout_deinit(&ble_hs_timer);\n', '')
+    if text.count(upstream) == 1 and OLD not in text and NEW not in text:
+        return text
     if text.count(NEW) == 1 and OLD not in text:
         return text
     if text.count(OLD) != 1 or NEW in text:

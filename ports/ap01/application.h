@@ -10,6 +10,8 @@ struct Ap01ApplicationPort {
     void (*unlockBindings)(void *);
     // Firmware owns maintenance; App only observes its availability gate.
     bool (*systemBusy)(void *) = nullptr;
+    // Same admission contract as Ap01BusinessPort; covers a whole mutation request.
+    int32_t (*writeScope)(void *,int32_t (*)(void *),void *,int32_t *) = nullptr;
 };
 #include "native_http_0041.h"
 
@@ -24,10 +26,14 @@ class Ap01Application {
     std::unique_ptr<Session> sessions;
     char mac[13], nonce[33] = {};
     uint64_t boot;
+    // Protected by the binding lock; UI only queues a validated release.
+    uint64_t confirmationEvent = 0;
+    uint32_t confirmationRevision = 0;
     bool ready = false;
     std::atomic<bool> online{false};
     static int save(void *, const uint8_t *, size_t);
     Session *session(const char *principal);
+    Ap01HttpReply businessHttpOwned(const Ap01HttpRequest &,uint64_t);
     void dispatch(const Ap01HttpRequest &, const char *principal, uint16_t op,
                   uint64_t now, Ap01HttpReply &reply);
 public:
@@ -45,4 +51,5 @@ public:
     bool pairingUi(uint64_t now, String &reply);
     bool pairingDisplayed(const char *request, uint32_t revision, uint64_t event);
     bool button(bool pressed, uint64_t event, uint64_t now);
+    void processConfirmation(uint64_t now); // Business worker only.
 };

@@ -21,6 +21,7 @@
 | 查HTTP直达、BLE提前结束与独立HTTP报告的应有行为 | [bridge-device-communication-scenarios.md](bridge-device-communication-scenarios.md)（场景合同）→ [bridge-device-communication-implementation.md](bridge-device-communication-implementation.md)（源码证据与验收边界） |
 | 判断历史协议哪些已过期、哪些遗漏或仍是草案 | [bridge-device-protocol-history-audit.md](bridge-device-protocol-history-audit.md)（定向历史对账，当前源码/现场交叉核对） |
 | 查同父目录 Slate 的协议参考及适用边界 | [bridge-device-slate-protocol-comparison.md](bridge-device-slate-protocol-comparison.md)（schema、错误、摘要、生命周期；只读比较） |
+| 修复协议可靠性隐患（BLE静默丢帧/HTTP预检RTT/512B重放截断）与过度设计收敛 | [bridge-device-protocol-remediation-design.md](bridge-device-protocol-remediation-design.md)（P0–P2 分阶段方案、资源预算与验收清单） |
 | 查 AP01 逆向、ROM、首次安装、资源预算与应用 OTA | 同父目录 `cuktech-ap01-firmware` 仓库（`reverse/reports/ap01/`、`roms/CATALOG.md`）；本仓库只做对接，第三方克隆只读参考 |
 
 | 改电源/唤醒/占用 | `docs/power-state.md` + `docs/generic-display-platform-design.md` §7 |
@@ -50,6 +51,7 @@
 | `bridge-device-communication-implementation.md` | 源码对照 | 基线9c38e45的处理分支、HTTP报告/PPL1/单份Bundle/OTA与既有验收边界 |
 | `bridge-device-protocol-history-audit.md` | 历史对账 | 过期实现/现场、遗漏合同、待实现方案及验收边界分别记录 |
 | `bridge-device-slate-protocol-comparison.md` | 参考比较 | Slate 的可借鉴原则、已有等价机制与不能照搬的身份/事务/提交语义 |
+| `bridge-device-protocol-remediation-design.md` | 演进方案 | 针对 HTTP/BLE 可靠性隐患（P0）与多层冗余编码/双轨状态机（P1/P2）的收敛设计 |
 | `generic-display-platform-design.md` | **权威** | 通用显示平台现行架构。与它冲突的旧描述一律以它为准 |
 | `power-state.md` | **权威** | 电源状态、身份/发现、占用 claim/lease 语义（§9.1/§9.2/§13.3） |
 | `ble-rendezvous-power-design.md` | 设计已定稿，实现分 6 阶段 | 会合功耗设计；阶段 1/2 已上线，其余见 backlog C4 |

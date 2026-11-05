@@ -111,6 +111,10 @@
 
 ### A9. PowerPlan 与 Data 同轮联合下发（2026-10-05）
 
+- **2026-11-02 协议整改 P0 源码/软件验收完成，未部署**：会话复用、只读重放/写回执守卫、BLE 错误和可恢复驱动；workspace522通过/5条件忽略、Note4构建/匹配ELF栈88项通过。设计差异、最后补充回归及同版本候选哈希见[专项状态](../../project-workflow/bridge-device-protocol-remediation/status.md)。真实驱动恢复/RF/资源高水位仍开放，不结A9/B6/C8。
+
+- **2026-10-31 10/30事件已修，Windows已部署**：恢复context ACK与冻结在途Data；同context/合同/值/缺失/质量重开不再误push或授600秒，真实变化/丢Data/合同失效继续恢复，周期全量及未知重试不授正式Light。Core/BLE/App347通过、3条件忽略。00:46自然会合同值idle/Sleep0通过，长期多周期及Mac原生仍待验，不结A9；state新增data_in_flight，回退需配套备份。[状态/验收](../../project-workflow/wifi-families/connection-fix-status.md)、[原现场](../../project-workflow/wifi-families/connection-incident-20261030.md)。
+
 - **2026-10-20 Plan激活已修并配套实机验收**：原60→59 Data872/Plan5880获Light却下一周期才联网，是network_start拆分导致；新能力由Plan原事务冻结目标摘要/回报路由并在BLE结束建连。Note4 `.106` 原OTA job f7186b2f succeeded/image_verified，Mac12:09已部署；401回归/5条件忽略，最终协议8、栈88项通过，周期同值Sleep对照通过。用户允许蓝牙/定位后14:20原Plan5904 ACK network_activation=plan，3.304秒内同Plan ready，随后同MAC认证HTTP Wi-Fi连接/BLE关闭/原期限递减，本轮complete；14:21 Data876 applied/displayed，用户目视确认Wi-Fi图标已显示。自然新余量全链路时延未验，不结A9。[实施/部署/边界](../../project-workflow/bridge-macos/plan-activation-20261020.md)。
 
 - **2026-10-20 Wi-Fi余量快路径已修并部署Mac**：通知即时响应+源60秒兜底；新工作首次投递，只有待确认按设备每6轮重试，源消费/跨MAC独立，Data先于诊断。Core181/App122+集成26通过，最终定向3项通过；同MAC Data871 HTTP ACK applied/displayed及认证读回通过，源刷新实测61.49秒含RPC。仍缺真实新余量变化的通知/屏幕时延、Windows部署与长期RF；上游通知未到达原因未定。见[实施与部署](../../project-workflow/bridge-macos/wifi-usage-fast-path-20261020.md)、[原调查](../../project-workflow/bridge-macos/wifi-usage-latency-20261020.md)。
@@ -362,6 +366,10 @@
 
 ### C9. 取消项目自管A/B、动态容量与内置更新界面
 
+- **2026-11-04 App 集合 Bridge 接入**：v3 core 维护传输和 12 项设备客户端回归通过；产物/能力校验、持久原事务协调、UI 单更/批更/恢复及真实 App 整链仍开放。未部署，见 [接入任务](../../project-workflow/ap01-app-set-v3/task.md)。
+
+- **2026-10-28 AP01画面/旋钮无响应，根因未定**：用户发现停在用量80多、重置之前，拔电后恢复。Bridge自10-27 20:17起首发超时/重试unchanged模式持续，不能据此确认死机时刻或绘制成功；重启后同部署build且认证displayed。旧现场/任务栈未保存，不能归因用量重置；再次发生需先保全断电前认证状态、UI心跳/阶段与日志，必要时另行补有界取证再复现。未改代码/刷机。[调查与证据](../../project-workflow/ap01-template-integration/freeze-20261028.md)。
+
 - **2026-10-22 快转首尾动画已部署并实机通过**：修复build`ec0a58f7…`已认证运行应用槽1，用户确认界面/旋钮/App正常及双向快速首尾不再被动画跳过。救援0031/槽0先认证启动、全程未写入；按用户要求仅核版本/槽位，不整槽读回。部分日志覆盖如实记录，不扩大为GPIO/逐帧/先前断联验收；C9其余项仍开放。[证据](../../artifacts/ap01-wifi-animation-rollout-20261022/physical-verification.json)。
 
 - **2026-10-22 快转首尾动画后续，仅模拟**：原生索引正常，旧首尾滚动让目标行约357ms后才完整进入视口，100ms下一格已替换它；固件仅让首尾循环立即定位，双向原生时序红绿/慢转对照及宿主消毒器通过。保留相邻动画和输入顺序；完整原生菜单/合成驱动回归及预览审阅通过，物理LCD刷新/GPIO仍未验，不结实机项。新候选未刷；整槽读回已按用户要求停止，后续仅核版本/槽位。[根因、候选及边界](../../project-workflow/ap01-wifi-profiles/animation-20261022.md)。
@@ -476,6 +484,8 @@
 - 相关：`tools/wake-contact-trace.mjs` 已存在，可先做离线对拍再上机。
 
 ### C4. 功耗与会合策略（power-plan-c / next-execution-plan）
+
+- **2026-10-31 Note4快掉电调查/通信修复Windows已部署**：快区间Light/Sleep主导读数斜率约2.55:1，整数电压映射不等于实际功耗比。owner未采样被当空闲导致重复claim、同已ACK Plan重复HTTP均已修；App132通过/3忽略，真实Light窗口被动验证见专项。剩余：更长周期/电池端电流比、600s业务策略取舍、Mac原生验收；不改ROM。[调查证据](../../project-workflow/power-plan-c/note4-battery-diagnostic-20261031.md)、[修复/验收](../../project-workflow/power-plan-c/communication-fix-status.md)。
 - 用户已选 B 方案用于 Note4 与 1.54 B/W：BT modem sleep + main XTAL、BLE 会合期 240/80 MHz DFS 且不启用自动 light sleep；未连接广播最多 4s，已连接等指令最多 6s，成功 ACK 后沿用 200ms 提前收尾。两份干净 ROM 已顺序构建并逐台 OTA，新版本及后续真实 timer BLE ACK 均已观察；1.54 设备日志确认 `esp_bt_sleep_enable()` 返回 `ESP_OK`。仍待两台新版 4s/6s 长期会合率、1.54 BLE 专属频率驻留与整机电池端电量测量。B 的 Note4 3s/6s 旧样本不能当作新版 4s/6s 或 1.54 的成功率。
 - 已做：Note4 BLE 等待 A/B/C 三臂各 ≥30 个 deep 周期，分别为 BMS 关/80 MHz、BMS 开/80 MHz、BMS 开/40 MHz；有效回答 33/34、32/32、30/34。C 的 4 次未答是 3 次 3s 未连接、1 次连接后 6s 无命令。随后同 C 参数仅延长截止到 5s 广播/9s 等命令，实机 **34/34 回答**、平均 BLE 窗口 2.277s（旧 C 2.858s）；两轮在广播后 4.2/4.3s 才建链，说明 5s 上限有实际覆盖，9s 上限收益尚未单独验证。各组约 34 轮且未交错测试，不能把成功率变化归因于窗口或推出净耗电下降；详见 `project-workflow/power-plan-c/task-4-modem-sleep.md`。Bridge 为 15s 实验周期临时缩短同 MAC 冷却到 8s，测后已恢复生产 55s。下一步是电流仪下的 30–60 分钟整周期基线、5s/9s 长时对照与连接回归；BMS 关/40 MHz 第四臂、A5（整分钟对齐导致的 ~2 分钟间隔）仍待测。A4（`device_first` vs `bridge_first`）随 `bridge_first` 废弃而取消（2026-10-03 用户确认）。
 - 已列出 Note4 每分钟互斥阶段电量和 BLE 电流敏感度，见 `project-workflow/power-plan-c/energy-budget-per-minute.md`；当前表只给芯片/CPU 参考情景，整机面板、PSRAM、稳压及偶发 Wi-Fi/light 的电池端增量仍待仪器实测，不能把表中合计当续航承诺。
@@ -484,6 +494,8 @@
 - 前置：C3 的记录格式（否则没有可信的对照口径）。
 
 ### C8. 设备同步与诊断协议（device-sync-diagnostics）
+
+- **2026-10-31 10/30事件已修，Windows已部署**：BLE建链超时保留原Future，在原总预算内等待迟到完成再disconnect；只有操作收尾且关闭成功才释放锁，持续挂起/嵌套超时/取消/关闭失败仍隔离。迟到成功/失败及后续会合回归通过，Core/BLE/App347通过、3条件忽略。Windows实体超时/多周期仍待验，无法由旧日志断言原WinRT操作何时完成，不结C8。[状态/审阅](../../project-workflow/wifi-families/connection-fix-status.md)、[原现场](../../project-workflow/wifi-families/connection-incident-20261030.md)。
 
 - **2026-10-23 新设备默认数据投递已部署**：首次登记默认开启，已有关闭设置及重注册/重启持久值保留；AP01回执返回真实同步设置。338测试通过/5忽略，Mac Bridge重建/重启，AP01 seq8/Note4 seq1011设备ACK已应用显示；不关闭C8其他验收。[记录](../../project-workflow/default-data-sync/status.md)
 
@@ -522,6 +534,7 @@
 - `docs/history/workflow/note4-bridge-publish/protocol.md`的manifest增量传输仍为草案。未来若实现，遵循C9单份内容策略，另验设备动态容量/流式解析，不恢复当前/回退双清单。
 
 ### C6. 多 env / packages 目录隔离收尾
+- **2026-10-31 release CI 本地验证**：原生Windows448 passed/5 ignored；act windows-cross完整构建/真实上传/接收端哈希CRC通过，修复匿名头文件token依赖与WSL artifact网络；交叉EXE在默认Windows实例health/MCP/WebView2/C++渲染通过并恢复原exe。双S3候选marker/槽容量/ELF栈/USB包通过；AP01双ROM已纳入主CI：0031菜单版http扩容保留GIF、Linux真实构建/校验、0041带App Windows重建通过（依赖69015e7），[证据](../../project-workflow/release-ci/status.md)。仍待GitHub云端矩阵/上传/发布及AP01云端CI、Mac两架构、干净主机安装/长期RF。
 - **2026-10-11 发布矩阵与安装文档**：保留Note4/1.54两个ROM构建（串行、明确env、marker/版本/大小/SHA256/双槽容量），Windows x64与macOS arm64/x64 Bridge原生构建。标签触发draft Release，手动触发仅产物，必需目标失败阻止完整发布。缺口：尚未运行GitHub矩阵；macOS签名公证/干净主机安装未验；1.54最新候选虽本机构建通过，认证运行、OTA/USB/配网及发布闭环未验，不能用旧版本记录替代。克隆后Agent提示词和步骤见[构建安装](../build-install.md)，证据见[实施状态](../../project-workflow/bridge-macos/release-fonts-status.md)。
 - `tools/pio-target.ps1` 已落地，**两侧都已实测**（2026-09-25）：`.pio-pkgs/note4` 与 `.pio-pkgs/154g` 各 2 real（两个冲突 framework 包，69 MB + 2057 MB）+ 15 junction，各 ≈2126 MB。
 - **154g 构建成功**：`pio run -d <repo> -e esp32-s3-epaper-154g` → SUCCESS 102.38 s，无 banner、无重装；产物 `1,740,576 B / 91937B18…`（`0.18.23-bw`），另见 `docs/history/progress-archive-2026-10-03.md`「多 env 实测」节。

@@ -174,6 +174,9 @@ pub struct PersistedState {
     pub next_seq: BTreeMap<String, u64>,
     #[serde(default)]
     pub contexts: BTreeMap<String, Value>,
+    /// Frozen Data transactions survive restart until their original ACK.
+    #[serde(default)]
+    pub data_in_flight: BTreeMap<String, crate::coordinator::InFlight>,
     /// Last sent/accepted plan per device (idempotent retry after restart).
     #[serde(default)]
     pub plans: BTreeMap<String, Value>,
@@ -231,6 +234,7 @@ impl PlatformService {
             running_images,
             next_seq,
             contexts,
+            data_in_flight,
             plans,
         } = persisted;
         wifi_library.validate()?;
@@ -364,6 +368,22 @@ impl PlatformService {
             }),
         };
         service.refresh_all_contracts()?;
+        {
+            let mut inner = service.inner.lock().unwrap();
+            for (mac, c) in &mut inner.coordinators {
+                // Loading the persisted contract is not a contract change. Restore
+                // its ACK only after initialization, before fresh source readings.
+                if let Some(ctx) = contexts.get(mac).and_then(|value|
+                    context_from_json(value, c.context.as_ref().map_or(1, |c| c.next_seq))) {
+                    c.data.acked_push_fp = ctx.acked_push_fp;
+                    c.data.acked_full_fp = ctx.acked_full_fp;
+                    c.data.in_flight = data_in_flight.get(mac)
+                        .filter(|f| f.payload.active_context_id == ctx.context_id).cloned();
+                    c.context = Some(ctx);
+                    c.recompute_fingerprints();
+                }
+            }
+        }
         if history_recovered || ota_recovered {
             let inner = service.inner.lock().unwrap();
             Self::persist(&inner, &service.state_path())?;
@@ -444,6 +464,8 @@ impl PlatformService {
                 c.job.as_ref().filter(|j| matches!(j.state, PublishState::Waiting | PublishState::Sending | PublishState::Unknown))
                     .map(|j| (mac.clone(), j.clone()))
             }).collect(),
+            data_in_flight: inner.coordinators.iter().filter_map(|(mac, c)|
+                c.data.in_flight.clone().map(|flight| (mac.clone(), flight))).collect(),
             next_seq: inner
                 .coordinators
                 .iter()
@@ -2740,6 +2762,10 @@ impl PlatformService {
             }
             c.active_template_id = (!reported.is_empty()).then(|| reported.to_owned());
             if contract_changed {
+                if let Some(context) = c.context.as_mut() {
+                    context.acked_push_fp = None;
+                    context.acked_full_fp = None;
+                }
                 c.data.in_flight = None;
                 c.data.acked_push_fp = None;
                 c.data.acked_full_fp = None;
@@ -3875,18 +3901,12 @@ mod tests {
             svc.note_codex_envelope(&envelope).unwrap();
             svc.next_http_delivery(mac,true,now);
             let first = svc.data_message_body(mac).unwrap();
-            let mut seq = first["seq"].as_u64().unwrap();
+            let seq = first["seq"].as_u64().unwrap();
             assert_eq!(svc.note_ack(mac,DeliveryKind::LightData,seq,first["crc"].as_str().unwrap(),true,"displayed")["outcome"],"applied");
             let svc = if restart {drop(svc);PlatformService::open(dir.path()).unwrap()} else {svc};
             status["data_seq"]=json!(seq);
             svc.note_device_status_at(mac,&status,"http",now+1).unwrap();
             svc.note_codex_envelope(&envelope).unwrap();
-            if restart && svc.next_http_delivery(mac,true,now+1)["decision"] == "light_data" {
-                // Startup may reconfirm the cached source; establish its ACK
-                // before testing the later device-only reboot.
-                let initial=svc.data_message_body(mac).unwrap();seq=initial["seq"].as_u64().unwrap();
-                assert_eq!(svc.note_ack(mac,DeliveryKind::LightData,seq,initial["crc"].as_str().unwrap(),true,"displayed")["outcome"],"applied");
-            }
             assert_eq!(svc.next_http_delivery(mac,true,now+1)["decision"],"idle");
             let before=svc.coordinator_summary(mac,now+1).unwrap();
             status["boot_id"]=json!("new");status["data_seq"]=json!(0);
@@ -3984,6 +4004,11 @@ mod tests {
                 let ready_env = if missing { json!({}) } else { env.clone() };
                 svc.note_codex_envelope(&ready_env).unwrap();
                 let ready = deliver(&svc);
+                if !missing {
+                    assert_eq!(ready["decision"], "idle");
+                    assert_eq!(svc.plan_for_rendezvous(mac, now, "rendezvous", 0).unwrap().mode, PlanMode::Sleep);
+                    continue;
+                }
                 assert_eq!(ready["decision"], if ble { "ble_data" } else { "light_data" });
                 let body = svc.data_message_body(mac).unwrap();
                 assert_eq!(body["fields"][1]["v"], if missing { Value::Null } else { json!(100) });
@@ -4083,6 +4108,96 @@ mod tests {
         }
     }
 
+    #[test]
+    fn restart_preserves_missing_quality_and_unknown_data_without_false_light() {
+        for initial in ["good", "missing", "stale"] {
+            let dir = tempfile::tempdir().unwrap();
+            let svc = first_contact_service(dir.path());
+            let mac = "AABBCCDDEEFF";
+            let now = crate::now_secs();
+            let read = |svc: &PlatformService, state: &str| {
+                svc.note_codex_envelope(&if state == "missing" { json!({}) } else {
+                    json!({"account":{"plan":"plus"}, "buckets":[{"id":"codex",
+                        "windows":[{"usedPercent":7,"windowMins":10080}]}]})
+                }).unwrap();
+                if state == "stale" {
+                    let mut inner = svc.inner.lock().unwrap();
+                    let c = inner.coordinators.get_mut(mac).unwrap();
+                    for source in c.sources.values_mut() {
+                        for field in source.fields.values_mut() { field.quality = crate::platform::model::Quality::Stale; }
+                    }
+                    c.recompute_fingerprints();
+                }
+            };
+            let ack = |svc: &PlatformService, data: &Value| {
+                assert_eq!(svc.note_ack(mac, DeliveryKind::LightData,
+                    data["data_seq"].as_u64().unwrap(), data["content_crc"].as_str().unwrap(),
+                    true, "displayed")["outcome"], "applied");
+            };
+            read(&svc, initial);
+            let first = svc.next_http_delivery(mac, true, now);
+            ack(&svc, &first);
+            let deadline = svc.coordinator_summary(mac, now).unwrap()["context"]["full_sync_deadline"].as_u64().unwrap();
+            drop(svc);
+            let svc = PlatformService::open(dir.path()).unwrap();
+            read(&svc, initial);
+            assert_eq!(svc.next_http_delivery(mac, true, now + 1)["decision"], "idle");
+            assert_eq!(svc.plan_for_rendezvous(mac, now + 1, "rendezvous", 0).unwrap().mode, PlanMode::Sleep);
+            // Periodic full sync, including its unknown retry, is temporary work.
+            let periodic = svc.next_http_delivery(mac, true, deadline);
+            assert_eq!(periodic["temporary_data"], true);
+            assert_eq!(svc.plan_for_rendezvous(mac, deadline, "rendezvous", 0).unwrap().mode, PlanMode::Sleep);
+            let body = svc.data_message_body(mac).unwrap();
+            drop(svc);
+            let svc = PlatformService::open(dir.path()).unwrap();
+            read(&svc, initial);
+            assert_eq!(svc.plan_for_rendezvous(mac, deadline + 1, "rendezvous", 0).unwrap().mode, PlanMode::Sleep);
+            let changed = if initial == "good" { "stale" } else { "good" };
+            read(&svc, changed);
+            let retry = svc.next_http_delivery(mac, true, deadline + 1);
+            assert_eq!(retry["data_seq"], periodic["data_seq"]);
+            assert_eq!(svc.data_message_body(mac).unwrap(), body);
+            ack(&svc, &retry);
+            // ACK of the old snapshot cannot swallow a quality/missing change.
+            assert_eq!(svc.plan_for_rendezvous(mac, deadline + 2, "rendezvous", 0).unwrap().light_duration_s, 600);
+            let push = svc.next_http_delivery(mac, true, deadline + 2);
+            assert_eq!(push["temporary_data"], false);
+            let push_body = svc.data_message_body(mac).unwrap();
+            drop(svc);
+            let svc = PlatformService::open(dir.path()).unwrap();
+            // Returning to the previously confirmed value must still settle the
+            // unknown push under its original sequence and frozen payload.
+            read(&svc, initial);
+            let retry = svc.next_http_delivery(mac, true, deadline + 3);
+            assert_eq!(retry["data_seq"], push["data_seq"]);
+            assert_eq!(svc.data_message_body(mac).unwrap(), push_body);
+            assert_eq!(svc.plan_for_rendezvous(mac, deadline + 3, "rendezvous", 0).unwrap().light_duration_s, 600);
+        }
+    }
+
+    #[test]
+    fn restart_cannot_restore_ack_invalidated_by_contract_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = first_contact_service(dir.path());
+        let mac = "AABBCCDDEEFF";
+        let now = crate::now_secs();
+        let env = json!({"account":{"plan":"plus"}});
+        svc.note_codex_envelope(&env).unwrap();
+        let first = svc.next_http_delivery(mac, true, now);
+        assert_eq!(svc.note_ack(mac, DeliveryKind::LightData, first["data_seq"].as_u64().unwrap(),
+            first["content_crc"].as_str().unwrap(), true, "displayed")["outcome"], "applied");
+        let mut contract = svc.device_get(mac).unwrap()["data_contract"].clone();
+        contract["source_crc"] = json!("87654321");
+        svc.note_device_status_at(mac, &json!({"device_mac":mac,"configured":true,
+            "active_context_id":"first-contact","active_template_id":"device-only",
+            "data_seq":first["data_seq"],"data_contract":contract}), "http", now + 1).unwrap();
+        drop(svc);
+        let svc = PlatformService::open(dir.path()).unwrap();
+        svc.note_codex_envelope(&env).unwrap();
+        assert_eq!(svc.plan_for_rendezvous(mac, now + 2, "rendezvous", 0).unwrap().light_duration_s, 600);
+        assert_eq!(svc.next_http_delivery(mac, true, now + 2)["decision"], "light_data");
+    }
+
     fn check_remaining_delivery(ble: bool, restart: bool, trigger: Option<&str>) {
         let dir = tempfile::tempdir().unwrap();
         let svc = PlatformService::open(dir.path()).unwrap();
@@ -4138,14 +4253,8 @@ mod tests {
         assert!(svc.templates().is_empty());
         svc.note_codex_envelope(&envelope(7, now + 86400)).unwrap();
         let resumed = delivery(&svc, now + 1);
-        if restart && resumed["decision"] == expected {
-            // Startup may reconfirm the cached snapshot; test subsequent changes
-            // against its successful ACK, rather than assuming no startup replay.
-            assert_eq!(svc.data_message_body(mac).unwrap()["fields"][0]["v"], 93);
-            ack(&svc, &resumed);
-        } else {
-            assert_eq!(resumed["decision"], "idle");
-        }
+        assert_eq!(resumed["decision"], "idle", "restart must preserve confirmed data");
+        assert_eq!(svc.plan_for_rendezvous(mac, now + 1, "rendezvous", 0).unwrap().mode, PlanMode::Sleep);
         let confirmed = svc.coordinator_summary(mac, now).unwrap();
         assert_eq!(delivery(&svc, now + 1)["decision"], "idle");
 

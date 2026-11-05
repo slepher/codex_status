@@ -35,7 +35,10 @@ pub fn interfaces() -> Result<Vec<LanInterface>, String> {
 }
 
 #[cfg(unix)]
-pub fn interfaces() -> Result<Vec<LanInterface>, String> {
+pub fn interfaces() -> Result<Vec<LanInterface>, String> { interfaces_on(None) }
+
+#[cfg(unix)]
+pub fn interfaces_on(name: Option<&str>) -> Result<Vec<LanInterface>, String> {
     let mut first=std::ptr::null_mut();
     if unsafe {libc::getifaddrs(&mut first)}!=0 {return Err("lan_interface_unavailable".into());}
     let mut result=Vec::new();let mut row=first;
@@ -50,7 +53,9 @@ pub fn interfaces() -> Result<Vec<LanInterface>, String> {
                 unsafe extern "C" {fn codex_network_interface_active(name:*const std::ffi::c_char)->i32;}
                 codex_network_interface_active(iface.ifa_name)!=0
             };
-            if active && !iface.ifa_addr.is_null() &&
+            if name.is_none_or(|name| !iface.ifa_name.is_null() &&
+                std::ffi::CStr::from_ptr(iface.ifa_name).to_bytes()==name.as_bytes()) &&
+                active && !iface.ifa_addr.is_null() &&
                 !iface.ifa_netmask.is_null() && (*iface.ifa_addr).sa_family as i32==libc::AF_INET {
                 let ip=&*iface.ifa_addr.cast::<libc::sockaddr_in>();
                 let mask=&*iface.ifa_netmask.cast::<libc::sockaddr_in>();
@@ -77,6 +82,12 @@ fn add(result:&mut Vec<LanInterface>,ip:Option<Ipv4Addr>,mask:Option<Ipv4Addr>) 
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn missing_named_interface_never_falls_back_to_vpn() {
+        assert!(super::interfaces_on(Some("codex-nonexistent-interface")).unwrap().is_empty());
+    }
+
     #[test]
     fn preserves_real_masks_and_rejects_noncontiguous_masks() {
         let mut result=Vec::new();
