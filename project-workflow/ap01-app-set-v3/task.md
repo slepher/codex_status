@@ -1,3 +1,7 @@
+# 2026-11-05 归属调整
+
+App 可执行包 OTA 及客户端归 firmware。本仓不再推进 Native Tauri IPC 或 App OTA 网络发现；以下勾选仅为迁移前历史。业务 Bundle/C2 协议与 App 平台适配保留。当前工作转至 ../cuktech-ap01-firmware/project-workflow/ap01-app-update/。
+
 # 任务
 
 - [x] Rust v3 路由/身份围栏/错误分类及 TCP 验证

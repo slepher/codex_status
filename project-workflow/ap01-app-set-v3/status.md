@@ -1,3 +1,9 @@
+# 2026-11-05 App OTA 迁回 firmware
+
+按用户要求移除本仓 App OTA 专用 Rust 模块、Bridge UI/worker、Tauri/MCP 命令及专用测试；firmware 已有多包 CLI 与生产 HTTP 交叉验收，作为维护入口。五个原始 OTA-only 源码补丁保存在 firmware/docs/history/app-ota-bridge，可追溯但不再作为本仓构建依赖。业务 Bundle/C2/BLE、配对和 ABI 3.1 App 源码保留；未删除任何本机运行数据或旧回执，未启停 Bridge。迁移验收：边界守卫、Node 页面及 WK80 场景通过（窄/宽截图审阅）；Rust core/app/mcp 347 passed、5 既有条件忽略。Fake BLE 初次被系统代理返回 503，测试进程绕过 loopback 代理后通过，业务协议未改。firmware CLI 五事务回环和 AUT3 103164 检查通过。11 个业务/适配关键文件字节保持，记录在 firmware/build/commit-check/ota-boundary-before.json。未操作本机 Bridge 数据或设备。
+
+以下均为历史证据，不再要求本仓完成 App OTA 产品化。
+
 # 状态
 
 2026-11-05 业务可写恢复接入 ABI 3.1 写作用域：Busy 不执行 begin、不锁存失败，解除后恢复一次；真实 I/O 失败仍保持失败。bootstrap 固定只读，新运行库拒绝无扩展平台。真实 Bundle 宿主回归及 james.local Docker 实际 worker 双基址通过，固件仓库报告 `build/scope-resume/qemu-final.json` SHA256 `4cce51dbcce47944cd7f9ae804b9f86d671b301e218e7ecbc3ec92f53733dd40`。Bundle/激活/配对的完整操作准入和 UI 配对保存迁至 worker 仍待完成；未部署、未操作实机。
