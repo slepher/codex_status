@@ -13,6 +13,8 @@
 
 ## 活跃事项与下一步
 
+- 11-05 Note4电池图标已修复并发布：codex-status-a v8，满电左右1px/上下2px白边；0/50/99/100%同源渲染及像素断言通过。Bridge库同步，完整Bundle34329d8f/事务24725a35 succeeded；独立认证同MAC、合同5ad7964c、commit_seq1149、ready/error空，Data9 displayed；ROM仍.108。用户已确认效果正常；认证时电量93%，满电边距由宿主像素验收。[记录与预览](project-workflow/bridge-macos/note4-battery-icon-20261105.md)。
+
 - 11-05 Mac添加设备/Note4现场修复已部署：AP01搜索可关闭、迟到响应围栏、全局BLE错误不污染设备卡、设备码只限AP01；首次配对使用显式绑定入口；首次无IP联网解除循环依赖，TUN下登记/Plan/claim及续租使用实际Wi-Fi接口。Bridge exe81482064B，SHA256 `ddff5b57a7470de3088de0b35f6e2359db6112e7ca99f4fdfdf58d5d9af90a43`。Node/WK82/窄宽图、Rust无IP/准入及claim9测试通过。Note4部署.108后自然窗口外原绑定加密重连通过、联网Xiaomi_1EBB、HTTP认证及Data seq5 displayed；owner host实测192.168.31.66。首次联网会合预算超时后独立认证报告成功；长Flash备份中断，实际保全引导/NVS及将覆盖区域分块备份，原.107槽未写。B6/C8完整矩阵仍未结。[状态](project-workflow/bridge-macos/device-add-20261105-status.md)
 
 - C9 独立 App：按用户边界，App 可执行包 OTA（单更/批更、回执、重启切换、回退及客户端）归兄弟 firmware 仓库；本仓撤出 App OTA Rust/UI/MCP 接线，保留业务 Bundle/C2/配对协议、只读恢复和 ABI 3.1 App 适配。原 Bridge OTA 实现留存于 firmware 的 docs/history/app-ota-bridge，维护入口为 tooling/scripts/app-set-client-v3.py。未启停 Bridge、未动运行数据、未部署；当前迁移验收见[状态](project-workflow/ap01-app-set-v3/status.md)。业务协议整改独立继续。

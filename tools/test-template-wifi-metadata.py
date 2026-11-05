@@ -11,7 +11,7 @@ scope = {"json": json}
 exec(compile(ast.Module(body=[encoder], type_ignores=[]), "bridge.py:tpl_canon", "exec"), scope)
 for path, expected in [
     ("tools/test-bridge/templates/quad.json", "abd79ca9"),
-    ("bridge/crates/core/tests/fixtures/codex-status-a-400x300.json", "6d54e167"),
+    ("bridge/crates/core/tests/fixtures/codex-status-a-400x300.json", "5ad7964c"),
     ("tools/test-bridge/templates/codex-status-ap01.json", "9bc56e9a"),
 ]:
     template = json.loads((root / path).read_text(encoding="utf-8"))
