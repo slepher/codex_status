@@ -2342,7 +2342,7 @@ mod tests {
     #[test]
     fn json_fragments_reassemble_at_boundary_and_preserve_utf8_bytes() {
         let mut input = vec![b'x'; 180];
-        input.extend_from_slice("鐣屽熬".as_bytes());
+        input.extend_from_slice("界尾".as_bytes());
         let parts = Pusher::fragment_payload(&input, super::JSON_WRITE_LIMIT);
         assert_eq!(parts.iter().map(Vec::len).max(), Some(180));
         assert!(parts

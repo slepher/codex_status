@@ -5,7 +5,7 @@
 ## 备份与保留
 
 - `artifacts/pull-merge-20261105/local-before.zip`：29个原修改/未跟踪文件，另有完整binary patch及分叉提交清单。
-- `stash@{0}`：Safety backup before pull integration 2026-11-05，未删除。
+- 合并备份stash `bd778d3fdbcc34aca6aaf9ec526159adaf59f72e`：2026-11-06按用户要求核验后清理；18个原未跟踪文件逐字节已提交，6个原修改文件与stash一致，其余代码/待办新增行经新版类型映射全部保留，旧交接卡完整归档。ZIP/patch继续保留，其他历史stash不变。
 - 原18个未跟踪文件已逐个核验内容一致（仅Git换行规范化），已暂存以避免漏提交。
 - 当前卡按设备合并时间线，两份原卡归档到docs/history；无运行现场核验，不将源码版本/历史候选视为部署。
 
@@ -20,3 +20,5 @@
 隔离构建目录：bridge/target-note4-sync。完整日志：artifacts/pull-merge-20261105/。未构建固件、未启停Bridge、未动data、未操作设备。
 
 最终日志：`cargo-test-final.log`保留并行3失败；`sim-targeted.log`为原接口失败用例修复通过；`sim-serial.log`为模拟器全73项通过。路径均在上述私有目录。未执行workspace doc-tests（并行命令在模拟器失败处停止）。
+
+2026-11-06清理复核：发现UTF-8分片测试样本“界尾”在合并中发生转码，已恢复两边原文；对应bridge-ble测试1项通过。此修正不改变运行逻辑。
