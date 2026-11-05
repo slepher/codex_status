@@ -1,5 +1,7 @@
 # 状态
 
+2026-11-05 业务可写恢复接入 ABI 3.1 写作用域：Busy 不执行 begin、不锁存失败，解除后恢复一次；真实 I/O 失败仍保持失败。bootstrap 固定只读，新运行库拒绝无扩展平台。真实 Bundle 宿主回归及 james.local Docker 实际 worker 双基址通过，固件仓库报告 `build/scope-resume/qemu-final.json` SHA256 `4cce51dbcce47944cd7f9ae804b9f86d671b301e218e7ecbc3ec92f53733dd40`。Bundle/激活/配对的完整操作准入和 UI 配对保存迁至 worker 仍待完成；未部署、未操作实机。
+
 2026-11-05 UI/Rust 与实际 RV32 同次闭环通过：生产页面经测试 IPC、Rust worker、回环 TCP 和 C++ HTTP，完成首装失败空回退、同包重新安装、A 单更、A+B 批更和整集回退。QEMU 仅运行于 james.local Docker；真实 App 双基址执行，健康不由宿主注入，20 次原事务查询等待，commit 每事务一次，boot=13/14/15/16/18，终态清理完成。页面重开恢复、结果标签、查询/归档均通过；报告位于兄弟固件仓库 `build/app-install/set-rv32-ui-v3-report-01.json`，SHA `26d67fcd842758202b07668a861420a9a82314c2463c011649c2f5ffe9fe2982`。原生 Tauri IPC/文件对话框、网络变化自动发现仍待验；未启停生产 Bridge、未连接实机。
 
 2026-11-04 暂存清理：stage 新增 128 MiB 逻辑容量限制；无活动回执时清理超过 24 小时的精确命名缓存/.tmp，复用刷新时间。有活动或损坏回执则保留全部缓存；超限拒绝新增，不触碰原始选择文件。5 项应用测试、职责边界检查及 UI→Rust→C++ 真实双包四链复验通过（首装/单更/批更/整集回退，测试 IPC、模型健康/重启）。原生 IPC、自动网络变化及固件资源/孤儿回收/RV32 全链仍开放，未部署或操作实机。
@@ -38,3 +40,7 @@ Node 设备页通过；原生 WKWebView 88 个窄/宽场景通过，已审阅 56
 2026-11-04 UI/Rust/C++ 同次链：生产 index.html 的 appUpdate 函数读取真实双包，测试 IPC 适配器调用真实 Rust stage/prepare/worker/query/archive，再连接生产 C++ HTTP 模型。首装、A 单更、A+B 批更、失败整集回退四次通过；每条注入一次丢回复、页面重开后恢复原 operation、最终查询并归档，UI 不将回退显示成功，归档后不复活旧任务。设备侧 commit 各一次，B 单更未上传且身份不变，回退运行列表与旧集合一致，boot_id 12/13/14/16。
 
 报告：兄弟固件 build/app-install/set-ui-rust-tcp-v3-report.json；复现用已有 TCP 交叉命令加 --rust-ui（替代 --rust-worker），报告改为该路径。测试入口 tools/test-ap01-app-ui-rpc.mjs 与 Rust ignored production_ui_rust_cpp_collection；隔离临时数据、回环随机端口和随机测试令牌。只替换 DOM/Tauri IPC 传输及固定测试端点，Rust/C++ 响应真实执行；尚未验证原生 Tauri IPC/桌面文件选择对话框，健康/CPU 重启仍为模型。生产 Bridge 与设备未访问。
+
+### 2026-11-05 分批提交边界
+
+HTTP 变更请求已接整请求 writeScope，准入早于 session/replay 更新；当前只读恢复宿主回归和跨仓库边界检查通过。认证 C2 Busy 后原请求重试、提交回执重放尚待专项验证，既有 RV32 包证据不覆盖此次 HTTP 接入；本地激活及配对确认写入仍待完成。未部署或操作实机。

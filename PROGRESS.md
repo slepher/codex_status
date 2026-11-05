@@ -13,7 +13,7 @@
 
 ## 活跃事项与下一步
 
-- C9 独立 App：固件 D3/D4 已有集合日志、重启选择/清理、HTTP 与 Python CLI；首装/单更/批更/整集回退通过 C++ 服务及回环 TCP 交叉模型。Bridge core 已有 v3 维护传输与 AMF3/APX2 校验，12 项客户端回归、真实双包/能力匹配及回执恢复校验通过；core 单步协调及丢 commit 回复恢复测试通过；Rust/C++ 回环四链及丢回复恢复交叉通过；共享 Tauri/MCP 单步应用入口已接；离线回执查询、终态归档及接续更新已验；显式地址恢复/未确认事务取消已验；后台 worker/持久取消及 C++ 四链通过；UI 已接且 Node/WK88 通过；UI→Rust→C++ 四链通过（测试 IPC）；暂存 128 MiB/24h 清理及活动回执保留已验；UI/Rust→真实 RV32 五事务闭环已通过（测试 IPC）；原生 IPC、网络变化、设备孤儿回收与完整原厂启动仍待完成。未启停/部署 Bridge，现场不变；模型不替代硬件准入。[Bridge 接入](project-workflow/ap01-app-set-v3/status.md) · [固件证据](../cuktech-ap01-firmware/project-workflow/ap01-app-update/status.md)
+- C9 独立 App：固件 D3/D4 已有集合日志、重启选择/清理、HTTP 与 Python CLI；首装/单更/批更/整集回退通过 C++ 服务及回环 TCP 交叉模型。Bridge core 已有 v3 维护传输与 AMF3/APX2 校验，12 项客户端回归、真实双包/能力匹配及回执恢复校验通过；core 单步协调及丢 commit 回复恢复测试通过；Rust/C++ 回环四链及丢回复恢复交叉通过；共享 Tauri/MCP 单步应用入口已接；离线回执查询、终态归档及接续更新已验；显式地址恢复/未确认事务取消已验；后台 worker/持久取消及 C++ 四链通过；UI 已接且 Node/WK88 通过；UI→Rust→C++ 四链通过（测试 IPC）；暂存 128 MiB/24h 清理及活动回执保留已验；UI/Rust→真实 RV32 五事务闭环已通过（测试 IPC）；业务可写恢复已接 ABI 3.1，真实 worker Busy 后恢复双基址通过；完整业务写集、原生 IPC、网络变化、设备孤儿回收与完整原厂启动仍待完成。未启停/部署 Bridge，现场不变；模型不替代硬件准入。[Bridge 接入](project-workflow/ap01-app-set-v3/status.md) · [固件证据](../cuktech-ap01-firmware/project-workflow/ap01-app-update/status.md)
 
 - 协议整改 P0 源码/软件验收完成，已提交、未部署：HTTP 会话复用与重放、BLE 错误/四槽队列/Notify 退避/可恢复冷却；workspace522通过/5条件忽略，最终core+ble245通过/2忽略，Note4构建及匹配ELF栈88项通过。**未部署同版本候选** `artifacts/protocol-p0/note4-p0-0.18.106.bin`，1872736 B，SHA256 `1b93bf34f4139c21d322fb0a8a3c93d9333503fb056663c4771f8a07bfaeb864`；现场ROM不变。新工具链、资源预算及实机边界见[状态](project-workflow/bridge-device-protocol-remediation/status.md)。A9/B6/C8实机未结，P1/P2未实施。
 
