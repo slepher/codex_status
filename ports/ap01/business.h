@@ -12,6 +12,9 @@ struct Ap01BusinessPort {
     bool (*present)(void *, uint8_t *, uint32_t);
     bool (*retire)(void *) = nullptr;
     const char *(*displayReason)(void *) = nullptr;
+    // Optional resident write admission: 1 means no callback (retry later),
+    // 0 means callback ran with its result in out; negative means unavailable.
+    int32_t (*writeScope)(void *,int32_t (*)(void *),void *,int32_t *) = nullptr;
 };
 
 class Ap01Business {

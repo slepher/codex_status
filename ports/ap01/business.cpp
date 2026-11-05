@@ -68,7 +68,15 @@ bool Ap01Business::syncWritePermission(uint64_t now,bool allow) {
     if(!allow){writesEnabled.store(false,std::memory_order_release);return true;}
     if(writeResumeFailed)return false;
     if(writesAllowed())return true;
-    if(begin(now,false))return true;
+    if(ui.writeScope){
+        struct Resume {Ap01Business *self;uint64_t now;} resume{this,now};
+        int32_t result=-1;
+        int32_t admitted=ui.writeScope(ui.context,[](void *p)->int32_t{
+            auto &r=*(Resume *)p;return r.self->begin(r.now,false)?0:-1;
+        },&resume,&result);
+        if(admitted==1)return true; // Busy: no begin, no migration or failure latch.
+        if(admitted==0&&result==0)return true;
+    }else if(begin(now,false))return true;
     writeResumeFailed=true;return false;
 }
 bool Ap01Business::render() {

@@ -10,6 +10,8 @@ struct Ap01ApplicationPort {
     void (*unlockBindings)(void *);
     // Firmware owns maintenance; App only observes its availability gate.
     bool (*systemBusy)(void *) = nullptr;
+    // Same admission contract as Ap01BusinessPort; covers a whole mutation request.
+    int32_t (*writeScope)(void *,int32_t (*)(void *),void *,int32_t *) = nullptr;
 };
 #include "native_http_0041.h"
 
@@ -28,6 +30,7 @@ class Ap01Application {
     std::atomic<bool> online{false};
     static int save(void *, const uint8_t *, size_t);
     Session *session(const char *principal);
+    Ap01HttpReply businessHttpOwned(const Ap01HttpRequest &,uint64_t);
     void dispatch(const Ap01HttpRequest &, const char *principal, uint16_t op,
                   uint64_t now, Ap01HttpReply &reply);
 public:

@@ -122,7 +122,10 @@ struct Runtime {
     ap01_window_0041 &window;
     explicit Runtime(const Ap01PlatformApiV3 &api)
         :networkClient(api.network),fs(api.files,api.private_root),
-         business(fs,{this,present,retire,displayReason},api.boot_id),bootId(api.boot_id),
+         business(fs,{this,present,retire,displayReason,
+             [](void *,int32_t (*callback)(void *),void *argument,int32_t *result)->int32_t{
+                 return ap01RuntimeWriteScopeV3(callback,argument,result);
+             }},api.boot_id),bootId(api.boot_id),
          root(api.ui.window->win),original(api.ui.window->stock),
          host(*api.ui.host),apps(api.ui.app),window(*api.ui.window) {}
     #else
@@ -556,12 +559,19 @@ void *Runtime::bootstrap(void *p) {
     if(ap01_app_core_call(&r.appServices,AP01_CORE_MAC,mac,sizeof(mac))!=AP01_SERVICE_OK||!r.fs.begin(false,"/resource",10,"resource"))return nullptr;
     #endif
     Ap01ApplicationPort callbacks{&r,appRandom,lockBindings,unlockBindings,systemBusy};
+#ifdef AP01_FILE_APP_V3
+    callbacks.writeScope=[](void *,int32_t (*callback)(void *),void *argument,int32_t *result)->int32_t{
+        return ap01RuntimeWriteScopeV3(callback,argument,result);
+    };
+#endif
     r.app.reset(new(std::nothrow) Ap01Application(r.fs,r.business,callbacks,mac,r.bootId));
     if(!r.app)return nullptr;
     bool appReady=r.app->begin(nowMs());
 #ifdef AP01_FILE_APP_V3
     // Set readonly policy before exposing pairing callbacks to maintenance.
-    r.business.begin(nowMs(),api->writes_allowed(context)!=1);
+    // Bootstrap never migrates/writes; the business worker obtains a complete
+    // write lease after durable approval before restoring writable state.
+    r.business.begin(nowMs(),true);
     Ap01AppBindingV3 binding{r.app.get(),
         [](void *p,const char *token,char out[65])->int32_t{return ((Ap01Application *)p)->bindingPrincipal(token,out);},
         [](void *p,const Ap01HttpRequestV3 *q,uint64_t now,Ap01ReplyV3 emit,void *out)->int32_t {

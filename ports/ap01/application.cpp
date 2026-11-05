@@ -219,6 +219,19 @@ void Ap01Application::dispatch(const Ap01HttpRequest &request, const char *princ
     }
 }
 Ap01HttpReply Ap01Application::businessHttp(const Ap01HttpRequest &request, uint64_t now) {
+    uint16_t op=operation(request.path);
+    if(!port.writeScope||!op||op==1||!business.writesAllowed())return businessHttpOwned(request,now);
+    struct Call {Ap01Application *app;const Ap01HttpRequest *request;uint64_t now;Ap01HttpReply reply;} call{this,&request,now,{}};
+    int32_t result=-1;
+    int32_t admitted=port.writeScope(port.context,[](void *p)->int32_t{
+        auto &c=*(Call *)p;c.reply=c.app->businessHttpOwned(*c.request,c.now);return 0;
+    },&call,&result);
+    if(admitted==0&&result==0)return std::move(call.reply);
+    // Admission precedes session/replay updates: Busy never retires a request.
+    error(call.reply,503,admitted==1?"maintenance_busy":"write_scope_unavailable","write_admission");
+    return std::move(call.reply);
+}
+Ap01HttpReply Ap01Application::businessHttpOwned(const Ap01HttpRequest &request, uint64_t now) {
     Ap01HttpReply reply;
     if (!ready || !online.load(std::memory_order_acquire)||maintenanceActive()) { error(reply, 503, "business_offline", "lifecycle"); return reply; }
     uint16_t op = operation(request.path);
