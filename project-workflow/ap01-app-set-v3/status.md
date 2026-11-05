@@ -44,3 +44,27 @@ Node 设备页通过；原生 WKWebView 88 个窄/宽场景通过，已审阅 56
 ### 2026-11-05 分批提交边界
 
 HTTP 变更请求已接整请求 writeScope，准入早于 session/replay 更新；当前只读恢复宿主回归和跨仓库边界检查通过。认证 C2 Busy 后原请求重试、提交回执重放尚待专项验证，既有 RV32 包证据不覆盖此次 HTTP 接入；本地激活及配对确认写入仍待完成。未部署或操作实机。
+
+2026-11-05 更新：固件仓库真实 C2/Bundle + AppFilesV3 宿主专项已补齐 claim 与 Bundle begin/chunk/commit 的 Busy 原请求重试及无额外写入的成功回执重放；status 在 Busy 时仍成功。ASan/UBSan 通过，证据见兄弟仓库 `build/commit-check/readonly-direct-report.json`。未覆盖 RV32 HTTP、HTTP 激活、本地激活与 UI 配对确认迁移。
+
+2026-11-05 激活推进：localActivate 已在完整 writeScope 内执行，Busy 返回 retry，原生 worker 重排且不覆盖更新请求。两模板真实业务宿主测试通过远程激活 Busy 原请求重试/回执重放、本地 Busy 不写盘后切页及存储失败不重试。原生 UI 队列并发未执行验证。新 App 包 204928 B，SHA256 `94cf12d85e5cb59609b93c34df8388816806d829014cadc07336102191e4bdf7`，固件仓库 `build/app-install/d2-business-activation-scope-01/app.apx2`；零外部导入、双基址归一化一致，尚未执行 QEMU/部署。配对确认线程迁移待完成。
+
+2026-11-05 配对确认：ABI 3 UI 只保存有效松键 event/revision，worker 在 writeScope 内落盘；Busy 保留，取消/替换/到期作废。宿主 ASan/UBSan 已验证 UI 零写入、Busy 后一次提交、旧确认不授权新请求、过期无写入。新包 `d2-business-pair-worker-01/app.apx2` 205360 B，SHA256 `27bb07332aff6eef0726f48ea09c3638eadee8df2be23b652324f6fed0e0b2cb`，交叉编译零导入/双基址一致；未执行新包 QEMU。原生并发/RV32 HTTP/配对/激活链待验，不代表硬件准入。
+
+2026-11-05 RV32 回归：`d2-business-pair-worker-01` 新包与 peer 在 james.local 既有 Docker QEMU 中双基址执行通过，覆盖生产加载、集合健康、Busy 后恢复与 worker 停滞检测。固件仓库报告 `build/pair-worker/qemu.json` 的输入哈希已与本地逐项核对。guest 未发送配对/业务 HTTP，请求路径及原生并发仍待验收；不代表完整 ROM 启动或硬件准入。
+
+2026-11-05 RV32 HTTP：固件集合 guest 已通过模型网络向真实 worker 发送分段 C2 HTTP，双基址验证 Trial 写入拒绝、未认证拒绝及系统 Busy 生命周期拒绝；报告 `build/pair-worker/http-wire-qemu.json`。仅 writeScope 竞争时 status 可读，系统 busy 时仍为 business_offline。认证成功/绑定与 Bundle 持久写入、原厂 socket、抢占并发仍未覆盖。
+
+2026-11-05 RV32 配对成功链：真实 resident bridge → App 配对状态机 → 模型绘制/真实 App 按键处理 → Busy 延迟 → worker APB1 验证保存/一次 rename → 令牌认证 HTTP 200，Docker QEMU 双基址通过。报告为固件仓库 `build/pair-worker/pair-http-qemu.json`；模型内存绑定文件不证明硬件持久性/掉电，配对入口未经过维护 HTTP parser，Bundle 成功链及原厂调度仍待验。
+
+2026-11-05 配对并发：真实 Application/Binding 与生产 AppFilesV3 的宿主 std::thread 在保存 write 处暂停，UI、重复 worker、principal 查询和取消均被绑定锁排除；释放后一次提交。ASan/UBSan 和 ThreadSanitizer 通过，报告在固件仓库 `build/commit-check/readonly-direct-tsan-report.json`。不替代原厂 RTOS/设备 I/O 时序。
+
+2026-11-05 Bundle RV32 准备：固件模型 VFS 已支持安装所需独立读/追加游标、seek、rename/remove、容量边界；宿主专项与多 App 回归通过，已有配对/认证 guest 在扩展 VFS 上双基址回归通过。尚未执行 Bundle 安装请求序列，成功链仍待接入。
+
+2026-11-05 Bundle RV32 成功链：真实 worker 经 C2 HTTP 完成 claim/begin/chunk/commit，最小单模板 Bundle 编译/存储/读回后 configured=true；相同 commit 重放回执一致且无新增写入/rename。Docker QEMU 双基址通过，报告 `build/pair-worker/bundle-http-qemu.json`。修正测试 guest bump heap 超出映射问题，复用既有有界 arena 作 ROM malloc 替身；真实 App 包/ABI 3 分配接口未改。完整业务模板/字体、重启恢复、实际显示和硬件持久性仍待验。
+
+2026-11-05 完整模板：仓库 AP01 codex-status-a 原始 elements 未裁剪，6496B Bundle 分 7 块经真实 RV32 worker 上传/编译/提交，逐块和 commit 同帧重放无重复写入，状态 configured=true；Docker QEMU 双基址通过。固件报告 `build/pair-worker/full-template-qemu.json`，源模板及生成头哈希已核对。未含外置字体、未验证实际显示或重启恢复。
+
+2026-11-05 恢复证据：boot42 真实安装文件直接导出后交给全新 boot43 guest，双基址通过绑定令牌认证、只读期 configured=true/零写入、健康后可写恢复。绑定 86B 与正文/缓存 17850B 保持逐字节一致，状态 420B 更新。报告 `build/pair-worker/business-resume-qemu.json`；这是独立启动文件交接，非同 VM reset/硬件掉电。
+
+2026-11-05 同 VM 恢复：完整模板安装/恢复两阶段在同一 QEMU 进程内通过 QMP reset 串联，双基址 PC 均回到 0xa0000000、业务文件交接完全一致，两阶段返回 0。新版运行器同时回归旧 fail-trial→rollback 日志链通过。报告位于固件仓库 `build/pair-worker/business-reset-qemu.json` 与 `journal-regression-qemu.json`。runner 仍重载 guest/注入模型文件，不代表原厂 ROM 复位引导或 flash 掉电。
