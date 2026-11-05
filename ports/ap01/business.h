@@ -63,7 +63,8 @@ public:
     uint8_t active() const { return profile.initial; }
     const char *screenId(unsigned index) const { return configured && index < profile.count ? profile.ids[index] : ""; }
     const char *context() const { return profile.contextId; }
-    bool localActivate(uint8_t index, uint64_t now);
+    // Retry is true only when write admission declined before any mutation.
+    bool localActivate(uint8_t index, uint64_t now, bool *retry = nullptr);
     void status(JsonDocument &out);
     int command(uint16_t op, JsonDocument &request, const char *nonce, uint64_t now,
                 const uint8_t *body, size_t bytes, const char *requestId,

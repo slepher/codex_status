@@ -342,6 +342,31 @@ bool Ap01Application::button(bool pressed, uint64_t event, uint64_t now) {
     BindingGuard guard(port); if (!ready || !guard) return false;
     bindings.maintenance=maintenanceActive()||!business.writesAllowed();
     bool pending = bindings.state == 1 || bindings.state == 2;
+    if(pending&&port.writeScope){
+        if(confirmationEvent&&confirmationRevision==bindings.revision)return true;
+        confirmationEvent=0;
+        if(!pressed&&bindings.state==2&&bindings.pressed_event&&
+           event>bindings.pressed_event&&event>bindings.displayed_event){
+            confirmationEvent=event;confirmationRevision=bindings.revision;
+            return true;
+        }
+    }
     if (pending) ap01PairButton(&bindings, pressed, event, now);
     return pending;
+}
+void Ap01Application::processConfirmation(uint64_t now) {
+    BindingGuard guard(port);if(!ready||!guard||!confirmationEvent)return;
+    // Poll expiry using worker time, never the old UI event timestamp.
+    ap01PairResult(&bindings,bindings.pending.request,bindings.pending.token,now);
+    if(bindings.state!=2||confirmationRevision!=bindings.revision){confirmationEvent=0;return;}
+    if(maintenanceActive()||!business.writesAllowed())return;
+    struct Call {Ap01Application *app;uint64_t now;} call{this,now};
+    int32_t result=-1;
+    int32_t admitted=port.writeScope(port.context,[](void *p)->int32_t{
+        auto &c=*(Call *)p;auto &s=*c.app;
+        s.bindings.maintenance=s.maintenanceActive()||!s.business.writesAllowed();
+        ap01PairButton(&s.bindings,false,s.confirmationEvent,c.now);
+        return 0;
+    },&call,&result);
+    if(admitted!=1)confirmationEvent=0; // Busy alone retains the physical approval.
 }

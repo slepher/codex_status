@@ -216,9 +216,15 @@ struct Runtime {
         }
         renderingToken=next->transition;renderingEpoch=uiEpoch.load(std::memory_order_acquire);
         unsigned index=next->index==~0u?business.active():next->index;
-        bool ok=business.active()==index?business.redraw():business.localActivate(index,nowMs());
+        bool retry=false;
+        bool ok=business.active()==index?business.redraw():business.localActivate(index,nowMs(),&retry);
         renderingToken=0;
         businessLock.clear(std::memory_order_release);
+        if(retry) {
+            Activation *empty=nullptr;
+            if(!activation.compare_exchange_strong(empty,next,std::memory_order_acq_rel))delete next;
+            return;
+        }
         if(!ok&&next->transition)failedToken.store(next->transition,std::memory_order_release);
         delete next;
     }
@@ -496,6 +502,7 @@ void Runtime::serve() {
             businessLock.clear(std::memory_order_release);
         }
 #endif
+        app->processConfirmation(nowMs());
         processActivation();
         if(!app->maintenanceActive()&&!businessLock.test_and_set(std::memory_order_acquire)) {
             renderingEpoch=uiEpoch.load(std::memory_order_acquire);

@@ -26,6 +26,9 @@ class Ap01Application {
     std::unique_ptr<Session> sessions;
     char mac[13], nonce[33] = {};
     uint64_t boot;
+    // Protected by the binding lock; UI only queues a validated release.
+    uint64_t confirmationEvent = 0;
+    uint32_t confirmationRevision = 0;
     bool ready = false;
     std::atomic<bool> online{false};
     static int save(void *, const uint8_t *, size_t);
@@ -48,4 +51,5 @@ public:
     bool pairingUi(uint64_t now, String &reply);
     bool pairingDisplayed(const char *request, uint32_t revision, uint64_t event);
     bool button(bool pressed, uint64_t event, uint64_t now);
+    void processConfirmation(uint64_t now); // Business worker only.
 };

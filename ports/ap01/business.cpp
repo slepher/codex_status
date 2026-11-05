@@ -101,10 +101,20 @@ void Ap01Business::clock(const char *hhmm) {
         if(!strcmp(path,"device.now")||!strcmp(path,"device.date")){render();break;}
     }
 }
-bool Ap01Business::localActivate(uint8_t index, uint64_t now) {
+bool Ap01Business::localActivate(uint8_t index, uint64_t now, bool *retry) {
+    if(retry)*retry=false;
     if (!writesAllowed() || storageUnknown || !configured || index >= profile.count) return false;
-    char next[BS_CTX_LEN]; newContext(next); String error;
-    return store.bsSetActive(index, next, error) && loadActive(now) && render();
+    struct Call {Ap01Business *self;uint8_t index;uint64_t now;} call{this,index,now};
+    auto activate=[](void *p)->int32_t{
+        auto &c=*(Call *)p;auto &s=*c.self;
+        char next[BS_CTX_LEN];s.newContext(next);String error;
+        return s.store.bsSetActive(c.index,next,error)&&s.loadActive(c.now)&&s.render()?0:-1;
+    };
+    if(!ui.writeScope)return activate(&call)==0;
+    int32_t result=-1;
+    int32_t admitted=ui.writeScope(ui.context,activate,&call,&result);
+    if(retry)*retry=admitted==1;
+    return admitted==0&&result==0;
 }
 void Ap01Business::displayFeedback(JsonDocument &out, const char *state) {
     out["active_template_id"] = configured ? profile.ids[profile.initial] : "";
