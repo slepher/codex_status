@@ -82,6 +82,7 @@ class PeerRef {
     bool     secure() const { return info_->isEncrypted() && info_->isBonded(); }
     bool     encrypted() const { return info_->isEncrypted(); }
     bool     bonded() const { return info_->isBonded(); }
+    bool storedBond() const { return NimBLEDevice::isBonded(info_->getIdAddress()); }
     uint16_t handle() const { return info_->getConnHandle(); }
     String   address() const { return info_->getAddress().toString().c_str(); }
     String identity() const {
@@ -100,6 +101,7 @@ class PeerRef {
     bool secure() const { return desc_ && desc_->sec_state.encrypted && desc_->sec_state.bonded; }
     bool encrypted() const { return desc_ && desc_->sec_state.encrypted; }
     bool bonded() const { return desc_ && desc_->sec_state.bonded; }
+    bool storedBond() const { return desc_ && NimBLEDevice::isBonded(NimBLEAddress(desc_->peer_id_addr)); }
     uint16_t handle() const { return desc_ ? desc_->conn_handle : BLE_HS_CONN_HANDLE_NONE; }
     String address() const {
         return desc_ ? NimBLEAddress(desc_->peer_id_addr).toString().c_str() : String();
@@ -328,7 +330,9 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         connected = true;
         PeerRef peer(desc);
         peerConnHandle = peer.handle();
-        peerBonded = peer.bonded();
+        // sec_state.bonded is still false before encryption resumes. Admit a
+        // known identity from the bond store, but keep writes encryption-gated.
+        peerBonded = peer.bonded() || peer.storedBond();
         peerEncrypted = peer.encrypted();
         disconnecting = false;
         clearReceiveBuffers();

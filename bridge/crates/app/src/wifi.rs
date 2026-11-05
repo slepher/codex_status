@@ -35,8 +35,9 @@ pub async fn action(ctx: &AppCtx, mac: &str, op: &str, body: Value) -> Result<Va
     }
     if op == "scan" {
         host_wifi::require_bluetooth()?;
-        let _delivery = ctx.device_delivery.lock().await;
-        let info = bridge_ble::Pusher::read_candidate_info().await.map_err(|_| "device_not_advertising_press_boot")?;
+        let _delivery = tokio::time::timeout(Duration::from_secs(10), ctx.device_delivery.lock()).await
+            .map_err(|_| "ble_scan_busy_retry")?;
+        let info = bridge_ble::Pusher::read_candidate_info().await.map_err(|error| format!("BLE discovery failed: {error:#}"))?;
         return Ok(json!({"mac":info["mac"], "fw":info["fw"], "wifi_setup_protocol":info["wifi_setup_protocol"]}));
     }
     let mac = DeviceIdentity::normalized_mac(mac).ok_or("invalid_device_mac")?;
@@ -181,7 +182,7 @@ pub async fn action(ctx: &AppCtx, mac: &str, op: &str, body: Value) -> Result<Va
                 tokio::time::Instant::now() + Duration::from_secs(10)).await?;
             let mut link = bridge_ble::DeviceConnection::connect(&mac, &ctx.config.token, &ctx.bridge_id)
                 .await.map_err(|_| "ble_connection_failed")?.ok_or("device_not_advertising_press_boot")?;
-            let result = match link.write_endpoint(&bridge_ble::lan_ip(),ctx.config.port,&ctx.config.token).await {
+            let result = match link.write_endpoint(&bridge_address(ctx).await?,ctx.config.port,&ctx.config.token).await {
                 Ok(()) => note_link(ctx,&mac,&mut link).await,
                 Err(error) => endpoint_feedback(&error),
             };
@@ -340,11 +341,15 @@ async fn add_device(ctx: &AppCtx, mac: &str) -> Result<Value, String> {
     let lock = platform::delivery_lock(ctx, mac);
     let (_device_delivery, _delivery) = platform::lock_device_ble(&lock, &ctx.device_delivery,
         tokio::time::Instant::now() + Duration::from_secs(10)).await?;
+    // This explicit Add action must establish the OS bond before using the
+    // ordinary DeviceConnection path, which intentionally rejects new peers.
+    bridge_mcp::fetch_device_token(&crate::mcp_config(ctx), mac).await
+        .map_err(|error| format!("BLE pairing failed: {error:#}"))?;
     let mut link = bridge_ble::DeviceConnection::connect(mac, &ctx.config.token, &ctx.bridge_id)
-        .await.map_err(|_| "ble_connection_failed")?.ok_or("device_not_advertising_press_boot")?;
+        .await.map_err(|error| format!("BLE connection failed: {error:#}"))?.ok_or("device_not_advertising_press_boot")?;
     let result = async {
         if link.info["wifi_setup_protocol"] != 1 || link.info["wifi_management"] != 3 { return Err("update_required".into()); }
-        if let Err(error) = link.write_endpoint(&bridge_ble::lan_ip(), ctx.config.port, &ctx.config.token).await {
+        if let Err(error) = link.write_endpoint(&bridge_address(ctx).await?, ctx.config.port, &ctx.config.token).await {
             return Ok(endpoint_feedback(&error));
         }
             let caps = platform::caps_from_status(&link.wifi_read("wifi_capabilities").await.map_err(|_| "device_capabilities_failed")?)?;
@@ -357,6 +362,7 @@ async fn add_device(ctx: &AppCtx, mac: &str) -> Result<Value, String> {
             if platform::service(ctx).device_get(mac).is_none() {
                 platform::service(ctx).device_upsert(identity, caps).map_err(|_| "device_save_failed")?;
             }
+        crate::watchdog::ble_recovered();
         Ok(json!({"device_mac":mac,"registered":true}))
     }.await;
     platform::close_device_ble(link,_device_delivery,_delivery).await;
@@ -425,10 +431,27 @@ fn target_query(target: &Network) -> Value {
     if let Some(password)=&target.password {query["credential_key"]=json!(format!("{:x}",Sha256::digest(password.as_bytes())));}
     query
 }
+fn host_address(host:&Value,address:std::net::Ipv4Addr)->Result<std::net::Ipv4Addr,String> {
+    // CoreWLAN identifies the actual Wi-Fi interface. A VPN default route
+    // cannot be used as the callback address for a newly paired LAN device.
+    #[cfg(target_os="macos")]
+    let address=if let Some(interface)=host["networks"].as_array().and_then(|rows|rows.first())
+        .and_then(|row|row["interface"].as_str()).filter(|name|!name.is_empty()) {
+        crate::ap01_lan::interfaces_on(Some(interface))?.first()
+            .ok_or("report_wifi_address_unavailable")?.address
+    } else {address};
+    Ok(address)
+}
+pub(crate) async fn bridge_address(ctx:&AppCtx)->Result<String,String> {
+    let host=tokio::time::timeout(Duration::from_secs(3),current_host(ctx)).await.map_err(|_|"host_wifi_timeout")?;
+    let fallback=bridge_ble::lan_ip().parse().map_err(|_|"report_route_unavailable")?;
+    Ok(host_address(&host,fallback)?.to_string())
+}
 pub(crate) async fn plan_network(ctx: &AppCtx, mac: &str, address: std::net::Ipv4Addr, budget: Budget) -> Result<Value, String> {
     let host=tokio::time::timeout(budget.remaining(),current_host(ctx)).await.map_err(|_|"host_wifi_timeout")?;
     let state=platform::service(ctx).wifi_state(mac);
     let target=current_device_target(ctx,&mac,&state,&host).ok_or("network_mapping_required")?;
+    let address=host_address(&host,address)?;
     let network=json!({"v":bridge_core::template::PLAN_ACTIVATION_VERSION,
         "bridge_addr":address.to_string(),"bridge_port":ctx.config.port,"target":target_query(target)});
     bridge_core::template::validate_plan_activation(&network).map_err(|_|"plan_network_shape")?;

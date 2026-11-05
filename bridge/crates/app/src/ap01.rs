@@ -156,7 +156,12 @@ async fn execute(ctx:&AppCtx,op:&str,args:&Value)->Result<Value,String> {
     let _guard=ctx.ap01.operation.try_lock().map_err(|_|"ap01_operation_busy")?;
     if op=="search" {
         let report=search(ctx,None).await?;
-        return Ok(json!({"result":if report.cancelled{"cancelled"}else{"complete"},"candidates":report.candidates,
+        let candidates:Vec<Value>=report.candidates.iter().map(|candidate| {
+            let mut value=serde_json::to_value(candidate).unwrap_or(Value::Null);
+            value["pairing_pending"]=json!(pending_path(ctx,&candidate.device_mac).exists());
+            value
+        }).collect();
+        return Ok(json!({"result":if report.cancelled{"cancelled"}else{"complete"},"candidates":candidates,
             "errors":report.errors,"partial":report.partial,"action":"选择设备后核对两端四位码，在设备上按下旋钮"}));
     }
     let mac=args["mac"].as_str().and_then(DeviceIdentity::normalized_mac).ok_or("invalid_device_mac")?;

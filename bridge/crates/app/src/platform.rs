@@ -653,18 +653,14 @@ fn project_device(raw: &Value, identity: &Value, now: u64) -> Value {
     let wifi_at = raw["last_authenticated"]["observed_at"].as_u64().unwrap_or(0);
     let contact_at = raw["last_authenticated_contact_at"].as_u64();
     let attempt = &raw["last_status_attempt"];
-    let recovery = &raw["ble_recovery"];
-    let ble_recovering = matches!(recovery["state"].as_str(), Some("recovering" | "restart_required"));
     let blocked = matches!(attempt["outcome"].as_str(), Some("blocked" | "mac_mismatch"))
         && attempt["at"].as_u64().unwrap_or(0) >= contact_at.unwrap_or(0);
     let recent = contact_at.is_some_and(|at| at <= now && now - at <= 30);
     let expected_sleep = body["power"]["mode"] == "sleep"
         || raw["record_observed"]["power"]["mode"] == "sleep";
-    let contact_state = if ble_recovering { "ble_recovering" } else if blocked { "blocked" } else if recent { "recently_authenticated" }
+    let contact_state = if blocked { "blocked" } else if recent { "recently_authenticated" }
         else if expected_sleep { "expected_sleep" } else { "waiting" };
     let contact_label = match contact_state {
-        "ble_recovering" if recovery["state"] == "restart_required" => "蓝牙异常，需要重新启动 Bridge",
-        "ble_recovering" => "蓝牙异常，正在自动恢复",
         "blocked" => "认证或占用受阻", "recently_authenticated" => "最近已认证",
         "expected_sleep" => "预计休眠", _ => "等待下次联系",
     };
@@ -750,7 +746,6 @@ fn project_device(raw: &Value, identity: &Value, now: u64) -> Value {
     if upgrade_failure.is_some() { attention.push("upgrade_failed"); }
     if display_state["value"] == "failed" { attention.push("display_failed"); }
     if blocked { attention.push("contact_blocked"); }
-    if ble_recovering { attention.push("ble_recovery"); }
     json!({
         "device_mac":mac,
         "identity":{"name":identity["name"].as_str().filter(|name| !name.is_empty())
@@ -759,7 +754,7 @@ fn project_device(raw: &Value, identity: &Value, now: u64) -> Value {
             "cuktech-ap01-0041" => "AP01 320×240",
             "codex-status-154g" => "书桌屏 200×200", _ => target},
             "source":"bridge_registration"},
-        "contact":{"state":contact_state,"label":contact_label,"ble_recovery":recovery,"last_authenticated_at":contact_at,
+        "contact":{"state":contact_state,"label":contact_label,"last_authenticated_at":contact_at,
             "transport":raw["last_authenticated_transport"],
             "wifi_sampled_at":raw["last_authenticated"]["observed_at"],
             "last_attempt_at":attempt["at"]},
@@ -781,14 +776,14 @@ fn project_device(raw: &Value, identity: &Value, now: u64) -> Value {
 
 #[cfg(test)]
 #[test]
-fn isolated_ble_is_visible_even_with_recent_http_and_survives_new_process() {
+fn global_ble_failure_does_not_override_authenticated_device() {
     let mut raw = json!({"device_mac":"AABBCCDDEEFF", "last_authenticated_contact_at":99,
         "last_authenticated":{"observed_at":99,"body":{"fw":"1.0","power":{"mode":"sleep"}}},
         "ble_recovery":{"state":"recovering","attempt":2,"retry_at":130}});
     let view = project_device(&raw, &Value::Null, 100);
-    assert_eq!(view["contact"]["state"], "ble_recovering");
-    assert_eq!(view["contact"]["label"], "蓝牙异常，正在自动恢复");
-    assert!(view["attention"].as_array().unwrap().contains(&json!("ble_recovery")));
+    assert_eq!(view["contact"]["state"], "recently_authenticated");
+    assert_eq!(view["contact"]["label"], "最近已认证");
+    assert!(!view["attention"].as_array().unwrap().contains(&json!("ble_recovery")));
     assert_eq!(view["contact"]["last_authenticated_at"],99);
     raw["ble_recovery"]["state"]=json!("recovered");
     assert_eq!(project_device(&raw,&Value::Null,100)["contact"]["state"],"recently_authenticated");
@@ -925,9 +920,7 @@ pub fn device_view(ctx: &AppCtx, requested_mac: Option<&str>) -> Result<Value, S
         let device_mac = row["device_mac"].as_str().unwrap_or("");
         let identity = crate::device_facts_for(ctx, device_mac)
             .map(|facts| crate::device_facts_json(&facts)).unwrap_or(Value::Null);
-        let mut row = row.clone();
-        row["ble_recovery"] = serde_json::to_value(crate::watchdog::ble_recovery()).unwrap_or(Value::Null);
-        project_device(&row, &identity, device_now(device_mac))
+        project_device(row, &identity, device_now(device_mac))
     }).collect();
     let devices: Vec<Value> = views.iter().map(|view| json!({
         "device_mac":view["device_mac"],"name":view["identity"]["name"],
@@ -935,7 +928,7 @@ pub fn device_view(ctx: &AppCtx, requested_mac: Option<&str>) -> Result<Value, S
         "attention":view["attention"]})).collect();
     let device = mac.as_ref().and_then(|mac| views.into_iter()
         .find(|view| view["device_mac"] == *mac));
-    Ok(json!({"devices":devices,"device":device}))
+    Ok(json!({"devices":devices,"device":device,"ble_recovery":crate::watchdog::ble_recovery()}))
 }
 
 /// One collapsed section from local state. No device contact or implicit action.
@@ -3562,12 +3555,12 @@ pub(crate) mod ble_close_lock_tests {
     async fn plan_activation_push_starts_same_round_without_network_start() {
         const HUNG_MAC:&str="024FADB93408";
         let _serial=SIM_ENV.lock().unwrap_or_else(|p|p.into_inner());
-        for case in ["push","periodic","unchanged","no_mapping"] {
+        for case in ["push","periodic","unchanged","no_mapping","no_ip"] {
             let dir=tempfile::tempdir().unwrap();
             let (ble,url)=start_fake_ble(HUNG_MAC,false).await;
             ble.protocol.store(true,Ordering::SeqCst);
             let (_http,ip,server)=start_full_http(ble.clone(),"bridge-lock-repro").await;
-            let ctx=test_ctx_with_ip(dir.path(),HUNG_MAC,&ip);
+            let ctx=test_ctx_with_ip(dir.path(),HUNG_MAC,if case=="no_ip" {""} else {&ip});
             let now=device_now(HUNG_MAC);
             let status=json!({"device_mac":HUNG_MAC,"configured":true,
                 "active_context_id":"event-context","active_template_id":"device-only",
@@ -3592,13 +3585,28 @@ pub(crate) mod ble_close_lock_tests {
                     {"network_id":"home","host_ssid":"Host","ssid":"Device","credential":"open"}
                 ])).unwrap(),now).unwrap();
             }
-            if matches!(case,"push"|"no_mapping") {svc.note_codex_envelope(&envelope(41)).unwrap();}
+            if matches!(case,"push"|"no_mapping"|"no_ip") {svc.note_codex_envelope(&envelope(41)).unwrap();}
             if case=="periodic" {
                 bridge_core::device_clock::configure(HUNG_MAC,0,((now+7200)*1000) as i64,0).unwrap();
             }
             std::env::set_var("CODEX_STATUS_SIM_BLE_ENDPOINTS",json!({HUNG_MAC:url}).to_string());
             std::env::set_var("CODEX_STATUS_TEST_HOST_WIFI",json!({"state":"connected","networks":[{"ssid":"Host"}]}).to_string());
-            let result=ble_cycle(&ctx,&[HUNG_MAC.into()]).await;
+            // Simulate an authenticated address observation only after the
+            // first Plan is sent: there must be no IP prerequisite for Plan.
+            let learn_address=async {
+                if case!="no_ip" {return;}
+                tokio::time::timeout(Duration::from_secs(5),async {
+                    loop {
+                        if ble.commands.lock().unwrap().iter().any(|c|c["op"]=="plan") {break;}
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }).await.expect("first Plan must not require a device IP");
+                let mut identity=DeviceIdentity::new(HUNG_MAC,"Newly paired").unwrap();
+                identity.ip=Some(ip.clone());
+                svc.device_upsert(identity,DeviceCapabilities::ssd1681_154g()).unwrap();
+            };
+            let candidates=[HUNG_MAC.into()];
+            let (result,())=tokio::join!(ble_cycle(&ctx,&candidates),learn_address);
             std::env::remove_var("CODEX_STATUS_SIM_BLE_ENDPOINTS");std::env::remove_var("CODEX_STATUS_TEST_HOST_WIFI");
             bridge_core::device_clock::clear(HUNG_MAC);
             let commands=ble.commands.lock().unwrap();
@@ -3609,9 +3617,9 @@ pub(crate) mod ble_close_lock_tests {
             } else {
                 assert!(matches!(&result,Ok(BleOpportunity::Connected{result:Ok(()),..})),"{case}: {result:?}");
                 let plan=commands.iter().find(|c|c["op"]=="plan").unwrap();
-                assert_eq!(plan["mode"],if case=="push" {"light"}else{"sleep"},"{case}");
-                assert_eq!(plan["network"].is_object(),case=="push","{case}: {plan}");
-                assert_eq!(ble.network_started.load(Ordering::SeqCst),case=="push","{case}");
+                assert_eq!(plan["mode"],if matches!(case,"push"|"no_ip") {"light"}else{"sleep"},"{case}");
+                assert_eq!(plan["network"].is_object(),matches!(case,"push"|"no_ip"),"{case}: {plan}");
+                assert_eq!(ble.network_started.load(Ordering::SeqCst),matches!(case,"push"|"no_ip"),"{case}");
                 if case!="unchanged" {assert!(plan["data"].is_object(),"{case}");}
             }
             server.abort();

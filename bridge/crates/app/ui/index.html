@@ -321,12 +321,14 @@
       <div class="card">
         <h2>当前屏幕</h2>
         <div id="registered-devices" class="plist muted">加载中…</div>
-        <div class="action-strip"><button onclick="ap01Search()">添加 AP01 · 局域网</button><button onclick="wifiAddDevice()">通过蓝牙添加设备</button></div>
+        <div class="action-strip"><button onclick="ap01Search()">添加 AP01 · 局域网</button><button id="ble-add-button" onclick="wifiAddDevice()">通过蓝牙添加设备</button></div>
+        <p id="bridge-ble-status" role="status" hidden></p>
+        <p id="ble-add-result" role="status" aria-live="polite" hidden></p>
         <div id="ap01-add" hidden>
           <p id="ap01-code" class="ap01-code" hidden aria-label="设备配对码"></p>
           <p id="ap01-result" role="status" aria-live="polite"></p>
           <div id="ap01-candidates" class="plist"></div>
-          <div class="action-strip"><button onclick="ap01CancelSearch()">停止搜索</button></div>
+          <div class="action-strip"><button id="ap01-stop-search" onclick="ap01CancelSearch()" hidden>停止搜索</button><button onclick="ap01Close()">关闭</button></div>
         </div>
       </div>
       <div class="card wifi-card" id="wifi-card">
@@ -1433,7 +1435,21 @@
   async function wifiSelect(i){const n=wifiScheme?.networks?.[i];if(wifiManualSelection){wifiSetResult('请在 AP01 设备菜单中手动选择网络。');return;}if(n?.writable&&window.confirm(`启用 ${n.network.network_id} 的 v${n.network.version}？将尝试切换网络。`))await wifiRun('activate',{network_id:n.network.network_id,version:n.network.version});}
   async function wifiCancel(){if(wifiBusyMac)await invoke('platform_wifi',{mac:wifiBusyMac,op:'cancel',body:{}}); }
   let ap01Poll = 0;
-  async function ap01CancelSearch(){ await invoke('platform_ap01',{op:'cancel_search',body:{}}); }
+  let ap01SearchGeneration = 0;
+  let ap01Searching = false;
+  async function ap01CancelSearch(){
+    if(!ap01Searching)return;
+    ++ap01SearchGeneration;ap01Searching=false;$('ap01-stop-search').hidden=true;
+    $('ap01-result').textContent='搜索已停止';
+    try{await invoke('platform_ap01',{op:'cancel_search',body:{}});}
+    catch(e){if(!$('ap01-add').hidden)$('ap01-result').textContent='停止搜索失败：'+String(e);}
+  }
+  function ap01Close(){
+    ap01CancelSearch();++ap01SearchGeneration;++ap01Poll;
+    $('ap01-add').hidden=true;$('ap01-code').hidden=true;
+    $('ap01-candidates').replaceChildren();
+    // Closing the view never cancels an already-sent pairing transaction.
+  }
   function ap01Message(value){
     const reply=value.reply||{};
     const state=['paired','cancelled','expired','rejected','error','unknown'].includes(value.result)
@@ -1450,42 +1466,80 @@
     const generation=++ap01Poll;
     try{
       let result=await invoke('platform_ap01',{op,body:{mac}});
+      if(generation!==ap01Poll)return;
       let state=ap01Message(result);
       const deadline=Date.now()+125000;
       while(generation===ap01Poll && Date.now()<deadline &&
         !['paired','cancelled','expired','rejected','error'].includes(state)){
         await new Promise(resolve=>setTimeout(resolve,1200));
         if(generation!==ap01Poll)return;
-        result=await invoke('platform_ap01',{op:'pair_status',body:{mac}});state=ap01Message(result);
+        result=await invoke('platform_ap01',{op:'pair_status',body:{mac}});
+        if(generation!==ap01Poll)return;state=ap01Message(result);
       }
       if(state==='paired'){selectedDeviceMac=mac;deviceSelectionGeneration++;clearDeviceView();await refreshPlatformDevice();}
       else if(Date.now()>=deadline)$('ap01-result').textContent+=' · 已停止自动查询，可查询原事务';
-    }catch(e){$('ap01-result').textContent=String(e);}
+    }catch(e){if(generation===ap01Poll)$('ap01-result').textContent=String(e);}
   }
   async function ap01Search(){
+    if(ap01Searching)return;
+    const generation=++ap01SearchGeneration;++ap01Poll;ap01Searching=true;
+    $('ap01-stop-search').hidden=false;$('ap01-code').hidden=true;
     $('ap01-add').hidden=false;$('ap01-result').textContent='正在搜索局域网中的 AP01…';
     $('ap01-candidates').replaceChildren();
     try{
       const result=await invoke('platform_ap01',{op:'search',body:{}});
+      if(generation!==ap01SearchGeneration)return;
       if(result.result==='error'){ap01Message(result);return;}
       $('ap01-result').textContent=result.candidates?.length?'选择设备，核对两端四位码后按下设备旋钮':
         `未发现 AP01。请确认电脑与设备位于同一局域网，并允许本地网络通信。${(result.errors||[]).join(' · ')}`;
       for(const candidate of result.candidates||[]){
         const row=document.createElement('div');row.className='action-strip';
         const label=document.createElement('span');label.textContent=`${candidate.name} · ${candidate.device_mac}`;row.append(label);
-        for(const [text,op] of [['配对','pair'],['查询原事务','pair_status'],['取消配对','cancel_pair']]){
-          const button=document.createElement('button');button.textContent=text;button.onclick=()=>ap01Pair(candidate.device_mac,op);row.append(button);
+        const registered=platformDevices.some(d=>d.device_mac===candidate.device_mac);
+        if(registered)label.textContent+=' · 已登记';
+        const actions=candidate.pairing_pending ? [['查询原事务','pair_status'],['取消配对','cancel_pair']] : registered ? [] : [['配对','pair'],['查询原事务','pair_status'],['取消配对','cancel_pair']];
+        for(const [text,op] of actions){
+          const button=document.createElement('button');button.textContent=text;
+          button.disabled=op!=='pair'&&!candidate.pairing_pending;
+          button.onclick=()=>{if(op==='pair')for(const control of row.querySelectorAll('button'))control.disabled=false;ap01Pair(candidate.device_mac,op);};row.append(button);
         }
         $('ap01-candidates').append(row);
       }
-    }catch(e){$('ap01-result').textContent=String(e);}
+    }catch(e){if(generation===ap01SearchGeneration)$('ap01-result').textContent=String(e);}
+    finally{if(generation===ap01SearchGeneration){ap01Searching=false;$('ap01-stop-search').hidden=true;}}
   }
   async function wifiAddDevice(){
-    wifiSetResult('扫描目标，请单击 BOOT 开启维护窗口');
+    if($('ble-add-button').disabled)return;
+    $('ble-add-button').disabled=true;$('ble-add-result').hidden=false;
+    $('ble-add-result').textContent='正在搜索蓝牙设备，请开启设备的 120 秒配对窗口…';
     try{const candidate=await invoke('platform_wifi',{mac:'',op:'scan',body:{}});const mac=candidate.mac;
-      if(!mac||!window.confirm(`绑定并登记目标 ${mac}？`))return;
-      await invoke('platform_wifi',{mac,op:'add',body:{}});selectedDeviceMac=mac;deviceSelectionGeneration++;clearDeviceView();await refreshPlatformDevice();
-      wifiSetResult('设备已登记；可离线准备目标。');}catch(e){wifiSetResult(wifiError(e));}
+      if(!mac){$('ble-add-result').textContent='未发现可添加的设备，请开启配对窗口后重试。';return;}
+      openModal(`<h3>添加蓝牙设备</h3><p>已发现设备 <b>${escapeHtml(mac)}</b>。请确认与 Note4 身份一致，并保持配对窗口开启。</p>
+        <div class="foot"><button onclick="closeModal();$('ble-add-result').textContent='已取消添加'">取消</button>
+        <button class="primary" onclick="wifiConfirmAdd('${escapeAttr(mac)}')">绑定并登记</button></div>`);
+    }catch(e){$('ble-add-result').textContent='添加蓝牙设备失败：'+wifiError(e);}
+    finally{$('ble-add-button').disabled=false;}
+  }
+  async function wifiConfirmAdd(mac){
+    if($('ble-add-button').disabled)return;
+    closeModal();$('ble-add-button').disabled=true;
+    $('ble-add-result').textContent=`正在绑定并登记 ${mac}…`;
+    try{
+      const result=await invoke('platform_wifi',{mac,op:'add',body:{}});
+      if(result.registered!==true){
+        $('ble-add-result').textContent=`设备 ${mac} 登记未完成：${wifiError(result.error||result.outcome)} · 阶段 ${result.stage||'登记'} · ${result.action||'请先确认原操作结果'}`;return;
+      }
+      selectedDeviceMac=result.device_mac;deviceSelectionGeneration++;clearDeviceView();await refreshPlatformDevice();
+      $('ble-add-result').textContent=`设备 ${mac} 已登记；可配置网络。`;
+    }catch(e){$('ble-add-result').textContent=`设备 ${mac} 绑定失败：`+wifiError(e);}
+    finally{$('ble-add-button').disabled=false;}
+  }
+
+  function renderBridgeBle(recovery){
+    const active=recovery && ['recovering','restart_required'].includes(recovery.state);
+    $('bridge-ble-status').hidden=!active;
+    $('bridge-ble-status').textContent=active ? 'Bridge 蓝牙服务异常；蓝牙添加暂不可用，设备的 Wi-Fi 状态独立显示。'+
+      (recovery.state==='restart_required'?'请重新启动 Bridge。':`正在恢复（第 ${recovery.attempt} 次）。`) : '';
   }
 
   let platformDeviceRequest = 0;
@@ -1656,12 +1710,7 @@
       $('dev-sample-note').textContent = d.contact.wifi_sampled_at
         ? `上次完整状态回报：${eventTime(d.contact.wifi_sampled_at)} · Wi-Fi`
         : '尚无完整 Wi-Fi 状态回报；普通缓存读取不会联系设备。';
-      const recovery = d.contact.ble_recovery;
-      if (recovery && recovery.state !== 'recovered') {
-        $('dev-sample-note').textContent += recovery.state === 'restart_required'
-          ? '\n蓝牙操作未确认结束；请从托管入口重新启动 Bridge。'
-          : `\n蓝牙操作未确认结束，正在自动恢复（第 ${recovery.attempt} 次）；恢复后等待设备下次联系，无需按 BOOT。`;
-      }
+      renderBridgeBle(result.ble_recovery);
       $('dev-fw').textContent = showReading(d.firmware.current);
       $('dev-latest').textContent = d.firmware.latest?.value
         ? `${d.firmware.latest.value} · 登记于 ${eventTime(d.firmware.latest.published_at)}`
@@ -1989,6 +2038,7 @@
     try {
       const view = await invoke('platform_device_view', {});
       if (!isCurrentDevice(mac, generation) || request !== platformDeviceRequest) return;
+      renderBridgeBle(view.ble_recovery);
       platformDevices = view.devices || [];
       const selected = resolveSelectedDevice();
       if (selected !== mac) {

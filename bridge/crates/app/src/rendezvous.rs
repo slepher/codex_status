@@ -85,7 +85,7 @@ pub(super) async fn claim_on_ble(ctx: &AppCtx, mac: &str, link: &mut bridge_ble:
     let token = bridge_mcp::load_device_token(&crate::mcp_config(ctx), mac).ok_or("device_token_required")?;
     let name = ctx.bridge_name.lock().unwrap().clone();
     let ack = link.command("claim", json!({"operation_token":token,"name":name,
-        "host":bridge_ble::lan_ip(),"port":ctx.config.port,"lease_s":300})).await
+        "host":crate::wifi::bridge_address(ctx).await?,"port":ctx.config.port,"lease_s":300})).await
         .map_err(|_| "claim_result_unknown")?;
     if ack["result"] != "applied" || ack["owner_id"] != ctx.bridge_id {
         return Err(ack["error"].as_str().unwrap_or("claim_rejected").to_owned());
@@ -154,7 +154,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             ));
         }
         cache_device_token_if_missing(ctx, &link, &mac).await?;
-        link.write_endpoint(&bridge_ble::lan_ip(), ctx.config.port, &ctx.config.token)
+        link.write_endpoint(&crate::wifi::bridge_address(ctx).await?, ctx.config.port, &ctx.config.token)
             .await
             .map_err(err_text)?;
         round.observation = link.command("status", json!({})).await.map_err(err_text)?;
@@ -215,6 +215,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
                 "device network attempt ended; next period may retry");
         }
         tracing::info!(event="network_admission",device_mac=%mac,needs_http,
+            wifi_connection=?link.info["wc"], firmware=?link.info["fw"],
             delivery=decision["decision"].as_str().unwrap_or("unknown"),
             wifi_jobs=round.admitted_wifi.len(),
             ota_state=service(ctx).ota_job(&mac).map(|job|job.state).as_deref().unwrap_or("none"),
@@ -241,7 +242,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
         let requested = service(ctx).wifi_state(&mac).connection_facts.is_some_and(|c| c.requested);
         round.wifi_repair = needs_http && (!reachable || requested);
         if reachable && !requested { crate::wifi::http_ready(ctx, &mac, probe_status.as_ref().unwrap(),probe_at); }
-        else if needs_http && remaining == 0 {
+        else if needs_http && (remaining == 0 || requested) {
             crate::wifi::prepare_connection(ctx,&mac,&mut link,remaining>0,round.command_budget).await?;
             if !reachable { crate::wifi::http_failed(ctx,&mac,"http_unavailable"); }
         }
@@ -263,8 +264,10 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
         let mut plan_body = serde_json::to_value(&plan).map_err(err_text)?;
         plan_body["need_http"] = json!(needs_http && !reachable);
         if plan_activation && needs_http && !reachable {
-            let target=device_link_for_mac(ctx,&mac).ok_or("report_device_address_missing")?;
-            let route=report_route(&target.ip)?;
+            // A newly paired device has no IP until this plan connects it.
+            let destination=device_link_for_mac(ctx,&mac).map(|target|target.ip)
+                .unwrap_or_else(bridge_ble::lan_ip);
+            let route=report_route(&destination)?;
             plan_body["network"]=crate::wifi::plan_network(ctx,&mac,route,round.command_budget).await?;
             round.activation_in_plan=true;
         }
@@ -463,7 +466,8 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
                     &mac,
                     &mut link,
                     shared_tail,
-                    round.observation["power"]["provisional_remaining_s"].as_u64().unwrap_or(0) > 0,
+                    round.observation["power"]["provisional_remaining_s"].as_u64().unwrap_or(0) > 0
+                        && !service(ctx).wifi_state(&mac).connection_facts.is_some_and(|c|c.requested),
                 )
                 .await { wifi_repair_error = Some(error); }
             }

@@ -1536,7 +1536,7 @@ async fn post_claim_once(
 ) -> Result<(reqwest::StatusCode, String), ClaimError> {
     let bridge_id = ctx.bridge_id.clone();
     let name = ctx.bridge_name.lock().unwrap().clone();
-    let host = lan_ip();
+    let host = wifi::bridge_address(ctx).await.map_err(ClaimError::Other)?;
     let port = ctx.config.port;
     if ap01::is_ap01(ctx,target_mac) {
         if force || release {return Err(ClaimError::Other("AP01 不支持 force/release；请等待占用租约到期".into()));}

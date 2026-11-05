@@ -1,6 +1,6 @@
 # Codex Status 当前交接
 
-更新时间：2026-11-04，Asia/Shanghai。
+更新时间：2026-11-05，Asia/Shanghai。
 
 ## 当前部署
 
@@ -9,9 +9,11 @@
 - 当前Mac（arm64）Bridge已首次构建/启动：`artifacts/bridge-macos/Codex Status Bridge.app`，exe 81394752 B，SHA256 `de3e039fddefcfb8b45e37ddca86359f0f7af7f781035317eddcf767130578df`。按需LaunchAgent supervisor51790/child51794，8765健康204、8766 MCP初始化通过，Codex app-server已启动。该机原无应用/运行数据，当前data已导入恢复的3组Wi-Fi，AP01已重新配对并认证登记；Note4因不在身边待配对，未验设备投递；此前Mac数据/设备ACK记录不能视为本机现场。Rust1.99.1、ArduinoJson7.0.4；托盘左键打开面板、右键菜单：Mac取消自动菜单挂载，改为右键显式弹出，用户两键实测正常；Windows源码保持同逻辑、未部署；已修复未选设备时初始化异常及主机网络按钮漏授权，Node/WK80和窄宽截图通过，用户已确认真实权限弹窗允许；菜单栏刷新已改原子保留系统模板模式，透明底居中数字，已按用户要求移除全部额外状态标记；定向2测试通过，原应用/data已备份。仅数字版本重建/重启，health204/MCP ping通过。旧数据迁移包未含Bridge目录；从历史对话找回2台Mac设备登记与3组Wi-Fi/历史密码，私有恢复清单在`artifacts/bridge-macos/recovered-device-wifi-20261102.json`；3组2.4G密码已导入并逐项读回一致，已按用户要求将3组5G密码设为对应2.4G密码并读回一致（库revision2），未推送设备网络。仓库5模板已校验并导入平台库，建立3个屏幕族的“仓库默认”本地配置；未绑定/发布设备。[记录](project-workflow/bridge-macos/tray-contrast-20261102.md)。
 - AP01 `34F01557210B`：首尾动画修复ROM应用槽1，版本`1.0.2_0041`、build`ec0a58f71f65c2830c08c9bfd7c155db`、Bundle`6a8d702a`。ROM `artifacts/ap01-wifi-animation-20261022/ap01-wifi-animation-candidate01.bin`，7045480 B，SHA256 `5a49f78b550fabbafcc3cde75aa1f6e9986fb9dd88320cd029cd6655d61e0cee`。10-22认证槽1，用户确认原厂界面/旋钮/App及双向快转首尾正常；10-23再次认证同build，未刷机、未复核槽位。
 - 救援0031/槽0保留：10-22先认证build`53574b55382d55a514ef5b7767db66d9`及槽0，再单次写应用1；按用户要求未整槽读回/导出，停止标记保留。
-- Note4 `.106-note4`认证通过；ROM `artifacts/bridge-macos/note4-0.18.106-plan-activation.bin`，1865680 B，SHA256 `36ca4c3aacdc7b27c9c7cebe4cb18df0bee4048461e189f51050b6332b24ceb4`。10-23未刷机。
+- Note4 `7C4FADB93408`：11-05按用户明确授权USB部署基于.106的`.108-note4`到`ota_0`，串口同MAC/版本/槽已确认；原`.107`保留`ota_1`，NVS/Bundle未写。ROM `artifacts/bridge-macos/note4-0.18.108-bond-reconnect.bin`，1873040B，SHA256 `13019165228c888a25f40e8c9f8566673419a5a57d25fcf4b591a44b06b467fa`，全镜像读回逐字节一致。自然窗口外原绑定重连/认证HTTP通过；Xiaomi_1EBB@192.168.31.90，Data seq5 applied/displayed。[记录](project-workflow/bridge-macos/device-add-20261105-status.md)
 
 ## 活跃事项与下一步
+
+- 11-05 Mac添加设备/Note4现场修复已部署：AP01搜索可关闭、迟到响应围栏、全局BLE错误不污染设备卡、设备码只限AP01；首次配对使用显式绑定入口；首次无IP联网解除循环依赖，TUN下登记/Plan/claim及续租使用实际Wi-Fi接口。Bridge exe81482064B，SHA256 `ddff5b57a7470de3088de0b35f6e2359db6112e7ca99f4fdfdf58d5d9af90a43`。Node/WK82/窄宽图、Rust无IP/准入及claim9测试通过。Note4部署.108后自然窗口外原绑定加密重连通过、联网Xiaomi_1EBB、HTTP认证及Data seq5 displayed；owner host实测192.168.31.66。首次联网会合预算超时后独立认证报告成功；长Flash备份中断，实际保全引导/NVS及将覆盖区域分块备份，原.107槽未写。B6/C8完整矩阵仍未结。[状态](project-workflow/bridge-macos/device-add-20261105-status.md)
 
 - C9 独立 App：按用户边界，App 可执行包 OTA（单更/批更、回执、重启切换、回退及客户端）归兄弟 firmware 仓库；本仓撤出 App OTA Rust/UI/MCP 接线，保留业务 Bundle/C2/配对协议、只读恢复和 ABI 3.1 App 适配。原 Bridge OTA 实现留存于 firmware 的 docs/history/app-ota-bridge，维护入口为 tooling/scripts/app-set-client-v3.py。未启停 Bridge、未动运行数据、未部署；当前迁移验收见[状态](project-workflow/ap01-app-set-v3/status.md)。业务协议整改独立继续。
 
