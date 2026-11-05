@@ -8,35 +8,6 @@ window.__wifiUiScenario = async function(scenario) {
   document.querySelectorAll('.panel').forEach(p => p.classList.toggle('on', p.id === 'tab-device'));
   selectedDeviceMac = mac; deviceSelectionGeneration++;
   clearDeviceView();
-
-  if(scenario.startsWith('app-update-')) {
-    $('wifi-card').hidden=true;$('device-power').hidden=true;$('app-update-card').hidden=false;
-    const manifest={apps:[{id:'codex_status',version:'2026.11.04',package_bytes:204080},{id:'peer_beats',version:'1.0',package_bytes:992}]};
-    const progress={phase:'receiving',changed_mask:1,ready_mask:0,received:[102400,0]};
-    if(scenario==='app-update-ready') {
-      const put=(id,files)=>{const transfer=new DataTransfer();files.forEach(f=>transfer.items.add(f));$(id).files=transfer.files;};
-      put('app-update-manifest',[new File([new Uint8Array([1,2,3,4])],'set.amf3')]);
-      put('app-update-packages',[new File([new Uint8Array([1,2,3,4])],'business.apx2'),new File([new Uint8Array([1,2,3,4])],'peer.apx2')]);
-      $('app-update-code').value='00000000';const calls=[];
-      window.__wifiRoundtripInvoke=async(name,{body})=>{check(name==='platform_ap01_app_update','Wrong App IPC');calls.push(body.op);
-        if(body.op==='stage')return {result:'staged',path:'/synthetic/'+body.kind};
-        if(body.op==='prepare')return {result:'prepared',operation_id:'01000000000000000000000000000000',manifest};throw Error('Unexpected App operation');};
-      try{await appUpdatePrepare();check(calls.join(',')==='stage,stage,stage,prepare','File selection must only stage/prepare');check(!$('app-update-run').disabled,'Prepared update cannot start');}
-      finally{window.__wifiRoundtripInvoke=null;}
-    }else{
-      const active=scenario==='app-update-upload';
-      const status=active?{result:'pending',progress}:scenario==='app-update-rollback'?{result:'terminal',reply:{phase:'failed_rolled_back'},progress:{...progress,phase:'failed_rolled_back',received:[204080,0]}}:{result:'unknown',error:'budget_exhausted',progress};
-      appUpdateShow({operation_id:'01000000000000000000000000000000',active,manifest,status});
-      if(active){check($('app-update-run').disabled&&!$('app-update-cancel').disabled,'Active worker controls incorrect');check($('app-update-progress').textContent.includes('复用已有包'),'Unchanged App is not identified');}
-      if(scenario==='app-update-rollback')check($('app-update-result').textContent.includes('整体回退')&&!$('app-update-result').textContent.includes('更新成功'),'Rollback was reported as success');
-      if(scenario==='app-update-unknown')check(appUpdate.operation&&$('app-update-result').textContent.includes('结果未知'),'Unknown operation was discarded');
-    }
-    const card=$('app-update-card');card.scrollIntoView({block:'start'});await wait();const bounds=card.getBoundingClientRect();
-    check(card.scrollWidth<=card.clientWidth+1,'App update card overflows');
-    for(const node of card.querySelectorAll('input,button,progress')){if(!node.getClientRects().length)continue;const r=node.getBoundingClientRect();check(r.left>=bounds.left-1&&r.right<=bounds.right+1,'App control exceeds card: '+node.id);}
-    check(window.__uiErrors.length===0,'App JS errors: '+window.__uiErrors.join('; '));
-    return {scenario,width:innerWidth,cardWidth:Math.round(bounds.width),result:$('app-update-result').textContent};
-  }
   wifiLibrary={revision:0,families:[],devices:{},wired_family:null};wifiManualSelection=false;$('wifi-family-editor').open=false;wifiFamilyRender();
   const network = {network_id:'home', label:'书桌网络', host_ssid:'Home-5G', ssid:'Home-2G',
     password:'fixture-pass',credential:'keep', origin:'local', version:2, deleted:false};

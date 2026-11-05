@@ -48,9 +48,3 @@ pub fn lan_ip() -> String {
     "127.0.0.1".to_string()
 }
 pub mod ap01;
-
-pub mod ap01_app_set;
-
-pub mod ap01_app_set_receipt;
-
-pub mod ap01_app_set_install;

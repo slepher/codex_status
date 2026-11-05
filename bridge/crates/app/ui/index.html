@@ -150,11 +150,6 @@
   button.danger { background: #fff8f6; }
   select, input, textarea { min-height: 34px; max-width: 100%; background: var(--surface); border-color: #d7e1d9; }
   input[type="checkbox"] { min-height: 0; padding: 0; margin: 0; flex: none; vertical-align: middle; }
-  .app-update-files { display:grid; gap:7px; margin:12px 0; }
-  .app-update-files input { width:100%; min-width:0; box-sizing:border-box; }
-  #app-update-progress .row { flex-wrap:wrap; }
-  #app-update-progress progress { max-width:100%; width:140px; }
-  #app-update-result, #app-update-identity { overflow-wrap:anywhere; margin-top:10px; }
   .checkbox-label { display: inline-flex; align-items: center; gap: 8px; }
   textarea { width: 100%; padding: 10px; border: 1px solid var(--line); border-radius: 9px; resize: vertical; color: var(--ink); }
   .muted, .sub, .todo, .ring small { color: var(--muted); }
@@ -422,22 +417,6 @@
         <div class="row"><span>升级结论</span><strong id="dev-verdict">无法判断</strong></div>
         <div class="row" id="dev-upgrade-failure-row" hidden><span>最近相关升级失败</span><span id="dev-upgrade-failure"></span></div>
       </div>
-      <section class="card" id="app-update-card" hidden>
-        <h2>独立 App 更新</h2>
-        <p class="sub">选择完整 App 清单和本次变更的一个或多个包。更新会重启设备；任一 App 试运行失败时整批回退。</p>
-        <div class="app-update-files"><label for="app-update-manifest">App 清单 (.amf3)</label><input id="app-update-manifest" type="file" accept=".amf3">
-          <label for="app-update-packages">变更的 App 包 (.apx2，可多选)</label><input id="app-update-packages" type="file" accept=".apx2" multiple>
-          <label for="app-update-code">设备菜单中的八位设备码</label><input id="app-update-code" type="password" inputmode="numeric" maxlength="8" autocomplete="off" placeholder="仅用于本次任务"></div>
-        <div class="action-strip"><button id="app-update-prepare" onclick="appUpdatePrepare()">校验更新</button><button onclick="appUpdateRestore()">恢复本地任务</button>
-          <button class="primary" id="app-update-run" onclick="appUpdateAction('run')" disabled>开始 / 继续</button><button id="app-update-query" onclick="appUpdateAction('query')" disabled>查询原事务</button>
-          <button id="app-update-cancel" onclick="appUpdateAction('cancel')" disabled>取消更新</button></div>
-        <div id="app-update-result" class="status" role="status" aria-live="polite">尚未准备更新</div>
-        <div id="app-update-progress"></div>
-        <details><summary>任务与恢复</summary><div id="app-update-identity" class="sub"></div>
-          <div class="action-strip"><button id="app-update-reconnect" onclick="appUpdateAction('reconnect')" disabled>核验已发现的新地址</button>
-            <button id="app-update-archive" onclick="appUpdateAction('archive')" disabled>确认结束并归档</button></div>
-          <p class="sub">结果未知时保留原任务。Bridge 重启后，继续上传需重新选择变更包；已提交的任务可直接查询。归档会再次核验结果，再允许下一次更新。</p></details>
-      </section>
       <div class="card">
         <h2>屏幕实际结果</h2>
         <div class="row"><span>已安装内容</span><span id="dev-installed">尚未读取</span></div>
@@ -1509,102 +1488,6 @@
       wifiSetResult('设备已登记；可离线准备目标。');}catch(e){wifiSetResult(wifiError(e));}
   }
 
-
-  let appUpdatePollSeq=0;
-  let appUpdate={operation:null,manifest:null,packages:[],active:false,busy:false};
-  function appUpdateReset(){
-    appUpdatePollSeq++;
-    appUpdate={operation:null,manifest:null,packages:[],active:false,busy:false};
-    $('app-update-card').hidden=true;
-    for(const id of ['app-update-manifest','app-update-packages','app-update-code'])$(id).value='';
-    $('app-update-progress').innerHTML='';$('app-update-identity').textContent='';$('app-update-result').textContent='尚未准备更新';appUpdateButtons();
-  }
-  function appUpdateButtons(){
-    $('app-update-prepare').disabled=appUpdate.busy||appUpdate.active||!!appUpdate.operation;
-    for(const name of ['run','query','cancel','reconnect','archive'])$('app-update-'+name).disabled=appUpdate.busy||!appUpdate.operation||(appUpdate.active&&name!=='cancel');
-    $('app-update-manifest').disabled=appUpdate.busy||appUpdate.active;
-    $('app-update-packages').disabled=appUpdate.busy||appUpdate.active;
-  }
-  function appUpdateError(error){
-    return ({budget_exhausted:'等待超时，可查询或继续原任务',app_set_original_receipt_exists:'已有任务，请先恢复原任务',app_receipt_target_changed:'设备地址已变化，请先重新发现并核验新地址',app_set_operation_mismatch:'任务身份不一致，请恢复原任务',app_set_terminal_not_confirmed:'尚未确认结束或清理完成，请继续查询',rediscover_device_first:'请先重新发现设备地址',app_set_cancel_save_failed:'取消意图保存失败，请检查本机数据目录后重试',worker_stopped:'后台任务已停止，请恢复原任务'})[error]||error;
-  }
-  function appUpdateShow(value){
-    if(value.operation_id)appUpdate.operation=value.operation_id;
-    if(value.manifest)appUpdate.manifest=value.manifest;
-    if(typeof value.active==='boolean')appUpdate.active=value.active;
-    const v=value.status||value,reply=v.reply||{},progress=v.progress||{};
-    const phase=reply.phase||progress.phase;
-    const labels={prepared:'校验通过，尚未开始',saved:'已恢复原任务，尚未联系设备',running:'后台任务正在推进',pending:'等待设备确认',confirmed:'更新成功，已核验重启后的完整运行集合',terminal:phase==='failed_rolled_back'?'更新失败，已整体回退':phase==='cancelled'?'更新已取消':phase==='recovery_required'?'设备需要维护恢复':'事务已结束',unknown:'结果未知，保留原事务',error:'操作未完成',cancelling:'取消请求已保存，等待设备确认',abandoned:'设备确认事务不存在，已关闭本地任务',archived:'原任务已归档，可准备下一次更新',absent:'本机没有活动任务'};
-    const phases={receiving:'上传变更包',ready:'准备重启',switch_pending:'等待重启切换',trial_started:'新集合试运行',rollback_pending:'等待重启回退',rollback_started:'旧集合恢复中'};
-    $('app-update-result').textContent=[labels[v.result]||v.result||'等待状态',phases[phase],v.cancel_requested?'已请求取消':'',appUpdateError(v.error),v.action].filter(Boolean).join(' · ');
-    if(['archived','abandoned','absent'].includes(v.result)){appUpdate.operation=null;appUpdate.active=false;appUpdate.manifest=null;appUpdate.packages=[];}
-    $('app-update-identity').textContent=appUpdate.operation?'原事务：'+appUpdate.operation:'暂无活动事务';
-    const apps=appUpdate.manifest?.apps||[];
-    $('app-update-progress').innerHTML=apps.map((app,i)=>{
-      const known=Number.isInteger(progress.changed_mask),changed=known&&!!(progress.changed_mask&(1<<i));
-      const received=progress.received?.[i]||0,total=app.package_bytes||0,ready=!!(progress.ready_mask&(1<<i));
-      const state=!known?'等待设备确认变更':!changed?'复用已有包':ready?'已校验':`${received} / ${total} B`;
-      return `<div class="row"><span>${escapeHtml(app.id)} · ${escapeHtml(app.version)}</span><span>${escapeHtml(state)}${changed?` <progress aria-label="${escapeHtml(app.id)} 上传进度" max="${total}" value="${received}"></progress>`:''}</span></div>`;
-    }).join('');appUpdateButtons();
-  }
-  async function appUpdateInvoke(mac,body){
-    const value=await invoke('platform_ap01_app_update',{body:{...body,mac}});
-    if(value.result==='error')throw new Error(appUpdateError(value.error)||'更新请求被拒绝');return value;
-  }
-  async function appUpdateStage(mac,file,kind){
-    const limit=kind==='manifest'?3584:16*1024*1024;
-    if(!file||file.size>limit)throw new Error('请选择有效文件；清单不超过 3584 B，每个包不超过 16 MiB');
-    const bytes=new Uint8Array(await file.arrayBuffer());let binary='';
-    for(let at=0;at<bytes.length;at+=8192)binary+=String.fromCharCode(...bytes.subarray(at,at+8192));
-    const value=await appUpdateInvoke(mac,{op:'stage',kind,data_base64:btoa(binary)});
-    if(value.result!=='staged')throw new Error('更新任务正忙，请先恢复原任务');return value.path;
-  }
-  async function appUpdatePackageFiles(mac,generation){
-    const files=Array.from($('app-update-packages').files||[]);
-    if(files.length>8||files.reduce((n,f)=>n+f.size,0)>64*1024*1024)throw new Error('最多选择 8 个包，合计不超过 64 MiB');
-    const paths=[];for(const file of files){if(!isCurrentDevice(mac,generation))throw new Error('已切换设备');paths.push(await appUpdateStage(mac,file,'package'));}return paths;
-  }
-  async function appUpdatePrepare(){
-    const mac=selectedTarget(),generation=deviceSelectionGeneration;if(appUpdate.busy||appUpdate.operation)return;
-    appUpdatePollSeq++;appUpdate.busy=true;appUpdateButtons();
-    try{
-      const code=$('app-update-code').value;if(!/^[0-9]{8}$/.test(code))throw new Error('请填写八位设备码');
-      const path=await appUpdateStage(mac,$('app-update-manifest').files?.[0],'manifest');
-      const packages=await appUpdatePackageFiles(mac,generation);if(!isCurrentDevice(mac,generation))return;
-      const value=await appUpdateInvoke(mac,{op:'prepare',code,manifest_path:path,package_paths:packages});
-      if(isCurrentDevice(mac,generation)){appUpdate.packages=packages;appUpdateShow(value);}
-    }catch(e){if(isCurrentDevice(mac,generation))$('app-update-result').textContent=String(e);}
-    finally{if(isCurrentDevice(mac,generation)){appUpdate.busy=false;appUpdateButtons();}}
-  }
-  async function appUpdateRestore(){
-    if(!selectedDeviceMac||$('app-update-card').hidden||appUpdate.busy)return;
-    const mac=selectedTarget(),generation=deviceSelectionGeneration;
-    appUpdatePollSeq++;appUpdate.busy=true;appUpdateButtons();
-    try{
-      const local=await appUpdateInvoke(mac,{op:'inspect'});if(!isCurrentDevice(mac,generation))return;appUpdateShow(local);
-    }catch(e){if(isCurrentDevice(mac,generation))$('app-update-result').textContent=String(e);}
-    finally{if(isCurrentDevice(mac,generation)){appUpdate.busy=false;appUpdateButtons();}}
-    if(isCurrentDevice(mac,generation))await appUpdatePoll();
-  }
-  async function appUpdatePoll(){
-    if(!selectedDeviceMac||$('app-update-card').hidden||appUpdate.busy)return;
-    const mac=selectedTarget(),generation=deviceSelectionGeneration,ticket=++appUpdatePollSeq;
-    try{const value=await appUpdateInvoke(mac,{op:'worker_status'});if(isCurrentDevice(mac,generation)&&ticket===appUpdatePollSeq&&value.operation_id&&(value.operation_id===appUpdate.operation||(!appUpdate.operation&&value.active)))appUpdateShow(value);}
-    catch(e){if(isCurrentDevice(mac,generation)&&ticket===appUpdatePollSeq)$('app-update-result').textContent='任务状态读取失败：'+e;}
-  }
-  async function appUpdateAction(op){
-    const mac=selectedTarget(),generation=deviceSelectionGeneration,operation=appUpdate.operation;if(!operation||appUpdate.busy)return;
-    appUpdatePollSeq++;appUpdate.busy=true;appUpdateButtons();
-    try{
-      const code=$('app-update-code').value;if(!(op==='cancel'&&appUpdate.active)&&!/^[0-9]{8}$/.test(code))throw new Error('请填写八位设备码');
-      let packages=appUpdate.packages;if(op==='run'&&$('app-update-packages').files?.length)packages=await appUpdatePackageFiles(mac,generation);
-      if(!isCurrentDevice(mac,generation))return;
-      const value=await appUpdateInvoke(mac,{op,code,operation_id:operation,package_paths:op==='run'?packages:undefined});
-      if(isCurrentDevice(mac,generation)){appUpdateShow(value);if(op==='run'&&(value.result==='running'||value.active)){$('app-update-code').value='';appUpdate.active=true;}}
-    }catch(e){if(isCurrentDevice(mac,generation))$('app-update-result').textContent=String(e);}
-    finally{if(isCurrentDevice(mac,generation)){appUpdate.busy=false;appUpdateButtons();}}
-  }
-
   let platformDeviceRequest = 0;
   let renameTargetMac = null;
 
@@ -1617,7 +1500,6 @@
   }
 
   function clearDeviceView() {
-    appUpdateReset();
     wifiFamilySelectionDirty=false;wifiWiredDirty=false;wifiManualSelection=false;$('wifi-ap01-code').value='';wifiFamilyCancel();
     $('device-power').hidden=false;$('wifi-card').hidden=false;
     wifiRenderOnline(null);
@@ -1747,7 +1629,7 @@
   function refreshVisibleDevice() {
     if (!document.querySelector('.tabs button[data-tab="device"]').classList.contains('on')) return;
     if(!selectedDeviceMac)return wifiCheckPermissions();
-    const update = Promise.all([refreshDevice(), wifiRefreshView(), appUpdatePoll()]); // Passive cache/host reads; never wakes or contacts the device.
+    const update = Promise.all([refreshDevice(), wifiRefreshView()]); // Passive cache/host reads; never wakes or contacts the device.
     if ($('details-upgrade_history').open) loadDeviceDetail('upgrade_history');
     return update;
   }
@@ -1762,7 +1644,6 @@
       const d = result.device;
       if (!d || d.device_mac !== mac) throw new Error('设备身份与所选 MAC 不符');
       $('device-power').hidden=d.power_mode==='always_on';
-      $('app-update-card').hidden=d.power_mode!=='always_on';
       $('wifi-card').hidden=false;
       $('dev-name').textContent = d.identity.name || mac;
       $('device-state').textContent = d.contact.label;

@@ -8,8 +8,7 @@ use std::{collections::BTreeMap,sync::atomic::{AtomicBool,Ordering},time::{Durat
 #[derive(Default)]
 pub struct Control {
     candidates:std::sync::Mutex<BTreeMap<String,Candidate>>,
-    pub(super) operation:tokio::sync::Mutex<()>,
-    pub(super) updates:crate::ap01_app_update::WorkerControl,
+    operation:tokio::sync::Mutex<()>,
     cancelled:AtomicBool,
     reconnect:std::sync::Mutex<BTreeMap<String,Retry>>,
     last_search:std::sync::Mutex<Option<(Vec<ap01::LanInterface>,Instant,ap01::DiscoveryReport)>>,
@@ -137,20 +136,6 @@ async fn search(ctx:&AppCtx,target:Option<&str>)->Result<ap01::DiscoveryReport,S
     Ok(report)
 }
 
-/// Same application entry point for UI and MCP; never start a second updater.
-pub async fn update_action(ctx:&std::sync::Arc<AppCtx>,args:&Value)->Value {
-    let Some(mac)=args["mac"].as_str().and_then(DeviceIdentity::normalized_mac) else {return json!({"result":"error","error":"invalid_device_mac"});};
-    if !is_ap01(ctx,&mac){return json!({"result":"error","error":"registered_ap01_required"});}
-    if let Some(value)=crate::ap01_app_update::worker_command(ctx,&mac,args).await {return value;}
-    let Ok(_guard)=ctx.ap01.operation.try_lock() else {return json!({"result":"pending","error":"ap01_operation_busy"});};
-    if args["op"]=="inspect" || args["op"]=="stage" {return crate::ap01_app_update::action(platform::service(ctx).data_root(),&mac,"",args).await;}
-    let endpoint=crate::device_facts_for(ctx,&mac).map(|f|f.endpoint()).unwrap_or_default();
-    let ip=endpoint.parse::<std::net::SocketAddr>().map(|a|a.ip()).or_else(|_|endpoint.parse::<std::net::IpAddr>());
-    let Ok(ip)=ip else {return json!({"result":"error","error":"rediscover_device_first"});};
-    let maintenance=std::net::SocketAddr::new(ip,18080).to_string();
-    crate::ap01_app_update::action(platform::service(ctx).data_root(),&mac,&maintenance,args).await
-}
-
 pub async fn action(ctx:&AppCtx,op:&str,args:&Value)->Value {
     match execute(ctx,op,args).await {
         Ok(value)=>value,
@@ -259,18 +244,6 @@ mod tests {
     use axum::{Router,Json,routing::get,extract::State};
     use std::sync::{Arc,Mutex};
     const MAC:&str="02000000A001";
-
-    #[tokio::test]
-    async fn app_update_requires_registered_ap01_and_shared_operation_lock() {
-        let dir=tempfile::tempdir().unwrap();let ctx=Arc::new(platform::ble_close_lock_tests::test_ctx(dir.path(),&[]));
-        let args=json!({"mac":MAC,"op":"inspect"});
-        assert_eq!(update_action(&ctx,&args).await["error"],"registered_ap01_required");
-        platform::service(&ctx).device_upsert(DeviceIdentity::new(MAC,"AP01").unwrap(),DeviceCapabilities::ap01()).unwrap();
-        assert_eq!(update_action(&ctx,&args).await["result"],"absent");
-        assert_eq!(update_action(&ctx,&json!({"mac":MAC,"op":"query"})).await["error"],"rediscover_device_first");
-        let _guard=ctx.ap01.operation.lock().await;
-        assert_eq!(update_action(&ctx,&args).await["error"],"ap01_operation_busy");
-    }
 
     struct Peer { root:std::path::PathBuf,posted:Mutex<Option<Value>> }
     async fn info()->Json<Value> {Json(json!({"mac":MAC,"model":"njcuk.enstor.ap01",
