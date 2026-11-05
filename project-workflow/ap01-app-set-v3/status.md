@@ -1,5 +1,9 @@
 # 2026-11-05 App OTA 迁回 firmware
 
+2026-11-05 实机版本部署：AP01 当前运行槽 1，CUKTECH ROM `0.1.0-cuktech` / 基线 `1.0.2_0041`，build `677bc30246d7ae8f7cd73698fe4086d6`；槽 0 改为同版本无载入器救援基座，后续更新保留。业务 App 从本仓源码构建 `0.18.108-ap01`，205360 B，SHA256 `feab260c87fc293d7df426ecddfcc266c7d4e120019d1a8f7bdd6e4a88370cc4`。集合序号 2，重启后 succeeded/healthy、cleanup_pending=false；诊断版本列表与真实运行列表一致。执行载荷与此前 d1.0 相同，仅版本元数据/摘要更新。App 版本声明现归 `ports/ap01/build-0041.json`，固件构建器读取配置或显式 --version，不再内置业务版本默认值；基座版本独立发布。
+
+槽 1 ROM 6935752 B，SHA256 `cf0f39c78129b571d6d6534daac02fd7f0fe86de9e0cb7cc3c5fadbdf117a4e6`；槽 0 ROM 6885128 B，SHA256 `39b4d342b0d2de99852f2c5416ce3bbd74d386cd9b94f751ce1258c576ce3c5d`。两者在兄弟固件 `build/version-protocol-20261105/`；App 在 `build/app-upgrade-018108-20261105/app/`。槽 0 未写入，头/构建标识/尾部抽样一致；Wi-Fi 3 个网络、revision 7 和当前网络在两槽一致。非整槽读回，不扩大为界面/旋钮或长期运行验收。App 客户端遇到不含 MAC 的 409 maintenance_busy 时中止，保留原事务恢复后确认成功；错误分类待固件仓库修复。私有验收：兄弟固件 `build/app-upgrade-018108-20261105/deployment/acceptance.json`；版本协议与部署记录见[固件状态](../../../cuktech-ap01-firmware/project-workflow/ap01-app-update/status.md)。本次未启停 Bridge、修改业务协议或重新发布 Bundle。
+
 按用户要求移除本仓 App OTA 专用 Rust 模块、Bridge UI/worker、Tauri/MCP 命令及专用测试；firmware 已有多包 CLI 与生产 HTTP 交叉验收，作为维护入口。五个原始 OTA-only 源码补丁保存在 firmware/docs/history/app-ota-bridge，可追溯但不再作为本仓构建依赖。业务 Bundle/C2/BLE、配对和 ABI 3.1 App 源码保留；未删除任何本机运行数据或旧回执，未启停 Bridge。迁移验收：边界守卫、Node 页面及 WK80 场景通过（窄/宽截图审阅）；Rust core/app/mcp 347 passed、5 既有条件忽略。Fake BLE 初次被系统代理返回 503，测试进程绕过 loopback 代理后通过，业务协议未改。firmware CLI 五事务回环和 AUT3 103164 检查通过。11 个业务/适配关键文件字节保持，记录在 firmware/build/commit-check/ota-boundary-before.json。未操作本机 Bridge 数据或设备。
 
 以下均为历史证据，不再要求本仓完成 App OTA 产品化。
