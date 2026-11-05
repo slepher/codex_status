@@ -348,7 +348,7 @@
         </div>
         <div id="wifi-ap01-auth" hidden>
           <p class="section-note">AP01 保持旋钮手动选网。同步只更新保存列表；设备读取不提供密码。</p>
-          <div class="wifi-field"><label for="wifi-ap01-code">设置 → 设备码（八位）</label><input id="wifi-ap01-code" type="password" inputmode="numeric" maxlength="8" autocomplete="off"><small>只用于本次维护请求，不保存。</small></div>
+          <div class="wifi-field"><label for="wifi-ap01-code">设置 → 设备码（八位）</label><input id="wifi-ap01-code" type="password" inputmode="numeric" maxlength="8" autocomplete="off"><small>验证成功后按设备保存；留空使用已保存的设备码。</small></div>
           <button onclick="wifiQueue('ap01_reconcile')">只读核对上次列表操作</button>
           <button onclick="wifiAp01Accept()">接受读回列表并解除未知结果阻挡</button>
         </div>
@@ -1142,7 +1142,7 @@
   let wifiViewMac=null, wifiRequestSeq=0, wifiResultJobId=null;
   let wifiPermissions=null, wifiPermissionBusy=false, wifiPermissionGuideShown=false, wifiPermissionStartupChecked=false;
   const wifiSelections=new Map();
-  const wifiError=e=>({wifi_shared_edit_library:'此网络来自共享族，请在共享族库编辑；取消订阅请修改设备的族选择。',wifi_library_revision_conflict:'共享族库已变化，请刷新后再保存。',wifi_family_no_compatible_network:'选中的族没有此设备支持的 2.4G 网络，原配置已保留。',wifi_family_ssid_conflict:'同一 SSID 不能属于多个族。',wifi_family_credential_conflict:'同名双频 SSID 的密码必须一致。',wifi_family_network_id_conflict:'族标识与旧配置冲突，请核对后再选择。',wifi_family_conflict:'族名或标识重复，请修改。',ap01_wifi_read_failed:'未能读取 AP01 网络列表，请检查设备在线状态、地址和设备码。',capacity:'设备网络配置数量超过上限，请减少选择后重试。',ap01_device_code_required:'请填写 AP01 设置菜单中的八位设备码。',ap01_wifi_result_unknown:'上次列表保存结果未知；只能先读回核对，不会自动重发。',ap01_manual_network_selection:'请在 AP01 菜单中手动选择网络。',manual_auth:'设备码不正确，请核对 AP01 菜单。',ambiguous_network_id:'设备存在同名配置，无法确定目标。配置已保留，请核对冲突记录。',revision_conflict:'设备方案已变化，缓存已过期，请重新读取设备后再同步。Bridge 配置已保留。',physical_required:'请单击 BOOT 开启维护窗口',unsupported:'此固件尚不支持完整方案，请等待升级',
+  const wifiError=e=>({wifi_shared_edit_library:'此网络来自共享族，请在共享族库编辑；取消订阅请修改设备的族选择。',wifi_library_revision_conflict:'共享族库已变化，请刷新后再保存。',wifi_family_no_compatible_network:'选中的族没有此设备支持的 2.4G 网络，原配置已保留。',wifi_family_ssid_conflict:'同一 SSID 不能属于多个族。',wifi_family_credential_conflict:'同名双频 SSID 的密码必须一致。',wifi_family_network_id_conflict:'族标识与旧配置冲突，请核对后再选择。',wifi_family_conflict:'族名或标识重复，请修改。',ap01_wifi_read_failed:'未能读取 AP01 网络列表，请检查设备在线状态、地址和设备码。',capacity:'设备网络配置数量超过上限，请减少选择后重试。',ap01_device_code_required:'尚无可用设备码，请填写 AP01 设置菜单中的八位设备码。',ap01_device_code_save_failed:'设备码验证成功，但本机保存失败，请检查数据目录权限。',ap01_wifi_result_unknown:'上次列表保存结果未知；只能先读回核对，不会自动重发。',ap01_manual_network_selection:'请在 AP01 菜单中手动选择网络。',manual_auth:'设备码不正确，请核对 AP01 菜单。',ambiguous_network_id:'设备存在同名配置，无法确定目标。配置已保留，请核对冲突记录。',revision_conflict:'设备方案已变化，缓存已过期，请重新读取设备后再同步。Bridge 配置已保留。',physical_required:'请单击 BOOT 开启维护窗口',unsupported:'此固件尚不支持完整方案，请等待升级',
     local_revision_conflict:'Bridge 保存版本已改变，保留修改，请重新比较',target_revision_conflict:'方案已改变，请处理冲突',host_network_changed:'主机网络已改变，请重新选择当前网络',network_not_configured:'Bridge 尚无当前网络配置，请先保存方案',current_network_required:'请保留或加入当前网络后再同步。',host_network_unknown:'无法识别当前网络，请先授权读取主机 Wi-Fi。',snapshot_conflict:'设备快照已变化，请重新预览。',
     http_session_mismatch:'HTTP 会话与本次设备会合不一致，已停止执行。',http_wake_mismatch:'HTTP 响应属于其他醒次，已停止执行。',rendezvous_failed:'本轮设备会合失败，任务与本地配置已保留。',
     transaction_identity_unknown:'缺少原事务身份，无法自动确认，已停止自动重试。',transaction_principal_changed:'Bridge 身份已变化，已停止自动重试。',transaction_namespace_changed:'设备绑定身份已变化，已停止自动重试。',transaction_namespace_invalid:'设备事务身份无效，已停止自动重试。',

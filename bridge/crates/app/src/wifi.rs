@@ -264,17 +264,26 @@ async fn ap01_action(ctx:&AppCtx,mac:&str,op:&str,body:&Value)->Result<Value,Str
 }
 async fn ap01_action_at(ctx:&AppCtx,mac:&str,op:&str,body:&Value,endpoint:&str)->Result<Value,String> {
     let svc=platform::service(ctx);
-    let code=body["device_code"].as_str().filter(|s|s.len()==8&&s.bytes().all(|b|b.is_ascii_digit())).ok_or("ap01_device_code_required")?;
+    let supplied=body["device_code"].as_str().filter(|s|!s.is_empty());
+    let code=match supplied {
+        Some(code) if code.len()==8&&code.bytes().all(|b|b.is_ascii_digit())=>code.to_owned(),
+        Some(_)=>return Err("ap01_device_code_required".into()),
+        None=>bridge_mcp::load_device_code_at(svc.data_root(),mac).ok_or("ap01_device_code_required")?,
+    };
     let lock=platform::delivery_lock(ctx,mac);
     let _guard=lock.try_lock().map_err(|_|"device_channel_busy")?;
     let now=crate::device_now_secs(mac).max(0) as u64;
-    let read=match bridge_core::device_client::ap01_wifi_profiles(endpoint,"GET",code,None).await {
+    let read=match bridge_core::device_client::ap01_wifi_profiles(endpoint,"GET",&code,None).await {
         Ok(read)=>read,
         Err(error)=>return Ok(json!({"state":"failed","stage":error.downcast_ref::<bridge_core::rendezvous::CommandFailure>().map_or("wifi_profiles_read",|e|e.stage),
             "error":"ap01_wifi_read_failed","action":"check_device_network_and_code"})),
     };
     if read.0!=200 {return Ok(json!({"state":"failed","stage":"wifi_profiles_read","error":read.1["error"],"http_status":read.0}));}
     let library=svc.wifi_library();let snapshot=ap01_snapshot(&read.1,mac,&library,now)?;
+    // Save only after authenticated response and MAC/snapshot validation.
+    if supplied.is_some() {
+        bridge_mcp::save_device_code_at(svc.data_root(),mac,&code).map_err(|_|"ap01_device_code_save_failed")?;
+    }
     let state=svc.wifi_state(mac);
     if op=="ap01_accept_observed" {
         let cached=state.snapshot.as_ref().filter(|s|s.complete&&s.revision==snapshot.revision).ok_or("snapshot_conflict")?;
@@ -316,7 +325,7 @@ async fn ap01_action_at(ctx:&AppCtx,mac:&str,op:&str,body:&Value,endpoint:&str)-
     // Persist BEFORE PUT. A lost ACK/restart may only read back, never resubmit.
     svc.wifi_ap01_cache(mac,None,Some(pending)).map_err(|_|"wifi_job_persistence")?;
     let payload=json!({"device_mac":mac,"expected_revision":snapshot.revision,"profiles":profiles});
-    match bridge_core::device_client::ap01_wifi_profiles(endpoint,"PUT",code,Some(&payload)).await {
+    match bridge_core::device_client::ap01_wifi_profiles(endpoint,"PUT",&code,Some(&payload)).await {
         Ok((200,reply))=>{
             let confirmed=ap01_snapshot(&reply,mac,&library,now)?;
             if confirmed.revision!=snapshot.revision+1{return Err("ap01_wifi_result_unknown".into());}
@@ -1064,6 +1073,13 @@ mod tests {
         assert_eq!(ap01_action_at(&ctx,mac,"get",&json!({"device_code":"00000000"}),&endpoint).await.unwrap()["error"],"manual_auth");
         ap01_action_at(&ctx,mac,"get",&code,&endpoint).await.unwrap();
         assert!(svc.wifi_state(mac).snapshot.unwrap().networks[0].network.password.is_none());
+        assert_eq!(bridge_mcp::load_device_code_at(root.path(),mac).as_deref(),Some("01234567"));
+        bridge_mcp::save_device_token_at(root.path(),mac,"0123456789abcdef0123456789abcdef").unwrap();
+        ap01_action_at(&ctx,mac,"get",&json!({}),&endpoint).await.unwrap();
+        assert_eq!(ap01_action_at(&ctx,mac,"get",&json!({"device_code":"00000000"}),&endpoint).await.unwrap()["error"],"manual_auth");
+        assert_eq!(bridge_mcp::load_device_code_at(root.path(),mac).as_deref(),Some("01234567"));
+        assert_eq!(bridge_mcp::load_device_token_at(root.path(),mac).as_deref(),Some("0123456789abcdef0123456789abcdef"));
+        assert!(bridge_mcp::load_device_code_at(root.path(),"AABBCCDDEE00").is_none());
         fake.lock().unwrap().wrong_mac=true;
         assert_eq!(ap01_action_at(&ctx,mac,"get",&code,&endpoint).await.unwrap_err(),"http_identity_mismatch");
         fake.lock().unwrap().wrong_mac=false;

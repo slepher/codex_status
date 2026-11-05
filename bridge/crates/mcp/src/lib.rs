@@ -236,6 +236,26 @@ pub fn save_device_token_at(data_root: &Path, expected_mac: &str, token: &str) -
     Ok(())
 }
 
+// Maintenance codes are separate from paired business tokens and never enter views/logs.
+pub fn load_device_code_at(data_root: &Path, expected_mac: &str) -> Option<String> {
+    let mac = bridge_core::platform::model::DeviceIdentity::normalized_mac(expected_mac)?;
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(
+        data_root.join(format!("device-code-{mac}.json"))).ok()?).ok()?;
+    if doc["device_mac"].as_str() != Some(mac.as_str()) { return None; }
+    let code = doc["device_code"].as_str()?;
+    (code.len() == 8 && code.bytes().all(|b| b.is_ascii_digit())).then(|| code.to_owned())
+}
+
+pub fn save_device_code_at(data_root: &Path, expected_mac: &str, code: &str) -> Result<()> {
+    let mac = bridge_core::platform::model::DeviceIdentity::normalized_mac(expected_mac)
+        .context("invalid target device MAC")?;
+    anyhow::ensure!(code.len() == 8 && code.bytes().all(|b| b.is_ascii_digit()), "invalid device code");
+    bridge_core::platform::store::write_json(&data_root.join(format!("device-code-{mac}.json")),
+        &json!({"device_mac":mac,"device_code":code,"updated_at":now_secs()}))?;
+    anyhow::ensure!(load_device_code_at(data_root,&mac).as_deref()==Some(code), "credential_readback_failed");
+    Ok(())
+}
+
 pub fn load_device_token(cfg: &McpConfig, expected_mac: &str) -> Option<String> {
     load_device_token_at(&cfg.data_root, expected_mac)
 }
