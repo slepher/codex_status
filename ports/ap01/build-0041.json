@@ -1,5 +1,6 @@
 {
   "format": 1,
+  "version": "0.18.108-ap01",
   "root": "../..",
   "include_dirs": [
     "src",
