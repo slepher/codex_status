@@ -373,7 +373,13 @@ async fn post_json(ip: &str, path: &str, token: &str, body: &Value, timeout: Dur
         // The frame was rejected before dispatch. Refresh identity once, but do
         // not blindly replay a mutation whose durable transaction predates reboot.
         if let Some(mac) = body["device_mac"].as_str() {
-            session_nonce(ip, token, mac, timeout.saturating_sub(started.elapsed())).await?;
+            if let Err(error) = session_nonce(ip, token, mac, timeout.saturating_sub(started.elapsed())).await {
+                // Recovery is a separate read. Its failure must not replace the
+                // original write's outcome or its original-transaction query fence.
+                tracing::warn!(event="session_refresh_failed", operation=path,
+                    error_category=safe_error_category(&error), action="query_original_business_transaction",
+                    "HTTP session refresh failed after write rejection");
+            }
         }
     }
     let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -665,13 +671,14 @@ pub async fn activate(
     expected_context: &str,
     timeout: Duration,
 ) -> Result<Value> {
+    let started = Instant::now();
     let (_, device_mac) = session_nonce(ip, token, expected_mac, timeout).await?;
     let request_id = format!("activate-{expected_context}-{template_id}");
     post_json(ip, "/api/activate", token, &json!({
         "device_mac": device_mac, "bridge_id": bridge_id,
         "request_id": request_id, "template_id": template_id,
         "expected_active_context_id": expected_context,
-    }), timeout).await
+    }), timeout.saturating_sub(started.elapsed())).await
 }
 
 async fn session_nonce(ip: &str, token: &str, expected_mac: &str, timeout: Duration) -> Result<(String, String)> {

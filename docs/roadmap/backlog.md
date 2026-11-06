@@ -111,6 +111,8 @@
 
 ### A9. PowerPlan 与 Data 同轮联合下发（2026-10-05）
 
+- **2026-11-06 P0 合并后修正，未部署**：会话刷新失败不覆盖原写事务查询要求；activation 握手与写入共用总预算。两项回归先复现再修正，Core/BLE 253通过/2忽略，固件宿主P0通过；完整验收记录见[专项状态](../../project-workflow/bridge-device-protocol-remediation/status.md)。不结A9/B6/C8。
+
 - **2026-11-02 协议整改 P0 源码/软件验收完成，未部署**：会话复用、只读重放/写回执守卫、BLE 错误和可恢复驱动；workspace522通过/5条件忽略、Note4构建/匹配ELF栈88项通过。设计差异、最后补充回归及同版本候选哈希见[专项状态](../../project-workflow/bridge-device-protocol-remediation/status.md)。真实驱动恢复/RF/资源高水位仍开放，不结A9/B6/C8。
 
 - **2026-10-31 10/30事件已修，Windows已部署**：恢复context ACK与冻结在途Data；同context/合同/值/缺失/质量重开不再误push或授600秒，真实变化/丢Data/合同失效继续恢复，周期全量及未知重试不授正式Light。Core/BLE/App347通过、3条件忽略。00:46自然会合同值idle/Sleep0通过，长期多周期及Mac原生仍待验，不结A9；state新增data_in_flight，回退需配套备份。[状态/验收](../../project-workflow/wifi-families/connection-fix-status.md)、[原现场](../../project-workflow/wifi-families/connection-incident-20261030.md)。

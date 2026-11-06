@@ -1,6 +1,6 @@
 # Codex Status 当前交接
 
-更新时间：2026-11-05，Asia/Hong_Kong。
+更新时间：2026-11-06，Asia/Shanghai。
 
 ## 工作区与部署
 
@@ -13,7 +13,7 @@
 
 ## 活跃事项与边界
 
-- A9/B6/C8：组合本地网络准入、Wi-Fi v2匹配、ACK/在途Data恢复与远端P0/绑定重连/首次联网修复；合并源码不代表组合已部署。Mac原生、RF、多周期功耗验收仍开放；state回退须配套exe/data备份。[本地修复](project-workflow/wifi-families/connection-fix-status.md)、[P0](project-workflow/bridge-device-protocol-remediation/status.md)。
+- A9/B6/C8：11-06补P0会话恢复错误归属与activation总预算修正，源码未提交/未部署；[修正与软件验收](project-workflow/bridge-device-protocol-remediation/status.md)。组合本地网络准入、Wi-Fi v2匹配、ACK/在途Data恢复与远端P0/绑定重连/首次联网修复；合并源码不代表组合已部署。Mac原生、RF、多周期功耗验收仍开放；state回退须配套exe/data备份。[本地修复](project-workflow/wifi-families/connection-fix-status.md)、[P0](project-workflow/bridge-device-protocol-remediation/status.md)。
 - C6：Windows交叉构建/双S3/AP01 CI入口与证据保留；历史候选不代表当前源码产物。[状态](project-workflow/release-ci/status.md)
 - C9：App OTA归兄弟firmware仓库，本仓保留业务Bundle/C2/配对及ABI适配；救援不依赖业务协议。C4长期功耗、C5中文实机等剩余只见[backlog](docs/roadmap/backlog.md)。
 - Note4电池图标v8完整Bundle已发布且用户确认；源码共享版本0.18.108（-note4/-bw），本次未生成ROM、未重启Bridge、未访问设备。[图标验收](project-workflow/bridge-macos/note4-battery-icon-20261105.md)

@@ -315,6 +315,55 @@ fn status_after_reboot_adopts_new_authenticated_session_before_writing() {
 }
 
 #[test]
+fn p0_session_refresh_failure_preserves_original_write_outcome() {
+    use bridge_core::rendezvous::{command_failure, DispatchOutcome};
+    for refresh_ok in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = std::thread::spawn(move || {
+            for (index, expected) in ["/api/status", "/api/data", "/api/status"].into_iter().enumerate() {
+                let (mut stream, _) = listener.accept().unwrap();
+                let (_, path, _, _) = read_request(&mut stream);
+                assert_eq!(path, expected, "recovery must not resend the mutation");
+                if path == "/api/data" {
+                    respond(&mut stream, 409, &json!({"result":"rejected","error":"session_expired"}));
+                } else if index == 2 && !refresh_ok {
+                    respond(&mut stream, 401, &json!({"error":"unauthorized"}));
+                } else {
+                    respond(&mut stream, 200, &json!({"device_mac":"70041DD7A340",
+                        "session_nonce":"0123456789abcdef0123456789abcdef"}));
+                }
+            }
+        });
+        let error = http(device_client::data(&addr, "tok", "70041DD7A340",
+            &json!({"seq":42,"fields":[]}), Duration::from_secs(2))).unwrap_err();
+        assert_eq!(command_failure(&error).map(|f| f.outcome), Some(DispatchOutcome::AckUnknown));
+        assert!(format!("{error:#}").contains("session"));
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn p0_activation_handshake_and_write_share_one_budget() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let server = std::thread::spawn(move || {
+        for expected in ["/api/status", "/api/activate"] {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (_, path, _, _) = read_request(&mut stream);
+            assert_eq!(path, expected);
+            std::thread::sleep(Duration::from_millis(200));
+            respond(&mut stream, 200, &json!({"result":"applied","device_mac":"70041DD7A340",
+                "session_nonce":"0123456789abcdef0123456789abcdef"}));
+        }
+    });
+    let result = http(device_client::activate(&addr, "tok", "70041DD7A340", "bridge-1",
+        "mini", "0000000000000001", Duration::from_millis(320)));
+    server.join().unwrap();
+    assert!(result.is_err(), "two 200ms round trips must not succeed within a 320ms budget");
+}
+
+#[test]
 fn concurrent_status_and_writes_share_the_authenticated_session() {
     let (addr, fake) = spawn_fake();
     http(async {

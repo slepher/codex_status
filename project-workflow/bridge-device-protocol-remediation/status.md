@@ -1,5 +1,18 @@
 # P0 状态
 
+## 2026-11-06 合并后修正
+
+源码修正未提交、未部署；没有启停 Bridge 或访问设备。
+
+- HTTP 会话失效后，身份刷新失败不再覆盖原写错误，保留原业务事务查询要求；刷新成功或失败均不自动重发写入。
+- activation 的首次握手和写入共享调用方的总 timeout，不再各自重获完整预算。
+- 两项新增回归修正前均复现失败，修正后通过。Core/BLE 全套 253 passed / 0 failed / 2 ignored（既有条件测试）；固件宿主 P0 重组/错误帧/四槽队列/只读分类测试通过。
+- `cargo test --workspace --locked -- --test-threads=1` 全套 540 passed / 0 failed / 5 ignored，含 doc-tests。沿用隔离 `/tmp/codex-ap01-bridge-v3-target`，串行测试规避既有模拟器并行干扰；不宣称默认并行已修复。Core/BLE 计数与工作区重叠，不相加。
+- [失败复现](../../artifacts/protocol-p0/recheck-20261106-red.log)、[Core/BLE](../../artifacts/protocol-p0/recheck-20261106-core-ble.log)、[固件宿主](../../artifacts/protocol-p0/recheck-20261106-host.log)、[完整工作区](../../artifacts/protocol-p0/recheck-20261106-workspace.log)。`git diff --check` 通过。
+- 无固件、线协议或持久格式变更；不产生新 ROM。真实驱动、RF、掉电和动态资源验收仍开放，A9/B6/C8 不结项。
+
+## 2026-11-02 阶段记录
+
 [计划](plan.md) · [任务](task.md) · [审阅](review.md)
 
 2026-11-02：P0 源码及软件验收完成，已提交、未部署、未刷机。
