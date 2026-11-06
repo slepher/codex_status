@@ -7,7 +7,7 @@ bool bleWireText(const String &value, size_t limit, bool allowEmpty) {
     // Reject embedded NUL, invalid/overlong UTF-8, surrogates and > U+10FFFF.
     for (size_t i = 0; i < value.length();) {
         uint8_t c = value[i++];
-        if (!c) return false;
+        if (c < 0x20 || c == 0x7f) return false;
         if (c < 0x80) continue;
         size_t n = c >= 0xc2 && c <= 0xdf ? 1 : c >= 0xe0 && c <= 0xef ? 2 :
                    c >= 0xf0 && c <= 0xf4 ? 3 : 0;
@@ -20,11 +20,6 @@ bool bleWireText(const String &value, size_t limit, bool allowEmpty) {
     return true;
 }
 bool bleWireFits(const String &bytes) { return bytes.length() && bytes.length() <= BLE_WIRE_MAX; }
-static String encoded(const String &text) {
-    char buffer[89]; // max input = 64 bytes, STANDARD base64 incl padding
-    syncBase64((const uint8_t *)text.c_str(), text.length(), buffer, sizeof(buffer));
-    return String(buffer);
-}
 static String finish(JsonDocument &doc) {
     if (doc.overflowed() || measureJson(doc) > BLE_WIRE_MAX) return String();
     String bytes; const size_t expected = measureJson(doc);
@@ -41,8 +36,8 @@ String bleBuildEndpoint(const String &request, const String &mac, const String &
                         const char *error, const char *stage) {
     if (!bleWireText(request,64,false) || !bleWireText(mac,17,false) ||
         !bleWireText(principal,64,false)) return String();
-    JsonDocument doc; doc["ack"] = "endpoint"; doc["ble_wire"] = 1; doc["rid"] = encoded(request);
-    doc["device_mac"] = mac; doc["pid"] = encoded(principal);
+    JsonDocument doc; doc["ack"] = "endpoint"; doc["ble_wire"] = 1; doc["rid"] = request;
+    doc["device_mac"] = mac; doc["pid"] = principal;
     doc["ok"] = !*error; doc["stage"] = stage;
     doc["result"] = !*error ? "applied" : !strcmp(error,"storage_unknown") ? "unknown" : "rejected";
     if (*error) doc["error"] = error;
@@ -60,7 +55,7 @@ String bleBuildInfo(const BleInfoSnapshot &s) {
     JsonDocument doc;
     doc["schema"] = 1; doc["model"] = "CodexStatus"; doc["ble_wire"] = 1;
     doc["er"] = 1; // correlated registration with read-only verification
-    doc["f"] = encoded(s.firmware); doc["mac"] = s.mac; doc["ip"] = s.ip;
+    doc["f"] = s.firmware; doc["mac"] = s.mac; doc["ip"] = s.ip;
     doc["http_port"] = 80; doc["rendezvous"] = true;
     doc["wifi_setup_protocol"] = s.wifiProtocol;
     doc["wifi_management"] = s.wifiManagement;
@@ -87,7 +82,7 @@ String bleBuildStatus(const BleStatusSnapshot &s) {
     if (s.networkError) doc["ne"] = !strcmp(s.networkError,"bridge_http_unreachable") ? 2 :
         !strcmp(s.networkError,"wifi_link_lost") ? 3 : 1;
     JsonArray a = doc["s"].to<JsonArray>();
-    a.add(s.nonce); a.add(encoded(s.context)); a.add(encoded(s.activeTemplate)); a.add(encoded(s.job));
+    a.add(s.nonce); a.add(s.context); a.add(s.activeTemplate); a.add(s.job);
     a.add(s.appliedSeq); a.add(s.light); a.add(s.planId); a.add(s.remainingS); a.add(s.provisionalS);
     a.add(s.syncAvailable); a.add(s.syncEnabled); a.add(s.rounds); a.add(s.due);
     a.add(s.retrySkip); a.add(s.pending); a.add(s.commitSeq);
@@ -100,14 +95,14 @@ String bleBuildReply(JsonDocument &doc, const String &request, uint32_t generati
         // One bounded, authenticated control observation, never a device snapshot.
         JsonDocument compact;compact["device_mac"]=doc["device_mac"];compact["ok"]=doc["ok"];
         JsonArray c=compact["c"].to<JsonArray>();
-        c.add(1);c.add(doc["boot_id"]);c.add(encoded(doc["fw"].as<String>()));
+        c.add(1);c.add(doc["boot_id"]);c.add(doc["fw"].as<String>());
         c.add(doc["wifi_control"]["remaining_ms"]);c.add(doc["wifi_control"]["read_allowed"]);c.add(doc["wifi_control"]["write_allowed"]);
         c.add(doc["wifi_control"]["principal"]);c.add(doc["wifi_control"]["namespace"]);
         c.add(doc["wifi_control"]["transaction_high_watermark"]);c.add(doc["wifi_control"]["reason"]);c.add(doc["wifi_storage"]["revision"]);
         doc=std::move(compact);
     }
     doc["ack"] = wifi ? "wifi" : "command";
-    doc["ble_wire"] = 1; doc["rid"] = encoded(request);
+    doc["ble_wire"] = 1; doc["rid"] = request;
     doc.remove("request_id"); doc.remove("wake_generation"); doc.remove("wake_seq");
     doc.remove("wake_stage"); doc.remove("wake_cause"); doc.remove("fw_target");
     JsonArray w = doc["w"].to<JsonArray>(); w.add(generation); w.add(wakeSeq);
@@ -116,7 +111,7 @@ String bleBuildReply(JsonDocument &doc, const String &request, uint32_t generati
         if (!json) return String();
         String context; context.concat(json.c_str(), json.size());
         if (!bleWireText(context, 32)) return String();
-        doc["ctx"] = encoded(context); doc.remove("active_context_id");
+        doc["ctx"] = context; doc.remove("active_context_id");
     }
     // Occupancy is queried over Wi-Fi (or wifi_owner), never echo its display
     // name, host or arbitrary stored strings in a rejected command.
@@ -129,7 +124,7 @@ String bleBuildReply(JsonDocument &doc, const String &request, uint32_t generati
     if (bytes.length()) return bytes;
     JsonDocument fallback;
     fallback["ack"] = wifi ? "wifi" : "command";
-    fallback["ble_wire"] = 1; fallback["rid"] = encoded(request);
+    fallback["ble_wire"] = 1; fallback["rid"] = request;
     JsonArray wake = fallback["w"].to<JsonArray>(); wake.add(generation); wake.add(wakeSeq);
     fallback["result"] = "unknown"; fallback["error"] = "reply_too_large";
     if (wifi) fallback["ok"] = false;

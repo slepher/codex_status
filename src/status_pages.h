@@ -2,13 +2,14 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <utility>
+#include "json_chunk.h"
 
 // One authenticated, immutable read. No persistent bytes or empty-slot reserve.
 class StatusPages {
 public:
     static constexpr size_t MAX_BYTES = 16384;
-    static constexpr size_t CHUNK_BYTES = 1800;
-    void clear() { body_ = String(); token_ = String(); id_ = String(); until_ = 0; }
+    static constexpr size_t CHUNK_BYTES = 3600;
+    void clear() { body_ = String(); token_ = String(); id_ = String(); until_ = 0; offset_ = next_ = 0; }
     void expire(uint64_t now) { if (until_ && now >= until_) clear(); }
     String begin(String &body, const String &token, const String &id, uint64_t now) {
         clear();
@@ -21,25 +22,19 @@ public:
         expire(now);
         if (!until_ || token != token_ || id != id_)
             return "{\"result\":\"rejected\",\"error\":\"status_read_expired\",\"stage\":\"status_read\"}";
-        if (offset >= body_.length() || offset % CHUNK_BYTES)
+        if (offset >= body_.length() || (offset != 0 && offset != offset_ && offset != next_))
             return "{\"result\":\"rejected\",\"error\":\"status_offset\",\"stage\":\"status_read\"}";
-        size_t count = body_.length() - offset;
-        if (count > CHUNK_BYTES) count = CHUNK_BYTES;
-        String hex;
-        hex.reserve(count * 2);
-        static const char digits[] = "0123456789abcdef";
-        for (size_t i = 0; i < count; ++i) {
-            uint8_t byte = body_[offset+i]; hex += digits[byte >> 4]; hex += digits[byte & 15];
-        }
-        if (hex.length() != count * 2)
-            return "{\"result\":\"rejected\",\"error\":\"allocation\",\"stage\":\"status_read\"}";
         JsonDocument doc;
         doc["result"] = "applied"; doc["status_read"] = id_;
-        doc["offset"] = offset; doc["total_bytes"] = body_.length(); doc["chunk_hex"] = hex;
-        doc["next_offset"] = offset + count < body_.length() ? offset + count : 0;
+        doc["offset"] = offset; doc["total_bytes"] = body_.length();
+        const size_t end = jsonChunk(doc, body_, offset, CHUNK_BYTES, 4096 - 48, true);
+        if (end == offset)
+            return "{\"result\":\"rejected\",\"error\":\"allocation\",\"stage\":\"status_read\"}";
+        offset_ = offset; next_ = end;
         String reply; serializeJson(doc, reply); return reply;
     }
 private:
     String body_, token_, id_;
+    size_t offset_ = 0, next_ = 0;
     uint64_t until_ = 0;
 };

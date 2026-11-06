@@ -1,7 +1,7 @@
 # Bridge—设备通信协议问题修复与精简设计方案
 
 制定日期：2026-11-01
-状态：设计定稿（待按阶段实施）
+状态：设计定稿；P0已完成软件验收，P1源码候选及差异见[实施记录](../project-workflow/bridge-device-protocol-remediation/p1-status.md)。部署以PROGRESS为准。
 关联文档：[bridge-device-protocol.md](bridge-device-protocol.md)、[bridge-device-compact-envelope-design.md](bridge-device-compact-envelope-design.md)、[bridge-device-communication-scenarios.md](bridge-device-communication-scenarios.md)、[generic-display-platform-design.md](generic-display-platform-design.md)
 
 ---

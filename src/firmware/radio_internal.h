@@ -14,12 +14,7 @@ struct ReadyReportState {
     uint16_t port = 0;
     int8_t endpointIndex = -1;
     String principal;
-    String originSession;
-    uint64_t originRequestNo = 0;
     uint64_t planId = 0;
-    String dataResult;
-    String httpSession;
-    String reportBody;
     uint8_t attempts = 0;
     uint64_t nextAtMs = 0;
     bool received = false;

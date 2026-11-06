@@ -991,11 +991,9 @@ pub fn decode_wire(raw: &[u8]) -> Result<serde_json::Value> {
         });
     }
     fn text(value: &serde_json::Value, max: usize) -> Result<String> {
-        use base64::Engine;
-        let encoded = value.as_str().context("BLE encoded identifier missing")?;
-        let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)?;
-        if bytes.len() > max || bytes.contains(&0) { bail!("invalid BLE identifier"); }
-        Ok(String::from_utf8(bytes)?)
+        let text = value.as_str().context("BLE identifier missing")?;
+        if text.len() > max || text.bytes().any(|b| b < 0x20 || b == 0x7f) { bail!("invalid BLE identifier"); }
+        Ok(text.to_owned())
     }
     if value.get("er").is_some() { value["endpoint_registration"] = value["er"].clone(); }
     if value.get("f").is_some() { value["fw"] = json!(text(&value["f"], 64)?); }
@@ -1821,13 +1819,11 @@ impl DeviceConnection {
             if snapshot.is_some_and(|previous| previous != id) || total > 4096 { bail!("Wi-Fi summary changed or exceeds limit"); }
             snapshot = Some(id);
             let chunk = reply["chunk"].as_str().context("Wi-Fi summary chunk")?;
-            if chunk.is_empty() || chunk.len() > 240 || chunk.len() % 2 != 0 || !chunk.is_ascii() { bail!("invalid Wi-Fi summary chunk"); }
-            for pair in chunk.as_bytes().chunks(2) {
-                bytes.push(u8::from_str_radix(std::str::from_utf8(pair)?, 16)?);
-            }
+            if chunk.is_empty() || chunk.len() > 320 { bail!("invalid Wi-Fi summary chunk"); }
+            bytes.extend_from_slice(chunk.as_bytes());
             if bytes.len() != next || next > total { bail!("Wi-Fi summary offset mismatch"); }
             if next == total { return serde_json::from_slice(&bytes).context("Wi-Fi summary JSON"); }
-            let pages=(total-next).div_ceil(chunk.len()/2);
+            let pages=(total-next).div_ceil(chunk.len());
             if budget.remaining()<reserve+Duration::from_millis(pages as u64*150) {
                 return Err(bridge_core::rendezvous::CommandFailure{outcome:bridge_core::rendezvous::DispatchOutcome::NotSent,
                     stage:"summary_preflight",reason:"summary_budget_exhausted"}.into());
@@ -2493,7 +2489,7 @@ mod tests {
         for bytes in [br#"{"ble_wire":1,"rid":"","w":[1,2]}"#.as_slice(),
             br#"{"ble_wire":1,"rid":"cg==","w":[1,4294967296]}"#.as_slice(),
             br#"{"ble_wire":1,"rid":"cg==","w":[1,2],"s":[]}"#.as_slice(),
-            br#"{"ble_wire":1,"rid":"AA==","w":[1,2]}"#.as_slice()] {
+            br#"{"ble_wire":1,"rid":"\u0000","w":[1,2]}"#.as_slice()] {
             assert!(super::decode_wire(bytes).is_err());
         }
     }

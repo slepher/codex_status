@@ -3318,35 +3318,37 @@ fn wifi_current_projection_freezes_pages_and_owner_manages_all_origins_atomicall
     let nonce=status["session_nonce"].as_str().unwrap();
     let command=|op:&str,body:Value|http(bridge_core::device_client::wifi_command(&address,ENDPOINT,mac,"bridge-test",op,body,Duration::from_secs(3))).unwrap();
     let snapshot=||http(bridge_core::device_client::wifi_snapshot(&address,ENDPOINT,mac,"bridge-test",Duration::from_secs(3))).unwrap();
-    let changes:Vec<_>=(0..4).map(|i|serde_json::json!({"network_id":format!("n{i}"),"host_ssid":format!("Host{i}"),"ssid":"中文网络".repeat(2),"label":"灯\\\"".repeat(8),"credential":"open"})).collect();
-    let apply=command("apply",serde_json::json!({"request_id":"w3_0000000000000001","expected_revision":0,"changes":changes}));
+    let changes:Vec<_>=(0..8).map(|i|serde_json::json!({"network_id":format!("n{i}"),"host_ssid":format!("Host{i}"),"ssid":"中文网络".repeat(2),"label":"灯\\\"".repeat(12),"credential":"replace","password":"p".repeat(63)})).collect();
+    let apply=command("apply",serde_json::json!({"request_id":"w3_0000000000000001","expected_revision":0,"changes":&changes[..4]}));
     assert_eq!(apply["outcome"],"committed","{apply}");
-    let full=snapshot();assert_eq!(full.networks.len(),6);assert_eq!(full.networks.iter().filter(|n|n.writable).count(),4);
+    let more=command("apply",serde_json::json!({"request_id":"seed-more","expected_revision":1,"changes":&changes[4..]}));
+    assert_eq!(more["outcome"],"committed","{more}");
+    let full=snapshot();assert_eq!(full.networks.len(),10);assert_eq!(full.networks.iter().filter(|n|n.writable).count(),8);
     assert_eq!(full.active["network_id"],"");
     let legacy:Vec<_>=full.networks.iter().filter(|n|n.bond=="legacy").map(|n|(n.network.network_id.as_str(),n.network.ssid.as_str())).collect();
     assert_eq!(legacy,vec![("legacy-0","USB-AP"),("legacy-1","Second-AP")]);
     assert!(http(bridge_core::device_client::wifi_snapshot(&address,"wrong-token",mac,"bridge-test",Duration::from_secs(3))).is_err());
-    let bad=command("apply",serde_json::json!({"request_id":"w3_0000000000000002","expected_revision":1,"changes":[
+    let bad=command("apply",serde_json::json!({"request_id":"w3_0000000000000002","expected_revision":2,"changes":[
         {"network_id":"n0","host_ssid":"Renamed","ssid":"Changed","credential":"keep"},
         {"network_id":"extra","host_ssid":"Extra","ssid":"Extra","credential":"keep"}]}));
     assert_eq!(bad["error"],"credentials_required");
     let receipt=command("result",serde_json::json!({"query_id":"w3_0000000000000002"}));
-    assert_eq!(receipt["outcome"],"rejected");assert_eq!(receipt["revision"],1);
+    assert_eq!(receipt["outcome"],"rejected");assert_eq!(receipt["revision"],2);
     assert_eq!(snapshot().networks[0].network.host_ssid,"Host0");
     // Current owner may manage every saved row; the creating namespace is provenance.
     assert_eq!(request(sim.address(),"POST","/sim/wifi",Some(CONTROL),br#"{"bond":"02:00:00:00:00:03/1"}"#).0,200);
-    let all=snapshot();assert_eq!(all.networks.iter().filter(|n|n.writable).count(),4);
+    let all=snapshot();assert_eq!(all.networks.iter().filter(|n|n.writable).count(),8);
     assert!(all.networks.iter().filter(|n|n.bond!="legacy").all(|n|n.bond=="02:00:00:00:00:02/1"));
     let first=http(bridge_core::device_client::wifi_request(&address,ENDPOINT,mac,"bridge-test","snapshot",serde_json::json!({"offset":0}),Duration::from_secs(3))).unwrap();
     assert_eq!(first["complete"],false);
-    let added=command("apply",serde_json::json!({"request_id":"w3_0000000000000001","expected_revision":1,"changes":[
+    let added=command("apply",serde_json::json!({"request_id":"w3_0000000000000001","expected_revision":2,"changes":[
         {"network_id":"n0","host_ssid":"Updated","ssid":"Updated","credential":"keep"},
         {"network_id":"other","host_ssid":"OtherHost","ssid":"OtherDevice","credential":"open"}]}));
     assert_eq!(added["outcome"],"committed","{added}");
     let stale=http(bridge_core::device_client::wifi_request(&address,ENDPOINT,mac,"bridge-test","snapshot",serde_json::json!({
         "offset":first["next_offset"],"snapshot_id":first["snapshot_id"]}),Duration::from_secs(3))).unwrap();
     assert_eq!(stale["error"],"snapshot_expired");
-    let full=snapshot();assert_eq!(full.networks.len(),7);assert_eq!(full.networks.iter().filter(|n|n.writable).count(),5);
+    let full=snapshot();assert_eq!(full.networks.len(),11);assert_eq!(full.networks.iter().filter(|n|n.writable).count(),9);
     let changed=full.networks.iter().find(|n|n.network.network_id=="n0").unwrap();
     assert_eq!(changed.network.host_ssid,"Updated");assert_eq!(changed.bond,"02:00:00:00:00:02/1");
 }

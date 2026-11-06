@@ -49,7 +49,7 @@ if reader and "WifiStoreV2" not in reader:
         if prefix == "wifiManagementCommand(" and args.no_legacy_management_entry:
             continue
         required.append(next((name for name in functions if name.startswith(prefix)), None))
-report = next((name for name in functions if name.startswith("serviceReadyReport(")), None)
+report = next((name for name in functions if name.startswith(("serviceReadyReport(", "presenceTask("))), None)
 if report:
     required.append(report)
     for prefix in ("v2HttpBegin(", "v2HttpRoute(", "handleV2Status(", "handleClaim(",
@@ -103,7 +103,7 @@ def local(name):
         return True
     if name.startswith(("PlanStore::", "PlanActivation::", "applyV2Plan(", "v2RendezvousTick(", "bleBuildReply(")):
         return True
-    return name.startswith(("wifi", "Wifi", "readWifiStore(", "saveV2(", "save(Wifi", "Preferences::", "nvs_", "nvs::", "store", "load(Endpoints", "save(Endpoints", "legacyString(", "wifiDeviceStatus(", "handleWifiManagement(", "servicePresence(", "serviceReadyReport(", "v2Http", "v2Response(", "handleV2Status(", "pageStatus(", "StatusPages::", "buildPlatformStatus(", "handleClaim(", "serviceV2Ble(", "_ZL22handleBleWifiMigration", "handleBleWifiMigration(", "handleBleWifiCapabilities(", "v2BleNotify("))
+    return name.startswith(("wifi", "Wifi", "readWifiStore(", "saveV2(", "save(Wifi", "Preferences::", "nvs_", "nvs::", "store", "load(Endpoints", "save(Endpoints", "legacyString(", "wifiDeviceStatus(", "handleWifiManagement(", "servicePresence(", "serviceReadyReport(", "presenceTask(", "HTTPClient::", "NetworkClient::", "v2Http", "v2Response(", "handleV2Status(", "pageStatus(", "StatusPages::", "buildPlatformStatus(", "handleClaim(", "serviceV2Ble(", "_ZL22handleBleWifiMigration", "handleBleWifiMigration(", "handleBleWifiCapabilities(", "v2BleNotify("))
 
 def chain(name, seen=frozenset()):
     if name in seen or name not in functions or not local(name):

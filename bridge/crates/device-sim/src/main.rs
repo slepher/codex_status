@@ -2525,40 +2525,20 @@ async fn sim_ready_reports(state: SimState) {
         let principal = intent["bridge_id"].as_str().unwrap_or("");
         let base = format!("http://{}:{}/api/device", intent["bridge_addr"].as_str().unwrap_or(""), intent["bridge_port"]);
         let boot = session_snapshot(&state).nonce;
-        let hello = json!({"device_mac":state.mac,"boot_id":boot,
-            "principal":principal,"instance_id":principal});
         let mut received = false;
         for attempt in 0..3 {
             let Some(clock) = clock_snapshot(&state) else {break;};
             let deadline = state.rendezvous.lock().unwrap().deadline();
             if deadline <= clock.monotonic_ms + 1000 {break;}
             let result: Result<()> = async {
-                let session:Value = client.post(format!("{base}/session")).bearer_auth(state.endpoint_token.as_ref())
-                    .json(&hello).send().await?.error_for_status()?.json().await?;
-                let id=session["session_id"].as_str().context("missing report session")?;
-                ensure!(id.len()==32,"invalid report session");
-                let mut session_bytes=[0u8;16];
-                for (index,byte) in session_bytes.iter_mut().enumerate() {
-                    *byte=u8::from_str_radix(&id[index*2..index*2+2],16)?;
-                }
-                let report=json!({"device_mac":state.mac,"boot_id":boot,"principal":principal,
-                    "instance_id":principal,"origin_session":session_snapshot(&state).nonce,
-                    "origin_request_no":intent["origin_request_no"],"business_id":intent["plan_id"].to_string(),
-                    "context_id":"","ip":state.report_ip.to_string(),"port":80,"http_ready":true,
-                    "plan_result":"applied","data_result":"none","network_result":"ready",
-                    "remaining_ms":(deadline-clock.monotonic_ms).min(90000)});
-                let payload=serde_json::to_vec(&report)?;
-                let frame=Header{kind:2,op:20,result:0,payload_len:payload.len() as u16,
-                    session:session_bytes,request_no:1,context:[0;16]};
-                let mut wire=frame.encode().map_err(anyhow::Error::msg)?.to_vec();wire.extend_from_slice(&payload);
-                let response=client.post(format!("{base}/report")).bearer_auth(state.endpoint_token.as_ref())
-                    .header(header::CONTENT_TYPE,bridge_core::compact_frame::CONTENT_TYPE).body(wire).send().await?;
-                ensure!(response.status()==StatusCode::ACCEPTED,"report rejected");
-                let bytes=response.bytes().await?;
-                let (ack,payload)=Header::decode(&bytes,256).map_err(anyhow::Error::msg)?;
-                ensure!(ack.kind==1 && ack.op==20 && ack.result==1 && ack.request_no==1 && ack.session==frame.session,"report ACK binding");
-                let body:Value=serde_json::from_slice(payload)?;
-                ensure!(body["result"]=="report_received","report ACK result");
+                let report=json!({"event":"presence","device_mac":state.mac,"boot_id":boot,
+                    "ip":state.report_ip.to_string(),"ready_reason":"network_ready",
+                    "active_context_id":status["active_context_id"],"data_pending_seq":status["applied_seq"]});
+                let response=client.post(format!("{base}/presence")).bearer_auth(state.endpoint_token.as_ref())
+                    .json(&report).send().await?;
+                ensure!(response.status()==StatusCode::ACCEPTED,"presence rejected");
+                let body:Value=response.json().await?;
+                ensure!(body["result"]=="accepted" && body["bridge_id"]==principal,"presence ACK binding");
                 Ok(())
             }.await;
             if result.is_ok() {received=true;break;}

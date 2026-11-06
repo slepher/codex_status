@@ -315,7 +315,7 @@ void applyV2Plan(const String &body) {
         ready.bridge.fromString(doc["network"]["bridge_addr"]|"");
         ready.port=doc["network"]["bridge_port"]|0u;
         ready.endpointIndex=endpointIndex;ready.principal=endpoint.principal;
-        ready.originSession=radio::state.v2RvId;ready.originRequestNo=decision.planId;ready.planId=decision.planId;
+        ready.planId=decision.planId;
         radio::state.v2RvNetworkExpected=true;radio::state.v2RvNetworkRequested=true;
         const uint64_t now=clock::v2NowMs();
         radio::state.v2Rv.awaitNetworkStart(now,power::state.v2Plan.lightActive(now)?power::state.v2Plan.deadlineMs():now+RV_NETWORK_MS);
@@ -358,7 +358,6 @@ void applyV2Plan(const String &body) {
         if (applied.error.length()) dataAck["error"] = applied.error;
         if (applied.seq >= 0) dataAck["data_seq"] = (uint64_t)applied.seq;
         if (applied.includeContext) dataAck["active_context_id"] = state.v2Profile.contextId;
-        radio::state.readyReport.dataResult = applied.result;
     }
     String response; serializeJson(ack, response);
     transport::v2Response(200, response);

@@ -1,3 +1,4 @@
+#include "json_chunk.h"
 #include "wifi_setup.h"
 #include "wifi_scheme.h"
 #include "ble_wire.h"
@@ -83,14 +84,10 @@ String wifiSetupReadPage(JsonDocument &request, const String &peer, uint32_t gen
         (!offset || (request["snapshot"] | 0u) == readCrc);
     out["ok"] = okay;
     if (okay) {
-        uint32_t next = std::min((uint32_t)readSnapshot.length(), offset + 80);
-        static const char hex[] = "0123456789abcdef";
-        String chunk; chunk.reserve((next - offset) * 2);
-        for (uint32_t i = offset; i < next; ++i) {
-            uint8_t c = readSnapshot[i]; chunk += hex[c >> 4]; chunk += hex[c & 15];
+        out["snapshot"] = readCrc; out["total"] = readSnapshot.length();
+        if (jsonChunk(out, readSnapshot, offset, 320, 400) == offset) {
+            out["ok"] = false; out["error"] = "reply_limit";
         }
-        out["chunk"] = chunk; out["snapshot"] = readCrc;
-        out["next_offset"] = next; out["total"] = readSnapshot.length();
     } else out["error"] = "read_snapshot";
     String text; serializeJson(out, text); return text;
 }

@@ -2930,7 +2930,7 @@ pub(crate) mod ble_close_lock_tests {
                     let offset=command["offset"].as_u64().unwrap_or(0) as usize;
                     let end=(offset+100).min(text.len());
                     reply["snapshot"]=json!(1);reply["total"]=json!(text.len());reply["next_offset"]=json!(end);
-                    reply["chunk"]=json!(text[offset..end].iter().map(|b|format!("{b:02x}")).collect::<String>());
+                    reply["chunk"]=json!(std::str::from_utf8(&text[offset..end]).unwrap());
                     }
                 },
                 "wifi_snapshot" if fake.rf_initial_ms.load(Ordering::SeqCst) > 0 => {
@@ -2957,7 +2957,7 @@ pub(crate) mod ble_close_lock_tests {
                     let offset=command["offset"].as_u64().unwrap_or(0) as usize;
                     let end=(offset+100).min(text.len());
                     reply["snapshot"]=json!(1); reply["total"]=json!(text.len()); reply["next_offset"]=json!(end);
-                    reply["chunk"]=json!(text[offset..end].iter().map(|b|format!("{b:02x}")).collect::<String>());
+                    reply["chunk"]=json!(std::str::from_utf8(&text[offset..end]).unwrap());
                 },
                 _ => {},
             }
@@ -3132,7 +3132,6 @@ pub(crate) mod ble_close_lock_tests {
             device_delivery: tokio::sync::Mutex::new(()),
             sim_control: tokio::sync::Mutex::new(()),
             per_mac_delivery: Mutex::new(HashMap::new()),
-            report_sessions: Mutex::new(HashMap::new()),
             status: Mutex::new(crate::RuntimeStatus {
                 last_sync: None,
                 last_error: None,
@@ -3781,110 +3780,29 @@ pub(crate) mod ble_close_lock_tests {
     }
 
     #[tokio::test]
-    async fn ready_report_ack_is_only_a_hint_and_rejects_wrong_binding() {
-        use axum::{extract::{State,ConnectInfo}, http::{HeaderMap, HeaderValue, header}, Json};
-        async fn send(ctx:Arc<crate::AppCtx>,peer:ConnectInfo<std::net::SocketAddr>,
-            mut auth:HeaderMap,mut report:Value) -> (axum::http::StatusCode,Value) {
-            let session=report["session_id"].as_str().unwrap().to_owned();
-            let number=report["report_request_no"].as_u64().unwrap();
-            report.as_object_mut().unwrap().remove("session_id");
-            report.as_object_mut().unwrap().remove("report_request_no");
-            let mut bytes=[0u8;16];
-            for (index,byte) in bytes.iter_mut().enumerate() {
-                *byte=u8::from_str_radix(&session[index*2..index*2+2],16).unwrap();
-            }
-            let payload=serde_json::to_vec(&report).unwrap();
-            let header=bridge_core::compact_frame::Header{kind:2,op:20,result:0,
-                payload_len:payload.len() as u16,session:bytes,request_no:number,context:[0;16]};
-            let mut frame=header.encode().unwrap().to_vec();frame.extend_from_slice(&payload);
-            auth.insert(header::CONTENT_TYPE,HeaderValue::from_static(bridge_core::compact_frame::CONTENT_TYPE));
-            let response=crate::framed_ready_report(State(ctx),peer,auth,axum::body::Bytes::from(frame)).await;
-            let status=response.status();
-            let body=axum::body::to_bytes(response.into_body(),4096).await.unwrap();
-            let (_,payload)=bridge_core::compact_frame::Header::decode(&body,4096).unwrap();
-            (status,serde_json::from_slice(payload).unwrap())
-        }
+    async fn presence_receipt_is_only_a_hint_and_rejects_wrong_source() {
+        use axum::{extract::{State,ConnectInfo}, http::{HeaderMap,HeaderValue,header,StatusCode},Json};
         let dir=tempfile::tempdir().unwrap();
         let ctx=Arc::new(test_ctx_with_ip(dir.path(),HUNG_MAC,"192.0.2.10"));
-        let plan=service(&ctx).plan_for_rendezvous(HUNG_MAC,device_now(HUNG_MAC),"rendezvous",0).unwrap();
+        service(&ctx).plan_for_rendezvous(HUNG_MAC,device_now(HUNG_MAC),"rendezvous",0).unwrap();
         let peer=ConnectInfo("192.0.2.10:49152".parse().unwrap());
         let mut auth=HeaderMap::new();
-        auth.insert(header::AUTHORIZATION,HeaderValue::from_static("Bearer fake-endpoint-token"));
-        let hello=json!({"device_mac":HUNG_MAC,"boot_id":"0123456789abcdef0123456789abcdef",
-            "principal":ctx.bridge_id,"instance_id":ctx.bridge_id});
-        let (bad,_) = crate::report_session(State(ctx.clone()),peer,HeaderMap::new(),Json(hello.clone())).await;
-        assert_eq!(bad,axum::http::StatusCode::UNAUTHORIZED);
+        let mut hint=json!({"device_mac":HUNG_MAC,"boot_id":"0123456789abcdef0123456789abcdef","ip":"192.0.2.10"});
+        assert_eq!(crate::presence_hint(State(ctx.clone()),peer,auth.clone(),Json(hint.clone())).await.0,StatusCode::UNAUTHORIZED);
         auth.insert(header::AUTHORIZATION,HeaderValue::from_str(&format!("Bearer {}",ctx.config.token)).unwrap());
-        let (ok,Json(session)) = crate::report_session(State(ctx.clone()),peer,auth.clone(),Json(hello.clone())).await;
-        assert_eq!(ok,axum::http::StatusCode::OK);
-        let mut report=json!({"device_mac":HUNG_MAC,"boot_id":hello["boot_id"],
-            "principal":ctx.bridge_id,"instance_id":ctx.bridge_id,
-            "session_id":session["session_id"],"origin_session":hello["boot_id"],
-            "origin_request_no":1,"report_request_no":1,"business_id":plan.plan_id.to_string(),"context_id":"",
-            "ip":"192.0.2.10","port":80,"http_ready":true,"remaining_ms":100,
-            "plan_result":"applied","data_result":"applied","network_result":"ready"});
-        report["instance_id"]="wrong".into();
-        let (bad,_) = send(ctx.clone(),peer,auth.clone(),report.clone()).await;
-        assert_eq!(bad,axum::http::StatusCode::CONFLICT);
-        report["instance_id"]=json!(ctx.bridge_id);
-        report["business_id"]="999999".into();
-        let (wrong_plan,_) = send(ctx.clone(),peer,auth.clone(),report.clone()).await;
-        assert_eq!(wrong_plan,axum::http::StatusCode::CONFLICT);
-        report["business_id"]=json!(plan.plan_id.to_string());
-        let (received,reply)=send(ctx.clone(),peer,auth.clone(),report.clone()).await;
-        assert_eq!(received,axum::http::StatusCode::ACCEPTED);
-        assert_eq!(reply["result"],"report_received");
-        let accepted_report=report.clone();
-        let (replay,_) = send(ctx.clone(),peer,auth.clone(),report.clone()).await;
-        assert_eq!(replay,axum::http::StatusCode::ACCEPTED);
-        let mut late=report.clone();
-        late["report_request_no"]=json!(2);late["remaining_ms"]=json!(0);
-        let (expired,_) = send(ctx.clone(),peer,auth.clone(),late).await;
-        assert_eq!(expired,axum::http::StatusCode::CONFLICT);
-        report["network_result"]="different".into();
-        let (conflict,_) = send(ctx.clone(),peer,auth.clone(),report.clone()).await;
-        assert_eq!(conflict,axum::http::StatusCode::CONFLICT);
-        report["ip"]="192.0.2.11".into();
-        let (wrong_ip,_) = send(ctx.clone(),peer,auth,report).await;
-        assert_eq!(wrong_ip,axum::http::StatusCode::CONFLICT);
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        assert_eq!(service(&ctx).coordinator_summary(HUNG_MAC,device_now(HUNG_MAC)).unwrap()["plan"]["last_accepted_id"],0);
-        // A process restart has a fresh reverse-direction session; a delayed
-        // report from the old process cannot establish business completion.
-        let restarted=Arc::new(test_ctx_with_ip(dir.path(),HUNG_MAC,"192.0.2.10"));
-        let mut old_auth=HeaderMap::new();
-        old_auth.insert(header::AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}",restarted.config.token)).unwrap());
-        let (late,_) = send(restarted,peer,old_auth,accepted_report).await;
-        assert_eq!(late,axum::http::StatusCode::CONFLICT);
-    }
-
-    #[test]
-    fn ready_report_requires_current_authenticated_light_owner_fact() {
-        let mut status=json!({"device_mac":HUNG_MAC,"boot_id":"same-boot",
-            "power":{"plan_id":7,"mode":"light","remaining_s":25},
-            "transports":{"http":{"ready":true}},"owner_id":"bridge-lock-repro"});
-        let verified=|body:&Value|crate::report_fact_verified(body,HUNG_MAC,
-            "same-boot",7,"bridge-lock-repro");
-        assert!(verified(&status));
-        for (path,value) in [
-            ("device_mac",json!(OTHER_MAC)),
-            ("boot_id",json!("restarted")),
-            ("power.plan_id",json!(8)),
-            ("power.mode",json!("sleep")),
-            ("power.remaining_s",json!(0)),
-            ("transports.http.ready",json!(false)),
-            ("owner_id",json!("other")),
-            ("owner_id",Value::Null),
-        ] {
-            let mut changed=status.clone();
-            let mut slot=&mut changed;
-            for segment in path.split('.') {slot=&mut slot[segment];}
-            *slot=value;
-            assert!(!verified(&changed),"report must remain a hint for {path}");
+        hint["ip"]=json!("192.0.2.11");
+        assert_eq!(crate::presence_hint(State(ctx.clone()),peer,auth.clone(),Json(hint.clone())).await.0,StatusCode::CONFLICT);
+        hint["ip"]=json!("192.0.2.10");
+        for _ in 0..2 {
+            let (code,Json(reply))=crate::presence_hint(State(ctx.clone()),peer,auth.clone(),Json(hint.clone())).await;
+            assert_eq!(code,StatusCode::ACCEPTED);assert_eq!(reply["result"],"accepted");
         }
-        status["power"]["remaining_s"]=json!(0);
-        assert!(!verified(&status));
+        assert_eq!(service(&ctx).coordinator_summary(HUNG_MAC,device_now(HUNG_MAC)).unwrap()["plan"]["last_accepted_id"],0);
+        let status=json!({"device_mac":HUNG_MAC,"boot_id":hint["boot_id"],"owner_id":ctx.bridge_id,"transports":{"http":{"ready":true}}});
+        assert!(crate::presence_fact_verified(&status,HUNG_MAC,hint["boot_id"].as_str().unwrap(),&ctx.bridge_id));
+        assert!(!crate::presence_fact_verified(&status,HUNG_MAC,"another-boot",&ctx.bridge_id));
+        assert!(!crate::presence_fact_verified(&status,HUNG_MAC,hint["boot_id"].as_str().unwrap(),"other-owner"));
+        assert!(!crate::presence_fact_verified(&status,OTHER_MAC,hint["boot_id"].as_str().unwrap(),&ctx.bridge_id));
     }
 
     fn observed_job(ctx: &AppCtx, mac: &str, job_id: &str) -> (String, Option<String>) {
@@ -4426,7 +4344,7 @@ pub(crate) mod ble_close_lock_tests {
             tokio::time::sleep(Duration::from_millis(1100)).await;
             payload=serde_json::to_vec(&json!({"result":"applied","status_read":"a".repeat(32),"offset":offset,
                 "total_bytes":full.len(),"next_offset":if end==full.len(){0}else{end},
-                "chunk_hex":full[offset..end].iter().map(|b|format!("{b:02x}")).collect::<String>()})).unwrap();
+                "chunk":std::str::from_utf8(&full[offset..end]).unwrap()})).unwrap();
         }
         let result=if status.is_success(){0}else{2};
         let header=bridge_core::compact_frame::Header{kind:1,op:frame.op,result,
@@ -5475,7 +5393,7 @@ pub(crate) mod ble_close_lock_tests {
         impl Drop for Cleanup {fn drop(&mut self){let _=self.0.kill();let _=self.0.wait();std::env::remove_var("CODEX_STATUS_SIM_BLE_ENDPOINTS");}}
         let dir=tempfile::tempdir().unwrap();let sim_dir=tempfile::tempdir().unwrap();
         let exe=std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join(format!("device-sim{}",std::env::consts::EXE_SUFFIX));
-        let address=format!("{ip}:80");
+        let address=format!("{ip}:0");
         let mut child=std::process::Command::new(exe).args(["--listen",&address,"--mac",MAC,"--data-dir"])
             .arg(sim_dir.path()).env("CODEX_STATUS_SIM_ENDPOINT_TOKEN",TOKEN)
             .env("CODEX_STATUS_SIM_DEVICE_TOKEN","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
@@ -5484,15 +5402,15 @@ pub(crate) mod ble_close_lock_tests {
             .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::inherit()).spawn().unwrap();
         let mut line=String::new();std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
         let _cleanup=Cleanup(child);let ready:Value=serde_json::from_str(&line).unwrap();let url=ready["http"].as_str().unwrap();
+        let address=url.strip_prefix("http://").unwrap().to_owned();
         let client=reqwest::Client::builder().no_proxy().build().unwrap();
         assert!(client.post(format!("{url}/sim/power")).bearer_auth("synthetic-control-token").json(&json!({"plugged":true})).send().await.unwrap().status().is_success());
         let endpoint=address.clone();
         let (code,_)=(async move { bridge_core::device_client::claim(&endpoint,TOKEN,"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &json!({"id":"bridge-lock-repro","lease":"300"}),Duration::from_secs(3)).await.unwrap() }).await;assert_eq!(code,200);
         let listener=tokio::net::TcpListener::bind((ip,0)).await.unwrap();
-        let mut ctx=test_ctx_with_ip(dir.path(),MAC,&ip.to_string());ctx.config.port=listener.local_addr().unwrap().port();let ctx=Arc::new(ctx);
-        let router=Router::new().route("/api/device/session",post(crate::report_session))
-            .route("/api/device/report",post(crate::framed_ready_report)).with_state(ctx.clone());
+        let mut ctx=test_ctx_with_ip(dir.path(),MAC,&address);ctx.config.port=listener.local_addr().unwrap().port();let ctx=Arc::new(ctx);
+        let router=Router::new().route("/api/device/presence",post(crate::presence_hint)).with_state(ctx.clone());
         let server=tokio::spawn(async move{axum::serve(listener,router.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();});
         std::env::set_var("CODEX_STATUS_SIM_BLE_ENDPOINTS",json!({MAC:ready["ble_http"]}).to_string());
         let mut link=bridge_ble::DeviceConnection::connect(MAC,TOKEN,&ctx.bridge_id).await.unwrap().unwrap();

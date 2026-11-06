@@ -947,8 +947,6 @@ void serviceV2Ble() {
                 radio::state.readyReport.bridge = bridge; radio::state.readyReport.port = (uint16_t)port;
                 radio::state.readyReport.endpointIndex = endpointIndex;
                 radio::state.readyReport.principal = current.id;
-                radio::state.readyReport.originSession = radio::state.v2RvId;
-                radio::state.readyReport.originRequestNo = requestNo;
                 radio::state.readyReport.planId = power::state.v2Plan.acceptedId();
                 radio::state.v2RvNetworkRequested = true;
                 radio::state.v2RvBleReleaseAtMs = now + RV_ACK_GRACE_MS;

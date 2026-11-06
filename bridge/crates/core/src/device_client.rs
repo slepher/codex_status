@@ -52,6 +52,14 @@ async fn write_until(stream: &mut (impl tokio::io::AsyncWrite + Unpin), mut byte
     Ok(())
 }
 
+type IdleHttp = Option<(TcpStream, Instant, tokio::runtime::Id)>;
+static HTTP_CONNECTIONS: OnceLock<Mutex<HashMap<String, Arc<AsyncMutex<IdleHttp>>>>> = OnceLock::new();
+
+fn http_connection(ip: &str) -> Arc<AsyncMutex<IdleHttp>> {
+    HTTP_CONNECTIONS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap()
+        .entry(ip.to_owned()).or_insert_with(|| Arc::new(AsyncMutex::new(None))).clone()
+}
+
 /// One HTTP round trip with a bounded body.
 async fn transport_request(
     ip: &str,
@@ -75,9 +83,23 @@ async fn transport_request(
         .parse()
         .map_err(|e| anyhow!("bad device address {ip}: {e}"))?;
     progress.stage = "http_connect";
-    let mut stream = tokio::time::timeout_at(deadline.into(), TcpStream::connect(addr)).await??;
+    let connection = http_connection(ip);
+    let mut idle = lock_session_until(&connection, deadline).await?;
+    // Taking ownership makes cancellation discard the socket. Never return a
+    // connection whose response framing or native write outcome is uncertain.
+    let runtime = tokio::runtime::Handle::current().id();
+    let reusable = idle.take().and_then(|(stream, at, owner)| {
+        let mut probe = [0u8; 1];
+        (owner == runtime && at.elapsed() < Duration::from_secs(5) &&
+            matches!(stream.try_read(&mut probe), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock))
+            .then_some(stream)
+    });
+    let mut stream = match reusable {
+        Some(stream) => stream,
+        None => tokio::time::timeout_at(deadline.into(), TcpStream::connect(addr)).await??,
+    };
     let mut head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: device\r\nConnection: close\r\nAccept: {content_type}\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: device\r\nConnection: keep-alive\r\nAccept: {content_type}\r\n"
     );
     if !token.is_empty() {
         head.push_str(&format!("Authorization: Bearer {token}\r\n"));
@@ -103,6 +125,7 @@ async fn transport_request(
     let mut raw = Vec::new();
     let mut chunk = [0u8; 2048];
     let mut expected_len = None;
+    let mut excess = false;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         anyhow::ensure!(!remaining.is_zero(), "wifi_window_budget");
@@ -118,18 +141,23 @@ async fn transport_request(
             let body_start = head_end + 4;
             if expected_len.is_none() {
                 let head = String::from_utf8_lossy(&raw[..head_end]);
-                expected_len = head.lines().find_map(|line| {
+                let mut lengths = head.lines().filter_map(|line| {
                     let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("Content-Length")
-                        .then(|| value.trim().parse::<usize>().ok())
-                        .flatten()
+                    name.eq_ignore_ascii_case("Content-Length").then_some(value.trim())
                 });
+                if let Some(length) = lengths.next() {
+                    anyhow::ensure!(length.bytes().all(|b| b.is_ascii_digit()), "invalid HTTP content length");
+                    let length = length.parse::<usize>().context("invalid HTTP content length")?;
+                    anyhow::ensure!(lengths.next().is_none(), "duplicate HTTP content length");
+                    expected_len = Some(length);
+                }
             }
             if let Some(len) = expected_len {
                 if len > 64 * 1024 {
                     bail!("device HTTP response body exceeds 64 KiB");
                 }
                 if raw.len() >= body_start + len {
+                    excess = raw.len() > body_start + len;
                     raw.truncate(body_start + len);
                     break;
                 }
@@ -141,12 +169,20 @@ async fn transport_request(
     if expected_len.is_some_and(|len| raw.len() < body_start + len) {
         bail!("incomplete device HTTP response body");
     }
-    let text = String::from_utf8_lossy(&raw).to_string();
-    let status = text
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(0);
+    let head = std::str::from_utf8(&raw[..body_start]).context("invalid HTTP headers")?;
+    let status_line = head.lines().next().context("missing HTTP status")?;
+    let mut fields = status_line.split_whitespace();
+    let version = fields.next().context("missing HTTP version")?;
+    let status = fields.next().context("missing HTTP status code")?.parse::<u16>()?;
+    anyhow::ensure!(matches!(version, "HTTP/1.0" | "HTTP/1.1") && (100..600).contains(&status), "invalid HTTP status");
+    let connection_close = head.lines().filter_map(|line| line.split_once(':'))
+        .any(|(name, value)| name.eq_ignore_ascii_case("Connection") && value.split(',').any(|v| v.trim().eq_ignore_ascii_case("close")));
+    let transfer_encoding = head.lines().filter_map(|line| line.split_once(':'))
+        .any(|(name, _)| name.eq_ignore_ascii_case("Transfer-Encoding"));
+    anyhow::ensure!(!transfer_encoding, "unsupported device HTTP transfer encoding");
+    if version == "HTTP/1.1" && status >= 200 && expected_len.is_some() && !connection_close && !excess {
+        *idle = Some((stream, Instant::now(), runtime));
+    }
     Ok((status, raw[body_start..].to_vec()))
 }
 
@@ -543,10 +579,9 @@ async fn status_mode(ip: &str, token: &str, timeout: Duration, compact: bool) ->
             anyhow::ensure!(value["result"]=="applied" && value["status_read"]==id &&
                 value["total_bytes"].as_u64()==Some(total as u64) &&
                 value["offset"].as_u64()==Some(bytes.len() as u64),"status page identity mismatch");
-            let hex=value["chunk_hex"].as_str().context("status chunk missing")?;
-            anyhow::ensure!(!hex.is_empty() && hex.len()<=3600 && hex.len()%2==0 &&
-                hex.bytes().all(|c|c.is_ascii_hexdigit()),"invalid status chunk");
-            for offset in (0..hex.len()).step_by(2) {bytes.push(u8::from_str_radix(&hex[offset..offset+2],16)?);}
+            let chunk=value["chunk"].as_str().context("status chunk missing")?;
+            anyhow::ensure!(!chunk.is_empty() && chunk.len()<=3600,"invalid status chunk");
+            bytes.extend_from_slice(chunk.as_bytes());
             anyhow::ensure!(bytes.len()<=total,"status chunk exceeds total");
             let next=value["next_offset"].as_u64().context("status next offset missing")?;
             if next==0 {anyhow::ensure!(bytes.len()==total,"incomplete status read");break;}

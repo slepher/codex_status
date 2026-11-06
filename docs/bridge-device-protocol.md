@@ -194,7 +194,7 @@ BEGIN/COMMIT载荷关联同一业务request及length/content_crc；完整正文�
 
 2026-10-27修复合同（候选，部署以PROGRESS为准）：INFO `wc=2`及HTTP `wifi_connection=2`支持连接匹配v2。`wifi_match`和Plan的target可带`match_v:2`；其`metadata_key=SHA256(SSID UTF-8 + NUL + open单字节)`，密码仍单独`credential_key=SHA256(password)`。network_id仍必须一致。label及host_ssid（族显示名）不参与v2，改名不强制替换已确认凭据；无match_v保留旧摘要，其他显式版本拒绝。Bridge按当前载体认证能力选择，旧ROM不发送v2，SSID/open/密码变化继续失配。
 
-BLE `wifi_status`加`control_only:true`请求单帧控制摘要；旧请求仍用冻结分页。应答`c=[1,boot_id,base64(fw),remaining_ms,read_allowed,write_allowed,principal,namespace,transaction_high_watermark,reason,revision]`，其device_mac、rid及wake/session仍由原48B封帧及认证围栏核验。remaining_ms=null表示continuous，0为unavailable；最大字段完整帧≤512B。只携带控制事实，不能冒充完整设备快照、联网成功或续期。Bridge校验数组长度/类型/版本后展开为原内部合同；旧ROM忽略control_only时仍可分页，但预留后续命令预算、预计无法完成时发送前明拒。会合去除重复全状态读取，apply/activate/trial剩余预算不足750ms不发送，不把最后几十毫秒的写入赌作成功；已发未知保持原ID查询。
+BLE `wifi_status`加`control_only:true`请求单帧控制摘要；旧请求仍用冻结分页。应答`c=[1,boot_id,fw,remaining_ms,read_allowed,write_allowed,principal,namespace,transaction_high_watermark,reason,revision]`，其device_mac、rid及wake/session仍由原48B封帧及认证围栏核验。remaining_ms=null表示continuous，0为unavailable；最大字段完整帧≤512B。只携带控制事实，不能冒充完整设备快照、联网成功或续期。Bridge校验数组长度/类型/版本后展开为原内部合同；旧ROM忽略control_only时仍可分页，但预留后续命令预算、预计无法完成时发送前明拒。会合去除重复全状态读取，apply/activate/trial剩余预算不足750ms不发送，不把最后几十毫秒的写入赌作成功；已发未知保持原ID查询。
 
 HTTP/BLE都以具体frame opcode进入同一Wi-Fi处理器；apply使用wifi_apply，删除wifi_command包装及wifi_save别名。两端拒绝JSON op/command/session_nonce/protocol/rv，原持久事务ID、principal/namespace和回执高水位保留。
 
@@ -324,3 +324,14 @@ HTTP快速就绪判断可读认证compact；需要sync窗口/data_contract的最
 已发送的激活/试连与保存一样，在后续会合按原ID查询；确认查询不依赖重新写入或当前网络重试退避。自动激活明确已接受但尚未完成时保留待确认状态，继续当前已确认Plan下的network_start，使设备在BLE释放后完成切网；待完成不等同于失败或成功。
 
 该修复适用于共享Wi-Fi事务层，并非跨网络特例；当前网络变更后重新用认证wifi_match读取目标，终结历史结果不会作为当前连接失败继续传播。实现/回归/部署见[执行记录](../project-workflow/bridge-macos/wifi-transaction-finality-20261019.md)。
+
+
+## P1 最终传输格式（2026-11-06，源码候选）
+
+HTTP Status 与 Wi-Fi 快照均使用 UTF-8 `chunk` 原文，不再使用 Hex。HTTP 原文上限3600B，BLE原文上限320B；按JSON转义后的总帧预算缩小切片，offset/next_offset始终为原始UTF-8字节偏移。HTTP Status维持不可变快照、token绑定及15秒期限；BLE摘要保留snapshot校验。实际每页长度由元数据和转义决定，不能假定固定倍数。
+
+BLE紧凑字段rid/pid/f/ctx及s/c数组中的标识字符串直接使用UTF-8，取消Base64包装；长度按原始字节校验，控制字符拒绝。紧凑布局和48B信封不变，二进制诊断数据Base64不变。Bridge与设备须同步更新，不提供旧编码回退。
+
+上报只有UDP发现和认证POST `/api/device/presence`；删除session/report两段路由。presence携带device_mac、boot_id、ip、ready_reason、active_context_id和data_pending_seq，202/accepted仅表示收到hint。Bridge核对来源IPv4与登记MAC，反向认证Status核对MAC/boot/owner及HTTP就绪后再交正常协调器处理。设备发送由单个按需任务执行，主循环消费有限结果；连接和读写超时各250ms，ready最多3次，普通presence间隔30秒，不续期PowerPlan。
+
+Bridge按设备地址串行借用最多一个HTTP连接，空闲5秒后不复用；仅完整Content-Length且未声明close的HTTP/1.1响应可归还。取消、超时、残缺/非法响应均丢弃连接；不自动重发未知写。设备主动close正常建立下一连接。

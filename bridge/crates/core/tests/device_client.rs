@@ -75,13 +75,16 @@ fn respond(stream: &mut TcpStream, status: u16, body: &Value) {
     respond_session(stream, status, body, [9;16]);
 }
 fn respond_session(stream: &mut TcpStream, status: u16, body: &Value, session: [u8;16]) {
+    respond_connection(stream, status, body, session, "close");
+}
+fn respond_connection(stream: &mut TcpStream, status: u16, body: &Value, session: [u8;16], connection: &str) {
     let payload = body.to_string();
     let request=REQUEST_FRAME.get().unwrap();
     let ack=Header{kind:1,op:request.op,result:if status>=400 || body["result"]=="rejected" {2}else{0},
         payload_len:payload.len() as u16,session,request_no:request.request_no,context:request.context};
     let mut bytes=ack.encode().unwrap().to_vec();bytes.extend_from_slice(payload.as_bytes());
     let head = format!(
-        "HTTP/1.1 {status} OK\r\nContent-Type: {CONTENT_TYPE}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} OK\r\nContent-Type: {CONTENT_TYPE}\r\nContent-Length: {}\r\nConnection: {connection}\r\n\r\n",
         bytes.len()
     );
     let _ = stream.write_all(head.as_bytes());
@@ -109,13 +112,19 @@ fn paged_status_preserves_the_complete_contract_and_rejects_changed_read_id() {
         let expected=json!({"result":"applied","device_mac":"AABBCCDDEEFF","active_context_id":"123456789abcdef0","data_contract":{"requirements":[{"field":"长字段".repeat(800)}]}});
         let bytes=serde_json::to_vec(&expected).unwrap();
         let server=std::thread::spawn(move || {
-            for (index,chunk) in bytes.chunks(1800).enumerate() {
+            let text=std::str::from_utf8(&bytes).unwrap();
+            let mut offset=0;
+            let mut index=0;
+            while offset<bytes.len() {
+                let mut end=(offset+1800).min(bytes.len());
+                while !text.is_char_boundary(end) {end-=1;}
+                let chunk=&text[offset..end];
                 let (mut socket,_)=listener.accept().unwrap();let request=read_request(&mut socket);
                 if index>0 {assert!(serde_json::from_slice::<Value>(&request.3).unwrap()["status_read"].is_string());}
                 let id=if tamper && index==1 {"22222222222222222222222222222222"}else{"11111111111111111111111111111111"};
-                let hex=chunk.iter().map(|b|format!("{b:02x}")).collect::<String>();
-                respond(&mut socket,200,&json!({"result":"applied","status_read":id,"offset":index*1800,"total_bytes":bytes.len(),"next_offset":if (index+1)*1800<bytes.len(){(index+1)*1800}else{0},"chunk_hex":hex}));
+                respond(&mut socket,200,&json!({"result":"applied","status_read":id,"offset":offset,"total_bytes":bytes.len(),"next_offset":if end<bytes.len(){end}else{0},"chunk":chunk}));
                 if tamper && index==1 {break;}
+                offset=end; index+=1;
             }
         });
         let actual=http(device_client::status(&addr.to_string(),"synthetic-pages",Duration::from_secs(2)));
@@ -495,4 +504,72 @@ fn unauthorized_is_an_error_not_a_silent_success() {
 fn http<F: std::future::Future + Send>(future: F) -> F::Output where F::Output: Send {
     std::thread::scope(|scope| scope.spawn(|| tokio::runtime::Builder::new_current_thread()
         .enable_all().build().unwrap().block_on(future)).join().unwrap())
+}
+
+#[test]
+fn persistent_http_reuses_one_connection_and_honors_server_close() {
+    let listener=TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr=listener.local_addr().unwrap().to_string();
+    let server=std::thread::spawn(move || {
+        let reply=json!({"device_mac":"70041DD7A340","session_nonce":"0123456789abcdef0123456789abcdef"});
+        let (mut socket,_)=listener.accept().unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        for index in 0..3 {
+            assert_eq!(read_request(&mut socket).1,"/api/status");
+            respond_connection(&mut socket,200,&reply,[9;16],if index==2 {"close"}else{"keep-alive"});
+        }
+        drop(socket);
+        let (mut socket,_)=listener.accept().unwrap();
+        assert_eq!(read_request(&mut socket).1,"/api/status");
+        respond(&mut socket,200,&reply);
+    });
+    http(async {
+        for _ in 0..4 {device_client::status(&addr,"keepalive-test",Duration::from_secs(2)).await.unwrap();}
+    });
+    server.join().unwrap();
+}
+
+#[test]
+fn lost_ack_on_reused_connection_drops_socket_without_replaying_write() {
+    let listener=TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr=listener.local_addr().unwrap().to_string();
+    let server=std::thread::spawn(move || {
+        let reply=json!({"device_mac":"70041DD7A340","session_nonce":"0123456789abcdef0123456789abcdef"});
+        let (mut socket,_)=listener.accept().unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        assert_eq!(read_request(&mut socket).1,"/api/status");
+        respond_connection(&mut socket,200,&reply,[9;16],"keep-alive");
+        assert_eq!(read_request(&mut socket).1,"/api/data");
+        drop(socket); // The mutation may have committed; its ACK is lost.
+        let (mut socket,_)=listener.accept().unwrap();
+        assert_eq!(read_request(&mut socket).1,"/api/status", "never replay the uncertain mutation");
+        respond(&mut socket,200,&reply);
+    });
+    http(async {
+        let error=device_client::data(&addr,"lost-ack-test","70041DD7A340",
+            &json!({"seq":42,"fields":[]}),Duration::from_secs(2)).await.unwrap_err();
+        assert_eq!(bridge_core::rendezvous::command_failure(&error).unwrap().outcome,
+            bridge_core::rendezvous::DispatchOutcome::AckUnknown);
+        device_client::status(&addr,"lost-ack-test",Duration::from_secs(2)).await.unwrap();
+    });
+    server.join().unwrap();
+}
+
+#[test]
+fn pooled_http_connection_is_not_reused_after_its_runtime_stops() {
+    let listener=TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr=listener.local_addr().unwrap().to_string();
+    let server=std::thread::spawn(move || {
+        let reply=json!({"device_mac":"70041DD7A340"});
+        for _ in 0..2 {
+            let (mut socket,_)=listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            assert_eq!(read_request(&mut socket).1,"/api/status");
+            respond_connection(&mut socket,200,&reply,[9;16],"keep-alive");
+        }
+    });
+    for _ in 0..2 {
+        http(device_client::status(&addr,"runtime-test",Duration::from_secs(2))).unwrap();
+    }
+    server.join().unwrap();
 }

@@ -10,6 +10,8 @@
 #include "data_activity_led.h"
 #include "data_activity_client.h"
 #include "network_link_policy.h"
+#include <atomic>
+#include <new>
 
 namespace firmware::radio {
 
@@ -40,7 +42,6 @@ static void requestAnnounce(bool bleFlag);
 static uint32_t retryDelaySec(uint8_t stage);
 static uint64_t wifiPresenceUntil(uint64_t now);
 static void servicePresence();
-static void serviceReadyReport();
 static void rendezvousWifiBegin();
 static void networkFailed(const char *reason);
 static bool startFallback();
@@ -494,169 +495,92 @@ void wifiDeviceStatus(JsonDocument &doc,const EndpointRec *endpoint) {
     if(endpoint)wifiDeviceControlStatus(doc,*endpoint);
 }
 
-static __attribute__((noinline)) void servicePresence() {
-    if (!state.wifiUp || WiFi.status() != WL_CONNECTED || wifiSetupBusy() || transport::state.otaInProgress ||
-        state.v2InRendezvous || state.failureReportPending) return;
-    const uint64_t now = clock::v2NowMs(), until = wifiControlUntil(now);
-    if (until <= now || (until != UINT64_MAX && until-now < 2000) ||
-        (state.presenceAttemptAtMs && now-state.presenceAttemptAtMs < 30000)) return;
-    state.presenceAttemptAtMs = now;
-    OwnerRec owner; const bool owned = ownerGet(owner);
-    bool found = false, reached = false;
-    for (int i=0; i<storeCount(); ++i) {
-        EndpointRec endpoint;
-        if (!storeGet(i,endpoint) || !endpoint.principal.length() ||
-            (owned && endpoint.principal != owner.id)) continue;
-        found = true;
-        JsonDocument event; event["event"]="presence"; event["device_mac"]=macText();
-        event["boot_id"]=transport::bootId(); event["ip"]=ipText();
-        event["manual_remaining_s"]=power::state.bleRecovery.lightRemaining(now);
-        DataActivityClient connection;
-        HTTPClient client; client.setConnectTimeout(750); client.setTimeout(750);
-        if (client.begin(connection, String("http://")+endpoint.host+":"+String(endpoint.port)+"/api/device/presence")) {
-            String body; serializeJson(event,body);
-            client.addHeader("Content-Type","application/json");
-            client.addHeader("Authorization",String("Bearer ")+endpoint.token);
-            const int code=client.POST(body);
-            if (code==202 && client.getSize()>0 && client.getSize()<=256) {
+// One transient work item and task stack, allocated only while sending. The
+// worker owns all network objects and never accesses loop-owned firmware state.
+struct PresenceWork {
+    String url, token, principal, body, ip, rendezvous;
+    uint64_t planId = 0;
+    bool ready = false, reached = false;
+    std::atomic<bool> done{false};
+};
+static PresenceWork *presenceWork = nullptr;
+static void presenceTask(void *argument) {
+    auto *work = static_cast<PresenceWork *>(argument);
+    {
+        NetworkClient connection;
+        HTTPClient client; client.setConnectTimeout(250); client.setTimeout(250);
+        if (client.begin(connection, work->url)) {
+            client.addHeader("Content-Type", "application/json");
+            client.addHeader("Authorization", String("Bearer ") + work->token);
+            const int code = client.POST(work->body);
+            if (code == 202 && client.getSize() > 0 && client.getSize() <= 256) {
                 JsonDocument reply;
-                reached=!deserializeJson(reply,client.getString()) &&
-                    bridgePresenceAccepted(code, String(reply["bridge_id"]|"")==endpoint.principal,
-                                           String(reply["result"]|"")=="accepted");
+                work->reached = !deserializeJson(reply, client.getString()) &&
+                    bridgePresenceAccepted(code, String(reply["bridge_id"]|"") == work->principal,
+                                           String(reply["result"]|"") == "accepted");
             }
             client.end();
         }
-        // One endpoint per period; do not multiply the radio budget by peers.
-        break;
     }
-    if (reached) {
-        state.bridgeReachable=true;
-        state.presenceFailures=0; state.networkError=nullptr;
-        updateInfoExtra();
-    } else if (!found || ++state.presenceFailures >= 3) {
-        networkFailed("bridge_http_unreachable");
-        updateInfoExtra();
+    work->done.store(true, std::memory_order_release);
+    vTaskDelete(nullptr);
+}
+static __attribute__((noinline)) void servicePresence() {
+    const uint64_t now = clock::v2NowMs();
+    if (presenceWork) {
+        if (!presenceWork->done.load(std::memory_order_acquire)) return;
+        auto *work = presenceWork; presenceWork = nullptr;
+        OwnerRec owner;
+        const bool current = state.wifiUp && work->ip == ipText() &&
+            (!ownerGet(owner) || owner.id == work->principal) &&
+            (!work->ready || (state.v2InRendezvous && now < state.v2Rv.deadline() && work->rendezvous == state.v2RvId && work->planId == state.readyReport.planId));
+        if (current) {
+            if (work->reached) {
+                state.bridgeReachable = true; state.presenceFailures = 0; state.networkError = nullptr;
+                if (work->ready) state.readyReport.received = true;
+            } else if (!work->ready && ++state.presenceFailures >= 3) networkFailed("bridge_http_unreachable");
+            updateInfoExtra();
+        }
+        delete work;
     }
+    if (!state.wifiUp || WiFi.status() != WL_CONNECTED || wifiSetupBusy() || transport::state.otaInProgress || state.failureReportPending) return;
+    const bool ready = state.v2InRendezvous && state.v2Rv.ready() && state.readyReport.port;
+    const uint64_t until = ready ? std::min(state.v2Rv.deadline(), sync::httpUntil(now)) : wifiControlUntil(now);
+    if (until <= now || (until != UINT64_MAX && until-now < 1000)) return;
+    if (ready) {
+        if (state.readyReport.received || state.readyReport.attempts >= 3 || now < state.readyReport.nextAtMs) return;
+    } else if (state.v2InRendezvous || (state.presenceAttemptAtMs && now-state.presenceAttemptAtMs < 30000)) return;
+    state.presenceAttemptAtMs = now;
+    if (ready) { ++state.readyReport.attempts; state.readyReport.nextAtMs = now + 1000; }
+    EndpointRec endpoint; OwnerRec owner; const bool owned = ownerGet(owner);
+    bool found = false;
+    if (ready) {
+        found = state.readyReport.endpointIndex >= 0 && storeGet(state.readyReport.endpointIndex, endpoint) &&
+            endpoint.principal == state.readyReport.principal;
+    } else for (int i=0; i<storeCount(); ++i) {
+        if (storeGet(i,endpoint) && endpoint.principal.length() && (!owned || endpoint.principal==owner.id)) {found=true;break;}
+    }
+    if (!found || !endpoint.token.length()) {
+        if (!ready) {networkFailed("bridge_http_unreachable");updateInfoExtra();}
+        return;
+    }
+    auto *work = new (std::nothrow) PresenceWork;
+    if (!work) return;
+    work->rendezvous=state.v2RvId; work->ready=ready; work->planId=state.readyReport.planId; work->ip=ipText();
+    work->token=endpoint.token; work->principal=endpoint.principal;
+    work->url=String("http://")+(ready ? state.readyReport.bridge.toString() : endpoint.host)+":"+
+        String(ready ? state.readyReport.port : endpoint.port)+"/api/device/presence";
+    JsonDocument event; event["event"]="presence"; event["device_mac"]=macText();
+    event["boot_id"]=transport::bootId(); event["ip"]=work->ip;
+    event["ready_reason"]=ready ? "network_ready" : "online";
+    event["active_context_id"]=platform::state.v2BundleReady ? platform::state.v2Profile.contextId : "";
+    event["data_pending_seq"]=platform::state.v2DisplayState == 2 ? platform::state.v2DataSeq.appliedSeq() : 0;
+    serializeJson(event,work->body);
+    if (event.overflowed() || work->body.length() != measureJson(event)) {delete work;return;}
+    presenceWork=work;
+    if (xTaskCreate(presenceTask,"presence",6144,work,1,nullptr)!=pdPASS) {presenceWork=nullptr;delete work;}
 }
 
-static __attribute__((noinline)) void serviceReadyReport() {
-    const uint64_t now = clock::v2NowMs();
-    if (!state.readyReport.port || state.readyReport.received || state.readyReport.attempts >= 3 ||
-        now < state.readyReport.nextAtMs || WiFi.status() != WL_CONNECTED ||
-        !state.httpServicesStarted || !state.v2Rv.ready()) return;
-    const uint64_t legalUntil = sync::httpUntil(now);
-    const uint64_t deadline = std::min(state.v2Rv.deadline(), legalUntil);
-    if (deadline <= now + 1000) return;
-    auto ioTimeout = [deadline]() -> uint16_t {
-        const uint64_t current = clock::v2NowMs();
-        return current >= deadline ? 0 :
-            (uint16_t)std::min<uint64_t>(1000, (deadline - current) / 2);
-    };
-    EndpointRec endpoint;
-    if (state.readyReport.endpointIndex < 0 || !storeGet(state.readyReport.endpointIndex, endpoint) ||
-        endpoint.principal != state.readyReport.principal || !endpoint.token.length()) return;
-    ++state.readyReport.attempts;
-    const String base = String("http://") + state.readyReport.bridge.toString() +
-        ":" + String(state.readyReport.port) + "/api/device/";
-    if (!state.readyReport.httpSession.length()) {
-        JsonDocument hello;
-        hello["device_mac"] = macText(); hello["boot_id"] = transport::bootId();
-        hello["principal"] = state.readyReport.principal;
-        hello["instance_id"] = state.readyReport.principal;
-        String body; serializeJson(hello, body);
-        const uint16_t limit = ioTimeout();
-        if (!limit) return;
-        DataActivityClient connection;
-        HTTPClient client; client.setConnectTimeout(limit); client.setTimeout(limit);
-        if (client.begin(connection, base + "session")) {
-            client.addHeader("Content-Type", "application/json");
-            client.addHeader("Authorization", String("Bearer ") + endpoint.token);
-            const int code = client.POST(body);
-            if (code == 200 && client.getSize() > 0 && client.getSize() <= 256) {
-                JsonDocument reply;
-                if (!deserializeJson(reply, client.getString()) && reply["result"] == "applied" &&
-                    String(reply["instance_id"] | "") == state.readyReport.principal) {
-                    const char *id = reply["session_id"] | "";
-                    if (strlen(id) == 32) state.readyReport.httpSession = id;
-                }
-            }
-            client.end();
-        }
-    }
-    if (state.readyReport.httpSession.length()) {
-        if (!state.readyReport.reportBody.length()) {
-            JsonDocument report;
-            report["device_mac"] = macText(); report["boot_id"] = transport::bootId();
-            report["principal"] = state.readyReport.principal;
-            report["instance_id"] = state.readyReport.principal;
-            report["origin_session"] = state.readyReport.originSession;
-            report["origin_request_no"] = state.readyReport.originRequestNo;
-            report["business_id"] = sync::syncNumber(state.readyReport.planId);
-            report["context_id"] = platform::state.v2BundleReady ? platform::state.v2Profile.contextId : "";
-            report["ip"] = WiFi.localIP().toString(); report["port"] = 80;
-            report["http_ready"] = true;
-            report["plan_result"] = "applied";
-            report["data_result"] = state.readyReport.dataResult.length() ? state.readyReport.dataResult : "none";
-            report["network_result"] = "ready";
-            report["remaining_ms"] = (uint32_t)std::min<uint64_t>(deadline - now, 90000);
-            serializeJson(report, state.readyReport.reportBody);
-        }
-        const uint16_t limit = ioTimeout();
-        if (!limit) return;
-        DataActivityClient connection;
-        HTTPClient client; client.setConnectTimeout(limit); client.setTimeout(limit);
-        if (client.begin(connection, base + "report")) {
-            CompactFrameHeader request;
-            request.kind = 2;
-            request.op = 20;
-            request.requestNo = 1;
-            request.payloadLen = state.readyReport.reportBody.length();
-            if (!transport::compactSessionFromHex(state.readyReport.httpSession, request.session)) {
-                client.end(); return;
-            }
-            if (platform::state.v2BundleReady && strlen(platform::state.v2Profile.contextId) == 16)
-                memcpy(request.context, platform::state.v2Profile.contextId, 16);
-            uint8_t header[COMPACT_FRAME_HEADER];
-            if (!compactFrameEncode(request, header) ||
-                COMPACT_FRAME_HEADER + state.readyReport.reportBody.length() > 4096) {
-                client.end(); return;
-            }
-            String frame(reinterpret_cast<const char *>(header), COMPACT_FRAME_HEADER);
-            frame.concat(state.readyReport.reportBody.c_str(), state.readyReport.reportBody.length());
-            client.addHeader("Content-Type", "application/vnd.codex-status.frame");
-            client.addHeader("Authorization", String("Bearer ") + endpoint.token);
-            const int code = client.POST(reinterpret_cast<uint8_t *>(const_cast<char *>(frame.c_str())), frame.length());
-            if (code == 202 && client.getSize() >= COMPACT_FRAME_HEADER && client.getSize() <= 256) {
-                String response = client.getString();
-                CompactFrameHeader ack;
-                if (compactFrameDecode(reinterpret_cast<const uint8_t *>(response.c_str()),
-                    response.length(), ack, 256) && ack.kind == 1 && ack.op == 20 &&
-                    ack.result == 1 && ack.requestNo == request.requestNo &&
-                    !memcmp(ack.session, request.session, 16)) {
-                    JsonDocument reply;
-                    if (!deserializeJson(reply, String(response.c_str() + COMPACT_FRAME_HEADER, ack.payloadLen)) &&
-                        reply["result"] == "report_received") {
-                        state.readyReport.received = true;
-                        diagnostics::traceSetStage(TRACE_STAGE_HTTP);
-                        DevLog.printf("[net] stage=ready_report_acked plan=%llu\n", (unsigned long long)state.readyReport.planId);
-                    }
-                }
-            } else if (code == 409 || code == 401) {
-                // A Bridge restart invalidates the hint session. The business
-                // attempt and its original identifiers stay frozen.
-                state.readyReport.httpSession = "";
-                state.readyReport.reportBody = "";
-            }
-            client.end();
-        }
-    }
-    if (!state.readyReport.received) {
-        const uint32_t backoff = state.readyReport.attempts == 1 ? 250 : 1000;
-        const uint64_t current = clock::v2NowMs();
-        state.readyReport.nextAtMs = current + std::min<uint64_t>(backoff,
-            deadline > current ? deadline - current : 0);
-    }
-}
 
 // No owner/plan mutation. Auth is resolved independently of payload bridge_id.
 void handleWifiManagement(const char *op) {
@@ -736,7 +660,7 @@ static void rendezvousWifiTick() {
             state.v2Rv.httpReady(); updateInfoExtra();
             DevLog.printf("[net] stage=http_listening plan=%llu\n", (unsigned long long)power::state.v2Plan.acceptedId());
         }
-        serviceReadyReport();
+        servicePresence();
         return;
     }
     // Configure before association completes; report handling does not start
@@ -781,7 +705,7 @@ void v2RendezvousTick() {
                 if (!v2RvWifiPhase) rendezvousWifiBegin();
                 rendezvousWifiTick();
             }
-            if (state.readyReport.received || state.readyReport.attempts >= 3)
+            if (state.readyReport.received || (state.readyReport.attempts >= 3 && !presenceWork))
                 state.v2Rv.finishExchange(now, sync::state.v2HistorySyncUntilMs);
         }
     } else if (state.v2Rv.hasPlan() && !state.v2RvNetworkExpected && !syncGuard) {

@@ -2,7 +2,7 @@ use bridge_render::simulator_ble_wire as wire;
 use serde_json::{json, Value};
 
 fn envelope() -> Value {
-    json!({"device_mac":"AA:BB:CC:DD:EE:FF","request_id":"\u{1}".repeat(64),
+    json!({"device_mac":"AA:BB:CC:DD:EE:FF","request_id":"r".repeat(64),
         "wake_generation":u32::MAX,"wake_seq":u32::MAX})
 }
 #[test]
@@ -12,7 +12,7 @@ fn production_ble_status_preserves_all_maximum_byte_identifiers() {
     input["rendezvous_v"] = json!(1);
     input["automatic_contact"] = json!(false);
     input["network_error"] = json!("bridge_http_unreachable");
-    input["active_context_id"] = json!("\u{1}".repeat(32));
+    input["active_context_id"] = json!("r".repeat(32));
     input["active_template_id"] = json!("\\".repeat(16));
     input["committed_job_id"] = json!("é".repeat(8));
     input["applied_seq"] = json!(u64::MAX); input["commit_seq"] = json!(u32::MAX);
@@ -22,10 +22,9 @@ fn production_ble_status_preserves_all_maximum_byte_identifiers() {
     println!("max status bytes={}", raw.len());
     assert!(raw.len() <= 512);
     let doc: Value = serde_json::from_slice(&raw).unwrap();
-    use base64::Engine;
-    let decode = |v: &Value| base64::engine::general_purpose::STANDARD.decode(v.as_str().unwrap()).unwrap();
-    assert_eq!(decode(&doc["rid"]), vec![1;64]);
-    assert_eq!(decode(&doc["s"][1]), vec![1;32]);
+    let decode = |v: &Value| v.as_str().unwrap().as_bytes().to_vec();
+    assert_eq!(decode(&doc["rid"]), vec![b'r';64]);
+    assert_eq!(decode(&doc["s"][1]), vec![b'r';32]);
     assert_eq!(decode(&doc["s"][2]), vec![b'\\';16]);
     assert_eq!(decode(&doc["s"][3]), "é".repeat(8).as_bytes());
     assert_eq!(doc["s"][4], u64::MAX);
@@ -44,7 +43,7 @@ fn production_ble_status_preserves_all_maximum_byte_identifiers() {
 #[test]
 fn production_info_and_all_ack_classes_are_bounded() {
     let info = wire("info", &json!({"mac":"AA:BB:CC:DD:EE:FF","ip":"255.255.255.255",
-        "fw":"\u{1}".repeat(64),"wake_generation":u32::MAX,"wake_seq":u32::MAX,
+        "fw":"r".repeat(64),"wake_generation":u32::MAX,"wake_seq":u32::MAX,
         "pairingWindow":true,"peerBonded":true,"peerEncrypted":true,"bundle_configured":true,
         "wifi_setup_protocol":255,"wifi_management":2,"wifi_connection":1,"plan_activation":1,"rf_remaining_ms":u32::MAX-1})).unwrap();
     assert_eq!(serde_json::from_slice::<Value>(&info).unwrap()["wc"],1);
@@ -56,7 +55,7 @@ fn production_info_and_all_ack_classes_are_bounded() {
             input["op"] = json!(op); input["result"] = json!(result);
             input["display_state"] = json!("unchanged"); input["retention"] = json!("flash");
             input["data_seq"] = json!(u64::MAX); input["plan_id"] = json!(u64::MAX);
-            input["active_context_id"] = json!("\u{1}".repeat(32));
+            input["active_context_id"] = json!("r".repeat(32));
             input["accepted_remaining_s"] = json!(u32::MAX);
             if result == "rejected" { input["error"] = json!("request_conflict"); }
             input["accepted_remaining_s"] = json!(u32::MAX - 1);
@@ -71,14 +70,13 @@ fn production_info_and_all_ack_classes_are_bounded() {
         for ok in [true,false] {
             let mut doc = json!({"ack":category,"ok":ok});
             if category == "endpoint" {
-                doc["request_id"] = json!("\u{1}".repeat(64)); doc["device_mac"] = json!("AA:BB:CC:DD:EE:FF");
-                doc["bridge_id"] = json!("\u{1}".repeat(64));
+                doc["request_id"] = json!("r".repeat(64)); doc["device_mac"] = json!("AA:BB:CC:DD:EE:FF");
+                doc["bridge_id"] = json!("r".repeat(64));
                 if !ok { doc["error"] = json!("storage_unknown"); doc["stage"] = json!("persist"); }
                 let reply: Value = serde_json::from_slice(&wire(category, &doc).unwrap()).unwrap();
                 assert_eq!(reply["ble_wire"],1);
-                use base64::Engine;
                 for field in ["rid","pid"] {
-                    assert_eq!(base64::engine::general_purpose::STANDARD.decode(reply[field].as_str().unwrap()).unwrap(),vec![1;64]);
+                    assert_eq!(reply[field].as_str().unwrap().as_bytes(),vec![b'r';64]);
                 }
                 println!("max endpoint {ok} bytes={}",wire(category,&doc).unwrap().len());
                 assert_eq!(reply["result"], if ok {"applied"} else {"unknown"});
@@ -117,7 +115,7 @@ fn joint_plan_data_activation_ack_fits_compact_frame() {
 }
 #[test]
 fn invalid_identity_is_not_echoed_and_oversize_is_unknown_after_execution() {
-    for id in [String::new(), "r".repeat(65), "r\0suffix".to_owned()] {
+    for id in [String::new(), "r".repeat(65), "r\0suffix".to_owned(), "\u{1}".repeat(64)] {
         let mut doc = envelope(); doc["request_id"] = json!(id);
         assert!(wire("reply", &doc).is_err());
     }
@@ -134,7 +132,7 @@ fn invalid_identity_is_not_echoed_and_oversize_is_unknown_after_execution() {
 #[test]
 fn wifi_control_summary_fits_one_frame_at_field_limits() {
     let input=json!({"device_mac":"AA:BB:CC:DD:EE:FF","request_id":"rffffffffffffffff","wake_generation":u32::MAX,"wake_seq":u32::MAX,
-        "ack":"wifi","ok":true,"control_only":true,"boot_id":"f".repeat(32),"fw":"\u{1}".repeat(64),
+        "ack":"wifi","ok":true,"control_only":true,"boot_id":"f".repeat(32),"fw":"r".repeat(64),
         "wifi_control":{"remaining_ms":u64::MAX,"read_allowed":true,"write_allowed":false,"principal":"f".repeat(32),"namespace":"f".repeat(21),"transaction_high_watermark":u64::MAX,"reason":"r".repeat(32)},"wifi_storage":{"revision":u64::MAX}});
     let raw=wire("reply",&input).unwrap();let doc:Value=serde_json::from_slice(&raw).unwrap();
     assert!(raw.len()+48<=512,"{} bytes",raw.len()+48);assert_eq!(doc["c"][0],1);assert_eq!(doc["c"][10],u64::MAX);

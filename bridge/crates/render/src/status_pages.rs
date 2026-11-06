@@ -23,14 +23,15 @@ impl Drop for SimulatorStatusPages {fn drop(&mut self){unsafe{sim_status_delete(
     use super::*;
     #[test] fn shared_status_snapshot_is_complete_bounded_and_principal_scoped() {
         let mut pager=SimulatorStatusPages::new().unwrap();let id="123456789abcdef0123456789abcdef0";
-        let original=serde_json::json!({"device_mac":"AABBCCDDEEFF","contract":"长字段".repeat(900)}).to_string();
+        let original=serde_json::json!({"device_mac":"AABBCCDDEEFF","contract":"长字段\"\\\n".repeat(700)}).to_string();
         let mut page=pager.page(Some(&original),"synthetic",id,0,10).unwrap();let mut bytes=Vec::new();
         assert_eq!(pager.page(None,"wrong",id,1800,11).unwrap()["error"],"status_read_expired");
         assert_eq!(pager.page(None,"synthetic","wrong",1800,11).unwrap()["error"],"status_read_expired");
         assert_eq!(pager.page(None,"synthetic",id,1,11).unwrap()["error"],"status_offset");
         loop {
-            assert!(page.to_string().len()+48<=4096);let hex=page["chunk_hex"].as_str().unwrap();
-            for i in (0..hex.len()).step_by(2){bytes.push(u8::from_str_radix(&hex[i..i+2],16).unwrap());}
+            assert_eq!(pager.page(None,"synthetic",id,page["offset"].as_u64().unwrap() as usize,12).unwrap(),page);
+            assert!(page.to_string().len()+48<=4096);let chunk=page["chunk"].as_str().unwrap();
+            bytes.extend_from_slice(chunk.as_bytes());
             let next=page["next_offset"].as_u64().unwrap();if next==0{break;}
             page=pager.page(None,"synthetic",id,next as usize,12).unwrap();
         }

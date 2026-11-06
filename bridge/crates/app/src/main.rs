@@ -311,7 +311,6 @@ struct AppCtx {
     device_delivery: tokio::sync::Mutex<()>,
     sim_control: tokio::sync::Mutex<()>,
     per_mac_delivery: Mutex<HashMap<String, Arc<platform::DeliveryLock>>>,
-    report_sessions: Mutex<HashMap<String, ReportSession>>,
     status: Mutex<RuntimeStatus>,
     /// Per-MAC runtime records (address, name, caches, occupancy, queues).
     ///
@@ -338,14 +337,6 @@ struct AppCtx {
     platform: Arc<bridge_core::platform::service::PlatformService>,
 }
 
-struct ReportSession {
-    id: String,
-    boot_id: String,
-    source_ip: std::net::Ipv4Addr,
-    expires: std::time::Instant,
-    highest_report_no: u64,
-    last_digest: [u8;32],
-}
 
 fn now_secs() -> i64 {
     SystemTime::now()
@@ -1146,213 +1137,49 @@ async fn mcp_handler(
 // Notification is a hint only. Registered MAC/IP and current endpoint token
 // restrict probes; authenticated status, never the event payload, updates truth.
 async fn presence_hint(axum::extract::State(ctx):axum::extract::State<Arc<AppCtx>>,
+    axum::extract::ConnectInfo(peer):axum::extract::ConnectInfo<std::net::SocketAddr>,
     headers:axum::http::HeaderMap,axum::Json(hint):axum::Json<Value>)-> (axum::http::StatusCode, axum::Json<Value>) {
+    use axum::http::StatusCode;
+    let reject=|code,error| (code,axum::Json(json!({"result":"rejected","stage":"presence",
+        "error":error,"action":"correct_presence_and_retry"})));
     if headers.get(axum::http::header::AUTHORIZATION).and_then(|h|h.to_str().ok())!=Some(format!("Bearer {}",ctx.config.token).as_str()) {
-        return (axum::http::StatusCode::UNAUTHORIZED, axum::Json(json!({})));
+        return reject(StatusCode::UNAUTHORIZED,"unauthorized");
     }
-    let Some(mac)=hint["device_mac"].as_str().and_then(bridge_core::platform::model::DeviceIdentity::normalized_mac) else{return (axum::http::StatusCode::BAD_REQUEST, axum::Json(json!({})));};
-    let Some(mut link)=platform::device_link_for_mac(&ctx,&mac) else{return (axum::http::StatusCode::NOT_FOUND, axum::Json(json!({})));};
-    let Some(candidate)=hint["ip"].as_str().filter(|ip|ip.parse::<std::net::Ipv4Addr>().is_ok()) else{return (axum::http::StatusCode::BAD_REQUEST, axum::Json(json!({})));};
-    let changed=candidate!=link.ip;link.ip=candidate.to_owned();
-    let saved=platform::service(&ctx).device_get(&mac).unwrap_or(Value::Null);
-    let sample=&saved["last_authenticated"];
-    let sampled_at=sample["observed_at"].as_i64().unwrap_or(0);
-    let verified=sample["transport"]=="http" && sample["body"]["boot_id"]==hint["boot_id"] && !hint["boot_id"].is_null() &&
-        sampled_at>0 && device_now_secs(&mac)>=sampled_at && device_now_secs(&mac)-sampled_at<45 &&
-        sample["body"]["transports"]["http"]["ready"]==true;
-    let reply=json!({"result":"accepted","bridge_id":ctx.bridge_id,"device_http_verified":verified});
-    // try_lock coalesces repeated hints and bounds work independently per MAC.
+    let Some(mac)=hint["device_mac"].as_str().and_then(bridge_core::platform::model::DeviceIdentity::normalized_mac) else{return reject(StatusCode::BAD_REQUEST,"device_mac");};
+    let Some(mut link)=platform::device_link_for_mac(&ctx,&mac) else{return reject(StatusCode::NOT_FOUND,"device_unknown");};
+    let Some(boot)=hint["boot_id"].as_str().filter(|s|s.len()==32 && s.bytes().all(|b|b.is_ascii_hexdigit())).map(str::to_owned) else{return reject(StatusCode::BAD_REQUEST,"boot_id");};
+    let Some(ip)=hint["ip"].as_str().and_then(|s|s.parse::<std::net::Ipv4Addr>().ok()) else{return reject(StatusCode::BAD_REQUEST,"ip");};
+    if peer.ip()!=std::net::IpAddr::V4(ip) || ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || ip.is_link_local() || ip.is_broadcast() {
+        return reject(StatusCode::CONFLICT,"source_address");
+    }
+    // The registered port is trusted configuration, not supplied by the hint.
+    let port=link.ip.parse::<std::net::SocketAddrV4>().map(|addr|addr.port()).unwrap_or(80);
+    let endpoint=if port==80 {ip.to_string()} else {format!("{ip}:{port}")};
+    let changed=link.ip!=endpoint;link.ip=endpoint;
+    // Receipt is only a hint, even after a previous successful observation.
+    let reply=json!({"result":"accepted","bridge_id":ctx.bridge_id});
     let lock=platform::delivery_lock(&ctx,&mac);
-    let Ok(guard)=lock.try_lock() else{return (axum::http::StatusCode::ACCEPTED, axum::Json(reply));};
+    let Ok(guard)=lock.try_lock() else{return (StatusCode::ACCEPTED,axum::Json(reply));};
     tokio::spawn(async move {
-        let sampled=std::time::Instant::now();let fetch=link.clone();
-        if let Ok(status)=bridge_core::device_client::status(&fetch.ip,&fetch.token,Duration::from_secs(2)).await {
-            if status["device_mac"].as_str().and_then(bridge_core::platform::model::DeviceIdentity::normalized_mac).as_deref()==Some(mac.as_str()) {
+        if let Ok(status)=bridge_core::device_client::status(&link.ip,&link.token,Duration::from_secs(2)).await {
+            if presence_fact_verified(&status,&mac,&boot,&ctx.bridge_id) {
                 let now=device_now_secs(&mac).max(0) as u64;
-                if platform::service(&ctx).note_authenticated_status_at(&mac,&status,now).is_err(){return;}
+                if platform::service(&ctx).note_device_status_at(&mac,&status,"http",now).is_err() ||
+                    platform::service(&ctx).note_authenticated_status_at(&mac,&status,now).is_err(){return;}
                 if changed {let _=platform::revalidate_registered_device_endpoint(&ctx,&mac,&link.ip).await;}
-                // Carry on only explicit existing jobs; notification never creates work.
-                if sampled.elapsed()<Duration::from_secs(3) {crate::wifi::opportunity_locked(&ctx,&mac).await;}
+                // The coordinator applies its normal owner/window/plan gates.
+                crate::wifi::http_ready(&ctx,&mac,&status,now);
+                crate::wifi::opportunity_locked(&ctx,&mac).await;
             }
         }
         drop(guard);
     });
-    (axum::http::StatusCode::ACCEPTED, axum::Json(reply))
+    (StatusCode::ACCEPTED,axum::Json(reply))
 }
 
-// The shared bearer permits a hint only. A fresh HTTP session binds the
-// notification to this Bridge instance; authenticated device HTTP supplies
-// the business facts after the response has already been sent.
-async fn report_session(axum::extract::State(ctx):axum::extract::State<Arc<AppCtx>>,
-    axum::extract::ConnectInfo(peer):axum::extract::ConnectInfo<std::net::SocketAddr>,
-    headers:axum::http::HeaderMap,axum::Json(body):axum::Json<Value>)
-    -> (axum::http::StatusCode, axum::Json<Value>) {
-    use axum::http::StatusCode;
-    if headers.get(axum::http::header::AUTHORIZATION).and_then(|h|h.to_str().ok())
-        != Some(format!("Bearer {}",ctx.config.token).as_str()) {
-        return (StatusCode::UNAUTHORIZED,axum::Json(json!({"result":"rejected","stage":"authenticate","error":"unauthorized"})));
-    }
-    let Some(mac)=body["device_mac"].as_str().and_then(bridge_core::platform::model::DeviceIdentity::normalized_mac) else {
-        return (StatusCode::BAD_REQUEST,axum::Json(json!({"result":"rejected","stage":"session","error":"device_mac"})));
-    };
-    let Some(boot)=body["boot_id"].as_str().filter(|s|s.len()==32 && s.bytes().all(|b|b.is_ascii_hexdigit())) else {
-        return (StatusCode::BAD_REQUEST,axum::Json(json!({"result":"rejected","stage":"session","error":"boot_id"})));
-    };
-    let std::net::IpAddr::V4(source_ip)=peer.ip() else {
-        return (StatusCode::BAD_REQUEST,axum::Json(json!({"result":"rejected","stage":"session","error":"source_address"})));
-    };
-    if body["principal"] != ctx.bridge_id || body["instance_id"] != ctx.bridge_id ||
-        platform::service(&ctx).device_get(&mac).is_none() {
-        return (StatusCode::CONFLICT,axum::Json(json!({"result":"rejected","stage":"session","error":"binding"})));
-    }
-    let id=uuid::Uuid::new_v4().simple().to_string();
-    ctx.report_sessions.lock().unwrap().insert(mac,ReportSession {
-        id:id.clone(),boot_id:boot.to_owned(),source_ip,
-        expires:std::time::Instant::now()+Duration::from_secs(90),
-        highest_report_no:0,last_digest:[0;32],
-    });
-    (StatusCode::OK,axum::Json(json!({"result":"applied","session_id":id,
-        "instance_id":ctx.bridge_id,"expires_in_ms":90000})))
-}
-
-async fn ready_report(axum::extract::State(ctx):axum::extract::State<Arc<AppCtx>>,
-    axum::extract::ConnectInfo(peer):axum::extract::ConnectInfo<std::net::SocketAddr>,
-    headers:axum::http::HeaderMap,axum::Json(report):axum::Json<Value>)
-    -> (axum::http::StatusCode, axum::Json<Value>) {
-    use axum::http::StatusCode;
-    if headers.get(axum::http::header::AUTHORIZATION).and_then(|h|h.to_str().ok())
-        != Some(format!("Bearer {}",ctx.config.token).as_str()) {
-        return (StatusCode::UNAUTHORIZED,axum::Json(json!({"result":"rejected","stage":"authenticate","error":"unauthorized"})));
-    }
-    let Some(mac)=report["device_mac"].as_str().and_then(bridge_core::platform::model::DeviceIdentity::normalized_mac) else {
-        return (StatusCode::BAD_REQUEST,axum::Json(json!({"result":"rejected","stage":"report","error":"device_mac"})));
-    };
-    let valid_session=ctx.report_sessions.lock().unwrap().get(&mac).is_some_and(|session|
-        session.id==report["session_id"] && session.boot_id==report["boot_id"] &&
-        peer.ip()==std::net::IpAddr::V4(session.source_ip) &&
-        std::time::Instant::now()<session.expires);
-    let ip=report["ip"].as_str().and_then(|s|s.parse::<std::net::Ipv4Addr>().ok());
-    let valid_ip=ip.is_some_and(|ip|peer.ip()==std::net::IpAddr::V4(ip) &&
-        !ip.is_loopback() && !ip.is_unspecified() &&
-        !ip.is_multicast() && !ip.is_link_local() && !ip.is_broadcast());
-    let context=report["context_id"].as_str().unwrap_or("");
-    let reported_plan=report["business_id"].as_str().and_then(|s|s.parse::<u64>().ok())
-        .filter(|id|*id>0);
-    let plan=platform::service(&ctx).coordinator_summary(&mac,device_now_secs(&mac).max(0) as u64);
-    let expected_plan=plan.as_ref().is_some_and(|state|reported_plan.is_some_and(|id|
-        state["plan"]["last_sent"]["plan_id"].as_u64()==Some(id) ||
-        state["plan"]["pending_explicit_light"]["plan_id"].as_u64()==Some(id) ||
-        state["plan"]["last_accepted_id"].as_u64()==Some(id)));
-    if !valid_session || report["principal"] != ctx.bridge_id ||
-        report["instance_id"] != ctx.bridge_id || report["http_ready"] != true ||
-        report["port"].as_u64()!=Some(80) ||
-        report["remaining_ms"].as_u64().is_none_or(|ms|ms==0 || ms>90000) ||
-        report["origin_request_no"].as_u64().is_none_or(|n|n==0) ||
-        report["report_request_no"].as_u64().is_none_or(|n|n==0) ||
-        report["origin_session"].as_str().is_none_or(|s|s.len()!=32 || !s.bytes().all(|b|b.is_ascii_hexdigit())) ||
-        !(context.is_empty() || (context.len()==16 && context.bytes().all(|b|b.is_ascii_hexdigit()))) ||
-        !valid_ip || !expected_plan || platform::service(&ctx).device_get(&mac).is_none() {
-        return (StatusCode::CONFLICT,axum::Json(json!({"result":"rejected","stage":"report","error":"binding_or_shape"})));
-    }
-    let report_no=report["report_request_no"].as_u64().unwrap();
-    use sha2::{Digest,Sha256};
-    let digest:[u8;32]=Sha256::digest(report.to_string().as_bytes()).into();
-    {
-        let mut sessions=ctx.report_sessions.lock().unwrap();
-        let session=sessions.get_mut(&mac).unwrap();
-        if report_no<=session.highest_report_no {
-            if report_no==session.highest_report_no && digest==session.last_digest {
-                return (StatusCode::ACCEPTED,axum::Json(json!({"result":"report_received","stage":"receipt"})));
-            }
-            return (StatusCode::CONFLICT,axum::Json(json!({"result":"rejected","stage":"report","error":"retired_or_conflict"})));
-        }
-        session.highest_report_no=report_no;session.last_digest=digest;
-    }
-    let device_ip=ip.unwrap().to_string();
-    let endpoint_token=ctx.config.token.clone();
-    let boot=report["boot_id"].as_str().unwrap().to_owned();
-    let plan_id=reported_plan.unwrap();
-    let remaining=Duration::from_millis(report["remaining_ms"].as_u64().unwrap().min(5000));
-    tracing::info!(event="ready_report",device_mac=%mac,plan_id,result="received","device network report received; business proof pending");
-    tokio::spawn(async move {
-        let lock=platform::delivery_lock(&ctx,&mac);
-        let Ok(_guard)=tokio::time::timeout(remaining,lock.lock()).await else{return;};
-        let target_ip=device_ip.clone();
-        let result=bridge_core::device_client::status(&target_ip,&endpoint_token,remaining).await;
-        let Ok(status)=result else{return;};
-        if !report_fact_verified(&status,&mac,&boot,plan_id,&ctx.bridge_id) {return;}
-        tracing::info!(event="ready_report",device_mac=%mac,plan_id,result="verified","device network report authenticated readback verified");
-        let now=device_now_secs(&mac).max(0) as u64;
-        if platform::service(&ctx).note_device_status_at(&mac,&status,"http",now).is_err() ||
-            platform::service(&ctx).note_authenticated_status_at(&mac,&status,now).is_err() {return;}
-        crate::wifi::http_ready(&ctx,&mac,&status,now);
-        let _=platform::revalidate_registered_device_endpoint(&ctx,&mac,&device_ip).await;
-        crate::wifi::opportunity_locked(&ctx,&mac).await;
-    });
-    (StatusCode::ACCEPTED,axum::Json(json!({"result":"report_received","stage":"receipt"})))
-}
-
-fn report_fact_verified(status:&Value,mac:&str,boot:&str,plan_id:u64,owner:&str)->bool {
-    status["device_mac"].as_str()
-        .and_then(bridge_core::platform::model::DeviceIdentity::normalized_mac)
-        .as_deref()==Some(mac) &&
-        status["boot_id"]==boot &&
-        status["power"]["plan_id"].as_u64()==Some(plan_id) &&
-        status["power"]["mode"]=="light" &&
-        status["power"]["remaining_s"].as_u64().unwrap_or(0)>0 &&
-        status["transports"]["http"]["ready"]==true &&
-        status["owner_id"]==owner
-}
-
-async fn framed_ready_report(
-    axum::extract::State(ctx): axum::extract::State<Arc<AppCtx>>,
-    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
-    headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
-) -> axum::response::Response {
-    use axum::{http::StatusCode, response::IntoResponse};
-    use bridge_core::compact_frame::{Header, CONTENT_TYPE};
-    if headers.get(axum::http::header::AUTHORIZATION).and_then(|h|h.to_str().ok())
-        != Some(format!("Bearer {}",ctx.config.token).as_str()) {
-        return (StatusCode::UNAUTHORIZED,axum::Json(json!({"result":"rejected",
-            "stage":"authenticate","error":"unauthorized"}))).into_response();
-    }
-    if headers.get(axum::http::header::CONTENT_TYPE).and_then(|h|h.to_str().ok()) != Some(CONTENT_TYPE) {
-        return (StatusCode::UNSUPPORTED_MEDIA_TYPE,axum::Json(json!({"result":"rejected",
-            "stage":"frame","error":"content_type"}))).into_response();
-    }
-    let Ok((frame,payload)) = Header::decode(&body,4096) else {
-        return (StatusCode::BAD_REQUEST,axum::Json(json!({"result":"rejected",
-            "stage":"frame","error":"protocol_mismatch"}))).into_response();
-    };
-    let Ok(mut report) = serde_json::from_slice::<Value>(payload) else {
-        return (StatusCode::BAD_REQUEST,axum::Json(json!({"result":"rejected",
-            "stage":"frame","error":"payload"}))).into_response();
-    };
-    if !report.is_object() || report.get("session_id").is_some() ||
-        report.get("report_request_no").is_some() {
-        return (StatusCode::BAD_REQUEST,axum::Json(json!({"result":"rejected",
-            "stage":"frame","error":"duplicate_binding"}))).into_response();
-    }
-    let session=frame.session;
-    let context = report["context_id"].as_str().unwrap_or("");
-    let valid_context = if context.is_empty() {frame.context==[0;16]} else {
-        context.len()==16 && frame.context.as_slice()==context.as_bytes()
-    };
-    if frame.kind!=2 || frame.op!=20 || !valid_context {
-        return (StatusCode::CONFLICT,axum::Json(json!({"result":"rejected",
-            "stage":"frame","error":"binding"}))).into_response();
-    }
-    report["session_id"]=json!(session.iter().map(|byte|format!("{byte:02x}")).collect::<String>());
-    report["report_request_no"]=json!(frame.request_no);
-    let (status,axum::Json(reply)) = ready_report(axum::extract::State(ctx),
-        axum::extract::ConnectInfo(peer),headers,axum::Json(report)).await;
-    let payload = serde_json::to_vec(&reply).unwrap();
-    let response = Header{kind:1,op:20,result:if status==StatusCode::ACCEPTED{1}else{2},
-        payload_len:payload.len() as u16,session,request_no:frame.request_no,context:frame.context};
-    let mut bytes = response.encode().unwrap().to_vec();
-    bytes.extend_from_slice(&payload);
-    (status,[(axum::http::header::CONTENT_TYPE,CONTENT_TYPE)],bytes).into_response()
+fn presence_fact_verified(status:&Value,mac:&str,boot:&str,owner:&str)->bool {
+    status["device_mac"].as_str().and_then(bridge_core::platform::model::DeviceIdentity::normalized_mac)
+        .as_deref()==Some(mac) && status["boot_id"]==boot && status["owner_id"]==owner && status["transports"]["http"]["ready"]==true
 }
 
 async fn mcp_serve(ctx: Arc<AppCtx>) {
@@ -3554,8 +3381,6 @@ async fn run_services(ctx: Arc<AppCtx>) {
         services.spawn(async move {
             if let Err(e) = serve_with_router(addr, axum::Router::new()
                 .route("/api/device/presence",axum::routing::post(presence_hint))
-                .route("/api/device/session",axum::routing::post(report_session))
-                .route("/api/device/report",axum::routing::post(framed_ready_report))
                 .with_state(ctx.clone())).await {
                 tracing::error!("http server: {e}");
                 let mut status = ctx.status.lock().unwrap();
@@ -3827,7 +3652,6 @@ fn main() {
         device_delivery: tokio::sync::Mutex::new(()),
         sim_control: tokio::sync::Mutex::new(()),
         per_mac_delivery: Mutex::new(HashMap::new()),
-        report_sessions: Mutex::new(HashMap::new()),
         status: Mutex::new(RuntimeStatus {
             last_sync: None,
             last_error: None,

@@ -83,11 +83,14 @@ static String wifiManagementWithContext(JsonDocument &doc, uint64_t now, const S
             String(doc["snapshot_id"] | "") != fullSnapshotId || fullSnapshotRevision != wifiStore.revision) return reply(doc, "snapshot_expired");
         if (fullSnapshotOwnerRead && !(context.sessionValid && context.claimed)) return reply(doc, "claim_required");
         if (offset >= fullSnapshot.length()) return reply(doc, "shape");
-        uint32_t next = std::min((uint32_t)fullSnapshot.length(), offset + (context.generation ? 80 : 768));
-        while (next < fullSnapshot.length() && next > offset && (((uint8_t)fullSnapshot[next] & 0xc0) == 0x80)) --next;
         out["schema"] = 2; out["revision"] = fullSnapshotRevision; out["snapshot_id"] = fullSnapshotId;
-        out["offset"] = offset; out["next_offset"] = next; out["complete"] = next == fullSnapshot.length();
-        out["total"] = fullSnapshot.length(); out["chunk"] = fullSnapshot.substring(offset, next);
+        out["offset"] = offset; out["total"] = fullSnapshot.length();
+        out["complete"] = false;
+        if (context.generation) { out["ack"] = "wifi"; out["request_id"] = doc["request_id"]; }
+        const size_t next = jsonChunk(out, fullSnapshot, offset, context.generation ? 320 : 3600,
+                                     context.generation ? 400 : 4048);
+        if (next == offset) return reply(doc, "reply_limit");
+        out["complete"] = next == fullSnapshot.length();
     } else if (op == "result" || op == "result_ack") {
         if (!running && !wifiSchemesBegin()) return reply(doc, "storage");
         String query = doc["query_id"] | "";

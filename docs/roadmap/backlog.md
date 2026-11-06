@@ -111,6 +111,8 @@
 
 ### A9. PowerPlan 与 Data 同轮联合下发（2026-10-05）
 
+- **2026-11-06 P1源码候选，未部署**：Status/Wi-Fi原文UTF-8分页、BLE标识取消Base64、单包presence与独立HTTP任务、HTTP keep-alive复用；workspace542通过/5忽略、显式presence闭环1通过、Note4/栈92项通过；候选/资源边界见[专项](../../project-workflow/bridge-device-protocol-remediation/p1-status.md)。不结A9/B6/C8，wire需配套更新。
+
 - **2026-11-06 P0 合并后修正，未部署**：会话刷新失败不覆盖原写事务查询要求；activation 握手与写入共用总预算。两项回归先复现再修正，Core/BLE 253通过/2忽略，固件宿主P0通过；完整验收记录见[专项状态](../../project-workflow/bridge-device-protocol-remediation/status.md)。不结A9/B6/C8。
 
 - **2026-11-02 协议整改 P0 源码/软件验收完成，未部署**：会话复用、只读重放/写回执守卫、BLE 错误和可恢复驱动；workspace522通过/5条件忽略、Note4构建/匹配ELF栈88项通过。设计差异、最后补充回归及同版本候选哈希见[专项状态](../../project-workflow/bridge-device-protocol-remediation/status.md)。真实驱动恢复/RF/资源高水位仍开放，不结A9/B6/C8。
