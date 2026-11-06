@@ -111,6 +111,12 @@
 
 ### A9. PowerPlan 与 Data 同轮联合下发（2026-10-05）
 
+- **2026-11-06 P2-2增量，未提交/未部署**：history旧HTTP/BLE入口、Plan尾窗和Bridge旧消费者已删除；唤醒摘要统一sync-v1，分页/持久确认与下一批去重通过。App132通过/3忽略、Note4/栈92项通过。用户目标扩为整改全文非实机完成，P2-1/P2-4及最终审计仍开放；见[完成审计](../../project-workflow/bridge-device-protocol-remediation/completion-audit.md)。
+
+- **2026-11-06 AP01 sync repaired/deployed**: firmware supervisor seqlock contention could latch UiStale and revoke writes; Bridge now exposes app_trial_readonly/lifecycle rejection. Production red/green race, healthy recovery/transaction hold/fatal fault tests and claim12 passed. Slot1 0.1.2-cuktech deployed; rescue slot0 preserved, App .109 unchanged. Stable restart now accepts first full healthy sample; Trial/Rollback retain 30s. Claim preflight reconciles context before first Data (claim13 and AUT3 103189 checks passed). Data245 displayed 16.77s after reboot request, no stale-context send; automatic renewal verified and user confirms ota_1 controls normal. Rescue ota_0 knob lag during upload reported; idle comparison unverified. No long-run closure of A9/B6/C8. [Evidence](../../project-workflow/bridge-device-protocol-remediation/ap01-sync-investigation-20261106.md).
+
+- **2026-11-06 P2非实机验收完成，未提交/未部署**：P1已提交3cf9061；数字opcode、boot/session分离、history归sync-v1、统一network_start及显式request_seq/WTX2已实现。旧回执原子迁移/未知事务恢复、独立宿主ASan/UBSan通过，Note4候选与匹配栈通过；Wi-Fi HTTP/BLE完成钩子通过，最终workspace542通过/5条件忽略；Bundle钩子、实际AP01 App宿主ASan/UBSan及3项显式App/Fake集成通过。验证与候选见[专项](../../project-workflow/bridge-device-protocol-remediation/p2-status.md)。用户明确暂不部署Bridge/刷ROM，不结A9/B6/C8。
+
 - **2026-11-06 P1源码候选，未部署**：Status/Wi-Fi原文UTF-8分页、BLE标识取消Base64、单包presence与独立HTTP任务、HTTP keep-alive复用；workspace542通过/5忽略、显式presence闭环1通过、Note4/栈92项通过；候选/资源边界见[专项](../../project-workflow/bridge-device-protocol-remediation/p1-status.md)。不结A9/B6/C8，wire需配套更新。
 
 - **2026-11-06 P0 合并后修正，未部署**：会话刷新失败不覆盖原写事务查询要求；activation 握手与写入共用总预算。两项回归先复现再修正，Core/BLE 253通过/2忽略，固件宿主P0通过；完整验收记录见[专项状态](../../project-workflow/bridge-device-protocol-remediation/status.md)。不结A9/B6/C8。

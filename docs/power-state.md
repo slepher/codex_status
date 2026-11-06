@@ -395,8 +395,8 @@ DevLog/`/log`），用于证明 light sleep 生效。0.13.0 起同一文本也�
 - **深睡切换历史**：RTC 内存环 120 条 × 12B（`epoch` u32、`ev` u8、`stage`
   u8、`batt` u8、`aux` u16），掉电清零、零 flash 磨损。记录点：boot/唤醒分类、
   enter-deep（aux=`next_contact_s`）、每分钟 thin、网络窗口 net-ok/net-fail
-  （aux=HTTP code，未知 0）、to-light。`GET /history`（JSON 数组，时间序，
-  `?since=<seq>` 增量）；`/status.json` 暴露 `hist_count`（最新记录序号）与
+  （aux=HTTP code，未知 0）、to-light。唤醒摘要以 `SYNC_WAKE_SUMMARY` 写入统一日志，
+  通过 `sync-v1` 的 begin/page/ack/complete 获取和确认；旧 `/history` 与 BLE op=25 已退役。`/status.json` 暴露 `hist_count`（最新记录序号）与
   `hist_head`（下一写槽），深睡 RAM 日志丢失后仍可取证。
 - 事件码：1 boot（aux=`esp_sleep_wakeup_cause_t`）、2 enter-deep、3 thin
   （aux=1 已画时钟）、4 net-ok（aux=200）、5 net-fail、6 to-light
@@ -412,11 +412,11 @@ Explicit HTTP `POST /claim` and capability `ble_claim=1`'s BLE `claim` share `ow
 
 2026-10-27 Bridge判定修正：纯周期诊断的HTTP需求不构成正式Light意图；已保存或过期的连接观察也不构成待办。诊断使用原SyncOpen有界临时窗口，真实Wi-Fi任务/显式连接、push变化、OTA及物理窗口仍由正式计划规则决定。正式计划入口不接收HTTP需求布尔值，避免传输选择反过来授予120秒Light。软件回归与部署见[修复状态](../project-workflow/wifi-families/activation-fix-status.md)，不以宿主通过替代实机自然周期验收。
 
-自动全量Data同步允许在自然联系机会唤醒并进入**临时 Light 传输状态**，不创建、不续期600秒正式Light PowerPlan。真实push可见变化与用户显式Light仍按正式计划执行。full_sync_deadline、数据投递许可及设备认证合同不变；只有成功Data ACK推进确认指纹/全量同步期限。小Data在原BLE会合中完成并收尾，大Data通过既有sync_open开临时HTTP窗口；不能为周期快照、其in_flight或重试冒充真实push。
+自动全量Data同步允许在自然联系机会唤醒并进入**临时 Light 传输状态**，不创建、不续期600秒正式Light PowerPlan。真实push可见变化与用户显式Light仍按正式计划执行。full_sync_deadline、数据投递许可及设备认证合同不变；只有成功Data ACK推进确认指纹/全量同步期限。小Data在原BLE会合中完成并收尾，大Data通过network_start(reason=data_sync)开临时HTTP窗口；不能为周期快照、其in_flight或重试冒充真实push。
 
-临时窗口复用WIFI_SYNC_ONCE，从设备首次接受sync_open起最多90秒，保持单独的绝对截止。正式Light remaining归零不撤销该临时传输授权，也不允许无限延期：网络关联/ready报告、Bridge身份核对和分页工作受各自有限预算及临时总截止约束。两端采用有效正式Light截止与有效临时截止的较晚者，再受原交换/本轮工作预算限制；Bridge以认证采样时刻锚定并扣除1秒余量，不能重新授予或在每页重计90秒。USB/manual窗口与owner/低电规则仍独立。
+临时窗口复用WIFI_SYNC_ONCE，从设备首次接受network_start起最多90秒，保持单独的绝对截止。正式Light remaining归零不撤销该临时传输授权，也不允许无限延期：网络关联/ready报告、Bridge身份核对和分页工作受各自有限预算及临时总截止约束。两端采用有效正式Light截止与有效临时截止的较晚者，再受原交换/本轮工作预算限制；Bridge以认证采样时刻锚定并扣除1秒余量，不能重新授予或在每页重计90秒。USB/manual窗口与owner/低电规则仍独立。
 
-BLE sync_open支持reason=data和正整数data_seq，绑定当前MAC/principal/session/wake、原open_id与待投递Data seq。此准入不修改正式计划ID、期限或持久Light记录。相同open_id/原因/seq重放不重启计时，不同内容明确batch_conflict，已关闭原窗口重放明确window_closed；重启或后续自然联系仍须重新认证并在有界合法机会查询/继续原Data事务，不冒充ACK或换Data seq。
+BLE network_start必填reason=wifi_setup/data_sync/diag_sync/bundle；data_sync要求正整数data_seq，其余用途不携带Data序号。一次准入绑定当前MAC/principal/session/wake、原request_id和回报地址/端口，不修改正式计划ID、期限或持久Light记录。相同request_id/原因/seq/路由重放不重启计时，同ID不同内容明确request_conflict，其他ID占用中明确batch_conflict，已关闭原窗口重放明确window_closed；重启或后续自然联系仍须重新认证并在有界合法机会查询/继续原Data事务，不冒充ACK或换Data seq。
 
 窗口内先完成已冻结完整读取，再完成已准入Data，最后诊断complete；诊断完成不能抢先关掉尚未完成的Data/读取。绑定Data成功（含已应用同seq的确认）且无其他诊断义务时200ms收尾；诊断已完成且Data未完成则保留原临时窗口至完成/硬截止。没有正式Light/物理/USB下界时收尾进入Sleep；仍有正式Light时只结束临时窗口，保留原正式剩余量。失败/丢ACK保留原seq/批次及unknown查询，不隐式续期。恢复/认证/传输错误、权限撤销与低电仍可终止。
 

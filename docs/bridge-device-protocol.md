@@ -2,7 +2,7 @@
 
 2026-10-11 BOOT/联网合同（已实现，Note4部署见下）：BLE status 保持原 `s` 数组布局，新增 `ac` 布尔值映射 `automatic_contact`；false 表示健康 HTTP 下仅开放主动 GATT，Bridge 不启动普通交汇。可选 `ne` 映射 `network_error`：1=`wifi_connect_failed`、2=`bridge_http_unreachable`、3=`wifi_link_lost`；仅失败报告轮携带。旧报文缺少 `ac` 保留普通交汇语义。认证 HTTP status 新增 `power.manual_remaining_s` 与 `network.bridge_reachable/error/automatic_ble`；人工剩余时间持续报告，不随首个正式 Plan 消失。presence 的 202 JSON 回应包含 `bridge_id`、`device_http_verified`，后者仅由同 boot_id 的近期认证 HTTP 状态支持，发现提示自身不构成认证证据。最终窗口与恢复合同见[通信场景](bridge-device-communication-scenarios.md)及[实施验收](../project-workflow/bridge-macos/boot-network-20261011.md)。
 
-2026-10-11 后续修正（源码候选，未部署）：有效202/accepted且bridge_id匹配即证明设备→Bridge方向可达；device_http_verified=false仅表示反向认证证明尚不可用，不计为Bridge不可达，也不授予任何业务权限。Bridge不可达不得主动拆除已取得IP的Wi-Fi关联，BOOT/正式/临时窗口仍按原期限结束，真实连接失败/丢失按Wi-Fi故障处理。boot_id为本次MCU启动固定的32位十六进制标识；session_nonce继续在BLE会话切换时轮换并执行原重放围栏，二者不可互代。status/presence/report使用同一稳定boot_id。实现及回归见[修复记录](../project-workflow/bridge-macos/boot-network-fix-20261011.md)。
+2026-10-11 后续修正（源码候选，未部署）：有效202/accepted且bridge_id匹配即证明设备→Bridge方向可达；device_http_verified=false仅表示反向认证证明尚不可用，不计为Bridge不可达，也不授予任何业务权限。Bridge不可达不得主动拆除已取得IP的Wi-Fi关联，BOOT/正式/临时窗口仍按原期限结束，真实连接失败/丢失按Wi-Fi故障处理。boot_id为本次MCU启动固定的32位十六进制标识；48B帧头session_id继续在BLE会话切换时轮换并执行传输重放围栏，二者不可互代。status/presence使用同一稳定boot_id。实现及回归见[修复记录](../project-workflow/bridge-macos/boot-network-fix-20261011.md)。
 
 设备模板字段统一使用当前独立绑定，退役device.state无兼容入口；C++/Rust/预览均拒绝该绑定。持久CT中旧字段返回ct_bind_unsupported，路径与编号不一致返回ct_bind_mismatch，字符串边界无效返回ct_req/ct_string；当前有效字段的数字标识不重排，退役14号不重用。已安装模板加载失败进入内置恢复界面，认证status的content_error报告原因，等待显式发布有效Bundle；文件不因读取失败自动删除。[字段退役与恢复回归](../project-workflow/bridge-macos/device-fields-only-20261011.md)。
 
@@ -49,7 +49,7 @@ Codex app-server → Bridge 的 JSON-RPC、UI IPC、Bridge MCP 不属于本协�
 | namespace | Wi-Fi 事务回执及重放围栏的隔离维度；不是配置编辑权限的创建者隔离 |
 | endpoint token | 设备业务通道认证；HTTP Bearer 或 BLE 命令 `token` |
 | device operation token | claim、OTA、诊断等管理入口凭据；与 endpoint token 分开，仅经受控绑定 BLE 链路获取/轮换 |
-| `session_nonce` / frame `session_id` | nonce在状态响应及二进制Bundle接收中关联连接/接收代次，不再放入JSON命令校验；frame session是16 B原始认证会话标识，HTTP打开后由设备分配，BLE绑定连接代次。不能混同持久事务或凭据 |
+| frame `session_id` | 16 B传输会话标识，仅在帧头；HTTP打开后由设备分配，BLE绑定连接代次。不作业务启动身份或凭据；Status/BLE摘要/sync回执使用boot_id，Bundle接收绑定boot及原业务ID |
 | owner / lease | 只由显式 claim 建立；有效他人 owner 拒绝写入，lease 到期清空；与电源期限独立 |
 | `active_context_id` | 设备当前激活上下文；模板切换产生新上下文，旧上下文数据不能应用 |
 | `request_id` | 请求关联；具体幂等条件仍由各操作定义，不能假定所有请求都有同一持久回执机制 |
@@ -108,15 +108,15 @@ Bridge Wi-Fi 读/同步等作业当前默认有效期24h；这是作业有效期
 
 完整配置读取采用冻结 snapshot/revision；当前设备冻结 TTL 30s。分页期间快照过期、revision 变化或失去所需 owner 权限明确拒绝；不以部分页替换完整缓存，保留旧缓存及 Bridge 编辑。只因进入页面、提交保存或查询结果，不反复读取整份配置。
 
-现行 WFS4 新写事务使用 `w3_` 加16位小写十六进制非零单调序号，Bridge 持久分配并冻结。设备按 principal+namespace 保留最高已接纳序号；有回执先核对原业务指纹，无回执且序号已被围栏覆盖则拒绝重新执行。`outcome=retired` 只表示原回执已退役/序号已围栏，不证明原操作成功。
+当前源码候选的新写事务携带独立非零 `request_seq: u64`，由 Bridge 持久分配并冻结；`request_id` 为不透明的原业务 ID，不从其前缀推导序号。WFS4 配置保持不变，WTX2 回执显式保存序号。设备按 principal+namespace 保留最高已接纳序号；有回执先核对原业务指纹，无回执且序号已被围栏覆盖则拒绝重新执行。`outcome=retired` 只表示原回执已退役/序号已围栏，不证明原操作成功。
 
-Bridge 持久确认原终态后才能 `result_ack(query_id)`；设备删除可退役的具体终态回执但保留高水位。不自动删除 pending/未知结果，账本满明确 `result_capacity`，游标满明确 `cursor_capacity`。旧任意ID回执不能套用新序号退役，返回 `legacy_receipt_retained`。换通道、重绑定或恢复旧 Bridge 备份不能清围栏或自动替已发事务换ID。
+Bridge 持久确认原终态后才能 `result_ack(query_id, request_seq)`；设备删除可退役的具体终态回执但保留高水位。不自动删除 pending/未知结果，账本满明确 `result_capacity`，游标满明确 `cursor_capacity`。旧存储导入时仅对规范 `w3_` 原 ID 恢复其既有序号；旧任意 ID 保留序号0并拒绝退役，返回 `legacy_receipt_retained`。新写不能使用0，查询/确认/重放须携带原序号，匹配到同 ID 不同序号明确 `request_conflict`。Bridge 旧磁盘作业只在缺少 request_seq 时导入；已存在字段始终权威。换通道、重绑定或恢复旧 Bridge 备份不能清围栏或自动替已发事务换ID。
 
 ### 4.4 配置保存、匹配与迁移
 
 配置保存版本和当前活动版本独立：更新/删除保存项不等于当前连接副本立刻替换，显式启用才切换。主机 host_ssid→设备 ssid 映射允许两端SSID不同；metadata/credential匹配只是保存内容判断，不替代原事务 committed 回执或实际 HTTP 认证。
 
-当前不提供在线wifi_migrate操作；离线历史归档工具及现行WFS4/WTX1读取规则见agent-operations。不得用未知操作或旧协议回退恢复旧写入入口。
+当前不提供在线wifi_migrate操作；离线历史归档工具及现行WFS4/WTX2及WTX1导入规则见agent-operations。不得用未知操作或旧协议回退恢复旧写入入口。
 
 ### 4.5 正式计划恢复与启动通道
 
@@ -154,14 +154,14 @@ HTTP每次保留Bearer鉴权：普通业务使用endpoint token；claim的Bearer
 | `/api/status` | 1 | 完整认证状态/data_contract，必要时冻结分页；BLE status只提供精简投影 |
 | `/claim` | 4 | 显式claim/续约；BLE claim另需ble_claim=1和operation_token，不支持普通force/release |
 | `/api/data`、`/api/plan` | 2、3 | 完整Data与正式PowerPlan，BLE共享业务规则 |
-| `/api/sync/begin`、`page`、`ack`、`complete` | 6–9 | 诊断批次；BLE sync_config/sync_open只是配置/准入 |
+| `/api/sync/begin`、`page`、`ack`、`complete` | 6–9 | 诊断批次；BLE sync_config配置；network_start(reason=diag_sync)准入 |
 | `/api/bundle/begin`、`chunk`、`commit` | 10–12 | 完整Bundle安装，仅HTTP |
 | `/api/activate` | 13 | 模板激活，仅HTTP |
 | `/api/wifi/snapshot`、`apply`、`result`、`result_ack` | 14–17 | Wi-Fi共享处理器 |
 | `/api/wifi/command` | 对应具体wifi_*编号 | 共用HTTP路由，操作由frame op唯一选择，不再发送JSON op/command |
 | `/api/ota/image` | 19 | 载荷image_bytes=N；认证运行分区指定前缀SHA256证明 |
 
-GET `/update`与POST `/doUpdate`仍为鉴权页面/multipart原生ROM上传，不包装48 B业务帧，也未采用CSZ1压缩。公开`/status.json`、`/log`、`/pmstats`是恢复/诊断视图，不能代替认证状态。POST `/diag`、GET `/history`及`/frame`按各自handler授权。
+GET `/update`与POST `/doUpdate`仍为鉴权页面/multipart原生ROM上传，不包装48 B业务帧，也未采用CSZ1压缩。公开`/status.json`、`/log`、`/pmstats`是恢复/诊断视图，不能代替认证状态。POST `/diag`及`/frame`按各自handler授权。旧GET `/history`和BLE history(op=25)已退役；日志、唤醒摘要与崩溃信息统一使用sync-v1分页和持久确认，不再用PowerPlan.history_sync_ms延长RF窗口。
 
 ### 5.1 外层frame与JSON业务字段
 
@@ -184,7 +184,7 @@ GET `/update`与POST `/doUpdate`仍为鉴权页面/multipart原生ROM上传，�
 
 ### 5.2 单份Bundle、动态容量与压缩
 
-BEGIN/COMMIT载荷关联同一业务request及length/content_crc；完整正文带job、目标/预期context、对象内容。CHUNK的frame载荷是原始冻结字节，offset/request_id/session_nonce仍由查询参数及对应X-*头关联。Bridge chunk范围256–4048 B（默认4048），设备返回next_offset并严格核对。长度/CRC/offset全部针对冻结传输字节。
+BEGIN/COMMIT载荷关联同一业务request及length/content_crc；完整正文带job、目标/预期context、对象内容。CHUNK的frame载荷是原始冻结字节，offset/request_id由查询参数及对应X-*头关联；不再传session_nonce/X-Session-Nonce，帧会话认证后用设备boot身份关联原接收。Bridge chunk范围256–4048 B（默认4048），设备返回next_offset并严格核对。长度/CRC/offset全部针对冻结传输字节。
 
 `bundle_storage_protocol=2`的max_bundle_bytes来自实时空闲空间，零容量明确拒绝，不能恢复固定256/512 KiB产品上限。下载使用incoming，原内容继续运行；完成预检后才停止内容、显示内置维护画面，退役旧context/合同并覆盖content.bin；缓存/字体校验和小型BCS2提交记录完成后可运行。覆盖失败回内置恢复并认证重传，无旧包回退；原生固件OTA双槽保留。AP01应用加载/退出仍待实机验证。
 
@@ -220,9 +220,9 @@ Service UUID：`e7f1a000-4b2a-4c9e-9a11-3c0d5e9a0000`。
 
 绑定并加密后写 Endpoint JSON：`schema=2`、host、port、token、bridge_id。设备将其与实际 bond identity 关联；不能通过提交任意 principal 绕过已有绑定更新规则。
 
-普通命令写 `e7f1a005`，使用48 B二进制头加JSON载荷；载荷包含 `request_id/device_mac/bridge_id/token`，op/session只在帧中编码，Bridge 可附校时字段。`status` 是取得当前 nonce 的握手例外，不要求调用者已经知道 nonce。claim 另传 `operation_token`，当前普通入口拒绝 force/release。
+普通命令写 `e7f1a005`，使用48 B二进制头加JSON载荷；载荷包含 `request_id/device_mac/bridge_id/token`，op/session只在帧中编码，Bridge 可附校时字段。`status` 用零session请求建立BLE传输会话，服务端session从响应帧头获取；摘要中的boot_id跨连接保持稳定。claim 另传 `operation_token`，当前普通入口拒绝 force/release。
 
-其他已实现BLE命令包括`network_start`、`sync_config`、`sync_open`、有界 `history` 及 `wifi_*` 管理查询/控制。不能把未实现操作转发到旧 Usage/Template Data 特征以规避 `http_required`。
+其他已实现BLE命令包括`network_start`、`sync_config`及 `wifi_*` 管理查询/控制。不能把未实现操作转发到旧 Usage/Template Data 特征以规避 `http_required`。
 
 ### 6.2 分片、大小与 wire 投影
 
@@ -240,7 +240,7 @@ Bridge业务写入对完整frame分片；按48 B头中的payload_len判定完整
 | ACK `ctx` | active_context_id 的标准 Base64 |
 | Status `s` | 有序精简状态数组，顺序见下文 |
 
-`s` 顺序：nonce、Base64 context、Base64 active template、Base64 committed job、applied seq、light、plan ID、remaining seconds、provisional seconds、sync available、sync enabled、rounds、due、retry skip、pending batch、commit seq。
+`s` 顺序：boot_id、context原文、active template原文、committed job原文、applied seq、light、plan ID、remaining seconds、provisional seconds、sync available、sync enabled、rounds、due、retry skip、pending batch、commit seq。
 
 业务ACK外包kind=response的48 B头，回显op/request_no/session；内部JSON仍可用`ack=command`或`ack=wifi`。Bridge `decode_wire` 还原关联信息。过长 history 可分页并标记 `more`；不能裁剪身份。结果封装仍超限时返回 `result=unknown,error=reply_too_large`，不能将可能已执行的命令伪装成拒绝。
 
@@ -298,11 +298,11 @@ B6/C8的RF/电池Sleep重启/掉电/跨平台矩阵及历史间歇延迟仍开�
 
 ## 2026-10-11 临时 Light 同步窗口合同（.83源码候选）
 
-自动全量Data同步允许在自然联系机会唤醒并进入**临时 Light 传输状态**，不创建、不续期600秒正式Light PowerPlan。真实push可见变化与用户显式Light仍按正式计划执行。full_sync_deadline、数据投递许可及设备认证合同不变；只有成功Data ACK推进确认指纹/全量同步期限。小Data在原BLE会合中完成并收尾，大Data通过既有sync_open开临时HTTP窗口；不能为周期快照、其in_flight或重试冒充真实push。
+自动全量Data同步允许在自然联系机会唤醒并进入**临时 Light 传输状态**，不创建、不续期600秒正式Light PowerPlan。真实push可见变化与用户显式Light仍按正式计划执行。full_sync_deadline、数据投递许可及设备认证合同不变；只有成功Data ACK推进确认指纹/全量同步期限。小Data在原BLE会合中完成并收尾，大Data通过network_start(reason=data_sync)开临时HTTP窗口；不能为周期快照、其in_flight或重试冒充真实push。
 
-临时窗口复用WIFI_SYNC_ONCE，从设备首次接受sync_open起最多90秒，保持单独的绝对截止。正式Light remaining归零不撤销该临时传输授权，也不允许无限延期：网络关联/ready报告、Bridge身份核对和分页工作受各自有限预算及临时总截止约束。两端采用有效正式Light截止与有效临时截止的较晚者，再受原交换/本轮工作预算限制；Bridge以认证采样时刻锚定并扣除1秒余量，不能重新授予或在每页重计90秒。USB/manual窗口与owner/低电规则仍独立。
+临时窗口复用WIFI_SYNC_ONCE，从设备首次接受network_start起最多90秒，保持单独的绝对截止。正式Light remaining归零不撤销该临时传输授权，也不允许无限延期：网络关联/ready报告、Bridge身份核对和分页工作受各自有限预算及临时总截止约束。两端采用有效正式Light截止与有效临时截止的较晚者，再受原交换/本轮工作预算限制；Bridge以认证采样时刻锚定并扣除1秒余量，不能重新授予或在每页重计90秒。USB/manual窗口与owner/低电规则仍独立。
 
-BLE sync_open支持reason=data和正整数data_seq，绑定当前MAC/principal/session/wake、原open_id与待投递Data seq。此准入不修改正式计划ID、期限或持久Light记录。相同open_id/原因/seq重放不重启计时，不同内容明确batch_conflict，已关闭原窗口重放明确window_closed；重启或后续自然联系仍须重新认证并在有界合法机会查询/继续原Data事务，不冒充ACK或换Data seq。
+BLE network_start必填reason=wifi_setup/data_sync/diag_sync/bundle；data_sync要求正整数data_seq，其余用途不携带Data序号。一次准入绑定当前MAC/principal/session/wake、原request_id和回报地址/端口，不修改正式计划ID、期限或持久Light记录。相同request_id/原因/seq/路由重放不重启计时，同ID不同内容明确request_conflict，其他ID占用中明确batch_conflict，已关闭原窗口重放明确window_closed；重启或后续自然联系仍须重新认证并在有界合法机会查询/继续原Data事务，不冒充ACK或换Data seq。
 
 窗口内先完成已冻结完整读取，再完成已准入Data，最后诊断complete；诊断完成不能抢先关掉尚未完成的Data/读取。绑定Data成功（含已应用同seq的确认）且无其他诊断义务时200ms收尾；诊断已完成且Data未完成则保留原临时窗口至完成/硬截止。没有正式Light/物理/USB下界时收尾进入Sleep；仍有正式Light时只结束临时窗口，保留原正式剩余量。失败/丢ACK保留原seq/批次及unknown查询，不隐式续期。恢复/认证/传输错误、权限撤销与低电仍可终止。
 

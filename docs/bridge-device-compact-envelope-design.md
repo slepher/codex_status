@@ -32,7 +32,7 @@
 |---|---|
 | 1–9 | status、data、plan、claim、renew、sync_begin、sync_page、sync_ack、sync_complete |
 | 10–18 | bundle_begin、bundle_chunk、bundle_commit、activate、wifi_snapshot、wifi_apply、wifi_result、wifi_result_ack、wifi_match |
-| 19–27 | ota_image、ready_report、business_query、network_start、sync_config、sync_open、history、wifi_owner、wifi_info |
+| 19–27 | ota_image、ready_report、business_query、network_start、sync_config、24/25保留（sync_open/history已退役）、wifi_owner、wifi_info |
 | 28–35 | wifi_active、wifi_trial、wifi_activate、wifi_setup_status、wifi_setup_cancel、wifi_status、wifi_scheme_get、wifi_capabilities |
 
 Rust/C++逐项对拍；编码源码为[固件](../src/v2_command_envelope.cpp)与[Bridge](../bridge/crates/core/src/compact_frame.rs)。
@@ -49,7 +49,7 @@ Rust/C++逐项对拍；编码源码为[固件](../src/v2_command_envelope.cpp)�
 - 设备重启、凭据轮换/撤销或会话过期后失效。owner/lease 在每次执行时按现行规则检查，握手通过不等于永久占用；读写不隐式 claim，也不续电源期限。
 - 会话状态按实际连接/会话分配，有界数量和有效期；无空槽预分配。核心固定标识需要 16 B session_id 加完整 nonce/身份及元数据，实际结构、峰值RAM与栈需按匹配版本证据核对，不能以 48 B wire 大小代替 RAM 预算。会话是临时 RAM 状态，不为每次握手写 NVS；设备重启统一作废。
 
-当前帧提供op/session，客户端移除语义调用中的op/command/session_nonce，接收端拒绝这些旧字段以及protocol/rv，不提供双协议翻译。载体完成token/session/replay/context准入后，CommandContext只校验业务device_mac、bridge_id和request_id。HTTP认证头、BLE token及claim的operation_token仍存在；它们是凭据，不由帧ID取代。状态响应仍提供启动/连接代次，Bundle二进制chunk仍带接收代次关联；这两者不是旧JSON命令会话检查。48 B不代表整个认证开销。
+当前帧提供op/session，客户端移除语义调用中的op/command/session_nonce，接收端拒绝这些旧字段以及protocol/rv，不提供双协议翻译。载体完成token/session/replay/context准入后，CommandContext只校验业务device_mac、bridge_id和request_id。HTTP认证头、BLE token及claim的operation_token仍存在；它们是凭据，不由帧ID取代。状态响应提供稳定boot_id；Bundle二进制chunk只带原request_id/offset，接收器内部绑定boot身份，重连仍由新帧会话校验。48 B不代表整个认证开销。
 
 ## 4. 请求、上下文与重放
 
@@ -107,4 +107,4 @@ Bridge和设备分别更新各自软件版本即可。实施只交付当前最�
 
 ### 2026-10-11 临时同步窗口修正（源码候选）
 
-周期全量Data不授予正式Light。BLE小快照在会合内完成，大快照用既有sync_open新增reason=data/data_seq准入临时90秒WIFI_SYNC_ONCE；该窗口与正式Light绝对截止独立，跨正式截止可继续，不续计划、不续窗口。正式/临时剩余预算取合法较晚截止后再受本轮工作预算约束；Data及冻结完整读取先于诊断complete，成功收尾或硬截止退出。报文新增sync.data_pending_seq状态；48 B头/模板格式/哈希不变。详细合同见[协议总览](bridge-device-protocol.md)，实施/测试/候选部署边界见[执行记录](../project-workflow/bridge-macos/sync-window-fix-20261011.md)；现场以PROGRESS为准。
+周期全量Data不授予正式Light。BLE小快照在会合内完成，大快照用network_start的reason=data_sync/data_seq准入临时90秒WIFI_SYNC_ONCE；该窗口与正式Light绝对截止独立，跨正式截止可继续，不续计划、不续窗口。正式/临时剩余预算取合法较晚截止后再受本轮工作预算约束；Data及冻结完整读取先于诊断complete，成功收尾或硬截止退出。报文新增sync.data_pending_seq状态；48 B头/模板格式/哈希不变。详细合同见[协议总览](bridge-device-protocol.md)，实施/测试/候选部署边界见[执行记录](../project-workflow/bridge-macos/sync-window-fix-20261011.md)；现场以PROGRESS为准。

@@ -1,7 +1,7 @@
 # Bridge—设备通信协议问题修复与精简设计方案
 
 制定日期：2026-11-01
-状态：设计定稿；P0已完成软件验收，P1源码候选及差异见[实施记录](../project-workflow/bridge-device-protocol-remediation/p1-status.md)。部署以PROGRESS为准。
+状态：设计定稿；P0/P1已提交，P2实现与非实机验收完成（未提交），见[完成审计](../project-workflow/bridge-device-protocol-remediation/completion-audit.md)及[P2实施记录](../project-workflow/bridge-device-protocol-remediation/p2-status.md)。以下数值为原设计目标，实测与实现差异以实施记录为准；本任务不部署Bridge、不刷ROM。部署以PROGRESS为准。
 关联文档：[bridge-device-protocol.md](bridge-device-protocol.md)、[bridge-device-compact-envelope-design.md](bridge-device-compact-envelope-design.md)、[bridge-device-communication-scenarios.md](bridge-device-communication-scenarios.md)、[generic-display-platform-design.md](generic-display-platform-design.md)
 
 ---
@@ -215,7 +215,7 @@ sequenceDiagram
 | **状态/Wi-Fi 分页峰值临时堆内存** | 1800B 原文 + 3600B `chunk_hex` `String` + JSON 封装 ≈ **6.2 KB** | 3600B UTF-8 `chunk` 直接切片 + JSON 封装 ≈ **4.0 KB** | 峰值堆分配下降 **~2.2 KB**，单页有效载荷翻倍，分页 RTT 减半 |
 | **BLE 等待回执空口轮询率** | 50 Hz（每 20ms 一次 `read_attribute`） | **Notify 驱动 + ≤6.6 Hz 退避兜底**（150ms→500ms） | 空口轮询流量下降 **90%+**，消除射频争用 |
 | **固件主循环 `loop()` 阻塞峰值** | 最高 **1500ms ~ 2000ms**（同步双次 HTTP POST） | **< 5ms**（移出主循环异步发送 + 砍除双段握手） | 保障按键、BLE 消费与墨水屏刷新实时性 |
-| **固件常驻 RAM / NVS 占用** | `v2BleQueue` 2 槽；`ReportSession` 逻辑；Hex/Base64 缓冲 | `v2BleQueue` 扩至 4 槽（仅 +32B 描述符）；删除 `serviceReadyReport` 状态机 | 常驻 RAM 净减少，NVS 格式与配额保持不变 |
+| **固件常驻 RAM / NVS 占用** | `v2BleQueue` 2 槽；`ReportSession` 逻辑；Hex/Base64 缓冲 | `v2BleQueue` 扩至 4 槽（仅 +32B 描述符）；删除 `serviceReadyReport` 状态机 | 常驻 RAM 净减少，配置WFS4与配额不变；WTX2每实际回执增加8B序号（最多64B），旧格式原子导入 |
 
 ### 5.2 阶段验收清单（Verification Checklist）
 
