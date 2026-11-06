@@ -15,7 +15,7 @@ struct BleInfoSnapshot {
     uint8_t planActivation = 0;
 };
 struct BleStatusSnapshot {
-    String mac, nonce, context, activeTemplate, job;
+    String mac, bootId, context, activeTemplate, job;
     uint64_t appliedSeq = 0, planId = 0;
     uint32_t remainingS = 0, provisionalS = 0, commitSeq = 0;
     bool light = false, syncAvailable = false, syncEnabled = false;

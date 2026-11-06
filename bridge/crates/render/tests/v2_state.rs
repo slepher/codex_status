@@ -642,7 +642,7 @@ fn shared_status_snapshot_preserves_fields_time_and_read_only_state() {
     let input = |display_state: u8, configured: bool| {
         serde_json::json!({
             "mac": "70:04:1D:AA:BB:CC",
-            "session_nonce": "boot-session",
+            "boot_id": "boot-session",
             "context": "ctx-current",
             "job_id": "job-current",
             "active_template_id": if configured { "t7" } else { "fallback-template" },
@@ -685,7 +685,7 @@ fn shared_status_snapshot_preserves_fields_time_and_read_only_state() {
     assert_eq!(status["result"], "applied");
     assert!(status.get("protocol").is_none());
     assert_eq!(status["device_mac"], "70:04:1D:AA:BB:CC");
-    assert_eq!(status["session_nonce"], "boot-session");
+    assert_eq!(status["boot_id"], "boot-session");
     assert_eq!(status["active_context_id"], "ctx-current");
     assert_eq!(status["active_template_id"], "t7");
     assert_eq!(status["committed_job_id"], "job-current");

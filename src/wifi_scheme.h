@@ -113,7 +113,7 @@ struct WifiSchemes {
 };
 struct WifiReceipt {
     WifiText bridge, request, bond, error, operation, target;
-    uint64_t targetVersion=0;
+    uint64_t targetVersion=0, sequence=0;
     uint8_t hash[32] = {};
     uint64_t revision = 0;
     uint64_t executionGeneration = 0;
@@ -129,16 +129,6 @@ struct WifiCursor {
     bool valid() const { return bridge.valid() && bond.valid(); }
     size_t heapBytes() const { return bridge.bytes()+bond.bytes(); }
 };
-// Only canonical sequence IDs are retireable; arbitrary legacy IDs stay retained.
-static uint64_t wifiRequestSequence(const char *id) {
-    if (strlen(id)!=19 || strncmp(id,"w3_",3)) return 0;
-    uint64_t sequence=0;
-    for (size_t i=3;i<19;++i) {
-        char c=id[i]; if (!((c>='0'&&c<='9')||(c>='a'&&c<='f'))) return 0;
-        sequence=(sequence<<4)|(c<='9'?c-'0':c-'a'+10);
-    }
-    return sequence;
-}
 // Aggregate used only to validate/commit a consistent pair. The configuration
 // writer and transaction writer persist disjoint fields; live RF state is in
 // wifi_setup.cpp and is never reconstructed from a receipt or active choice.

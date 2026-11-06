@@ -170,7 +170,7 @@ void Ap01Application::dispatch(const Ap01HttpRequest &request, const char *princ
     if (op == 1) {
         business.status(doc); doc["device_mac"] = mac; doc["mac"] = mac;
         imageIdentity(doc);
-        doc["boot_id"] = boot; doc["uptime_ms"] = now; doc["session_nonce"] = nonce;
+        doc["boot_id"] = boot; doc["uptime_ms"] = now;
         {
             BindingGuard guard(port);
             if (!guard) { error(reply, 503, "bindings_busy", "owner"); return; }
@@ -208,7 +208,6 @@ void Ap01Application::dispatch(const Ap01HttpRequest &request, const char *princ
             error(reply, 409, "claim_required", "owner"); return;
         }
     }
-    if (op == 11 && strcmp(request.nonce, nonce)) { error(reply, 409, "session", "bundle"); return; }
     if (op == 11) doc["bridge_id"] = principal;
     reply.status = business.command(op, doc, nonce, now, request.body, request.length,
                                     request.requestId, request.offset, reply.bytes);
@@ -256,7 +255,7 @@ Ap01HttpReply Ap01Application::businessHttpOwned(const Ap01HttpRequest &request,
     uint8_t zero[16] = {}, digest[32];
     String covered;
     bool coveredOk = covered.concat((const char *)request.body, request.length);
-    for (const char *field : {request.method, request.path, request.requestId, request.offset, request.nonce, request.deviceToken}) {
+    for (const char *field : {request.method, request.path, request.requestId, request.offset, request.deviceToken}) {
         size_t n = strlen(field); uint8_t size[2] = {uint8_t(n), uint8_t(n >> 8)};
         coveredOk = coveredOk && n <= 512 && covered.concat((const char *)size, 2) && covered.concat(field, n);
     }

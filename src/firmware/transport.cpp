@@ -313,7 +313,7 @@ static void v2BleNotify(JsonDocument &doc) {
     }
     const char *op = doc["op"] | (doc["ack"] == "wifi" ? "wifi" : "command");
     const bool known = !strcmp(op, "status") || !strcmp(op, "data") || !strcmp(op, "plan") ||
-        !strcmp(op, "sync_config") || !strcmp(op, "sync_open") || !strcmp(op, "wifi");
+        !strcmp(op, "sync_config") || !strcmp(op, "network_start") || !strcmp(op, "wifi");
     String correlation = doc["rid"] | "";
     DevLog.printf("[ble-wire] phase=encode op=%s correlation=%08x encoded_bytes=%u reply_bytes=%u max=512 wake=%u/%u result=%s\n",
         known ? op : "command", (unsigned)v2Crc32((const uint8_t *)correlation.c_str(), correlation.length()),
@@ -552,7 +552,10 @@ static bool v2HttpBegin(uint16_t op) {
 }
 
 void v2HttpRoute(uint16_t op, void (*handler)()) {
-    if (v2HttpBegin(op)) handler();
+    if (v2HttpBegin(op)) {
+        radio::noteBridgeContact(state.commandPrincipal);
+        handler();
+    }
     state.v2HttpFrameActive = false;
     v2HttpCacheReply = false;
     state.v2HttpBody = "";
@@ -689,7 +692,10 @@ void serviceV2Ble() {
         v2Ack("command", "rejected", "unchanged", "ram", "retired_protocol", -1, 0, nullptr, UINT32_MAX);
         return;
     }
-    doc["op"] = compactOperationName(frame.op);
+    // Wi-Fi control consumes the numeric frame operation directly.
+    const bool wifiControl = (frame.op >= 14 && frame.op <= 18) ||
+                             (frame.op >= 28 && frame.op <= 32) || frame.op == 34;
+    if (!wifiControl) doc["op"] = compactOperationName(frame.op);
     uint8_t expectedSession[16] = {};
     if (frame.op == 1) {
         uint8_t empty[16] = {};
@@ -733,7 +739,12 @@ void serviceV2Ble() {
             state.commandPrincipal=endpoint.principal;authenticated = true; break;
         }
     }
-    String operation = doc["op"] | "";
+    if (authenticated) {
+        String mac = radio::macText();
+        CommandContext context{mac.c_str(), state.commandPrincipal.c_str()};
+        if (!context.validateIdentity(doc)) radio::noteBridgeContact(state.commandPrincipal);
+    }
+    String operation = compactOperationName(frame.op);
     if (operation.startsWith("wifi_")) {
         // Current Wi-Fi control uses the authenticated endpoint context.
         // Discovery remains read-only; unknown/retired operations never fall back.
@@ -763,12 +774,13 @@ void serviceV2Ble() {
                     if(doc["control_only"]==true){
                         radio::wifiDeviceControlStatus(out,endpoint);out["control_only"]=true;out["ok"]=true;
                     }else{
-                        JsonDocument status;radio::wifiDeviceStatus(status,&endpoint);status["session_nonce"]=v2Nonce();status["ok"]=true;
+                        JsonDocument status;radio::wifiDeviceStatus(status,&endpoint);status["boot_id"]=bootId();status["ok"]=true;
                         String text;serializeJson(status,text);deserializeJson(out,wifiSetupReadPage(doc,endpoint.nameSpace,generation,text));
                     }
                 }
-                else deserializeJson(out,wifiControlCommand(doc,context,now));
+                else deserializeJson(out,wifiControlCommand(frame.op,doc,context,now));
             }
+            if(frame.op==17 && out["ok"]==true && out["outcome"]=="retired")sync::networkWorkCompleted("wifi_setup");
             out["ack"]="wifi";out["op"]="wifi";out["request_id"]=doc["request_id"];
             if(wifiSetupBusy())radio::state.wifiUp=false;
             v2BleNotify(out);return;
@@ -814,10 +826,10 @@ void serviceV2Ble() {
         if (!strcmp(op, "status")) {
             // Status itself is authenticated; later commands validate their
             // own session before changing data freshness or device state.
-            // Status is only observation; Data/Plan retain their own contact clock.
+            // Contact freshness is separate from Data/Plan and their deadlines.
             if (radio::automaticContactNeeded() && !radio::state.v2InRendezvous && !radio::state.v2RvBleReleased) radio::v2RendezvousBegin();
             BleStatusSnapshot snapshot;
-            snapshot.mac = radio::macText(); snapshot.nonce = v2Nonce();
+            snapshot.mac = radio::macText(); snapshot.bootId = bootId();
             snapshot.rendezvousVersion = 1;
             snapshot.context = platform::state.v2Profile.contextId;
             snapshot.activeTemplate = platform::state.v2Profile.count ? platform::state.v2Profile.ids[platform::state.v2Profile.initial] : "";
@@ -869,103 +881,73 @@ void serviceV2Ble() {
                       saved ? "flash" : "ram", saved ? nullptr : "storage", -1, 0,
                       nullptr, UINT32_MAX);
             }
-        } else if (!strcmp(op, "sync_open")) {
-            OwnerRec current;
-            String mac=radio::macText();
-            CommandContext context{mac.c_str(),state.commandPrincipal.c_str()};
-            const bool identityValid=!context.validateIdentity(doc);
-            String openId = doc["open_id"] | "";
-            String reason = doc["reason"] | "";
-            bool idValid = openId.length() == 32;
-            for (size_t i = 0; i < openId.length(); ++i)
-                if (!isxdigit((unsigned char)openId[i])) idValid = false;
-            bool wakeValid = (doc["wake_generation"] | 0u) == diagnostics::retained.rtcWakeGeneration &&
-                             (doc["wake_seq"] | 0u) == diagnostics::retained.rtcTraceCurrentSeq;
-            SyncStoreBatch pending;
-            const uint64_t dataSeq = doc["data_seq"] | 0ULL;
-            bool data = reason == "data" && dataSeq > 0;
-            bool retry = reason == "retry" &&
-                         (syncStoreActive(pending) || (sync::retained.syncRtc.flags & 4) || sync::retained.syncRtc.reasonBits);
-            bool periodic = reason == "periodic" && sync::retained.syncRtc.rounds == 15 && (sync::retained.syncRtc.flags & 1);
-            const char *error = !identityValid || !idValid || !wakeValid ? "session" :
-                                !ownerGet(current) ? "claim_required" :
-                                current.id != (doc["bridge_id"] | "") ? "occupied" :
-                                !sync::state.syncEnabled || sync::state.syncOwner != current.id ? "disabled" :
-                                v2BatteryPowerOff(power::state.plugged, power::batteryPercent()) ? "low_battery" :
-                                !data && (sync::state.syncSkippedThisWake || sync::retained.syncRtc.retrySkip || (!periodic && !retry)) ? "range" :
-                                !sync::state.syncOpenThisWake && openId == sync::state.syncOpenId ? "window_closed" :
-                                sync::state.syncOpenThisWake &&
-                                (openId != sync::state.syncOpenId || reason != sync::state.syncOpenReason ||
-                                 (data && dataSeq != sync::state.syncDataSeq)) ? "batch_conflict" : nullptr;
-            if (error) {
-                if (!strcmp(error, "low_battery")) sync::syncRecordOutcome(2, 7);
-                v2Ack("sync_open", "rejected", "unchanged", "ram", error, -1, 0,
-                      nullptr, UINT32_MAX);
-            } else {
-                if (!sync::state.syncOpenThisWake) {
-                    sync::state.syncOpenThisWake = true;
-                    sync::state.syncExitAtMs = 0;
-                    power::retained.rtcMode = MODE_LIGHT; // temporary only; never persist a Light plan
-                    sync::state.syncBlockedError = 0;
-                    sync::state.lastFailure = nullptr;
-                    sync::state.syncOpenId = openId;
-                    sync::state.syncOpenReason = reason;
-                    sync::state.syncDataSeq = data ? dataSeq : 0;
-                    sync::state.syncDataPending = data;
-                    sync::state.syncLastProgressMs = millis();
-                    sync::state.syncOpenAnsweredAt = clock::v2NowMs();
-                    if (radio::state.v2InRendezvous && radio::state.v2RvNetworkExpected)
-                        radio::state.v2Rv.awaitNetworkStart(clock::v2NowMs(), sync::httpUntil(clock::v2NowMs()));
-                }
-                v2Ack("sync_open", "applied", "unchanged", "ram", nullptr, -1, 0,
-                      nullptr, UINT32_MAX);
-            }
         } else if (!strcmp(op, "network_start")) {
             JsonDocument request;
             if (!v2Command(body, request)) { state.v2ReplyOverBle = false; return; }
             OwnerRec current;
             const uint64_t now = clock::v2NowMs();
-            const bool owned = ownerGet(current) && current.id == String(request["bridge_id"] | "");
-            const uint64_t legalUntil = sync::httpUntil(now);
+            const bool hasOwner = ownerGet(current);
+            const String purpose = request["reason"] | "";
+            const String id = request["request_id"] | "";
+            const uint64_t dataSeq = request["data_seq"] | 0ULL;
+            const bool data = purpose == "data_sync";
+            const bool diag = purpose == "diag_sync";
+            const bool purposeValid = data || diag || purpose == "wifi_setup" || purpose == "bundle";
+            const bool wakeValid = (request["wake_generation"] | 0u) == diagnostics::retained.rtcWakeGeneration &&
+                                   (request["wake_seq"] | 0u) == diagnostics::retained.rtcTraceCurrentSeq;
             IPAddress bridge;
             const char *addr = request["bridge_addr"] | "";
             const uint32_t port = request["bridge_port"] | 0u;
-            const uint64_t requestNo = request["origin_request_no"] | 0ULL;
             int8_t endpointIndex = -1;
             for (int i = 0; i < storeCount(); ++i) {
                 EndpointRec endpoint;
                 if (storeGet(i, endpoint) && endpoint.principal == current.id &&
                     endpoint.token == String(request["token"] | "")) { endpointIndex = i; break; }
             }
-            const char *error = !owned ? "claim_required" :
-                !radio::state.v2InRendezvous || !radio::state.v2Rv.hasPlan() || legalUntil <= now ||
-                (request["plan_id"] | 0ULL) != power::state.v2Plan.acceptedId() ? "plan_window" :
+            SyncStoreBatch pending;
+            const bool diagDue = syncStoreActive(pending) || (sync::retained.syncRtc.flags & 1) || sync::retained.syncRtc.reasonBits;
+            const bool replay = sync::state.syncOpenThisWake && id == sync::state.syncOpenId;
+            const char *error = !hasOwner ? "claim_required" :
+                current.id != String(request["bridge_id"] | "") ? "occupied" :
+                !purposeValid || (data && !dataSeq) || (!data && dataSeq) ? "purpose" :
+                !wakeValid ? "session" :
+                !radio::state.v2InRendezvous ? "window_closed" :
                 !bridge.fromString(addr) || bridge[0] == 0 || bridge[0] == 127 ||
-                bridge[0] >= 224 || !port || port > UINT16_MAX || !requestNo ? "report_route" :
-                endpointIndex < 0 ? "report_binding" : nullptr;
-            if (!error && !radio::state.v2RvNetworkRequested) {
-                radio::state.readyReport.bridge = bridge; radio::state.readyReport.port = (uint16_t)port;
+                bridge[0] >= 224 || !port || port > UINT16_MAX ? "report_route" :
+                endpointIndex < 0 ? "report_binding" :
+                v2BatteryPowerOff(power::state.plugged, power::batteryPercent()) ? "low_battery" :
+                !request["plan_id"].isNull() && (request["plan_id"] | 0ULL) != power::state.v2Plan.acceptedId() ? "plan_window" :
+                sync::state.syncOpenThisWake && syncBudgetFailure(now, sync::state.syncOpenAnsweredAt, millis(), sync::state.syncLastProgressMs) ? "window_closed" :
+                !sync::state.syncOpenThisWake && id == sync::state.syncOpenId ? "window_closed" :
+                replay && (purpose != sync::state.syncOpenReason || dataSeq != sync::state.syncDataSeq ||
+                    radio::state.readyReport.bridge != bridge || radio::state.readyReport.port != port ||
+                    radio::state.readyReport.principal != current.id) ? "request_conflict" :
+                sync::state.syncOpenThisWake && !replay ? "batch_conflict" :
+                diag && (!sync::state.syncEnabled || sync::state.syncOwner != current.id) ? "disabled" :
+                diag && !replay && (!diagDue || sync::state.syncSkippedThisWake || sync::retained.syncRtc.retrySkip) ? "range" : nullptr;
+            if (!error && !replay) {
+                sync::state.syncOpenThisWake = true;
+                sync::state.syncExitAtMs = 0;
+                sync::state.syncOpenId = id;
+                sync::state.syncOpenReason = purpose;
+                sync::state.syncDataSeq = dataSeq;
+                sync::state.syncDataPending = data;
+                sync::state.syncLastProgressMs = millis();
+                sync::state.syncOpenAnsweredAt = now;
+                sync::state.syncBlockedError = 0;
+                sync::state.lastFailure = nullptr;
+                power::retained.rtcMode = MODE_LIGHT; // temporary, never persist/renew PowerPlan
+                radio::state.readyReport.bridge = bridge;
+                radio::state.readyReport.port = (uint16_t)port;
                 radio::state.readyReport.endpointIndex = endpointIndex;
                 radio::state.readyReport.principal = current.id;
                 radio::state.readyReport.planId = power::state.v2Plan.acceptedId();
+                radio::state.v2Rv.awaitNetworkStart(now, sync::httpUntil(now));
                 radio::state.v2RvNetworkRequested = true;
                 radio::state.v2RvBleReleaseAtMs = now + RV_ACK_GRACE_MS;
             }
-            DevLog.printf("[net] stage=network_start result=%s reason=%s plan=%llu\n",
-                error ? "rejected" : "accepted", error ? error : "none", (unsigned long long)power::state.v2Plan.acceptedId());
             v2Ack("network_start", error ? "rejected" : "accepted", "unchanged", "ram",
                   error, -1, power::state.v2Plan.acceptedId(), platform::state.v2Profile.contextId, UINT32_MAX);
-        } else if (!strcmp(op, "history")) {
-            if (sync::state.v2HistorySyncMs) sync::state.v2HistorySyncUntilMs = clock::v2NowMs() + sync::state.v2HistorySyncMs;
-            const uint32_t since = doc["since"] | 0u;
-            uint8_t limit = doc["limit"] | 8u;
-            if (!limit) limit = 1;
-            if (limit > HIST_CAP) limit = HIST_CAP;
-            bool more = false;
-            // Keep room for the authenticated ACK envelope and request id;
-            // never let diagnostics consume the normal status/data path.
-            String out = diagnostics::traceHistoryJson(since, limit, 350, more);
-            v2Response(200, out);
         } else if (!strcmp(op, "data")) {
             platform::applyV2Data(body);
         } else if (!strcmp(op, "plan")) {
@@ -982,13 +964,12 @@ void registerHttpRoutes() {
     static bool registered = false;
     if (registered) return;
     registered = true;
-    const char *bundleHeaders[] = {"X-Request-Id", "X-Session-Nonce", "X-Offset", "Authorization", "Content-Type", "X-Device-Token"};
-    state.server.collectHeaders(bundleHeaders, 6);
+    const char *bundleHeaders[] = {"X-Request-Id", "X-Offset", "Authorization", "Content-Type", "X-Device-Token"};
+    state.server.collectHeaders(bundleHeaders, 5);
     state.server.on("/", HTTP_GET, diagnostics::handleStatus);
     state.server.on("/status.json", HTTP_GET, diagnostics::handleStatusJson);
     state.server.on("/log", HTTP_GET, diagnostics::handleLog);
     state.server.on("/offline-log", HTTP_GET, sync::handleOfflineLog);
-    state.server.on("/history", HTTP_GET, diagnostics::handleHistory);
     state.server.on("/pmstats", HTTP_GET, diagnostics::handlePmStats);
     state.server.on("/frame", HTTP_GET, diagnostics::handleFrame);
     state.server.on("/diag", HTTP_POST, diagnostics::handleDiag);

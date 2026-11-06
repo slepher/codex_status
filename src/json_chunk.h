@@ -18,7 +18,10 @@ inline size_t jsonChunk(JsonDocument &doc, const String &body, size_t offset,
         const size_t size = measureJson(doc);
         if (!doc.overflowed() && size <= wireLimit) return end;
         if (doc.overflowed()) break;
-        end -= std::min(end - offset, std::max(size_t(1), size - wireLimit));
+        // Escaped bytes may expand more than 2x. The wire excess is not a
+        // source-byte count: never discard the entire candidate before trying
+        // a smaller valid page (except when even one byte cannot fit).
+        end -= std::min((end - offset + 1) / 2, std::max(size_t(1), size - wireLimit));
     }
     doc.remove("chunk");
     return offset;

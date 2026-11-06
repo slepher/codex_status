@@ -154,7 +154,7 @@ try {
     const requestId = `config-${device.mac.slice(-2)}`;
     const accepted = await call(device.url, endpoint, '/sim/ble/command', {
       op: 'sync_config', request_id: requestId,
-      token: endpoint, device_mac: status.device_mac, session_nonce: status.session_nonce,
+      token: endpoint, device_mac: status.device_mac,
       bridge_id: bridgeId, enabled: true });
     if (accepted.result !== 'accepted') throw new Error('BLE upload not accepted');
     const configured = await call(device.url, endpoint, '/sim/ble/status');

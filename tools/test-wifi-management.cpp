@@ -1,18 +1,21 @@
 #define CODEX_WIFI_SETUP_HOST_TEST
 #include "../src/wifi_setup.cpp"
+#include "wifi-control-test-adapter.h"
 #include "../src/ble_wire.h"
 #include <cassert>
 #include <iostream>
 
 static const char *bond = "02:00:00:00:00:02/1";
 static const char *other = "02:00:00:00:00:03/1";
+static uint64_t testSequence=0;
 static JsonDocument request(const char *op, const char *id = "read") {
     JsonDocument d; d["op"] = String(op); d["request_id"] = String(id);
+    d["request_seq"]=++testSequence;
     d["bridge_id"] = "installation"; d["device_mac"] = "020000000001"; return d;
 }
 static WifiControlContext management;
 static JsonDocument invoke(JsonDocument &d, uint64_t now = 1000) {
-    JsonDocument result; assert(!deserializeJson(result, wifiControlCommand(d, management, now,
+    JsonDocument result; assert(!deserializeJson(result, testWifiControlCommand(d, management, now,
         "[{\"network_id\":\"legacy-0\",\"ssid\":\"USB-network\"}]"))); return result;
 }
 static JsonDocument snapshot() {
@@ -35,13 +38,21 @@ static JsonDocument change(const char *id, uint64_t revision, const char *ssid =
 static String control(JsonDocument &doc,const String &peer,uint32_t generation,uint64_t now,uint64_t physical,uint64_t until,bool claimed) {
     WifiControlContext context;context.principal="installation";context.nameSpace=peer;context.generation=generation;
     context.physicalUntil=physical;context.until=std::max(physical,until);context.claimed=claimed;
-    return wifiControlCommand(doc,context,now);
+    return testWifiControlCommand(doc,context,now);
 }
 int main() {
     management.principal="installation";management.nameSpace=bond;management.claimed=true;management.until=121000;
 
+    // Numeric dispatch rejects the retired JSON discriminator and unknown ops.
+    auto numeric=request("snapshot"); JsonDocument numericReply;
+    assert(!deserializeJson(numericReply,wifiControlCommand(14,numeric,management,1000)));
+    assert(numericReply["error"]=="retired_protocol");
+    numeric.remove("op");
+    assert(!deserializeJson(numericReply,wifiControlCommand(65535,numeric,management,1000)));
+    assert(numericReply["error"]=="unsupported");
+
     // The current error envelope must fit the bounded BLE attribute.
-    auto largestError = request("wifi_save");
+    auto largestError = request("wifi_apply");
     largestError["ack"]="wifi";largestError["ok"]=false;largestError["stage"]="rejected";largestError["error"]="storage_unknown";
     largestError["storage_stage"]="storage_encode";largestError["encode_stage"]="initialize";largestError["encode_status"]=-2;
     largestError["storage_bytes"]=0;largestError["unencoded_bytes"]=5248;largestError["nvs_free_entries"]=0;
@@ -82,20 +93,22 @@ int main() {
     assert(full["networks"][0]["network"]["password"].isNull());management.claimed=true;
     auto second=change("txn2",1,"OtherDevice");second["changes"][0]["network_id"]="travel";
     assert(invoke(second)["outcome"]=="committed");management.nameSpace=bond;
+    management.generation=1; // Force bounded BLE pages for this expiry fixture.
     auto expiryPageRequest=request("snapshot");
     auto expiryPage=invoke(expiryPageRequest);assert(expiryPage["complete"]==false);
     expiryPageRequest["snapshot_id"]=expiryPage["snapshot_id"];expiryPageRequest["offset"]=expiryPage["next_offset"];
     assert(invoke(expiryPageRequest,31001)["error"]=="snapshot_expired");
+    management.generation=0;
     auto invalid = change("txn3",2);
     auto n = invalid["changes"].as<JsonArray>().add<JsonObject>(); n["network_id"] = "invalid";
     blob = testNvsBlob;
     assert(invoke(invalid)["error"] == "shape" && wifiStore.revision == 2);
-    auto rejected = request("result"); rejected["query_id"]="txn3"; assert(invoke(rejected)["outcome"]=="rejected");
+    auto rejected = request("result"); rejected["query_id"]="txn3";rejected["request_seq"]=invalid["request_seq"]; assert(invoke(rejected)["outcome"]=="rejected");
     blob=testNvsBlob;
     auto storage = change("txn4",2,"Edited"); testNvsFail = true;
     assert(invoke(storage)["error"] == "storage_unknown" && blob == testNvsBlob); testNvsFail = false;
     assert(wifiSchemesBegin()); // revision and receipt survive reboot
-    auto query = request("result"); query["query_id"] = "txn1";
+    auto query = request("result"); query["query_id"] = "txn1";query["request_seq"]=first["request_seq"];
     assert(invoke(query)["outcome"] == "committed");
     query["bridge_id"]="different";assert(invoke(query)["error"]=="principal_mismatch");
     management.principal="different";assert(invoke(query)["outcome"]=="unknown");management.principal="installation";
@@ -108,7 +121,7 @@ int main() {
     JsonDocument result; assert(!deserializeJson(result, control(activate,bond,1,1000,121000,0,true)));
     assert(result["stage"] == "connecting"); WiFi.connected = WL_CONNECTED; WiFi.ipReady = true;
     wifiSetupPoll(2000); assert(wifiSetupActivated());
-    auto postCommitCancel=request("wifi_setup_cancel","cancel-activation");postCommitCancel["query_id"]="activate1";blob=testNvsBlob;
+    auto postCommitCancel=request("wifi_setup_cancel","cancel-activation");postCommitCancel["query_id"]="activate1";postCommitCancel["request_seq"]=activate["request_seq"];blob=testNvsBlob;
     deserializeJson(result,control(postCommitCancel,bond,1,2000,121000,0,true));
     assert(result["persisted"]==true&&blob==testNvsBlob);
     String activeSsid, activePass; assert(wifiSchemesCredentials(activeSsid, activePass) && activeSsid == "Device");
@@ -124,11 +137,11 @@ int main() {
     assert(!wifiSetupBusy() && !wifiSetupActivated() && testNvsBlob != blob && schemes.findShared("trial")==-1 && WiFi.SSID() == "Device");
     // Production protocol: no HTTP snapshot is needed to match one Bridge row.
     auto match=request("wifi_match",std::string(64,'m').c_str());match["network_id"]="home";
-    const int home=schemes.find(bond,"home");match["metadata_key"]=wifiMetadataKey(schemes.networks[home],schemes.networks[home].label.c_str(),false);match["open"]=false;
+    const int home=schemes.find(bond,"home");match["metadata_key"]=wifiMetadataKey(schemes.networks[home],schemes.networks[home].label.c_str(),true);match["open"]=true;
     auto matching=[&](){JsonDocument r;assert(!deserializeJson(r,control(match,bond,1,2000,0,60000,true)));return r;};
     assert(matching()["matches"]==true&&matching()["active"]==false); // edited, not silently active
     match["metadata_key"]=std::string(64,'0');assert(matching()["matches"]==false);
-    match["metadata_key"]=wifiMetadataKey(schemes.networks[home],schemes.networks[home].label.c_str(),false);
+    match["metadata_key"]=wifiMetadataKey(schemes.networks[home],schemes.networks[home].label.c_str(),true);
     WiFi.connected=WL_CONNECTED;WiFi.ipReady=true; // old network has recovered after trial
     auto ordinary=request("wifi_activate","ordinary-connect");ordinary["network_id"]="home";ordinary["version"]=schemes.networks[home].version;
     assert(!deserializeJson(result,control(ordinary,bond,1,2000,0,60000,true)));
@@ -141,7 +154,7 @@ int main() {
     JsonDocument failedFrame;failedFrame.set(matching());
     String failedWire=bleBuildReply(failedFrame,match["request_id"].as<String>(),UINT32_MAX,UINT32_MAX);
     assert(failedWire.length()&&failedWire.length()<=512&&failedWire.indexOf("password")==-1);
-    ordinary["request_id"]="ordinary-success";
+    ordinary["request_id"]="ordinary-success";ordinary["request_seq"]=++testSequence;
     deserializeJson(result,control(ordinary,bond,1,30000,0,60000,true));
     wifiSetupPoll(30001);WiFi.connected=WL_CONNECTED;WiFi.ipReady=false;
     wifiSetupPoll(31000);assert(wifiSetupBusy()); // DHCP is part of proof
@@ -150,7 +163,7 @@ int main() {
     wifiSetupConnectionStarted(String(schemes.networks[home].ssid));wifiDisconnectReason=202;WiFi.connected=0;WiFi.ssid="";
     assert(matching()["error"]=="authentication_failed"&&matching()["stage"]=="failed");
     WiFi.connected=WL_CONNECTED;WiFi.ssid=String(schemes.networks[home].ssid);wifiDisconnectReason=0;
-    auto wrongVersion=ordinary;wrongVersion["request_id"]="old-version";wrongVersion["version"]=0;
+    auto wrongVersion=ordinary;wrongVersion["request_id"]="old-version";wrongVersion["version"]=0;wrongVersion["request_seq"]=++testSequence;
     deserializeJson(result,control(wrongVersion,bond,1,33000,0,60000,true));assert(result["error"]=="revision_conflict");
     auto otherMatch=match;deserializeJson(result,control(otherMatch,other,1,33000,0,60000,true));assert(result["matches"]==true);
     std::cout<<"BLE network feedback: matching, old-version rejection/shared owner access, BLE-alive association, auth failure, DHCP and wire budget passed\n";
@@ -181,30 +194,30 @@ int main() {
     // Routine, owner-approved paired BLE writes borrow the formal window,
     // atomically commit two rows, and recover by receipt without a full read.
     testNvsBlob.clear();assert(wifiSchemesBegin());wifiManagementResetSession();
-    auto batch=request("wifi_save","formal-batch");batch["expected_revision"]=0;
+    auto batch=request("wifi_apply","formal-batch");batch["expected_revision"]=0;
     auto rows=batch["changes"].to<JsonArray>();
     for(const char *id : {"home","travel"}) {auto n=rows.add<JsonObject>();n["network_id"]=id;n["host_ssid"]=String(id);n["ssid"]="Device";n["label"]="Network";n["credential"]="open";}
     WifiControlContext formal;formal.principal="installation";formal.nameSpace=bond;formal.generation=9;
     auto bleInvoke=[&](JsonDocument &doc,bool allowed=true,uint64_t now=1000,uint64_t until=30000){
         formal.claimed=allowed;formal.occupied=!allowed;formal.until=until;
-        JsonDocument r;assert(!deserializeJson(r,wifiControlCommand(doc,formal,now)));return r;
+        JsonDocument r;assert(!deserializeJson(r,testWifiControlCommand(doc,formal,now)));return r;
     };
     assert(bleInvoke(batch,false)["error"]=="occupied" && wifiStore.revision==0);
     assert(bleInvoke(batch,true,1000,0)["error"]=="window_required" && wifiStore.revision==0);
     auto committed=bleInvoke(batch);assert(committed["outcome"]=="committed"&&committed["revision"]==1&&committed["bond"]==bond);
     assert(schemes.find(bond,"home")>=0&&schemes.find(bond,"travel")>=0);
-    auto formalQuery=request("wifi_result","query");formalQuery["query_id"]="formal-batch";
+    auto formalQuery=request("wifi_result","query");formalQuery["query_id"]="formal-batch";formalQuery["request_seq"]=batch["request_seq"];
     assert(bleInvoke(formalQuery)["outcome"]=="committed");
     formal.nameSpace=other;assert(bleInvoke(formalQuery)["outcome"]=="unknown");formal.nameSpace=bond;
     auto changed=batch;changed["changes"][0]["ssid"]="Different";assert(bleInvoke(changed)["error"]=="request_conflict");
-    auto expiredBatch=batch;expiredBatch["request_id"]="expired-formal";expiredBatch["expected_revision"]=1;
+    auto expiredBatch=batch;expiredBatch["request_id"]="expired-formal";expiredBatch["request_seq"]=++testSequence;expiredBatch["expected_revision"]=1;
     assert(bleInvoke(expiredBatch,true,30000,30000)["error"]=="window_required");
     std::cout<<"Formal BLE window: atomic batch, owner/expiry/bond rejection, durable receipt and replay passed\n";
     // Permanent sequence fence survives ACK retirement, channel/session reset
-    // and atomic NVS failures; legacy arbitrary IDs cannot be safely retired.
+    // and atomic NVS failures; arbitrary IDs use explicit business sequences.
     auto seq=change("w3_0000000000000001",wifiStore.revision);
     assert(bleInvoke(seq)["outcome"]=="committed");
-    auto confirm=request("result_ack");confirm["query_id"]=seq["request_id"];confirm["result_peer"]=bond;
+    auto confirm=request("result_ack");confirm["query_id"]=seq["request_id"];confirm["request_seq"]=seq["request_seq"];confirm["result_peer"]=bond;
     const auto beforeAck=testNvsBlob;
     testNvsFail=true;assert(bleInvoke(confirm)["error"]=="storage_unknown"&&testNvsBlob==beforeAck);testNvsFail=false;
     assert(wifiSchemesBegin()&&bleInvoke(seq)["outcome"]=="committed");
@@ -214,22 +227,22 @@ int main() {
     assert(bleInvoke(seq)["error"]=="request_retired");
     seq["expected_revision"]=wifiStore.revision;seq["changes"][0]["ssid"]="Replay";
     assert(bleInvoke(seq)["error"]=="request_retired");
-    confirm["query_id"]="formal-batch";assert(bleInvoke(confirm)["error"]=="legacy_receipt_retained");
-    confirm["query_id"]="w3_0000000000000001";confirm["bridge_id"]="foreign";assert(bleInvoke(confirm)["error"]=="principal_mismatch");
+    confirm["query_id"]="formal-batch";confirm["request_seq"]=batch["request_seq"];assert(bleInvoke(confirm)["outcome"]=="retired");
+    confirm["query_id"]="w3_0000000000000001";confirm["request_seq"]=seq["request_seq"];confirm["bridge_id"]="foreign";assert(bleInvoke(confirm)["error"]=="principal_mismatch");
     formal.principal="foreign";assert(bleInvoke(confirm)["outcome"]=="unknown");formal.principal="installation";
-    seq["request_id"]="w3_0000000000000002";assert(bleInvoke(seq)["outcome"]=="committed");
+    seq["request_id"]="w3_0000000000000002";seq["request_seq"]=++testSequence;assert(bleInvoke(seq)["outcome"]=="committed");
     const auto committedSeq=testNvsBlob;seq["changes"][0]["ssid"]="Conflict";
     assert(bleInvoke(seq)["error"]=="request_conflict"&&testNvsBlob==committedSeq);
     wifiManagementResetSession();assert(wifiSchemesBegin());
-    auto seqQuery=request("result");seqQuery["query_id"]="w3_0000000000000002";seqQuery["result_peer"]=bond;
+    auto seqQuery=request("result");seqQuery["query_id"]="w3_0000000000000002";seqQuery["request_seq"]=seq["request_seq"];seqQuery["result_peer"]=bond;
     assert(bleInvoke(seqQuery)["outcome"]=="committed");
-    std::cout<<"WFS4 permanent fence: confirmation, retained legacy, cross-principal, replay and commit-then-error restart passed\n";
+    std::cout<<"WTX2 permanent fence: confirmation, opaque IDs, cross-principal, replay and commit-then-error restart passed\n";
 
     // Both adapters call this exact production handler. USB continuous has no
     // permit/BLE/PowerPlan prerequisite; ownership still gates every side effect.
     testNvsBlob.clear();running=false;wifiManagementResetSession();assert(wifiSchemesBegin());
     WifiControlContext ctx;ctx.principal="installation";ctx.nameSpace=bond;ctx.until=UINT64_MAX;ctx.claimed=true;
-    auto unified=[&](JsonDocument &d){JsonDocument r;assert(!deserializeJson(r,wifiControlCommand(d,ctx,1000)));return r;};
+    auto unified=[&](JsonDocument &d){JsonDocument r;assert(!deserializeJson(r,testWifiControlCommand(d,ctx,1000)));return r;};
     auto usb=change("w3_0000000000000010",0);ctx.claimed=false;
     assert(unified(usb)["error"]=="claim_required"&&wifiStore.revision==0);
     auto forged=usb;forged["permit"]="retired-permit";forged["namespace"]=other;forged["result_peer"]=other;
@@ -237,7 +250,7 @@ int main() {
     ctx.occupied=true;assert(unified(usb)["error"]=="occupied");ctx.occupied=false;ctx.claimed=true;
     ctx.sessionValid=false;assert(unified(usb)["error"]=="session_expired");ctx.sessionValid=true;
     assert(unified(usb)["outcome"]=="committed");
-    auto queryUsb=request("result");queryUsb["query_id"]=usb["request_id"];
+    auto queryUsb=request("result");queryUsb["query_id"]=usb["request_id"];queryUsb["request_seq"]=usb["request_seq"];
     ctx.until=0;ctx.claimed=false;ctx.sessionValid=false;
     assert(unified(queryUsb)["outcome"]=="committed"&&unified(usb)["outcome"]=="committed");
     auto snap=request("snapshot");assert(unified(snap)["error"]=="window_required");
@@ -246,7 +259,7 @@ int main() {
     const int rfBeforePending=WiFi.begins;testNvsFail=true;
     assert(unified(activateUsb)["error"]=="storage_unknown"&&WiFi.begins==rfBeforePending);testNvsFail=false;assert(wifiSchemesBegin());
     auto started=unified(activateUsb);assert(started["ok"]==true&&wifiSetupBusy());
-    auto pendingBytes=testNvsBlob;auto queryActivation=request("result");queryActivation["query_id"]=activateUsb["request_id"];
+    auto pendingBytes=testNvsBlob;auto queryActivation=request("result");queryActivation["query_id"]=activateUsb["request_id"];queryActivation["request_seq"]=activateUsb["request_seq"];
     assert(unified(queryActivation)["outcome"]=="accepted");
     wifiSetupPoll(1001);assert(wifiSetupBusy()); // transport disconnect is not cancellation
     WiFi.connected=WL_CONNECTED;WiFi.ipReady=true;wifiSetupPoll(1002);
@@ -260,8 +273,8 @@ int main() {
     auto usbTrial=request("trial","w3_0000000000000012");usbTrial["network_id"]="trial";usbTrial["host_ssid"]="Host";usbTrial["ssid"]="Candidate";usbTrial["password"]="";usbTrial["replace"]=false;
     assert(unified(usbTrial)["ok"]==true);WiFi.connected=WL_CONNECTED;WiFi.ipReady=true;
     wifiSetupPoll(1002);assert(!wifiSetupBusy());requestId="";assert(wifiSchemesBegin());
-    auto queryTrial=request("result");queryTrial["query_id"]=usbTrial["request_id"];assert(unified(queryTrial)["outcome"]=="completed");
-    usbTrial["request_id"]="w3_0000000000000013";ctx.until=1005;assert(unified(usbTrial)["ok"]==true);
+    auto queryTrial=request("result");queryTrial["query_id"]=usbTrial["request_id"];queryTrial["request_seq"]=usbTrial["request_seq"];assert(unified(queryTrial)["outcome"]=="completed");
+    usbTrial["request_id"]="w3_0000000000000013";usbTrial["request_seq"]=++testSequence;ctx.until=1005;assert(unified(usbTrial)["ok"]==true);
     int beforeClose=WiFi.begins;wifiSetupConstrain(1005,0,true);assert(!wifiSetupBusy()&&WiFi.begins==beforeClose);
     std::cout<<"Unified HTTP/BLE: USB no-permit, strict claim, stale session replay, pending/active atomicity, durable trial and no RF after deadline passed\n";
     // A sole saved active configuration remains protected. Build this fixture
@@ -286,14 +299,14 @@ int main() {
     assert(unified(namespaceA)["outcome"]=="committed");
     ctx.nameSpace=other;
     auto namespaceB=change("w3_0000000000000001",1,"SecondNamespace");
-    namespaceB["changes"][0]["network_id"]="travel";
+    namespaceB["request_seq"]=namespaceA["request_seq"];namespaceB["changes"][0]["network_id"]="travel";
     assert(unified(namespaceB)["outcome"]=="committed");
     assert(wifiSchemesBegin() && wifiStore.receipts.size()==2);
-    auto namespaceQuery=request("result");namespaceQuery["query_id"]=namespaceA["request_id"];
+    auto namespaceQuery=request("result");namespaceQuery["query_id"]=namespaceA["request_id"];namespaceQuery["request_seq"]=namespaceA["request_seq"];
     assert(unified(namespaceQuery)["revision"]==2 && unified(namespaceQuery)["bond"]==other);
     auto conflicting=namespaceB;conflicting["changes"][0]["ssid"]="Conflict";
     assert(unified(conflicting)["error"]=="request_conflict");
-    auto namespaceAck=request("result_ack");namespaceAck["query_id"]=namespaceA["request_id"];
+    auto namespaceAck=request("result_ack");namespaceAck["query_id"]=namespaceA["request_id"];namespaceAck["request_seq"]=namespaceA["request_seq"];
     assert(unified(namespaceAck)["outcome"]=="retired");
     assert(unified(namespaceQuery)["outcome"]=="retired");
     ctx.nameSpace=bond;
@@ -314,7 +327,7 @@ int main() {
         if(trialOperation){command["host_ssid"]="TrialHost";command["ssid"]="TrialDevice";command["password"]="";command["replace"]=false;}
         assert(unified(command)["ok"]==true);
         auto pending=testNvsBlob;
-        auto outcome=request("result");outcome["query_id"]=command["request_id"];
+        auto outcome=request("result");outcome["query_id"]=command["request_id"];outcome["request_seq"]=command["request_seq"];
         // Simulated reboot: recovery must be committed and read back before
         // claiming an interrupted terminal state or allowing receipt retirement.
         running=false;requestId="";wifiExecutionGeneration=0;
@@ -323,7 +336,7 @@ int main() {
         testNvsReadbackFail=true;assert(!wifiSchemesBegin());testNvsReadbackFail=false;
         assert(wifiSchemesBegin()&&unified(outcome)["error"]=="interrupted");
         assert(!*wifiStore.active.id && wifiStore.revision==1);
-        auto retire=request("result_ack");retire["query_id"]=command["request_id"];
+        auto retire=request("result_ack");retire["query_id"]=command["request_id"];retire["request_seq"]=command["request_seq"];
         assert(unified(retire)["outcome"]=="retired"&&unified(retire)["outcome"]=="retired");
         const int noReplay=WiFi.begins;assert(unified(command)["error"]=="request_retired"&&WiFi.begins==noReplay);
         // Old pending has no generation proof and must stay unresolved.
@@ -333,7 +346,7 @@ int main() {
         assert(saveV2(legacyPending));wifiExecutionGeneration=0;assert(wifiSchemesBegin());
         assert(unified(outcome)["outcome"]=="unknown"&&unified(retire)["outcome"]=="unknown");
     }
-    std::cout<<"WTX1 interruption: atomic recovery/readback failure, old pending retained, no replay after ACK passed\n";
+    std::cout<<"WTX2 interruption: atomic recovery/readback failure, old pending retained, no replay after ACK passed\n";
     // Identical namespace/request ID under a different principal is a new
     // transaction, never a hit in a transport-local replay shortcut.
     testNvsBlob.clear();running=false;requestId="";assert(wifiSchemesBegin());
@@ -343,9 +356,9 @@ int main() {
     assert(unified(principalTrial)["ok"]==true);WiFi.connected=WL_CONNECTED;WiFi.ipReady=true;wifiSetupPoll(1002);
     ctx.principal="other-installation";principalTrial["bridge_id"]=ctx.principal;
     assert(unified(principalTrial)["ok"]==true&&wifiSetupBusy()&&wifiStore.receipts.size()==2);
-    auto foreignCancel=request("setup_cancel","cancel");foreignCancel["query_id"]=principalTrial["request_id"];
+    auto foreignCancel=request("setup_cancel","cancel");foreignCancel["query_id"]=principalTrial["request_id"];foreignCancel["request_seq"]=principalTrial["request_seq"];
     ctx.principal="installation";assert(unified(foreignCancel)["error"]=="not_found"&&wifiSetupBusy());
-    auto principalResult=request("result");principalResult["query_id"]=principalTrial["request_id"];
+    auto principalResult=request("result");principalResult["query_id"]=principalTrial["request_id"];principalResult["request_seq"]=principalTrial["request_seq"];
     assert(unified(principalResult)["outcome"]=="completed");
     ctx.principal="other-installation";principalResult["bridge_id"]=ctx.principal;
     assert(unified(principalResult)["outcome"]=="accepted");

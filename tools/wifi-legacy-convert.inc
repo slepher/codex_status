@@ -1,6 +1,6 @@
 // Retired explicit formats are decoded only by the offline converter.
 static bool wifiDecodeExplicitOffline(uint8_t *bytes, size_t size, WifiStore &out) {
-    if(size>=4 && !memcmp(bytes,"WFS5",4))return wifiDecode5(bytes,size,out);
+    if(size>=4 && (!memcmp(bytes,"WFS5",4) || !memcmp(bytes,"WFS6",4)))return wifiDecode5(bytes,size,out);
     if (size<33 || size>WIFI_STORAGE_MAX || (memcmp(bytes,"WFS3",4) && memcmp(bytes,"WFS4",4))) return false;
     WifiReader r{bytes,size,4};
     size_t version=r.integer(1), cursors=r.integer(1);
@@ -24,6 +24,7 @@ static bool wifiDecodeExplicitOffline(uint8_t *bytes, size_t size, WifiStore &ou
             !r.text(receipt.bridge,64) || !r.text(receipt.request,64) ||
             !r.text(receipt.bond,21) || !r.text(receipt.error,32))return false;
         if(version>=4) {receipt.targetVersion=r.integer(8);if(!r.text(receipt.operation,16)||!r.text(receipt.target,32))return false;}
+        receipt.sequence=wifiLegacyRequestSequence(receipt.request);
         if(!r.okay || r.pos-start!=length)return false;
     }
     if (!out.cursors.resize(cursors)) return false;
@@ -88,6 +89,7 @@ static bool wifiDecodeLegacyOffline(const uint8_t *input,size_t size,WifiStore &
         if(!legacyText(receipt.bridge,record,0,65) || !legacyText(receipt.request,record,65,65) ||
             !legacyText(receipt.bond,record,130,22) || !legacyText(receipt.error,record,184,33))return false;
         if(!*receipt.request)continue;
+        receipt.sequence=wifiLegacyRequestSequence(receipt.request);
         memcpy(receipt.hash,record+152,32);receipt.revision=legacyInteger(record,224,8);
         if(!out.receipts.append(receipt))return false;
     }

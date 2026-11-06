@@ -603,7 +603,7 @@ class NativeProvider(OriginalProvider):
         if reply.get('state')!='approved':raise RuntimeError('native pairing confirmation failed')
         self.report['native_pairing_approved']=True
         return token,identity,principal
-    def lifecycle_probe(self,frame,bundle,status,token,identity,principal,nonce):
+    def lifecycle_probe(self,frame,bundle,status,token,identity,principal):
         import copy,zlib
         self.report['native_application_stage']='coexistence'
         def probe(operation):return self.action(host_probe=operation)
@@ -668,10 +668,10 @@ class NativeProvider(OriginalProvider):
             replacement['profile']={'template_ids':[ids[0]],'initial_active_id':ids[0]}
             replacement['templates']=[next(t for t in bundle['templates'] if t['key']['template_id']==ids[0])]
             raw=json.dumps(replacement,ensure_ascii=False,separators=(',',':')).encode()
-            request={'bridge_id':principal,'device_mac':identity,'session_nonce':nonce,'request_id':'peer-publish',
+            request={'bridge_id':principal,'device_mac':identity,'request_id':'peer-publish',
                      'length':len(raw),'content_crc':f'{zlib.crc32(raw):08x}'}
             frame(10,'/api/bundle/begin',request)
-            for at in range(0,len(raw),3072):frame(11,'/api/bundle/chunk?request_id=peer-publish&session_nonce='+nonce+'&offset='+str(at),raw[at:at+3072])
+            for at in range(0,len(raw),3072):frame(11,'/api/bundle/chunk?request_id=peer-publish&offset='+str(at),raw[at:at+3072])
             ack=frame(12,'/api/bundle/commit',request)
             assert ack['result']=='applied'
             for _ in range(3):
@@ -777,11 +777,11 @@ class NativeProvider(OriginalProvider):
                 calls=self.report['native_ff13_calls'];assert len(calls)==2 and all(call['result']==0 for call in calls)
                 elapsed=calls[1]['guest_uptime_ms']-calls[0]['guest_uptime_ms'];assert 9000<=elapsed<30000
                 self.report['native_boot_health_verified']={'path':str(path),'tables':tables,'firmware_slots_unchanged':True,'elapsed_ms':elapsed}
-        session=secrets.token_bytes(16);number=0;nonce=''
+        session=secrets.token_bytes(16);number=0
         def frame(op,path,payload,claim=False,expected_status=200):
             nonlocal session,number
             if not isinstance(payload,bytes):
-                payload={k:v for k,v in payload.items() if k not in ('op','session_nonce')}
+                payload={k:v for k,v in payload.items() if k != 'op'}
             body=payload if isinstance(payload,bytes) else json.dumps(payload,separators=(',',':')).encode()
             for attempt in range(5):
                 number+=1
@@ -804,7 +804,7 @@ class NativeProvider(OriginalProvider):
                 if code!=expected_status:raise RuntimeError('native operation rejected: '+str(value.get('error',code)))
                 return value
             raise RuntimeError('native binding admission retry budget exhausted')
-        status=frame(1,'/api/status',{});nonce=status['session_nonce']
+        status=frame(1,'/api/status',{})
         frame(4,'/claim',{'bridge_id':principal,'device_mac':identity},True)
         fixture=Path(json.loads(resume_report.read_bytes()).get('native_bundle_fixture',str(native_bundle))) if resume_report else native_bundle
         fixture_bytes=fixture.read_bytes();bundle=json.loads(fixture_bytes)
@@ -813,7 +813,7 @@ class NativeProvider(OriginalProvider):
         bundle['bridge_id']=principal;bundle['device_mac']=identity
         raw=json.dumps(bundle,ensure_ascii=False,separators=(',',':')).encode()
         import zlib
-        envelope={'bridge_id':principal,'device_mac':identity,'session_nonce':nonce,'request_id':'native-bundle',
+        envelope={'bridge_id':principal,'device_mac':identity,'request_id':'native-bundle',
                   'length':len(raw),'content_crc':f'{zlib.crc32(raw):08x}'}
         if resume_report:
             previous=json.loads(resume_report.read_bytes())
@@ -824,7 +824,7 @@ class NativeProvider(OriginalProvider):
             assert status['active_context_id']!=prior['active_context_id'] and status['applied_seq']==0
             recovered=status['active_context_id'];frame(12,'/api/bundle/commit',envelope)
             if previous.get('native_activation_request'):
-                activation={**previous['native_activation_request'],'session_nonce':nonce}
+                activation={**previous['native_activation_request']}
                 frame(13,'/api/activate',activation)
                 self.report['native_activation_recovered']=True
             status=frame(1,'/api/status',{})
@@ -835,7 +835,7 @@ class NativeProvider(OriginalProvider):
             self.report['native_application_stage']='bundle'
             frame(10,'/api/bundle/begin',envelope)
             for at in range(0,len(raw),3072):
-                path=f'/api/bundle/chunk?request_id=native-bundle&session_nonce={nonce}&offset={at}'
+                path=f'/api/bundle/chunk?request_id=native-bundle&offset={at}'
                 frame(11,path,raw[at:at+3072])
             self.report['native_application_stage']='commit'
             frame(12,'/api/bundle/commit',envelope)
@@ -875,7 +875,7 @@ class NativeProvider(OriginalProvider):
         fields=[{'i':r['index'],'k':r['field'],'v':values.get(r['field']),'q':'fresh' if r['field'] in values else 'missing'}
                 for r in status['data_contract']['requirements'] if not r['local']]
         fingerprint=''.join(f'{f["i"]}:{f["k"]}:'+('~' if f['v'] is None else json.dumps(f['v'],ensure_ascii=False,separators=(',',':')))+f':{f["q"]};' for f in fields).encode()
-        frame(2,'/api/data',{'bridge_id':principal,'device_mac':identity,'session_nonce':nonce,
+        frame(2,'/api/data',{'bridge_id':principal,'device_mac':identity,
             'request_id':'native-data-1','active_context_id':status['active_context_id'],'seq':1,'crc':f'{zlib.crc32(fingerprint):08x}','fields':fields})
         self.report['native_data_applied']=True
         context=status['active_context_id']
@@ -897,7 +897,7 @@ class NativeProvider(OriginalProvider):
                      'q':'fresh' if r['field'] in values else 'missing'}
                     for r in status['data_contract']['requirements'] if not r['local']]
             fingerprint=''.join(f'{f["i"]}:{f["k"]}:'+('~' if f['v'] is None else json.dumps(f['v'],ensure_ascii=False,separators=(',',':')))+f':{f["q"]};' for f in fields).encode()
-            frame(2,'/api/data',{'bridge_id':principal,'device_mac':identity,'session_nonce':nonce,
+            frame(2,'/api/data',{'bridge_id':principal,'device_mac':identity,
                   'request_id':f'native-data-{seq}','active_context_id':context,'seq':seq,'crc':f'{zlib.crc32(fingerprint):08x}','fields':fields})
             until=time.monotonic()+30
             while time.monotonic()<until:
@@ -931,7 +931,7 @@ class NativeProvider(OriginalProvider):
             self.report['native_clock_minute_refresh']={'passed':True,'data_sequence_unchanged':True,
                 'context_unchanged':True,'business_requests_during_refresh_wait':0,'before':before,'after':observed}
         if host_lifecycle_probe:
-            self.lifecycle_probe(frame,bundle,status,token,identity,principal,nonce)
+            self.lifecycle_probe(frame,bundle,status,token,identity,principal)
             self.report['native_application_stage']='complete'
             return
         self.report['native_application_stage']='navigation'
@@ -961,11 +961,11 @@ class NativeProvider(OriginalProvider):
                 replacement['profile']={'template_ids':order,'initial_active_id':initial}
                 replacement['templates']=[next(t for t in bundle['templates'] if t['key']['template_id']==id) for id in order]
                 raw=json.dumps(replacement,ensure_ascii=False,separators=(',',':')).encode()
-                request={'bridge_id':principal,'device_mac':identity,'session_nonce':nonce,
+                request={'bridge_id':principal,'device_mac':identity,
                     'request_id':job,'length':len(raw),'content_crc':f'{zlib.crc32(raw):08x}'}
                 frame(10,'/api/bundle/begin',request)
                 for at in range(0,len(raw),3072):
-                    frame(11,f'/api/bundle/chunk?request_id={job}&session_nonce={nonce}&offset={at}',raw[at:at+3072])
+                    frame(11,f'/api/bundle/chunk?request_id={job}&offset={at}',raw[at:at+3072])
                 ack=frame(12,'/api/bundle/commit',request)
                 assert ack['result']=='applied' and ack['display_state']=='pending'
                 return ack
@@ -1011,14 +1011,14 @@ class NativeProvider(OriginalProvider):
                 k:status[k] for k in ('active_template_id','display_state','display_reason','template_ids')}}
         if transition_probe:
             (self.screen_host_transition_probe if manifest.get('screen_host') else self.transition_probe)(len(ids));status=frame(1,'/api/status',{})
-        activation={'bridge_id':principal,'device_mac':identity,'session_nonce':nonce,
+        activation={'bridge_id':principal,'device_mac':identity,
                     'request_id':'native-activate-'+Path(sys.argv[sys.argv.index('--output')+1]).stem,
                     'template_id':ids[1],'expected_active_context_id':status['active_context_id']}
         frame(13,'/api/activate',activation);status=frame(1,'/api/status',{})
         assert status['active_template_id']==ids[1] and status['active_context_id']!=activation['expected_active_context_id']
         activated=status['active_context_id'];frame(13,'/api/activate',activation);status=frame(1,'/api/status',{})
         assert status['active_context_id']==activated
-        self.report['native_activation_request']={key:value for key,value in activation.items() if key!='session_nonce'}
+        self.report['native_activation_request']=dict(activation)
         self.report['native_persisted_status']={key:status.get(key) for key in ('active_context_id','active_template_id','applied_seq','template_ids')}
         self.report['native_activation_replay_passed']=True
         if firmware_probe:self.firmware_probe(token,identity,frame)

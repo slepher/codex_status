@@ -1,5 +1,15 @@
-// WFS4 configuration and WTX1 transaction records have independent persistence.
-// The WFS5 codec remains an offline archive reader/writer, never a device store.
+// Disk import only: never infer a sequence from a wire request ID.
+static uint64_t wifiLegacyRequestSequence(const char *id) {
+    if (strlen(id)!=19 || strncmp(id,"w3_",3)) return 0;
+    uint64_t sequence=0;
+    for (size_t i=3;i<19;++i) {
+        char c=id[i]; if (!((c>='0'&&c<='9')||(c>='a'&&c<='f'))) return 0;
+        sequence=(sequence<<4)|(c<='9'?c-'0':c-'a'+10);
+    }
+    return sequence;
+}
+// WFS4 configuration and WTX2 transaction records have independent persistence.
+// WFS6 is the offline archive writer; WFS4/5/6 import is never a device store.
 static constexpr size_t WIFI_STORAGE_MAX = 8192;
 struct WifiWriter {
     uint8_t *bytes; size_t pos = 0;
@@ -11,12 +21,12 @@ struct WifiWriter {
         integer(size,2); integer(n.version,8);
         for (const char *value : {n.bond.c_str(),n.id.c_str(),n.host.c_str(),n.ssid.c_str(),n.password.c_str(),n.label.c_str()}) text(value);
     }
-    void receipt(const WifiReceipt &r) {
-        integer(8+32+4+10+8+strlen(r.bridge)+strlen(r.request)+strlen(r.bond)+strlen(r.error)+strlen(r.operation)+strlen(r.target),2);
+    void receipt(const WifiReceipt &r, bool sequence=true) {
+        integer((sequence?8:0)+8+32+4+10+8+strlen(r.bridge)+strlen(r.request)+strlen(r.bond)+strlen(r.error)+strlen(r.operation)+strlen(r.target),2);
         integer(r.revision,8); raw(r.hash,32);
         for (const char *value : {r.bridge.c_str(),r.request.c_str(),r.bond.c_str(),r.error.c_str()}) text(value);
         integer(r.targetVersion,8);text(r.operation);text(r.target);
-        integer(r.executionGeneration,8);
+        integer(r.executionGeneration,8); if(sequence)integer(r.sequence,8);
     }
     void configuration(const WifiStore &s) {
         raw("WFS4",4); integer(4,1); integer(0,1); integer(s.schemes.networks.size(),1); integer(0,1);
@@ -28,13 +38,13 @@ struct WifiWriter {
         for(const auto &n:s.schemes.networks)record(n);
     }
     void transactions(const WifiStore &s) {
-        raw("WTX1",4);integer(1,1);integer(s.cursors.size(),1);integer(0,1);integer(s.receipts.size(),1);
+        raw("WTX2",4);integer(2,1);integer(s.cursors.size(),1);integer(0,1);integer(s.receipts.size(),1);
         integer(0,4);integer(0,4);integer(s.executionGeneration,8);
         for(const auto &r:s.receipts)receipt(r);
         for(const auto &c:s.cursors){integer(10+strlen(c.bridge)+strlen(c.bond),2);integer(c.high,8);text(c.bridge);text(c.bond);}
     }
     void store(const WifiStore &s) {
-        raw("WFS5",4); integer(5,1); integer(s.cursors.size(),1); integer(s.schemes.networks.size(),1); integer(s.receipts.size(),1);
+        raw("WFS6",4); integer(6,1); integer(s.cursors.size(),1); integer(s.schemes.networks.size(),1); integer(s.receipts.size(),1);
         integer(0,4); integer(0,4); integer(s.revision,8); integer(s.activeVersion,8);
         integer(s.executionGeneration,8);
         int slot = s.schemes.find(s.active.bond,s.active.id);
@@ -66,12 +76,13 @@ struct WifiReader {
         if (!okay || length > size-start) return false;
         return text(n.bond,21) && text(n.id,32) && text(n.host,32) && text(n.ssid,32) && text(n.password,64) && text(n.label,64) && pos-start == length;
     }
-    bool receipt(WifiReceipt &r, bool generation=true) {
+    bool receipt(WifiReceipt &r, bool generation=true, bool sequence=false) {
         size_t length = integer(2), start = pos; r.revision = integer(8);
         if (!okay || length > size-start) return false;
         if (!(raw(r.hash,32) && text(r.bridge,64) && text(r.request,64) && text(r.bond,21) && text(r.error,32))) return false;
         r.targetVersion=integer(8);if(!text(r.operation,16)||!text(r.target,32))return false;
         r.executionGeneration=generation?integer(8):0;
+        r.sequence=sequence?integer(8):wifiLegacyRequestSequence(r.request);
         return pos-start==length;
     }
 };
@@ -96,14 +107,15 @@ static bool wifiStoreShape(const WifiStore &s) {
         if (!identifier(r.bridge,64) || !identifier(r.request,64) || !*r.bond || strlen(r.bond)>21 || strlen(r.error)>32 || r.revision>s.revision || strlen(r.operation)>16 || strlen(r.target)>32) return false;
         if (r.executionGeneration > s.executionGeneration || (r.executionGeneration &&
             strcmp(r.operation,"trial") && strcmp(r.operation,"activate"))) return false;
-        for (size_t j=0;j<i;++j) if (r.matches(s.receipts[j].bridge,s.receipts[j].bond,s.receipts[j].request)) return false;
+        for (size_t j=0;j<i;++j) if (r.matches(s.receipts[j].bridge,s.receipts[j].bond,s.receipts[j].request) ||
+            (r.sequence && r.sequence==s.receipts[j].sequence && !strcmp(r.bridge,s.receipts[j].bridge) && !strcmp(r.bond,s.receipts[j].bond))) return false;
     }
     for (size_t i=0;i<s.cursors.size();++i) {
         const auto &c=s.cursors[i];
         if (!identifier(c.bridge,64) || !*c.bond || strlen(c.bond)>21 || !c.high) return false;
         for (size_t j=0;j<i;++j) if (!strcmp(c.bridge,s.cursors[j].bridge) && !strcmp(c.bond,s.cursors[j].bond)) return false;
     }
-    for (const auto &receipt:s.receipts) if (uint64_t seq=wifiRequestSequence(receipt.request)) {
+    for (const auto &receipt:s.receipts) if (uint64_t seq=receipt.sequence) {
         bool found=false;
         for (const auto &c:s.cursors) if (!strcmp(c.bridge,receipt.bridge) && !strcmp(c.bond,receipt.bond) && c.high>=seq) found=true;
         if (!found) return false;
@@ -111,10 +123,12 @@ static bool wifiStoreShape(const WifiStore &s) {
     return true;
 }
 static bool wifiDecodeStore(uint8_t *bytes, size_t size, WifiStore &out, bool generations) {
-    if (size<(generations?41u:33u) || size>WIFI_STORAGE_MAX || memcmp(bytes,generations?"WFS5":"WFS4",4)) return false;
+    if (size<(generations?41u:33u) || size>WIFI_STORAGE_MAX) return false;
+    const bool sequences=generations && !memcmp(bytes,"WFS6",4);
+    if (memcmp(bytes,generations?(sequences?"WFS6":"WFS5"):"WFS4",4)) return false;
     WifiReader r{bytes,size,4};
     size_t version=r.integer(1), cursors=r.integer(1);
-    if (version!=(generations?5u:4u) || cursors>8) return false;
+    if (version!=(generations?(sequences?6u:5u):4u) || cursors>8) return false;
     size_t networks=r.integer(1), receipts=r.integer(1);
     if (networks>12 || receipts>8 || r.integer(4)!=size) return false;
     uint32_t crc=r.integer(4); memset(bytes+12,0,4);
@@ -128,7 +142,7 @@ static bool wifiDecodeStore(uint8_t *bytes, size_t size, WifiStore &out, bool ge
     if (mode==2 && !(r.text(out.active.ssid,32) && r.text(out.active.password,64))) return false;
     if (!out.schemes.networks.resize(networks) || !out.receipts.resize(receipts)) return false;
     for(auto &n:out.schemes.networks) if(!r.record(n)) return false;
-    for(auto &receipt:out.receipts) if(!r.receipt(receipt,generations)) return false;
+    for(auto &receipt:out.receipts) if(!r.receipt(receipt,generations,sequences)) return false;
     if (!out.cursors.resize(cursors)) return false;
     for (auto &c:out.cursors) {
         size_t length=r.integer(2), start=r.pos; c.high=r.integer(8);

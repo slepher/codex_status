@@ -69,12 +69,12 @@ String bleBuildInfo(const BleInfoSnapshot &s) {
     return finish(doc);
 }
 String bleBuildStatus(const BleStatusSnapshot &s) {
-    if (!macValid(s.mac) || !bleWireText(s.nonce, 32, false) ||
+    if (!macValid(s.mac) || !bleWireText(s.bootId, 32, false) ||
         !bleWireText(s.context, 32) || !bleWireText(s.activeTemplate, 16) ||
         !bleWireText(s.job, 16)) return String();
-    // Nonce is generated as 32 hex chars. Never accept a truncatable nonce.
-    if (s.nonce.length() != 32) return String();
-    for (size_t i = 0; i < 32; ++i) if (!isxdigit((unsigned char)s.nonce[i])) return String();
+    // Boot identity is independent of the rotating transport session.
+    if (s.bootId.length() != 32) return String();
+    for (size_t i = 0; i < 32; ++i) if (!isxdigit((unsigned char)s.bootId[i])) return String();
     JsonDocument doc;
     doc["op"] = "status"; doc["device_mac"] = s.mac;
     if (s.rendezvousVersion) doc["rendezvous_v"] = s.rendezvousVersion;
@@ -82,7 +82,7 @@ String bleBuildStatus(const BleStatusSnapshot &s) {
     if (s.networkError) doc["ne"] = !strcmp(s.networkError,"bridge_http_unreachable") ? 2 :
         !strcmp(s.networkError,"wifi_link_lost") ? 3 : 1;
     JsonArray a = doc["s"].to<JsonArray>();
-    a.add(s.nonce); a.add(s.context); a.add(s.activeTemplate); a.add(s.job);
+    a.add(s.bootId); a.add(s.context); a.add(s.activeTemplate); a.add(s.job);
     a.add(s.appliedSeq); a.add(s.light); a.add(s.planId); a.add(s.remainingS); a.add(s.provisionalS);
     a.add(s.syncAvailable); a.add(s.syncEnabled); a.add(s.rounds); a.add(s.due);
     a.add(s.retrySkip); a.add(s.pending); a.add(s.commitSeq);

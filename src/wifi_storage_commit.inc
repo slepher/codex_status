@@ -2,6 +2,7 @@
 // transactions together. Prepared slots are invisible until this record changes.
 static constexpr size_t WIFI_TRANSACTION_MAX=4096, WIFI_COMMIT_BYTES=32;
 static bool wifiStorageSplit=false, wifiStorageCleanupPending=false;
+static uint8_t wifiTransactionFormat=0;
 static size_t wifiConfigurationBytes=0, wifiTransactionBytes=0;
 static const char *wifiConfigKey(unsigned slot){return slot?"config1":"config0";}
 static const char *wifiTransactionKey(unsigned slot){return slot?"txn1":"txn0";}
@@ -28,17 +29,18 @@ static bool wifiCommitRead(Preferences &p,uint8_t *record){
         wifiWord(record,16)>=24 && wifiWord(record,16)<=WIFI_TRANSACTION_MAX;
 }
 static bool wifiDecodeTransactions(WifiBlob &blob,WifiStore &out){
-    auto *b=blob.data.get();if(blob.size<24 || memcmp(b,"WTX1",4) || b[4]!=1 || b[5]>8 || b[6] || b[7]>8 || wifiWord(b,8)!=blob.size)return false;
+    auto *b=blob.data.get();const bool sequences=blob.size>=24 && !memcmp(b,"WTX2",4);
+    if(blob.size<24 || memcmp(b,sequences?"WTX2":"WTX1",4) || b[4]!=(sequences?2:1) || b[5]>8 || b[6] || b[7]>8 || wifiWord(b,8)!=blob.size)return false;
     uint32_t crc=wifiWord(b,12);wifiSetWord(b,12,0);bool intact=crc==v2Crc32(b,blob.size);wifiSetWord(b,12,crc);if(!intact)return false;
     WifiReader r{b,blob.size,16};out.executionGeneration=r.integer(8);
     if(!out.receipts.resize(b[7]) || !out.cursors.resize(b[5]))return false;
-    for(auto &receipt:out.receipts)if(!r.receipt(receipt))return false;
+    for(auto &receipt:out.receipts)if(!r.receipt(receipt,true,sequences))return false;
     for(auto &c:out.cursors){size_t length=r.integer(2),start=r.pos;c.high=r.integer(8);
         if(!r.okay || length>r.size-start || !r.text(c.bridge,64) || !r.text(c.bond,21) || r.pos-start!=length)return false;}
     return r.okay && r.pos==r.size && wifiStoreShape(out);
 }
 static __attribute__((noinline)) bool readWifiStore(Preferences &p,WifiStore &out){
-    wifiStorageSplit=false;wifiConfigurationBytes=wifiTransactionBytes=wifiStorageBytes=0;
+    wifiStorageSplit=false;wifiTransactionFormat=0;wifiConfigurationBytes=wifiTransactionBytes=wifiStorageBytes=0;
     if(!p.isKey("commit")){
         if(wifiPreparedKeys(p))return false; // Missing selector must never roll back to an older ledger.
         WifiBlob old;if(!old.read(p,"store3",WIFI_STORAGE_MAX) || !wifiDecode4(old.data.get(),old.size,out))return false;
@@ -62,6 +64,7 @@ static __attribute__((noinline)) bool readWifiStore(Preferences &p,WifiStore &ou
     {
         WifiBlob txn;if(!txn.read(p,wifiTransactionKey(record[5]),WIFI_TRANSACTION_MAX) || txn.size!=wifiWord(record,16) ||
             v2Crc32(txn.data.get(),txn.size)!=wifiWord(record,20) || !wifiDecodeTransactions(txn,out))return false;
+        wifiTransactionFormat=txn.data[4];
     }
     wifiStorageSplit=true;wifiStorageFormat=4;wifiConfigurationBytes=wifiWord(record,8);wifiTransactionBytes=wifiWord(record,16);
     wifiStorageBytes=wifiConfigurationBytes+wifiTransactionBytes+WIFI_COMMIT_BYTES;
@@ -122,7 +125,7 @@ static bool saveV2(WifiStore &next){
     if(okay){
         // Preparation readback and the selector readback prove the pair. Failed
         // garbage collection cannot undo an already confirmed transaction.
-        wifiRetirePrepared(p,record);wifiStorageUncertain=false;wifiStorageSplit=true;wifiStorageFormat=4;
+        wifiRetirePrepared(p,record);wifiStorageUncertain=false;wifiStorageSplit=true;wifiStorageFormat=4;wifiTransactionFormat=2;
         wifiConfigurationBytes=wifiWord(record,8);wifiTransactionBytes=wifiWord(record,16);
         wifiStorageBytes=wifiVerifiedStorageBytes=wifiConfigurationBytes+wifiTransactionBytes+WIFI_COMMIT_BYTES;
         if(&next!=&wifiStore)wifiStore=std::move(next);

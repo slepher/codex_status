@@ -44,7 +44,8 @@ impl BleDevice {
                         if f.size >= HEADER_LEN + base.len() {
                             value["padding"] = json!("x".repeat(f.size - HEADER_LEN - base.len()));
                             let payload = serde_json::to_vec(&value).unwrap();
-                            header.payload_len = payload.len() as u16;
+                            if kind == "wrong_session" { header.session = [0xf;16]; }
+                    header.payload_len = payload.len() as u16;
                             bytes = header.encode().unwrap().to_vec();
                             bytes.extend_from_slice(&payload);
                         } else { bytes.resize(f.size, b'x'); }
@@ -55,7 +56,7 @@ impl BleDevice {
                 } else { bytes.resize(f.size, b'x'); }
             }
         }
-        if matches!(kind, "wrong_request" | "wrong_wake" | "wrong_mac" | "wrong_session" | "wrong_op") {
+        if matches!(kind, "wrong_request" | "wrong_wake" | "wrong_mac" | "wrong_session" | "wrong_boot" | "wrong_op") {
             let frame_header = Header::decode(&bytes, 8192).ok().map(|(h,p)| (h,p.to_vec()));
             let json_bytes = frame_header.as_ref().map_or(bytes.as_slice(), |(_,p)| p.as_slice());
             if let Ok(mut value) = serde_json::from_slice::<Value>(json_bytes) {
@@ -64,11 +65,16 @@ impl BleDevice {
                     "wrong_request" => { value["rid"] = json!("c3RhbGU="); value["request_id"] = json!("stale"); },
                     "wrong_wake" => value["w"][1] = json!(self.wake.1.saturating_add(1)),
                     "wrong_mac" => value["device_mac"] = json!("AA:BB:CC:DD:EE:FF"),
-                    "wrong_session" => value["session_nonce"] = json!("f".repeat(32)),
+                    "wrong_session" => {},
+                    "wrong_boot" => {
+                        value["boot_id"] = json!("f".repeat(32));
+                        if value["s"].is_array() { value["s"][0] = json!("f".repeat(32)); }
+                    },
                     _ => unreachable!(),
                 }
                 let payload = serde_json::to_vec(&value).unwrap();
                 if let Some((mut header,_)) = frame_header {
+                    if kind == "wrong_session" { header.session = [0xf;16]; }
                     header.payload_len = payload.len() as u16;
                     bytes = header.encode().unwrap().to_vec();
                     bytes.extend_from_slice(&payload);

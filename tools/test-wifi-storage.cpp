@@ -26,6 +26,7 @@ void operator delete(void *p,const std::nothrow_t &) noexcept { ::operator delet
 void operator delete[](void *p,const std::nothrow_t &) noexcept { ::operator delete(p); }
 #define CODEX_WIFI_SETUP_HOST_TEST
 #include "../src/wifi_setup.cpp"
+#include "wifi-control-test-adapter.h"
 #include "../src/wifi_legacy.h"
 
 static const char *bond="02:00:00:00:00:02/1";
@@ -71,7 +72,7 @@ static void legacyFixture(int version,bool compressed) {
     assert(!wifiSchemesBegin()&&testNvsLegacyBlob==previous&&testNvsBlob.empty());
     WifiControlContext context;context.principal="installation";context.nameSpace=bond;context.claimed=true;context.until=30000;
     JsonDocument request;request["op"]="apply";request["bridge_id"]="installation";request["request_id"]="must-not-overwrite";
-    JsonDocument reply;assert(!deserializeJson(reply,wifiControlCommand(request,context,1000)));
+    JsonDocument reply;assert(!deserializeJson(reply,testWifiControlCommand(request,context,1000)));
     assert(reply["ok"]==false&&testNvsLegacyBlob==previous&&testNvsBlob.empty());
 
 }
@@ -81,7 +82,7 @@ int main() {
     for(size_t size=0;size<valid.size();++size) {auto cut=valid;cut.resize(size);refused(std::move(cut));}
     for(size_t i=0;i<valid.size();++i){auto broken=valid;broken[i]^=0x80;refused(std::move(broken));}
     auto broken=valid;broken.push_back(0);refused(broken);
-    for(auto [offset,value]:std::initializer_list<std::pair<size_t,uint8_t>>{{4,6},{5,9},{6,13},{7,9},{40,3},{41,22}}) {broken=valid;broken[offset]=value;reseal(broken);refused(broken);}
+    for(auto [offset,value]:std::initializer_list<std::pair<size_t,uint8_t>>{{4,7},{5,9},{6,13},{7,9},{40,3},{41,22}}) {broken=valid;broken[offset]=value;reseal(broken);refused(broken);}
     // Every stored row has independent framing; valid CRC cannot hide an
     // embedded NUL, duplicate id/mapping, excess bonds or mismatched active.
     broken=valid;broken[42]=0;reseal(broken);refused(broken);
@@ -103,8 +104,8 @@ int main() {
     const size_t configurationEnd=pos;
     for(size_t i=0;i<wfs4[7];++i) {
         size_t length=wfs4[pos]+256*wfs4[pos+1];
-        wfs4.erase(wfs4.begin()+pos+2+length-8,wfs4.begin()+pos+2+length);
-        length-=8;wfs4[pos]=length;wfs4[pos+1]=length>>8;pos+=2+length;
+        wfs4.erase(wfs4.begin()+pos+2+length-16,wfs4.begin()+pos+2+length);
+        length-=16;wfs4[pos]=length;wfs4[pos+1]=length>>8;pos+=2+length;
     }
     for(size_t i=0;i<4;++i)wfs4[8+i]=wfs4.size()>>(8*i);reseal(wfs4);
     testNvsBlob=wfs4;wifiExecutionGeneration=0;
@@ -149,16 +150,16 @@ int main() {
     for(long fault=0;fault<=140;++fault) {
         reset();auto initial=example(1,0);assert(saveV2(initial));auto previous=testNvsBlob;
         WifiControlContext context;context.principal="installation";context.nameSpace=bond;context.claimed=true;context.until=30000;
-        JsonDocument apply;apply["op"]="apply";apply["bridge_id"]="installation";apply["request_id"]="new";apply["expected_revision"]=wifiStore.revision;
+        JsonDocument apply;apply["op"]="apply";apply["bridge_id"]="installation";apply["request_id"]="new";apply["request_seq"]=1;apply["expected_revision"]=wifiStore.revision;
         auto n=apply["changes"].to<JsonArray>().add<JsonObject>();n["network_id"]="network-0";n["host_ssid"]="Host-0";n["ssid"]="Edited";n["credential"]="replace";n["password"]="new-password";
         allocationFaultInjected=false;
         testNvsCommitThenFailKey=fault==140?"commit":"";
-        failAllocation=fault;String result=wifiControlCommand(apply,context,1000);failAllocation=-1;testNvsCommitThenFailKey.clear();
+        failAllocation=fault;String result=testWifiControlCommand(apply,context,1000);failAllocation=-1;testNvsCommitThenFailKey.clear();
         if(allocationFaultInjected)++exercisedAllocationFailures;
         if(fault==140) {
             JsonDocument response;assert(!deserializeJson(response,result)&&response["error"]=="storage_unknown");
-            JsonDocument query;query["op"]="result";query["bridge_id"]="installation";query["query_id"]="new";
-            assert(!deserializeJson(response,wifiControlCommand(query,context,1000))&&response["outcome"]=="committed"&&response["revision"]==11);
+            JsonDocument query;query["op"]="result";query["bridge_id"]="installation";query["query_id"]="new";query["request_seq"]=1;
+            assert(!deserializeJson(response,testWifiControlCommand(query,context,1000))&&response["outcome"]=="committed"&&response["revision"]==11);
         }
         assert(wifiSchemesBegin());
         if(wifiStore.revision==11) {assert(wifiStore.receipts.size()==1&&!strcmp(wifiStore.receipts[0].request,"new"));}
@@ -198,7 +199,7 @@ int main() {
     TestNvsKeys after;assert(testNvsKeys(after));assert(after.at("config0")==before.at("config0")&&!after.count("config1"));
     assert(!testNvsWrites["config0"]&&!testNvsWrites["config1"]);
     const auto &cfg=after.at("config0");assert(!memcmp(cfg.data(),"WFS4",4)&&!cfg[5]&&!cfg[7]);
-    const auto &tx=after.at("txn1");assert(!memcmp(tx.data(),"WTX1",4));
+    const auto &tx=after.at("txn1");assert(!memcmp(tx.data(),"WTX2",4));
     assert(std::search(tx.begin(),tx.end(),std::begin("test-password"),std::end("test-password")-1)==tx.end());
     testNvsWrites.clear();auto unchanged=wifiStore;assert(saveV2(unchanged)&&testNvsWrites.empty());
     // A failed retirement leaves a verified new commit and bounded old slots;
@@ -231,7 +232,7 @@ int main() {
     for(int fault=0;fault<4;++fault){reset();auto first=example(1,1);testNvsFailAfter=fault;
         assert(!saveV2(first));testNvsFailAfter=-1;assert(wifiSchemesBegin()&&schemes.networks.size()==0&&wifiStore.receipts.size()==0);}
     testNvsBlob=complete;assert(wifiSchemesBegin());
-    std::cout<<"WFS4 + WTX1: compatible import, zero config writes for receipts, atomic split commit faults, unknown original result, cleanup and corruption passed\n";
+    std::cout<<"WFS4 + WTX2: compatible import, zero config writes for receipts, atomic split commit faults, unknown original result, cleanup and corruption passed\n";
     // Isolate production clone+encode+readback; exclude host NVS vectors from
     // logical target budgets. Measured host delta includes its vector resize.
     for(auto [networks,receipts]:std::initializer_list<std::pair<size_t,size_t>>{{0,0},{1,1},{2,2},{12,8}}) {

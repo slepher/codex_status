@@ -10,8 +10,6 @@ struct State {
     uint32_t syncLogWakeSeq = 0;
     bool syncLogReady = false;
     uint32_t lastBridgeContactMs = 0;
-    uint32_t       v2HistorySyncMs = 0;
-    uint64_t       v2HistorySyncUntilMs = 0;
     bool syncEnabled = false;
     String syncOwner;
     bool syncOpenThisWake = false;
@@ -44,6 +42,7 @@ void syncReply(const char *op, const char *result, const char *error,
 void syncBatchFields(JsonDocument &doc, const SyncStoreBatch &batch);
 uint64_t httpUntil(uint64_t now);
 void dataApplied(uint64_t seq);
+void networkWorkCompleted(const char *purpose);
 void handleSyncBegin();
 void handleSyncPage();
 void handleSyncAck();

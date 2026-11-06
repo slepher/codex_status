@@ -54,13 +54,13 @@ struct Client {
     Ap01Application &app;
     uint64_t number = 0;
     uint8_t session[16] = {1};
-    std::string nonce, token="0123456789abcdef0123456789abcdef";
+    std::string token="0123456789abcdef0123456789abcdef";
     Ap01HttpReply send(unsigned op, const char *path, const std::string &payload, const char *id="", const char *offset="") {
         CompactFrameHeader h; h.op=op; h.requestNo=++number; h.payloadLen=payload.size(); memcpy(h.session, session, 16);
         uint8_t header[48]; assert(compactFrameEncode(h, header));
         std::string bytes((const char *)header, 48); bytes+=payload;
         auto r=req("POST",path,token.c_str(),bytes); r.contentType="application/vnd.codex-status.frame";
-        r.requestId=id; r.offset=offset; r.nonce=nonce.c_str();
+        r.requestId=id; r.offset=offset;
         auto reply=app.businessHttp(r,1000+number);
         if (reply.frame) { CompactFrameHeader response; assert(compactFrameDecode((const uint8_t *)reply.bytes.c_str(),reply.bytes.length(),response,4096)); memcpy(session,response.session,16); }
         return reply;
@@ -69,7 +69,7 @@ struct Client {
     std::string command(const char *id) { return std::string("\"bridge_id\":\"bridge-test\",\"device_mac\":\"AABBCCDDEEFF\",\"request_id\":\"")+id+"\""; }
     void status() {
         auto reply=send(1,"/api/status","{}"); assert(reply.status==200);
-        LocalJsonAllocator a; JsonDocument doc(&a); assert(!deserializeJson(doc,body(reply).c_str())); nonce=doc["session_nonce"].as<const char *>();
+        LocalJsonAllocator a; JsonDocument doc(&a); assert(!deserializeJson(doc,body(reply).c_str())); assert(doc["session_nonce"].isNull()); assert(!doc["boot_id"].isNull());
     }
     void claim() { auto reply=send(4,"/claim","{\"device_mac\":\"AABBCCDDEEFF\",\"bridge_id\":\"bridge-test\"}"); assert(reply.status==200); }
     Ap01HttpReply publish(const std::string &bundle,const char *id) {
@@ -186,6 +186,18 @@ int main(int argc,char **argv) {
         app.businessOnline(true);
         binaryHttp(app);
         Client client{app}; client.status(); client.claim();
+        auto firstStatus=client.send(1,"/api/status","{}");
+        LocalJsonAllocator identityAllocator;JsonDocument firstIdentity(&identityAllocator),reconnectedIdentity(&identityAllocator);
+        assert(!deserializeJson(firstIdentity,client.body(firstStatus).c_str()));
+        client.session[0]^=0x80;
+        auto stale=client.send(4,"/claim","{\"device_mac\":\"AABBCCDDEEFF\",\"bridge_id\":\"bridge-test\"}");
+        assert(stale.status==409 && client.body(stale).find("session")!=std::string::npos);
+        client.session[0]^=0x40; // Explicitly reopen the transport session.
+        auto reopened=client.send(1,"/api/status","{}");assert(reopened.status==200);
+        assert(!deserializeJson(reconnectedIdentity,client.body(reopened).c_str()));
+        assert(firstIdentity["boot_id"].as<String>()==reconnectedIdentity["boot_id"].as<String>());
+        assert(reconnectedIdentity["session_nonce"].isNull());
+
         char crc[9]; snprintf(crc,9,"%08x",v2Crc32((const uint8_t *)bundle.data(),bundle.size()));
         std::string envelope="{"+client.command("bundle-test")+",\"length\":"+std::to_string(bundle.size())+",\"content_crc\":\""+crc+"\"}";
         auto begin=client.send(10,"/api/bundle/begin",envelope); assert(begin.status==200);

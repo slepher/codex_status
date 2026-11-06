@@ -294,6 +294,19 @@ fn connection_from_disk<'de,D:serde::Deserializer<'de>>(d:D)->std::result::Resul
     }).transpose()
 }
 
+fn jobs_from_disk<'de,D:serde::Deserializer<'de>>(d:D)->std::result::Result<Vec<Job>,D::Error> {
+    let rows=Vec::<Value>::deserialize(d)?;
+    rows.into_iter().map(|mut row| {
+        if row.get("request_seq").is_none() {
+            let sequence=row["request_id"].as_str().and_then(|id|id.strip_prefix("w3_"))
+                .filter(|s|s.len()==16 && s.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+                .and_then(|s|u64::from_str_radix(s,16).ok()).unwrap_or(0);
+            row["request_seq"]=json!(sequence);
+        }
+        serde_json::from_value(row).map_err(serde::de::Error::custom)
+    }).collect()
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WifiState {
@@ -307,6 +320,7 @@ pub struct WifiState {
     pub targets: Vec<Network>,
     pub snapshot: Option<Snapshot>,
     pub baseline: BTreeMap<String, Value>,
+    #[serde(deserialize_with="jobs_from_disk")]
     pub jobs: Vec<Job>,
     #[serde(default, rename="connection", deserialize_with="connection_from_disk")]
     pub connection_facts: Option<ConnectionFacts>,
@@ -326,6 +340,8 @@ pub struct Settlement {
 pub struct Job {
     pub job_id: String,
     pub request_id: String,
+    #[serde(default)]
+    pub request_seq: u64,
     pub device_mac: String,
     pub bridge_id: String,
     #[serde(default, skip_serializing_if="Option::is_none")]
@@ -375,7 +391,7 @@ impl Job {
     /// Historical reconciliation is query-only and never creates a wake intent.
     pub fn settlement_due(&self, now: u64) -> bool {
         self.terminal() && (self.receipt_ack_pending || self.confirmation_pending())
-            && self.request_id.starts_with("w3_")
+            && self.request_seq > 0
             && self.transaction_namespace.as_deref().is_some_and(|s| !s.is_empty())
             && self.settlement.as_ref().is_none_or(|s| s.attempts < 3 && now >= s.next_attempt_at)
     }
@@ -438,6 +454,33 @@ impl Job {
 #[cfg(test)]
 mod retirement_tests {
     use super::*;
+    #[test]
+    fn disk_sequence_migration_preserves_unknown_original_identity_and_counter() {
+        let mut state=WifiState::default();
+        state.queue("0200000000D4","bridge-test","activate",vec!["home".into()],100,"original".into(),BTreeMap::new()).unwrap();
+        let mut disk=serde_json::to_value(&state).unwrap();
+        disk["next_job_seq"]=json!(0);
+        let job=&mut disk["jobs"][0];
+        job["request_id"]=json!("w3_0000000000000007");
+        job.as_object_mut().unwrap().remove("request_seq");
+        job["sent"]=json!(true);job["may_have_committed"]=json!(true);job["state"]=json!("cancelled");
+        let mut migrated:WifiState=serde_json::from_value(disk.clone()).unwrap();
+        assert_eq!(migrated.jobs[0].request_id,"w3_0000000000000007");
+        assert_eq!(migrated.jobs[0].request_seq,7);
+        assert!(migrated.jobs[0].confirmation_pending());
+        let next=migrated.queue("0200000000D4","bridge-test","activate",vec!["home".into()],101,"new-opaque-id".into(),BTreeMap::new()).unwrap();
+        assert_eq!(next.request_id,"new-opaque-id");assert_eq!(next.request_seq,8);
+        let restored:WifiState=serde_json::from_value(serde_json::to_value(migrated).unwrap()).unwrap();
+        assert_eq!(restored.jobs[0].request_seq,7);assert!(restored.jobs[0].confirmation_pending());
+        disk["jobs"][0]["request_seq"]=json!(19);
+        let explicit:WifiState=serde_json::from_value(disk.clone()).unwrap();
+        assert_eq!(explicit.jobs[0].request_seq,19,"explicit sequence never parses the opaque ID");
+        disk["jobs"][0].as_object_mut().unwrap().remove("request_seq");
+        disk["jobs"][0]["request_id"]=json!("unsequenced-original");
+        let legacy:WifiState=serde_json::from_value(disk).unwrap();
+        assert_eq!(legacy.jobs[0].request_seq,0);assert!(legacy.jobs[0].confirmation_pending());
+    }
+
     #[test]
     fn accepted_evidence_respects_reply_source() {
         for stage in ["accepted", "connecting"] {
@@ -624,7 +667,9 @@ impl WifiState {
         if self.jobs.len() >= 32 { bail!("wifi_job_capacity"); }
         let before = self.snapshot.as_ref().map(|s| s.networks.iter().filter(|n| n.writable && selected.contains(&n.network.network_id))
             .map(|n| (n.network.network_id.clone(), n.network.metadata())).collect()).unwrap_or_default();
-        let j = Job { request_id: if self.next_job_seq>0 { format!("w3_{:016x}",self.next_job_seq) } else { job_id.clone() }, job_id, device_mac: mac.into(), bridge_id: bridge.into(), kind: kind.into(),
+        self.next_job_seq = self.next_job_seq.max(self.jobs.iter().map(|j|j.request_seq).max().unwrap_or(0)
+            .checked_add(1).context("wifi_id_exhausted")?);
+        let j = Job { request_id: job_id.clone(), request_seq: self.next_job_seq, job_id, device_mac: mac.into(), bridge_id: bridge.into(), kind: kind.into(),
             transaction_namespace: None, state: "queued".into(), execution_intent: ExecutionIntent::Active, created_at: now, expires_at: now.saturating_add(INTENT_TTL_S), updated_at: now,
             local_revision: self.local_revision, attempt_count: 0, confirmation_attempts: 0, last_attempt_at: None, next_attempt_at: now,
             last_stage: "accepted".into(), error_code: None, sent: false, may_have_committed: false,
@@ -772,7 +817,7 @@ impl WifiState {
             snapshot.revision = revision; snapshot.snapshot_id = job.request_id.clone(); snapshot.observed_at = now;
             let result = self.confirm_sync(job_id, snapshot, true, now)?;
             let current = self.jobs.iter_mut().find(|j| j.job_id == job_id).unwrap();
-            current.last_stage = "committed_receipt".into(); current.confirmation = Some("durable_receipt".into()); current.receipt_ack_pending=current.request_id.starts_with("w3_");
+            current.last_stage = "committed_receipt".into(); current.confirmation = Some("durable_receipt".into()); current.receipt_ack_pending=current.request_seq > 0;
             let _ = result; return Ok(current.clone());
         }
         for frozen in &job.frozen {
@@ -783,7 +828,7 @@ impl WifiState {
         }
         let j = self.jobs.iter_mut().find(|j| j.job_id == job_id).unwrap();
         j.state = "completed".into(); j.updated_at = now; j.last_stage = "committed_receipt".into();
-        j.confirmed_revision = Some(revision); j.confirmation = Some("durable_receipt".into()); j.receipt_ack_pending=j.request_id.starts_with("w3_"); j.error_code = None;
+        j.confirmed_revision = Some(revision); j.confirmation = Some("durable_receipt".into()); j.receipt_ack_pending=j.request_seq > 0; j.error_code = None;
         Ok(j.clone())
     }
     pub fn import(&mut self, selected: &[String], expected: u64, now: u64) -> Result<()> {

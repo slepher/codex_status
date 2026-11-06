@@ -72,6 +72,7 @@ struct Retained {
     uint32_t rtcActiveAt = 0;
     char     rtcActiveMac[20] = {0};
     uint32_t rtcLastSyncEpoch = 0;
+    BridgeContactState bridgeContact;
 
     // Why AP config mode was entered last (0 none, 1 no saved slots, 2 BOOT held
     // 15 s). Kept in RTC memory for post-mortem /status.json reads.
@@ -88,6 +89,7 @@ String macText();
 WifiPhase wifiPhase();
 void serviceWifiMetadata();
 void markSynced();
+void noteBridgeContact(const String &principal);
 String ipText();
 void updateInfoExtra();
 int countWifiSlots();

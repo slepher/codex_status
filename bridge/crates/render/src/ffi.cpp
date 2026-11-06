@@ -1496,7 +1496,7 @@ int codex_ble_wire(const char *kind, const char *input, char *out, int cap) {
         bytes = bleBuildInfo(snapshot);
     } else if (!strcmp(kind, "status")) {
         BleStatusSnapshot snapshot;
-        snapshot.mac = text("device_mac"); snapshot.nonce = text("session_nonce");
+        snapshot.mac = text("device_mac"); snapshot.bootId = text("boot_id");
         snapshot.context = text("active_context_id"); snapshot.activeTemplate = text("active_template_id");
         snapshot.commitSeq = doc["commit_seq"] | 0u;
         snapshot.job = text("committed_job_id"); snapshot.appliedSeq = doc["applied_seq"] | 0ULL;
@@ -1545,7 +1545,7 @@ int codex_v2_status_snapshot(const char *input, char *out, int cap) {
     if (deserializeJson(doc, input)) return -2;
     V2StatusSnapshot snapshot;
     snapshot.mac = doc["mac"] | "";
-    snapshot.sessionNonce = doc["session_nonce"] | "";
+    snapshot.bootId = doc["boot_id"] | "";
     snapshot.firmwareVersion = doc["firmware_version"] | "";
     BsProfile profile{};
     const char *context = doc["context"] | "";

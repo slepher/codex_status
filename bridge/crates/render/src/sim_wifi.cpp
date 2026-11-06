@@ -2,6 +2,7 @@
 #define CODEX_WIFI_SETUP_HOST_TEST
 #define CODEX_WIFI_SIM
 #include "../../../..//src/wifi_setup.cpp"
+#include "../../../../tools/wifi-control-test-adapter.h"
 #include <fstream>
 #include <cstdio>
 std::string wifiBlobPath;
@@ -52,7 +53,7 @@ extern "C" int codex_sim_wifi_control(const char *input,const char *principal,co
     JsonDocument doc;if(deserializeJson(doc,input))return -1;
     WifiControlContext ctx;ctx.principal=principal;ctx.nameSpace=nameSpace;ctx.generation=generation;ctx.until=until;ctx.physicalUntil=physical;
     ctx.claimed=claimed!=0;ctx.sessionValid=sessionValid!=0;
-    String response=wifiControlCommand(doc,ctx,now,simWifiLegacy);if(response.length()>=(size_t)cap)return -2;
+    String response=testWifiControlCommand(doc,ctx,now,simWifiLegacy);if(response.length()>=(size_t)cap)return -2;
     memcpy(out,response.c_str(),response.length()+1);return response.length();
 }
 

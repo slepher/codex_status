@@ -68,11 +68,7 @@ static void traceFinishInterrupted();
 static uint8_t traceFinalResult();
 static void histAddFull(uint8_t ev, uint16_t aux, uint32_t, uint8_t);
 static const char *wakeResultName(uint8_t result);
-static bool traceGetComplete(uint32_t seq, WakeTraceRec &out);
 static uint32_t traceEarliestComplete();
-static uint32_t traceLatestComplete();
-static bool traceRecordActive(uint32_t seq);
-static void traceAppendRow(JsonArray arr, const WakeTraceRec &r, bool compact = false);
 static String pmStatsText();
 static String timerStatsText();
 static String sleepDiagText();
@@ -687,23 +683,6 @@ void handleLog() {
     transport::state.server.send(200, "text/plain; charset=utf-8", DevLog.dump());
 }
 
-static bool traceGetComplete(uint32_t seq, WakeTraceRec &out) {
-    if (!seq || seq > histCount) return false;
-    if (traceCurrent() && rtcTraceShadow.seq == seq && traceValid(rtcTraceShadow)) {
-        out = rtcTraceShadow;
-        out.awake_ms = millis() - traceStartMs;
-        return true;
-    }
-    for (uint16_t offset = 0, next = 0; offset < sync::retained.syncRtc.used; offset = next) {
-        SyncRecord record;
-        if (!syncReadAt(sync::retained.syncRtc, offset, record, next)) break;
-        if (record.kind != SYNC_WAKE_SUMMARY || record.payloadLen != sizeof(out)) continue;
-        memcpy(&out, record.payload, sizeof(out));
-        if (out.seq == seq && traceValid(out)) return true;
-    }
-    return false;
-}
-
 static uint32_t traceEarliestComplete() {
     for (uint16_t offset = 0, next = 0; offset < sync::retained.syncRtc.used; offset = next) {
         SyncRecord record;
@@ -715,113 +694,6 @@ static uint32_t traceEarliestComplete() {
     }
     if (traceCurrent() && traceValid(rtcTraceShadow)) return rtcTraceShadow.seq;
     return 0;
-}
-
-static uint32_t traceLatestComplete() {
-    if (traceCurrent() && traceValid(rtcTraceShadow)) return rtcTraceShadow.seq;
-    uint32_t latest = 0;
-    for (uint16_t offset = 0, next = 0; offset < sync::retained.syncRtc.used; offset = next) {
-        SyncRecord record;
-        if (!syncReadAt(sync::retained.syncRtc, offset, record, next)) break;
-        if (record.kind != SYNC_WAKE_SUMMARY || record.payloadLen != sizeof(WakeTraceRec)) continue;
-        WakeTraceRec wake;
-        memcpy(&wake, record.payload, sizeof(wake));
-        if (traceValid(wake)) latest = wake.seq;
-    }
-    return latest;
-}
-
-static bool traceRecordActive(uint32_t seq) {
-    return seq && seq == retained.rtcTraceCurrentSeq && traceCurrent() &&
-           traceCurrent()->seq == seq;
-}
-
-static void traceAppendRow(JsonArray arr, const WakeTraceRec &r, bool compact) {
-    if(compact){wakeTraceCompactRow(arr,r,!traceRecordActive(r.seq));return;}
-    JsonObject item = arr.add<JsonObject>();
-    item["format"] = TRACE_FORMAT;
-    item["wake_generation"] = r.wake_generation;
-    item["seq"] = r.seq;
-    item["wake_type"] = traceWakeTypeName(r.wake_type);
-    if (!compact) {
-        item["wake_cause"] = wakeCauseName((esp_sleep_wakeup_cause_t)r.wake_cause);
-        item["ext1"] = r.ext1;
-    }
-    item["awake_ms"] = r.awake_ms;
-    item["result"] = traceResultName(r.result);
-    item["complete"] = !traceRecordActive(r.seq);
-    if (!compact) item["error"] = r.error;
-    if (compact) item["stage"] = r.furthest;
-    else item["stage"] = traceStageName(r.furthest);
-    JsonArray timing = item["timing"].to<JsonArray>();
-    for (uint8_t i = 0; i < TRACE_STAGE_COUNT; ++i)
-        timing.add((uint32_t)r.timing[i] * 100u);
-    if (!compact && r.request_crc) item["request_crc"] = r.request_crc;
-    item["transport"] = traceTransportName(r.transport);
-}
-
-String traceHistoryJson(uint32_t since, uint8_t limit, size_t maxBytes,
-                               bool &more) {
-    if (!limit) limit = 1;
-    if (limit > HIST_CAP) limit = HIST_CAP;
-    const uint32_t latest = traceLatestComplete();
-    const uint32_t earliest = traceEarliestComplete();
-    JsonDocument doc;
-    doc["wake_generation"] = retained.rtcWakeGeneration;
-    doc["earliest_seq"] = earliest;
-    doc["latest_seq"] = latest;
-    JsonArray records = doc["records"].to<JsonArray>();
-    more = false;
-    uint8_t added = 0;
-    if (earliest && latest) {
-        for (uint32_t seq = earliest; seq <= latest; ++seq) {
-            if (seq <= since) continue;
-            WakeTraceRec r;
-            if (!traceGetComplete(seq, r)) continue;
-            if (added >= limit) { more = true; break; }
-            traceAppendRow(records, r, true);
-            String probe;
-            serializeJson(doc, probe);
-            if (probe.length() > maxBytes && added == 0) {
-                records.remove(records.size() - 1);
-                more = true;
-                break;
-            }
-            if (probe.length() > maxBytes) {
-                records.remove(records.size() - 1);
-                more = true;
-                break;
-            }
-            added++;
-        }
-    }
-    doc["more"] = more;
-    String out;
-    serializeJson(doc, out);
-    return out;
-}
-
-// GET /history keeps its array shape and incremental `since` semantics.
-void handleHistory() {
-    uint32_t since = 0;
-    if (transport::state.server.hasArg("since")) {
-        long long v = transport::state.server.arg("since").toInt();
-        if (v > 0) since = (uint32_t)v;
-    }
-    JsonDocument doc;
-    JsonArray arr = doc.to<JsonArray>();
-    const uint32_t earliest = traceEarliestComplete();
-    const uint32_t latest = traceLatestComplete();
-    if (earliest && latest) {
-        for (uint32_t seq = earliest; seq <= latest; ++seq) {
-            if (seq <= since) continue;
-            WakeTraceRec r;
-            if (traceGetComplete(seq, r)) traceAppendRow(arr, r);
-        }
-    }
-    String out;
-    serializeJson(doc, out);
-    transport::state.server.send(200, "application/json", out);
 }
 
 // PM light-sleep counters (CONFIG_PM_PROFILING) for remote diagnostics.
@@ -1229,7 +1101,7 @@ static __attribute__((noinline)) void buildPlatformStatus(JsonDocument &doc) {
     V2StatusSnapshot snapshot;
     snapshot.mac = radio::macText();
     snapshot.firmwareVersion = application::state.firmwareVersion;
-    snapshot.sessionNonce = transport::v2Nonce();
+    snapshot.bootId = transport::bootId();
     snapshot.profile = &platform::state.v2Profile;
     snapshot.configured = platform::state.v2BundleReady;
     snapshot.compiled = platform::state.v2CtValid ? &platform::state.v2Ct : nullptr;
@@ -1347,6 +1219,8 @@ void handleV2Status() {
     offlineLogStatus(clock::timeKnown() ? (uint64_t)time(nullptr) : 0,doc["offline_log"].to<JsonObject>());
     OwnerRec owner;
     sync["enabled"] = sync::state.syncEnabled && ownerGet(owner) && owner.id == sync::state.syncOwner;
+    sync["open_id"] = sync::state.syncOpenId;
+    sync["reason"] = sync::state.syncOpenReason;
     sync["phase"] = sync::state.syncOpenThisWake ? "WIFI_SYNC_ONCE" :
                     power::retained.rtcMode == MODE_LIGHT ? "WIFI_LIGHT" : "DEEP";
     const uint64_t syncUntil = sync::state.syncOpenAnsweredAt + 90000;

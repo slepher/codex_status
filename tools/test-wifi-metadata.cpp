@@ -1,6 +1,27 @@
 #include "network_display_state.h"
 #include <cassert>
 int main() {
+    BridgeContactState contact;
+    const uint32_t lastData = 1700000000;
+    // No Data or Plan for half an hour: authenticated contacts alone stay on.
+    for (uint32_t elapsed = 0; elapsed <= 1800; elapsed += 30) {
+        contact.observed(lastData + elapsed);
+        assert(contact.offlineMinutes(lastData + elapsed + 29, lastData, true, 6, -1) == -1);
+    }
+    assert(contact.offlineMinutes(lastData + 1800 + 419, lastData, true, 6, -1) == -1);
+    assert(contact.offlineMinutes(lastData + 1800 + 420, lastData, true, 6, -1) == 7);
+    contact.failed = true;
+    assert(contact.offlineMinutes(lastData + 1801, lastData, true, 6, -1) == 0);
+    contact.observed(lastData + 1802); // BLE can recover display without Wi-Fi success.
+    assert(contact.offlineMinutes(lastData + 1802, lastData, true, 6, -1) == -1);
+    BridgeContactState retained = contact;
+    assert(retained.offlineMinutes(lastData + 1803, lastData, true, 6, -1) == -1);
+    BridgeContactState cold;
+    assert(cold.offlineMinutes(0, 0, false, 6, -1) == -1);
+    cold.observed(0);
+    assert(cold.epoch == 0);
+    assert(sizeof(BridgeContactState) == 8); // fixed RTC footprint; no heap/NVS
+
     assert(bridgeOfflineMinutes(1700000010,1700000000,true,6,-1,true)==0);
     assert(bridgeOfflineMinutes(1700000010,1700000000,true,6,-1,false)==-1);
     assert(bridgeOfflineMinutes(0,0,false,6,-1,true)==0);

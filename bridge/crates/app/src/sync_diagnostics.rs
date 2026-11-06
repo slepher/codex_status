@@ -435,7 +435,7 @@ pub async fn transfer_with_budget(data_root: &Path, link: &DeviceLink, budget: b
     if status["sync_v1"] != 1 || status["sync"]["enabled"] != true {
         return Ok(json!({"result":"unsupported_or_disabled"}));
     }
-    let nonce = status["session_nonce"].as_str().context("sync session nonce missing")?;
+    let boot_id = status["boot_id"].as_str().context("sync boot identity missing")?;
     let mut store = Store::open(data_root, &compact_mac, &link.bridge_id)?;
     store.retire_lost_ack(&status)?;
     let mut request = 0u32;
@@ -443,7 +443,7 @@ pub async fn transfer_with_budget(data_root: &Path, link: &DeviceLink, budget: b
         request += 1;
         let id = format!("sync-{op}-{request}");
         device_client::sync(&link.ip, &link.token, &wire_mac, &link.bridge_id,
-            nonce, op, &id, &fields, budget.remaining().min(timeout)).await
+            boot_id, op, &id, &fields, budget.remaining().min(timeout)).await
     };
     if store.awaiting_ack() {
         let id = store.batch_id().context("missing completed batch id")?.to_owned();

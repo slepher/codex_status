@@ -34,12 +34,12 @@ fn convert_file(input:&Path,output:&Path)->Result<(usize,usize)> {
 fn main()->Result<()> {
     let args:Vec<_>=std::env::args_os().skip(1).collect();
     if args.len()==1 && args[0]=="--help" {
-        println!("wifi-store-convert INPUT_BLOB NEW_OUTPUT_BLOB\nAccepts WFS3/WFS4/WFS5 and verified Note4 v1/v2/WFZ2 layouts; emits a historical WFS5 archive without boot recovery; NOT a deployable device store.\nUse private existing directories. Does not overwrite or deploy. Other legacy ABIs are unsupported.");
+        println!("wifi-store-convert INPUT_BLOB NEW_OUTPUT_BLOB\nAccepts WFS3/WFS4/WFS5/WFS6 and verified Note4 v1/v2/WFZ2 layouts; emits a WFS6 archive without boot recovery; NOT a deployable device store.\nUse private existing directories. Does not overwrite or deploy. Other legacy ABIs are unsupported.");
         return Ok(());
     }
     anyhow::ensure!(args.len()==2,"usage: wifi-store-convert INPUT_BLOB NEW_OUTPUT_BLOB");
     let (before,after)=convert_file(Path::new(&args[0]),Path::new(&args[1]))?;
-    println!("Validated historical WFS5 archive (not deployable): {before} -> {after} bytes; input unchanged.");
+    println!("Validated WFS6 archive (not deployable): {before} -> {after} bytes; input unchanged.");
     Ok(())
 }
 
@@ -54,7 +54,7 @@ mod tests {
     fn fixture(version:u8,with_operation:bool)->Vec<u8> {
         let mut out=format!("WFS{version}").into_bytes();out.extend_from_slice(&[version,u8::from(with_operation),1,1]);out.extend_from_slice(&[0;8]);
         out.extend_from_slice(&7u64.to_le_bytes());out.extend_from_slice(&7u64.to_le_bytes());
-        if version==5 {out.extend_from_slice(&0u64.to_le_bytes());}out.push(1);
+        if version>=5 {out.extend_from_slice(&0u64.to_le_bytes());}out.push(1);
         field(&mut out,b"original-namespace");field(&mut out,b"home");
         let mut network=7u64.to_le_bytes().to_vec();
         for text in [b"original-namespace".as_slice(),b"home",b"Host",b"Device",b"fixture-password",b"Desk"] {field(&mut network,text);}
@@ -66,7 +66,8 @@ mod tests {
             receipt.extend_from_slice(&if with_operation {6u64}else{0}.to_le_bytes());
             field(&mut receipt,if with_operation {b"activate"}else{b""});field(&mut receipt,if with_operation {b"home"}else{b""});
         }
-        if version==5 {receipt.extend_from_slice(&0u64.to_le_bytes());}
+        if version>=5 {receipt.extend_from_slice(&0u64.to_le_bytes());}
+        if version>=6 {receipt.extend_from_slice(&if with_operation {9u64}else{0}.to_le_bytes());}
         out.extend_from_slice(&(receipt.len() as u16).to_le_bytes());out.extend_from_slice(&receipt);
         if with_operation {
             let mut cursor=12u64.to_le_bytes().to_vec();field(&mut cursor,b"principal");field(&mut cursor,b"original-namespace");
@@ -76,10 +77,10 @@ mod tests {
     }
     #[test]
     fn conversion_preserves_unknown_identity_fingerprint_and_operation() {
-        for version in [3,4,5] {
+        for version in [3,4,5,6] {
             let original=fixture(version,version>=4);
             let current=bridge_render::convert_wifi_storage(&original).unwrap();
-            assert_eq!(current,fixture(5,version>=4));
+            assert_eq!(current,fixture(6,version>=4));
             assert_eq!(bridge_render::convert_wifi_storage(&current).unwrap(),current);
             for size in 0..original.len() {assert!(bridge_render::convert_wifi_storage(&original[..size]).is_err());}
             for offset in 0..original.len() {
@@ -89,12 +90,12 @@ mod tests {
         let mut unknown=fixture(5,true);unknown[4]=6;seal(&mut unknown);
         assert!(bridge_render::convert_wifi_storage(&unknown).is_err());
         assert!(bridge_render::convert_wifi_storage(&vec![0;8193]).is_err());
-        let mut executing=fixture(5,true);
+        let mut executing=fixture(6,true);
         let network_at=41+1+b"original-namespace".len()+1+b"home".len();
         let receipt_at=network_at+2+u16::from_le_bytes(executing[network_at..network_at+2].try_into().unwrap()) as usize;
         let receipt_end=receipt_at+2+u16::from_le_bytes(executing[receipt_at..receipt_at+2].try_into().unwrap()) as usize;
         executing[32..40].copy_from_slice(&42u64.to_le_bytes());
-        executing[receipt_end-8..receipt_end].copy_from_slice(&42u64.to_le_bytes());seal(&mut executing);
+        executing[receipt_end-16..receipt_end-8].copy_from_slice(&42u64.to_le_bytes());seal(&mut executing);
         assert_eq!(bridge_render::convert_wifi_storage(&executing).unwrap(),executing,"offline conversion must not run boot interruption recovery");
         executing[receipt_end+2..receipt_end+10].copy_from_slice(&8u64.to_le_bytes());seal(&mut executing);
         assert!(bridge_render::convert_wifi_storage(&executing).is_err(),"cursor must fence the stored request sequence");
@@ -121,8 +122,8 @@ mod tests {
             }
             let converted=bridge_render::convert_wifi_storage(&raw).unwrap();
             assert_eq!(bridge_render::convert_wifi_storage(&converted).unwrap(),converted);
-            if v2 {assert_eq!(converted,fixture(5,false));} else {
-                assert_eq!(&converted[..8],b"WFS5\x05\x00\x01\x00");assert_eq!(&converted[16..40],&[0;24]);
+            if v2 {assert_eq!(converted,fixture(6,false));} else {
+                assert_eq!(&converted[..8],b"WFS6\x06\x00\x01\x00");assert_eq!(&converted[16..40],&[0;24]);
                 assert_eq!(converted[40],1);assert!(converted.windows(16).any(|w|w==b"fixture-password"));
             }
             for size in 0..raw.len() {assert!(bridge_render::convert_wifi_storage(&raw[..size]).is_err());}
@@ -145,7 +146,7 @@ mod tests {
     fn runtime_reads_deployed_wfs4_without_rewriting_and_rejects_archive_formats() {
         let root=std::env::temp_dir().join(format!("wifi-current-runtime-{}",std::process::id()));
         fs::create_dir(&root).unwrap();let path=root.join("wifi-schemes.bin");
-        for original in [vec![],fixture(3,false),fixture(4,true),fixture(5,true)] {
+        for original in [vec![],fixture(3,false),fixture(4,true),fixture(5,true),fixture(6,true)] {
             fs::write(&path,&original).unwrap();
             if original.get(4)==Some(&4) {
                 let mut sim=bridge_render::SimulatorWifi::new(&root).unwrap();
@@ -167,7 +168,7 @@ mod tests {
         assert!(convert_file(&input,&input).is_err());assert_eq!(fs::read(&input).unwrap(),original);
         fs::write(&staging,b"keep").unwrap();assert!(convert_file(&input,&output).is_err());assert_eq!(fs::read(&staging).unwrap(),b"keep");
         fs::remove_file(&staging).unwrap();convert_file(&input,&output).unwrap();
-        let converted=fs::read(&output).unwrap();assert_eq!(converted,fixture(5,true));assert!(!staging.exists());
+        let converted=fs::read(&output).unwrap();assert_eq!(converted,fixture(6,true));assert!(!staging.exists());
         assert!(convert_file(&input,&output).is_err());assert_eq!(fs::read(&output).unwrap(),converted);assert_eq!(fs::read(&input).unwrap(),original);
         fs::remove_file(input).unwrap();fs::remove_file(output).unwrap();fs::remove_dir(root).unwrap();
     }

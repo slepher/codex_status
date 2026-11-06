@@ -62,7 +62,7 @@ fn committed_job(fake: &Fake, svc: &PlatformService, namespace: &str, revision: 
     svc.wifi_bind_transaction(MAC, &job.job_id, "bridge-test", namespace).unwrap();
     svc.wifi_mark_sent(MAC, &job.job_id, now + 1).unwrap();
     // The carrier deliberately withholds this committed response from the Bridge.
-    let reply = fake.command("apply", json!({"request_id":job.request_id,"expected_revision":revision,
+    let reply = fake.command("apply", json!({"request_id":job.request_id,"request_seq":job.request_seq,"expected_revision":revision,
         "changes":[{"network_id":"home","host_ssid":"FakeHost","ssid":format!("Fake{revision}"),"credential":"open"}]})).unwrap();
     assert_eq!(reply["outcome"], "committed", "{reply}");
     svc.wifi_finish(MAC, &job.job_id, "cancelled", None, now + 2).unwrap()
@@ -88,7 +88,7 @@ fn stopped_job_settles_original_id_after_ack_loss_and_both_restarts() {
     })).unwrap().unwrap();
     assert_eq!(done.state, "cancelled"); assert!(!done.runnable(1000)); assert!(!done.receipt_ack_pending);
     assert_eq!(before, serde_json::to_value(svc.wifi_state(MAC).snapshot).unwrap());
-    assert_eq!(fake.command("result", json!({"query_id":job.request_id})).unwrap()["outcome"], "retired");
+    assert_eq!(fake.command("result", json!({"query_id":job.request_id,"request_seq":job.request_seq})).unwrap()["outcome"], "retired");
     assert_eq!(fake.command("snapshot", json!({})).unwrap()["revision"], 1);
 }
 
@@ -122,7 +122,7 @@ fn eight_device_receipts_and_thirty_two_bridge_jobs_require_proven_ack_to_releas
     let (_root, fake, svc, namespace) = fixture("capacity");
     let mut jobs = Vec::new();
     for n in 0..8 { jobs.push(committed_job(&fake, &svc, &namespace, n, 100 + n * 4)); }
-    let full = fake.command("apply", json!({"request_id":"w3_ffffffffffffffff","expected_revision":8,
+    let full = fake.command("apply", json!({"request_id":"capacity-probe","request_seq":u64::MAX,"expected_revision":8,
         "changes":[{"network_id":"home","host_ssid":"Host","ssid":"Extra","credential":"open"}]})).unwrap();
     assert_eq!(full["error"], "result_capacity", "{full}");
     for n in 8..32 {
@@ -142,11 +142,11 @@ fn eight_device_receipts_and_thirty_two_bridge_jobs_require_proven_ack_to_releas
     })).unwrap();
     let next = svc.wifi_queue_control(MAC, "bridge-test", "activate", json!({"network_id":"home","version":1}), 363).unwrap();
     assert_eq!(svc.wifi_state(MAC).jobs.len(), 32);
-    let accepted = fake.command("apply", json!({"request_id":next.request_id,"expected_revision":8,
+    let accepted = fake.command("apply", json!({"request_id":next.request_id,"request_seq":next.request_seq,"expected_revision":8,
         "changes":[{"network_id":"home","host_ssid":"Host","ssid":"Extra","credential":"open"}]})).unwrap();
     assert_eq!(accepted["outcome"], "committed", "{accepted}");
     for job in jobs.iter().skip(1) {
-        assert_eq!(fake.command("result", json!({"query_id":job.request_id})).unwrap()["outcome"], "committed");
+        assert_eq!(fake.command("result", json!({"query_id":job.request_id,"request_seq":job.request_seq})).unwrap()["outcome"], "committed");
     }
 }
 

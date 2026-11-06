@@ -68,10 +68,10 @@ static uint32_t readGeneration = 0;
 static uint32_t readCrc = 0;
 
 String wifiSetupReadPage(JsonDocument &request, const String &peer, uint32_t generation,
-                         const String &payload) {
+                         const String &payload, const char *operation) {
     uint32_t offset = request["offset"] | 0u;
     if (!request["offset"].isNull() && !request["offset"].is<uint32_t>()) offset = UINT32_MAX;
-    const String op = request["op"] | "";
+    const String op = operation ? operation : (request["op"] | "");
     JsonDocument out;
     out["ack"] = "wifi"; out["request_id"] = request["request_id"];
     out["device_mac"] = request["device_mac"];
@@ -140,7 +140,7 @@ bool wifiSchemesBegin() {
 #endif
     Preferences prefs;
     if (!prefs.begin("wifi-bonds", false)) { storeReady = false; return false; }
-    wifiStorageFormat=0;wifiStorageSplit=false;wifiStorageCleanupPending=false;
+    wifiStorageFormat=0;wifiStorageSplit=false;wifiTransactionFormat=0;wifiStorageCleanupPending=false;
     wifiConfigurationBytes=wifiTransactionBytes=wifiStorageBytes=0;
     if (!prefs.isKey("commit") && !prefs.isKey("store3") && !prefs.isKey("scheme") && !wifiPreparedKeys(prefs)) {
         wifiStore = WifiStore{}; storeReady = true;wifiStorageFormat=0;
@@ -184,7 +184,7 @@ bool wifiSchemesCredentials(String &ssid, String &password) {
     return true;
 }
 void wifiSchemesStorageStatus(JsonObject out) {
-    out["transaction_format"]=!storeReady?"unreadable":wifiStorageSplit?"WTX1":wifiStorageFormat?"embedded":"empty";
+    out["transaction_format"]=!storeReady?"unreadable":wifiStorageSplit?(wifiTransactionFormat==2?"WTX2":"WTX1"):wifiStorageFormat?"embedded":"empty";
     out["configuration_bytes"]=wifiConfigurationBytes;out["transaction_bytes"]=wifiTransactionBytes;
     out["cleanup_pending"]=wifiStorageCleanupPending;
     out["format"] = !storeReady?"unreadable":wifiStorageFormat==4?"WFS4":"empty"; out["ready"] = storeReady; out["uncertain"] = wifiStorageUncertain;
@@ -352,10 +352,9 @@ bool wifiPlanTargetMatches(JsonVariantConst target) {
     if (running && deferredSelection) return wifiTargetMatches(candidate,target);
     return *wifiStore.active.id && wifiTargetMatches(*wifiStore.activeCredentials(),target);
 }
-String wifiSetupCommand(JsonDocument &doc, const String &peer, uint32_t generation,
+String wifiSetupCommand(uint16_t op, JsonDocument &doc, const String &peer, uint32_t generation,
                         uint64_t now, uint64_t physicalUntil, uint64_t lightUntil,
                         bool selectAllowed) {
-    const char *op = doc["op"] | "";
     const char *id = doc["request_id"] | "";
     if (!identifier(id, 64) || !peer.length() || peer.length() > 21) return reply(doc, "shape");
     for (const char *key : {"op", "request_id", "network_id", "query_id", "host_ssid", "ssid", "password", "label", "credential", "metadata_key", "credential_key"}) {
@@ -365,7 +364,7 @@ String wifiSetupCommand(JsonDocument &doc, const String &peer, uint32_t generati
     }
     if (wifiStorageUncertain && !running && !wifiSchemesBegin()) return reply(doc, "storage");
     if (!storeReady) return reply(doc, "storage");
-    if (!strcmp(op, "wifi_match")) {
+    if (op == 18) {
         const char *networkId = doc["network_id"] | "";
         if (!identifier(networkId, 32)) return reply(doc, "shape");
         int slot = schemes.findShared(networkId);
@@ -395,16 +394,16 @@ String wifiSetupCommand(JsonDocument &doc, const String &peer, uint32_t generati
         if (connected) out["ip"] = WiFi.localIP().toString();
         String text; serializeJson(out,text); return text;
     }
-    if (!strcmp(op, "wifi_active")) {
+    if (op == 28) {
         JsonDocument out; out["ack"] = "wifi"; out["op"] = "wifi"; out["request_id"] = id;
         out["device_mac"] = doc["device_mac"]; out["ok"] = true;
         out["network_id"] = wifiStore.active.id.c_str(); out["version"] = wifiStore.activeVersion;
         out["revision"] = wifiStore.revision;
         String text; serializeJson(out, text); return text;
     }
-    if (!strcmp(op, "wifi_scheme_get")) {
+    if (op == 34) {
         JsonDocument out;
-        out["ack"] = "wifi"; out["op"] = op; out["request_id"] = id;
+        out["ack"] = "wifi"; out["op"] = "wifi_scheme_get"; out["request_id"] = id;
         out["device_mac"] = doc["device_mac"]; out["ok"] = true;
         out["capacity"] = 12; out["wifi_setup_protocol"] = 1;
         out["physical_remaining_s"] = physicalUntil > now ? (physicalUntil - now) / 1000 : 0;
@@ -419,18 +418,19 @@ String wifiSetupCommand(JsonDocument &doc, const String &peer, uint32_t generati
             n["password"] = String(network.password);
         }
         String text; serializeJson(out, text);
-        return wifiSetupReadPage(doc, peer, generation, text);
+        return wifiSetupReadPage(doc, peer, generation, text, "wifi_scheme_get");
     }
-    if (!strcmp(op, "wifi_setup_status") || !strcmp(op, "wifi_setup_cancel")) {
+    if (op == 31 || op == 32) {
         if (transactionPeer != peer || selectingBridge != (doc["bridge_id"] | "") || requestId != (doc["query_id"] | "")) return reply(doc, "not_found");
-        if (!strcmp(op, "wifi_setup_cancel")) { wifiSetupConstrain(now,lightUntil,selectAllowed); wifiSetupAbort("cancelled"); }
+        if (op == 32) { wifiSetupConstrain(now,lightUntil,selectAllowed); wifiSetupAbort("cancelled"); }
         return reply(doc, nullptr, true);
     }
-    bool trial = !strcmp(op, "wifi_trial"), activate = !strcmp(op, "wifi_activate");
+    bool trial = op == 29, activate = op == 30;
     if (!trial && !activate) return reply(doc, "unsupported");
     // Bind idempotency to the whole payload without retaining transient secrets.
     JsonDocument business;
-    for(const char *key:{"op","network_id","version","host_ssid","ssid","password","replace"}) if(!doc[key].isNull())business[key]=doc[key];
+    business["op"] = trial ? "wifi_trial" : "wifi_activate";
+    for(const char *key:{"network_id","version","host_ssid","ssid","password","replace"}) if(!doc[key].isNull())business[key]=doc[key];
     String body; serializeJson(business, body);
     uint8_t hash[32];
     mbedtls_sha256((const unsigned char *)body.c_str(), body.length(), hash, 0);
@@ -460,7 +460,7 @@ String wifiSetupCommand(JsonDocument &doc, const String &peer, uint32_t generati
     if (until <= now) { network.password.clear(); return reply(doc, "window_required"); }
     {
         if(!wifiExecutionGeneration || wifiExecutionGeneration < wifiStore.executionGeneration) return reply(doc,"generation_exhausted");
-        String bridge=doc["bridge_id"]|"";uint64_t seq=wifiRequestSequence(id);
+        String bridge=doc["bridge_id"]|"";uint64_t seq=(doc["request_seq"] | 0ULL);
         int existing=wifiReceiptIndex(bridge,peer,String(id));
         if(existing>=0) return reply(doc,"request_already_recorded");
         if(wifiStore.receipts.size()>=8)return reply(doc,"result_capacity");
@@ -469,7 +469,7 @@ String wifiSetupCommand(JsonDocument &doc, const String &peer, uint32_t generati
         if(seq && cursor>=0 && seq<=wifiStore.cursors[cursor].high)return reply(doc,"request_retired");
         if(seq && cursor<0 && wifiStore.cursors.size()>=8)return reply(doc,"cursor_capacity");
         std::unique_ptr<WifiStore> next(new(std::nothrow) WifiStore(wifiStore));if(!next||!next->valid())return reply(doc,"memory");
-        WifiReceipt receipt;receipt.bridge.set(bridge.c_str());receipt.bond.set(peer.c_str());receipt.request.set(id);receipt.error.set("pending");
+        WifiReceipt receipt;receipt.bridge.set(bridge.c_str());receipt.bond.set(peer.c_str());receipt.request.set(id);receipt.sequence=seq;receipt.error.set("pending");
         next->executionGeneration=wifiExecutionGeneration;receipt.executionGeneration=wifiExecutionGeneration;
         receipt.operation.set(trial?"trial":"activate");receipt.target.set(networkId);receipt.targetVersion=network.version;receipt.revision=next->revision;memcpy(receipt.hash,hash,32);
         if(!next->receipts.append(receipt))return reply(doc,"memory");

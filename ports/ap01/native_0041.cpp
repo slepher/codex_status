@@ -586,7 +586,7 @@ void *Runtime::bootstrap(void *p) {
             Ap01HttpRequest request{};
             request.method=q->method;request.path=q->path;request.token=q->token;
             request.deviceToken=q->device_token;request.contentType=q->content_type;
-            request.requestId=q->request_id;request.offset=q->offset;request.nonce=q->nonce;
+            request.requestId=q->request_id;request.offset=q->offset;
             request.body=q->body;request.length=q->length;request.chunkSha256=q->chunk_sha256;request.deviceMac=q->device_mac;
             auto reply=((Ap01Application *)p)->pairingHttp(request,now);
             return emit(out,uint32_t(reply.status),(const uint8_t *)reply.bytes.c_str(),uint32_t(reply.bytes.length()));

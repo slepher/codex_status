@@ -17,6 +17,7 @@ pub(super) struct RendezvousContext {
     need_http: bool,
     wifi_repair: bool,
     plan_ack_unknown: bool,
+    network_intent: Option<Value>,
     sync_open_id: Option<String>,
     sync_open_unknown: bool,
     sync_open_read_safe: bool,
@@ -31,7 +32,7 @@ impl RendezvousContext {
         Self { observation, admitted_wifi: Vec::new(), admitted_at: std::time::Instant::now(),
             http_window: Budget::new(Duration::from_secs(90)), command_budget: Budget::new(Duration::from_secs(10)),
             plan: None, temporary_data_seq: None, http_reachable: false, need_http: false,
-            wifi_repair: false, plan_ack_unknown: false, sync_open_id: None,
+            wifi_repair: false, plan_ack_unknown: false, network_intent: None, sync_open_id: None,
             sync_open_unknown: false, sync_open_read_safe: false, network_start: None, activation_in_plan: false,
             sync_enabled: false, sync_opened: false, light: false }
     }
@@ -267,7 +268,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             .map_err(err_text)? };
         let mut plan_body = serde_json::to_value(&plan).map_err(err_text)?;
         plan_body["need_http"] = json!(needs_http && !reachable);
-        if plan_activation && needs_http && !reachable {
+        if plan_activation && needs_http && !reachable && plan.mode == bridge_core::platform::model::PlanMode::Light {
             // A newly paired device has no IP until this plan connects it.
             let destination=device_link_for_mac(ctx,&mac).map(|target|target.ip)
                 .unwrap_or_else(bridge_ble::lan_ip);
@@ -277,9 +278,6 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
         }
         if let Some(data) = &pending_data {
             plan_body["data"] = data.clone();
-        }
-        if !sync_enabled && wake_history_sync_due(&mac, &round.observation) {
-            plan_body["history_sync_ms"] = json!(2500);
         }
         // Timeout means unknown, not rejected. The device may already have
         // applied the persisted plan and started HTTP. Reconcile the same ID.
@@ -355,58 +353,18 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             transport = "ble",
             "device PowerPlan acknowledgement"
         );
-        let mut sync_opened = false;
-        // A confirmed Plan has already changed the device RF phase. Refresh
-        // before SyncOpen as well as the later configuration work.
-        if accepted && needs_http {
-            link.refresh_info(round.http_window.remaining().min(Duration::from_secs(1)))
-                .await.map_err(|_| "ble_info_refresh_failed".to_owned())?;
-        }
-        let should_open = !failure_report && (temporary_data_seq.is_some() || (sync_enabled
-            && round.observation["sync"]["retry_skip"] == 0
-            && (round.observation["sync"]["due"] == true || round.observation["sync"]["pending"] == true)));
-        if should_open && !ack_unknown {
-            let reason = if temporary_data_seq.is_some() {
-                "data"
-            } else if round.observation["sync"]["rounds"] == 15 && round.observation["sync"]["pending"] != true {
-                "periodic"
-            } else {
-                "retry"
-            };
-            let open_id = uuid::Uuid::new_v4().simple().to_string();
-            round.sync_open_id = Some(open_id.clone());
-            round.sync_open_unknown = true;
-            match link
-                .command(
-                    "sync_open",
-                    json!({
-                        "reason":reason, "open_id":open_id, "data_seq":temporary_data_seq,
-                        "wake_generation":round.observation["wake_generation"],
-                        "wake_seq":round.observation["wake_seq"],
-                    }),
-                )
-                .await
-            {
-                Ok(open) if open["result"] == "applied" => {
-                    sync_opened = true;
-                    round.sync_open_unknown = false;
-                }
-                Ok(_) if accepted && plan.mode == bridge_core::platform::model::PlanMode::Light => {
-                    round.sync_open_unknown = false;
-                    tracing::warn!(device_mac=%mac,stage="sync_open",error_category="sync_open_rejected","sync window rejected; accepted light plan remains valid");
-                }
-                Ok(_) => return Err("sync_open_rejected".into()),
-                // Unknown is only a candidate opportunity. Authenticated HTTP
-                // must prove the same plan/wake and the temporary sync phase.
-                Err(error) => {
-                    // ACK failures prove the frame was fully written. A read
-                    // may follow; a timed-out fragment write must not reuse it.
-                    if bridge_core::rendezvous::not_dispatched(&error) { return Err("not_sent".into()); }
-                    round.sync_open_read_safe = bridge_core::rendezvous::command_failure(&error)
-                        .is_some_and(|failure| failure.outcome == bridge_core::rendezvous::DispatchOutcome::AckUnknown);
-                    sync_opened = true;
-                }
-            }
+        // Prepare the intent only. Wi-Fi configuration runs before the single
+        // network_start command admits the window and freezes its return route.
+        let should_open = !failure_report && !ack_unknown &&
+            plan.mode == bridge_core::platform::model::PlanMode::Sleep &&
+            (temporary_data_seq.is_some() || (sync_enabled &&
+             round.observation["sync"]["retry_skip"] == 0 &&
+             (round.observation["sync"]["due"] == true || round.observation["sync"]["pending"] == true)));
+        if should_open {
+            round.network_intent = Some(json!({
+                "reason":if temporary_data_seq.is_some() {"data_sync"} else {"diag_sync"},
+                "data_seq":temporary_data_seq,
+            }));
         }
         if ack_unknown && plan.mode == bridge_core::platform::model::PlanMode::Sleep {
             return Err("BLE sleep plan acknowledgement unknown".into());
@@ -416,7 +374,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
         } else {
             ack["accepted_remaining_s"].as_u64().unwrap_or(0) > 0
         };
-        { round.sync_opened = sync_opened; round.light = light_plan; Ok(()) }
+        { round.light = light_plan; Ok(()) }
     };
     let mut normal_result = work.await;
     link.set_command_budget(None);
@@ -424,7 +382,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
     let mut http_budget = round.http_window;
     let mut wifi_repair_error = None;
     if normal_result.is_ok() {
-        if round.sync_opened || (round.light && round.need_http) {
+        if round.network_intent.is_some() || (round.light && round.need_http) {
             if round.sync_open_unknown && !round.sync_open_read_safe {
                 super::close_device_ble(link,_device_delivery,_delivery).await;
                 return Err("ble_write_result_unknown".into());
@@ -468,7 +426,7 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
                 )
                 .await { wifi_repair_error = Some(error); }
             }
-            if round.need_http && !round.http_reachable && !round.activation_in_plan &&
+            if round.need_http && (round.network_intent.is_some() || (!round.http_reachable && !round.activation_in_plan)) &&
                 wifi_repair_error.is_none() {
                 // A lost SyncOpen reply does not make the already acknowledged
                 // Plan uncertain or block its independently admitted HTTP work.
@@ -481,11 +439,22 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
                         .ok_or_else(||"report_device_address_missing".to_owned())
                         .and_then(|target| report_route(&target.ip));
                     if let Ok(route) = attempt {
-                        let fields=json!({"plan_id":plan_id,"bridge_addr":route.to_string(),
-                            "bridge_port":ctx.config.port,"origin_request_no":plan_id});
+                        let id=uuid::Uuid::new_v4().simple().to_string();
+                        round.sync_open_id=Some(id.clone());
+                        let mut fields=round.network_intent.clone().unwrap_or_else(||json!({"reason":"wifi_setup"}));
+                        fields["request_id"]=json!(id);
+                        fields["plan_id"]=json!(plan_id);
+                        fields["bridge_addr"]=json!(route.to_string());
+                        fields["bridge_port"]=json!(ctx.config.port);
+                        fields["wake_generation"]=round.observation["wake_generation"].clone();
+                        fields["wake_seq"]=round.observation["wake_seq"].clone();
+                        crate::wifi::acknowledge_receipts_on_link_budget(ctx,&mac,&mut link,shared_tail.capped(Duration::from_millis(500))).await;
                         match network_start_on_link(&mut link, fields, shared_tail).await {
                             Ok(applied) => {
                                 round.network_start = Some(applied);
+                                round.sync_opened = round.network_intent.is_some();
+                                round.sync_open_unknown = !applied;
+                                round.sync_open_read_safe = !applied;
                             }
                             Err(error) => wifi_repair_error = Some(error),
                         }
@@ -501,12 +470,8 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
         }
     }
     if let Some(error) = wifi_repair_error { normal_result = Err(error); }
-    let mut tail_error=None;
-    if normal_result.is_ok() {
-        if !round.sync_enabled {
-            tail_error=sync_wake_history(&mut link,&mac,&round.observation,shared_tail.capped(Duration::from_secs(2))).await.err();
-        }
-        if tail_error.is_none() && !round.light {
+    if normal_result.is_ok() && round.network_start.is_none() && !round.activation_in_plan {
+        if !round.light {
             let _ = crate::wifi::recover_on_link_budget(
                 ctx,
                 &mac,
@@ -515,9 +480,8 @@ pub async fn ble_cycle(ctx: &AppCtx, candidates: &[String]) -> Result<BleOpportu
             )
             .await;
         }
-        if tail_error.is_none() {crate::wifi::acknowledge_receipts_on_link_budget(ctx,&mac,&mut link,shared_tail.capped(Duration::from_millis(500))).await;}
+        crate::wifi::acknowledge_receipts_on_link_budget(ctx,&mac,&mut link,shared_tail.capped(Duration::from_millis(500))).await;
     }
-    if let Some(error)=tail_error {normal_result=Err(error);}
     // Release the HTTP permit first; native disconnect retains the radio permit.
     super::close_device_ble(link,_device_delivery,_delivery).await;
     if normal_result.is_ok() {
@@ -616,8 +580,8 @@ fn matching_http(
     {
         return Err("http_identity_mismatch".into());
     }
-    if status["session_nonce"] != ble.observation["session_nonce"]
-        || status["session_nonce"].as_str().is_none_or(str::is_empty)
+    if status["boot_id"] != ble.observation["boot_id"]
+        || status["boot_id"].as_str().is_none_or(str::is_empty)
     {
         return Err("http_session_mismatch".into());
     }
@@ -645,6 +609,9 @@ fn matching_http(
         {
             return Err("plan_expired".into());
         }
+    }
+    if ble.network_start.is_some() && ble.sync_open_id.as_deref() != status["sync"]["open_id"].as_str() {
+        return Err("network_start_unconfirmed".into());
     }
     if ble.sync_open_unknown
         && ble.plan_mode() == Some("sleep")
@@ -683,8 +650,9 @@ fn http_transfer_budget(status: &Value, sampled_at: std::time::Instant, work_bud
 
 /// true = accepted, false = full frame sent but ACK unknown. Partial writes
 /// terminate this link; definite local non-dispatch never waits for HTTP.
-pub(crate) async fn network_start_on_link(link: &mut bridge_ble::DeviceConnection, fields: Value, budget: Budget) -> Result<bool, String> {
-    let id = uuid::Uuid::new_v4().simple().to_string();
+pub(crate) async fn network_start_on_link(link: &mut bridge_ble::DeviceConnection, mut fields: Value, budget: Budget) -> Result<bool, String> {
+    let id = fields["request_id"].as_str().map(str::to_owned).unwrap_or_else(||uuid::Uuid::new_v4().simple().to_string());
+    if let Some(object)=fields.as_object_mut() { object.remove("request_id"); }
     let result = link.command_with_id_budget("network_start", fields, &id, budget.remaining()).await;
     match result {
         Ok(reply) if reply["result"] == "accepted" => Ok(true),
@@ -795,10 +763,10 @@ mod tests {
 
     #[test]
     fn protocol_http_remains_usable_after_ready_report_ack() {
-        let mut ble=RendezvousContext::new(json!({"session_nonce":"boot","wake_generation":2,"wake_seq":9}));
+        let mut ble=RendezvousContext::new(json!({"boot_id":"boot","wake_generation":2,"wake_seq":9}));
         ble.plan=Some(bridge_core::platform::model::PowerPlan::sleep(101,900,"test"));
         ble.plan.as_mut().unwrap().mode=bridge_core::platform::model::PlanMode::Light;
-        let mut status=json!({"device_mac":"7C4FADB93408","session_nonce":"boot",
+        let mut status=json!({"device_mac":"7C4FADB93408","boot_id":"boot",
             "wake_generation":2,"wake_seq":9,"power":{"plan_id":101,"mode":"light","remaining_s":100},
             "transports":{"http":{"ready":true}},"rendezvous":{"v":1,"ready":false,"id":"rv","remaining_ms":0}});
         assert!(matching_http(&status,"7C4FADB93408",&ble,101,true).is_ok());
@@ -807,15 +775,15 @@ mod tests {
     }
     #[test]
     fn device_http_status_rejects_wrong_session_wake_and_plan() {
-        let mut ble=RendezvousContext::new(json!({"session_nonce":"boot","wake_generation":2,"wake_seq":9}));
+        let mut ble=RendezvousContext::new(json!({"boot_id":"boot","wake_generation":2,"wake_seq":9}));
         ble.plan=Some(bridge_core::platform::model::PowerPlan::sleep(101,900,"test"));
         ble.plan.as_mut().unwrap().mode=bridge_core::platform::model::PlanMode::Light;
-        let status = json!({"device_mac":"7C4FADB93408","session_nonce":"boot","wake_generation":2,"wake_seq":9,
+        let status = json!({"device_mac":"7C4FADB93408","boot_id":"boot","wake_generation":2,"wake_seq":9,
             "power":{"plan_id":101,"mode":"light","remaining_s":100},"transports":{"http":{"ready":true}},"rendezvous":{"v":1,"ready":true,"id":"rv"}});
         assert!(matching_http(&status, "7C4FADB93408", &ble, 101, true).is_ok());
         for (key, value) in [
             ("device_mac", json!("70041DD7A340")),
-            ("session_nonce", json!("old")),
+            ("boot_id", json!("old")),
             ("wake_seq", json!(8)),
         ] {
             let mut wrong = status.clone();

@@ -4,7 +4,7 @@
 #include "firmware/application.h"
 
 // Shared release sequence; hardware suffixes do not advance independently.
-#define FW_RELEASE_VERSION "0.18.108"
+#define FW_RELEASE_VERSION "0.18.110"
 
 #if defined(CODEX_CLK_WINDOW_TEST)
 #define FW_VERSION    "0.13.9-clkwin"

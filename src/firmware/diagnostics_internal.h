@@ -79,9 +79,6 @@ const char *wakeCauseName(esp_sleep_wakeup_cause_t cause);
 void handleStatus();
 void handleStatusJson();
 void handleLog();
-String traceHistoryJson(uint32_t since, uint8_t limit, size_t maxBytes,
-                               bool &more);
-void handleHistory();
 void handlePmStats();
 void captureFrameToFs(const char *tag);
 void handleFrame();

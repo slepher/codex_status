@@ -41,7 +41,7 @@ impl Device {
         value["maintenance_http_port"]=json!(self.maintenance_port);
         value["result"]=json!("ok");value["mac"]=json!(self.mac);value["device_mac"]=json!(self.mac);
         value["fw_target"]=json!(FIRMWARE_TARGET_AP01);value["fw"]=json!("ap01-codex-sim/1");
-        value["boot_id"]=json!(self.boot);value["uptime_ms"]=json!(now);value["session_nonce"]=json!(self.nonce);
+        value["boot_id"]=json!(self.boot);value["uptime_ms"]=json!(now);
         value["active_context_id"]=value["context"].clone();value["power_mode"]=json!("always_on");
         value["power_plan"]=json!(false);value["binding_method"]=json!(BINDING_METHOD);
         value["owner"]=self.bindings.owner(now);
@@ -228,7 +228,7 @@ fn dispatch(device:&mut Device,principal:&str,token:&str,operation_token:&str,pa
         "/api/bundle/chunk"=>{
             if device.bundle.status()?["rx_owner"]!=principal{return Ok((409,fail("rx_owner","bundle")));}
             device.bundle.chunk(query.get("request_id").map(String::as_str).unwrap_or(""),
-                query.get("session_nonce").map(String::as_str).unwrap_or(""),
+                &nonce,
                 query.get("offset").map(String::as_str).unwrap_or(""),payload,now)?
         },
         "/api/bundle/commit"=>{let context=device.context();device.bundle.commit(&message,&nonce,now,&context)?},

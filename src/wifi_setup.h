@@ -19,14 +19,14 @@ uint32_t wifiSetupIpEvent();
 uint16_t wifiSetupConnectionReason();
 const char *wifiSetupConnectionFailure();
 // Handles only wifi_*; callers still enforce encrypted bond and full MAC.
-String wifiSetupCommand(JsonDocument &doc, const String &peer, uint32_t generation,
+String wifiSetupCommand(uint16_t op, JsonDocument &doc, const String &peer, uint32_t generation,
                         uint64_t now, uint64_t physicalUntil, uint64_t lightUntil,
                         bool selectAllowed);
 void wifiSetupPoll(uint64_t now, bool startAllowed = true);
 void wifiSetupAbort(const char *reason);
 String wifiSetupSelectingBridge();
 String wifiSetupReadPage(JsonDocument &request, const String &peer, uint32_t generation,
-                         const String &payload);
+                         const String &payload, const char *operation = nullptr);
 
 void wifiManagementResetSession();
 
@@ -42,7 +42,7 @@ struct WifiControlContext {
     uint64_t until=0;
     uint64_t physicalUntil=0;
 };
-String wifiControlCommand(JsonDocument &request, const WifiControlContext &context,
+String wifiControlCommand(uint16_t op, JsonDocument &request, const WifiControlContext &context,
                           uint64_t now, const String &legacy=String("[]"));
 
 void wifiSetupConstrain(uint64_t now,uint64_t until,bool ownerAllowed);

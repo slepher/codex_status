@@ -1386,6 +1386,38 @@ impl std::fmt::Display for ClaimError {
     }
 }
 
+fn claim_protocol_detail(error: &anyhow::Error) -> String {
+    for cause in error.chain() {
+        let text = cause.to_string();
+        for (reason, stage) in [
+            ("app_trial_readonly", "lifecycle"), ("business_offline", "lifecycle"),
+            ("maintenance_busy", "write_admission"), ("write_scope_unavailable", "write_admission"),
+            ("bindings_busy", "binding"), ("unauthorized", "binding"),
+            ("protocol_mismatch", "frame"),
+        ] {
+            if text == format!("device {reason}; stage={stage}; action=read_device_status") {
+                return format!("{reason}; stage={stage}; action=read_device_status");
+            }
+        }
+        if let Some(status) = cause.downcast_ref::<bridge_core::device_client::HttpStatus>() {
+            return format!("http_{}", status.0);
+        }
+        for (needle, code) in [
+            ("response identity mismatch", "response_identity"),
+            ("invalid frame length", "frame_length"),
+            ("frame payload length", "frame_length"),
+            ("invalid frame header", "frame_header"),
+            ("invalid context reference", "frame_context"),
+            ("incomplete device HTTP headers", "http_headers"),
+            ("incomplete device HTTP response body", "http_body"),
+            ("session_expired", "session_expired"),
+        ] {
+            if text.contains(needle) { return code.into(); }
+        }
+    }
+    "transport_or_protocol".into()
+}
+
 /// One `POST /claim` with an explicit token (the device's `/claim` is gated by
 /// the same device token as `/doUpdate`, not the endpoint token).
 async fn post_claim_once(
@@ -1399,17 +1431,35 @@ async fn post_claim_once(
 ) -> Result<(reqwest::StatusCode, String), ClaimError> {
     let bridge_id = ctx.bridge_id.clone();
     let name = ctx.bridge_name.lock().unwrap().clone();
-    let host = wifi::bridge_address(ctx).await.map_err(ClaimError::Other)?;
+    let host = wifi::bridge_address(ctx).await.map_err(|reason| {
+        tracing::warn!(device_mac=target_mac, stage="host_address", reason=%reason, outcome="not_sent", "claim failed");
+        ClaimError::Other(format!("claim host_address/not_sent: {reason}"))
+    })?;
     let port = ctx.config.port;
     if ap01::is_ap01(ctx,target_mac) {
         if force || release {return Err(ClaimError::Other("AP01 不支持 force/release；请等待占用租约到期".into()));}
-        ap01::verify_endpoint(ctx,target_mac,endpoint).await.map_err(ClaimError::Other)?;
+        // Reconcile the authenticated context/contract before claim permits delivery.
+        ap01::revalidate(ctx,target_mac,endpoint).await.map_err(|reason| {
+            tracing::warn!(device_mac=target_mac, stage="identity_preflight", reason=%reason, outcome="not_sent", "claim failed");
+            ClaimError::Other(format!("claim identity_preflight/not_sent: {reason}"))
+        })?;
         let (endpoint,token,mac)=(endpoint.to_owned(),token.to_owned(),target_mac.to_owned());
         let body=json!({"device_mac":mac,"bridge_id":bridge_id,"name":name,"host":host,"port":port,
             "lease_s":300,"request_id":uuid::Uuid::new_v4().simple().to_string()});
         let (code,reply)=bridge_core::device_client::claim(
             &endpoint,&token,&token,&body,budget.remaining()).await
-            .map_err(|_|ClaimError::Other("AP01 claim result unknown; read authenticated status".into()))?;
+            .map_err(|error| {
+                let failure = bridge_core::rendezvous::command_failure(&error);
+                let stage = failure.map_or("claim_response", |f| f.stage);
+                let rejected = error.chain().any(|cause| cause.downcast_ref::<bridge_core::device_client::HttpStatus>().is_some());
+                let outcome = failure.map_or(if rejected { "rejected" } else { "result_unknown" }, |f| f.code());
+                let reason = failure.map_or_else(|| bridge_core::rendezvous::wifi_error(&error).1, |f| f.reason);
+                // Only fixed classifications enter diagnostics; never log arbitrary payloads or credentials.
+                let detail = claim_protocol_detail(&error);
+                tracing::warn!(device_mac=target_mac, stage, outcome, reason, detail, "claim failed");
+                ClaimError::Other(format!("AP01 claim {stage}/{outcome}: {reason}/{detail}; read authenticated status"))
+            })?;
+        tracing::info!(device_mac=target_mac, stage="claim_response", status=code, "claim response");
         return Ok((reqwest::StatusCode::from_u16(code).map_err(|e|ClaimError::Other(e.to_string()))?,reply.to_string()));
     }
     post_claim_to_endpoint_budget(
@@ -4007,7 +4057,7 @@ mod claim_target_tests {
 
             let (mut stream, _) = listener.accept().unwrap();
             let body = format!(
-                r#"{{"device_mac":"{mac}","session_nonce":"0123456789abcdef0123456789abcdef"}}"#
+                r#"{{"device_mac":"{mac}","boot_id":"0123456789abcdef0123456789abcdef"}}"#
             );
             respond_frame(&mut stream,1,&body);
             drop(stream);
@@ -4376,5 +4426,24 @@ mod device_status_cache_tests {
         assert_eq!(bridge_core::device_clock::monotonic_ms(other),Some(7000));
         bridge_core::device_clock::clear(mac);
         bridge_core::device_clock::clear(other);
+    }
+}
+
+#[cfg(test)]
+mod claim_diagnostic_tests {
+    use super::claim_protocol_detail;
+    use bridge_core::{device_client::HttpStatus,rendezvous::{CommandFailure,DispatchOutcome}};
+    #[test]
+    fn claim_rejection_retains_safe_lifecycle_reason_and_transport_stage() {
+        let rejection=anyhow::Error::new(HttpStatus(503)).context(
+            "device app_trial_readonly; stage=lifecycle; action=read_device_status");
+        assert_eq!(claim_protocol_detail(&rejection),"app_trial_readonly; stage=lifecycle; action=read_device_status");
+        let private=anyhow::Error::new(HttpStatus(503)).context(
+            "device SECRET_TOKEN; stage=lifecycle; action=read_device_status");
+        assert_eq!(claim_protocol_detail(&private),"http_503");
+        let transport=anyhow::anyhow!("incomplete device HTTP headers").context(CommandFailure {
+            stage:"http_ack",outcome:DispatchOutcome::AckUnknown,reason:"transport_unavailable"});
+        assert_eq!(claim_protocol_detail(&transport),"http_headers");
+        assert_eq!(bridge_core::rendezvous::command_failure(&transport).unwrap().code(),"result_unknown");
     }
 }

@@ -38,7 +38,7 @@ String v2BuildStatusSnapshot(const V2StatusSnapshot &snapshot) {
         doc["wake_stage"] = snapshot.wake->stage ? snapshot.wake->stage : "none";
         doc["wake_cause"] = snapshot.wake->cause ? snapshot.wake->cause : "";
     }
-    doc["session_nonce"] = snapshot.sessionNonce;
+    doc["boot_id"] = snapshot.bootId;
     doc["active_context_id"] = profile.contextId;
     doc["active_template_id"] = snapshot.activeTemplateId;
     doc["committed_job_id"] = profile.jobId;

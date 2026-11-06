@@ -164,7 +164,7 @@ fn spawn_fake() -> (String, FakeDevice) {
                     &json!({
                         "result": "applied",
                         "active_context_id": "0000000000000001",
-                        "device_mac": "70:04:1D:D7:A3:40", "session_nonce": "0123456789abcdef0123456789abcdef",
+                        "device_mac": "70:04:1D:D7:A3:40", "boot_id": "0123456789abcdef0123456789abcdef",
                         "active_template_id": "quad",
                         "data_seq": 4,
                         "power": {"mode": "light", "plan_id": 7, "remaining_s": 120}
@@ -172,7 +172,8 @@ fn spawn_fake() -> (String, FakeDevice) {
                 );
             } else if path == "/api/data" {
                 let message: Value = serde_json::from_slice(&body).unwrap();
-                let ok = message["seq"] == 5 && message["context_id"] == "0000000000000001";
+                assert_eq!(message["request_id"], "data-0000000000000001-5");
+                let ok = message["seq"] == 5 && message["active_context_id"] == "0000000000000001";
                 respond(
                     &mut stream,
                     200,
@@ -180,6 +181,7 @@ fn spawn_fake() -> (String, FakeDevice) {
                 );
             } else if path == "/api/plan" {
                 let plan: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(plan["request_id"], "plan-8");
                 respond(
                     &mut stream,
                     200,
@@ -207,7 +209,8 @@ fn spawn_fake() -> (String, FakeDevice) {
                     .parse()
                     .unwrap_or(0);
                 assert_eq!(header(&head, "X-Request-Id"), Some("bundle-job-1"));
-                assert_eq!(header(&head, "X-Session-Nonce"), Some("0123456789abcdef0123456789abcdef"));
+                assert_eq!(header(&head, "X-Session-Nonce"), None);
+                assert!(!path.contains("session_nonce"));
                 let expected_offset = stated.to_string();
                 assert_eq!(header(&head, "X-Offset"), Some(expected_offset.as_str()));
                 let expected = offset.load(Ordering::SeqCst);
@@ -271,7 +274,7 @@ fn status_data_plan_activate_round_trip() {
         &addr,
         token,
         "70:04:1D:D7:A3:40",
-        &json!({"context_id": "0000000000000001", "seq": 5, "fields": []}),
+        &json!({"active_context_id": "0000000000000001", "seq": 5, "fields": []}),
         timeout,
     ))
     .unwrap();
@@ -306,7 +309,7 @@ fn status_after_reboot_adopts_new_authenticated_session_before_writing() {
             if i<2 {
                 assert_eq!(path,"/api/status");
                 respond_session(&mut stream,200,&json!({"device_mac":"70041DD7A340",
-                    "boot_id":format!("boot-{i}"),"session_nonce":"0123456789abcdef0123456789abcdef"}),[9+i;16]);
+                    "boot_id":format!("boot-{i}")}),[9+i;16]);
             } else {
                 assert_eq!(path,"/api/data");
                 assert_eq!(REQUEST_FRAME.get().unwrap().session,[10;16]);
@@ -340,7 +343,7 @@ fn p0_session_refresh_failure_preserves_original_write_outcome() {
                     respond(&mut stream, 401, &json!({"error":"unauthorized"}));
                 } else {
                     respond(&mut stream, 200, &json!({"device_mac":"70041DD7A340",
-                        "session_nonce":"0123456789abcdef0123456789abcdef"}));
+                        "boot_id":"0123456789abcdef0123456789abcdef"}));
                 }
             }
         });
@@ -363,7 +366,7 @@ fn p0_activation_handshake_and_write_share_one_budget() {
             assert_eq!(path, expected);
             std::thread::sleep(Duration::from_millis(200));
             respond(&mut stream, 200, &json!({"result":"applied","device_mac":"70041DD7A340",
-                "session_nonce":"0123456789abcdef0123456789abcdef"}));
+                "boot_id":"0123456789abcdef0123456789abcdef"}));
         }
     });
     let result = http(device_client::activate(&addr, "tok", "70041DD7A340", "bridge-1",
@@ -378,7 +381,7 @@ fn concurrent_status_and_writes_share_the_authenticated_session() {
     http(async {
         let timeout = Duration::from_secs(2);
         device_client::status(&addr, "tok", timeout).await.unwrap();
-        let data = json!({"context_id":"0000000000000001","seq":5,"fields":[]});
+        let data = json!({"active_context_id":"0000000000000001","seq":5,"fields":[]});
         let plan = json!({"plan_id":8,"light_duration_s":300});
         let (read, data, plan) = tokio::join!(
             device_client::status(&addr, "tok", timeout),
@@ -467,7 +470,7 @@ fn owner_conflict_stops_the_write_without_retrying() {
             let Ok(mut stream) = stream else { break };
             let (_, path, _, _) = read_request(&mut stream);
             if path == "/api/status" {
-                respond(&mut stream, 200, &json!({"device_mac": "70:04:1D:D7:A3:40", "session_nonce": "0123456789abcdef0123456789abcdef"}));
+                respond(&mut stream, 200, &json!({"device_mac": "70:04:1D:D7:A3:40", "boot_id": "0123456789abcdef0123456789abcdef"}));
             } else {
                 respond(&mut stream, 409, &json!({"owner": {"name": "other"}}));
             }
@@ -511,7 +514,7 @@ fn persistent_http_reuses_one_connection_and_honors_server_close() {
     let listener=TcpListener::bind("127.0.0.1:0").unwrap();
     let addr=listener.local_addr().unwrap().to_string();
     let server=std::thread::spawn(move || {
-        let reply=json!({"device_mac":"70041DD7A340","session_nonce":"0123456789abcdef0123456789abcdef"});
+        let reply=json!({"device_mac":"70041DD7A340","boot_id":"0123456789abcdef0123456789abcdef"});
         let (mut socket,_)=listener.accept().unwrap();
         socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         for index in 0..3 {
@@ -534,7 +537,7 @@ fn lost_ack_on_reused_connection_drops_socket_without_replaying_write() {
     let listener=TcpListener::bind("127.0.0.1:0").unwrap();
     let addr=listener.local_addr().unwrap().to_string();
     let server=std::thread::spawn(move || {
-        let reply=json!({"device_mac":"70041DD7A340","session_nonce":"0123456789abcdef0123456789abcdef"});
+        let reply=json!({"device_mac":"70041DD7A340","boot_id":"0123456789abcdef0123456789abcdef"});
         let (mut socket,_)=listener.accept().unwrap();
         socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         assert_eq!(read_request(&mut socket).1,"/api/status");
@@ -571,5 +574,42 @@ fn pooled_http_connection_is_not_reused_after_its_runtime_stops() {
     for _ in 0..2 {
         http(device_client::status(&addr,"runtime-test",Duration::from_secs(2))).unwrap();
     }
+    server.join().unwrap();
+}
+
+#[test]
+fn wifi_control_uses_frame_operation_without_json_discriminator() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let server = std::thread::spawn(move || {
+        for expected in [1, 29, 30, 34] {
+            let (mut socket, _) = listener.accept().unwrap();
+            let (_, path, _, bytes) = read_request(&mut socket);
+            assert_eq!(REQUEST_FRAME.get().unwrap().op, expected);
+            if expected == 1 {
+                respond(&mut socket, 200, &json!({"device_mac":"AABBCCDDEEFF"}));
+            } else {
+                assert_eq!(path, "/api/wifi/command");
+                let body: Value = serde_json::from_slice(&bytes).unwrap();
+                assert!(body.get("op").is_none());
+                assert_eq!(body["request_id"], "w3_0000000000000001");
+                assert_eq!(body["bridge_id"], "bridge-test");
+                respond(&mut socket, 200, &json!({"device_mac":"AABBCCDDEEFF","ok":true}));
+            }
+        }
+    });
+    http(async {
+        for op in ["trial", "activate", "scheme_get"] {
+            device_client::wifi_command(&addr, "test-token", "AABBCCDDEEFF", "bridge-test", op,
+                json!({"request_id":"w3_0000000000000001"}), Duration::from_secs(2)).await.unwrap();
+        }
+        for (op, body) in [("claim", json!({})), ("trial", json!({"op":"activate"}))] {
+            let error = device_client::wifi_command(&addr, "test-token", "AABBCCDDEEFF", "bridge-test",
+                op, body, Duration::from_secs(2)).await.unwrap_err();
+            let failure=bridge_core::rendezvous::command_failure(&error).unwrap();
+            assert_eq!(failure.outcome, bridge_core::rendezvous::DispatchOutcome::NotSent);
+            assert!(matches!(failure.reason, "invalid_wifi_operation" | "retired_protocol"));
+        }
+    });
     server.join().unwrap();
 }

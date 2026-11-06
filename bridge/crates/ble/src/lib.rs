@@ -931,7 +931,7 @@ pub struct DeviceConnection {
     endpoint_unconfirmed: AtomicBool,
     token: String,
     bridge_id: String,
-    nonce: String,
+    boot_id: String,
     session: [u8; 16],
     next_request_no: u64,
     context_id: String,
@@ -1021,15 +1021,15 @@ pub fn decode_wire(raw: &[u8]) -> Result<serde_json::Value> {
     if let Some(summary) = value.get("s") {
         let a = summary.as_array().context("invalid BLE summary")?.clone();
         if a.len() != 16 { bail!("invalid BLE summary length"); }
-        let nonce = a[0].as_str().context("BLE nonce missing")?;
-        if nonce.len() != 32 || !nonce.bytes().all(|c| c.is_ascii_hexdigit()) { bail!("invalid BLE nonce"); }
+        let nonce = a[0].as_str().context("BLE boot identity missing")?;
+        if nonce.len() != 32 || !nonce.bytes().all(|c| c.is_ascii_hexdigit()) { bail!("invalid BLE boot identity"); }
         for i in [4,6,7,8,11,13,15] {
             let n = a[i].as_u64().context("BLE counter missing")?;
             let max = if matches!(i, 11 | 13) { u8::MAX as u64 } else if matches!(i, 7 | 8 | 15) { u32::MAX as u64 } else { u64::MAX };
             if n > max { bail!("invalid BLE counter"); }
         }
         for i in [5,9,10,12,14] { if !a[i].is_boolean() { bail!("invalid BLE flag"); } }
-        value["result"] = json!("applied"); value["session_nonce"] = a[0].clone();
+        value["result"] = json!("applied"); value["boot_id"] = a[0].clone();
         value["active_context_id"] = json!(text(&a[1], 32)?);
         value["active_template_id"] = json!(text(&a[2], 16)?);
         value["committed_job_id"] = json!(text(&a[3], 16)?);
@@ -1185,7 +1185,7 @@ impl DeviceConnection {
                     command_budget_deadline: None,
                     rf_deadline: info["rf_remaining_ms"].as_u64().map(|ms| info_started + Duration::from_millis(ms)),
                     token: token.to_owned(), bridge_id: bridge_id.to_owned(),
-                    nonce: String::new(), session: [0; 16], next_request_no: 1, context_id: String::new(), device_mac,
+                    boot_id: String::new(), session: [0; 16], next_request_no: 1, context_id: String::new(), device_mac,
                     auth_ready: Pusher::peer_encrypted_bonded(&info),
                     wake_identity: wake_identity(&info),
                     wake_cause: text_field(&info, &["wake_cause"]).unwrap_or_default(),
@@ -1284,7 +1284,7 @@ impl DeviceConnection {
                 rf_deadline: info["rf_remaining_ms"].as_u64().map(|ms| info_started + Duration::from_millis(ms)),
                 token: token.to_owned(),
                 bridge_id: bridge_id.to_owned(),
-                nonce: String::new(),
+                boot_id: String::new(),
                 session: [0; 16],
                 next_request_no: 1,
                 context_id: String::new(),
@@ -1562,7 +1562,7 @@ impl DeviceConnection {
                 "before_write", "previous_write_unknown", deadline, Duration::ZERO).into());
         }
         if id.is_empty() || id.len() > 64 || id.contains('\0') { bail!("invalid BLE request identity"); }
-        if op.starts_with("wifi_") && self.nonce.is_empty() {
+        if op.starts_with("wifi_") && self.boot_id.is_empty() {
             // Obtain the ordinary session before a configuration command.
             // Physical rescue still works if endpoint auth has not been set up.
             Box::pin(self.command_with_id_budget("status", json!({}), "session",
@@ -1716,8 +1716,8 @@ impl DeviceConnection {
                     let wake_matches = !self.wake_identity.zip(ack_identity).is_some_and(|(a,b)| a != b);
                     let version_matches = self.info["ble_wire"] != 1 || (reply["ble_wire"] == 1 && ack_identity.is_some());
                     let operation_matches = reply["op"].as_str().map_or(true, |actual| actual == op || actual == "command" || (actual == "wifi" && op.starts_with("wifi_")));
-                    let nonce_matches = op == "status" || !reply["session_nonce"].as_str().is_some_and(|n| n != self.nonce);
-                    if !mac_matches || !wake_matches || !version_matches || !nonce_matches || !operation_matches {
+                    let boot_matches = op == "status" || !reply["boot_id"].as_str().is_some_and(|n| n != self.boot_id);
+                    if !mac_matches || !wake_matches || !version_matches || !boot_matches || !operation_matches {
                         continue;
                     }
                     if self.wake_identity.is_none() {
@@ -1731,14 +1731,14 @@ impl DeviceConnection {
                         self.device_last_stage = stage;
                     }
                     if op == "status" && reply["result"] == "applied" {
-                        if reply_header.session == [0; 16] || reply["session_nonce"].as_str().is_none() {
+                        if reply_header.session == [0; 16] || reply["boot_id"].as_str().is_none() {
                             return Err(self.command_failure(id, op, bridge_core::rendezvous::DispatchOutcome::AckUnknown,
                                 "ack", "invalid_ack_session", deadline, started.elapsed()).into());
                         }
                         self.session = reply_header.session;
-                        self.nonce = reply["session_nonce"]
+                        self.boot_id = reply["boot_id"]
                             .as_str()
-                            .context("session nonce")?
+                            .context("boot identity")?
                             .to_owned();
                         self.context_id = reply["active_context_id"]
                             .as_str().unwrap_or("").to_owned();
@@ -2499,7 +2499,7 @@ mod tests {
             write_uncertain: std::sync::atomic::AtomicBool::new(false),
             endpoint_unconfirmed: std::sync::atomic::AtomicBool::new(false),
             command_budget_deadline: None, rf_deadline: None, token: String::new(),
-            bridge_id: String::new(), nonce: String::new(), session: [0; 16], device_mac: String::new(),
+            bridge_id: String::new(), boot_id: String::new(), session: [0; 16], device_mac: String::new(),
             next_request_no: 1, context_id: String::new(),
             auth_ready: true, wake_identity: None, wake_cause: String::new(),
             device_last_stage: String::new(), timings: vec![],

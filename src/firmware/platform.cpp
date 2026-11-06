@@ -286,14 +286,6 @@ void applyV2Plan(const String &body) {
     radio::markSynced();
     V2PlanDecision decision = power::state.planStore.apply(doc, power::state.v2Plan,
         clock::v2NowMs(), clock::planUtc(), power::state.v2Provisional);
-    // Local: the requested history window is recorded as soon as the plan shape is
-    // valid -- before the accept result is known -- mirroring the pre-refactor
-    // path, which set it right after its own shape check and before v2Plan.accept().
-    if (!decision.error || strcmp(decision.error, "plan_shape")) {
-        uint32_t historyMs = doc["history_sync_ms"] | 0u;
-        if (historyMs > 2500) historyMs = 2500;
-        sync::state.v2HistorySyncMs = historyMs;
-    }
     if (!decision.accepted) {
         transport::v2Ack("plan", decision.result, decision.display, "ram", decision.error,
               -1, decision.planId, decision.includeContext ? state.v2Profile.contextId : nullptr,
@@ -337,9 +329,6 @@ void applyV2Plan(const String &body) {
         power::state.v2LightDeadlineMs = 0;
         power::state.v2Provisional = false;
         DevLog.printf("[platform] plan %lu sleep\n", (unsigned long)plan.planId);
-    }
-    if (transport::state.v2ReplyOverBle && sync::state.v2HistorySyncMs) {
-        sync::state.v2HistorySyncUntilMs = clock::v2NowMs() + sync::state.v2HistorySyncMs;
     }
     JsonDocument ack;
     deserializeJson(ack, v2BuildAck("plan", decision.result, decision.display, "nvs",
@@ -439,7 +428,7 @@ void handleV2BundleBegin() {
     }
     JsonDocument doc;
     if (!transport::v2Command(transport::state.v2HttpBody, doc)) return;
-    const String nonce = transport::v2Nonce();
+    const String nonce = transport::bootId();
     const uint64_t nowMs = clock::v2NowMs();
     const V2BundleFingerprint committed{
         v2CommittedOwner.c_str(), v2CommittedRequest.c_str(), v2CommittedCrc,
@@ -477,7 +466,8 @@ void handleV2BundleChunk() {
     }
     if (!ownerAllows(v2Rx.owner)) { v2BundleError("occupied"); return; }
     const String request = transport::state.server.header("X-Request-Id");
-    const String nonce = transport::state.server.header("X-Session-Nonce");
+    // v2HttpRoute already authenticated the frame session; do not accept a second wire nonce.
+    const String nonce = transport::bootId();
     const String offsetText = transport::state.server.header("X-Offset");
     const V2BundleChunkStartDecision start = v2DecideBundleChunkStart(
         v2Rx, request.c_str(), nonce.c_str(), offsetText.c_str(), clock::v2NowMs());
@@ -521,7 +511,7 @@ void handleV2BundleCommit() {
     }
     JsonDocument doc;
     if (!transport::v2Command(transport::state.v2HttpBody, doc)) return;
-    const String nonce = transport::v2Nonce();
+    const String nonce = transport::bootId();
     const uint64_t nowMs = clock::v2NowMs();
     const String bridgeIdFallback = transport::state.server.arg("bridge_id");
     const V2BundleFingerprint committed{
@@ -536,6 +526,7 @@ void handleV2BundleCommit() {
         return;
     }
     if (decision.action == V2_BUNDLE_COMMIT_REPLAY) {
+        sync::networkWorkCompleted("bundle");
         transport::v2Ack("bundle", "applied", "unchanged", "flash", nullptr, -1, 0,
               decision.replayContext, UINT32_MAX);
         return;
@@ -547,6 +538,7 @@ void handleV2BundleCommit() {
         v2CommittedContext = state.v2Profile.contextId;
         v2Rx.deadline = 0;
         LittleFS.remove(v2RxPath);
+        sync::networkWorkCompleted("bundle");
         transport::v2Ack("bundle", "applied", "unchanged", "flash", nullptr, -1, 0,
               state.v2Profile.contextId, UINT32_MAX);
         return;
@@ -594,6 +586,7 @@ void handleV2BundleCommit() {
         int32_t args[] = {0, (int32_t)bsCommitSeq()};
         syncAppendEvent(sync::retained.syncRtc, sync::state.syncLogWakeSeq, millis(), 7, args, 2);
     }
+    sync::networkWorkCompleted("bundle");
     transport::v2Ack("bundle", "applied", state.v2DisplayState == 3 ? "failed" : "displayed",
           "flash", nullptr, -1, 0, state.v2Profile.contextId,
           UINT32_MAX);

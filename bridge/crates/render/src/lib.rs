@@ -1729,7 +1729,7 @@ fn owner_snapshot_grants_shared_configuration_permissions() {
     std::fs::create_dir_all(&dir).unwrap();
     let mut sim=SimulatorWifi::new(&dir).unwrap();
     for (i,namespace) in ["legacy","foreign"].iter().enumerate() {
-        let ack=sim.control(&serde_json::json!({"op":"apply","bridge_id":"test","request_id":format!("write{i}"),"device_mac":"AABBCCDDEEFF","expected_revision":i,
+        let ack=sim.control(&serde_json::json!({"op":"apply","bridge_id":"test","request_id":format!("write{i}"),"request_seq":i+1,"device_mac":"AABBCCDDEEFF","expected_revision":i,
             "changes":[{"network_id":format!("slot{i}"),"host_ssid":"Host","ssid":"Device","credential":"replace","password":"test-password"}]}),"test",namespace,1,1000,u64::MAX,0,true,true).unwrap();
         assert_eq!(ack["outcome"],"committed");
     }
@@ -1763,25 +1763,25 @@ fn shared_wifi_cross_bridge_writes_keep_credentials_and_receipt_isolation() {
     let dir=std::env::temp_dir().join(format!("codex-wifi-shared-{}",std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let mut sim=SimulatorWifi::new(&dir).unwrap();
-    let command=|op:&str,id:&str,revision:u64,changes:serde_json::Value| serde_json::json!({
-        "op":op,"bridge_id":"windows","request_id":id,"device_mac":"AABBCCDDEEFF","expected_revision":revision,"changes":changes});
-    let seed=serde_json::json!({"op":"apply","bridge_id":"mac","request_id":"seed","device_mac":"AABBCCDDEEFF","expected_revision":0,
+    let command=|op:&str,id:&str,sequence:u64,revision:u64,changes:serde_json::Value| serde_json::json!({
+        "op":op,"bridge_id":"windows","request_id":id,"request_seq":sequence,"device_mac":"AABBCCDDEEFF","expected_revision":revision,"changes":changes});
+    let seed=serde_json::json!({"op":"apply","bridge_id":"mac","request_id":"seed","request_seq":1,"device_mac":"AABBCCDDEEFF","expected_revision":0,
         "changes":[{"network_id":"home","host_ssid":"Host","ssid":"Device","credential":"replace","password":"fixture-password"},
                    {"network_id":"backup","host_ssid":"Other","ssid":"Backup","credential":"open"}]});
     assert_eq!(sim.control(&seed,"mac","mac-bond",1,1000,u64::MAX,0,true,true).unwrap()["outcome"],"committed");
-    let update=command("apply","shared-update",1,serde_json::json!([{"network_id":"home","host_ssid":"Host","ssid":"Device","label":"Updated from Windows","credential":"keep"}]));
+    let update=command("apply","shared-update",2,1,serde_json::json!([{"network_id":"home","host_ssid":"Host","ssid":"Device","label":"Updated from Windows","credential":"keep"}]));
     assert_eq!(sim.control(&update,"windows","windows-bond",1,1001,u64::MAX,0,false,true).unwrap()["error"],"claim_required");
     assert_eq!(sim.control(&update,"windows","windows-bond",1,1001,u64::MAX,0,true,false).unwrap()["error"],"session_expired");
     assert_eq!(sim.control(&update,"windows","windows-bond",1,1001,u64::MAX,0,true,true).unwrap()["outcome"],"committed");
     // Replaying the same transaction does not repeat the write.
     assert_eq!(sim.control(&update,"windows","windows-bond",1,1002,u64::MAX,0,true,true).unwrap()["revision"],2);
-    let query=serde_json::json!({"op":"result","bridge_id":"mac","request_id":"query","query_id":"shared-update","device_mac":"AABBCCDDEEFF"});
+    let query=serde_json::json!({"op":"result","bridge_id":"mac","request_id":"query","query_id":"shared-update","request_seq":2,"device_mac":"AABBCCDDEEFF"});
     assert_eq!(sim.control(&query,"mac","mac-bond",1,1002,u64::MAX,0,true,true).unwrap()["outcome"],"unknown");
     let matched=serde_json::json!({"op":"match","bridge_id":"windows","request_id":"match","network_id":"home","open":false,"metadata_key":"0".repeat(64),"device_mac":"AABBCCDDEEFF"});
     let found=sim.control(&matched,"windows","windows-bond",1,1002,u64::MAX,0,true,true).unwrap();assert_eq!(found["ok"],true);assert_eq!(found["version"],2);
-    let stale=command("apply","stale",1,serde_json::json!([{"network_id":"backup","deleted":true}]));
+    let stale=command("apply","stale",3,1,serde_json::json!([{"network_id":"backup","deleted":true}]));
     assert_eq!(sim.control(&stale,"windows","windows-bond",1,1002,u64::MAX,0,true,true).unwrap()["error"],"revision_conflict");
-    let activate=serde_json::json!({"op":"activate","bridge_id":"windows","request_id":"activate-shared","network_id":"home","version":2,"device_mac":"AABBCCDDEEFF"});
+    let activate=serde_json::json!({"op":"activate","bridge_id":"windows","request_id":"activate-shared","request_seq":4,"network_id":"home","version":2,"device_mac":"AABBCCDDEEFF"});
     assert_eq!(sim.control(&activate,"windows","windows-bond",1,1003,u64::MAX,0,true,true).unwrap()["ok"],true);
     sim.poll(1004,"windows-bond",1,true,0).unwrap();
     sim.poll(1005,"windows-bond",1,true,1).unwrap();
@@ -1794,7 +1794,7 @@ fn shared_wifi_cross_bridge_writes_keep_credentials_and_receipt_isolation() {
     let home=snapshot["networks"].as_array().unwrap().iter().find(|r|r["network"]["network_id"]=="home").unwrap();
     assert_eq!(home["bond"],"mac-bond");assert_eq!(home["writable"],true);assert_eq!(home["network"]["password"],"fixture-password");
     assert_eq!(snapshot["active"]["network_id"],"home");
-    let delete=command("apply","delete-shared",snapshot["revision"].as_u64().unwrap(),serde_json::json!([{"network_id":"backup","deleted":true}]));
+    let delete=command("apply","delete-shared",5,snapshot["revision"].as_u64().unwrap(),serde_json::json!([{"network_id":"backup","deleted":true}]));
     assert_eq!(sim.control(&delete,"windows","windows-bond",1,1006,u64::MAX,0,true,true).unwrap()["outcome"],"committed");
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -1808,11 +1808,11 @@ fn shared_wifi_global_capacity_keeps_bounded_storage() {
     let mut count=0;
     for (batch,size) in [1,3,4,4].into_iter().enumerate() {
         let changes:Vec<_>=(count..count+size).map(|i|serde_json::json!({"network_id":format!("network{i}"),"host_ssid":format!("Host{i}"),"ssid":format!("Device{i}"),"credential":"open"})).collect();
-        let request=serde_json::json!({"op":"apply","bridge_id":"test","request_id":format!("batch{batch}"),"device_mac":"AABBCCDDEEFF","expected_revision":batch,"changes":changes});
+        let request=serde_json::json!({"op":"apply","bridge_id":"test","request_id":format!("batch{batch}"),"request_seq":batch+1,"device_mac":"AABBCCDDEEFF","expected_revision":batch,"changes":changes});
         assert_eq!(sim.control(&request,"test","same-bond",1,1000,u64::MAX,0,true,true).unwrap()["outcome"],"committed");
         count+=size;println!("records={count} {}",sim.storage_status().unwrap());
     }
-    let excess=serde_json::json!({"op":"apply","bridge_id":"test","request_id":"excess","device_mac":"AABBCCDDEEFF","expected_revision":4,"changes":[{"network_id":"excess","host_ssid":"Excess","ssid":"Excess","credential":"open"}]});
+    let excess=serde_json::json!({"op":"apply","bridge_id":"test","request_id":"excess","request_seq":5,"device_mac":"AABBCCDDEEFF","expected_revision":4,"changes":[{"network_id":"excess","host_ssid":"Excess","ssid":"Excess","credential":"open"}]});
     assert_eq!(sim.control(&excess,"test","same-bond",1,1000,u64::MAX,0,true,true).unwrap()["error"],"capacity");
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -1832,12 +1832,12 @@ fn shared_wifi_old_duplicate_ids_are_preserved_and_explicitly_rejected() {
     std::fs::write(dir.join("wifi-schemes.bin"),&fixture).unwrap();
     let mut sim=SimulatorWifi::new(&dir).unwrap();
     assert_eq!(std::fs::read(dir.join("wifi-schemes.bin")).unwrap(),fixture);
-    let request=serde_json::json!({"op":"apply","bridge_id":"new","request_id":"ambiguous","device_mac":"AABBCCDDEEFF","expected_revision":2,"changes":[{"network_id":"same","deleted":true}]});
+    let request=serde_json::json!({"op":"apply","bridge_id":"new","request_id":"ambiguous","request_seq":1,"device_mac":"AABBCCDDEEFF","expected_revision":2,"changes":[{"network_id":"same","deleted":true}]});
     for _ in 0..2 {
         sim=SimulatorWifi::new(&dir).unwrap();
         let r=sim.control(&request,"new","new",1,1000,30000,0,true,true).unwrap();assert_eq!(r["error"],"ambiguous_network_id");assert_eq!(sim.storage_status().unwrap()["revision"],2);
     }
-    let activate=serde_json::json!({"op":"activate","bridge_id":"new","request_id":"ambiguous-activate","network_id":"same","version":1,"device_mac":"AABBCCDDEEFF"});
+    let activate=serde_json::json!({"op":"activate","bridge_id":"new","request_id":"ambiguous-activate","request_seq":2,"network_id":"same","version":1,"device_mac":"AABBCCDDEEFF"});
     assert_eq!(sim.control(&activate,"new","new",1,1000,30000,0,true,true).unwrap()["error"],"ambiguous_network_id");
     assert_eq!(sim.storage_status().unwrap()["networks"],2);
     std::fs::remove_dir_all(dir).unwrap();
@@ -1848,24 +1848,24 @@ fn physical_ble_hold_finishes_wifi_activation_without_starting_deferred_rf() {
     let _guard=WIFI_PERMISSION_TEST_LOCK.lock().unwrap();
     let dir=std::env::temp_dir().join(format!("codex-wifi-hold-{}",std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();let mut sim=SimulatorWifi::new(&dir).unwrap();
-    let seed=serde_json::json!({"op":"apply","bridge_id":"test","request_id":"seed","device_mac":"AABBCCDDEEFF","expected_revision":0,
+    let seed=serde_json::json!({"op":"apply","bridge_id":"test","request_id":"seed","request_seq":1,"device_mac":"AABBCCDDEEFF","expected_revision":0,
         "changes":[{"network_id":"home","host_ssid":"Host","ssid":"Device","credential":"open"}]});
     assert_eq!(sim.control(&seed,"test","bond",1,1000,300000,300000,true,true).unwrap()["outcome"],"committed");
-    let activation=|id:&str|serde_json::json!({"op":"activate","bridge_id":"test","request_id":id,"device_mac":"AABBCCDDEEFF","network_id":"home","version":1});
-    assert_eq!(sim.control(&activation("hold"),"test","bond",1,1100,300000,300000,true,true).unwrap()["ok"],true);
+    let activation=|id:&str,sequence:u64|serde_json::json!({"op":"activate","bridge_id":"test","request_id":id,"request_seq":sequence,"device_mac":"AABBCCDDEEFF","network_id":"home","version":1});
+    assert_eq!(sim.control(&activation("hold",2),"test","bond",1,1100,300000,300000,true,true).unwrap()["ok"],true);
     // Physical hold keeps BLE active; association has already started. The
     // ROM must still poll completion, commit the receipt and preserve Wi-Fi.
     assert!(!sim.poll_with_start_allowed(1200,"bond",1,true,1,false).unwrap());
-    let query=serde_json::json!({"op":"result","bridge_id":"test","request_id":"query","query_id":"hold","device_mac":"AABBCCDDEEFF"});
+    let query=serde_json::json!({"op":"result","bridge_id":"test","request_id":"query","query_id":"hold","request_seq":2,"device_mac":"AABBCCDDEEFF"});
     assert_eq!(sim.control(&query,"test","bond",1,1300,300000,300000,true,true).unwrap()["outcome"],"committed");
     assert_eq!(sim.observe().unwrap()["connected"],true);
     let begins=sim.observe().unwrap()["begins"].clone();
-    assert_eq!(sim.control(&activation("healthy"),"test","bond",1,1350,300000,300000,true,true).unwrap()["ok"],true);
+    assert_eq!(sim.control(&activation("healthy",3),"test","bond",1,1350,300000,300000,true,true).unwrap()["ok"],true);
     assert_eq!(sim.observe().unwrap()["connected"],true,"explicit activation must preserve the matching healthy link");
     assert!(!sim.poll_with_start_allowed(1360,"bond",1,true,0,false).unwrap());
     assert_eq!(sim.observe().unwrap()["begins"],begins,"no repeated association for the same connected network");
     // Ordinary BLE defers a NEW association, then permits it after release.
-    assert_eq!(sim.control(&activation("deferred"),"test","bond",1,1400,300000,0,true,true).unwrap()["ok"],true);
+    assert_eq!(sim.control(&activation("deferred",4),"test","bond",1,1400,300000,0,true,true).unwrap()["ok"],true);
     assert!(sim.poll_with_start_allowed(1500,"bond",1,true,0,false).unwrap());
     // SHA256 of Host\0Device\0\0 followed by the open-network byte 1.
     let mut target=serde_json::json!({"network_id":"home","open":true,"metadata_key":"b733bca5c43500f3fcfd520711c18f89d0e4ea05ab1ce7b4cf6c23be82b656e2"});
@@ -1878,7 +1878,7 @@ fn physical_ble_hold_finishes_wifi_activation_without_starting_deferred_rf() {
 
     target["metadata_key"]=serde_json::json!("0".repeat(64));
     assert!(!sim.plan_matches(&target).unwrap(),"Plan must not connect a different configuration");
-    assert_eq!(sim.control(&serde_json::json!({"op":"result","bridge_id":"test","request_id":"query2","query_id":"deferred","device_mac":"AABBCCDDEEFF"}),"test","bond",1,1600,300000,0,true,true).unwrap()["outcome"],"accepted");
+    assert_eq!(sim.control(&serde_json::json!({"op":"result","bridge_id":"test","request_id":"query2","query_id":"deferred","request_seq":4,"device_mac":"AABBCCDDEEFF"}),"test","bond",1,1600,300000,0,true,true).unwrap()["outcome"],"accepted");
     assert!(!sim.poll_with_start_allowed(1700,"bond",1,false,1,true).unwrap());
     std::fs::remove_dir_all(dir).unwrap();
 }

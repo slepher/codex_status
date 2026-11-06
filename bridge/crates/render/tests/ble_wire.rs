@@ -8,7 +8,7 @@ fn envelope() -> Value {
 #[test]
 fn production_ble_status_preserves_all_maximum_byte_identifiers() {
     let mut input = envelope();
-    input["session_nonce"] = json!("f".repeat(32));
+    input["boot_id"] = json!("f".repeat(32));
     input["rendezvous_v"] = json!(1);
     input["automatic_contact"] = json!(false);
     input["network_error"] = json!("bridge_http_unreachable");

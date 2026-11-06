@@ -220,7 +220,6 @@ fn frame_operation(path: &str) -> Result<u16> {
         "/api/sync/ack" => "sync_ack", "/api/sync/complete" => "sync_complete",
         "/api/wifi/snapshot" => "wifi_snapshot", "/api/wifi/apply" => "wifi_apply",
         "/api/wifi/result" => "wifi_result", "/api/wifi/result_ack" => "wifi_result_ack",
-        "/api/wifi/command" => "wifi_match",
         _ => return Err(HttpRequestError::UnsupportedOperation.into()),
     };
     crate::compact_frame::operation(name).context("unregistered frame operation")
@@ -230,19 +229,19 @@ async fn request(
     ip: &str, _method: &str, path: &str, token: &str, body: Option<&[u8]>,
     extra_headers: &[(&str, &str)], timeout: Duration,
 ) -> Result<(u16, String)> {
+    request_with_operation(ip, _method, path, token, body, extra_headers, timeout, None).await
+}
+
+async fn request_with_operation(
+    ip: &str, _method: &str, path: &str, token: &str, body: Option<&[u8]>,
+    extra_headers: &[(&str, &str)], timeout: Duration, operation: Option<u16>,
+) -> Result<(u16, String)> {
     use crate::compact_frame::{Header, CONTENT_TYPE, HEADER_LEN, MAX_HTTP_FRAME};
     let mut progress = HttpProgress { outcome: DispatchOutcome::NotSent, stage: "http_prepare" };
     let result = async {
     let deadline = Instant::now() + timeout;
-    let mut op = frame_operation(path)?;
-    let command_payload = if path.split('?').next()==Some("/api/wifi/command") {
-        let mut value:Value=serde_json::from_slice(body.unwrap_or(b"{}"))?;
-        op=crate::compact_frame::operation(&format!("wifi_{}",value["op"].as_str().unwrap_or("")))
-            .context("invalid_wifi_operation")?;
-        value.as_object_mut().context("invalid_wifi_command")?.remove("op");
-        Some(serde_json::to_vec(&value)?)
-    }else{None};
-    let body=command_payload.as_deref().or(body).filter(|b|!b.is_empty());
+    let op = match operation { Some(op) => op, None => frame_operation(path)? };
+    let body = body.filter(|b| !b.is_empty());
     progress.stage = "http_session";
     let session = frame_session(ip, token);
     if op != 1 && op != 19 && lock_session_until(&session, deadline).await?.id == [0; 16] {
@@ -303,7 +302,7 @@ async fn request(
     }
     if status == 200 && ack.result == 0 {
         if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
-            if op == 1 && value["device_mac"].is_string() { session.identity = Some(json!({"device_mac":value["device_mac"], "boot_id":value["boot_id"], "session_nonce":value["session_nonce"]})); }
+            if op == 1 && value["device_mac"].is_string() { session.identity = Some(json!({"device_mac":value["device_mac"], "boot_id":value["boot_id"]})); }
             if let Some(ctx) = value["active_context_id"].as_str() {
                 if ctx.len() == 16 && ctx.bytes().all(|b| b.is_ascii_hexdigit()) {
                     session.context.copy_from_slice(ctx.as_bytes());
@@ -385,6 +384,11 @@ pub async fn ap01_wifi_profiles(endpoint:&str, method:&str, code:&str, body:Opti
 }
 
 async fn post_json(ip: &str, path: &str, token: &str, body: &Value, timeout: Duration) -> Result<Value> {
+    post_json_with_operation(ip, path, token, body, timeout, None).await
+}
+
+async fn post_json_with_operation(ip: &str, path: &str, token: &str, body: &Value,
+                                  timeout: Duration, operation: Option<u16>) -> Result<Value> {
     let started = Instant::now();
     let mut payload=body.clone();
     if path!="/api/wifi/command" {if let Some(object)=payload.as_object_mut(){object.remove("op");}}
@@ -404,12 +408,12 @@ async fn post_json(ip: &str, path: &str, token: &str, body: &Value, timeout: Dur
         job_id = job_id.as_deref().unwrap_or(""),
         "device HTTP request"
     );
-    let response = request(ip, "POST", path, token, Some(&text), &[], timeout).await;
+    let response = request_with_operation(ip, "POST", path, token, Some(&text), &[], timeout, operation).await;
     if response.as_ref().err().is_some_and(|e| e.downcast_ref::<HttpSessionExpired>().is_some()) {
         // The frame was rejected before dispatch. Refresh identity once, but do
         // not blindly replay a mutation whose durable transaction predates reboot.
         if let Some(mac) = body["device_mac"].as_str() {
-            if let Err(error) = session_nonce(ip, token, mac, timeout.saturating_sub(started.elapsed())).await {
+            if let Err(error) = authenticated_identity(ip, token, mac, timeout.saturating_sub(started.elapsed())).await {
                 // Recovery is a separate read. Its failure must not replace the
                 // original write's outcome or its original-transaction query fence.
                 tracing::warn!(event="session_refresh_failed", operation=path,
@@ -594,7 +598,7 @@ async fn status_mode(ip: &str, token: &str, timeout: Duration, compact: bool) ->
         value=parse_status_body(std::str::from_utf8(&bytes)?)?;
         let session=frame_session(ip,token);
         let mut session=lock_session_until(&session,deadline).await?;
-        session.identity = Some(json!({"device_mac":value["device_mac"], "boot_id":value["boot_id"], "session_nonce":value["session_nonce"]}));
+        session.identity = Some(json!({"device_mac":value["device_mac"], "boot_id":value["boot_id"]}));
         if let Some(ctx)=value["active_context_id"].as_str().filter(|s|s.len()==16 && s.bytes().all(|c|c.is_ascii_hexdigit())) {session.context.copy_from_slice(ctx.as_bytes());}
         return Ok(value);
     }
@@ -641,7 +645,7 @@ pub async fn ota_image(ip: &str, token: &str, mac: &str, image_bytes: usize, tim
 /// sync-v1 keeps the device's precise error code (notably claim_required,
 /// digest_mismatch and batch_lost) and validates every response identity.
 pub async fn sync(
-    ip: &str, token: &str, mac: &str, bridge_id: &str, nonce: &str,
+    ip: &str, token: &str, mac: &str, bridge_id: &str, boot_id: &str,
     op: &str, request_id: &str, fields: &Value, timeout: Duration,
 ) -> Result<Value> {
     let path = match op {
@@ -664,7 +668,7 @@ pub async fn sync(
     let reply: Value = serde_json::from_str(&text).context("sync response JSON")?;
     if status == 401 { bail!("sync unauthorized (401)"); }
     if reply["device_mac"].as_str().and_then(DeviceIdentity::normalized_mac).as_deref()
-            != Some(expected_mac.as_str()) || reply["session_nonce"] != nonce ||
+            != Some(expected_mac.as_str()) || reply["boot_id"] != boot_id ||
         reply["request_id"] != request_id || reply["sync_version"] != 1 ||
         reply["op"] != format!("sync_{op}") {
         bail!("sync response identity mismatch");
@@ -689,10 +693,18 @@ pub async fn plan(ip: &str, token: &str, expected_mac: &str, plan: &Value, timeo
 async fn session_post(ip: &str, path: &str, token: &str, expected_mac: &str, message: &Value, timeout: Duration) -> Result<Value> {
     let started = Instant::now();
     let mut command = message.clone();
-    let (_, device_mac) = session_nonce(ip, token, expected_mac, timeout).await?;
+    let device_mac = authenticated_identity(ip, token, expected_mac, timeout).await?;
     command["device_mac"] = json!(device_mac);
-    command["request_id"] = json!(format!("{}-{:08x}", path.rsplit('/').next().unwrap_or("command"),
-        crc32fast::hash(&crate::template::canonical_bytes(message))));
+    // Correlation uses the existing business identity. Content integrity and
+    // conflicts belong to the frame fence and the Plan/Data handlers.
+    if command["request_id"].is_null() {
+        command["request_id"] = if path == "/api/data" {
+            json!(format!("data-{}-{}", message["active_context_id"].as_str().unwrap_or(""),
+                message["seq"].as_u64().unwrap_or(0)))
+        } else {
+            json!(format!("plan-{}", message["plan_id"].as_u64().unwrap_or(0)))
+        };
+    }
     post_json(ip, path, token, &command, timeout.saturating_sub(started.elapsed())).await
 }
 
@@ -707,7 +719,7 @@ pub async fn activate(
     timeout: Duration,
 ) -> Result<Value> {
     let started = Instant::now();
-    let (_, device_mac) = session_nonce(ip, token, expected_mac, timeout).await?;
+    let device_mac = authenticated_identity(ip, token, expected_mac, timeout).await?;
     let request_id = format!("activate-{expected_context}-{template_id}");
     post_json(ip, "/api/activate", token, &json!({
         "device_mac": device_mac, "bridge_id": bridge_id,
@@ -716,7 +728,7 @@ pub async fn activate(
     }), timeout.saturating_sub(started.elapsed())).await
 }
 
-async fn session_nonce(ip: &str, token: &str, expected_mac: &str, timeout: Duration) -> Result<(String, String)> {
+async fn authenticated_identity(ip: &str, token: &str, expected_mac: &str, timeout: Duration) -> Result<String> {
     let session = frame_session(ip, token);
     let deadline = Instant::now() + timeout;
     let cached = lock_session_until(&session, deadline).await?.identity.clone();
@@ -739,11 +751,7 @@ async fn session_nonce(ip: &str, token: &str, expected_mac: &str, timeout: Durat
     tracing::info!(event = "preflight_accept", operation = "/api/status",
         device_mac = %expected, reported_mac = %actual, error_category = "none",
         "device HTTP identity preflight accepted");
-    let nonce = state["session_nonce"].as_str().unwrap_or("");
-    if nonce.len() != 32 || !nonce.bytes().all(|c| c.is_ascii_hexdigit()) {
-        bail!("device lacks required session protection; update firmware before publishing or activating");
-    }
-    Ok((nonce.to_owned(), mac.to_owned()))
+    Ok(mac.to_owned())
 }
 
 /// Bounded BEGIN/CHUNK/COMMIT install of a complete Bundle payload.
@@ -760,7 +768,7 @@ pub async fn install_bundle(
         bail!("bundle payload size {} out of range", payload.len());
     }
     let chunk_bytes = chunk_bytes.clamp(256, BUNDLE_CHUNK_BYTES);
-    let (nonce, device_mac) = session_nonce(ip, token, expected_mac, timeout).await?;
+    let device_mac = authenticated_identity(ip, token, expected_mac, timeout).await?;
     let content_crc = format!("{:08x}", crc32fast::hash(payload));
     // Service freezes CSZ1 bytes at publish time; retries send those exact bytes.
     let decoded = bridge_render::bundle_codec::decode(payload, 16 * 1024 * 1024)
@@ -787,7 +795,7 @@ pub async fn install_bundle(
     if offset > payload.len() { bail!("bundle begin offset exceeds payload"); }
     while offset < payload.len() {
         let end = (offset + chunk_bytes).min(payload.len());
-        let path = format!("/api/bundle/chunk?request_id={request_id}&session_nonce={nonce}&offset={offset}");
+        let path = format!("/api/bundle/chunk?request_id={request_id}&offset={offset}");
         let offset_text = offset.to_string();
         let trace_device_mac = event_id(&command, "device_mac").unwrap_or_default();
         let trace_job_id = event_id(&bundle, "job_id").unwrap_or_default();
@@ -801,7 +809,7 @@ pub async fn install_bundle(
             &path,
             token,
             Some(&payload[offset..end]),
-            &[("X-Request-Id", &request_id), ("X-Session-Nonce", &nonce), ("X-Offset", &offset_text)],
+            &[("X-Request-Id", &request_id), ("X-Offset", &offset_text)],
             timeout,
         ).await;
         let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -938,7 +946,7 @@ mod tests {
                         assert!(body.get("permit").is_none(), "retired permit must not enter the frame");
                     }
                     let code = if opening { if status==401 {401}else{200} } else {status};
-                    let text = if opening {r#"{"device_mac":"AABBCCDDEEFF","session_nonce":"snapshot-test-nonce"}"#} else {&payload};
+                    let text = if opening {r#"{"device_mac":"AABBCCDDEEFF","boot_id":"snapshot-test-nonce"}"#} else {&payload};
                     let header=crate::compact_frame::Header{kind:1,op:frame.op,result:if code>=400 {2}else{0},
                         payload_len:text.len() as u16,session:[7;16],request_no:frame.request_no,context:frame.context};
                     let mut reply=header.encode().unwrap().to_vec(); reply.extend_from_slice(text.as_bytes());
@@ -987,7 +995,7 @@ mod tests {
                 }
                 // Complete frame received, but no ACK is returned.
             });
-            let error = request(&address, "POST", "/api/wifi/command", token, Some(br#"{"op":"match"}"#), &[], Duration::from_secs(2)).await.unwrap_err();
+            let error = request_with_operation(&address, "POST", "/api/wifi/command", token, Some(b"{}"), &[], Duration::from_secs(2), Some(18)).await.unwrap_err();
             server.join().unwrap();
             let evidence = crate::rendezvous::command_failure(&error).unwrap();
             assert_eq!(evidence.outcome, if established { DispatchOutcome::AckUnknown } else { DispatchOutcome::NotSent });
@@ -1063,7 +1071,7 @@ mod tests {
                 "/api/data",
                 "secret-token",
                 &json!({"device_mac": "AABBCCDDEEFF", "request_id": "data-1", "seq": 1,
-                    "session_nonce": "request-secret", "snapshot": {"account": "request-secret"}}),
+                    "boot_id": "request-secret", "snapshot": {"account": "request-secret"}}),
                 Duration::from_secs(2),
             ).await;
             server.join().unwrap();
@@ -1176,11 +1184,22 @@ pub async fn wifi_command(ip:&str,token:&str,mac:&str,bridge:&str,op:&str,mut bo
     // Setup reads share the GATT correlation envelope. Mutation IDs must always
     // come from the durable job; never generate a new transaction here.
     if body["request_id"].is_null() && matches!(op,"match"|"active"|"setup_status"|"scheme_get") {
-        body["request_id"]=json!(format!("query-{op}-{:08x}",crc32fast::hash(&crate::template::canonical_bytes(&body))));
+        // Reads have no durable transaction: session/request_no correlates each
+        // response, including repeated queries with different arguments.
+        body["request_id"]=json!(format!("query-{op}"));
     }
     body["device_mac"]=json!(compact.as_bytes().chunks(2).map(|p|std::str::from_utf8(p).unwrap()).collect::<Vec<_>>().join(":"));
-    body["bridge_id"]=json!(bridge);body["op"]=json!(op);
-    let reply=post_json(ip,"/api/wifi/command",token,&body,timeout).await?;
+    body["bridge_id"]=json!(bridge);
+    if body.get("op").is_some() {
+        return Err(anyhow!("retired_protocol").context(CommandFailure {
+            outcome: DispatchOutcome::NotSent, stage: "http_prepare", reason: "retired_protocol",
+        }));
+    }
+    let operation = crate::compact_frame::operation(&format!("wifi_{op}")).ok_or_else(||
+        anyhow!("invalid_wifi_operation").context(CommandFailure {
+            outcome: DispatchOutcome::NotSent, stage: "http_prepare", reason: "invalid_wifi_operation",
+        }))?;
+    let reply=post_json_with_operation(ip,"/api/wifi/command",token,&body,timeout,Some(operation)).await?;
     anyhow::ensure!(reply["device_mac"].as_str().and_then(DeviceIdentity::normalized_mac).as_deref()==Some(compact.as_str()),"wifi_mac_mismatch");
     Ok(reply)
 }

@@ -22,6 +22,7 @@ fn find_arduinojson(root: &Path) -> PathBuf {
 }
 
 fn main() {
+    println!("cargo:rerun-if-changed=../../../tools/wifi-control-test-adapter.h");
     println!("cargo:rerun-if-changed=../../../src/json_chunk.h");
     println!("cargo:rerun-if-changed=../../../src/local_json_allocator.h");
     println!("cargo:rerun-if-changed=../../../src/bundle_store_context.h");

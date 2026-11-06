@@ -26,6 +26,18 @@ inline int bridgeOfflineMinutes(uint32_t now, uint32_t lastContact, bool timeKno
     return minutes > (uint32_t)lostMinutes ? (int)minutes : -1;
 }
 
+// Display freshness is independent of Data revisions and PowerPlan deadlines.
+struct BridgeContactState {
+    uint32_t epoch = 0;
+    bool failed = false;
+    void observed(uint32_t now) { if (now > 1600000000) epoch = now; failed = false; }
+    int offlineMinutes(uint32_t now, uint32_t lastSync, bool timeKnown,
+                       int lostMinutes, int unknownValue) const {
+        return bridgeOfflineMinutes(now, epoch > lastSync ? epoch : lastSync,
+                                    timeKnown, lostMinutes, unknownValue, failed);
+    }
+};
+
 // A network glyph must converge even when no business Data is delivered.
 inline bool sleepFrameNeedsRefresh(uint8_t glyph, int bridgeOffline) {
     return !(glyph & 4) || bool(glyph & 8) != (bridgeOffline >= 0);

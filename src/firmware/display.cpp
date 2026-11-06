@@ -906,12 +906,11 @@ static void renderUsage(const String &json, const char *channel) {
 }
 
 static int currentBridgeOfflineMinutes() {
-    // Explicit Bridge failure overrides recent Data freshness, without changing
-    // the Wi-Fi phase. Zero means known offline with no elapsed minute yet.
-    return bridgeOfflineMinutes((uint32_t)time(nullptr), radio::retained.rtcLastSyncEpoch,
+    // Failure remains visible until a subsequent authenticated owner contact.
+    // Contact freshness changes neither Data freshness nor the Wi-Fi phase.
+    return radio::retained.bridgeContact.offlineMinutes((uint32_t)time(nullptr), radio::retained.rtcLastSyncEpoch,
                                 clock::timeKnown(), BRIDGE_LOST_MIN,
-                                (diagnostics::retained.rtcDeepGlyph & 8) ? 0 : -1,
-                                !radio::state.bridgeReachable && radio::state.networkError);
+                                (diagnostics::retained.rtcDeepGlyph & 8) ? 0 : -1);
 }
 
 void renderActiveUsage(const String &json, const char *channel) {

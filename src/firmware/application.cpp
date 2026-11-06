@@ -149,6 +149,7 @@ void initialize(const char *firmwareVersion, const char *imageIdentity) {
         radio::retained.rtcActiveAt = 0;
         radio::retained.rtcActiveMac[0] = 0;
         radio::retained.rtcLastSyncEpoch = 0;
+        radio::retained.bridgeContact = {};
         diagnostics::retained.rtcDeepGlyph = 0;
         power::retained.rtcRetryStage = 0;
         platform::retained.rtcUsageHash = 0;
@@ -480,7 +481,7 @@ void tick() {
                                                           millis(), sync::state.syncLastProgressMs)) {
             sync::state.lastFailure = failure;
             sync::syncRecordOutcome(1, 3);
-            syncFail(sync::retained.syncRtc);
+            if (sync::state.syncOpenReason == "diag_sync") syncFail(sync::retained.syncRtc);
             sync::state.syncOpenThisWake = false;
             sync::state.syncDataSeq = 0;
             sync::state.syncDataPending = false;
@@ -505,6 +506,8 @@ void tick() {
                 sync::state.syncOpenThisWake = true;
                 sync::state.syncLastProgressMs = millis();
                 sync::state.syncOpenAnsweredAt = clock::v2NowMs();
+                sync::state.syncOpenId = "";
+                sync::state.syncOpenReason = "diag_sync";
                 sync::state.lastFailure = nullptr;
                 radio::sendAnnounce(radio::state.bleOn);
             } else power::enterDeep("plan");
@@ -516,6 +519,8 @@ void tick() {
                 sync::state.syncOpenThisWake = true;
                 sync::state.syncLastProgressMs = millis();
                 sync::state.syncOpenAnsweredAt = clock::v2NowMs();
+                sync::state.syncOpenId = "";
+                sync::state.syncOpenReason = "diag_sync";
                 sync::state.lastFailure = nullptr;
                 radio::sendAnnounce(radio::state.bleOn);
             } else power::enterDeep("provisional");
@@ -538,8 +543,8 @@ void tick() {
         if (clock::timeKnown()) {
             time_t nowSec = time(nullptr);
             if (radio::retained.rtcLastSyncEpoch > 1600000000) {
-                long mins = ((long)nowSec - (long)radio::retained.rtcLastSyncEpoch) / 60;
-                int offlineMinute = (mins > BRIDGE_LOST_MIN) ? (int)mins : -1;
+                int offlineMinute = radio::retained.bridgeContact.offlineMinutes(
+                    (uint32_t)nowSec, radio::retained.rtcLastSyncEpoch, true, BRIDGE_LOST_MIN, -1);
                 if (offlineMinute != lastOfflineMinute) {
                     bool wasShown = lastOfflineMinute > 0;
                     lastOfflineMinute = offlineMinute;

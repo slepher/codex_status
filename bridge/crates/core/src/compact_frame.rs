@@ -8,7 +8,7 @@ pub const MAX_HTTP_FRAME: usize = 4096;
 pub const MAX_BLE_FRAME: usize = 8192;
 pub const MAX_ATTRIBUTE: usize = 512;
 
-const OPERATIONS: [&str; 36] = ["", "status", "data", "plan", "claim", "renew", "sync_begin", "sync_page", "sync_ack", "sync_complete", "bundle_begin", "bundle_chunk", "bundle_commit", "activate", "wifi_snapshot", "wifi_apply", "wifi_result", "wifi_result_ack", "wifi_match", "ota_image", "ready_report", "business_query", "network_start", "sync_config", "sync_open", "history", "wifi_owner", "wifi_info", "wifi_active", "wifi_trial", "wifi_activate", "wifi_setup_status", "wifi_setup_cancel", "wifi_status", "wifi_scheme_get", "wifi_capabilities"];
+const OPERATIONS: [&str; 36] = ["", "status", "data", "plan", "claim", "renew", "sync_begin", "sync_page", "sync_ack", "sync_complete", "bundle_begin", "bundle_chunk", "bundle_commit", "activate", "wifi_snapshot", "wifi_apply", "wifi_result", "wifi_result_ack", "wifi_match", "ota_image", "ready_report", "business_query", "network_start", "sync_config", "", "", "wifi_owner", "wifi_info", "wifi_active", "wifi_trial", "wifi_activate", "wifi_setup_status", "wifi_setup_cancel", "wifi_status", "wifi_scheme_get", "wifi_capabilities"];
 pub fn operation(name: &str) -> Option<u16> {
     OPERATIONS.iter().position(|&n| !n.is_empty() && n == name).map(|i|i as u16)
 }
@@ -17,7 +17,7 @@ pub fn operation_name(op: u16) -> Option<&'static str> {
 }
 
 pub fn is_idempotent_read_op(op: u16) -> bool {
-    matches!(op, 1 | 7 | 14 | 16 | 21 | 25 | 26 | 27 | 28 | 31 | 33 | 34 | 35)
+    matches!(op, 1 | 7 | 14 | 16 | 21 | 26 | 27 | 28 | 31 | 33 | 34 | 35)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,7 +34,7 @@ pub struct Header {
 impl Header {
     fn valid(&self) -> Result<(), &'static str> {
         let transport_error = self.kind == 1 && self.result == 2 && self.op == 0 && self.request_no == 0;
-        if !transport_error && (self.kind > 2 || self.op == 0 || self.op > MAX_OP || self.result > 3
+        if !transport_error && (self.kind > 2 || self.op == 0 || self.op > MAX_OP || matches!(self.op,24|25) || self.result > 3
             || (self.kind != 1 && self.result != 0) || self.request_no == 0)
         {
             return Err("invalid frame header");
@@ -134,7 +134,7 @@ mod tests {
 
     #[test]
     fn uncached_read_reexecutes_but_changed_payload_and_writes_do_not() {
-        for op in 1..=MAX_OP {
+        for op in (1..=MAX_OP).filter(|op| !matches!(*op,24|25)) {
             let h = Header { kind: 0, op, result: 0, payload_len: 2,
                 session: [1;16], request_no: 1, context: [0;16] };
             let mut frame = h.encode().unwrap().to_vec(); frame.extend_from_slice(b"{}");
@@ -160,11 +160,11 @@ mod tests {
 
     #[test]
     fn every_operation_matches_firmware_without_alias_or_wildcard() {
-        for op in 1..=MAX_OP {
+        for op in (1..=MAX_OP).filter(|op| !matches!(*op,24|25)) {
             let name=operation_name(op).unwrap();assert_eq!(operation(name),Some(op));
             assert_eq!(bridge_render::simulator_compact_operation(name),op);
         }
-        for name in ["wifi_command","wifi_save","wifi_future_unknown",""] {
+        for name in ["wifi_command","wifi_save","wifi_future_unknown","history","sync_open",""] {
             assert_eq!(operation(name),None);assert_eq!(bridge_render::simulator_compact_operation(name),0);
         }
     }

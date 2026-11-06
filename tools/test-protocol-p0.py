@@ -73,6 +73,11 @@ void rejected(uint64_t number) {
     assert(connectionGeneration==7);
 }
 int main() {
+    for (uint8_t op : {24,25}) {
+        auto retired=frame(1);retired[3]=op;CompactFrameHeader retiredHeader;
+        assert(!compactFrameDecode((const uint8_t*)retired.data(),retired.size(),retiredHeader,512));
+    }
+    assert(compactOperation("history")==0);
     auto valid=frame(1);
     assert(appendCommandFrame(tplCtrlBuf,valid)); assert(queue.size()==1);
     assert(!appendCommandFrame(tplCtrlBuf,frame(2).substr(0,48)));
@@ -97,7 +102,7 @@ int main() {
     doc.clear();assert(!deserializeJson(doc,replies.back().c_str()+48));assert(doc["error"]=="ble_auth_required");
     for(auto *message:firmware::pending)delete message;
     for (uint16_t op=1;op<=35;++op) {
-        bool expected=op==1||op==7||op==14||op==16||op==21||op==25||op==26||op==27||op==28||op==31||op==33||op==34||op==35;
+        bool expected=op==1||op==7||op==14||op==16||op==21||op==26||op==27||op==28||op==31||op==33||op==34||op==35;
         assert(isIdempotentReadOp(op)==expected);
     }
 }

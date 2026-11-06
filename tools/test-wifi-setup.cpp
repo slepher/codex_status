@@ -1,12 +1,14 @@
 #define CODEX_WIFI_SETUP_HOST_TEST
 #include "../src/wifi_setup.cpp"
+#include "wifi-control-test-adapter.h"
 #include "../src/ble_wire.h"
 #include <cassert>
 #include <iostream>
 
 static size_t maximumFrame = 0;
 static JsonDocument command(const char *op, const char *id, const char *network = "home") {
-    JsonDocument doc;
+    static uint64_t sequence=0;
+    JsonDocument doc;doc["request_seq"]=++sequence;
     doc["op"] = String(op); doc["request_id"] = String(id); doc["network_id"] = String(network);
     doc["device_mac"] = "02:00:00:00:00:01";doc["bridge_id"]="test-bridge";
     return doc;
@@ -16,7 +18,7 @@ static JsonDocument execute(JsonDocument &doc, const char *bond = "02:00:00:00:0
     WifiControlContext context;context.principal="test-bridge";context.nameSpace=bond;context.generation=1;
     context.physicalUntil=physical;context.until=std::max(physical,light);context.claimed=allowed;
     JsonDocument reply;
-    assert(!deserializeJson(reply, wifiControlCommand(doc,context,1000)));
+    assert(!deserializeJson(reply, testWifiControlCommand(doc,context,1000)));
     JsonDocument finalBody;
     finalBody.set(reply);
     String final = bleBuildReply(finalBody, doc["request_id"] | "", UINT32_MAX, UINT32_MAX);
@@ -32,12 +34,14 @@ static JsonDocument execute(JsonDocument &doc, const char *bond = "02:00:00:00:0
             maximumFrame = std::max(maximumFrame, frame.length());
             JsonDocument encoded; assert(!deserializeJson(encoded, frame));
             assert(encoded["result"] != "unknown");
+            if (!reply["chunk"].is<const char *>()) std::cerr << "page error=" << (reply["error"]|"") << " offset=" << (doc["offset"]|0u) << " snapshot=" << (doc["snapshot"]|0u) << "\n";
+            assert(reply["ok"] == true && reply["chunk"].is<const char *>());
             std::string chunk = reply["chunk"].as<const char *>();
-            for (size_t i = 0; i < chunk.size(); i += 2) bytes += (char)std::stoul(chunk.substr(i, 2), nullptr, 16);
+            bytes += chunk;
             if (reply["next_offset"] == reply["total"]) break;
             doc["offset"] = reply["next_offset"].as<uint32_t>();
             doc["snapshot"] = reply["snapshot"].as<uint32_t>();
-            assert(!deserializeJson(reply, wifiControlCommand(doc,context,1000)));
+            assert(!deserializeJson(reply, testWifiControlCommand(doc,context,1000)));
         }
         assert(!deserializeJson(reply, bytes)); doc.remove("offset"); doc.remove("snapshot");
     }
@@ -58,7 +62,8 @@ int main() {
     for (const std::string invalid : {std::string("a\0b",3), std::string("\xc0\xaf",2),
         std::string("\xed\xa0\x80",3), std::string("\xf4\x90\x80\x80",4)})
         assert(!bleWireText(String(invalid), 64));
-    assert(bleWireText(String("中文\\\"\x01"),64));
+    assert(!bleWireText(String("中文\\\"\x01"),64));
+    assert(bleWireText(String("中文\\\""),64));
     assert(wifiSchemesBegin());
     auto first=trial("trial1");
     assert(execute(first,"02:00:00:00:00:02/1",0)["error"]=="window_required");
@@ -67,7 +72,7 @@ int main() {
     int begins=WiFi.begins;
     assert(execute(first)["outcome"]=="accepted"&&WiFi.begins==begins);
     auto conflicting=first;conflicting["ssid"]="different";assert(execute(conflicting)["error"]=="request_conflict");
-    auto cancel=command("wifi_setup_cancel","cancel1");cancel["query_id"]="trial1";
+    auto cancel=command("wifi_setup_cancel","cancel1");cancel["query_id"]="trial1";cancel["request_seq"]=first["request_seq"];
     assert(execute(cancel,"02:00:00:00:00:03/1")["error"]=="not_found");
     assert(execute(cancel)["error"]=="cancelled");
     auto second=trial("trial2");assert(execute(second)["stage"]=="connecting");
@@ -75,9 +80,9 @@ int main() {
     assert(wifiSetupBusy()&&schemes.networks.size()==0); // disconnect/reconnect does not cancel; DHCP required
     WiFi.ipReady=true;wifiSetupPoll(2500);
     assert(!wifiSetupBusy()&&schemes.networks.size()==0);
-    auto query=command("wifi_result","query");query["query_id"]="trial2";
+    auto query=command("wifi_result","query");query["query_id"]="trial2";query["request_seq"]=second["request_seq"];
     assert(execute(query)["outcome"]=="completed");
-    auto save=command("wifi_save","save");save["expected_revision"]=0;
+    auto save=command("wifi_apply","save");save["expected_revision"]=0;
     auto row=save["changes"].to<JsonArray>().add<JsonObject>();row["network_id"]="home";
     row["host_ssid"]="host-5g";row["ssid"]="device-2g";row["credential"]="replace";row["password"]=second["password"];
     assert(execute(save)["outcome"]=="committed");
@@ -96,7 +101,7 @@ int main() {
     auto failed=trial("failed");failed["ssid"]="replacement";assert(execute(failed)["stage"]=="connecting");
     auto before=testNvsBlob;connected();testNvsFail=true;wifiSetupPoll(3000);testNvsFail=false;
     assert(!wifiSetupBusy()&&testNvsBlob==before&&WiFi.SSID()=="device-2g");
-    query["query_id"]="failed";assert(execute(query)["outcome"]=="unknown");
+    query["query_id"]="failed";query["request_seq"]=failed["request_seq"];assert(execute(query)["outcome"]=="unknown");
     auto timed=trial("timed");assert(execute(timed)["stage"]=="connecting");begins=WiFi.begins;
     wifiSetupPoll(26000);assert(!wifiSetupBusy()&&WiFi.begins==begins);
     auto invalid=trial("nul");invalid["ssid"]=std::string("a\0b",3);assert(execute(invalid)["error"]=="shape");
@@ -107,11 +112,11 @@ int main() {
     // Independent maximal-escaping fixture: full device capacity, not the old per-bond subset.
     testNvsBlob.clear();running=false;requestId="";assert(wifiSchemesBegin());
     for(int batch=0;batch<3;++batch) {
-        auto bounded=command("wifi_save",("bounded"+std::to_string(batch)).c_str());bounded["expected_revision"]=batch;
+        auto bounded=command("wifi_apply",("bounded"+std::to_string(batch)).c_str());bounded["expected_revision"]=batch;
         auto rows=bounded["changes"].to<JsonArray>();
         for(int i=0;i<4;++i) {
             auto n=rows.add<JsonObject>();n["network_id"]="n"+std::to_string(batch*4+i);
-            n["host_ssid"]=std::string(31,'\x01')+char('a'+batch*4+i);n["ssid"]=std::string(32,'\x02');n["credential"]="open";
+            n["host_ssid"]=std::string(31,'\\')+char('a'+batch*4+i);n["ssid"]=std::string(32,'\"');n["credential"]="open";
         }
         assert(execute(bounded)["outcome"]=="committed");
     }
@@ -120,7 +125,7 @@ int main() {
     assert(execute(get)["error"]=="read_snapshot");
     auto full=trial(std::string(64,'r').c_str());full["network_id"]=std::string(32,'n');
     assert(execute(full)["stage"]=="connecting");connected();wifiSetupPoll(3000);
-    auto outcome=command("wifi_setup_status",std::string(64,'q').c_str());outcome["query_id"]=std::string(64,'r');
+    auto outcome=command("wifi_setup_status",std::string(64,'q').c_str());outcome["query_id"]=std::string(64,'r');outcome["request_seq"]=full["request_seq"];
     assert(execute(outcome)["stage"]=="trial_complete"&&execute(outcome)["persisted"]==false);
     std::cout<<"Max final Wi-Fi frame="<<maximumFrame<<" bytes\n";
     std::cout<<"Current Wi-Fi: DHCP, durable replay, conflict, namespace, cancel, timeout, reconnect, storage, owner, 12-row paging and redaction passed\n";

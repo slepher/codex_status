@@ -744,7 +744,7 @@ impl PlatformService {
         self.wifi_mutate(mac,|s| {
             let j=s.jobs.iter_mut().find(|j|j.job_id==job_id).context("wifi_job_not_found")?;
             j.state="completed".into();j.updated_at=now;j.last_stage="confirmed_operation".into();
-            j.confirmation=Some("operation_result".into());j.error_code=None;j.receipt_ack_pending=j.request_id.starts_with("w3_");
+            j.confirmation=Some("operation_result".into());j.error_code=None;j.receipt_ack_pending=j.request_seq > 0;
             j.confirmed_revision=revision;Ok(j.clone())
         })
     }
@@ -753,7 +753,7 @@ impl PlatformService {
             let j = s.jobs.iter_mut().find(|j| j.job_id == job_id).context("wifi_job_not_found")?;
             j.state = "failed".into(); j.updated_at = now; j.may_have_committed = false;
             j.confirmation = Some("durable_rejection".into()); j.last_stage = "confirmed_operation".into();
-            j.error_code = Some(code.into()); j.receipt_ack_pending = j.request_id.starts_with("w3_");
+            j.error_code = Some(code.into()); j.receipt_ack_pending = j.request_seq > 0;
             Ok(j.clone())
         })
     }
@@ -809,7 +809,7 @@ impl PlatformService {
             if let Some(job)=archived {anyhow::ensure!(s.jobs.len()<32,"wifi_job_capacity");s.jobs.push(job);}
             let j=s.jobs.iter_mut().find(|j|j.job_id==job_id).context("wifi_job_not_found")?;
             anyhow::ensure!(j.terminal() && (j.confirmation_pending() || j.receipt_ack_pending), "settlement_not_required");
-            anyhow::ensure!(j.request_id.starts_with("w3_"),"settlement_identity_unsupported");
+            anyhow::ensure!(j.request_seq > 0,"settlement_identity_unsupported");
             j.check_transaction_context(&j.bridge_id,j.transaction_namespace.as_deref().unwrap_or(""))?;
             if let Some(s)=j.settlement.as_mut(){s.attempts=0;s.next_attempt_at=0;s.error=None;}
             Ok(j.clone())
@@ -833,7 +833,7 @@ impl PlatformService {
         let Some(job)=job else{return Ok(None);};
         let result:Result<()> = async {
             if !job.receipt_ack_pending {
-                let reply=transport.exchange("result",json!({"query_id":job.request_id})).await?;
+                let reply=transport.exchange("result",json!({"query_id":job.request_id,"request_seq":job.request_seq})).await?;
                 let control=matches!(job.kind.as_str(),"trial"|"activate");
                 let (confirmation,revision,rejection)=match OperationReply::decode(ReplySource::ResultQuery,&reply)? {
                     OperationReply::Committed {revision,bond} => {
@@ -859,7 +859,7 @@ impl PlatformService {
                     Ok(())
                 })?;
             }
-            let reply=transport.exchange("result_ack",json!({"query_id":job.request_id})).await?;
+            let reply=transport.exchange("result_ack",json!({"query_id":job.request_id,"request_seq":job.request_seq})).await?;
             anyhow::ensure!(reply["ok"]==true && reply["outcome"]=="retired","settlement_ack_unknown");
             self.wifi_receipt_acked(mac,job_id,principal,namespace)
         }.await;
@@ -980,7 +980,7 @@ impl PlatformService {
         let run: Result<WifiJob> = async {
             let control = matches!(job.kind.as_str(), "trial" | "activate");
             if job.sent {
-                let reply = transport.exchange("result", json!({"query_id":job.request_id})).await?;
+                let reply = transport.exchange("result", json!({"query_id":job.request_id,"request_seq":job.request_seq})).await?;
                 return match OperationReply::decode(ReplySource::ResultQuery, &reply)? {
                     OperationReply::AcceptedPending => self.wifi_accepted_pending(mac, job_id, now),
                     OperationReply::Committed { revision, bond } if !control =>
@@ -998,7 +998,7 @@ impl PlatformService {
             }
             if control {
                 if !write_allowed { return self.wifi_finish(mac,job_id,"waiting_rendezvous",Some("window_required"),now); }
-                let mut body=job.command.clone().context("wifi_control_payload_required")?;body["request_id"]=json!(job.request_id);
+                let mut body=job.command.clone().context("wifi_control_payload_required")?;body["request_id"]=json!(job.request_id);body["request_seq"]=json!(job.request_seq);
                 self.wifi_mark_sent(mac, job_id, now)?;
                 let reply = transport.exchange(&job.kind, body).await?;
                 return match OperationReply::decode(ReplySource::OriginalWrite, &reply)? {
@@ -1073,7 +1073,7 @@ impl PlatformService {
                 })?;
             }
             self.wifi_mutate(mac, |s| s.mark_sent(job_id, now))?;
-            let reply = transport.exchange("apply", json!({"request_id":job.request_id,"expected_revision":revision,
+            let reply = transport.exchange("apply", json!({"request_id":job.request_id,"request_seq":job.request_seq,"expected_revision":revision,
                 "changes":changes})).await?;
             match OperationReply::decode(ReplySource::OriginalWrite, &reply)? {
                 OperationReply::AcceptedPending => self.wifi_accepted_pending(mac, job_id, now),

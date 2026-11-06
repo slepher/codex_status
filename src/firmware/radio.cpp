@@ -126,6 +126,12 @@ static void setActiveMac(const String &mac) {
     retained.rtcActiveMac[sizeof(retained.rtcActiveMac) - 1] = '\0';
 }
 
+void noteBridgeContact(const String &principal) {
+    OwnerRec owner;
+    if (!ownerGet(owner) || owner.id != principal) return;
+    retained.bridgeContact.observed(clock::timeKnown() ? (uint32_t)time(nullptr) : 0);
+}
+
 void markSynced() {
     retained.rtcLastSyncEpoch = clock::timeKnown() ? (uint32_t)time(nullptr) : 0;
     power::retained.rtcRetryStage = 0;
@@ -343,6 +349,7 @@ static void networkFailed(const char *reason) {
     state.wifiLostHandled = disconnect;
     state.bridgeReachable = false;
     state.networkError = reason;
+    retained.bridgeContact.failed = true;
     state.wifiTerminal = disconnect;
     state.fallbackUntilMs = 0;
     state.wifiConnActive = false;
@@ -481,7 +488,7 @@ void wifiDeviceStatus(JsonDocument &doc,const EndpointRec *endpoint) {
     doc["power"]["mode"]=power::retained.rtcMode==MODE_LIGHT?"light":"sleep";doc["power"]["plan_id"]=power::state.v2Plan.acceptedId();doc["power"]["remaining_s"]=power::state.v2Plan.remainingS(now);
     auto presence=doc["presence"].to<JsonObject>();presence["mode"]=continuous?"continuous":until>now?"window":"ending";
     if(continuous)presence["remaining_ms"]=nullptr;else presence["remaining_ms"]=until>now?until-now:0;
-    presence["window_id"]=transport::v2Nonce()+String("_")+String(sequence);
+    presence["window_id"]=String(transport::bootId())+String("_")+String(sequence);
     doc["power"]["manual_remaining_s"]=power::state.bleRecovery.lightRemaining(now);
     doc["network"]["bridge_reachable"]=state.bridgeReachable;
     doc["network"]["error"]=state.networkError;
@@ -536,6 +543,7 @@ static __attribute__((noinline)) void servicePresence() {
             (!work->ready || (state.v2InRendezvous && now < state.v2Rv.deadline() && work->rendezvous == state.v2RvId && work->planId == state.readyReport.planId));
         if (current) {
             if (work->reached) {
+                noteBridgeContact(work->principal);
                 state.bridgeReachable = true; state.presenceFailures = 0; state.networkError = nullptr;
                 if (work->ready) state.readyReport.received = true;
             } else if (!work->ready && ++state.presenceFailures >= 3) networkFailed("bridge_http_unreachable");
@@ -595,10 +603,10 @@ void handleWifiManagement(const char *op) {
     if(!request["op"].isNull() || !request["command"].isNull() || !request["session_nonce"].isNull()) {
         transport::v2Response(400,"{\"ok\":false,\"error\":\"retired_protocol\"}");return;
     }
-    request["op"]=compactOperationName(transport::state.v2HttpFrame.op);
     auto context=wifiControlContext(endpoint);
-    String response=wifiControlCommand(request,context,clock::v2NowMs());
+    String response=wifiControlCommand(transport::state.v2HttpFrame.op,request,context,clock::v2NowMs());
     JsonDocument outcome;deserializeJson(outcome,response);
+    if (transport::state.v2HttpFrame.op == 17 && outcome["ok"] == true && outcome["outcome"] == "retired") sync::networkWorkCompleted("wifi_setup");
     transport::v2Response(200,response);
 }
 
@@ -623,7 +631,6 @@ void v2RendezvousBegin(bool deep) {
         sync::state.syncVisibleSkip = sync::retained.syncRtc.retrySkip;
         if (sync::state.syncSkippedThisWake) syncConsumeSkip(sync::retained.syncRtc);
     }
-    sync::state.v2HistorySyncMs = 0; sync::state.v2HistorySyncUntilMs = 0;
     state.v2Rv.begin(clock::v2NowMs(), V2_RENDEZVOUS_WINDOW_MS);
     v2RfDeadlineMs = state.v2Rv.deadline();
     enterBleOn(false);
@@ -681,10 +688,8 @@ void v2RendezvousTick() {
     if (state.v2RvNetworkRequested && ((state.v2Rv.hasPlan() && light) || sync::state.syncOpenThisWake)) {
         // Plan owns activation. Keep the bounded exchange open for configuration,
         // then start immediately on central close; no second activation command.
-        if (state.readyReport.activation.active()) {
-            if (bleIsConnected() && now<state.v2RvBleReleaseAtMs) return;
-            if (!bleIsConnected()) state.v2RvBleReleaseAtMs=now;
-        }
+        if (bleIsConnected() && now<state.v2RvBleReleaseAtMs) return;
+        if (!bleIsConnected()) state.v2RvBleReleaseAtMs=now;
         const uint64_t legalUntil = sync::httpUntil(now);
         state.v2Rv.admitHttp(now, legalUntil);
         if (state.v2Rv.needsHttp()) {
@@ -706,10 +711,10 @@ void v2RendezvousTick() {
                 rendezvousWifiTick();
             }
             if (state.readyReport.received || (state.readyReport.attempts >= 3 && !presenceWork))
-                state.v2Rv.finishExchange(now, sync::state.v2HistorySyncUntilMs);
+                state.v2Rv.finishExchange(now, 0);
         }
     } else if (state.v2Rv.hasPlan() && !state.v2RvNetworkExpected && !syncGuard) {
-        state.v2Rv.finishExchange(now, sync::state.v2HistorySyncUntilMs);
+        state.v2Rv.finishExchange(now, 0);
     }
     v2RfDeadlineMs = state.v2Rv.deadline();
     if (state.v2Rv.active() && (state.bleOn || state.v2Rv.needsHttp() ||

@@ -39,15 +39,15 @@ static void projectWifiNetwork(JsonArray list, const WifiNetwork &n, const char 
     net["origin"] = String(writable ? "local" : n.bond); net["deleted"] = false;
     if(writable || ownerRead) net["password"] = String(n.password);
 }
-static String wifiManagementWithContext(JsonDocument &doc, uint64_t now, const String &legacy, const WifiControlContext &context) {
-    const String op = doc["op"] | "", bridge = doc["bridge_id"] | "";
+static String wifiManagementWithContext(uint16_t op, JsonDocument &doc, uint64_t now, const String &legacy, const WifiControlContext &context) {
+    const String bridge = doc["bridge_id"] | "";
     if (wifiStorageUncertain && !running && !wifiSchemesBegin()) return reply(doc, "storage");
     if (!storeReady) return reply(doc, "storage");
     if (!wifiManagementShape(doc)) return reply(doc,"shape");
     if (!identifier(bridge.c_str(), 64)) return reply(doc, "shape");
     JsonDocument out;
     out["ok"] = true; out["device_mac"] = doc["device_mac"];
-    if (op == "snapshot") {
+    if (op == 14) {
         if(context.until<=now) return reply(doc,"window_required");
         uint32_t offset = doc["offset"] | 0u;
         if (!doc["offset"].isNull() && !doc["offset"].is<uint32_t>()) return reply(doc, "shape");
@@ -91,15 +91,16 @@ static String wifiManagementWithContext(JsonDocument &doc, uint64_t now, const S
                                      context.generation ? 400 : 4048);
         if (next == offset) return reply(doc, "reply_limit");
         out["complete"] = next == fullSnapshot.length();
-    } else if (op == "result" || op == "result_ack") {
+    } else if (op == 16 || op == 17) {
         if (!running && !wifiSchemesBegin()) return reply(doc, "storage");
         String query = doc["query_id"] | "";
         if (!identifier(query.c_str(), 64)) return reply(doc, "shape");
         out["outcome"] = "unknown";
-        uint64_t sequence=wifiRequestSequence(query.c_str());
+        uint64_t sequence=(doc["request_seq"] | 0ULL);
         for (const auto &c:wifiStore.cursors) if (bridge==c.bridge && sequence && sequence<=c.high &&
             context.nameSpace==c.bond) out["outcome"]="retired";
         for (const auto &r : wifiStore.receipts) if (r.matches(context.principal.c_str(),context.nameSpace.c_str(),query.c_str())) {
+            if(r.sequence != sequence)return reply(doc,"request_conflict");
             out["outcome"] = *r.error ? "rejected" : !strcmp(r.operation,"trial") ? "completed" : "committed"; out["revision"] = r.revision; out["bond"] = String(r.bond);
             if(*r.operation){out["operation"]=String(r.operation);out["network_id"]=String(r.target);out["version"]=r.targetVersion;}
             if(String(r.error)=="pending") {
@@ -107,9 +108,9 @@ static String wifiManagementWithContext(JsonDocument &doc, uint64_t now, const S
                 out["outcome"]=live ? (running?"accepted":r.executionGeneration?"unknown":trialOnly && !error.length()?"completed":"rejected") : "unknown";
                 out["stage"]=live?stage:String("result_unknown");
                 if(live && error.length())out["error"]=error;
-                if(op!="result_ack" || r.executionGeneration || !live || running || !trialOnly)break;
+                if(op != 17 || r.executionGeneration || !live || running || !trialOnly)break;
             }
-            if (op=="result_ack") {
+            if (op == 17) {
                 if (!sequence) return reply(doc,"legacy_receipt_retained");
                 if (String(r.error)=="pending" && !(transactionPeer==r.bond && selectingBridge==r.bridge && requestId==r.request && trialOnly && !running)) return reply(doc,"result_pending");
                 if (String(r.error)=="result_unknown") return reply(doc,"result_pending");
@@ -120,7 +121,7 @@ static String wifiManagementWithContext(JsonDocument &doc, uint64_t now, const S
             }
             if (*r.error) out["error"] = r.error.c_str(); break;
         }
-    } else if (op == "apply") {
+    } else if (op == 15) {
         const char *id = doc["request_id"] | "";
         if (!identifier(id, 64) || !doc["changes"].is<JsonArray>() || !doc["expected_revision"].is<uint64_t>()) return reply(doc, "shape");
         // Hash only business content; nonce, token and revalidated
@@ -129,7 +130,7 @@ static String wifiManagementWithContext(JsonDocument &doc, uint64_t now, const S
         String body; serializeJson(intent, body); uint8_t hash[32];
         mbedtls_sha256((const unsigned char *)body.c_str(), body.length(), hash, 0); wipeString(body);
         for (const auto &r : wifiStore.receipts) if (r.matches(context.principal.c_str(),context.nameSpace.c_str(),id)) {
-            if (memcmp(hash, r.hash, sizeof(hash))) return reply(doc, "request_conflict");
+            if (r.sequence != (doc["request_seq"] | 0ULL) || memcmp(hash, r.hash, sizeof(hash))) return reply(doc, "request_conflict");
             out["outcome"] = *r.error ? "rejected" : !strcmp(r.operation,"trial") ? "completed" : "committed"; out["revision"] = r.revision; out["bond"] = String(r.bond);
             if(*r.operation){out["operation"]=String(r.operation);out["network_id"]=String(r.target);out["version"]=r.targetVersion;}
             if(String(r.error)=="pending") {
@@ -142,12 +143,12 @@ static String wifiManagementWithContext(JsonDocument &doc, uint64_t now, const S
             if (*r.error) { out["ok"] = false; out["error"] = r.error.c_str(); }
             String text; serializeJson(out, text); return text;
         }
-        if(wifiRequestSequence(id)<=wifiManagementHighWater(context.principal,context.nameSpace) && wifiRequestSequence(id))return reply(doc,"request_retired");
-        if(String(id).startsWith("w3_") && !wifiRequestSequence(id))return reply(doc,"shape");
+        if(!(doc["request_seq"] | 0ULL))return reply(doc,"shape");
+        if((doc["request_seq"] | 0ULL)<=wifiManagementHighWater(context.principal,context.nameSpace) && (doc["request_seq"] | 0ULL))return reply(doc,"request_retired");
         if (!context.sessionValid) return reply(doc,"session_expired");
         if (!context.claimed) return reply(doc,context.occupied?"occupied":"claim_required");
         if (context.until <= now) return reply(doc, "window_required");
-        uint64_t sequence=wifiRequestSequence(id);
+        uint64_t sequence=(doc["request_seq"] | 0ULL);
         int cursor=-1;
         for (size_t i=0;i<wifiStore.cursors.size();++i) if (bridge==wifiStore.cursors[i].bridge && context.nameSpace==wifiStore.cursors[i].bond) cursor=i;
         if (sequence && cursor>=0 && sequence<=wifiStore.cursors[cursor].high) return reply(doc,"request_retired");
@@ -217,7 +218,7 @@ static String wifiManagementWithContext(JsonDocument &doc, uint64_t now, const S
             next = wifiStore;
         } else next.revision++;
         if (!next.valid() || !next.receipts.resize(receipt+1)) return reply(doc,"memory");
-        auto &r = next.receipts[receipt]; r.bridge.set(bridge.c_str()); r.request.set(id);
+        auto &r = next.receipts[receipt]; r.bridge.set(bridge.c_str()); r.request.set(id);r.sequence=sequence;
         r.bond.set(context.nameSpace.c_str()); memcpy(r.hash, hash, sizeof(hash)); r.revision = next.revision;
         if (failure) r.error.set(failure);
         if (sequence) {
@@ -233,40 +234,42 @@ static String wifiManagementWithContext(JsonDocument &doc, uint64_t now, const S
     String text; serializeJson(out, text); return text;
 }
 
-String wifiControlCommand(JsonDocument &doc,const WifiControlContext &ctx,uint64_t now,const String &legacy) {
+String wifiControlCommand(uint16_t op, JsonDocument &doc,const WifiControlContext &ctx,uint64_t now,const String &legacy) {
+    if(!doc["op"].isNull() || !doc["command"].isNull() || !doc["session_nonce"].isNull())return reply(doc,"retired_protocol");
     if(!wifiManagementShape(doc))return reply(doc,"shape");
-    const char *requestedId=doc["request_id"]|"";
-    if(!strncmp(requestedId,"w3_",3) && !wifiRequestSequence(requestedId))return reply(doc,"shape");
+    if(!doc["request_seq"].isNull() && !doc["request_seq"].is<uint64_t>())return reply(doc,"shape");
     if (!ctx.principal.length() || !ctx.nameSpace.length()) return reply(doc,"binding_required");
     if (String(doc["bridge_id"]|"")!=ctx.principal) return reply(doc,"principal_mismatch");
-    String op=doc["op"]|"";
-    if (op.startsWith("wifi_")) op=op.substring(5);
-    if (op=="snapshot" || op=="apply" || op=="result" || op=="result_ack") {
-        JsonDocument request; request.set(doc);request["op"]=op;request["result_peer"]=ctx.nameSpace;
-        return wifiManagementWithContext(request,now,legacy,ctx);
-    }
-    if (op=="match" || op=="active" || op=="trial" || op=="activate" || op=="setup_status" || op=="setup_cancel" || op=="scheme_get") {
-        JsonDocument request; request.set(doc);request["op"]=String("wifi_")+op;
-        if(op=="trial" || op=="activate") {
+    switch (op) {
+    case 14: case 15: case 16: case 17:
+        return wifiManagementWithContext(op,doc,now,legacy,ctx);
+    case 18: case 28: case 29: case 30: case 31: case 32: case 34: {
+        if(op == 29 || op == 30) {
             int index=wifiReceiptIndex(ctx.principal,ctx.nameSpace,doc["request_id"]|"");
             if(index>=0){
-                JsonDocument business;business["op"]=String("wifi_")+op;
+                JsonDocument business;business["op"]=op == 29 ? "wifi_trial" : "wifi_activate";
                 for(const char *key:{"network_id","version","host_ssid","ssid","password","replace"})if(!doc[key].isNull())business[key]=doc[key];
                 String text;serializeJson(business,text);uint8_t hash[32];mbedtls_sha256((const uint8_t *)text.c_str(),text.length(),hash,0);wipeString(text);
-                if(memcmp(hash,wifiStore.receipts[index].hash,32))return reply(doc,"request_conflict");
-                JsonDocument query;query.set(doc);query["op"]="result";query["query_id"]=doc["request_id"];query["result_peer"]=ctx.nameSpace;
-                return wifiManagementWithContext(query,now,legacy,ctx);
+                if(wifiStore.receipts[index].sequence != (doc["request_seq"] | 0ULL) || memcmp(hash,wifiStore.receipts[index].hash,32))return reply(doc,"request_conflict");
+                JsonDocument query;query.set(doc);query["query_id"]=doc["request_id"];
+                return wifiManagementWithContext(16,query,now,legacy,ctx);
             }
         }
-        if ((op=="trial" || op=="activate") && wifiRequestSequence(requestedId) && wifiRequestSequence(requestedId)<=wifiManagementHighWater(ctx.principal,ctx.nameSpace))return reply(doc,"request_retired");
-        if ((op=="trial" || op=="activate") && !ctx.sessionValid) return reply(doc,"session_expired");
-        if ((op=="trial" || op=="activate") && !ctx.claimed) return reply(doc,ctx.occupied?"occupied":"claim_required");
-        if(op=="scheme_get" && !ctx.sessionValid)return reply(doc,"session_expired");
-        if(op=="scheme_get" && !ctx.claimed)return reply(doc,ctx.occupied?"occupied":"claim_required");
-        if(op=="scheme_get" && ctx.until<=now)return reply(doc,"window_required");
-        return wifiSetupCommand(request,ctx.nameSpace,ctx.generation,now,ctx.physicalUntil,ctx.until,ctx.claimed);
+        if (op == 31 || op == 32) {
+            int index=wifiReceiptIndex(ctx.principal,ctx.nameSpace,doc["query_id"]|"");
+            if(index>=0 && wifiStore.receipts[index].sequence != (doc["request_seq"] | 0ULL))return reply(doc,"request_conflict");
+        }
+        if ((op == 29 || op == 30) && !(doc["request_seq"] | 0ULL))return reply(doc,"shape");
+        if ((op == 29 || op == 30) && (doc["request_seq"] | 0ULL) && (doc["request_seq"] | 0ULL)<=wifiManagementHighWater(ctx.principal,ctx.nameSpace))return reply(doc,"request_retired");
+        if ((op == 29 || op == 30) && !ctx.sessionValid) return reply(doc,"session_expired");
+        if ((op == 29 || op == 30) && !ctx.claimed) return reply(doc,ctx.occupied?"occupied":"claim_required");
+        if(op == 34 && !ctx.sessionValid)return reply(doc,"session_expired");
+        if(op == 34 && !ctx.claimed)return reply(doc,ctx.occupied?"occupied":"claim_required");
+        if(op == 34 && ctx.until<=now)return reply(doc,"window_required");
+        return wifiSetupCommand(op,doc,ctx.nameSpace,ctx.generation,now,ctx.physicalUntil,ctx.until,ctx.claimed);
     }
-    return reply(doc,"unsupported");
+    default: return reply(doc,"unsupported");
+    }
 }
 
 uint64_t wifiManagementHighWater(const String &principal,const String &nameSpace) {

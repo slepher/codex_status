@@ -53,7 +53,7 @@ struct V2BundleCommitDecision {
 
 V2BundleBeginDecision v2DecideBundleBegin(
     JsonDocument &doc, const V2BundleRx &current,
-    const V2BundleFingerprint &committed, const char *sessionNonce,
+    const V2BundleFingerprint &committed, const char *bootId,
     uint64_t nowMs, V2BundleServices *services = nullptr);
 
 // Validate a Bundle commit against the received payload on flash. The payload is
@@ -61,7 +61,7 @@ V2BundleBeginDecision v2DecideBundleBegin(
 // RAM; on V2_BUNDLE_COMMIT_INSTALL the caller installs it from the same file.
 V2BundleCommitDecision v2DecideBundleCommit(
     JsonDocument &doc, const V2BundleRx &current,
-    const V2BundleFingerprint &committed, const char *sessionNonce,
+    const V2BundleFingerprint &committed, const char *bootId,
     uint64_t nowMs, const char *receivePath, const char *bridgeIdFallback,
     V2BundleServices *services = nullptr);
 
@@ -73,7 +73,7 @@ struct V2BundleChunkStartDecision {
 };
 
 V2BundleChunkStartDecision v2DecideBundleChunkStart(
-    const V2BundleRx &current, const char *request, const char *sessionNonce,
+    const V2BundleRx &current, const char *request, const char *bootId,
     const char *offsetText, uint64_t nowMs);
 
 struct V2BundleChunkWriteDecision {

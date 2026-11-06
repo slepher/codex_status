@@ -33,7 +33,7 @@ replace("        self.report['native_application_stage']='visual-cases'", """   
         changed={**values,'buckets[codex].5h.remaining':41}
         fields=[{'i':r['index'],'k':r['field'],'v':changed.get(r['field']),'q':'fresh' if r['field'] in changed else 'missing'} for r in status['data_contract']['requirements'] if not r['local']]
         fingerprint=''.join(f'{f["i"]}:{f["k"]}:'+('~' if f['v'] is None else json.dumps(f['v'],ensure_ascii=False,separators=(',',':')))+f':{f["q"]};' for f in fields).encode()
-        frame(2,'/api/data',{'bridge_id':principal,'device_mac':identity,'session_nonce':nonce,'request_id':'entry-offscreen-data','active_context_id':prior['active_context_id'],'seq':2,'crc':f'{zlib.crc32(fingerprint):08x}','fields':fields})
+        frame(2,'/api/data',{'bridge_id':principal,'device_mac':identity,'request_id':'entry-offscreen-data','active_context_id':prior['active_context_id'],'seq':2,'crc':f'{zlib.crc32(fingerprint):08x}','fields':fields})
         until=time.monotonic()+30
         while time.monotonic()<until:
             if self.action(observe=True)['generation']>prior['frame_generation']:break
@@ -46,9 +46,9 @@ replace("        self.report['native_application_stage']='visual-cases'", """   
         self.input(0x11,0x13)
         replacement=json.loads(json.dumps(bundle));replacement['job_id']='entry-replace'
         raw=json.dumps(replacement,ensure_ascii=False,separators=(',',':')).encode()
-        envelope={'bridge_id':principal,'device_mac':identity,'session_nonce':nonce,'request_id':'entry-replace','length':len(raw),'content_crc':f'{zlib.crc32(raw):08x}'}
+        envelope={'bridge_id':principal,'device_mac':identity,'request_id':'entry-replace','length':len(raw),'content_crc':f'{zlib.crc32(raw):08x}'}
         frame(10,'/api/bundle/begin',envelope)
-        for at in range(0,len(raw),3072):frame(11,f'/api/bundle/chunk?request_id=entry-replace&session_nonce={nonce}&offset={at}',raw[at:at+3072])
+        for at in range(0,len(raw),3072):frame(11,f'/api/bundle/chunk?request_id=entry-replace&offset={at}',raw[at:at+3072])
         frame(12,'/api/bundle/commit',envelope)
         until=time.monotonic()+30
         while time.monotonic()<until:

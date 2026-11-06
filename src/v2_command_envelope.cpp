@@ -16,7 +16,7 @@ static bool compactContextValid(const uint8_t context[16]) {
 
 static bool compactHeaderValid(const CompactFrameHeader &h) {
     if (h.kind == 1 && h.result == 2 && h.op == 0 && h.requestNo == 0) return compactContextValid(h.context);
-    return h.kind <= 2 && h.op > 0 && h.op <= COMPACT_FRAME_MAX_OP &&
+    return h.kind <= 2 && h.op > 0 && h.op <= COMPACT_FRAME_MAX_OP && h.op != 24 && h.op != 25 &&
            h.result <= 3 && (h.kind == 1 || h.result == 0) &&
            h.requestNo != 0 && compactContextValid(h.context);
 }
@@ -51,10 +51,10 @@ bool compactFrameDecode(const uint8_t *frame, size_t length, CompactFrameHeader 
     return true;
 }
 
-static const char *const operationNames[] = {"", "status", "data", "plan", "claim", "renew", "sync_begin", "sync_page", "sync_ack", "sync_complete", "bundle_begin", "bundle_chunk", "bundle_commit", "activate", "wifi_snapshot", "wifi_apply", "wifi_result", "wifi_result_ack", "wifi_match", "ota_image", "ready_report", "business_query", "network_start", "sync_config", "sync_open", "history", "wifi_owner", "wifi_info", "wifi_active", "wifi_trial", "wifi_activate", "wifi_setup_status", "wifi_setup_cancel", "wifi_status", "wifi_scheme_get", "wifi_capabilities"};
-const char *compactOperationName(uint16_t op) {return op && op <= COMPACT_FRAME_MAX_OP ? operationNames[op] : nullptr;}
+static const char *const operationNames[] = {"", "status", "data", "plan", "claim", "renew", "sync_begin", "sync_page", "sync_ack", "sync_complete", "bundle_begin", "bundle_chunk", "bundle_commit", "activate", "wifi_snapshot", "wifi_apply", "wifi_result", "wifi_result_ack", "wifi_match", "ota_image", "ready_report", "business_query", "network_start", "sync_config", "", "", "wifi_owner", "wifi_info", "wifi_active", "wifi_trial", "wifi_activate", "wifi_setup_status", "wifi_setup_cancel", "wifi_status", "wifi_scheme_get", "wifi_capabilities"};
+const char *compactOperationName(uint16_t op) {return op && op != 24 && op != 25 && op <= COMPACT_FRAME_MAX_OP ? operationNames[op] : nullptr;}
 uint16_t compactOperation(const char *name) {
-    if (name) for (uint16_t i=1;i<=COMPACT_FRAME_MAX_OP;++i) if (!strcmp(name,operationNames[i])) return i;
+    if (name) for (uint16_t i=1;i<=COMPACT_FRAME_MAX_OP;++i) if (*operationNames[i] && !strcmp(name,operationNames[i])) return i;
     return 0;
 }
 

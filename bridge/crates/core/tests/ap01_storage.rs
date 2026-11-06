@@ -6,7 +6,7 @@ use std::{fs,path::{Path,PathBuf}};
 const RESERVE:usize=49152;
 const CACHE_RECORD:usize=11354; // ID17 + length4 + CTP1(11333), verified against installed files.
 fn install(sim:&mut SimulatorBundle,wire:&[u8],request:&str,context:&str)->Value {
-    let command=json!({"bridge_id":"storage-test","request_id":request,"session_nonce":"storage-nonce",
+    let command=json!({"bridge_id":"storage-test","request_id":request,
         "length":wire.len(),"content_crc":format!("{:08x}",crc32fast::hash(wire))});
     let begin=sim.begin(&command.to_string(),"storage-nonce",0).unwrap();
     if begin["result"]!="applied" {return begin;}

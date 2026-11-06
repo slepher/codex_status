@@ -46,6 +46,19 @@ fn ap01_shared_compiler_layouts_and_boundaries() {
             "local_fields":compiled.local_dependencies,"palette_frame_bytes":frame_bytes(320,240)});
         std::fs::write(std::path::Path::new(&dir).join("template-manifest.json"),serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
     }
+    if let Ok(path)=std::env::var("AP01_NATIVE_TEST_BUNDLE") {
+        let templates:Vec<_>=["codex-status-a","codex-status-b"].into_iter().map(|id| {
+            let mut source=src.clone();source["id"]=json!(id);
+            let compiled=compile::compile(&source,RENDER_TARGET_AP01).unwrap();
+            json!({"key":{"template_id":id,"render_target":RENDER_TARGET_AP01},"source":source,"compiled":compiled})
+        }).collect();
+        let bundle=json!({"bridge_id":"bridge-test","job_id":"native-fixture",
+            "firmware_target":bridge_core::platform::model::FIRMWARE_TARGET_AP01,
+            "render_target":RENDER_TARGET_AP01,"compiler_abi":2,
+            "profile":{"template_ids":["codex-status-a","codex-status-b"],"initial_active_id":"codex-status-a"},
+            "templates":templates,"resources":[],"bindings":[]});
+        std::fs::write(path,serde_json::to_vec(&bundle).unwrap()).unwrap();
+    }
     let mut env = Env::default();
     env.sync_hhmm = "12:40";
     let fonts: Vec<Vec<u8>> = ["AP01_PREVIEW_FONT", "AP01_PREVIEW_DIGITS", "AP01_PREVIEW_MEDIUM", "AP01_PREVIEW_LATIN"]

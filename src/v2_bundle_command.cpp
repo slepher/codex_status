@@ -57,7 +57,7 @@ CommittedReplay checkCommittedReplay(JsonDocument &doc,
 
 V2BundleBeginDecision v2DecideBundleBegin(
     JsonDocument &doc, const V2BundleRx &current,
-    const V2BundleFingerprint &committed, const char *sessionNonce,
+    const V2BundleFingerprint &committed, const char *bootId,
     uint64_t nowMs, V2BundleServices *services) {
     V2BundleBeginDecision decision;
 #if !defined(CODEX_AP01_NATIVE)
@@ -82,7 +82,7 @@ V2BundleBeginDecision v2DecideBundleBegin(
         return decision;
     }
     if (current.live(nowMs)) {
-        if (!current.matches(owner, request, sessionNonce)) {
+        if (!current.matches(owner, request, bootId)) {
             decision.error = "busy";
         } else if (current.length != length || current.crc != crc) {
             decision.error = "request_conflict";
@@ -93,7 +93,7 @@ V2BundleBeginDecision v2DecideBundleBegin(
         return decision;
     }
 
-    if (!decision.candidate.begin(owner, request, sessionNonce, length, crc, nowMs)) {
+    if (!decision.candidate.begin(owner, request, bootId, length, crc, nowMs)) {
         decision.error = "size";
         return decision;
     }
@@ -103,7 +103,7 @@ V2BundleBeginDecision v2DecideBundleBegin(
 
 V2BundleCommitDecision v2DecideBundleCommit(
     JsonDocument &doc, const V2BundleRx &current,
-    const V2BundleFingerprint &committed, const char *sessionNonce,
+    const V2BundleFingerprint &committed, const char *bootId,
     uint64_t nowMs, const char *receivePath, const char *bridgeIdFallback, V2BundleServices *services) {
 #if !defined(CODEX_AP01_NATIVE)
     if (!services) services = &legacyServices();
@@ -133,7 +133,7 @@ V2BundleCommitDecision v2DecideBundleCommit(
         decision.error = "crc";
         return decision;
     }
-    if (!current.matches(owner, request, sessionNonce) ||
+    if (!current.matches(owner, request, bootId) ||
         !current.complete(decision.length, decision.crc, nowMs)) {
         decision.error = "session_or_length";
         return decision;
@@ -211,11 +211,11 @@ V2BundleCommitDecision v2DecideBundleCommit(
 }
 
 V2BundleChunkStartDecision v2DecideBundleChunkStart(
-    const V2BundleRx &current, const char *request, const char *sessionNonce,
+    const V2BundleRx &current, const char *request, const char *bootId,
     const char *offsetText, uint64_t nowMs) {
     V2BundleChunkStartDecision decision;
-    if (!request || strcmp(current.request, request) || !sessionNonce ||
-        strcmp(current.nonce, sessionNonce) || !current.live(nowMs) ||
+    if (!request || strcmp(current.request, request) || !bootId ||
+        strcmp(current.nonce, bootId) || !current.live(nowMs) ||
         !offsetText || !*offsetText) return decision;
 
     uint64_t parsedOffset = 0;

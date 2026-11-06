@@ -30,11 +30,12 @@ fn wifi_activate_repro_fixture(mac: &str) -> (Simulator, Value) {
     assert_eq!(claim(&sim, "id=bridge-test", Some(DEVICE)).0, 200);
     let status = http(bridge_core::device_client::status(&sim.address().to_string(), ENDPOINT, Duration::from_secs(3))).unwrap();
     let saved = wifi_activate_repro_command(&sim, &status, "apply", serde_json::json!({
-        "request_id":"fixture-save", "expected_revision":0,
+        "request_id":"fixture-save", "request_seq":1, "expected_revision":0,
         "changes":[{"network_id":"home","host_ssid":"FakeHost","ssid":"FakeDevice","credential":"replace","password":"synthetic-only-password"}]
     })).unwrap();
     assert_eq!(saved["outcome"], "committed");
     assert_eq!(wifi_activate_repro_command(&sim, &status, "active", serde_json::json!({})).unwrap()["network_id"], "");
+    let status = http(bridge_core::device_client::status(&sim.address().to_string(), ENDPOINT, Duration::from_secs(3))).unwrap();
     (sim, status)
 }
 
@@ -67,7 +68,7 @@ fn same_source_rendezvous_waits_for_ble_release_and_real_ip() {
         assert_eq!(link.command("plan", plan).await.unwrap()["result"], "applied");
         let started = link.command("network_start", serde_json::json!({
             "device_mac":mac,"bridge_id":"bridge-test",
-            "plan_id":2,"origin_request_no":3,"bridge_addr":"192.0.2.1","bridge_port":8765
+            "plan_id":2,"reason":"wifi_setup","wake_generation":status["wake_generation"],"wake_seq":status["wake_seq"],"bridge_addr":"192.0.2.1","bridge_port":8765
         })).await.unwrap();
         assert_eq!(started["result"], "accepted", "network_start ACK: {started}");
         let before = http(bridge_core::device_client::status(&sim.address().to_string(), ENDPOINT,
@@ -75,7 +76,7 @@ fn same_source_rendezvous_waits_for_ble_release_and_real_ip() {
         assert_eq!(before["rendezvous"]["ready"], false);
         assert_eq!(before["transports"]["http"]["ready"], false);
         let activated = wifi_activate_repro_command(&sim, &initial, "activate", serde_json::json!({
-            "request_id":"network-activate","network_id":"home","version":1
+            "request_id":"network-activate","request_seq":2,"network_id":"home","version":1
         })).unwrap();
         assert_eq!(activated["stage"], "accepted", "{activated}");
         let no_ip = wifi_activate_repro_poll(&sim, 2);
@@ -96,10 +97,11 @@ fn same_source_rendezvous_waits_for_ble_release_and_real_ip() {
         assert_eq!(after["transports"]["http"]["ready"], true);
         assert_eq!(set_time(&sim, Some(CONTROL),
             &serde_json::json!({"op":"step","delta_ms":121000})).0, 200);
-        let expired = http(bridge_core::device_client::status(&sim.address().to_string(), ENDPOINT,
-            Duration::from_secs(3))).unwrap();
-        assert_eq!(expired["rendezvous"]["ready"], false);
-        assert_eq!(expired["rendezvous"]["remaining_ms"], 0);
+        let expired = sim_state(&sim);
+        assert_eq!(expired["power"]["sync_open"], false);
+        assert_eq!(expired["power"]["mode"], "deep");
+        assert!(bridge_core::device_client::status(&sim.address().to_string(), ENDPOINT,
+            Duration::from_millis(200)).await.is_err(), "expired windows cannot keep HTTP alive");
     });
     std::env::remove_var("CODEX_STATUS_SIM_BLE_ENDPOINTS");
 }
@@ -113,6 +115,7 @@ fn wifi_activate_repro_pending_dhcp_timeout_and_same_id_success() {
     let root = temp_data_dir();
     let svc = PlatformService::open(&root).unwrap();
     svc.device_upsert(DeviceIdentity::new(mac, "Activate repro").unwrap(), DeviceCapabilities::ssd1681_154g()).unwrap();
+    svc.note_authenticated_status_at(mac,&status,100).unwrap();
     let saved_radio=wifi_activate_repro_poll(&sim, 0);
     assert_eq!(saved_radio["radio"]["begins"],0,"saving alone must not start RF");
     assert_eq!(saved_radio["radio"]["connected"],false);
@@ -150,17 +153,17 @@ fn wifi_activate_repro_pending_dhcp_timeout_and_same_id_success() {
     let done = ready(svc.wifi_attempt_async(mac, &next.job_id, &next.bridge_id, status["wifi_control"]["namespace"].as_str().unwrap(), false, &BTreeMap::new(), 136,&mut |op: &str, body: Value| wifi_activate_repro_command(&sim, &status, op, body))).unwrap().unwrap();
     assert_eq!(done.state, "completed");
     let before_replay=wifi_activate_repro_poll(&sim,1)["radio"]["begins"].clone();
-    let replay = wifi_activate_repro_command(&sim, &status, "activate", serde_json::json!({"request_id":next.request_id,"network_id":"home","version":1})).unwrap();
+    let replay = wifi_activate_repro_command(&sim, &status, "activate", serde_json::json!({"request_id":next.request_id,"request_seq":next.request_seq,"network_id":"home","version":1})).unwrap();
     assert_eq!(replay["outcome"], "committed");
     assert_eq!(wifi_activate_repro_poll(&sim,1)["radio"]["begins"],before_replay,"same-ID replay must not start RF again");
     assert_eq!(wifi_activate_repro_command(&sim, &status, "active", serde_json::json!({})).unwrap()["network_id"], "home");
     eprintln!("REPRO: association plus IP commits activation; same request ID returns its original committed receipt.");
-    let close=wifi_activate_repro_command(&sim,&status,"activate",serde_json::json!({"request_id":"window-close","network_id":"home","version":1})).unwrap();
+    let close=wifi_activate_repro_command(&sim,&status,"activate",serde_json::json!({"request_id":"window-close","request_seq":next.request_seq+1,"network_id":"home","version":1})).unwrap();
     assert_eq!(close["ok"],true);
     let closed=request(sim.address(),"POST","/sim/wifi",Some(CONTROL),br#"{"outcome":0,"window_ms":0}"#);
     assert_eq!(closed.0,200);
     assert_eq!(json_body(&closed.1)["radio"]["connected"],false);
-    let rejected=wifi_activate_repro_command(&sim,&status,"result",serde_json::json!({"query_id":"window-close"})).unwrap();
+    let rejected=wifi_activate_repro_command(&sim,&status,"result",serde_json::json!({"query_id":"window-close","request_seq":next.request_seq+1})).unwrap();
     assert_eq!(rejected["outcome"],"rejected");assert_eq!(rejected["error"],"window_closed");
     assert_eq!(wifi_activate_repro_command(&sim,&status,"active",serde_json::json!({})).unwrap()["network_id"],"home");
     eprintln!("REPRO: production window constraint aborts RF with window_closed but retains selected home; active selection is not a live connection.");
@@ -176,6 +179,7 @@ fn wifi_activate_repro_32_completed_acked_jobs_allow_next_activation() {
     let root = temp_data_dir();
     let svc = PlatformService::open(&root).unwrap();
     svc.device_upsert(DeviceIdentity::new(mac, "Queue repro").unwrap(), DeviceCapabilities::ssd1681_154g()).unwrap();
+    svc.note_authenticated_status_at(mac,&status,100).unwrap();
     for i in 0..32 {
         let now = 100 + i * 10;
         let job = svc.wifi_queue_control(mac, "bridge-test", "activate", serde_json::json!({"network_id":"home","version":1}), now).unwrap();
@@ -185,7 +189,7 @@ fn wifi_activate_repro_32_completed_acked_jobs_allow_next_activation() {
         wifi_activate_repro_poll(&sim, 1);
         let done = ready(svc.wifi_attempt_async(mac, &job.job_id, &job.bridge_id, status["wifi_control"]["namespace"].as_str().unwrap(), false, &BTreeMap::new(), now + 6,&mut |op: &str, body: Value| wifi_activate_repro_command(&sim, &status, op, body))).unwrap().unwrap();
         assert_eq!(done.state, "completed");
-        assert_eq!(wifi_activate_repro_command(&sim, &status, "result_ack", serde_json::json!({"query_id":job.request_id})).unwrap()["outcome"], "retired");
+        assert_eq!(wifi_activate_repro_command(&sim, &status, "result_ack", serde_json::json!({"query_id":job.request_id,"request_seq":job.request_seq})).unwrap()["outcome"], "retired");
         svc.wifi_receipt_acked(mac, &job.job_id, &job.bridge_id, status["wifi_control"]["namespace"].as_str().unwrap()).unwrap();
     }
     drop(svc);
@@ -387,7 +391,7 @@ fn request(address:SocketAddr, method:&str, path:&str, token:Option<&str>, body:
             let mac=json_body(&info.1)["mac"].as_str().unwrap_or("").to_owned();
             let hello=serde_json::json!({"op":"status","request_id":"test-session-open",
                 "token":token.unwrap_or(""),"device_mac":mac,"bridge_id":"bridge-test",
-                "session_nonce":""});
+                "boot_id":""});
             let first=test_ble_send(address,token.unwrap_or(""),&hello,TestBleFrame{session:[0;16],next:1,generation});
             let Ok((header,_))=bridge_core::compact_frame::Header::decode(&first.1,512) else{return first;};
             let frame=TestBleFrame{session:header.session,next:2,generation};
@@ -479,7 +483,7 @@ fn sync_v1_s04_note4_shared_protocol_replay_and_digest_conflict() {
         Some(ENDPOINT), b"").1);
     assert_eq!(initial["sync_v1"], 1);
     assert_eq!(initial["firmware_target"], "zectrix-note4-400x300");
-    let nonce = initial["session_nonce"].as_str().unwrap();
+    let nonce = initial["boot_id"].as_str().unwrap();
     assert_eq!(initial["device_mac"], "02:00:00:00:00:B2");
     let config = serde_json::json!({"op":"sync_config","request_id":"config-1",
         "token":ENDPOINT,"device_mac":"02:00:00:00:00:B2",
@@ -578,7 +582,7 @@ fn sync_v1_s01_note4_fifteenth_deep_round_requires_explicit_open() {
     assert_eq!(json_body(&request(sim.address(), "POST", "/sim/ble/command",
         Some(ENDPOINT), config.to_string().as_bytes()).1)["result"], "applied");
     let ip = sim.address().to_string();
-    let nonce = status["session_nonce"].as_str().unwrap();
+    let nonce = status["boot_id"].as_str().unwrap();
     let call = |op: &str, id: &str, fields: Value| http(bridge_core::device_client::sync(&ip,
         ENDPOINT, "02:00:00:00:00:B3", "bridge-test", nonce, op, id,
         &fields, Duration::from_secs(3))).unwrap();
@@ -615,10 +619,10 @@ fn sync_v1_s01_note4_fifteenth_deep_round_requires_explicit_open() {
                 "token":ENDPOINT});
             let early = json_body(&request(sim.address(), "POST", "/sim/ble/command",
                 Some(ENDPOINT), status_cmd.to_string().as_bytes()).1);
-            let open = serde_json::json!({"op":"sync_open","request_id":"open-14",
+            let open = serde_json::json!({"op":"network_start","bridge_addr":"192.0.2.1","bridge_port":8765,"request_id":"open-14",
                 "token":ENDPOINT,"device_mac":"02:00:00:00:00:B3",
                 "bridge_id":"bridge-test",
-                "reason":"periodic","open_id":"too-early",
+                "reason":"diag_sync",
                 "wake_generation":early["wake_generation"],"wake_seq":early["wake_seq"]});
             assert_eq!(json_body(&request(sim.address(), "POST", "/sim/ble/command",
                 Some(ENDPOINT), open.to_string().as_bytes()).1)["result"], "rejected");
@@ -630,20 +634,20 @@ fn sync_v1_s01_note4_fifteenth_deep_round_requires_explicit_open() {
     let current = json_body(&request(sim.address(), "POST", "/sim/ble/command",
         Some(ENDPOINT), ble_status.to_string().as_bytes()).1);
     assert_eq!(current["sync"]["v"], 1);
-    let open = serde_json::json!({"op":"sync_open","request_id":"open-15",
+    let open = serde_json::json!({"op":"network_start","bridge_addr":"192.0.2.1","bridge_port":8765,"request_id":"open-15",
         "token":ENDPOINT,"device_mac":"02:00:00:00:00:B3",
         "bridge_id":"bridge-test",
-        "reason":"periodic","open_id":"fifteenth-open",
+        "reason":"diag_sync",
         "wake_generation":current["wake_generation"],"wake_seq":current["wake_seq"]});
     let result = json_body(&request(sim.address(), "POST", "/sim/ble/command",
         Some(ENDPOINT), open.to_string().as_bytes()).1);
-    assert_eq!(result["result"], "applied", "{result}");
+    assert_eq!(result["result"], "accepted", "{result}");
     let replay = json_body(&request(sim.address(), "POST", "/sim/ble/command",
         Some(ENDPOINT), open.to_string().as_bytes()).1);
-    assert_eq!(replay["result"], "applied", "{replay}");
+    assert_eq!(replay["result"], "accepted", "{replay}");
     assert_eq!(sim_state(&sim)["power"]["sync_open"], true);
     assert_eq!(authenticated_status(&sim)["sync"]["phase"], "WIFI_SYNC_ONCE");
-    let nonce2 = current["session_nonce"].as_str().unwrap();
+    let nonce2 = current["boot_id"].as_str().unwrap();
     let call2 = |op: &str, id: &str, fields: Value| http(bridge_core::device_client::sync(&ip,
         ENDPOINT, "02:00:00:00:00:B3", "bridge-test", nonce2, op, id,
         &fields, Duration::from_secs(3))).unwrap();
@@ -723,7 +727,7 @@ fn authenticated_status(sim: &Simulator) -> Value {
 
 fn note4_sync_roundtrip(sim: &Simulator, serial: u64, reasons: &[&str]) -> Value {
     let state = authenticated_status(&sim);
-    let nonce = state["session_nonce"].as_str().unwrap();
+    let nonce = state["boot_id"].as_str().unwrap();
     let mac = state["device_mac"].as_str().unwrap();
     let ip = sim.address().to_string();
     let call = |op: &str, fields: Value| http(bridge_core::device_client::sync(&ip, ENDPOINT,
@@ -789,9 +793,13 @@ fn configured_note4_sync_sim_with_options(mac: &str, options: &[&str]) -> Simula
 fn current_device_protocol_rejects_retired_routes_and_ble_markers() {
     let sim = configured_note4_sync_sim("02:00:00:00:00:BC");
     assert_eq!(request(sim.address(), "GET", "/v2/status", Some(ENDPOINT), b"").0, 404);
-    let status = json_body(&request(sim.address(), "GET", "/api/status",
-        Some(ENDPOINT), b"").1);
+    assert_eq!(request(sim.address(), "GET", "/history", Some(ENDPOINT), b"").0, 404);
+    let status = authenticated_status(&sim);
     assert!(status.get("protocol").is_none());
+    let mut retired_plan=plan_message(&status,"bridge-test","retired-history-plan",99,"sleep",None);
+    retired_plan["history_sync_ms"]=serde_json::json!(2500);
+    assert_eq!(post_plan(&sim,Some(ENDPOINT),&retired_plan).1["error"],"plan_shape");
+    assert_eq!(authenticated_status(&sim)["power"]["plan_id"],status["power"]["plan_id"]);
     let public_status = json_body(&request(sim.address(), "GET", "/status.json",
         None, b"").1);
     assert_eq!(public_status["bundle_configured"], true);
@@ -951,7 +959,7 @@ fn sync_v1_s03_note4_frozen_pages_survive_light_deadline() {
         + before["plan"]["accepted_at_ms"].as_u64().unwrap()
         + before["plan"]["granted_s"].as_u64().unwrap() * 1000;
     let state = authenticated_status(&sim);
-    let nonce = state["session_nonce"].as_str().unwrap();
+    let nonce = state["boot_id"].as_str().unwrap();
     let mac = state["device_mac"].as_str().unwrap();
     let ip = sim.address().to_string();
     let call = |op: &str, fields: Value| http(bridge_core::device_client::sync(&ip, ENDPOINT,
@@ -1016,14 +1024,14 @@ fn sync_v1_s05_note4_stalled_transfer_skips_full_retry_window() {
     let current = json_body(&request(sim.address(), "POST", "/sim/ble/command",
         Some(ENDPOINT), status_cmd.to_string().as_bytes()).1);
     assert_eq!(current["sync"]["due"], true);
-    let open = serde_json::json!({"op":"sync_open","request_id":"s05-open",
+    let open = serde_json::json!({"op":"network_start","bridge_addr":"192.0.2.1","bridge_port":8765,"request_id":"s05-open",
         "token":ENDPOINT,"device_mac":"02:00:00:00:00:B9",
         "bridge_id":"bridge-test",
-        "reason":"periodic","open_id":"s05-open-id",
+        "reason":"diag_sync",
         "wake_generation":current["wake_generation"],"wake_seq":current["wake_seq"]});
     assert_eq!(json_body(&request(sim.address(), "POST", "/sim/ble/command",
-        Some(ENDPOINT), open.to_string().as_bytes()).1)["result"], "applied");
-    let nonce = current["session_nonce"].as_str().unwrap();
+        Some(ENDPOINT), open.to_string().as_bytes()).1)["result"], "accepted");
+    let nonce = current["boot_id"].as_str().unwrap();
     let begin = http(bridge_core::device_client::sync(&sim.address().to_string(), ENDPOINT,
         "02:00:00:00:00:B9", "bridge-test", nonce, "begin", "s05-begin",
         &serde_json::json!({"client_serial":"2","reasons":["periodic"]}),
@@ -1044,8 +1052,8 @@ fn sync_v1_s05_note4_stalled_transfer_skips_full_retry_window() {
     assert_eq!(skipped["sync"]["retry_skip"], 1);
     let mut retry = open.clone();
     retry["request_id"] = "s05-skipped-open".into();
-    retry["reason"] = "retry".into();
-    retry["open_id"] = "s05-retry-id".into();
+    retry["reason"] = "diag_sync".into();
+    retry["request_id"] = "s05-retry-id".into();
 
     retry["wake_generation"] = skipped["wake_generation"].clone();
     retry["wake_seq"] = skipped["wake_seq"].clone();
@@ -1057,12 +1065,12 @@ fn sync_v1_s05_note4_stalled_transfer_skips_full_retry_window() {
         Some(ENDPOINT), status_cmd.to_string().as_bytes()).1);
     assert_eq!(next["sync"]["retry_skip"], 0);
     retry["request_id"] = "s05-next-open".into();
-    retry["open_id"] = "s05-next-id".into();
+    retry["request_id"] = "s05-next-id".into();
 
     retry["wake_generation"] = next["wake_generation"].clone();
     retry["wake_seq"] = next["wake_seq"].clone();
     assert_eq!(json_body(&request(sim.address(), "POST", "/sim/ble/command",
-        Some(ENDPOINT), retry.to_string().as_bytes()).1)["result"], "applied");
+        Some(ENDPOINT), retry.to_string().as_bytes()).1)["result"], "accepted");
     assert_eq!(sim_state(&sim)["sync"]["pending_batch"]["batch_id"], batch_id);
 }
 
@@ -1086,29 +1094,29 @@ fn sync_v1_s07_note4_hard_restart_resumes_frozen_batch() {
         "token":ENDPOINT});
     let current = json_body(&request(sim.address(), "POST", "/sim/ble/command",
         Some(ENDPOINT), status_cmd.to_string().as_bytes()).1);
-    let open = serde_json::json!({"op":"sync_open","request_id":"s07-open",
+    let open = serde_json::json!({"op":"network_start","bridge_addr":"192.0.2.1","bridge_port":8765,"request_id":"s07-open",
         "token":ENDPOINT,"device_mac":"02:00:00:00:00:BA",
         "bridge_id":"bridge-test",
-        "reason":"periodic","open_id":"s07-open-id",
+        "reason":"diag_sync",
         "wake_generation":current["wake_generation"],"wake_seq":current["wake_seq"]});
     assert_eq!(json_body(&request(sim.address(), "POST", "/sim/ble/command",
-        Some(ENDPOINT), open.to_string().as_bytes()).1)["result"], "applied");
+        Some(ENDPOINT), open.to_string().as_bytes()).1)["result"], "accepted");
     let state = authenticated_status(&sim);
     let first = http(bridge_core::device_client::sync(&sim.address().to_string(), ENDPOINT,
-        "02:00:00:00:00:BA", "bridge-test", state["session_nonce"].as_str().unwrap(),
+        "02:00:00:00:00:BA", "bridge-test", state["boot_id"].as_str().unwrap(),
         "begin", "s07-begin", &serde_json::json!({"client_serial":"2",
         "reasons":["periodic"]}), Duration::from_secs(3))).unwrap();
     let batch_id = first["batch_id"].as_str().unwrap().to_owned();
     let bytes = first["bytes"].as_u64().unwrap() as usize;
     assert!(bytes > 64);
     let page = http(bridge_core::device_client::sync(&sim.address().to_string(), ENDPOINT,
-        "02:00:00:00:00:BA", "bridge-test", state["session_nonce"].as_str().unwrap(),
+        "02:00:00:00:00:BA", "bridge-test", state["boot_id"].as_str().unwrap(),
         "page", "s07-page", &serde_json::json!({"batch_id":batch_id,
             "offset":0,"limit":64}), Duration::from_secs(3))).unwrap();
     let mut content = base64::engine::general_purpose::STANDARD
         .decode(page["data_b64"].as_str().unwrap()).unwrap();
     let ack = http(bridge_core::device_client::sync(&sim.address().to_string(), ENDPOINT,
-        "02:00:00:00:00:BA", "bridge-test", state["session_nonce"].as_str().unwrap(),
+        "02:00:00:00:00:BA", "bridge-test", state["boot_id"].as_str().unwrap(),
         "ack", "s07-ack", &serde_json::json!({"batch_id":batch_id,
             "offset":content.len(),"prefix_sha256":format!("{:x}", Sha256::digest(&content))}),
         Duration::from_secs(3))).unwrap();
@@ -1122,8 +1130,8 @@ fn sync_v1_s07_note4_hard_restart_resumes_frozen_batch() {
     assert_eq!(resumed["sync"]["pending_batch"]["batch_id"], batch_id,"{resumed}");
     assert_eq!(resumed["sync"]["pending_batch"]["acked_offset"], 64);
     assert_eq!(resumed["sync"]["diag_generation"], state["sync"]["diag_generation"]);
-    assert_ne!(resumed["session_nonce"], state["session_nonce"]);
-    let nonce = resumed["session_nonce"].as_str().unwrap();
+    assert_ne!(resumed["boot_id"], state["boot_id"]);
+    let nonce = resumed["boot_id"].as_str().unwrap();
     while content.len() < bytes {
         let page = http(bridge_core::device_client::sync(&restarted.address().to_string(), ENDPOINT,
             "02:00:00:00:00:BA", "bridge-test", nonce, "page", "s07-resume-page",
@@ -1161,7 +1169,7 @@ fn sync_v1_s07_note4_crash_before_blob_reference_keeps_previous_metadata() {
     assert_eq!(request(sim.address(), "POST", "/sim/storage", Some(CONTROL),
         br#"{"crash_after_sync":"sync_blob","count":2}"#).0, 200);
     let addr = sim.address().to_string();
-    let nonce = state["session_nonce"].as_str().unwrap();
+    let nonce = state["boot_id"].as_str().unwrap();
     assert!(http(bridge_core::device_client::sync(&addr, ENDPOINT, "02:00:00:00:00:BB",
         "bridge-test", nonce, "begin", "s07-crash-begin",
         &serde_json::json!({"client_serial":"2","reasons":["periodic"]}),
@@ -1177,7 +1185,7 @@ fn sync_v1_s07_note4_crash_before_blob_reference_keeps_previous_metadata() {
     assert_eq!(recovered["sync"]["due"], true);
     let retried = http(bridge_core::device_client::sync(&restarted.address().to_string(), ENDPOINT,
         "02:00:00:00:00:BB", "bridge-test",
-        recovered["session_nonce"].as_str().unwrap(), "begin", "s07-retry-begin",
+        recovered["boot_id"].as_str().unwrap(), "begin", "s07-retry-begin",
         &serde_json::json!({"client_serial":"2","reasons":["periodic"]}),
         Duration::from_secs(3))).unwrap();
     assert_eq!(retried["result"], "applied");
@@ -1185,7 +1193,7 @@ fn sync_v1_s07_note4_crash_before_blob_reference_keeps_previous_metadata() {
     let batch_id = retried["batch_id"].as_str().unwrap();
     let page = http(bridge_core::device_client::sync(&restarted.address().to_string(), ENDPOINT,
         "02:00:00:00:00:BB", "bridge-test",
-        recovered["session_nonce"].as_str().unwrap(), "page", "s07-retry-page",
+        recovered["boot_id"].as_str().unwrap(), "page", "s07-retry-page",
         &serde_json::json!({"batch_id":batch_id,"offset":0,"limit":64}),
         Duration::from_secs(3))).unwrap();
     let prefix = base64::engine::general_purpose::STANDARD
@@ -1194,7 +1202,7 @@ fn sync_v1_s07_note4_crash_before_blob_reference_keeps_previous_metadata() {
         br#"{"crash_after_sync":"sync_meta","count":2}"#).0, 200);
     assert!(http(bridge_core::device_client::sync(&restarted.address().to_string(), ENDPOINT,
         "02:00:00:00:00:BB", "bridge-test",
-        recovered["session_nonce"].as_str().unwrap(), "ack", "s07-crash-ack",
+        recovered["boot_id"].as_str().unwrap(), "ack", "s07-crash-ack",
         &serde_json::json!({"batch_id":batch_id,"offset":prefix.len(),
             "prefix_sha256":format!("{:x}", Sha256::digest(&prefix))}),
         Duration::from_secs(3))).is_err());
@@ -1248,7 +1256,7 @@ fn ota_switches_only_after_a_complete_catalogued_upload_or_explicit_override() {
     assert!(ota_request(&sim, "/doUpdate?token=device-test-secret&target=codex-status-154g", &valid[..100]).1.contains("UPDATE FAILED"));
     assert!(ota_request(&sim, "/doUpdate?token=device-test-secret&target=codex-status-154g", &vec![7u8;1024]).1.contains("UPDATE FAILED"));
     assert_eq!(fw(), "0.18.24-bw");
-    let before_nonce = json_body(&request(sim.address(), "GET", "/api/status", Some(ENDPOINT), b"").1)["session_nonce"].clone();
+    let before_nonce = json_body(&request(sim.address(), "GET", "/api/status", Some(ENDPOINT), b"").1)["boot_id"].clone();
     let (code, ack) = ota_request(&sim, "/doUpdate?token=device-test-secret&target=codex-status-154g", &valid);
     assert_eq!(code, 200);
     if !ack.contains("UPDATE OK") {
@@ -1264,7 +1272,7 @@ fn ota_switches_only_after_a_complete_catalogued_upload_or_explicit_override() {
     let versions = json_body(&request(sim.address(), "GET", "/sim/versions", Some(CONTROL), b"").1);
     assert_eq!(versions["active"], "v2");
     assert_eq!(versions["source"], "ota_upload");
-    assert_ne!(json_body(&request(sim.address(), "GET", "/api/status", Some(ENDPOINT), b"").1)["session_nonce"], before_nonce);
+    assert_ne!(json_body(&request(sim.address(), "GET", "/api/status", Some(ENDPOINT), b"").1)["boot_id"], before_nonce);
     let data_dir = sim.data_dir.clone();
     sim.stop_preserving_data();
     let sim = Simulator::start_with_dir("02:00:00:00:00:34", &[], data_dir, true);
@@ -1752,7 +1760,7 @@ fn real_device_client_installs_one_and_eight_template_bundles() {
             assert_eq!(restored["data_seq"], 0);
         }
         assert_eq!(restored["template_ids"], before_restart["template_ids"]);
-        assert_ne!(restored["session_nonce"], before_restart["session_nonce"]);
+        assert_ne!(restored["boot_id"], before_restart["boot_id"]);
         if count == 1 {
             let mut replacement = bundle.clone();
             replacement["job_id"] = "torn-install".into();
@@ -1815,7 +1823,7 @@ fn configured_power_sleeps_and_timer_and_button_wakes_have_distinct_windows() {
     assert_eq!(http(bridge_core::device_client::data(&sim.address().to_string(), ENDPOINT,
         "02:00:00:00:00:35", &data, Duration::from_secs(3))).unwrap()["result"], "applied");
     assert_eq!(claim(&sim, "id=bridge-test&lease=120", Some(DEVICE)).0, 200);
-    let nonce = status["session_nonce"].clone();
+    let nonce = status["boot_id"].clone();
     assert_eq!(request(sim.address(), "POST", "/sim/power", Some(CONTROL),
         br#"{"plugged":true,"deep_on_usb":false}"#).0, 200);
     let sleep = plan_message(&status, "bridge-test", "sleep-now", 1, "sleep", None);
@@ -1846,7 +1854,7 @@ fn configured_power_sleeps_and_timer_and_button_wakes_have_distinct_windows() {
     assert_eq!(json_body(&body)["power"]["provisional"], true);
     let button_status = json_body(&request(sim.address(), "GET", "/api/status",
         Some(ENDPOINT), b"").1);
-    assert_ne!(button_status["session_nonce"], nonce);
+    assert_ne!(button_status["boot_id"], nonce);
     assert_eq!(button_status["committed_job_id"], "power-job");
     assert_eq!(button_status["active_context_id"], status["active_context_id"]);
     assert_eq!(button_status["power"]["provisional"], true);
@@ -1992,7 +2000,7 @@ fn timer_ble_rendezvous_accepts_formal_plan_before_http_opens() {
     assert_eq!(status["ack"], "command");
     assert_eq!(status["request_id"], "ble-status");
     assert_eq!(status["result"], "applied");
-    assert_ne!(status["session_nonce"], initial["session_nonce"]);
+    assert_ne!(status["boot_id"], initial["boot_id"]);
     let mut light = plan_message(&status, "bridge-test", "ble-light", 2, "light", Some(120));
     light["op"] = "plan".into();
     light["token"] = ENDPOINT.into();
@@ -2054,7 +2062,7 @@ fn bridge_device_connection_uses_fake_ble_without_os_radio() {
         assert_eq!(mac, "02000000003B");
         let status = link.command("status", serde_json::json!({})).await.unwrap();
         assert_eq!(status["result"], "applied");
-        assert_ne!(status["session_nonce"], initial["session_nonce"]);
+        assert_ne!(status["boot_id"], initial["boot_id"]);
         assert_eq!(link.request_device_token().await.unwrap(), DEVICE);
         let plan = plan_message(&status,"bridge-test","light",2,"light",Some(120));
         let ack = link.command("plan", plan).await.unwrap();
@@ -2412,12 +2420,16 @@ fn ready_and_status_are_safe_and_use_shared_builder() {
     let status = json_body(&body);
     assert_eq!(status["result"], "applied");
     assert!(status.get("protocol").is_none());
+    let mut retired_plan=plan_message(&status,"bridge-test","retired-history-plan",99,"sleep",None);
+    retired_plan["history_sync_ms"]=serde_json::json!(2500);
+    assert_eq!(post_plan(&sim,Some(ENDPOINT),&retired_plan).1["error"],"plan_shape");
+    assert_eq!(authenticated_status(&sim)["power"]["plan_id"],status["power"]["plan_id"]);
     assert_eq!(status["device_mac"], "02:AB:CD:00:00:01");
     assert_eq!(status["configured"], false);
     assert_eq!(status["active_template_id"], "");
     assert_eq!(status["data_seq"], 0);
     assert_eq!(status["power"]["battery"], 75);
-    assert_eq!(status["session_nonce"].as_str().unwrap().len(), 32);
+    assert_eq!(status["boot_id"].as_str().unwrap().len(), 32);
 }
 
 #[test]
@@ -3301,7 +3313,7 @@ fn wifi_jobs_use_production_hal_real_ble_ack_and_query_after_lost_http_ack() {
     let restarted = Simulator::start_with_dir(mac,&[],sim.data_dir.clone(),true);
     let fresh=http(bridge_core::device_client::status(&restarted.address().to_string(),ENDPOINT,Duration::from_secs(3))).unwrap();
     let receipt = http(bridge_core::device_client::wifi_command(&restarted.address().to_string(),ENDPOINT,mac,"bridge-test","result",
-        serde_json::json!({"query_id":job.request_id}),Duration::from_secs(3))).unwrap();
+        serde_json::json!({"query_id":job.request_id,"request_seq":job.request_seq}),Duration::from_secs(3))).unwrap();
     assert_eq!(receipt["outcome"],"committed");assert_eq!(receipt["revision"],1);
     std::env::remove_var("CODEX_STATUS_SIM_BLE_ENDPOINTS"); let _ = fs::remove_dir_all(root);
 }
@@ -3315,24 +3327,24 @@ fn wifi_current_projection_freezes_pages_and_owner_manages_all_origins_atomicall
     // Historical records remain visible until the separate offline conversion.
     assert_eq!(request(sim.address(),"POST","/sim/wifi",Some(CONTROL),br#"{"legacy":[{"network_id":"legacy-0","ssid":"USB-AP"},{"network_id":"legacy-1","ssid":"Second-AP"}]}"#).0,200);
     let status=http(bridge_core::device_client::status(&address,ENDPOINT,Duration::from_secs(3))).unwrap();
-    let nonce=status["session_nonce"].as_str().unwrap();
+    let nonce=status["boot_id"].as_str().unwrap();
     let command=|op:&str,body:Value|http(bridge_core::device_client::wifi_command(&address,ENDPOINT,mac,"bridge-test",op,body,Duration::from_secs(3))).unwrap();
     let snapshot=||http(bridge_core::device_client::wifi_snapshot(&address,ENDPOINT,mac,"bridge-test",Duration::from_secs(3))).unwrap();
     let changes:Vec<_>=(0..8).map(|i|serde_json::json!({"network_id":format!("n{i}"),"host_ssid":format!("Host{i}"),"ssid":"中文网络".repeat(2),"label":"灯\\\"".repeat(12),"credential":"replace","password":"p".repeat(63)})).collect();
-    let apply=command("apply",serde_json::json!({"request_id":"w3_0000000000000001","expected_revision":0,"changes":&changes[..4]}));
+    let apply=command("apply",serde_json::json!({"request_id":"w3_0000000000000001","request_seq":1,"expected_revision":0,"changes":&changes[..4]}));
     assert_eq!(apply["outcome"],"committed","{apply}");
-    let more=command("apply",serde_json::json!({"request_id":"seed-more","expected_revision":1,"changes":&changes[4..]}));
+    let more=command("apply",serde_json::json!({"request_id":"seed-more","request_seq":2,"expected_revision":1,"changes":&changes[4..]}));
     assert_eq!(more["outcome"],"committed","{more}");
     let full=snapshot();assert_eq!(full.networks.len(),10);assert_eq!(full.networks.iter().filter(|n|n.writable).count(),8);
     assert_eq!(full.active["network_id"],"");
     let legacy:Vec<_>=full.networks.iter().filter(|n|n.bond=="legacy").map(|n|(n.network.network_id.as_str(),n.network.ssid.as_str())).collect();
     assert_eq!(legacy,vec![("legacy-0","USB-AP"),("legacy-1","Second-AP")]);
     assert!(http(bridge_core::device_client::wifi_snapshot(&address,"wrong-token",mac,"bridge-test",Duration::from_secs(3))).is_err());
-    let bad=command("apply",serde_json::json!({"request_id":"w3_0000000000000002","expected_revision":2,"changes":[
+    let bad=command("apply",serde_json::json!({"request_id":"w3_0000000000000002","request_seq":3,"expected_revision":2,"changes":[
         {"network_id":"n0","host_ssid":"Renamed","ssid":"Changed","credential":"keep"},
         {"network_id":"extra","host_ssid":"Extra","ssid":"Extra","credential":"keep"}]}));
     assert_eq!(bad["error"],"credentials_required");
-    let receipt=command("result",serde_json::json!({"query_id":"w3_0000000000000002"}));
+    let receipt=command("result",serde_json::json!({"query_id":"w3_0000000000000002","request_seq":3}));
     assert_eq!(receipt["outcome"],"rejected");assert_eq!(receipt["revision"],2);
     assert_eq!(snapshot().networks[0].network.host_ssid,"Host0");
     // Current owner may manage every saved row; the creating namespace is provenance.
@@ -3341,7 +3353,7 @@ fn wifi_current_projection_freezes_pages_and_owner_manages_all_origins_atomicall
     assert!(all.networks.iter().filter(|n|n.bond!="legacy").all(|n|n.bond=="02:00:00:00:00:02/1"));
     let first=http(bridge_core::device_client::wifi_request(&address,ENDPOINT,mac,"bridge-test","snapshot",serde_json::json!({"offset":0}),Duration::from_secs(3))).unwrap();
     assert_eq!(first["complete"],false);
-    let added=command("apply",serde_json::json!({"request_id":"w3_0000000000000001","expected_revision":2,"changes":[
+    let added=command("apply",serde_json::json!({"request_id":"w3_0000000000000001","request_seq":1,"expected_revision":2,"changes":[
         {"network_id":"n0","host_ssid":"Updated","ssid":"Updated","credential":"keep"},
         {"network_id":"other","host_ssid":"OtherHost","ssid":"OtherDevice","credential":"open"}]}));
     assert_eq!(added["outcome"],"committed","{added}");
@@ -3354,7 +3366,7 @@ fn wifi_current_projection_freezes_pages_and_owner_manages_all_origins_atomicall
 }
 
 #[test]
-fn wifi_bounded_recovery_and_history_share_production_bytes_and_keep_display() {
+fn wifi_bounded_recovery_uses_production_bytes_and_keeps_display() {
     let _env_guard=BLE_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mac="02000000004C";let sim=Simulator::start(mac,&[]);
     assert_eq!(request(sim.address(),"POST","/sim/wifi",Some(CONTROL),br#"{"maintenance_ms":120000}"#).0,200);
@@ -3364,32 +3376,26 @@ fn wifi_bounded_recovery_and_history_share_production_bytes_and_keep_display() {
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let mut link=bridge_ble::DeviceConnection::connect(mac,ENDPOINT,"bridge-test").await.unwrap().unwrap();
         link.command("status",serde_json::json!({})).await.unwrap();
-        let trial=link.command("wifi_trial",serde_json::json!({"network_id":"candidate","host_ssid":"Host","ssid":"Candidate","password":"","replace":false})).await.unwrap();
+        let trial=link.command("wifi_trial",serde_json::json!({"request_seq":1,"network_id":"candidate","host_ssid":"Host","ssid":"Candidate","password":"","replace":false})).await.unwrap();
         assert_eq!(trial["stage"],"connecting");
-        let outcome=link.command("wifi_setup_status",serde_json::json!({"query_id":trial["query_id"]})).await.unwrap();
+        let outcome=link.command("wifi_setup_status",serde_json::json!({"query_id":trial["query_id"],"request_seq":1})).await.unwrap();
         assert_eq!(outcome["stage"],"trial_complete");assert_eq!(outcome["persisted"],false);
         // Current trials persist their receipt, but never save a configuration.
         assert!(sim.data_dir.join("wifi-schemes.bin").exists());
         assert!(link.wifi_snapshot().await.unwrap()["networks"].as_array().unwrap().is_empty());
         assert_eq!(request(sim.address(),"POST","/sim/ble/fault",Some(CONTROL),br#"{"kind":"drop_ack"}"#).0,200);
-        assert!(link.command_with_id("wifi_apply",serde_json::json!({"expected_revision":0,"changes":[
+        assert!(link.command_with_id("wifi_apply",serde_json::json!({"request_seq":2,"expected_revision":0,"changes":[
             {"network_id":"home","host_ssid":"Host","ssid":"Stored","label":"Desk","credential":"open"}]}),"stable-recovery").await.is_err());
-        let receipt=link.command("wifi_result",serde_json::json!({"query_id":"stable-recovery"})).await.unwrap();
+        let receipt=link.command("wifi_result",serde_json::json!({"query_id":"stable-recovery","request_seq":2})).await.unwrap();
         assert_eq!(receipt["outcome"],"committed");assert_eq!(receipt["revision"],1);
         let saved=link.wifi_read("wifi_scheme_get").await.unwrap();assert_eq!(saved["networks"][0]["ssid"],"Stored");
         assert_eq!(link.command("wifi_active",serde_json::json!({})).await.unwrap()["network_id"],"");
-        let activation=link.command("wifi_activate",serde_json::json!({"network_id":"home","version":1})).await.unwrap();
+        let activation=link.command("wifi_activate",serde_json::json!({"request_seq":3,"network_id":"home","version":1})).await.unwrap();
         assert_eq!(activation["stage"],"connecting");
-        assert_eq!(link.command("wifi_setup_status",serde_json::json!({"query_id":activation["query_id"]})).await.unwrap()["persisted"],true);
+        assert_eq!(link.command("wifi_setup_status",serde_json::json!({"query_id":activation["query_id"],"request_seq":3})).await.unwrap()["persisted"],true);
         assert_eq!(link.command("wifi_active",serde_json::json!({})).await.unwrap()["version"],1);
         link.command("status",serde_json::json!({})).await.unwrap();
-        for seq in 1..=8 {
-            assert_eq!(request(sim.address(),"POST","/sim/history",Some(CONTROL),serde_json::json!({
-                "wake_generation":sim.ready["boot_id"],"seq":seq,"awake_ms":u32::MAX}).to_string().as_bytes()).0,200);
-        }
-        let history=link.command_with_id("history",serde_json::json!({"since":0,"limit":8}),&"x".repeat(64)).await.unwrap();
-        assert!(!history["records"].as_array().unwrap().is_empty());assert_eq!(history["more"],true);
-        assert_eq!(history["records"][0]["format"],2);
+        assert!(link.command("history",serde_json::json!({})).await.is_err());
         let attributes=json_body(&request(sim.address(),"GET","/sim/ble/attributes",Some(CONTROL),b"").1);
         assert!(attributes.to_string().contains("write_failed"));
         link.close().await;
@@ -3459,7 +3465,7 @@ fn current_wifi_rejects_retired_commands_over_http_and_ble_without_mutation() {
     assert_eq!(request(sim.address(),"POST","/sim/power",Some(CONTROL),br#"{"plugged":true}"#).0,200);
     assert_eq!(claim(&sim,"id=bridge-test",Some(DEVICE)).0,200);
     let status=http(bridge_core::device_client::status(&address,ENDPOINT,Duration::from_secs(3))).unwrap();
-    let nonce=status["session_nonce"].as_str().unwrap();
+    let nonce=status["boot_id"].as_str().unwrap();
     let retired=["wifi_authorize","wifi_migrate","wifi_setup","wifi_select","wifi_scheme_delete","wifi_future_unknown"];
     for op in retired {
         let error=http(bridge_core::device_client::wifi_command(&address,ENDPOINT,mac,"bridge-test",op,
@@ -3503,7 +3509,7 @@ fn unified_usb_http_without_ble_survives_bridge_restart_lost_ack_and_receipt_ret
     };
     assert_eq!(ready(svc.wifi_attempt_async(mac,&read.job_id, &read.bridge_id, "",false,&BTreeMap::new(),101,&mut transport)).unwrap().unwrap().state,"completed");
     let targets=serde_json::from_value(serde_json::json!([{"network_id":"home","host_ssid":"Host5G","ssid":"Device2G","credential":"open"}])).unwrap();svc.wifi_save(mac,0,targets,102).unwrap();
-    let job=svc.wifi_queue(mac,"bridge-test","sync",vec!["home".into()],103).unwrap();assert!(job.request_id.starts_with("w3_"));
+    let job=svc.wifi_queue(mac,"bridge-test","sync",vec!["home".into()],103).unwrap();assert!(!job.request_id.starts_with("w3_"));assert!(job.request_seq>0);
     assert_eq!(request(sim.address(),"POST","/sim/wifi",Some(CONTROL),br#"{"drop_http_ack":true}"#).0,200);
     assert_eq!(ready(svc.wifi_attempt_async(mac,&job.job_id, &job.bridge_id, status["wifi_control"]["namespace"].as_str().unwrap(),true,&BTreeMap::new(),104,&mut transport)).unwrap().unwrap().state,"awaiting_confirmation");
     drop(svc);let svc=PlatformService::open(&root).unwrap();let mut calls=vec![];
@@ -3516,24 +3522,24 @@ fn unified_usb_http_without_ble_survives_bridge_restart_lost_ack_and_receipt_ret
             let mut link=bridge_ble::DeviceConnection::connect(mac,ENDPOINT,"bridge-test").await.unwrap().unwrap();assert_eq!(link.info["wifi_management"],3);
             link.write_endpoint("127.0.0.1",8765,ENDPOINT).await.unwrap();
             let control=link.wifi_read("wifi_status").await.unwrap();assert_eq!(control["wifi_control"]["mode"],"continuous");
-            assert_eq!(control["wifi_control"]["transaction_high_watermark"],u64::from_str_radix(job.request_id.strip_prefix("w3_").unwrap(),16).unwrap());
-            assert_eq!(link.command("wifi_result",serde_json::json!({"query_id":job.request_id})).await.unwrap()["outcome"],"committed");
+            assert_eq!(control["wifi_control"]["transaction_high_watermark"],job.request_seq);
+            assert_eq!(link.command("wifi_result",serde_json::json!({"query_id":job.request_id,"request_seq":job.request_seq})).await.unwrap()["outcome"],"committed");
             let snapshot=link.wifi_snapshot().await.unwrap();assert_eq!(snapshot["revision"],1);assert_eq!(snapshot["networks"].as_array().unwrap().len(),1);
             link.close().await;
         });
         std::env::remove_var("CODEX_STATUS_SIM_BLE_ENDPOINTS");
     }
-    assert_eq!(transport("result_ack",serde_json::json!({"query_id":job.request_id})).unwrap()["outcome"],"retired");svc.wifi_receipt_acked(mac, &job.job_id, &job.bridge_id, status["wifi_control"]["namespace"].as_str().unwrap()).unwrap();
+    assert_eq!(transport("result_ack",serde_json::json!({"query_id":job.request_id,"request_seq":job.request_seq})).unwrap()["outcome"],"retired");svc.wifi_receipt_acked(mac, &job.job_id, &job.bridge_id, status["wifi_control"]["namespace"].as_str().unwrap()).unwrap();
     let redundant=svc.wifi_queue(mac,"bridge-test","sync",vec!["home".into()],120).unwrap();
     let confirmed=svc.wifi_confirm_current(mac,&redundant.job_id,1,&BTreeMap::from([("home".into(),1)]),121).unwrap();
     assert_eq!(confirmed.request_id,redundant.request_id);assert!(!confirmed.sent && !confirmed.receipt_ack_pending);assert_eq!(confirmed.confirmation.as_deref(),Some("verified_post_state"));assert!(!svc.wifi_state(mac).snapshot.as_ref().unwrap().complete);
-    let old=serde_json::json!({"request_id":job.request_id,"expected_revision":1,"changes":[{"network_id":"home","host_ssid":"Host5G","ssid":"Device2G","credential":"open"}]});
+    let old=serde_json::json!({"request_id":job.request_id,"request_seq":job.request_seq,"expected_revision":1,"changes":[{"network_id":"home","host_ssid":"Host5G","ssid":"Device2G","credential":"open"}]});
     assert_eq!(transport("apply",old.clone()).unwrap()["error"],"request_retired");
     sim.stop_preserving_data();let restarted=Simulator::start_with_dir(mac,&[],sim.data_dir.clone(),true);
     let recovered=http(bridge_core::device_client::status(&restarted.address().to_string(),ENDPOINT,Duration::from_secs(3))).unwrap();
     assert_eq!(http(bridge_core::device_client::wifi_command(&restarted.address().to_string(),ENDPOINT,mac,"bridge-test","apply",old,Duration::from_secs(3))).unwrap()["error"],"request_retired");
     // Principal cannot select a namespace in the request.
-    assert_eq!(http(bridge_core::device_client::wifi_command(&restarted.address().to_string(),ENDPOINT,mac,"other","result",serde_json::json!({"query_id":job.request_id,"bond":"arbitrary"}),Duration::from_secs(3))).unwrap()["error"],"principal_mismatch");
+    assert_eq!(http(bridge_core::device_client::wifi_command(&restarted.address().to_string(),ENDPOINT,mac,"other","result",serde_json::json!({"query_id":job.request_id,"request_seq":job.request_seq,"bond":"arbitrary"}),Duration::from_secs(3))).unwrap()["error"],"principal_mismatch");
     let _=fs::remove_dir_all(root);
 }
 
@@ -3550,7 +3556,7 @@ fn new_wifi_sync_with_old_snapshot_reports_real_device_revision_rejection() {
     let snapshot=http(bridge_core::device_client::wifi_snapshot(&address,ENDPOINT,mac,"bridge-test",Duration::from_secs(3))).unwrap();assert_eq!(snapshot.revision,0);
     svc.wifi_complete_read(mac,&read.job_id,snapshot,100).unwrap();
     let mut transport=|op:&str,body:Value|http(bridge_core::device_client::wifi_command(&address,ENDPOINT,mac,"bridge-test",op,body,Duration::from_secs(3)));
-    let external=transport("apply",serde_json::json!({"request_id":"external-config","expected_revision":0,"changes":[{"network_id":"home","host_ssid":"Host","ssid":"External","credential":"open"}]})).unwrap();assert_eq!(external["revision"],1);
+    let external=transport("apply",serde_json::json!({"request_id":"external-config","request_seq":1,"expected_revision":0,"changes":[{"network_id":"home","host_ssid":"Host","ssid":"External","credential":"open"}]})).unwrap();assert_eq!(external["revision"],1);
     svc.wifi_save(mac,0,serde_json::from_value(serde_json::json!([{"network_id":"home","host_ssid":"Host","ssid":"Desired","credential":"open"}])).unwrap(),101).unwrap();
     let job=svc.wifi_queue(mac,"bridge-test","sync",vec!["home".into()],102).unwrap();assert_eq!(job.expected_revision,Some(0));assert!(!job.sent);
     let result=ready(svc.wifi_attempt_async(mac,&job.job_id, &job.bridge_id, status["wifi_control"]["namespace"].as_str().unwrap(),true,&BTreeMap::new(),103,&mut |op: &str, body: Value| {
@@ -3742,14 +3748,18 @@ fn periodic_data_window_does_not_grant_formal_light_and_replay_cannot_extend_it(
     let reply=post_plan(&sim,Some(ENDPOINT),&short).1;assert_eq!(reply["result"],"applied","{reply} ");
     let command=serde_json::json!({"op":"status","request_id":"temp-status","token":ENDPOINT});
     let current=json_body(&request(sim.address(),"POST","/sim/ble/command",Some(ENDPOINT),command.to_string().as_bytes()).1);
-    let open=serde_json::json!({"op":"sync_open","request_id":"temp-open","token":ENDPOINT,
+    let open=serde_json::json!({"op":"network_start","bridge_addr":"192.0.2.1","bridge_port":8765,"request_id":"temp-open","token":ENDPOINT,
         "device_mac":mac,"bridge_id":"bridge-test",
-        "reason":"data","data_seq":999,"open_id":"0123456789abcdef0123456789abcdef",
+        "reason":"data_sync","data_seq":999,
         "wake_generation":current["wake_generation"],"wake_seq":current["wake_seq"]});
-    assert_eq!(json_body(&request(sim.address(),"POST","/sim/ble/command",Some(ENDPOINT),open.to_string().as_bytes()).1)["result"],"applied");
+    assert_eq!(json_body(&request(sim.address(),"POST","/sim/ble/command",Some(ENDPOINT),open.to_string().as_bytes()).1)["result"],"accepted");
+    let mut conflict=open.clone();conflict["bridge_port"]=serde_json::json!(8766);
+    assert_eq!(json_body(&request(sim.address(),"POST","/sim/ble/command",Some(ENDPOINT),conflict.to_string().as_bytes()).1)["error"],"request_conflict");
+    conflict=open.clone();conflict["reason"]=serde_json::json!("bundle");conflict["data_seq"]=serde_json::json!(0);
+    assert_eq!(json_body(&request(sim.address(),"POST","/sim/ble/command",Some(ENDPOINT),conflict.to_string().as_bytes()).1)["error"],"request_conflict");
     let before=sim_state(&sim);
     assert_eq!(set_time(&sim,Some(CONTROL),&serde_json::json!({"op":"step","delta_ms":1000})).0,200);
-    assert_eq!(json_body(&request(sim.address(),"POST","/sim/ble/command",Some(ENDPOINT),open.to_string().as_bytes()).1)["result"],"applied");
+    assert_eq!(json_body(&request(sim.address(),"POST","/sim/ble/command",Some(ENDPOINT),open.to_string().as_bytes()).1)["result"],"accepted");
     assert_eq!(set_time(&sim,Some(CONTROL),&serde_json::json!({"op":"step","delta_ms":30000})).0,200);
     let during=sim_state(&sim);
     assert_eq!(during["plan"]["accepted_at_ms"],before["plan"]["accepted_at_ms"]);
@@ -3766,14 +3776,17 @@ fn periodic_data_window_does_not_grant_formal_light_and_replay_cannot_extend_it(
 fn periodic_data_completes_over_http_with_a_sleep_plan_and_releases_the_window() {
     let mac="02:00:00:00:00:CF";
     let sim=configured_note4_sync_sim(mac);
+    let disable=serde_json::json!({"op":"sync_config","request_id":"disable-diagnostics","token":ENDPOINT,
+        "device_mac":mac,"bridge_id":"bridge-test","enabled":false});
+    assert_eq!(json_body(&request(sim.address(),"POST","/sim/ble/command",Some(ENDPOINT),disable.to_string().as_bytes()).1)["result"],"applied");
     let status=authenticated_status(&sim);
     let current=json_body(&request(sim.address(),"POST","/sim/ble/command",Some(ENDPOINT),
         br#"{"op":"status","request_id":"temp-status","token":"endpoint-test-secret"}"#).1);
-    let open=serde_json::json!({"op":"sync_open","request_id":"temp-open","token":ENDPOINT,
+    let open=serde_json::json!({"op":"network_start","bridge_addr":"192.0.2.1","bridge_port":8765,"request_id":"temp-open","token":ENDPOINT,
         "device_mac":mac,"bridge_id":"bridge-test",
-        "reason":"data","data_seq":1,"open_id":"1123456789abcdef0123456789abcdef",
+        "reason":"data_sync","data_seq":1,
         "wake_generation":current["wake_generation"],"wake_seq":current["wake_seq"]});
-    assert_eq!(json_body(&request(sim.address(),"POST","/sim/ble/command",Some(ENDPOINT),open.to_string().as_bytes()).1)["result"],"applied");
+    assert_eq!(json_body(&request(sim.address(),"POST","/sim/ble/command",Some(ENDPOINT),open.to_string().as_bytes()).1)["result"],"accepted");
     let sleep=plan_message(&status,"bridge-test","periodic-sleep",55,"sleep",Some(0));
     let reply=post_plan(&sim,Some(ENDPOINT),&sleep).1;assert_eq!(reply["result"],"applied","{reply} ");
     assert_eq!(sim_state(&sim)["power"]["sync_open"],true);
@@ -3982,6 +3995,7 @@ fn fake_ble_device_remote_close_reconnect_and_unknown_quarantine() {
         assert_eq!(reply.0,200); json_body(&reply.1)
     };
     assert_eq!(request(sim.address(),"POST","/sim/ble/device",Some(ENDPOINT),br#"{"op":"disconnect"}"#).0,401);
+    let expected_boot=authenticated_status(&sim)["boot_id"].clone();
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         control("disconnect_on_discovery");
         let failed=bridge_ble::DeviceConnection::connect("0200000000C4",ENDPOINT,"bridge-test").await.err().expect("discovery disconnect must fail");
@@ -3989,7 +4003,9 @@ fn fake_ble_device_remote_close_reconnect_and_unknown_quarantine() {
         assert_eq!(json_body(&request(sim.address(),"GET","/sim/ble/device",Some(CONTROL),b"").1)["connected"],false);
         for (seq, plan) in [(1,"Plus"),(2,"Pro"),(3,"Team")] {
             let mut link=bridge_ble::DeviceConnection::connect("0200000000C4",ENDPOINT,"bridge-test").await.unwrap().unwrap();
-            link.command("status",serde_json::json!({})).await.unwrap();
+            let observed=link.command("status",serde_json::json!({})).await.unwrap();
+            assert_eq!(observed["boot_id"],expected_boot,"BLE reconnect must preserve boot identity");
+            assert!(observed["session_nonce"].is_null(),"transport session belongs only in the frame");
             let source=bridge_core::datasource::DataSource {
                 source_id:"fake".into(),kind:bridge_core::datasource::DataSourceKind::StaticJson,
                 config:serde_json::json!({"values":{"account.plan":plan}}),credential_ref:None,enabled:true };
@@ -4084,5 +4100,119 @@ fn ready<F: std::future::Future>(future:F)->F::Output {
     match future.as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop())) {
         std::task::Poll::Ready(value)=>value,
         std::task::Poll::Pending=>panic!("synchronous fixture suspended"),
+    }
+}
+
+#[test]
+fn wake_summaries_use_sync_v1_pages_and_durable_completion_only() {
+    let sim=configured_note4_sync_sim("02:00:00:00:00:D2");
+    let sleep=plan_message(&authenticated_status(&sim),"bridge-test","history-sleep",1,"sleep",None);
+    assert_eq!(post_plan(&sim,Some(ENDPOINT),&sleep).1["result"],"applied");
+    assert_eq!(set_time(&sim,Some(CONTROL),&serde_json::json!({"op":"step","delta_ms":60000})).0,200);
+    let status_cmd=serde_json::json!({"op":"status","request_id":"history-status","token":ENDPOINT});
+    let current=json_body(&request(sim.address(),"POST","/sim/ble/command",Some(ENDPOINT),status_cmd.to_string().as_bytes()).1);
+    let mut light=plan_message(&current,"bridge-test","history-light",2,"light",Some(120));
+    light["op"]=serde_json::json!("plan");light["token"]=serde_json::json!(ENDPOINT);
+    assert_eq!(json_body(&request(sim.address(),"POST","/sim/ble/command",Some(ENDPOINT),light.to_string().as_bytes()).1)["result"],"applied");
+    for seq in 1..=8 {
+        assert_eq!(request(sim.address(),"POST","/sim/history",Some(CONTROL),serde_json::json!({
+            "wake_generation":sim.ready["boot_id"],"seq":seq,"awake_ms":u32::MAX
+        }).to_string().as_bytes()).0,200);
+    }
+    let summaries=|batch:&Value| {
+        let raw=base64::engine::general_purpose::STANDARD.decode(batch["diag"]["records_b64"].as_str().unwrap()).unwrap();
+        let (mut offset,mut count)=(0,0);
+        while offset<raw.len() {
+            let size=u16::from_le_bytes([raw[offset],raw[offset+1]]) as usize;
+            assert!(size>=4 && offset+size<=raw.len());
+            if raw[offset+2]==1 {count+=1;}
+            offset+=size;
+        }
+        count
+    };
+    assert_eq!(summaries(&note4_sync_roundtrip(&sim,2,&["periodic","light_enter"])),8);
+    assert_eq!(set_time(&sim,Some(CONTROL),&serde_json::json!({"op":"step","delta_ms":120000})).0,200);
+    assert_eq!(summaries(&note4_sync_roundtrip(&sim,3,&["periodic","light_exit"])),0);
+    assert_eq!(request(sim.address(),"GET","/history",Some(ENDPOINT),b"").0,404);
+}
+
+#[test]
+fn network_start_purposes_are_explicit_and_closed_ids_cannot_reopen() {
+    for (purpose,ble_ack) in [("wifi_setup",false),("wifi_setup",true),("bundle",false),("data_sync",false),("diag_sync",false)] {
+        let mac="02:00:00:00:00:D8";
+        let sim=configured_note4_sync_sim(mac);
+        let mut status=authenticated_status(&sim);
+        if purpose=="diag_sync" {
+            let sleep=plan_message(&status,"bridge-test","purpose-sleep",79,"sleep",None);
+            assert_eq!(post_plan(&sim,Some(ENDPOINT),&sleep).1["result"],"applied");
+            assert_eq!(set_time(&sim,Some(CONTROL),&serde_json::json!({"op":"step","delta_ms":60000})).0,200);
+            status=json_body(&request(sim.address(),"POST","/sim/ble/command",Some(ENDPOINT),
+                serde_json::json!({"op":"status","request_id":"purpose-status","token":ENDPOINT}).to_string().as_bytes()).1);
+        }
+        let mut light=plan_message(&status,"bridge-test","purpose-light",80,"light",Some(120));
+        light["op"]=serde_json::json!("plan");light["token"]=serde_json::json!(ENDPOINT);
+        assert_eq!(json_body(&request(sim.address(),"POST","/sim/ble/command",Some(ENDPOINT),light.to_string().as_bytes()).1)["result"],"applied");
+        let mut open=serde_json::json!({"op":"network_start","request_id":"purpose-window","token":ENDPOINT,
+            "device_mac":mac,"bridge_id":"bridge-test","bridge_addr":"192.0.2.1","bridge_port":8765,
+            "wake_generation":status["wake_generation"],"wake_seq":status["wake_seq"]});
+        let send=|body:&Value|json_body(&request(sim.address(),"POST","/sim/ble/command",Some(ENDPOINT),body.to_string().as_bytes()).1);
+        assert_eq!(send(&open)["error"],"purpose");
+        open["reason"]=serde_json::json!("unknown");
+        assert_eq!(send(&open)["error"],"purpose");
+        open["reason"]=serde_json::json!(purpose);
+        if purpose=="data_sync" {open["data_seq"]=serde_json::json!(1);}
+        let accepted=send(&open);
+        assert_eq!(accepted["result"],"accepted","{purpose}: {accepted}");
+        let before=sim_state(&sim);
+        assert_eq!(send(&open)["result"],"accepted");
+        assert_eq!(sim_state(&sim)["power"]["sync_opened_at_ms"],before["power"]["sync_opened_at_ms"]);
+        if purpose=="bundle" {
+            let source:Value=serde_json::from_str(include_str!("../../core/tests/fixtures/codex-status-a-400x300.json")).unwrap();
+            let compiled=bridge_core::compile::compile(&source,"epd-ssd2683-400x300-1bpp").unwrap();
+            let mut bundle=serde_json::json!({"bridge_id":"bridge-test","job_id":"purpose-bundle",
+                "firmware_target":"wrong-target","render_target":"epd-ssd2683-400x300-1bpp","compiler_abi":2,
+                "profile":{"template_ids":["codex-status-a"],"initial_active_id":"codex-status-a"},
+                "templates":[{"key":{"template_id":"codex-status-a","render_target":"epd-ssd2683-400x300-1bpp"},
+                    "source":source,"compiled":compiled}],"resources":[],"bindings":[]});
+            let install=|bytes:&[u8],seconds|http(bridge_core::device_client::install_bundle(
+                &sim.address().to_string(),ENDPOINT,mac,"bridge-test",bytes,4096,Duration::from_secs(seconds)));
+            assert_eq!(install(&bridge_core::template::canonical_bytes(&bundle),3).unwrap()["result"],"rejected");
+            assert_eq!(sim_state(&sim)["power"]["sync_open"],true,"rejected commit is not completion");
+            bundle["firmware_target"]=serde_json::json!("zectrix-note4-400x300");
+            let bytes=bridge_core::template::canonical_bytes(&bundle);
+            assert_eq!(request(sim.address(),"POST","/sim/fault",Some(CONTROL),
+                br#"{"stall_ack_after":"bundle_commit"}"#).0,200);
+            assert!(install(&bytes,1).is_err());
+            let committed=sim_state(&sim);
+            assert_eq!(committed["bundle"]["job_id"],"purpose-bundle");
+            assert_eq!(committed["power"]["sync_open"],false,"durable commit ends window even if ACK is lost");
+            assert_eq!(committed["power"]["safety_deadline_ms"],before["power"]["safety_deadline_ms"]);
+            assert_eq!(install(&bytes,10).unwrap()["result"],"applied");
+            assert_eq!(sim_state(&sim)["bundle"]["commit_seq"],committed["bundle"]["commit_seq"]);
+        }
+        if purpose=="wifi_setup" {
+            let status=authenticated_status(&sim);
+            let ack=|seq| if ble_ack {send(&serde_json::json!({"op":"wifi_result_ack","token":ENDPOINT,
+                "bridge_id":"bridge-test","device_mac":mac,"request_id":format!("purpose-ack-{seq}"),
+                "query_id":"purpose-save","request_seq":seq}))} else {
+                wifi_activate_repro_command(&sim,&status,"result_ack",
+                    serde_json::json!({"query_id":"purpose-save","request_seq":seq})).unwrap()
+            };
+            assert_eq!(ack(1)["outcome"],"unknown");
+            assert_eq!(sim_state(&sim)["power"]["sync_open"],true,"unknown receipt is not completion");
+            let saved=wifi_activate_repro_command(&sim,&status,"apply",serde_json::json!({
+                "request_id":"purpose-save","request_seq":1,"expected_revision":0,
+                "changes":[{"network_id":"purpose","host_ssid":"Host","ssid":"Device","credential":"open"}]})).unwrap();
+            assert_eq!(saved["outcome"],"committed");
+            assert_eq!(ack(2)["error"],"request_conflict");
+            assert_eq!(sim_state(&sim)["power"]["sync_open"],true);
+            assert_eq!(ack(1)["outcome"],"retired");
+            assert_eq!(sim_state(&sim)["power"]["sync_open"],false);
+            assert_eq!(sim_state(&sim)["power"]["safety_deadline_ms"],before["power"]["safety_deadline_ms"]);
+        }
+
+        assert_eq!(set_time(&sim,Some(CONTROL),&serde_json::json!({"op":"step","delta_ms":90000})).0,200);
+        assert_eq!(sim_state(&sim)["power"]["sync_open"],false);
+        assert_eq!(send(&open)["error"],"window_closed");
     }
 }
