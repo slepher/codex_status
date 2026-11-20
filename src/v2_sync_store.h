@@ -28,6 +28,6 @@ bool syncStoreChangeOwner();
 bool syncStoreAdvanceSerial(uint64_t &serial);
 bool syncStoreFreeze(const uint8_t *bytes, size_t length, const SyncStoreBatch &batch);
 bool syncStorePage(uint32_t offset, uint16_t limit, uint8_t *out, size_t &read);
-bool syncStoreAck(uint32_t offset, const uint8_t prefixSha256[32]);
+bool syncStoreAck(uint32_t offset);
 bool syncStoreComplete(const SyncStoreBatch &expected);
 uint32_t syncStoreAckedOffset();

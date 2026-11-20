@@ -58,6 +58,32 @@ uint16_t compactOperation(const char *name) {
     return 0;
 }
 
+uint16_t compactAck(String &payload, uint16_t operation, int httpStatus) {
+    LocalJsonAllocator allocator;
+    JsonDocument doc(&allocator);
+    if (deserializeJson(doc, payload) || !doc.is<JsonObject>()) {
+        payload = "{\"error\":\"reply_encoding\",\"stage\":\"response\",\"query\":\"original_business_id\"}";
+        return 3;
+    }
+    const char *value = doc["result"] | "";
+    const uint16_t result = !strcmp(value, "unknown") ? 3 :
+        !strcmp(value, "rejected") || httpStatus >= 400 || doc["ok"] == false ? 2 :
+        !strcmp(value, "accepted") ? 1 : 0;
+    static const char *const outcomes[] = {"applied", "accepted", "rejected", "unknown"};
+    const char *name = compactOperationName(operation);
+    const bool omitOp = name && !strcmp(doc["op"] | "", name);
+    const bool omitResult = !strcmp(value, outcomes[result]);
+    if (omitOp || omitResult) {
+        if (omitOp) doc.remove("op");
+        if (omitResult) doc.remove("result");
+        String compact;
+        size_t expected = measureJson(doc);
+        if (serializeJson(doc, compact) == expected && compact.length() == expected)
+            payload = std::move(compact);
+    }
+    return result;
+}
+
 const char *v2ParseCommand(const String &body, JsonDocument &doc) {
     return deserializeJson(doc, body) ? "json" : nullptr;
 }

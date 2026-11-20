@@ -23,6 +23,8 @@ bool compactFrameDecode(const uint8_t *frame, size_t length, CompactFrameHeader 
 uint16_t compactOperation(const char *name);
 const char *compactOperationName(uint16_t op);
 
+uint16_t compactAck(String &payload, uint16_t operation, int httpStatus);
+
 const char *v2ParseCommand(const String &body, JsonDocument &doc);
 
 // Constructed only after carrier token/session/replay/context admission.

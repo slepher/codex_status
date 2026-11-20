@@ -292,9 +292,12 @@ Ap01HttpReply Ap01Application::businessHttpOwned(const Ap01HttpRequest &request,
             dispatch(payload, principal, op, now, reply);
         }
     }
-    if (!reply.bytes.length() || reply.bytes.length() > (isIdempotentReadOp(op) ? 4048u : 464u)) error(reply, 503, "reply_limit", "response", true);
     CompactFrameHeader response = frame; response.kind = 1;
-    response.result = reply.status < 400 ? 0 : reply.status == 503 ? 3 : 2;
+    response.result = compactAck(reply.bytes, op, reply.status);
+    if (!reply.bytes.length() || reply.bytes.length() > (isIdempotentReadOp(op) ? 4048u : 464u)) {
+        error(reply, 503, "reply_limit", "response", true);
+        response.result = compactAck(reply.bytes, op, reply.status);
+    }
     response.payloadLen = reply.bytes.length(); memcpy(response.session, s->id, 16);
     uint8_t header[48];
     if (!compactFrameEncode(response, header)) { error(reply, 503, "encode", "frame", true); return reply; }

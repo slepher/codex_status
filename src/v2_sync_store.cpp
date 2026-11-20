@@ -145,9 +145,6 @@ bool syncStoreFreeze(const uint8_t *bytes, size_t length, const SyncStoreBatch &
         batch.bytes != length || batch.deviceSerial != state.syncSerial ||
         batch.clientSerial <= state.highestClientSerial ||
         !batch.batchId[0] || !batch.owner[0]) return false;
-    uint8_t digest[32];
-    syncSha256(bytes, length, digest);
-    if (memcmp(digest, batch.sha256, 32)) return false;
     // Other users of LittleFS leave 40 KiB available; this path may spend it.
     if (LittleFS.totalBytes() < RESERVE ||
         LittleFS.totalBytes() - LittleFS.usedBytes() < length + 4096) return false;
@@ -183,26 +180,12 @@ bool syncStorePage(uint32_t offset, uint16_t limit, uint8_t *out, size_t &read) 
     return ok;
 }
 
-bool syncStoreAck(uint32_t offset, const uint8_t prefixSha256[32]) {
-    if (!mounted || lost || !state.active || offset > state.current.bytes || !prefixSha256)
-        return false;
-    uint8_t *contents = (uint8_t *)malloc(offset ? offset : 1);
-    if (!contents) return false;
-    File f = LittleFS.open(BLOB[state.blob], "r");
-    bool ok = f && f.read(contents, offset) == offset;
-    if (f) f.close();
-    if (ok) {
-        uint8_t digest[32];
-        syncSha256(contents, offset, digest);
-        ok = !memcmp(digest, prefixSha256, 32);
-    }
-    free(contents);
-    if (ok && offset > state.ackedOffset) {
-        Meta next = state;
-        next.ackedOffset = offset;
-        ok = writeMeta(next);
-    }
-    return ok;
+bool syncStoreAck(uint32_t offset) {
+    if (!mounted || lost || !state.active || offset > state.current.bytes) return false;
+    if (offset <= state.ackedOffset) return true;
+    Meta next = state;
+    next.ackedOffset = offset;
+    return writeMeta(next);
 }
 
 bool syncStoreComplete(const SyncStoreBatch &expected) {

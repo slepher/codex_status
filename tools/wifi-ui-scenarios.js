@@ -45,7 +45,7 @@ window.__wifiUiScenario = async function(scenario) {
     network_id:'home',state:'bridge_changed',writable:true,bridge:network,device:[own],
     fields:[{field:'ssid',bridge:'Home-2G',device:'Old-2G',conflict:false}]}];
   wifiSelections.clear(); wifiPreview = null;
-  $('wifi-target').textContent = 'Note4 · ' + mac;
+  $('wifi-target').textContent = scenario==='wifi-family-ap01'?mac:'Note4 · ' + mac;
   wifiRenderOnline({observed_at:Date.now()/1000,presence:{mode:'continuous',remaining_ms:null,reasons:['usb']},transports:{http:{ready:true},ble:{ready:false}},wifi_control:{write_allowed:true}});
   check($('wifi-online').textContent.includes('USB 常驻在线') && $('wifi-online').textContent.includes('BLE 关闭'),'Missing independent transport availability');
   $('wifi-auto').textContent = scenario==='empty'?'活动网络未知 · 自动选网使用已确认映射':'活动网络 Home-2G · 自动选网使用已确认映射';
@@ -330,6 +330,8 @@ window.__wifiUiScenario = async function(scenario) {
     const familyBounds=$('wifi-family-library').getBoundingClientRect();
     for(const control of $('wifi-family-library').querySelectorAll('input,select,button')){if(!control.getClientRects().length)continue;const r=control.getBoundingClientRect();check(r.left>=familyBounds.left-1&&r.right<=familyBounds.right+1,'Family control exceeds library: '+control.id);}
     if(wifiManualSelection) {
+      wifiRenderOnline({observed_at:Math.floor(Date.now()/1000),presence:null});
+      check($('wifi-online').textContent.startsWith('HTTP 已认证 · '),'AP01 authenticated contact missing');
       check(!$('wifi-ap01-auth').hidden&&$('wifi-note-recovery').hidden&&$('wifi-current-action').hidden,'AP01 automatic network controls exposed');
       check(!$('wifi-networks').innerHTML.includes('wifiSelect('),'AP01 must select network on device');
     } else {

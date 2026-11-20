@@ -409,12 +409,13 @@ fn request(address:SocketAddr, method:&str, path:&str, token:Option<&str>, body:
 }
 
 fn json_body(body: &[u8]) -> Value {
-    let body=if body.first()==Some(&bridge_core::compact_frame::MARKER) {
-        bridge_core::compact_frame::Header::decode(body,8192).expect("frame response").1
-    } else {body};
-    let value: Value = serde_json::from_slice(body).expect("JSON response");
-    if value.get("ble_wire").is_some() { bridge_ble::decode_wire(body).expect("BLE wire response") }
-    else { value }
+    let frame = (body.first() == Some(&bridge_core::compact_frame::MARKER))
+        .then(|| bridge_core::compact_frame::Header::decode(body,8192).expect("frame response"));
+    let payload = frame.map_or(body, |(_, payload)| payload);
+    let mut value: Value = serde_json::from_slice(payload).expect("JSON response");
+    if value.get("ble_wire").is_some() { value = bridge_ble::decode_wire(payload).expect("BLE wire response"); }
+    if let Some((header, _)) = frame { header.restore_ack(&mut value); }
+    value
 }
 
 #[test]
@@ -475,6 +476,85 @@ fn fixed_frame_http_rejects_malformed_identity_and_retired_requests() {
 }
 
 #[test]
+fn wire_size_short_receipts_preserve_transaction_and_outcome() {
+    use bridge_core::compact_frame::{Header, HEADER_LEN};
+    for (code, result, http_status) in [(0, "applied", 200), (1, "accepted", 200),
+                                        (2, "rejected", 409), (3, "unknown", 503)] {
+        let mut ack = serde_json::json!({"op":"data","result":result,"data_seq":17,"request_id":"original-17"});
+        if code == 2 { ack["error"]="request_conflict".into(); ack["stage"]="admission".into(); }
+        if code == 3 { ack["error"]="reply_limit".into(); ack["query"]="original_business_id".into(); }
+        let original = serde_json::to_vec(&ack).unwrap();
+        let (actual, payload) = bridge_render::simulator_compact_ack(2, http_status, &original).unwrap();
+        assert_eq!(actual, code);
+        let header = Header {kind:1, op:2, result:actual, payload_len:payload.len() as u16,
+            session:[1;16], request_no:44, context:[0;16]};
+        let mut frame = header.encode().unwrap().to_vec();
+        frame.extend_from_slice(&payload);
+        let (header, payload) = Header::decode(&frame, 512).unwrap();
+        let mut body: Value = serde_json::from_slice(payload).unwrap();
+        assert!(body.get("op").is_none() && body.get("result").is_none());
+        header.restore_ack(&mut body);
+        assert_eq!(body, ack);
+        println!("ACK {result}: {} -> {} B", HEADER_LEN + original.len(), frame.len());
+        assert!(frame.len() < HEADER_LEN + original.len());
+    }
+    let ack = br#"{"op":"sync_complete","result":"already_complete","receipt":"original-batch"}"#;
+    let (code, payload) = bridge_render::simulator_compact_ack(9, 200, ack).unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(json_body(&payload)["result"], "already_complete");
+}
+
+#[test]
+fn wire_size_sync_pages_measured_from_frozen_batch() {
+    use bridge_core::compact_frame::HEADER_LEN;
+    let dir = temp_data_dir();
+    fs::create_dir(&dir).unwrap();
+    let mut device = bridge_render::SimulatorSync::new(&dir, "02:00:00:00:00:42",
+        "note4", 1, 1, "boot").unwrap();
+    device.set_owner("bridge-test", true).unwrap();
+    for i in 0..24 { device.append_text("[sync] wire sample", i).unwrap(); }
+    let snapshot = serde_json::json!({"label":"温度🌡","escaped":"a\"b"});
+    let begin = device.command("sync_begin", r#"{"bridge_id":"bridge-test","client_serial":"1","reasons":["periodic"]}"#, &snapshot).unwrap();
+    let id = begin["batch_id"].as_str().unwrap();
+    let page = |dev: &mut bridge_render::SimulatorSync, offset, limit| {
+        let request = serde_json::json!({"bridge_id":"bridge-test","request_id":"read-original",
+            "batch_id":id,"offset":offset,"limit":limit});
+        let mut page = dev.command("sync_page", &request.to_string(), &snapshot).unwrap();
+        assert_eq!(page.as_object_mut().unwrap().remove("http_status").unwrap(), 200);
+        page["boot_id"] = "0123456789abcdef0123456789abcdef".into();
+        page
+    };
+    let mut frozen = Vec::new();
+    let (mut old_size, mut new_size, mut pages) = (0, 0, 0);
+    while frozen.len() < begin["bytes"].as_u64().unwrap() as usize {
+        let response = page(&mut device, frozen.len(), 1024);
+        assert!(response.get("data_b64").is_none());
+        assert_eq!(response, page(&mut device, frozen.len(), 1024));
+        let chunk = bridge_core::device_client::sync_page_bytes(&response).unwrap();
+        assert!(!chunk.is_empty());
+        assert!(response.get("chunk_sha256").is_none());
+        let (_, wire) = bridge_render::simulator_compact_ack(7, 200, &serde_json::to_vec(&response).unwrap()).unwrap();
+        new_size += HEADER_LEN + wire.len();
+        let mut old = response;
+        old.as_object_mut().unwrap().remove("chunk");
+        old["chunk_sha256"] = format!("{:x}", Sha256::digest(&chunk)).into();
+        old["data_b64"] = base64::engine::general_purpose::STANDARD.encode(&chunk).into();
+        old_size += HEADER_LEN + serde_json::to_vec(&old).unwrap().len();
+        pages += 1;
+        frozen.extend(chunk);
+    }
+    assert_eq!(begin["sha256"],format!("{:x}",Sha256::digest(&frozen)));
+    let unicode = frozen.windows("🌡".len()).position(|v| v == "🌡".as_bytes()).unwrap();
+    for i in unicode..unicode + 4 {
+        assert_eq!(bridge_core::device_client::sync_page_bytes(&page(&mut device, i, 1)).unwrap(), [frozen[i]]);
+    }
+    assert!(pages > 1 && new_size < old_size);
+    println!("sync pages={pages}, frozen={} B, frames={old_size} -> {new_size} B", frozen.len());
+    drop(device);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn sync_v1_s04_note4_shared_protocol_replay_and_digest_conflict() {
     let sim = Simulator::start("02:00:00:00:00:B2",
         &["--target", "zectrix-note4-400x300"]);
@@ -514,20 +594,16 @@ fn sync_v1_s04_note4_shared_protocol_replay_and_digest_conflict() {
             serde_json::json!({"batch_id":id,"offset":bytes.len(),"limit":256}));
         let replay = call!("page", &page_id,
             serde_json::json!({"batch_id":id,"offset":bytes.len(),"limit":256}));
-        assert_eq!(replay["data_b64"], page["data_b64"]);
-        let chunk = base64::engine::general_purpose::STANDARD.decode(
-            page["data_b64"].as_str().unwrap()).unwrap();
+        assert_eq!(replay["chunk"], page["chunk"]);
+        let chunk = bridge_core::device_client::sync_page_bytes(&page).unwrap();
         assert!(!chunk.is_empty());
         bytes.extend_from_slice(&chunk);
-        let prefix = format!("{:x}", Sha256::digest(&bytes));
         let ack_id = format!("ack-{}", bytes.len());
         let ack = call!("ack", &ack_id,
-            serde_json::json!({"batch_id":id,"offset":bytes.len(),
-                "prefix_sha256":prefix}));
+            serde_json::json!({"batch_id":id,"offset":bytes.len()}));
         assert_eq!(ack["acked_offset"], bytes.len());
         let ack_replay = call!("ack", &ack_id,
-            serde_json::json!({"batch_id":id,"offset":bytes.len(),
-                "prefix_sha256":prefix}));
+            serde_json::json!({"batch_id":id,"offset":bytes.len()}));
         assert_eq!(ack_replay["acked_offset"], bytes.len());
     }
     let hash = format!("{:x}", Sha256::digest(&bytes));
@@ -593,10 +669,9 @@ fn sync_v1_s01_note4_fifteenth_deep_round_requires_explicit_open() {
     while content.len() < begin["bytes"].as_u64().unwrap() as usize {
         let page = call("page", "baseline-page", serde_json::json!({
             "batch_id":id,"offset":content.len(),"limit":1024}));
-        content.extend(base64::engine::general_purpose::STANDARD
-            .decode(page["data_b64"].as_str().unwrap()).unwrap());
+        content.extend(bridge_core::device_client::sync_page_bytes(&page).unwrap());
         call("ack", "baseline-ack", serde_json::json!({"batch_id":id,
-            "offset":content.len(),"prefix_sha256":format!("{:x}", Sha256::digest(&content))}));
+            "offset":content.len()}));
     }
     call("complete", "baseline-complete", serde_json::json!({"batch_id":id,
         "bytes":content.len(),"sha256":begin["sha256"]}));
@@ -658,10 +733,9 @@ fn sync_v1_s01_note4_fifteenth_deep_round_requires_explicit_open() {
     while content.len() < next["bytes"].as_u64().unwrap() as usize {
         let page = call2("page", "round15-page", serde_json::json!({
             "batch_id":batch,"offset":content.len(),"limit":1024}));
-        content.extend(base64::engine::general_purpose::STANDARD
-            .decode(page["data_b64"].as_str().unwrap()).unwrap());
+        content.extend(bridge_core::device_client::sync_page_bytes(&page).unwrap());
         call2("ack", "round15-ack", serde_json::json!({"batch_id":batch,
-            "offset":content.len(),"prefix_sha256":format!("{:x}", Sha256::digest(&content))}));
+            "offset":content.len()}));
     }
     call2("complete", "round15-complete", serde_json::json!({"batch_id":batch,
         "bytes":content.len(),"sha256":next["sha256"]}));
@@ -740,10 +814,8 @@ fn note4_sync_roundtrip(sim: &Simulator, serial: u64, reasons: &[&str]) -> Value
     while content.len() < begin["bytes"].as_u64().unwrap() as usize {
         let page = call("page", serde_json::json!({"batch_id":id,
             "offset":content.len(),"limit":1024}));
-        content.extend(base64::engine::general_purpose::STANDARD
-            .decode(page["data_b64"].as_str().unwrap()).unwrap());
-        call("ack", serde_json::json!({"batch_id":id,"offset":content.len(),
-            "prefix_sha256":format!("{:x}", Sha256::digest(&content))}));
+        content.extend(bridge_core::device_client::sync_page_bytes(&page).unwrap());
+        call("ack", serde_json::json!({"batch_id":id,"offset":content.len()}));
     }
     assert_eq!(format!("{:x}", Sha256::digest(&content)), begin["sha256"]);
     let frozen: Value = serde_json::from_slice(&content).unwrap();
@@ -975,10 +1047,8 @@ fn sync_v1_s03_note4_frozen_pages_survive_light_deadline() {
     while content.len() < frozen_size {
         let page = call("page", serde_json::json!({"batch_id":id,
             "offset":content.len(),"limit":64}));
-        content.extend(base64::engine::general_purpose::STANDARD
-            .decode(page["data_b64"].as_str().unwrap()).unwrap());
-        call("ack", serde_json::json!({"batch_id":id,"offset":content.len(),
-            "prefix_sha256":format!("{:x}", Sha256::digest(&content))}));
+        content.extend(bridge_core::device_client::sync_page_bytes(&page).unwrap());
+        call("ack", serde_json::json!({"batch_id":id,"offset":content.len()}));
         pages += 1;
         if pages == 1 {
             for i in 0..20 {
@@ -1113,12 +1183,11 @@ fn sync_v1_s07_note4_hard_restart_resumes_frozen_batch() {
         "02:00:00:00:00:BA", "bridge-test", state["boot_id"].as_str().unwrap(),
         "page", "s07-page", &serde_json::json!({"batch_id":batch_id,
             "offset":0,"limit":64}), Duration::from_secs(3))).unwrap();
-    let mut content = base64::engine::general_purpose::STANDARD
-        .decode(page["data_b64"].as_str().unwrap()).unwrap();
+    let mut content = bridge_core::device_client::sync_page_bytes(&page).unwrap();
     let ack = http(bridge_core::device_client::sync(&sim.address().to_string(), ENDPOINT,
         "02:00:00:00:00:BA", "bridge-test", state["boot_id"].as_str().unwrap(),
         "ack", "s07-ack", &serde_json::json!({"batch_id":batch_id,
-            "offset":content.len(),"prefix_sha256":format!("{:x}", Sha256::digest(&content))}),
+            "offset":content.len()}),
         Duration::from_secs(3))).unwrap();
     assert_eq!(ack["acked_offset"], content.len());
     let data_dir = sim.data_dir.clone();
@@ -1137,12 +1206,10 @@ fn sync_v1_s07_note4_hard_restart_resumes_frozen_batch() {
             "02:00:00:00:00:BA", "bridge-test", nonce, "page", "s07-resume-page",
             &serde_json::json!({"batch_id":batch_id,"offset":content.len(),"limit":1024}),
             Duration::from_secs(3))).unwrap();
-        content.extend(base64::engine::general_purpose::STANDARD
-            .decode(page["data_b64"].as_str().unwrap()).unwrap());
+        content.extend(bridge_core::device_client::sync_page_bytes(&page).unwrap());
         http(bridge_core::device_client::sync(&restarted.address().to_string(), ENDPOINT,
             "02:00:00:00:00:BA", "bridge-test", nonce, "ack", "s07-resume-ack",
-            &serde_json::json!({"batch_id":batch_id,"offset":content.len(),
-                "prefix_sha256":format!("{:x}", Sha256::digest(&content))}),
+            &serde_json::json!({"batch_id":batch_id,"offset":content.len()}),
             Duration::from_secs(3))).unwrap();
     }
     assert_eq!(format!("{:x}", Sha256::digest(&content)), first["sha256"]);
@@ -1196,15 +1263,13 @@ fn sync_v1_s07_note4_crash_before_blob_reference_keeps_previous_metadata() {
         recovered["boot_id"].as_str().unwrap(), "page", "s07-retry-page",
         &serde_json::json!({"batch_id":batch_id,"offset":0,"limit":64}),
         Duration::from_secs(3))).unwrap();
-    let prefix = base64::engine::general_purpose::STANDARD
-        .decode(page["data_b64"].as_str().unwrap()).unwrap();
+    let prefix = bridge_core::device_client::sync_page_bytes(&page).unwrap();
     assert_eq!(request(restarted.address(), "POST", "/sim/storage", Some(CONTROL),
         br#"{"crash_after_sync":"sync_meta","count":2}"#).0, 200);
     assert!(http(bridge_core::device_client::sync(&restarted.address().to_string(), ENDPOINT,
         "02:00:00:00:00:BB", "bridge-test",
         recovered["boot_id"].as_str().unwrap(), "ack", "s07-crash-ack",
-        &serde_json::json!({"batch_id":batch_id,"offset":prefix.len(),
-            "prefix_sha256":format!("{:x}", Sha256::digest(&prefix))}),
+        &serde_json::json!({"batch_id":batch_id,"offset":prefix.len()}),
         Duration::from_secs(3))).is_err());
     let data_dir = restarted.data_dir.clone();
     restarted.stop_preserving_data();
@@ -2793,7 +2858,7 @@ fn plan_checks_json_session_owner_and_token_order_without_advancing_state() {
     assert_eq!(
         body,
         serde_json::json!({
-            "result":"rejected", "error":"occupied",
+            "op":"plan", "result":"rejected", "error":"occupied",
             "owner": {"id":"held-owner", "name":"", "host":"", "port":0,
                 "since_s":0, "last_seen_s":0, "lease_s":300, "expires_in_s":300}
         })
@@ -2963,18 +3028,18 @@ fn claim_uses_shared_decision_and_enforces_token_owner_actions() {
     assert_eq!(empty_release.0, 200);
     assert_eq!(
         empty_release.1,
-        serde_json::json!({"owner":null,"released":false})
+        serde_json::json!({"op":"claim","result":"applied","owner":null,"released":false})
     );
     assert_eq!(
         claim(&sim, "id=%20%20%20", Some(DEVICE)),
-        (400, serde_json::json!({"error":"args"}))
+        (400, serde_json::json!({"op":"claim","result":"rejected","error":"args"}))
     );
 
     let (code, unauthorized) = claim(&sim, "id=owner-a", None);
     assert_eq!(code, 401);
     assert_eq!(
         unauthorized,
-        serde_json::json!({"error":"unauthorized","owner":null})
+        serde_json::json!({"op":"claim","result":"rejected","error":"unauthorized","owner":null})
     );
     let (code, unauthorized) = claim(&sim, "id=owner-a", Some(ENDPOINT));
     assert_eq!(code, 401);
@@ -3049,7 +3114,7 @@ fn claim_uses_shared_decision_and_enforces_token_owner_actions() {
     assert_eq!(forced["owner"]["id"], "other");
     let (code, released) = claim(&sim, "id=other&release=1", Some(DEVICE));
     assert_eq!(code, 200);
-    assert_eq!(released, serde_json::json!({"owner":null,"released":true}));
+    assert_eq!(released, serde_json::json!({"op":"claim","result":"applied","owner":null,"released":true}));
     assert_eq!(sim_state(&sim)["owner"], Value::Null);
 }
 

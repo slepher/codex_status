@@ -328,6 +328,10 @@ HTTP快速就绪判断可读认证compact；需要sync窗口/data_contract的最
 
 ## P1 最终传输格式（2026-11-06，源码候选）
 
+C2 短回执使用帧头的数字操作与通用结果码。正文省略与头完全相同的 `op` 和 `result`，Bridge 校验帧身份后还原应用层字段。`already_complete` 等专用结果、业务 request_id、错误码、失败阶段和原事务查询信息继续随正文传送。
+
+sync-v1 冻结批次仍为原始 JSON 字节，二进制记录仅在 `records_b64` 编码一次。op7 页正文的 `chunk` 通常是 UTF-8 字符串，每页上限 1024 原文 B；若任意偏移或极小 limit 落在码点中间，返回最多 3 个原始字节的整数数组。offset 与 next_offset 按原始字节计量。ACK 确认已落盘偏移；页和前缀不另传摘要。完成前对重组文件核对唯一的整批 SHA-256；不符时保留原 batch_id，回到偏移 0，下一次联系重读。既有冻结批次、落盘前缀、已归档文件及完成回执沿用原身份。
+
 HTTP Status 与 Wi-Fi 快照均使用 UTF-8 `chunk` 原文，不再使用 Hex。HTTP 原文上限3600B，BLE原文上限320B；按JSON转义后的总帧预算缩小切片，offset/next_offset始终为原始UTF-8字节偏移。HTTP Status维持不可变快照、token绑定及15秒期限；BLE摘要保留snapshot校验。实际每页长度由元数据和转义决定，不能假定固定倍数。
 
 BLE紧凑字段rid/pid/f/ctx及s/c数组中的标识字符串直接使用UTF-8，取消Base64包装；长度按原始字节校验，控制字符拒绝。紧凑布局和48B信封不变，二进制诊断数据Base64不变。Bridge与设备须同步更新，不提供旧编码回退。

@@ -975,7 +975,10 @@ fn identity_text(identity: Option<WakeIdentity>) -> (String, String) {
 // their bounded reader; capability v1 is explicit and cannot masquerade as it.
 pub fn decode_wire(raw: &[u8]) -> Result<serde_json::Value> {
     if raw.is_empty() || raw.len() > 512 { bail!("invalid BLE attribute length"); }
-    let mut value: serde_json::Value = serde_json::from_slice(raw)?;
+    expand_wire(serde_json::from_slice(raw)?)
+}
+
+fn expand_wire(mut value: serde_json::Value) -> Result<serde_json::Value> {
     let Some(version) = value.get("ble_wire") else { return Ok(value); };
     if version != 1 { bail!("unsupported BLE wire version"); }
     if let Some(contact) = value.get("ac").cloned() {
@@ -1698,16 +1701,32 @@ impl DeviceConnection {
                     // Bound polling on both a real radio and the Fake transport.
                     continue;
                 }
+                if reply_header.result == 3 {
+                    if let Ok(mut reply) = serde_json::from_slice::<serde_json::Value>(reply_payload) {
+                        if reply["query"] == "original_business_id" && reply["error"].is_string()
+                            && reply["request_id"].as_str().is_none_or(|original| original == id) {
+                            reply_header.restore_ack(&mut reply);
+                            return Ok(reply);
+                        }
+                    }
+                }
                 if reply_header.result == 2 {
-                    if let Ok(reply) = serde_json::from_slice::<serde_json::Value>(reply_payload) {
+                    if let Ok(mut reply) = serde_json::from_slice::<serde_json::Value>(reply_payload) {
+                        reply_header.restore_ack(&mut reply);
                         if reply["stage"].as_str().is_some_and(|s| matches!(s, "gatt_write" | "reassembly" | "queue")) {
                             return Ok(reply);
                         }
                     }
                 }
-                let Ok(reply) = decode_wire(reply_payload) else {
+                let Ok(body) = serde_json::from_slice::<serde_json::Value>(reply_payload) else {
                     continue;
                 };
+                let body_op = body.get("op").is_some();
+                let body_result = body.get("result").is_some();
+                let Ok(mut reply) = expand_wire(body) else {
+                    continue;
+                };
+                reply_header.restore_ack(&mut reply);
                 if reply["ack"] == if op.starts_with("wifi_") { "wifi" } else { "command" } && reply["request_id"] == id {
                     let ack_identity = wake_identity(&reply);
                     let mac_matches = reply["device_mac"].as_str().map_or(!op.starts_with("wifi_"), |mac|
@@ -1751,6 +1770,8 @@ impl DeviceConnection {
                         op,
                         request_id = %id,
                         result = reply["result"].as_str().unwrap_or("acknowledged"),
+                        frame_bytes = raw.len(), header_result = reply_header.result,
+                        body_op, body_result,
                         wake_generation = %wake_generation,
                         wake_seq = %wake_seq,
                         wake_association = if ack_identity.is_some() { "confirmed" } else { "incomplete" },

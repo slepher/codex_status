@@ -69,6 +69,11 @@ pub fn candidate_paths(explicit: Option<&Path>) -> Vec<PathBuf> {
         }
         out.push(PathBuf::from("/opt/homebrew/bin/codex"));
         out.push(PathBuf::from("/usr/local/bin/codex"));
+        let bundled_cli = "ChatGPT.app/Contents/Resources/codex-cli/bin/codex";
+        out.push(Path::new("/Applications").join(bundled_cli));
+        if let Some(home) = std::env::var_os("HOME") {
+            out.push(PathBuf::from(home).join("Applications").join(bundled_cli));
+        }
     }
     #[cfg(windows)]
     out.push(PathBuf::from("codex.exe"));
@@ -89,16 +94,16 @@ fn version_matches(exe: &Path) -> bool {
     }
     let output = cmd.output();
     match output {
-        Ok(out) => {
+        Ok(out) if out.status.success() => {
             let mut text = String::from_utf8_lossy(&out.stdout).to_string();
             text.push_str(&String::from_utf8_lossy(&out.stderr));
             text.contains(CLI_MARKER)
         }
-        Err(_) => false,
+        _ => false,
     }
 }
 
-/// Pick the first candidate whose `--version` reports `codex-cli`.
+/// Pick the first candidate whose `--version` succeeds and reports `codex-cli`.
 pub fn locate_codex(explicit: Option<&Path>) -> Result<PathBuf> {
     for cand in candidate_paths(explicit) {
         if cand.is_absolute() && !cand.exists() {
@@ -108,7 +113,7 @@ pub fn locate_codex(explicit: Option<&Path>) -> Result<PathBuf> {
             return Ok(cand);
         }
     }
-    bail!("codex CLI not found (need `--version` to contain `{CLI_MARKER}`)")
+    bail!("codex CLI not found (need `--version` to succeed and report `{CLI_MARKER}`)")
 }
 
 type Pending = Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;

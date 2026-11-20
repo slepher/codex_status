@@ -570,6 +570,7 @@ extern "C" {
     fn codex_rgn_on_partial() -> c_int;
     fn codex_rgn_on_full() -> c_int;
     fn codex_rgn_dump(out: *mut c_char, out_len: c_int) -> c_int;
+    fn codex_compact_ack(op: u16, status: c_int, json: *const c_char, result: *mut u16, out: *mut c_char, cap: c_int) -> c_int;
     fn codex_ble_wire(kind: *const c_char, input: *const c_char, out: *mut c_char, cap: c_int) -> c_int;
     fn codex_compact_operation(name: *const c_char) -> c_int;
     fn codex_compact_frame_golden(out: *mut u8, cap: c_int) -> c_int;
@@ -887,6 +888,17 @@ pub fn simulator_compact_frame_golden() -> anyhow::Result<[u8; 50]> {
     let rc = unsafe { codex_compact_frame_golden(out.as_mut_ptr(), out.len() as c_int) };
     anyhow::ensure!(rc == 50, "firmware compact frame vector failed");
     Ok(out)
+}
+
+pub fn simulator_compact_ack(op: u16, status: u16, payload: &[u8]) -> anyhow::Result<(u16, Vec<u8>)> {
+    let json = CString::new(payload)?;
+    let mut out = vec![0u8; payload.len() + 1];
+    let mut result = 0;
+    let len = unsafe { codex_compact_ack(op, status.into(), json.as_ptr(), &mut result,
+        out.as_mut_ptr().cast(), out.len().try_into()?) };
+    anyhow::ensure!(len > 0, "compact ACK encoding failed");
+    out.truncate(len as usize);
+    Ok((result, out))
 }
 
 /// Build a BLE attribute using the SAME firmware encoder. Return its exact

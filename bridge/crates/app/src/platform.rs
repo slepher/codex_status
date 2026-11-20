@@ -4226,7 +4226,6 @@ pub(crate) mod ble_close_lock_tests {
             "offset":offset,"next_offset":end,"total":f.snapshot.len(),"complete":end==f.snapshot.len(),"chunk":&f.snapshot[offset..end]}))
     }
     async fn full_sync(State(f): State<Arc<FullHttp>>, uri: axum::http::Uri, Json(body): Json<Value>) -> impl IntoResponse {
-        use base64::Engine;
         use sha2::{Digest, Sha256};
         let hash=format!("{:x}", Sha256::digest(&f.diagnostic));
         let mut reply=json!({"result":"applied","device_mac":HUNG_MAC,"batch_id":"1-audit","bytes":f.diagnostic.len(),"sha256":hash,
@@ -4235,8 +4234,7 @@ pub(crate) mod ble_close_lock_tests {
         match uri.path() {
             "/api/sync/page" => {
                 reply["offset"]=body["offset"].clone();reply["next_offset"]=json!(f.diagnostic.len());
-                reply["data_b64"]=json!(base64::engine::general_purpose::STANDARD.encode(&f.diagnostic));
-                reply["chunk_sha256"]=json!(hash);
+                reply["chunk"]=json!(std::str::from_utf8(&f.diagnostic).unwrap());
             },
             "/api/sync/ack" => { reply["acked_offset"]=body["offset"].clone(); },
             "/api/sync/complete" => {

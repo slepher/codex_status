@@ -29,6 +29,7 @@ pub const AP01_WIDTH: i64 = 320;
 pub const AP01_HEIGHT: i64 = 240;
 pub const MAX_TEMPLATE_BYTES: usize = 32768;
 /// Versioned Plan activation envelope shared by firmware and Bridge.
+/// Its business ACK is projected from the C2 response header by compact_frame.
 pub const PLAN_ACTIVATION_VERSION: u8 = 1;
 
 pub fn validate_plan_activation(network: &Value) -> Result<()> {

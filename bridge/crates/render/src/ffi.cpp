@@ -286,7 +286,7 @@ int codex_sync_store_check() {
     size_t got = 0;
     if (!syncStorePage(0, 1024, page, got) || got != batch.bytes ||
         memcmp(page, bytes, got)) return 5;
-    if (!syncStoreAck(batch.bytes, batch.sha256) || syncStoreAckedOffset() != batch.bytes)
+    if (!syncStoreAck(batch.bytes) || syncStoreAckedOffset() != batch.bytes)
         return 6;
     if (!syncStoreComplete(batch) || !syncStoreBegin() ||
         syncStoreActive(loaded) || !syncStoreReceipt(loaded) ||
@@ -1469,6 +1469,12 @@ int codex_v2_build_ack(const char *op, const char *result, const char *display,
     if (body.length() >= (size_t)cap) return -3;
     memcpy(out, body.c_str(), body.length() + 1);
     return (int)body.length();
+}
+// Run the same receipt projection as both firmware targets.
+int codex_compact_ack(uint16_t op, int status, const char *json, uint16_t *result, char *out, int cap) {
+    String payload(json);
+    *result = compactAck(payload, op, status);
+    return simCopy(payload, out, cap);
 }
 // Returns production ArduinoJson wire bytes directly, never a Rust re-encoding.
 int codex_ble_wire(const char *kind, const char *input, char *out, int cap) {

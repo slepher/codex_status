@@ -32,6 +32,19 @@ pub struct Header {
 }
 
 impl Header {
+    /// Project frame metadata into the existing application response schema.
+    pub fn restore_ack(&self, value: &mut serde_json::Value) {
+        if let Some(object) = value.as_object_mut() {
+            if let Some(op) = operation_name(self.op) {
+                object.entry("op").or_insert_with(|| op.into());
+            }
+            let outcomes = ["applied", "accepted", "rejected", "unknown"];
+            if let Some(&result) = outcomes.get(self.result as usize) {
+                object.entry("result").or_insert_with(|| result.into());
+            }
+        }
+    }
+
     fn valid(&self) -> Result<(), &'static str> {
         let transport_error = self.kind == 1 && self.result == 2 && self.op == 0 && self.request_no == 0;
         if !transport_error && (self.kind > 2 || self.op == 0 || self.op > MAX_OP || matches!(self.op,24|25) || self.result > 3

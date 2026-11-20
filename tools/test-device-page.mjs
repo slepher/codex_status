@@ -449,9 +449,10 @@ console.log('AP01 template family is selectable in the same configuration menu')
 select(macA);
 let sharedWifiLibrary={revision:9,families:[{id:'home',name:'Home-5',ssid_2g:'Home-2',ssid_5g:'Home-5',password_2g:'fixture-password',password_5g:'fixture-password'}],devices:{[macA]:['home'],[macB]:[]},wired_family:'home'};
 let manualWifi=false;
+let manualWifiOnline=null;
 const familyTarget={network_id:'home',host_ssid:'Home-5',ssid:'Home-2',credential:'keep',password:'fixture-password',origin:'local',version:2};
 handlers.platform_wifi=({op,body})=>{
-  if(op==='view')return {library:sharedWifiLibrary,manual_selection:manualWifi,host:{state:'connected',family_name:'Home-5',networks:[{ssid:'Home-2'}]},
+  if(op==='view')return {library:sharedWifiLibrary,manual_selection:manualWifi,online:manualWifiOnline,host:{state:'connected',family_name:'Home-5',networks:[{ssid:'Home-2'}]},
     wifi:{local_revision:4,targets:[familyTarget],jobs:[],snapshot:{schema:2,complete:true,snapshot_id:'family-snapshot',revision:2,capacity:{total:12},networks:[{bond:'own',writable:true,network:familyTarget}]}},differences:[],automatic_state:manualWifi?'manual_selection':'connected',matched_target:familyTarget};
   if(op==='library_save'){sharedWifiLibrary={...sharedWifiLibrary,families:body.families,revision:sharedWifiLibrary.revision+1};return sharedWifiLibrary;}
   return {state:'completed'};
@@ -483,12 +484,18 @@ element('wifi-wired-family').value='';run('wifiWiredDirty=true;wifiFamilySelecti
 context.document.querySelectorAll=selector=>selector==='[data-wifi-family]:checked'?[{dataset:{wifiFamily:'home'}}]:[];await run('wifiRefreshView()');
 assert.equal(element('wifi-wired-family').value,'');assert.match(element('wifi-family-list').innerHTML,/checked/);context.document.querySelectorAll=()=>[];
 manualWifi=true;run('wifiFamilySelectionDirty=false;wifiWiredDirty=false');await run('wifiRefreshView()');
+assert.equal(element('wifi-online').textContent,'等待认证在线状态');
+manualWifiOnline={presence:null,observed_at:run('Date.now()/1000')};await run('wifiRefreshView()');
+assert.match(element('wifi-online').textContent,/^HTTP 已认证 · /);
+run('countdownNow+=31000;wifiRenderOnline()');
+assert.match(element('wifi-online').textContent,/^在线状态待确认 · 最近认证 /);
 assert.equal(element('wifi-ap01-auth').hidden,false);assert.equal(element('wifi-current-action').hidden,true);
 assert.equal(element('wifi-note-recovery').hidden,true);assert(!element('wifi-networks').innerHTML.includes('wifiSelect('));
 element('wifi-ap01-code').value='01234567';await run('wifiReadScheme()');assert.equal(element('wifi-ap01-code').value,'');
 const ap01Read=calls.filter(c=>c.name==='platform_wifi'&&c.args.op==='get').at(-1);assert.equal(ap01Read.args.body.device_code,'');
 assert.equal(run("wifiManualNetworkGuard(['home'])"),null);
 select(macB);assert.equal(element('wifi-ap01-auth').hidden,true);assert.equal(element('wifi-ap01-code').value,'');assert.equal(run('wifiFamilySelectionDirty'),false);
+assert.equal(element('wifi-online').textContent,'等待认证在线状态');
 console.log('Wi-Fi families: shared edits, independent selections, family-name wire key, wired draft, cached import, password cleanup and AP01 manual selection OK');
 
 // Shared editor is the only edit path, including current host shortcuts.

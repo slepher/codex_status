@@ -116,3 +116,12 @@ HTTP health204、MCP44工具、library_select可见；生产MCP读取Wi-Fi族sch
 旧分页及后续Wi-Fi请求的预算进一步取调用预算、设备RF截止和共享命令deadline的最小值，避免只有Bridge预算时仍越过真实通信窗口。新增截止时间/已过期预算测试，连同单帧控制摘要、未知ACK共享deadline、完成回执退休共4项定向回归通过；构建通过。日志：`artifacts/wifi-families/commit-rf-budget-{tests,build}.log`。
 
 最终Windows Bridge为39039488 B，SHA256 `0b8b843414d97904fb21dac3f341bfc269edcc147d42e759e6e4039fd4899a47`，20:24部署，旧exe及308文件data逐文件备份核对通过，health204/MCP44；证据`artifacts/wifi-families/workspace-deployment-20261027-202355/verification.json`。此补充仅宿主Rust，双板.107 ROM及其hash保持上述实机证明，无重新OTA。本次提交纳入修复、统一版本规则和双板部署记录，不纳入私有日志/data/ROM/ELF；前述“未提交”是对应时点的历史状态。
+## AP01 Wi-Fi 在线徽标调查（2026-11-18）
+
+macOS Bridge 实际运行包与交接卡 SHA256 一致。同一 AP01 的完整网络快照于 15:29:16 读取，共 3 条。15:31:12 的认证 HTTP 状态已缓存，`presence` 缺失。八位码维护接口读取成功后只缓存网络快照。Wi-Fi 徽标依赖业务状态的 `presence`，而 AP01 的状态实现没有此字段，导致持续显示「等待认证在线状态」。本次只核对源码和运行数据。
+
+### 在线徽标修正计划（2026-11-18）
+
+用 AP01 已有认证 HTTP 状态的时间戳显示最近联系，沿用 30 秒过期规则。任务：覆盖无样本、近期、过期及切换设备，运行 Node 和原生窄宽回归，审阅截图，再部署到原托管实例并核对健康及 AP01 认证状态。
+
+状态与复核：已部署。Node 回归和原生 WKWebView 82 场景通过，已审阅 `artifacts/bridge-macos/wifi-ui/{560,1000}-wifi-family-ap01.png`。UI 测试使用合成 IPC。原 LaunchAgent supervisor 65303，Bridge 65311，health HTTP 204，MCP 8766 监听；15:35:55 同 MAC 的认证 HTTP 状态已缓存，原完整快照仍有 3 条。旧包保留在 `artifacts/bridge-macos/ap01-badge-20261118/Previous Codex Status Bridge.app`。构建包含工作区原有的 Codex CLI 查找改动；未刷固件。

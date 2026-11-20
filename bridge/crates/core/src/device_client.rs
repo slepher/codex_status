@@ -300,17 +300,27 @@ async fn request_with_operation(
         session.identity = None;
         session.context = [0; 16];
     }
+    let Ok(mut value) = serde_json::from_slice::<Value>(bytes) else {
+        // The operation-specific decoder classifies malformed payloads (e.g. snapshot_shape).
+        return Ok((status, std::str::from_utf8(bytes).context("device frame payload UTF-8")?.to_owned()));
+    };
     if status == 200 && ack.result == 0 {
-        if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
-            if op == 1 && value["device_mac"].is_string() { session.identity = Some(json!({"device_mac":value["device_mac"], "boot_id":value["boot_id"]})); }
-            if let Some(ctx) = value["active_context_id"].as_str() {
-                if ctx.len() == 16 && ctx.bytes().all(|b| b.is_ascii_hexdigit()) {
-                    session.context.copy_from_slice(ctx.as_bytes());
-                }
+        if op == 1 && value["device_mac"].is_string() {
+            session.identity = Some(json!({"device_mac":value["device_mac"], "boot_id":value["boot_id"]}));
+        }
+        if let Some(ctx) = value["active_context_id"].as_str() {
+            if ctx.len() == 16 && ctx.bytes().all(|b| b.is_ascii_hexdigit()) {
+                session.context.copy_from_slice(ctx.as_bytes());
             }
         }
     }
-    Ok((status, std::str::from_utf8(bytes).context("device frame payload UTF-8")?.to_owned()))
+    if op != 1 {
+        tracing::info!(op, header_result = ack.result, frame_bytes = response.len(),
+            body_op = value.get("op").is_some(), body_result = value.get("result").is_some(),
+            "HTTP frame acknowledged");
+    }
+    ack.restore_ack(&mut value);
+    Ok((status, serde_json::to_string(&value)?))
     }.await;
     result.map_err(|error: anyhow::Error| {
         if error.chain().any(|cause| cause.downcast_ref::<HttpStatus>().is_some()) { return error; }
@@ -461,18 +471,18 @@ async fn post_json_with_operation(ip: &str, path: &str, token: &str, body: &Valu
         error_category,
         "device HTTP result"
     );
-    if status == 409 {
+    if status >= 400 {
         let parsed: Value = serde_json::from_str(&response_body).unwrap_or(Value::Null);
         // A protocol conflict is not necessarily an ownership conflict. Keep
         // the device's rejection (including its identity and failure stage)
         // so callers can handle stale revisions without discarding edits.
-        if (parsed["result"] == "rejected" || parsed["ok"] == false)
+        if (parsed["result"] == "unknown" || (status == 409 && (parsed["result"] == "rejected" || parsed["ok"] == false)))
             && parsed["error"].as_str().is_some_and(|code|
                 !code.is_empty() && code.len() <= 64 && code.bytes().all(|b|b.is_ascii_alphanumeric() || b == b'_'))
         {
             return Ok(parsed);
         }
-        return Ok(json!({"result": "rejected", "error": "occupied", "detail": parsed}));
+        if status == 409 { return Ok(json!({"result": "rejected", "error": "occupied", "detail": parsed})); }
     }
     if !(200..300).contains(&status) { return Err(HttpStatus(status).into()); }
     let parsed: Value = serde_json::from_str(&response_body).context("device_json_shape")?;
@@ -640,6 +650,18 @@ pub async fn ota_image(ip: &str, token: &str, mac: &str, image_bytes: usize, tim
     if reported_mac != expected_mac { bail!("OTA image MAC mismatch"); }
     image["device_mac"] = json!(reported_mac);
     Ok(image)
+}
+
+/// Decode bytes from the frozen JSON without wrapping the entire page in Base64.
+pub fn sync_page_bytes(page: &Value) -> Result<Vec<u8>> {
+    if let Some(text) = page["chunk"].as_str() {
+        anyhow::ensure!(text.len() <= 1024, "sync page length");
+        return Ok(text.as_bytes().to_vec());
+    }
+    let partial = page["chunk"].as_array().context("sync page chunk missing")?;
+    anyhow::ensure!((1..=3).contains(&partial.len()), "invalid UTF-8 page fragment");
+    partial.iter().map(|v| v.as_u64().and_then(|n| u8::try_from(n).ok())
+        .context("invalid sync fragment byte")).collect()
 }
 
 /// sync-v1 keeps the device's precise error code (notably claim_required,
@@ -1083,7 +1105,7 @@ mod tests {
 
         assert_eq!(
             serve_once(200, r#"{"result":"applied","data_seq":1}"#).await,
-            r#"{"data_seq":1,"result":"applied"}"#
+            r#"{"data_seq":1,"op":"data","result":"applied"}"#
         );
         let failed = serve_once(503, r#"{"secret":"response-secret"}"#).await;
         assert!(failed.contains("HTTP 503"));

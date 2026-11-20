@@ -278,13 +278,12 @@ bool compactSessionFromHex(const String &text, uint8_t out[16]) {
 static void v2BleNotify(JsonDocument &doc) {
     String reply = bleBuildReply(doc, state.v2RequestId, diagnostics::retained.rtcWakeGeneration, diagnostics::retained.rtcTraceCurrentSeq);
     if (v2BleFrameActive) {
+        const uint16_t result = reply.length() ? compactAck(reply, v2BleFrame.op, 200) : 3;
         const bool limited = !reply.length() || reply.length() > 512 - COMPACT_FRAME_HEADER;
         if (limited) {
             JsonDocument limit;
             limit["ack"] = doc["ack"] | "command";
-            limit["op"] = doc["op"] | "command";
             limit["request_id"] = state.v2RequestId;
-            limit["result"] = "unknown";
             limit["error"] = "reply_limit";
             limit["stage"] = "frame";
             limit["query"] = "original_business_id";
@@ -293,10 +292,7 @@ static void v2BleNotify(JsonDocument &doc) {
         }
         CompactFrameHeader response = v2BleFrame;
         response.kind = 1;
-        const char *result = doc["result"] | "";
-        response.result = limited ? 3 : !strcmp(result, "accepted") ? 1 :
-            !strcmp(result, "unknown") ? 3 :
-            !strcmp(result, "rejected") || doc["ok"] == false ? 2 : 0;
+        response.result = limited ? 3 : result;
         response.payloadLen = reply.length();
         compactSessionFromHex(v2Nonce(), response.session);
         uint8_t header[COMPACT_FRAME_HEADER];
@@ -326,6 +322,7 @@ void v2Response(int status, const String &body) {
     if (!state.v2ReplyOverBle) {
         if (!state.v2HttpFrameActive) { state.server.send(status, "application/json", body); return; }
         String payload = body;
+        uint16_t resultCode = compactAck(payload, state.v2HttpFrame.op, status);
         if (state.v2HttpFrame.op == 6 && payload.length() > 512 - COMPACT_FRAME_HEADER) {
             // These diagnostics remain in the frozen batch and status. The
             // BEGIN receipt needs only identity, batch ID, length/hash and offset.
@@ -338,7 +335,7 @@ void v2Response(int status, const String &body) {
         if (!isIdempotentReadOp(state.v2HttpFrame.op) && payload.length() > 512 - COMPACT_FRAME_HEADER) {
             // Never replay a fabricated success after executing a mutation.
             payload = "{\"result\":\"unknown\",\"error\":\"reply_limit\",\"stage\":\"reply\",\"query\":\"original_business_id\"}";
-            if (status >= 400) {
+            if (resultCode == 2) {
                 JsonDocument original, compact;
                 deserializeJson(original, body);
                 String error = original["error"] | "reply_limit";
@@ -348,20 +345,17 @@ void v2Response(int status, const String &body) {
                 compact["action"] = "read_device_status";
                 payload = ""; serializeJson(compact, payload);
             }
+            resultCode = compactAck(payload, state.v2HttpFrame.op, status);
         }
         if (payload.length() > 4096 - COMPACT_FRAME_HEADER) {
             payload = "{\"result\":\"unknown\",\"error\":\"reply_limit\",\"stage\":\"frame\",\"query\":\"original_business_id\"}";
+            resultCode = compactAck(payload, state.v2HttpFrame.op, status);
         }
         CompactFrameHeader response = state.v2HttpFrame;
         response.kind = 1;
         response.payloadLen = payload.length();
         memcpy(response.session, v2HttpSession, 16);
-        JsonDocument result;
-        deserializeJson(result, payload);
-        const char *value = result["result"] | "";
-        response.result = !strcmp(value, "accepted") ? 1 :
-            !strcmp(value, "unknown") ? 3 :
-            status >= 400 || !strcmp(value, "rejected") || result["ok"] == false ? 2 : 0;
+        response.result = resultCode;
         uint8_t header[COMPACT_FRAME_HEADER];
         if (!compactFrameEncode(response, header)) {
             state.server.send(500, "application/json", "{\"error\":\"frame_encode\"}"); return;

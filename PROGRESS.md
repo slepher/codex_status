@@ -1,8 +1,12 @@
 # Codex Status 当前交接
 
-更新时间：2026-11-06，Asia/Shanghai。
+更新时间：2026-11-18，Asia/Shanghai。
 
 ## 工作区与部署
+
+- 11-18 A9/B6 已配套部署。macOS Bridge health 204；Note4 `ota_1` 运行 `artifacts/protocol-wire-20261118/note4-wire-0.18.110.bin`，1864944 B，认证 SHA256 `d7bdf5e224935d1d02c9f47d5c1d7fdbe1581a39631b8c93ec3d3752c5f1752c`（原 OTA 三次未确认，随后独立核验）；AP01 实际 0055 基座槽 1，独立 App .110/集合 4 healthy。Wi-Fi/BLE 短回执、Note4 两页诊断及原事务查询实机通过。[版本、帧大小、丢回执与备份](project-workflow/bridge-device-protocol-remediation/wire-size-20261118.md)
+
+- 11-18 15:36 macOS Bridge 已托管重启，AP01 Wi-Fi 徽标按认证 HTTP 采样显示，30 秒后提示待确认。运行包 81810400 B，SHA256 `18c966c7a709dbc82554713c250105a3ce6bbe01299406c7e37c4a5936e1014b`；health204，重启后同 MAC 认证 HTTP 通过，原 3 条配置快照保留。Node/WK 82 场景及窄宽截图通过。B6，未提交。[验证与回滚包位置](project-workflow/wifi-families/status.md#在线徽标修正计划2026-11-18)
 
 - Pull合并：本地6f61814（2个独有提交）、远端9a55586（26个独有提交）及本地未提交修复已合并，随本次合并提交登记；未推送、未部署。[验证与备份](project-workflow/pull-merge-20261105/status.md)。以下为最后已记录证据，当前运行未重新核验。
 - Windows Bridge：`bridge/target/debug/bridge-app.exe`，39285248 B，SHA256 `f94cc00011708a925028d830ba53cd4be1280130bb21a6d624623381064d1e62`。10/31 03:28部署重复claim/同Plan HTTP抑制修复，PID48712，health204；347文件data备份校验、3设备配置及4凭据文件保留。[修复/部署](project-workflow/power-plan-c/communication-fix-status.md)。

@@ -75,7 +75,7 @@ bool freeze(const SyncProtocolInput &input, uint8_t requested,
         for (uint16_t i = offset; i < next; ++i)
             raw.push_back(input.rtc.bytes[(tail + i) % 4096]);
     }
-    std::vector<char> encoded(5465);
+    std::vector<char> encoded(4 * ((raw.size() + 2) / 3) + 1);
     if (raw.size() && !syncBase64(raw.data(), raw.size(), encoded.data(), encoded.size()))
         return false;
     if (raw.empty()) encoded[0] = 0;
@@ -212,30 +212,43 @@ SyncProtocolResult syncProtocolRun(const SyncProtocolInput &input,
             uint16_t limit = request["limit"] | 1024;
             if (!limit || limit > 1024 || offset > batch.bytes)
                 return answer(response, "rejected", "range", 400);
-            std::vector<uint8_t> bytes(1024);
+            std::vector<uint8_t> bytes(limit);
             size_t length = 0;
             if (!syncStorePage(offset, limit, bytes.data(), length))
                 return answer(response, "rejected", "storage", 503);
-            std::vector<char> encoded(1369);
-            char hash[65]; uint8_t digest[32];
-            syncBase64(bytes.data(), length, encoded.data(), encoded.size());
-            syncSha256(bytes.data(), length, digest); syncHex(digest, 32, hash);
+            // Frozen batches are UTF-8 JSON. Keep offsets byte-based, including
+            // old checkpoints or callers requesting a single byte inside a scalar.
+            size_t text = 0;
+            while (text < length) {
+                const uint8_t c = bytes[text];
+                const size_t width = c < 0x80 ? 1 : c < 0xc0 ? 0 : c < 0xe0 ? 2 : c < 0xf0 ? 3 : 4;
+                if (!width || width > length - text) break;
+                text += width;
+            }
+            if (text || !length) {
+                length = text;
+                response["chunk"] = std::string(reinterpret_cast<const char *>(bytes.data()), length);
+            } else {
+                // At most three bytes up to the next scalar boundary.
+                size_t fragment = 1;
+                while (fragment < length && (bytes[fragment] & 0xc0) == 0x80) ++fragment;
+                length = fragment;
+                auto partial = response["chunk"].to<JsonArray>();
+                for (size_t i = 0; i < length; ++i) partial.add(bytes[i]);
+            }
+            if (response.overflowed()) return answer(response, "rejected", "allocation", 503);
             response["batch_id"] = std::string(batch.batchId);
             response["offset"] = offset;
             response["next_offset"] = offset + length;
-            response["data_b64"] = encoded.data();
-            response["chunk_sha256"] = hash;
             response["more"] = offset + length < batch.bytes;
             return answer(response, "applied");
         }
         if (!strcmp(operation, "sync_ack")) {
-            uint8_t hash[32];
-            if (!request["offset"].is<uint32_t>() ||
-                !parseHash(request["prefix_sha256"] | "", hash))
+            if (!request["offset"].is<uint32_t>())
                 return answer(response, "rejected", "shape", 400);
             uint32_t offset = request["offset"].as<uint32_t>();
-            if (!syncStoreAck(offset, hash))
-                return answer(response, "rejected", "digest_mismatch", 409);
+            if (offset > batch.bytes) return answer(response, "rejected", "range", 400);
+            if (!syncStoreAck(offset)) return answer(response, "rejected", "storage", 503);
             response["batch_id"] = std::string(batch.batchId);
             response["acked_offset"] = syncStoreAckedOffset();
             return answer(response, "applied");

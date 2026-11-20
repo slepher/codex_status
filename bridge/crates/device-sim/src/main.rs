@@ -2898,17 +2898,15 @@ fn ble_frame_session(state: &SimState) -> [u8; 16] {
 fn ble_frame_reply(state: &SimState, request: Header, op: &str, ack: &Value,
                    original: &[u8], now: u64) -> Result<()> {
     let wire_kind = if op == "status" && ack["result"] == "applied" { "status" } else { "reply" };
-    let mut payload = bridge_render::simulator_ble_wire(wire_kind, ack)?;
+    let original_ack = bridge_render::simulator_ble_wire(wire_kind, ack)?;
+    let (mut result, mut payload) = bridge_render::simulator_compact_ack(request.op, 200, &original_ack)?;
     if payload.len() > 512 - HEADER_LEN {
-        payload = serde_json::to_vec(&json!({"ack":"command","op":op,
-            "request_id":ack["request_id"],"result":"unknown","error":"reply_limit",
+        result = 3;
+        payload = serde_json::to_vec(&json!({"ack":"command",
+            "request_id":ack["request_id"],"error":"reply_limit",
             "stage":"frame","query":"original_business_id"}))?;
     }
     ensure!(payload.len() <= 512 - HEADER_LEN, "BLE reply limit");
-    let result = match ack["result"].as_str() {
-        Some("accepted") => 1, Some("rejected") => 2, Some("unknown") => 3,
-        _ if ack["ok"] == false => 2, _ => 0,
-    };
     let header = Header { kind: 1, op: request.op, result,
         payload_len: payload.len().try_into()?, session: ble_frame_session(state),
         request_no: request.request_no, context: request.context };
@@ -3311,9 +3309,12 @@ async fn claim(State(state): State<SimState>, request: Request<Body>) -> Respons
 
 fn framed_http_response(status: StatusCode, header: Header, session: [u8; 16],
                         result: u16, payload: &[u8]) -> Response {
+    let Ok((_, payload)) = bridge_render::simulator_compact_ack(header.op, status.as_u16(), payload) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
     let mut reply = Header {kind:1,op:header.op,result,payload_len:payload.len() as u16,
         session,request_no:header.request_no,context:header.context}.encode().unwrap().to_vec();
-    reply.extend_from_slice(payload);
+    reply.extend_from_slice(&payload);
     (status, [(header::CONTENT_TYPE, bridge_core::compact_frame::CONTENT_TYPE)], reply).into_response()
 }
 
@@ -3411,12 +3412,6 @@ where F: FnOnce(State<SimState>, Request<Body>) -> Fut,
     let Ok(bytes) = to_bytes(response.into_body(), BODY_LIMIT).await else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
-    let result = serde_json::from_slice::<Value>(&bytes).ok().map(|value| {
-        match value["result"].as_str() {
-            Some("accepted") => 1, Some("rejected") => 2, Some("unknown") => 3,
-            _ if value["ok"] == false || !status.is_success() => 2, _ => 0,
-        }
-    }).unwrap_or(if status.is_success() {0} else {2});
     let page=if op==1 && bytes.len()+HEADER_LEN>4096 {
         let pages=match bridge_render::SimulatorStatusPages::new(){Ok(p)=>p,Err(_)=>return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
         session.status_pages=Some(pages);
@@ -3424,7 +3419,9 @@ where F: FnOnce(State<SimState>, Request<Body>) -> Fut,
         let reply=session.status_pages.as_mut().unwrap().page(Some(std::str::from_utf8(&bytes).unwrap()),&token,&id,0,device_uptime_ms(&state,clock_snapshot(&state).unwrap())).unwrap();
         Some(serde_json::to_vec(&reply).unwrap())
     }else{None};
-    let mut bytes = bytes.to_vec();
+    let Ok((result, mut bytes)) = bridge_render::simulator_compact_ack(frame.op, status.as_u16(), &bytes) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
     if frame.op == 6 && bytes.len()+HEADER_LEN>512 {
         if let Ok(mut value) = serde_json::from_slice::<Value>(&bytes) {
             if let Some(object) = value.as_object_mut() {
@@ -3435,10 +3432,9 @@ where F: FnOnce(State<SimState>, Request<Body>) -> Fut,
     }
     let write_limit = !bridge_core::compact_frame::is_idempotent_read_op(frame.op) && bytes.len()+HEADER_LEN>512;
     let payload = if write_limit {
-        serde_json::to_vec(&json!({"result":if status.is_success(){"unknown"}else{"rejected"},
-            "error":"reply_limit","stage":"reply","query":"original_business_id"})).unwrap()
+        serde_json::to_vec(&json!({"error":"reply_limit","stage":"reply","query":"original_business_id"})).unwrap()
     } else if let Some(page)=page.as_ref() {page.clone()} else if bytes.len() + HEADER_LEN <= 4096 { bytes.to_vec() } else {
-        br#"{"result":"unknown","error":"reply_limit","stage":"frame","query":"original_business_id"}"#.to_vec()
+        br#"{"error":"reply_limit","stage":"frame","query":"original_business_id"}"#.to_vec()
     };
     let result = if write_limit {if status.is_success(){3}else{2}} else if page.is_some(){0}else if bytes.len() + HEADER_LEN > 4096 {3} else {result};
     let mut reply = Header {kind:1,op:frame.op,result,payload_len:payload.len() as u16,

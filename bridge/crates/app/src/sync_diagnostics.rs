@@ -26,7 +26,6 @@ struct Checkpoint {
     bytes: usize,
     sha256: String,
     durable_offset: usize,
-    prefix_sha256: String,
     phase: String,
     #[serde(default)]
     completed_at: Option<u64>,
@@ -167,7 +166,7 @@ fn validate_diag(body: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
-fn diag_fingerprints(body: &Value) -> Result<Vec<(String, u64, String)>> {
+fn diag_records(body: &Value) -> Result<Vec<(String, u64, Vec<u8>)>> {
     let generation = body["diag"]["generation"].as_str()
         .context("diagnostic generation missing")?.to_owned();
     let encoded = body["diag"]["records_b64"].as_str()
@@ -182,14 +181,14 @@ fn diag_fingerprints(body: &Value) -> Result<Vec<(String, u64, String)>> {
             bail!("invalid diagnostic record length");
         }
         let seq = u64::from_le_bytes(bytes[offset+4..offset+12].try_into().unwrap());
-        result.push((generation.clone(), seq, digest(&bytes[offset..offset+length])));
+        result.push((generation.clone(), seq, bytes[offset..offset+length].to_vec()));
         offset += length;
     }
     Ok(result)
 }
 
 fn check_existing_records(root: &Path, body: &Value) -> Result<()> {
-    let fresh = diag_fingerprints(body)?;
+    let fresh = diag_records(body)?;
     if fresh.is_empty() { return Ok(()); }
     for entry in fs::read_dir(root)? {
         let entry = entry?;
@@ -199,10 +198,10 @@ fn check_existing_records(root: &Path, body: &Value) -> Result<()> {
             !entry.file_type()?.is_file() { continue; }
         let old: Value = serde_json::from_slice(&fs::read(entry.path())?)?;
         validate_diag(&old).context("archived diagnostic batch corrupt")?;
-        let prior = diag_fingerprints(&old)?;
-        for (generation, seq, hash) in &fresh {
-            if let Some((_, _, old_hash)) = prior.iter().find(|(g, s, _)| g == generation && s == seq) {
-                if old_hash != hash { bail!("protocol_conflict: same diagnostic key has different bytes"); }
+        let prior = diag_records(&old)?;
+        for (generation, seq, bytes) in &fresh {
+            if let Some((_, _, old_bytes)) = prior.iter().find(|(g, s, _)| g == generation && s == seq) {
+                if old_bytes != bytes { bail!("protocol_conflict: same diagnostic key has different bytes"); }
             }
         }
     }
@@ -222,7 +221,7 @@ impl Store {
         } else {
             Checkpoint { mac: mac.into(), bridge_id: bridge_id.into(), client_serial: 0,
                 batch_id: None, bytes: 0, sha256: String::new(), durable_offset: 0,
-                prefix_sha256: digest(&[]), phase: "idle".into(), completed_at: None }
+                phase: "idle".into(), completed_at: None }
         };
         if checkpoint.mac != mac { bail!("diagnostic MAC mismatch"); }
         if checkpoint.bridge_id != bridge_id {
@@ -230,7 +229,7 @@ impl Store {
             write_checkpoint(&retired, &checkpoint)?;
             checkpoint = Checkpoint { mac: mac.into(), bridge_id: bridge_id.into(), client_serial: 0,
                 batch_id: None, bytes: 0, sha256: String::new(), durable_offset: 0,
-                prefix_sha256: digest(&[]), phase: "idle".into(), completed_at: None };
+                phase: "idle".into(), completed_at: None };
             write_checkpoint(&checkpoint_path, &checkpoint)?;
         }
         if let Some(id) = &checkpoint.batch_id {
@@ -242,21 +241,20 @@ impl Store {
                     bail!("archive_lost: committed diagnostic file missing or corrupt");
                 }
             } else if checkpoint.phase == "receiving" {
-                if !part.exists() {
-                    checkpoint.durable_offset = 0;
-                    checkpoint.prefix_sha256 = digest(&[]);
+                if final_path.exists() {
+                    if digest(&fs::read(&final_path)?) != checkpoint.sha256 { bail!("diagnostic archive conflict"); }
+                    // Rename completed before the receipt checkpoint was saved.
+                    checkpoint.phase = "awaiting_device_ack".into();
                     write_checkpoint(&checkpoint_path, &checkpoint)?;
                 } else {
-                    let file = OpenOptions::new().read(true).write(true).open(&part)?;
-                    if file.metadata()?.len() < checkpoint.durable_offset as u64 {
-                        bail!("diagnostic part shorter than checkpoint");
+                    let file = OpenOptions::new().create(true).truncate(false).write(true).open(&part)?;
+                    if checkpoint.durable_offset > checkpoint.bytes ||
+                        file.metadata()?.len() < checkpoint.durable_offset as u64 {
+                        checkpoint.durable_offset = 0;
+                        write_checkpoint(&checkpoint_path, &checkpoint)?;
                     }
                     file.set_len(checkpoint.durable_offset as u64)?;
                     file.sync_all()?;
-                    let prefix = fs::read(&part)?;
-                    if digest(&prefix) != checkpoint.prefix_sha256 {
-                        bail!("diagnostic prefix digest mismatch");
-                    }
                 }
             }
         }
@@ -316,7 +314,6 @@ impl Store {
         self.checkpoint.bytes = 0;
         self.checkpoint.sha256.clear();
         self.checkpoint.durable_offset = 0;
-        self.checkpoint.prefix_sha256 = digest(&[]);
         self.checkpoint.phase = "idle".into();
         self.checkpoint.completed_at = None;
         self.save()?;
@@ -343,12 +340,11 @@ impl Store {
         self.checkpoint.bytes = bytes;
         self.checkpoint.sha256 = sha256.into();
         self.checkpoint.durable_offset = 0;
-        self.checkpoint.prefix_sha256 = digest(&[]);
         self.checkpoint.phase = "receiving".into();
         self.save()
     }
 
-    pub fn append_page(&mut self, offset: usize, page: &[u8]) -> Result<(usize, String)> {
+    pub fn append_page(&mut self, offset: usize, page: &[u8]) -> Result<usize> {
         if self.checkpoint.phase != "receiving" || page.len() > 1024 ||
             offset > self.checkpoint.bytes || offset + page.len() > self.checkpoint.bytes {
             bail!("diagnostic page range");
@@ -368,10 +364,9 @@ impl Store {
             file.write_all(page)?;
             file.sync_all()?;
             self.checkpoint.durable_offset += page.len();
-            self.checkpoint.prefix_sha256 = digest(&fs::read(&part)?);
             self.save()?;
         }
-        Ok((self.checkpoint.durable_offset, self.checkpoint.prefix_sha256.clone()))
+        Ok(self.checkpoint.durable_offset)
     }
 
     pub fn finish(&mut self) -> Result<()> {
@@ -382,7 +377,13 @@ impl Store {
         let id = self.checkpoint.batch_id.as_deref().context("no diagnostic batch")?;
         let part = self.root.join(format!("{id}.part"));
         let bytes = fs::read(&part)?;
-        if digest(&bytes) != self.checkpoint.sha256 { bail!("diagnostic whole-file digest mismatch"); }
+        if digest(&bytes) != self.checkpoint.sha256 {
+            // Persist the rewind before truncation so either crash order can resume.
+            self.checkpoint.durable_offset = 0;
+            self.save()?;
+            File::create(&part)?.sync_all()?;
+            bail!("diagnostic whole-file digest mismatch; reread original batch");
+        }
         let body: serde_json::Value = serde_json::from_slice(&bytes)?;
         if body["format"] != "device-sync-1" ||
             body["device_mac"].as_str().and_then(DeviceIdentity::normalized_mac)
@@ -475,8 +476,7 @@ pub async fn transfer_with_budget(data_root: &Path, link: &DeviceLink, budget: b
     let mut last_progress = Instant::now();
     let mut failures = 0u8;
     if store.offset() > 0 {
-        let (_, prefix) = store.append_page(0, &[])?;
-        call("ack", json!({"batch_id":id,"offset":store.offset(),"prefix_sha256":prefix})).await?;
+        call("ack", json!({"batch_id":id,"offset":store.offset()})).await?;
     }
     while store.offset() < bytes {
         if last_progress.elapsed() >= Duration::from_secs(90) { bail!("sync_incomplete: 90s without durable progress"); }
@@ -490,18 +490,18 @@ pub async fn transfer_with_budget(data_root: &Path, link: &DeviceLink, budget: b
             }
         };
         if page["batch_id"] != id || page["offset"] != offset { bail!("sync page identity mismatch"); }
-        let encoded = page["data_b64"].as_str().context("sync page bytes missing")?;
-        let chunk = base64::engine::general_purpose::STANDARD.decode(encoded)?;
+        let chunk = bridge_core::device_client::sync_page_bytes(&page)?;
         if page["next_offset"] != offset + chunk.len() ||
-            page["chunk_sha256"] != digest(&chunk) || chunk.is_empty() {
-            bail!("sync page digest or range mismatch");
+            chunk.is_empty() {
+            bail!("sync page range mismatch");
         }
-        let (durable, prefix) = store.append_page(offset, &chunk)?;
+        let durable = store.append_page(offset, &chunk)?;
         last_progress = Instant::now();
         let mut ack_errors = 0;
         loop {
-            match call("ack", json!({"batch_id":id,"offset":durable,"prefix_sha256":prefix})).await {
-                Ok(reply) if reply["acked_offset"] == durable => break,
+            match call("ack", json!({"batch_id":id,"offset":durable})).await {
+                Ok(reply) if reply["batch_id"] == id && reply["acked_offset"].as_u64()
+                    .is_some_and(|high| (durable as u64..=bytes as u64).contains(&high)) => break,
                 Ok(_) => bail!("sync ACK offset mismatch"),
                 Err(error) => {
                     ack_errors += 1;
@@ -599,7 +599,16 @@ mod tests {
         fs::write(store.root.join("1-abc.part"), body).unwrap(); // part ahead of checkpoint
         let mut resumed = Store::open(dir.path(), "0200000000A1", "bridge-a").unwrap();
         assert_eq!(resumed.offset(), 20);
-        resumed.append_page(20, &body[20..]).unwrap();
+        let mut damaged = body[20..].to_vec();
+        damaged[0] ^= 1;
+        resumed.append_page(20, &damaged).unwrap();
+        assert!(resumed.finish().unwrap_err().to_string().contains("whole-file digest mismatch"));
+        let mut resumed = Store::open(dir.path(), "0200000000A1", "bridge-a").unwrap();
+        assert!(!resumed.awaiting_ack());
+        assert_eq!(resumed.batch_id(), Some("1-abc"));
+        assert_eq!(resumed.offset(), 0);
+        assert!(!resumed.root.join("1-abc.json").exists());
+        resumed.append_page(0, body).unwrap();
         resumed.finish().unwrap();
         let pending = Store::open(dir.path(), "0200000000A1", "bridge-a").unwrap();
         assert!(pending.awaiting_ack());

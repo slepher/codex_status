@@ -796,7 +796,12 @@ class NativeProvider(OriginalProvider):
                 if reply[:1]==b'{':value=json.loads(reply)
                 else:
                     if len(reply)<48 or reply[0]!=0xc2 or int.from_bytes(reply[24:32],'big')!=number:raise RuntimeError('native CompactFrame correlation')
+                    if int.from_bytes(reply[2:4], 'big') != op or reply[1] != 1:
+                        raise RuntimeError('native CompactFrame operation')
+                    result = int.from_bytes(reply[4:6], 'big')
+                    if result > 3: raise RuntimeError('native CompactFrame result')
                     session=reply[8:24];value=json.loads(reply[48:])
+                    value.setdefault('result', ('applied', 'accepted', 'rejected', 'unknown')[result])
                 if code==503 and value.get('error')=='bindings_busy' and value.get('result')=='rejected':
                     self.report['native_binding_admission_retries']=self.report.get('native_binding_admission_retries',0)+1
                     time.sleep(.05);continue # Explicit rejection before dispatch; same application transaction.

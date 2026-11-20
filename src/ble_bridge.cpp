@@ -167,7 +167,7 @@ void bleReplyTransportError(const uint8_t *prefix, size_t length, const char *co
             header = CompactFrameHeader{}; header.kind = 1; header.result = 2;
         }
     }
-    String payload = String("{\"ok\":false,\"result\":\"rejected\",\"error\":\"") + code +
+    String payload = String("{\"ok\":false,\"error\":\"") + code +
         "\",\"stage\":\"" + stage + "\",\"action\":\"retry_after_transport_recovery\"}";
     header.payloadLen = payload.length();
     uint8_t bytes[COMPACT_FRAME_HEADER];

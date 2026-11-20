@@ -1279,10 +1279,12 @@
   function wifiRenderOnline(status=wifiOnlineStatus) {
     wifiOnlineStatus=status;
     const node=$('wifi-online');if(!node)return;
-    if(!status?.presence){node.textContent='等待认证在线状态';return;}
+    const ap01HttpStatus=wifiManualSelection&&Number(status?.observed_at)>0;
+    if(!status?.presence&&!ap01HttpStatus){node.textContent='等待认证在线状态';return;}
     const age=Math.max(0,Date.now()/1000-Number(status.observed_at||0));
     const p=status.presence,t=status.transports||{},control=status.wifi_control||{};
     if(age>30){node.textContent='在线状态待确认 · 最近认证 '+eventTime(status.observed_at);return;}
+    if(!p){node.textContent='HTTP 已认证 · '+eventTime(status.observed_at);return;}
     const reasons=p.reasons||[],left=p.remaining_ms==null?null:Math.max(0,Math.floor(p.remaining_ms/1000-age));
     const why=p.mode==='continuous'&&reasons.includes('usb')?'USB 常驻在线':reasons.includes('boot')?'BOOT 在线':reasons.includes('bridge')?'Bridge 激活在线':'设备工作窗口';
     node.textContent=(left===0?'窗口已结束 / 预计休眠':why+(left==null?'':' · 剩余 '+left+' 秒'))+
