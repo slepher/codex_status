@@ -1,6 +1,7 @@
+#include "health_v3.h"
 #include "application.h"
 #ifndef AP01_FILE_APP_V3
-#include "native_services_0041.h"
+#include "native_services.h"
 #include "app_tasks_0041.h"
 #include "app_services_0041.h"
 #include "app_vfs_client_v2.h"
@@ -10,9 +11,9 @@
 #include "app_network_client_v3.h"
 #endif
 #include "http.h"
-#include "screen_port_0041.h"
+#include "screen_port.h"
 #ifndef AP01_FILE_APP_V3
-#include "native_io_0041.h"
+#include "native_io.h"
 #endif
 #include "vfs_0041.h"
 #include "ap01_template_display.h"
@@ -22,7 +23,7 @@
 #include <stddef.h>
 #include <time.h>
 #ifdef AP01_SCREEN_HOST_PROBE
-#include "test_screen_peer_0041.h"
+#include "test_screen_peer.h"
 #endif
 
 bool ap01Calendar(time_t epoch, struct tm &result);
@@ -77,18 +78,18 @@ struct Runtime {
     uint32_t renderingEpoch=1; // Captured by the business executor before each operation.
     std::atomic<uint32_t> ready{0}; // 0 initializing, 1 live, 2 root retired.
     std::atomic<uint32_t> uiHeartbeat{0};
+    CodexAppHealthV3 health;
+    void failHealth(CodexAppHealthV3::Code code){health.fail(code);ready.store(3,std::memory_order_release);}
 #ifdef AP01_FILE_APP_V3
     std::atomic<uint32_t> businessHeartbeat{0},discoveryHeartbeat{0},workersStarted{0};
-    bool workersFresh() const {
+    int32_t workerHealth() const {
         uint32_t businessBeat=businessHeartbeat.load(std::memory_order_acquire);
         uint32_t discoveryBeat=discoveryHeartbeat.load(std::memory_order_acquire);
         uint32_t now=uint32_t(nowMs());
         // Sample beats before the clock so a concurrent update cannot look like wraparound.
         // HTTP has a 5 s deadline plus the 1 s listener wait. These are
         // observation limits, not proof of bounded ROM/VFS/render execution.
-        return workersStarted.load(std::memory_order_acquire)==3&&
-            uint32_t(now-businessBeat)<=15000&&
-            uint32_t(now-discoveryBeat)<=5000;
+        return health.sample(workersStarted.load(std::memory_order_acquire),now,businessBeat,discoveryBeat);
     }
 #endif
     std::atomic<bool> stop{false};
@@ -486,7 +487,7 @@ void Runtime::key(void *e) {
 }
 
 void Runtime::serve() {
-    int fd=networkClient.listen(18081);if(fd<0){ready.store(3,std::memory_order_release);return;}
+    int fd=networkClient.listen(18081);if(fd<0){failHealth(CodexAppHealthV3::TcpListenFailed);return;}
 #ifdef AP01_FILE_APP_V3
     uint32_t starting=0;ready.compare_exchange_strong(starting,1,std::memory_order_acq_rel);
 #endif
@@ -498,7 +499,7 @@ void Runtime::serve() {
         if(!businessLock.test_and_set(std::memory_order_acquire)) {
             auto *api=ap01RuntimeApiV3();void *context=ap01RuntimeContextV3();
             if(!business.syncWritePermission(nowMs(),api->writes_allowed(context)==1))
-                ready.store(3,std::memory_order_release);
+                failHealth(CodexAppHealthV3::WriteRestoreFailed);
             businessLock.clear(std::memory_order_release);
         }
 #endif
@@ -531,9 +532,9 @@ void Runtime::serve() {
 void *Runtime::udp(void *p) {
     Runtime &r=*(Runtime *)p;
 #ifdef AP01_FILE_APP_V3
-    struct WorkerExit {Runtime &r;~WorkerExit(){r.ready.store(3,std::memory_order_release);}} exit{r};
+    struct WorkerExit {Runtime &r;~WorkerExit(){r.failHealth(CodexAppHealthV3::WorkerExited);}} exit{r};
 #endif
-    int fd=r.networkClient.listen(8767,true);if(fd<0){r.ready.store(3,std::memory_order_release);return nullptr;}
+    int fd=r.networkClient.listen(8767,true);if(fd<0){r.failHealth(CodexAppHealthV3::UdpListenFailed);return nullptr;}
     uint64_t nextReply=0;
     while(!r.stop.load(std::memory_order_acquire)) {
 #ifdef AP01_FILE_APP_V3
@@ -552,7 +553,7 @@ void *Runtime::udp(void *p) {
 void *Runtime::bootstrap(void *p) {
     Runtime &r=*(Runtime *)p;char mac[13];
 #ifdef AP01_FILE_APP_V3
-    struct WorkerExit {Runtime &r;~WorkerExit(){r.ready.store(3,std::memory_order_release);}} exit{r};
+    struct WorkerExit {Runtime &r;bool initialized=false;~WorkerExit(){r.failHealth(initialized?CodexAppHealthV3::WorkerExited:CodexAppHealthV3::InitializingFailed);}} exit{r};
 #endif
     // Resident XIP startup prepares the private root. File-App startup will
     // receive a prepared root and permission from the permanent installer.
@@ -619,6 +620,9 @@ void *Runtime::bootstrap(void *p) {
 #ifndef AP01_FILE_APP_V3
     r.business.begin(nowMs());
 #endif
+#ifdef AP01_FILE_APP_V3
+    exit.initialized=true;
+#endif
     r.serve();
     return nullptr;
 }
@@ -642,16 +646,14 @@ extern "C" __attribute__((used)) int32_t ap01_app_event_v3(void *instance,uint32
         auto &r=*(Runtime *)instance;if(r.root)return AP01_APP_V3_INVALID;
         r.root=r.window.win;r.original=r.window.stock;
         if(r.initUi())return AP01_APP_V3_OK;
-        r.root=nullptr;r.ready.store(2,std::memory_order_release);return AP01_APP_V3_FAILED;
+        r.root=nullptr;r.failHealth(CodexAppHealthV3::UiRestoreFailed);return AP01_APP_V3_FAILED;
     }
     return AP01_APP_V3_UNSUPPORTED;
 }
 extern "C" __attribute__((used)) int32_t ap01_app_health_v3(void *instance) {
     if(!instance)return AP01_APP_V3_INVALID;
     auto &r=*(Runtime *)instance;
-    if(r.ready.load(std::memory_order_acquire)==3)return AP01_APP_V3_FAILED;
-    if(r.workersStarted.load(std::memory_order_acquire)!=3)return AP01_APP_V3_PENDING;
-    if(!r.workersFresh())return AP01_APP_V3_FAILED;
+    int32_t health=r.workerHealth();if(health)return health;
     return Runtime::healthy(instance)?AP01_APP_V3_OK:AP01_APP_V3_PENDING;
 }
 #else

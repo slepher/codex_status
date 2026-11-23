@@ -1,7 +1,7 @@
 // Host-only integration of the exact native application/VFS surface. Never
 // linked into a ROM. Tests the protocol and persistence, not the recovered ABI.
 #include "http.h"
-#include "test_maintenance_app_0041.h"
+#include "test_maintenance_app.h"
 #include "local_json_allocator.h"
 #include "v2_command_envelope.h"
 #include "v2_sync.h"
