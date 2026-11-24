@@ -86,14 +86,14 @@ struct Client {
 struct MemoryStream { std::string input, output; size_t offset=0, fragment=17; };
 int streamRead(void *p, uint8_t *out, size_t n, uint64_t) { auto &s=*(MemoryStream *)p; n=std::min(n,std::min(s.fragment,s.input.size()-s.offset)); memcpy(out,s.input.data()+s.offset,n); s.offset+=n; return n; }
 int streamWrite(void *p,const uint8_t *out,size_t n,uint64_t) { auto &s=*(MemoryStream *)p; n=std::min(n,s.fragment); s.output.append((const char *)out,n); return n; }
-void http(Ap01Maintenance0041 &maintenance) {
+void http(Ap01Maintenance &maintenance) {
     struct Example {const char *request;unsigned status;};
     for (auto example : {
         Example{"GET /api/pairing/info HTTP/1.1\r\nHost: ap01\r\n\r\n",200},
         Example{"POST /api/pairing HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\n{",400},
         Example{"POST /api/pairing HTTP/1.1\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n{",400},
         Example{"POST /api/pairing HTTP/1.1\r\nContent-Length: 4097\r\n\r\n",413}}) {
-        MemoryStream s{example.request}; Ap01Stream io{&s,streamRead,streamWrite}; assert(ap01ServeMaintenanceHttp0041(maintenance,io,1,5000));
+        MemoryStream s{example.request}; Ap01Stream io{&s,streamRead,streamWrite}; assert(ap01ServeMaintenanceHttp(maintenance,io,1,5000));
         assert(s.output.rfind("HTTP/1.1 "+std::to_string(example.status)+" ",0)==0);
     }
 }
@@ -117,7 +117,7 @@ int menuCode(void *p,char out[9]) {
     if(h.codeError)return h.codeError;
     memcpy(out,h.menuCode,9); return 0;
 }
-void manualAuthTests(Ap01Maintenance0041 &maintenance,Host &host) {
+void manualAuthTests(Ap01Maintenance &maintenance,Host &host) {
     auto call=[&](const char *token,uint64_t now) {
         return maintenance.handle(req("GET","/api/diagnostic/status",token,{}),now);
     };
@@ -142,7 +142,7 @@ void manualAuthTests(Ap01Maintenance0041 &maintenance,Host &host) {
             {"Authorization: Bearer 76543210\r\nAuthorization: Bearer 76543210\r\n",401},
             {"Authorization: Bearer 7654321x\r\n",401}}) {
         MemoryStream stream{std::string("GET /api/diagnostic/status HTTP/1.1\r\n")+example.first+"\r\n"};
-        Ap01Stream io{&stream,streamRead,streamWrite};assert(ap01ServeMaintenanceHttp0041(maintenance,io,30020,35000));
+        Ap01Stream io{&stream,streamRead,streamWrite};assert(ap01ServeMaintenanceHttp(maintenance,io,30020,35000));
         assert(stream.output.rfind("HTTP/1.1 "+std::to_string(example.second)+" ",0)==0);
     }
     assert(call("76543210",30021).status==200);
@@ -162,9 +162,9 @@ int main(int argc,char **argv) {
         Ap01Business content(fs,{&host,present},1); assert(content.begin(0));
         Ap01ApplicationPort callbacks{&host,randomBytes,lock,unlock};
         Ap01Application app(fs,content,callbacks,"AABBCCDDEEFF",1); assert(app.begin()); app.businessOnline(true);
-        Ap01MaintenancePort0041 servicePort{};servicePort.context=&host;
+        Ap01MaintenancePort servicePort{};servicePort.context=&host;
         servicePort.wifiProfiles={&host,wifiCurrent,wifiLoad,wifiStore,nullptr};servicePort.deviceCode=menuCode;
-        Ap01Maintenance0041 maintenance(fs,servicePort,testMaintenanceBridge0041(app),"AABBCCDDEEFF",1);assert(maintenance.begin());
+        Ap01Maintenance maintenance(fs,servicePort,testMaintenanceBridge(app),"AABBCCDDEEFF",1);assert(maintenance.begin());
         http(maintenance);
         manualAuthTests(maintenance,host);
         const std::string pairing="{\"device_mac\":\"AABBCCDDEEFF\",\"bridge_id\":\"bridge-test\",\"name\":\"native-test\",\"display_code\":\"1234\",\"binding_token\":\"0123456789abcdef0123456789abcdef\",\"request_id\":\"pair-test\",\"boot_id\":1,\"pairing_revision\":0}";

@@ -3,7 +3,7 @@
 #include <stdint.h>
 
 // App-specific health codes; ABI common codes remain -1 through -15.
-struct CodexAppHealthV3 {
+struct CodexAppHealth {
     enum Code:int32_t {InitializingFailed=-101,WorkerExited=-102,BusinessStale=-103,
         DiscoveryStale=-104,TcpListenFailed=-105,UdpListenFailed=-106,
         WriteRestoreFailed=-107,UiRestoreFailed=-108};

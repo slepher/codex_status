@@ -1,13 +1,13 @@
 #include "application.h"
-#ifdef AP01_FILE_APP_V3
-#include "app_runtime_v3.h"
+#ifdef AP01_FILE_APP
+#include "app_runtime.h"
 #endif
 #include "local_json_allocator.h"
 #include "v2_command_envelope.h"
 #include "v2_sync.h"
 #include "platform_target.h"
 #include <new>
-#if defined(__riscv) && !defined(AP01_FILE_APP_V3)
+#if defined(__riscv) && !defined(AP01_FILE_APP)
 extern "C" const uint8_t ap01_native_manifest[256];
 #endif
 
@@ -15,8 +15,8 @@ namespace {
 constexpr const char *FRAME_TYPE = "application/vnd.codex-status.frame";
 void imageIdentity(JsonDocument &out) {
     out["fw"] = "1.0.2_0041";
-#if defined(AP01_FILE_APP_V3)
-    const auto *api=ap01RuntimeApiV3();
+#if defined(AP01_FILE_APP)
+    const auto *api=ap01RuntimeApi();
     // Keep the existing firmware identity field; report the independent App too.
     out["app_build"] = api->platform_build;
     out["app_package_digest"] = api->app_digest;

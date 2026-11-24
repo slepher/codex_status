@@ -5,11 +5,11 @@ import tempfile
 
 root=Path(__file__).resolve().parents[1]
 source=r'''
-#include "health_v3.h"
+#include "health.h"
 #include <cassert>
 #include <climits>
 int main(){
-    using H=CodexAppHealthV3;
+    using H=CodexAppHealth;
     H healthy;
     assert(healthy.sample(0,0,0,0)==1);
     assert(healthy.sample(3,15000,0,10000)==0);

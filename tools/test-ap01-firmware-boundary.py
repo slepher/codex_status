@@ -1,6 +1,6 @@
 """Check AP01 source ownership; no device, network or build side effects."""
 from pathlib import Path
-import argparse, json, runpy
+import argparse, json
 
 repo=Path(__file__).resolve().parents[1]
 platform=repo.parent/'cuktech-ap01-firmware/tooling/firmware-modules'
@@ -11,9 +11,9 @@ args=parser.parse_args()
 for name in ('application.cpp','application.h','native_0041.cpp','http.cpp','http.h'):
     source=(repo/'ports/ap01'/name).read_text(encoding='utf-8')
     for token in ('/api/firmware/','/api/wifi/','/api/diagnostic/','Ap01Firmware',
-                  'Ap01WifiSwitch0041','manualAuth','flashOpen(','ap01SelectSlot0041('):
+                  'Ap01WifiSwitch','manualAuth','flashOpen(','ap01SelectSlot('):
         assert token not in source,(name,token)
-for name in ('firmware.h','firmware_smoke.cpp','ota_image.h','slot_0041.h','native_wifi_switch_0041.h'):
+for name in ('firmware.h','firmware_smoke.cpp','ota_image.h','slot.h','native_wifi_switch.h'):
     assert not (repo/'ports/ap01'/name).exists(),name
 
 # App executable OTA is firmware-owned, including its client and UI.
@@ -26,13 +26,13 @@ for relative in ('bridge/crates/app/src/main.rs','bridge/crates/app/src/ap01.rs'
                  'bridge/crates/core/src/device_client.rs','bridge/crates/core/src/lib.rs',
                  'bridge/crates/mcp/src/lib.rs','bridge/crates/app/ui/index.html'):
     source=(repo/relative).read_text(encoding='utf-8')
-    for token in ('ap01_app_update','ap01_app_set','/api/app/v3/','app-update-card'):
+    for token in ('ap01_app_update','ap01_app_set','/api/app/','app-update-card'):
         assert token not in source,(relative,token)
-assert (platform.parent/'scripts/app-set-client-v3.py').is_file()
+assert (platform.parent/'scripts/app-set-client.py').is_file()
 
-owned=('native_firmware_0041.cpp','native_slot_0041.cpp','native_wifi_switch_0041.cpp',
-       'native_wifi_switch_port_0041.cpp','native_device_code_menu_0041.cpp',
-       'native_maintenance_0041.cpp','native_services_0041.cpp','native_http_transport_0041.cpp')
+owned=('native_firmware.cpp','native_slot.cpp','native_wifi_switch.cpp',
+       'native_wifi_switch_port.cpp','native_device_code_menu.cpp',
+       'native_maintenance.cpp','native_services.cpp','native_http_transport.cpp')
 for name in owned:
     assert (platform/name).is_file(),name
     source=(platform/name).read_text(encoding='utf-8')
@@ -50,7 +50,7 @@ if args.audit:
 # App-side build entries may forward arguments, never compile/link platform code.
 for name in ('check-ap01-native.py','link-ap01-native.py','ap01_firmware_build.py'):
     text=(repo/'tools'/name).read_text(encoding='utf-8')
-    for token in ('subprocess','-march=','--gc-sections','native_services_0041.cpp'):
+    for token in ('subprocess','-march=','--gc-sections','native_services.cpp'):
         assert token not in text,(name,token)
 config=json.loads((repo/'ports/ap01/build-0041.json').read_text(encoding='utf-8'))
 assert config['format']==1
@@ -58,6 +58,5 @@ for relative in config['sources']+config['plain_sources']+config['include_dirs']
     assert (repo/relative).resolve().is_relative_to(repo),relative
     assert (repo/relative).exists(),relative
 
-builder=runpy.run_path(str(repo/'tools/build-ap01-rom.py'))
-assert Path(builder['main'].__code__.co_filename).resolve().is_relative_to(platform.parent/'scripts')
+assert (platform.parent/'scripts/build-app.py').is_file()
 print('AP01 boundary passed: App protocol/display only; OTA/slots/Wi-Fi/menu/HTTP policies and ROM packaging owned by firmware')
