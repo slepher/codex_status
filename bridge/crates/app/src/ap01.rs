@@ -43,7 +43,10 @@ async fn http(endpoint:String,method:&str,path:String,token:String,body:Option<V
 pub async fn verify_endpoint(ctx:&AppCtx,mac:&str,endpoint:&str)->Result<Value,String> {
     let token=bridge_mcp::load_device_token_at(platform::service(ctx).data_root(),mac).ok_or("ap01_pairing_required")?;
     let endpoint=endpoint.to_owned();
-    let status=device_client::status(&endpoint,&token,Duration::from_secs(3)).await.map_err(|_|"authenticated_status_failed")?;
+    let status=device_client::status(&endpoint,&token,Duration::from_secs(3)).await.map_err(|error| {
+        let detail=crate::claim_protocol_detail(&error);
+        if detail.starts_with("maintenance_busy;"){detail}else{"authenticated_status_failed".into()}
+    })?;
     if status["device_mac"].as_str().and_then(DeviceIdentity::normalized_mac).as_deref()!=Some(mac) ||
         status["render_target"]!=bridge_core::platform::model::RENDER_TARGET_AP01 ||
         status["fw_target"]!="cuktech-ap01-0041" {return Err("authenticated_identity_mismatch".into());}
@@ -67,8 +70,22 @@ fn register(ctx:&AppCtx,mac:&str,endpoint:&str,name:&str,status:&Value)->Result<
 }
 
 pub async fn revalidate(ctx:&AppCtx,mac:&str,endpoint:&str)->Result<bool,String> {
+    refresh_status(ctx,mac,endpoint).await.map(|_|true)
+}
+
+pub async fn refresh_status(ctx:&AppCtx,mac:&str,endpoint:&str)->Result<Value,String> {
     let status=verify_endpoint(ctx,mac,endpoint).await?;
-    register(ctx,mac,endpoint,"AP01",&status)?;Ok(true)
+    register(ctx,mac,endpoint,"AP01",&status)?;
+    Ok(status)
+}
+
+pub async fn update_holds_writes(endpoint:&str,mac:&str,boot:u64,token:&str,timeout:Duration)->bool {
+    let Ok(mut address)=endpoint.parse::<std::net::SocketAddrV4>() else {return false;};
+    address.set_port(ap01::MAINTENANCE_HTTP_PORT);
+    let Ok((200,status))=device_client::pairing_request(&address.to_string(),"GET",
+        "/api/maintenance/status",token,None,timeout.min(Duration::from_secs(1))).await else {return false;};
+    status["device_mac"].as_str()==Some(mac) && status["boot_id"].as_u64()==Some(boot)
+        && status["app_runtime"]["update_hold"]==true
 }
 
 pub async fn reconnect(ctx:&AppCtx,mac:&str)->Result<bool,String> {

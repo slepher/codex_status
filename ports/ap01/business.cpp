@@ -29,6 +29,57 @@ void Ap01Business::newContext(char (&out)[BS_CTX_LEN]) {
     }
     out[32] = 0;
 }
+namespace {
+constexpr size_t maxUsage = 6144;
+constexpr size_t header = 18; // magic/version, bundle CRC, source CRC, slot, HH:MM
+constexpr char snapshotPath[] = "/usage.bin";
+constexpr char pendingPath[] = "/usage.tmp";
+void put32(uint8_t *p,uint32_t value) {
+    for(unsigned i=0;i<4;++i)p[i]=uint8_t(value>>(8*i));
+}
+uint32_t get32(const uint8_t *p) {
+    return uint32_t(p[0])|(uint32_t(p[1])<<8)|(uint32_t(p[2])<<16)|(uint32_t(p[3])<<24);
+}
+}
+bool Ap01Business::saveSnapshot() {
+    size_t n=usage.length();
+    if(!n||n>maxUsage)return false;
+    size_t total=header+n+4;
+    std::unique_ptr<uint8_t[]> record(new(std::nothrow) uint8_t[total]);
+    if(!record)return false;
+    auto *p=record.get();
+    memcpy(p,"USA1",4);put32(p+4,profile.bundleCrc);put32(p+8,compiled->sourceCrc);
+    p[12]=profile.initial;
+    memcpy(p+13,syncTime.length()==5?syncTime.c_str():"--:--",5);
+    memcpy(p+header,usage.c_str(),n);
+    put32(p+header+n,v2Crc32(p,header+n));
+    File file=fs.open(pendingPath,"w");
+    if(!file||file.write(p,total)!=total)return false;
+    file.close();
+    file=fs.open(pendingPath,"r");
+    if(!file||file.size()!=total)return false;
+    uint8_t block[128];
+    for(size_t at=0;at<total;){
+        size_t len=total-at;if(len>sizeof(block))len=sizeof(block);
+        if(file.read(block,len)!=len||memcmp(block,p+at,len))return false;
+        at+=len;
+    }
+    file.close();
+    return fs.rename(pendingPath,snapshotPath);
+}
+bool Ap01Business::restoreSnapshot() {
+    File file=fs.open(snapshotPath,"r");
+    size_t total=file.size();
+    if(!file||total<=header+4||total>header+maxUsage+4)return false;
+    std::unique_ptr<uint8_t[]> record(new(std::nothrow) uint8_t[total]);
+    auto *p=record.get();
+    if(!p||file.read(p,total)!=total||memcmp(p,"USA1",4)||
+       get32(p+4)!=profile.bundleCrc||get32(p+8)!=compiled->sourceCrc||
+       p[12]!=profile.initial||get32(p+total-4)!=v2Crc32(p,total-4))return false;
+    if(!usage.concat(reinterpret_cast<const char*>(p+header),total-header-4))return false;
+    syncTime.concat(reinterpret_cast<const char*>(p+13),5);
+    return true;
+}
 bool Ap01Business::loadActive(uint64_t now) {
     configured = store.bsProfile(profile);
     if (!configured) { compiled.reset(); return false; }
@@ -37,7 +88,9 @@ bool Ap01Business::loadActive(uint64_t now) {
     if (!compiled || !store.bsLoadCompiled(profile.initial, *compiled, error)) {
         configured = false; compiled.reset(); return false;
     }
-    sequence.beginContext(now, 1); usage = "";
+    sequence.beginContext(now, 1); usage = ""; syncTime = "";
+    snapshotSaved=restoreSnapshot();
+    if(!generation && snapshotSaved){bootSnapshot=true;bootUsageCrc=v2CrcOf(usage);}
     return true;
 }
 bool Ap01Business::begin(uint64_t now, bool readOnly) {
@@ -62,21 +115,47 @@ bool Ap01Business::begin(uint64_t now, bool readOnly) {
             contextCounter = previous; newContext(next);
         }
     }
-    return finish(store.bsSetActive(profile.initial, next, error) && loadActive(now) && render());
+    if (!store.bsSetActive(profile.initial, next, error)) return false;
+    resumeContextCommitted=true;
+    bool okay=loadActive(now) && render();
+    if(okay)resumeContextCommitted=false;
+    return finish(okay);
+}
+const char *Ap01Business::writeReason() const {
+    if(writeResumeFailed)return "write_restore_failed";
+    if(resumeAfter)return "write_restore_retry";
+    if(writesAllowed())return "writable";
+    return previouslyWritable?"platform_readonly":"awaiting_write_approval";
 }
 bool Ap01Business::syncWritePermission(uint64_t now,bool allow) {
-    if(!allow){writesEnabled.store(false,std::memory_order_release);return true;}
+    if(!allow){
+        writesEnabled.store(false,std::memory_order_release);
+        resumeAfter=0;resumeRetries=0;resumeContextCommitted=false;
+        return !writeResumeFailed;
+    }
     if(writeResumeFailed)return false;
     if(writesAllowed())return true;
-    if(ui.writeScope){
-        struct Resume {Ap01Business *self;uint64_t now;} resume{this,now};
-        int32_t result=-1;
-        int32_t admitted=ui.writeScope(ui.context,[](void *p)->int32_t{
-            auto &r=*(Resume *)p;return r.self->begin(r.now,false)?0:-1;
-        },&resume,&result);
-        if(admitted==1)return true; // Busy: no begin, no migration or failure latch.
-        if(admitted==0&&result==0)return true;
-    }else if(begin(now,false))return true;
+    if(now<resumeAfter)return true;
+    struct Resume {Ap01Business *self;uint64_t now;} resume{this,now};
+    auto restore=[](void *p)->int32_t{
+        auto &r=*(Resume *)p;
+        auto &business=*r.self;
+        if(!business.resumeContextCommitted)return business.begin(r.now,false)?0:-1;
+        // The context was durably committed. Replay only reads and presentation.
+        if(!business.loadActive(r.now)||!business.render())return -1;
+        business.resumeContextCommitted=false;
+        business.writesEnabled.store(true,std::memory_order_release);
+        return 0;
+    };
+    int32_t result=-1;
+    int32_t admitted=0;
+    if(ui.writeScope)admitted=ui.writeScope(ui.context,restore,&resume,&result);
+    else result=restore(&resume);
+    if(admitted==1){resumeAfter=now+1000;return true;}
+    if(admitted==0&&result==0){previouslyWritable=true;resumeRetries=0;resumeAfter=0;return true;}
+    if(admitted==0&&resumeContextCommitted&&resumeRetries<3){
+        resumeAfter=now+(1000u<<resumeRetries++);return true;
+    }
     writeResumeFailed=true;return false;
 }
 bool Ap01Business::render() {
@@ -118,8 +197,9 @@ bool Ap01Business::localActivate(uint8_t index, uint64_t now, bool *retry) {
 }
 void Ap01Business::displayFeedback(JsonDocument &out, const char *state) {
     out["active_template_id"] = configured ? profile.ids[profile.initial] : "";
-    out["display_reason"] = !strcmp(state,"pending")
-        ? (ui.displayReason ? ui.displayReason(ui.context) : "waiting_for_draw")
+    const char *reason=ui.displayReason?ui.displayReason(ui.context):"waiting_for_draw";
+    out["display_reason"] = !strcmp(state,"pending")||(!strcmp(state,"displayed")&&!strcmp(reason,"ui_heartbeat_stale"))
+        ? reason
         : !strcmp(state,"displayed") ? "current_template_drawn"
         : !strcmp(state,"failed") ? "render_or_ui_allocation" : "unchanged";
 }
@@ -132,6 +212,7 @@ void Ap01Business::status(JsonDocument &out) {
     out["wifi"] = true; out["ble"] = false; out["partial"] = false;
     out["power_mode"] = "always_on"; out["power_plan"] = false; out["max_light_s"] = 0;
     out["max_templates"] = 8; out["max_fields"] = 64; out["max_snapshot_bytes"] = 4048;
+    out["write_permission"] = writeReason();
     out["storage_state"] = storageUnknown ? "unknown" : "ready";
     out["bundle_storage_protocol"] = 2; out["bundle_font_protocol"] = 3;
     out["bundle_compression"] = store.bsCompressionProtocol();
@@ -150,6 +231,10 @@ void Ap01Business::status(JsonDocument &out) {
         generation && generation == displayedGeneration.load(std::memory_order_acquire) ? "displayed" : "pending";
     displayFeedback(out, out["display_state"] | "unchanged");
     if(configured&&failed){out["display_error"]="render_or_ui_allocation";out["display_action"]="refresh_or_publish_complete_bundle";}
+    out["boot_snapshot_loaded"]=bootSnapshot;
+    if(bootSnapshot)out["boot_usage_crc"]=bootUsageCrc;
+    out["snapshot_saved"]=snapshotSaved;
+    if(usage.length())out["usage_crc"]=v2CrcOf(usage);
     out["frame_generation"] = generation; out["frame_crc"] = frameCrc;
     for (uint8_t i = 0; configured && i < profile.count; ++i) out["template_ids"].add(profile.ids[i]);
     if (configured && compiled) {
@@ -161,7 +246,7 @@ int Ap01Business::command(uint16_t op, JsonDocument &request, const char *nonce,
                            const uint8_t *body, size_t bytes, const char *requestId,
                            const char *offset, String &reply) {
     if (!writesAllowed()) {
-        reply = v2BuildAck("storage", "rejected", "unchanged", "lifecycle", "app_trial_readonly",
+        reply = v2BuildAck("storage", "rejected", "unchanged", "lifecycle", writeReason(),
                           -1, 0, nullptr, UINT32_MAX, FW_TARGET_ID);
         return 503;
     }
@@ -324,9 +409,10 @@ int Ap01Business::command(uint16_t op, JsonDocument &request, const char *nonce,
                 seq, 0, profile.contextId, UINT32_MAX, FW_TARGET_ID, true); return 409;
         }
         if (decision.firstApplied) {
-            usage = decision.usage; syncTime = currentTime;
+            usage = std::move(decision.usage); syncTime = currentTime;
+            snapshotSaved=saveSnapshot();
             display = render() ? "pending" : "failed";
-        }
+        } else if(!snapshotSaved && usage.length())snapshotSaved=saveSnapshot();
     } else error = op == 3 ? "power_plan_unsupported" : "unsupported";
     if (error) { result = "rejected"; status = 409; }
     reply = v2BuildAck(operation, result, display, op == 2 ? "ram" : "flash", error,

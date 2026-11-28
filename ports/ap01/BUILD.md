@@ -4,10 +4,12 @@
 
 ```sh
 mkdir -p build/codex-status-app
-python3 tooling/scripts/build-app.py --app-config ../codex_status/ports/ap01/build-0041.json --out build/codex-status-app --tool-prefix riscv-none-elf-
+python3 tooling/scripts/build-app.py --app-config ../codex_status/ports/ap01/app-build.json --out build/codex-status-app --tool-prefix riscv-none-elf-
 ```
 
 使用 `tooling/scripts/app-manifest.py` 生成集合清单，使用 `tooling/scripts/app-set-client.py` 通过 `/api/app/*` 安装。包扩展名为 `.apx`，清单扩展名为 `.amf`。诊断接口 `GET /api/diagnostic/versions` 返回当前 ROM 和已加载的 App 版本。
+
+独立 App 的业务状态省略 `fw`。Bridge 从平台认证接口 `GET /api/maintenance/status` 读取该字段，并核对设备 MAC 和启动 ID。版本读取失败时，业务状态仍可用，固件版本留空。
 
 ## AP01 App 健康诊断
 

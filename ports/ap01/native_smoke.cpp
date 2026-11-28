@@ -5,6 +5,7 @@
 #include "local_json_allocator.h"
 #include "v2_command_envelope.h"
 #include "v2_sync.h"
+#include "v2_runtime.h"
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -218,6 +219,27 @@ int main(int argc,char **argv) {
         content.clock("00:59");assert(host.displays==displays+unsigned(hasClock));
         content.clock("01:00");assert(host.displays==displays+2*unsigned(hasClock));
         assert(clockContext==content.context());content.status(status);assert((status["applied_seq"]|0u)==0);
+        // A read-only boot must paint the same pixels before any new Data or claim.
+        JsonDocument data(&a);data["seq"]=1;data["active_context_id"]=content.context();
+        auto fields=data["fields"].to<JsonArray>();
+        for(JsonObject req:status["data_contract"]["requirements"].as<JsonArray>()){
+            if(req["local"]|false)continue;
+            auto field=fields.add<JsonObject>();field["i"]=req["index"];field["k"]=req["field"];
+            if(!strcmp(req["kind"]|"","text"))field["v"]="cached";else field["v"]=72;
+        }
+        char fieldsCrc[9];snprintf(fieldsCrc,sizeof(fieldsCrc),"%08x",v2DataFieldsCrc(fields));
+        data["crc"]=fieldsCrc;String ack;
+        assert(content.command(2,data,"nonce",2000,nullptr,0,"","",ack)==200);
+        auto savedFrame=host.frame;
+        Ap01Business restarted(fs,{&host,present},7);assert(restarted.begin(0,true));
+        JsonDocument restored(&a);restarted.status(restored);
+        assert(restored["boot_snapshot_loaded"]==true&&restored["applied_seq"]==0);
+        assert(host.frame==savedFrame);
+        File broken=fs.open("/usage.bin","w");uint8_t invalid[32]={};
+        assert(broken.write(invalid,sizeof(invalid))==sizeof(invalid));broken.close();
+        Ap01Business damaged(fs,{&host,present},8);assert(damaged.begin(0,true));
+        restored.clear();damaged.status(restored);
+        assert(restored["boot_snapshot_loaded"]==false&&host.frame!=savedFrame);
         const char *second=status["template_ids"][1] | "";
         std::string activate="{"+client.command("activate-test")+",\"template_id\":\""+second+"\",\"expected_active_context_id\":\""+content.context()+"\"}";
         host.lostRename=true;

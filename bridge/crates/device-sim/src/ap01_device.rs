@@ -40,7 +40,7 @@ impl Device {
         for (key,item) in caps.as_object().unwrap(){value[key]=item.clone();}
         value["maintenance_http_port"]=json!(self.maintenance_port);
         value["result"]=json!("ok");value["mac"]=json!(self.mac);value["device_mac"]=json!(self.mac);
-        value["fw_target"]=json!(FIRMWARE_TARGET_AP01);value["fw"]=json!("ap01-codex-sim/1");
+        value["fw_target"]=json!(FIRMWARE_TARGET_AP01);
         value["boot_id"]=json!(self.boot);value["uptime_ms"]=json!(now);
         value["active_context_id"]=value["context"].clone();value["power_mode"]=json!("always_on");
         value["power_plan"]=json!(false);value["binding_method"]=json!(BINDING_METHOD);
@@ -150,7 +150,7 @@ async fn maintenance_status(State(shared):State<Shared>,request:Request<Body>)->
     if device.bindings.principal(&token).is_none(){return (StatusCode::UNAUTHORIZED,Json(fail("unauthorized","maintenance_auth"))).into_response();}
     // Maintenance does not read the Codex data context or generate a PowerPlan.
     Json(json!({"device_mac":device.mac,"fw_target":FIRMWARE_TARGET_AP01,"boot_id":device.boot,
-        "service":"ap01-maintenance","business_online":device.business_online,"http_port":device.maintenance_port,
+        "service":"ap01-maintenance","fw":"ap01-codex-sim/1","business_online":device.business_online,"http_port":device.maintenance_port,
         "firmware_ota":"unsupported_in_host_simulator","app_install":"unsupported_in_host_simulator"})).into_response()
 }
 fn response(mut status:u16,header:Header,session:[u8;16],value:&Value)->(Response,Vec<u8>) {

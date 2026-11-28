@@ -17,7 +17,7 @@ pio device monitor
 
 ### AP01 可选 App 构建
 
-AP01 编译、RV32 审计、链接和打包统一由兄弟固件仓库执行；源码配置为 `ports/ap01/build-0041.json`，命令及兼容入口见 [构建说明](../ports/ap01/BUILD.md)。这不改变下述 Note4/1.54 构建目标约定。
+AP01 编译、RV32 审计、链接和打包统一由兄弟固件仓库执行；源码配置为 `ports/ap01/app-build.json`，命令及兼容入口见 [构建说明](../ports/ap01/BUILD.md)。这不改变下述 Note4/1.54 构建目标约定。
 
 ### 固件目标：默认只构建 Note4；本次双 ROM 实机测试例外
 

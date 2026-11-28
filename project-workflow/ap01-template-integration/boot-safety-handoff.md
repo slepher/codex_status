@@ -10,7 +10,7 @@
 
 - `ports/ap01/firmware.{h,cpp}`：已确认稳定槽完整镜像身份核验、启动预置、原生UI/维护监听连续健康9秒锁回工作槽、30秒无健康保留稳定槽；无稳定记录不猜测。窗口内禁止新升级/修改稳定记录，显式稳定槽切换可取消自动锁回，选槽unknown不重试。
 - APF1新增可选`boot_trial_pending`，预置前写旧ROM可理解的Failed回执；健康确认只更新当前启动内存态，每次启动重新验健康，避免稳定槽旧ROM读取Applied工作槽回执后阻塞业务。APS1稳定槽仍为显式确认。
-- `application.{h,cpp}`传递启动时间；`native_0041.cpp`接原生UI心跳及维护监听健康条件，不依赖Codex/Bundle/owner；`slot_0041.cpp`成功提交后推进RAM表副本索引，让预置/锁回交替写表。已有绘制事件筛选保留。
+- `application.{h,cpp}`传递启动时间；`native_app.cpp`接原生UI心跳及维护监听健康条件，不依赖Codex/Bundle/owner；`slot_0041.cpp`成功提交后推进RAM表副本索引，让预置/锁回交替写表。已有绘制事件筛选保留。
 - 宿主测试新增健康/超时/心跳中断/unknown/损坏槽/显式救援/无稳定记录；模拟器脚本新增`--boot-trial-cut`、`--fallback-receipt`、双表CRC/age/slot及字节保护核验。代码已保存，新增模拟分支尚未验证。
 
 ## 产物与证据

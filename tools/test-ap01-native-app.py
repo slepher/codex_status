@@ -57,7 +57,8 @@ for folder in ('ports/ap01','bridge/crates/render/shim','src','.pio/libdeps/zect
     cmd+=['-I',linux(repo/folder)]
 source_paths=[repo/'src'/s for s in sources]+[repo/'ports/ap01'/s for s in ('business.cpp','application.cpp','http.cpp','native_smoke.cpp')]
 platform=repo.parent/'cuktech-ap01-firmware/tooling/firmware-modules'
-source_paths += [platform/'native_maintenance_0041.cpp',platform/'native_http_transport_0041.cpp',platform/'native_wifi_profiles_0041.cpp',platform/'native_diagnostic_0041.cpp',platform/'native_calendar_0041.cpp',platform/'native_firmware_0041.cpp',platform/'native_ota_image_0041.c']
+source_paths += [platform/name for name in ('native_maintenance.cpp','native_http_transport.cpp',
+    'native_wifi_profiles.cpp','native_diagnostic.cpp','native_calendar.cpp','native_firmware.cpp','native_ota_image.c')]
 cmd+=['-I',linux(platform)]
 objects=[]
 headers=list(platform.glob('*.h'))+list((repo/'ports/ap01').glob('*.h'))+list((repo/'src').glob('*.h'))
@@ -78,7 +79,7 @@ if args.app_only:
         'binary_sha256':hashlib.sha256(binary.read_bytes()).hexdigest(),'bundle_bytes':len(payload),
         'checks':result.stdout.strip()},indent=2),encoding='utf-8')
     print(report);sys.exit(0)
-firmware_source=platform/'test_native_maintenance_0041.cpp';firmware_object=out/'native-host-firmware_smoke.o'
+firmware_source=platform/'test_native_maintenance.cpp';firmware_object=out/'native-host-firmware_smoke.o'
 subprocess.run(cmd+['-c',linux(firmware_source),'-o',linux(firmware_object)],check=True)
 firmware_binary=out/'native-firmware-smoke'
 subprocess.run(cmd+[linux(p) for p in objects if p.stem!='native-host-native_smoke']+[linux(firmware_object),'-o',linux(firmware_binary)],check=True)
@@ -90,8 +91,8 @@ assert not firmware_result.returncode,firmware_result.stderr
 independent_object=out/'native-host-maintenance-only.o'
 subprocess.run(cmd+['-DAP01_MAINTENANCE_ONLY_TEST=1','-c',linux(firmware_source),'-o',linux(independent_object)],check=True)
 independent_binary=out/'native-maintenance-independent'
-independent_names={'native_maintenance_0041','native_http_transport_0041','native_wifi_profiles_0041',
-                   'native_diagnostic_0041','native_firmware_0041','native_ota_image_0041','sha256'}
+independent_names={'native_maintenance','native_http_transport','native_wifi_profiles',
+                   'native_diagnostic','native_firmware','native_ota_image','sha256'}
 independent_objects=[obj for source,obj in zip(source_paths,objects) if source.stem in independent_names]
 assert len(independent_objects)==len(independent_names)
 subprocess.run(cmd+[linux(p) for p in independent_objects]+[linux(independent_object),'-o',linux(independent_binary)],check=True)
@@ -107,8 +108,8 @@ assert not independent_result.returncode,independent_result.stderr
     'checks':independent_result.stdout.strip(),'physical_verified':False},indent=2),encoding='utf-8')
 # Current review regressions use the same production objects and private disk.
 for name, extra, argv in (
-    ('test_native_maintenance_recovery_0041', independent_objects, [independent_state]),
-    ('test_native_menu_order_0041', [], []),
+    ('test_native_maintenance_recovery', independent_objects, [independent_state]),
+    ('test_native_menu_order', [], []),
 ):
     target=out/name
     subprocess.run(cmd+[linux(platform/(name+'.cpp'))]+[linux(p) for p in extra]+['-o',linux(target)],check=True)

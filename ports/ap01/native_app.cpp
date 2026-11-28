@@ -15,7 +15,7 @@
 #ifndef AP01_FILE_APP
 #include "native_io.h"
 #endif
-#include "vfs_0041.h"
+#include "native_vfs.h"
 #include "ap01_template_display.h"
 #include "local_json_allocator.h"
 #include <atomic>
@@ -157,7 +157,10 @@ struct Runtime {
 #endif
     }
     static const char *displayReason(void *p) {
-        switch(((Runtime *)p)->displayWait.load(std::memory_order_acquire)) {
+        auto &r=*(Runtime *)p;
+        uint32_t beat=r.uiHeartbeat.load(std::memory_order_acquire);
+        if(beat&&uint32_t(nowMs()-beat)>5000)return "ui_heartbeat_stale";
+        switch(r.displayWait.load(std::memory_order_acquire)) {
             case 1:return "waiting_for_draw";
             case 2:return "screen_not_visible";
             case 3:return "pairing_dialog";

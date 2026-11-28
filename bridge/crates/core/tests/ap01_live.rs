@@ -75,6 +75,7 @@ fn discover_pair_publish_and_sync_without_power_plan() {
         assert!(Instant::now()<deadline,"physical confirmation not persisted: {reply}");std::thread::sleep(Duration::from_millis(50));
     }
     let before=http(client::status(endpoint,TOKEN,TIMEOUT)).unwrap();assert_eq!(before["configured"],false);
+    assert_eq!(before["fw"], "ap01-codex-sim/1");
     assert_eq!(before["fw_target"],"cuktech-ap01-0041");
     assert_eq!(before["power_mode"],"always_on");assert_eq!(before["power_plan"],false);
     let (code,claim)=http(client::claim(endpoint,TOKEN,TOKEN,&json!({"device_mac":mac,"bridge_id":BRIDGE,

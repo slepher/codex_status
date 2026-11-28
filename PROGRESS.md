@@ -1,8 +1,10 @@
 # Codex Status 当前交接
 
-更新时间：2026-11-18，Asia/Shanghai。
+更新时间：2026-11-28，Asia/Shanghai。
 
 ## 工作区与部署
+
+- 11-28 AP01 App 文件按功能命名，Bridge 从运行平台读取固件版本。独立 App .113 离线构建通过，未部署。[构建及验证边界](project-workflow/ap01-unified-build/status.md#2026-11-28-app-功能命名)
 
 - 11-18 A9/B6 已配套部署。macOS Bridge health 204；Note4 `ota_1` 运行 `artifacts/protocol-wire-20261118/note4-wire-0.18.110.bin`，1864944 B，认证 SHA256 `d7bdf5e224935d1d02c9f47d5c1d7fdbe1581a39631b8c93ec3d3752c5f1752c`（原 OTA 三次未确认，随后独立核验）；AP01 实际 0055 基座槽 1，独立 App .110/集合 4 healthy。Wi-Fi/BLE 短回执、Note4 两页诊断及原事务查询实机通过。[版本、帧大小、丢回执与备份](project-workflow/bridge-device-protocol-remediation/wire-size-20261118.md)
 
@@ -12,7 +14,7 @@
 - Windows Bridge：`bridge/target/debug/bridge-app.exe`，39285248 B，SHA256 `f94cc00011708a925028d830ba53cd4be1280130bb21a6d624623381064d1e62`。10/31 03:28部署重复claim/同Plan HTTP抑制修复，PID48712，health204；347文件data备份校验、3设备配置及4凭据文件保留。[修复/部署](project-workflow/power-plan-c/communication-fix-status.md)。
 - 书桌屏 `70041DD7A340`：20:14认证`.107-bw`/ota_1，原`.38-bw`/ota_0保留；原非活动.37槽1已替换。ROM `artifacts/wifi-families/desk-0.18.107-connection-fix.bin`，1840176 B，SHA256 `72225732b045651efd991bd4a29393c5df55e871b436c565066fb1ff1f5d6705`。原OTA succeeded/image_verified，20:15同boot HTTP/网络/内容正常，Profile/Bundle/网络目标保留；context按正常重启轮换并已对账。[验收](project-workflow/wifi-families/status.md)
 - Note4 `7C4FADB93408`：11-05按用户明确授权USB部署基于.106的`.108-note4`到`ota_0`，串口同MAC/版本/槽已确认；原`.107`保留`ota_1`，NVS/Bundle未写。ROM `artifacts/bridge-macos/note4-0.18.108-bond-reconnect.bin`，1873040B，SHA256 `13019165228c888a25f40e8c9f8566673419a5a57d25fcf4b591a44b06b467fa`，全镜像读回逐字节一致。自然窗口外原绑定重连/认证HTTP通过；Xiaomi_1EBB@192.168.31.90，Data seq5 applied/displayed。[记录](project-workflow/bridge-macos/device-add-20261105-status.md)
-- AP01 `34F01557210B`：11-05当前槽1，CUKTECH ROM `0.1.0-cuktech`（基于0041），build `677bc30246d7ae8f7cd73698fe4086d6`；独立App `0.18.108-ap01`已安装，集合2 succeeded/healthy、清理完成。版本诊断与运行列表一致。App版本由本仓 `ports/ap01/build-0041.json` 声明，基座独立发版。[产物哈希与验收](project-workflow/ap01-app-set-v3/status.md)。
+- AP01 `34F01557210B`：11-05当前槽1，CUKTECH ROM `0.1.0-cuktech`（基于0041），build `677bc30246d7ae8f7cd73698fe4086d6`；独立App `0.18.108-ap01`已安装，集合2 succeeded/healthy、清理完成。版本诊断与运行列表一致。App版本由本仓 `ports/ap01/app-build.json` 声明，基座独立发版。[产物哈希与验收](project-workflow/ap01-app-set-v3/status.md)。
 - AP01槽0现为0.1.0-cuktech无载入器救援基座，已取代旧0031记录。Mac Bridge最后11/05：81482064 B，SHA256 `ddff5b57a7470de3088de0b35f6e2359db6112e7ca99f4fdfdf58d5d9af90a43`；配对/无IP联网/TUN地址修复已部署。[状态](project-workflow/bridge-macos/device-add-20261105-status.md)
 
 ## 活跃事项与边界

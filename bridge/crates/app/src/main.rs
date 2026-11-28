@@ -1391,6 +1391,8 @@ fn claim_protocol_detail(error: &anyhow::Error) -> String {
         let text = cause.to_string();
         for (reason, stage) in [
             ("app_trial_readonly", "lifecycle"), ("business_offline", "lifecycle"),
+            ("awaiting_write_approval", "lifecycle"), ("platform_readonly", "lifecycle"),
+            ("write_restore_retry", "lifecycle"), ("write_restore_failed", "lifecycle"),
             ("maintenance_busy", "write_admission"), ("write_scope_unavailable", "write_admission"),
             ("bindings_busy", "binding"), ("unauthorized", "binding"),
             ("protocol_mismatch", "frame"),
@@ -1439,26 +1441,35 @@ async fn post_claim_once(
     if ap01::is_ap01(ctx,target_mac) {
         if force || release {return Err(ClaimError::Other("AP01 不支持 force/release；请等待占用租约到期".into()));}
         // Reconcile the authenticated context/contract before claim permits delivery.
-        ap01::revalidate(ctx,target_mac,endpoint).await.map_err(|reason| {
+        let observed=ap01::refresh_status(ctx,target_mac,endpoint).await.map_err(|reason| {
             tracing::warn!(device_mac=target_mac, stage="identity_preflight", reason=%reason, outcome="not_sent", "claim failed");
             ClaimError::Other(format!("claim identity_preflight/not_sent: {reason}"))
         })?;
         let (endpoint,token,mac)=(endpoint.to_owned(),token.to_owned(),target_mac.to_owned());
         let body=json!({"device_mac":mac,"bridge_id":bridge_id,"name":name,"host":host,"port":port,
             "lease_s":300,"request_id":uuid::Uuid::new_v4().simple().to_string()});
-        let (code,reply)=bridge_core::device_client::claim(
-            &endpoint,&token,&token,&body,budget.remaining()).await
-            .map_err(|error| {
+        let (code,reply)=match bridge_core::device_client::claim(
+            &endpoint,&token,&token,&body,budget.remaining()).await {
+            Ok(reply)=>reply,
+            Err(error)=>{
                 let failure = bridge_core::rendezvous::command_failure(&error);
                 let stage = failure.map_or("claim_response", |f| f.stage);
                 let rejected = error.chain().any(|cause| cause.downcast_ref::<bridge_core::device_client::HttpStatus>().is_some());
                 let outcome = failure.map_or(if rejected { "rejected" } else { "result_unknown" }, |f| f.code());
                 let reason = failure.map_or_else(|| bridge_core::rendezvous::wifi_error(&error).1, |f| f.reason);
                 // Only fixed classifications enter diagnostics; never log arbitrary payloads or credentials.
-                let detail = claim_protocol_detail(&error);
+                let mut detail = claim_protocol_detail(&error);
+                if detail.starts_with("platform_readonly;") || detail.starts_with("awaiting_write_approval;") {
+                    if let Some(boot)=observed["boot_id"].as_u64() {
+                        if ap01::update_holds_writes(&endpoint,target_mac,boot,&token,budget.remaining()).await {
+                            detail="update_hold; stage=write_admission; action=read_device_status".into();
+                        }
+                    }
+                }
                 tracing::warn!(device_mac=target_mac, stage, outcome, reason, detail, "claim failed");
-                ClaimError::Other(format!("AP01 claim {stage}/{outcome}: {reason}/{detail}; read authenticated status"))
-            })?;
+                return Err(ClaimError::Other(format!("AP01 claim {stage}/{outcome}: {reason}/{detail}; read authenticated status")));
+            }
+        };
         tracing::info!(device_mac=target_mac, stage="claim_response", status=code, "claim response");
         return Ok((reqwest::StatusCode::from_u16(code).map_err(|e|ClaimError::Other(e.to_string()))?,reply.to_string()));
     }

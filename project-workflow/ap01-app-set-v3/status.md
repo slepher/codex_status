@@ -1,6 +1,6 @@
 # 2026-11-05 App OTA 迁回 firmware
 
-2026-11-05 实机版本部署：AP01 当前运行槽 1，CUKTECH ROM `0.1.0-cuktech` / 基线 `1.0.2_0041`，build `677bc30246d7ae8f7cd73698fe4086d6`；槽 0 改为同版本无载入器救援基座，后续更新保留。业务 App 从本仓源码构建 `0.18.108-ap01`，205360 B，SHA256 `feab260c87fc293d7df426ecddfcc266c7d4e120019d1a8f7bdd6e4a88370cc4`。集合序号 2，重启后 succeeded/healthy、cleanup_pending=false；诊断版本列表与真实运行列表一致。执行载荷与此前 d1.0 相同，仅版本元数据/摘要更新。App 版本声明现归 `ports/ap01/build-0041.json`，固件构建器读取配置或显式 --version，不再内置业务版本默认值；基座版本独立发布。
+2026-11-05 实机版本部署：AP01 当前运行槽 1，CUKTECH ROM `0.1.0-cuktech` / 基线 `1.0.2_0041`，build `677bc30246d7ae8f7cd73698fe4086d6`；槽 0 改为同版本无载入器救援基座，后续更新保留。业务 App 从本仓源码构建 `0.18.108-ap01`，205360 B，SHA256 `feab260c87fc293d7df426ecddfcc266c7d4e120019d1a8f7bdd6e4a88370cc4`。集合序号 2，重启后 succeeded/healthy、cleanup_pending=false；诊断版本列表与真实运行列表一致。执行载荷与此前 d1.0 相同，仅版本元数据/摘要更新。App 版本声明现归 `ports/ap01/app-build.json`，固件构建器读取配置或显式 --version，不再内置业务版本默认值；基座版本独立发布。
 
 槽 1 ROM 6935752 B，SHA256 `cf0f39c78129b571d6d6534daac02fd7f0fe86de9e0cb7cc3c5fadbdf117a4e6`；槽 0 ROM 6885128 B，SHA256 `39b4d342b0d2de99852f2c5416ce3bbd74d386cd9b94f751ce1258c576ce3c5d`。两者在兄弟固件 `build/version-protocol-20261105/`；App 在 `build/app-upgrade-018108-20261105/app/`。槽 0 未写入，头/构建标识/尾部抽样一致；Wi-Fi 3 个网络、revision 7 和当前网络在两槽一致。非整槽读回，不扩大为界面/旋钮或长期运行验收。App 客户端遇到不含 MAC 的 409 maintenance_busy 时中止，保留原事务恢复后确认成功；错误分类待固件仓库修复。私有验收：兄弟固件 `build/app-upgrade-018108-20261105/deployment/acceptance.json`；版本协议与部署记录见[固件状态](../../../cuktech-ap01-firmware/project-workflow/ap01-app-update/status.md)。本次未启停 Bridge、修改业务协议或重新发布 Bundle。
 

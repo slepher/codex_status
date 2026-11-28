@@ -14,10 +14,9 @@ extern "C" const uint8_t ap01_native_manifest[256];
 namespace {
 constexpr const char *FRAME_TYPE = "application/vnd.codex-status.frame";
 void imageIdentity(JsonDocument &out) {
-    out["fw"] = "1.0.2_0041";
 #if defined(AP01_FILE_APP)
     const auto *api=ap01RuntimeApi();
-    // Keep the existing firmware identity field; report the independent App too.
+    // The platform reports its running firmware version on its maintenance listener.
     out["app_build"] = api->platform_build;
     out["app_package_digest"] = api->app_digest;
     out["rom_bytes"] = api->rom_bytes;
@@ -232,9 +231,10 @@ Ap01HttpReply Ap01Application::businessHttp(const Ap01HttpRequest &request, uint
 }
 Ap01HttpReply Ap01Application::businessHttpOwned(const Ap01HttpRequest &request, uint64_t now) {
     Ap01HttpReply reply;
-    if (!ready || !online.load(std::memory_order_acquire)||maintenanceActive()) { error(reply, 503, "business_offline", "lifecycle"); return reply; }
+    if (!ready || !online.load(std::memory_order_acquire)) { error(reply, 503, "business_offline", "lifecycle"); return reply; }
+    if(maintenanceActive()){error(reply,503,"maintenance_busy","write_admission");return reply;}
     uint16_t op = operation(request.path);
-    if (op != 1 && !business.writesAllowed()) { error(reply, 503, "app_trial_readonly", "lifecycle"); return reply; }
+    if (op != 1 && !business.writesAllowed()) { error(reply, 503, business.writeReason(), "lifecycle"); return reply; }
     if (!op) { error(reply, 404, "unsupported_endpoint", "business_router"); return reply; }
     if (strcmp(request.method, "POST") || strcmp(request.contentType, FRAME_TYPE)) {
         error(reply, 415, "content_type_or_method", "frame"); return reply;

@@ -201,7 +201,7 @@ jobs:
         run: |
           $output = "$env:GITHUB_WORKSPACE/dist/ap01-codex-status-0041.bin"
           $tool = "$env:USERPROFILE/.platformio/packages/toolchain-riscv32-esp/bin/riscv32-esp-elf-"
-          python -B cuktech-ap01-firmware/tooling/scripts/build-firmware-0041.py --app-config codex_status/ports/ap01/build-0041.json --tool-prefix $tool --build-dir "$env:GITHUB_WORKSPACE/build/ap01" --output $output
+          python -B cuktech-ap01-firmware/tooling/scripts/build-firmware-0041.py --app-config codex_status/ports/ap01/app-build.json --tool-prefix $tool --build-dir "$env:GITHUB_WORKSPACE/build/ap01" --output $output
           if ($LASTEXITCODE -ne 0) { throw 'AP01 audit/link/package failed' }
           python -B cuktech-ap01-firmware/tooling/scripts/test-firmware-0041.py --manifest "$env:GITHUB_WORKSPACE/dist/ap01-codex-status-0041.manifest.json"
           if ($LASTEXITCODE -ne 0) { throw 'AP01 ROM validation failed' }

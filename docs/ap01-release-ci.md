@@ -1,6 +1,6 @@
 # AP01 双仓库 ROM 生成
 
-构建实现继续由 `slepher/cuktech-ap01-firmware` 拥有，本仓库只提供 `ports/ap01/build-0041.json` 和 App 源码。不需要逆向仓库，也不需要复制 OTA/维护模块进本仓库。
+构建实现继续由 `slepher/cuktech-ap01-firmware` 拥有，本仓库只提供 `ports/ap01/app-build.json` 和 App 源码。不需要逆向仓库，也不需要复制 OTA/维护模块进本仓库。
 
 ## 已实测的本地入口
 
@@ -9,7 +9,7 @@
 ```powershell
 python -m pip install platformio
 pio pkg install --global --tool 'espressif/toolchain-riscv32-esp@8.4.0+2021r2-patch5'
-python -B ../cuktech-ap01-firmware/tooling/scripts/build-firmware-0041.py --app-config ports/ap01/build-0041.json --build-dir artifacts/ap01-release/objects --output artifacts/ap01-release/ap01-codex-status-0041.bin
+python -B ../cuktech-ap01-firmware/tooling/scripts/build-firmware-0041.py --app-config ports/ap01/app-build.json --build-dir artifacts/ap01-release/objects --output artifacts/ap01-release/ap01-codex-status-0041.bin
 python -B ../cuktech-ap01-firmware/tooling/scripts/test-firmware-0041.py --manifest artifacts/ap01-release/ap01-codex-status-0041.manifest.json
 ```
 

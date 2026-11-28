@@ -610,9 +610,37 @@ async fn status_mode(ip: &str, token: &str, timeout: Duration, compact: bool) ->
         let mut session=lock_session_until(&session,deadline).await?;
         session.identity = Some(json!({"device_mac":value["device_mac"], "boot_id":value["boot_id"]}));
         if let Some(ctx)=value["active_context_id"].as_str().filter(|s|s.len()==16 && s.bytes().all(|c|c.is_ascii_hexdigit())) {session.context.copy_from_slice(ctx.as_bytes());}
-        return Ok(value);
+    } else {
+        value = parse_status_body(&body)?;
     }
-    parse_status_body(&body)
+    if value["render_target"] == crate::platform::model::RENDER_TARGET_AP01 {
+        // File Apps can outlive their build platform. Only the running platform owns fw.
+        value.as_object_mut().unwrap().remove("fw");
+        let budget = deadline.saturating_duration_since(Instant::now()).min(Duration::from_secs(1));
+        if let Some(fw) = ap01_platform_version(ip, token, &value, budget).await {
+            value["fw"] = Value::String(fw);
+        }
+    }
+    Ok(value)
+}
+
+async fn ap01_platform_version(ip: &str, token: &str, business: &Value, timeout: Duration) -> Option<String> {
+    let mut address: std::net::SocketAddr = ip.parse().ok()?;
+    let port = match business.get("maintenance_http_port") {
+        Some(port) => u16::try_from(port.as_u64()?).ok()?,
+        None => crate::ap01::MAINTENANCE_HTTP_PORT,
+    };
+    let boot = business["boot_id"].as_u64()?;
+    let mac = DeviceIdentity::normalized_mac(business["device_mac"].as_str()?)?;
+    address.set_port(port);
+    let (code, platform) = pairing_request(&address.to_string(), "GET", "/api/maintenance/status",
+                                           token, None, timeout).await.ok()?;
+    if code != 200 || platform["service"] != "ap01-maintenance" ||
+        platform["boot_id"].as_u64() != Some(boot) ||
+        DeviceIdentity::normalized_mac(platform["device_mac"].as_str()?)? != mac {
+        return None;
+    }
+    platform["fw"].as_str().filter(|v| !v.is_empty()).map(str::to_owned)
 }
 
 fn parse_status_body(body: &str) -> Result<Value> {

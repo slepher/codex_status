@@ -8,7 +8,7 @@ parser=argparse.ArgumentParser()
 parser.add_argument('--audit',type=Path)
 args=parser.parse_args()
 
-for name in ('application.cpp','application.h','native_0041.cpp','http.cpp','http.h'):
+for name in ('application.cpp','application.h','native_app.cpp','http.cpp','http.h'):
     source=(repo/'ports/ap01'/name).read_text(encoding='utf-8')
     for token in ('/api/firmware/','/api/wifi/','/api/diagnostic/','Ap01Firmware',
                   'Ap01WifiSwitch','manualAuth','flashOpen(','ap01SelectSlot('):
@@ -52,7 +52,7 @@ for name in ('check-ap01-native.py','link-ap01-native.py','ap01_firmware_build.p
     text=(repo/'tools'/name).read_text(encoding='utf-8')
     for token in ('subprocess','-march=','--gc-sections','native_services.cpp'):
         assert token not in text,(name,token)
-config=json.loads((repo/'ports/ap01/build-0041.json').read_text(encoding='utf-8'))
+config=json.loads((repo/'ports/ap01/app-build.json').read_text(encoding='utf-8'))
 assert config['format']==1
 for relative in config['sources']+config['plain_sources']+config['include_dirs']:
     assert (repo/relative).resolve().is_relative_to(repo),relative

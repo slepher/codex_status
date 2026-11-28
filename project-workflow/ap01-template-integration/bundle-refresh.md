@@ -30,7 +30,7 @@
 
 Bridge默认选中Note4，`platform_profile_get`没有MAC参数，因此从平台状态读取AP01 Profile；所有写操作必须明确目标MAC/目标render_target，不能沿用默认设备。
 
-19:39 pending调查：仅读认证状态，未重新发布或投递。原Bundle/Data19不变，frame_generation从415到419，display_state已为displayed且无display_error。源码表明pending表示当前帧代号尚未得到imageDrawn确认；完整Bundle替换先retire旧画面，UI清除focused，后续render只提交帧、不主动夺取页面焦点；只有应用页面获得焦点、主界面可见且非维护状态时绘制回调才确认displayed。因此发布完成不保证立即显示；这条焦点重置路径可以解释此前等待，旧采样未记录UI焦点，无法追认当时具体页面或进入时间。分钟时钟也会生成新帧，故419不能单独证明用户操作。证据：artifacts/ap01-bundle-unclip-20261020/pending-investigation-status.json；ports/ap01/business.cpp的beforeReplace/render/status及ports/ap01/native_0041.cpp的tick/imageDrawn。
+19:39 pending调查：仅读认证状态，未重新发布或投递。原Bundle/Data19不变，frame_generation从415到419，display_state已为displayed且无display_error。源码表明pending表示当前帧代号尚未得到imageDrawn确认；完整Bundle替换先retire旧画面，UI清除focused，后续render只提交帧、不主动夺取页面焦点；只有应用页面获得焦点、主界面可见且非维护状态时绘制回调才确认displayed。因此发布完成不保证立即显示；这条焦点重置路径可以解释此前等待，旧采样未记录UI焦点，无法追认当时具体页面或进入时间。分钟时钟也会生成新帧，故419不能单独证明用户操作。证据：artifacts/ap01-bundle-unclip-20261020/pending-investigation-status.json；ports/ap01/business.cpp的beforeReplace/render/status及ports/ap01/native_app.cpp的tick/imageDrawn。
 
 ## Review
 

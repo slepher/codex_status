@@ -1,6 +1,6 @@
 {
   "format": 1,
-  "version": "0.18.111-ap01",
+  "version": "0.18.113-ap01",
   "root": "../..",
   "include_dirs": [
     "src",
@@ -20,8 +20,8 @@
     "ports/ap01/business.cpp",
     "ports/ap01/application.cpp",
     "ports/ap01/http.cpp",
-    "ports/ap01/native_0041.cpp",
-    "ports/ap01/manifest_0041.cpp",
+    "ports/ap01/native_app.cpp",
+    "ports/ap01/app_manifest.cpp",
     "src/template_engine.cpp",
     "src/GUI_Paint.cpp",
     "src/font_asset.cpp",

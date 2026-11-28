@@ -1,6 +1,6 @@
 # AP01 unified build status — 2026-10-27
 
-完成：平台源码清单、编译器发现、RV32 flags、XIP 节审计、预算提取、ET_REL 合并、最终链接和 ROM 打包均由固件仓库维护。App 的 check/link 脚本只剩薄转发；build-ap01-rom.py 保留原 import 接口并共用固件工具链发现。App 只增加 ports/ap01/build-0041.json 源码配置，不改业务实现。
+完成：平台源码清单、编译器发现、RV32 flags、XIP 节审计、预算提取、ET_REL 合并、最终链接和 ROM 打包均由固件仓库维护。App 的 check/link 脚本只剩薄转发；build-ap01-rom.py 保留原 import 接口并共用固件工具链发现。App 只增加 ports/ap01/app-build.json 源码配置，不改业务实现。
 
 验证：独立版、App 版从源码完整构建并通过 ROM 重建/CRC/篡改拒绝检查；App 旧 audit→link→package 命令及 screen-host-probe 版完整通过；源码职责边界检查通过；3 项配置/源文件/对象过期拒绝回归通过；无相邻仓库的新副本独立构建通过，OTA 8 项中通过 7 项，1 项因未安装可选 Unicorn 跳过。
 
@@ -14,3 +14,9 @@ App 版保留既有 offsetof/ArduinoJson deprecated 编译警告。源文件顺�
 日志/证据：兄弟固件仓库 `build/unified-0041/` 的 manifest/audit/link；`legacy/0.log` 至 `3.log`；`isolated/independence-report.json`。
 
 提交前其他任务更新了两个非 AP01 头文件，使先前全目录头文件审计过期；已对当前快照重新完整构建并通过候选检查，最新 App 产物为上述 codex-status-commit.bin。其他任务源码不在本次提交范围。
+
+## 2026-11-28 App 功能命名
+
+仅更新 codex_status 工作区，保留现有 App 版本和现场。
+
+含既有未提交改动的工作区独立 App `0.18.113-ap01`（ABI 3、RV32 GCC 12.5.0），209384 B，SHA256 `feee3ad6638bf66c6958d2ba3ce5a1e7f002c9562b506f376949c7ddbd3cf66f`，临时输出 `/private/tmp/ap01-app-build.FAz9GY/`。源码边界检查与 Bridge core、模拟器及其测试代码编译通过。james.local 主机名无法解析，项目集成测试未执行，未部署。
