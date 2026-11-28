@@ -25,6 +25,7 @@ AP01 源码边界：本仓库 `ports/ap01/` 只拥有 Bridge 配对/通信 App�
 - 隔离脚本同时隔离包目录并还原目标自己生成的完整 sdkconfig 快照；不得伪造指纹首行。保留 `.pio/build`/SCons 缓存，不例行 clean。不用 `pio -v`；路径含空格时按操作细则处理。
 - 每次构建核对 env、版本、大小、SHA256；最终 ROM 路径/哈希写交接卡，候选与已部署明确区分。发布前再核对 marker、登记 MAC 与设备身份。重编会改变镜像哈希。`FW_VERSION` 在 `src/main.cpp`；Note4 版本只用 `版本号-note4`，不加 a/b 或功能后缀，不改 env/target 标识。
 - Rust 在 `bridge/` 运行。锁定/ACL 构建失败优先隔离 `CARGO_TARGET_DIR`；`bridge/target/debug/data/` 有真实运行数据，删除 target 前必须备份 data，不能为测试擅停其他实例。
+- Rust 隔离构建优先复用已有且兼容的目录。任务结束时清理确认已废弃、可重建的编译缓存，保留 Bridge 运行数据（含命名实例）、设备备份和诊断记录。
 - 默认 Bridge 从提权命令运行 `pwsh -File <repo绝对路径>\tools\start-bridge.ps1`，使用按需计划任务 `CodexStatusBridge`；不得从受限工具会话起后台桥。停止前核对路径/端口/任务；先停同 exe watchdog，再停任务，必要时停核实的残留监听 PID。重建前两者退出，保留 data，成功后脚本启动；不用 `restart-bridge.ps1` 代替。UI 嵌入 exe，改 `ui/index.html` 后从包含改动的工作区重建/重启。其他后台服务立即返回且不继承工具 stdio。
 
 ## 协议与产品不变量
